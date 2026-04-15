@@ -1,5 +1,6 @@
 # YetAnotherAA-Validator
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 A complete BLS signature infrastructure for ERC-4337 account abstraction,
 combining off-chain signature aggregation services with on-chain verification
 smart contracts.
@@ -287,7 +288,7 @@ YetAnotherAA-Validator/
 ├── data/                         # Node data directory
 ├── package.json                  # NPM package configuration
 ├── README.md                     # This file
-└── LICENSE                       # MIT License
+└── LICENSE                       # Apache License 2.0
 
 node_dev_*.json         # Development node state files (contain private keys)
 node_*.json             # Dynamic node files (ignored by git)
@@ -473,7 +474,7 @@ For the complete account abstraction stack, see the main
 
 ## License
 
-MIT
+Licensed under the [Apache License, Version 2.0](https://opensource.org/licenses/Apache-2.0). See [LICENSE](./LICENSE) for details.
 
 ## Contributing
 
