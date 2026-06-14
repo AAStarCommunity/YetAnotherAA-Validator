@@ -33,6 +33,15 @@ export default () => {
     entryPointAddress:
       process.env.ENTRY_POINT_ADDRESS || "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
 
+    // DVT independent policy gate (Fix 2 Stage 2, issue #40).
+    // Disabled by default so existing deployments keep Stage 1 behavior unchanged.
+    // When enabled, the node refuses to co-sign ops outside its OWN policy — the
+    // owner and CA cannot change these rules, which is what makes the second factor
+    // independent. perTxMaxWei unset = no per-tx cap; allowlist empty = any recipient.
+    policyEnabled: process.env.POLICY_ENABLED === "true",
+    policyPerTxMaxWei: process.env.POLICY_PER_TX_MAX_WEI || undefined,
+    policyRecipientAllowlist: parseAllowlist(process.env.POLICY_RECIPIENT_ALLOWLIST || ""),
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),
@@ -52,4 +61,12 @@ function parseBootstrapPeers(peersString: string): string[] {
     .split(",")
     .map(p => p.trim())
     .filter(p => p.length > 0);
+}
+
+function parseAllowlist(allowlistString: string): string[] {
+  if (!allowlistString) return [];
+  return allowlistString
+    .split(",")
+    .map(a => a.trim())
+    .filter(a => a.length > 0);
 }
