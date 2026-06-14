@@ -1,49 +1,121 @@
-import { IsString, IsNotEmpty, Matches, IsEthereumAddress } from "class-validator";
-import { ApiProperty } from "@nestjs/swagger";
+import {
+  IsString,
+  IsNotEmpty,
+  IsEthereumAddress,
+  ValidateNested,
+  IsOptional,
+} from "class-validator";
+import { Type } from "class-transformer";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 
 /**
- * Request to have this DVT node co-sign a userOpHash.
+ * ERC-4337 v0.7 PackedUserOperation.
  *
- * Fix 2 Stage 1 (owner-authorization gate): the node will ONLY co-sign when the
- * request carries a valid account-owner signature (`ownerAuth`) over `userOpHash`.
- * This closes the open-oracle hole (a network-reachable attacker without the owner
- * key can no longer obtain a DVT co-sign). It does NOT defend against owner-key
- * compromise — that is Stage 2, tracked in YetAnotherAA-Validator issue #40.
- *
- * The value actually BLS-signed by the node remains `hashToCurve(userOpHash)`;
- * `account` and `ownerAuth` are used solely for the authorization check.
+ * Carries the FULL UserOperation so the node can derive the authoritative
+ * userOpHash itself (via EntryPoint.getUserOpHash) rather than trusting a
+ * caller-supplied hash. This binds the signed hash to `sender`, the EntryPoint,
+ * and chainId — closing the cross-account oracle hole (an attacker can no longer
+ * pair their own account's owner signature with a victim's userOpHash).
  */
-export class SignMessageDto {
+export class PackedUserOperationDto {
   @ApiProperty({
-    description: "The ERC-4337 userOpHash to be BLS co-signed (32-byte hex, 0x-prefixed)",
-    example: "0x8bb1b199f427dfc49e5fe40f2f3278cb1a48587824b78263051c8c4d81d77a81",
-  })
-  @IsString()
-  @IsNotEmpty()
-  @Matches(/^0x[0-9a-fA-F]{64}$/, {
-    message: "userOpHash must be a 0x-prefixed 32-byte hex string",
-  })
-  userOpHash: string;
-
-  @ApiProperty({
-    description: "The AirAccount address whose owner authorizes this co-sign request",
+    description: "Account that the UserOperation is for (becomes the authorized account)",
     example: "0x08923CE682336DF2f238C034B4add5Bf73d4028A",
   })
   @IsString()
   @IsNotEmpty()
-  @IsEthereumAddress({ message: "account must be a valid Ethereum address" })
-  account: string;
+  @IsEthereumAddress({ message: "userOp.sender must be a valid Ethereum address" })
+  sender: string;
+
+  @ApiProperty({ description: "Nonce (uint256, decimal or 0x-hex)", example: "0" })
+  @IsString()
+  @IsNotEmpty()
+  nonce: string;
 
   @ApiProperty({
-    description:
-      "Account-owner ECDSA signature (EIP-191) over userOpHash. Reuse the same owner " +
-      "signature that signs the UserOperation. 65-byte hex, 0x-prefixed.",
-    example: "0x" + "ab".repeat(65),
+    description: "Account init code (0x for already-deployed accounts)",
+    example: "0x",
   })
   @IsString()
   @IsNotEmpty()
-  @Matches(/^0x[0-9a-fA-F]+$/, {
-    message: "ownerAuth must be a 0x-prefixed hex string",
+  initCode: string;
+
+  @ApiProperty({ description: "Call data", example: "0x" })
+  @IsString()
+  @IsNotEmpty()
+  callData: string;
+
+  @ApiProperty({
+    description: "Packed verificationGasLimit + callGasLimit (bytes32)",
+    example: "0x" + "00".repeat(32),
   })
-  ownerAuth: string;
+  @IsString()
+  @IsNotEmpty()
+  accountGasLimits: string;
+
+  @ApiProperty({ description: "preVerificationGas (uint256)", example: "0" })
+  @IsString()
+  @IsNotEmpty()
+  preVerificationGas: string;
+
+  @ApiProperty({
+    description: "Packed maxPriorityFeePerGas + maxFeePerGas (bytes32)",
+    example: "0x" + "00".repeat(32),
+  })
+  @IsString()
+  @IsNotEmpty()
+  gasFees: string;
+
+  @ApiProperty({ description: "Paymaster and data (0x if none)", example: "0x" })
+  @IsString()
+  @IsNotEmpty()
+  paymasterAndData: string;
+
+  @ApiPropertyOptional({
+    description:
+      "UserOperation signature field. Not used for authorization (ownerAuth is) and " +
+      "does not affect getUserOpHash in v0.7. Defaults to 0x.",
+    example: "0x",
+  })
+  @IsString()
+  @IsOptional()
+  signature?: string;
+}
+
+/**
+ * Request to have this DVT node co-sign a UserOperation.
+ *
+ * Fix 2 Stage 1 (owner-authorization gate): the node co-signs ONLY when the
+ * request carries a valid account-owner signature (`ownerAuth`) over the
+ * userOpHash DERIVED from the full `userOp` (never a caller-supplied hash).
+ * This closes the open-oracle hole — a network-reachable attacker without the
+ * owner key, and an attacker who owns a *different* account, can no longer
+ * obtain a DVT co-sign for someone else's userOpHash. It does NOT defend
+ * against owner-key compromise — that is Stage 2 (issue #40).
+ *
+ * `ownerAuth` shape is intentionally NOT regex-validated here: all
+ * owner-authorization failures (missing/malformed/mismatched) must surface as
+ * 403 from the authorization gate, not as a 400 from the ValidationPipe.
+ */
+export class SignMessageDto {
+  @ApiProperty({
+    description: "The full ERC-4337 v0.7 PackedUserOperation to co-sign",
+    type: PackedUserOperationDto,
+  })
+  @ValidateNested()
+  @Type(() => PackedUserOperationDto)
+  @IsNotEmpty()
+  userOp: PackedUserOperationDto;
+
+  @ApiProperty({
+    description:
+      "Account-owner ECDSA signature (EIP-191) over the EntryPoint-derived userOpHash. " +
+      "Reuse the same owner signature that signs the UserOperation. 65-byte hex, 0x-prefixed. " +
+      "Intentionally not shape-validated: malformed/missing values are rejected with 403 by " +
+      "the authorization gate (consistent owner-auth-failure contract), not 400.",
+    example: "0x" + "ab".repeat(65),
+    required: false,
+  })
+  @IsOptional()
+  ownerAuth?: string;
 }

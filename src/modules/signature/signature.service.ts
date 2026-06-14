@@ -4,6 +4,7 @@ import { BlsService } from "../bls/bls.service.js";
 import { NodeService } from "../node/node.service.js";
 import { SignatureResult, AggregateSignatureResult } from "../../interfaces/signature.interface.js";
 import { sigs, bls, BLS_DST } from "../../utils/bls.util.js";
+import { PackedUserOp } from "../blockchain/blockchain.service.js";
 
 @Injectable()
 export class SignatureService {
@@ -12,14 +13,11 @@ export class SignatureService {
     private readonly nodeService: NodeService
   ) {}
 
-  async signMessage(
-    userOpHash: string,
-    account: string,
-    ownerAuth: string
-  ): Promise<SignatureResult> {
+  async signMessage(userOp: PackedUserOp, ownerAuth: string | undefined): Promise<SignatureResult> {
     const node = this.nodeService.getNodeForSigning();
-    // bls.service enforces the Fix 2 Stage 1 owner-authorization gate before signing.
-    return await this.blsService.signMessage(userOpHash, account, ownerAuth, node);
+    // bls.service enforces the Fix 2 Stage 1 owner-authorization gate: it derives the
+    // authoritative userOpHash from userOp and requires a valid owner signature over it.
+    return await this.blsService.signMessage(userOp, ownerAuth, node);
   }
 
   async aggregateExternalSignatures(signatureStrings: string[]): Promise<AggregateSignatureResult> {
