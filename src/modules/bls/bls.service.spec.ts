@@ -180,6 +180,33 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
+  it("rejects (403, not 400) when userOp.sender is not a valid address", async () => {
+    getUserOpHash.mockResolvedValue(derivedHash);
+    getAccountOwner.mockResolvedValue(ownerWallet.address);
+    const ownerAuth = await signEip191(ownerWallet, derivedHash);
+    const bad = { ...makeUserOp(victimAccount), sender: "not-an-address" };
+
+    await expect(service.signMessage(bad, ownerAuth, node)).rejects.toBeInstanceOf(
+      ForbiddenException
+    );
+    // Shape rejected before any chain read.
+    expect(getUserOpHash).not.toHaveBeenCalled();
+    expect(getAccountOwner).not.toHaveBeenCalled();
+  });
+
+  it("rejects (403, not 400) when a required userOp field is missing", async () => {
+    getUserOpHash.mockResolvedValue(derivedHash);
+    getAccountOwner.mockResolvedValue(ownerWallet.address);
+    const ownerAuth = await signEip191(ownerWallet, derivedHash);
+    const bad = { ...makeUserOp(victimAccount) } as Partial<PackedUserOp>;
+    delete bad.callData;
+
+    await expect(service.signMessage(bad as PackedUserOp, ownerAuth, node)).rejects.toBeInstanceOf(
+      ForbiddenException
+    );
+    expect(getUserOpHash).not.toHaveBeenCalled();
+  });
+
   it("rejects (403) fail-closed for a P256/passkey-only account (owner == zero address)", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
     getAccountOwner.mockResolvedValue(ethers.ZeroAddress);

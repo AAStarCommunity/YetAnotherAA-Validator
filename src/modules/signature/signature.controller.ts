@@ -64,12 +64,13 @@ export class SignatureController {
       },
     },
   })
-  @ApiResponse({ status: 400, description: "Invalid input data (malformed userOp shape)" })
+  @ApiResponse({ status: 400, description: "Request body is not a JSON object (userOp missing)" })
   @ApiResponse({
     status: 403,
     description:
-      "Owner authorization required (missing/malformed/mismatched ownerAuth, owner read " +
-      "failure, getUserOpHash revert, or P256/passkey-only account)",
+      "Owner authorization required — uniform fail-closed. Returned for malformed userOp " +
+      "fields (bad sender / missing fields), getUserOpHash revert, owner read failure, " +
+      "P256/passkey-only account (owner==0x0), and missing/malformed/mismatched ownerAuth",
   })
   @ApiBody({ type: SignMessageDto })
   @Post("sign")

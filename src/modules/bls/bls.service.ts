@@ -48,8 +48,34 @@ export class BlsService {
     userOp: PackedUserOp,
     ownerAuth: string | undefined
   ): Promise<string> {
-    // account is the UserOperation sender — derived, never caller-claimed.
-    const account = userOp.sender;
+    // Fail-closed shape check (→ 403, never 400): a malformed signing request is
+    // rejected by the same authorization gate as a bad signature, keeping the
+    // endpoint uniformly fail-closed. `sender` must be a valid address (it becomes
+    // the authorized account); the remaining fields must be present so
+    // EntryPoint.getUserOpHash can ABI-encode them (any encoding failure also → 403).
+    let account: string;
+    try {
+      if (!userOp || typeof userOp.sender !== "string") {
+        throw new Error("malformed userOp");
+      }
+      account = ethers.getAddress(userOp.sender); // throws on non-address → 403
+      const requiredFields: (keyof PackedUserOp)[] = [
+        "nonce",
+        "initCode",
+        "callData",
+        "accountGasLimits",
+        "preVerificationGas",
+        "gasFees",
+        "paymasterAndData",
+      ];
+      for (const f of requiredFields) {
+        if (userOp[f] === undefined || userOp[f] === null) {
+          throw new Error(`malformed userOp: missing ${String(f)}`);
+        }
+      }
+    } catch {
+      throw new ForbiddenException("owner authorization required");
+    }
 
     // Derive the authoritative userOpHash on-chain. This binds the hash to the
     // sender, chainId, and EntryPoint — a caller cannot substitute another hash.
