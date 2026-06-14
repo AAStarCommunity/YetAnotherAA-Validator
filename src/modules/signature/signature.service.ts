@@ -12,9 +12,14 @@ export class SignatureService {
     private readonly nodeService: NodeService
   ) {}
 
-  async signMessage(message: string): Promise<SignatureResult> {
+  async signMessage(
+    userOpHash: string,
+    account: string,
+    ownerAuth: string
+  ): Promise<SignatureResult> {
     const node = this.nodeService.getNodeForSigning();
-    return await this.blsService.signMessage(message, node);
+    // bls.service enforces the Fix 2 Stage 1 owner-authorization gate before signing.
+    return await this.blsService.signMessage(userOpHash, account, ownerAuth, node);
   }
 
   async aggregateExternalSignatures(signatureStrings: string[]): Promise<AggregateSignatureResult> {

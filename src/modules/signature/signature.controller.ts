@@ -65,14 +65,25 @@ export class SignatureController {
     },
   })
   @ApiResponse({ status: 400, description: "Invalid input data" })
+  @ApiResponse({
+    status: 403,
+    description: "Owner authorization required (missing/malformed/mismatched ownerAuth)",
+  })
   @ApiBody({ type: SignMessageDto })
   @Post("sign")
   async signMessage(@Body(ValidationPipe) signDto: SignMessageDto) {
     this.logger.log(`=== BLS Sign Request ===`);
-    this.logger.log(`Message: ${signDto.message}`);
+    this.logger.log(`userOpHash: ${signDto.userOpHash}`);
+    this.logger.log(`account: ${signDto.account}`);
 
     try {
-      const result = await this.signatureService.signMessage(signDto.message);
+      // Fix 2 Stage 1: bls.service rejects with 403 unless ownerAuth is a valid
+      // account-owner signature over userOpHash.
+      const result = await this.signatureService.signMessage(
+        signDto.userOpHash,
+        signDto.account,
+        signDto.ownerAuth
+      );
 
       this.logger.log(`✅ Sign Success:`);
       this.logger.log(`  Node ID: ${result.nodeId}`);

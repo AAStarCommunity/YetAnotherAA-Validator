@@ -209,6 +209,31 @@ export class BlockchainService {
     }
   }
 
+  /**
+   * Read the on-chain owner of an AirAccount.
+   *
+   * Used by the Fix 2 Stage 1 owner-authorization gate. The v0.18 account exposes
+   * `address public owner` (see AAStarAirAccountBase.sol), which Solidity surfaces as
+   * a `owner() view returns (address)` getter. Uses the read-only provider (no wallet
+   * required), so it works on nodes that have no ETH_PRIVATE_KEY configured.
+   */
+  async getAccountOwner(account: string): Promise<string> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+
+    const abi = ["function owner() view returns (address)"];
+    const contract = new ethers.Contract(account, abi, this.provider);
+
+    try {
+      const owner: string = await contract.owner();
+      return ethers.getAddress(owner);
+    } catch (error: any) {
+      this.logger.error(`Failed to read owner() for account ${account}: ${error.message}`);
+      throw error;
+    }
+  }
+
   async getRegisteredNodes(
     contractAddress: string,
     offset: number,
