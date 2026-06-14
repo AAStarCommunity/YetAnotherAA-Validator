@@ -205,6 +205,7 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
       ForbiddenException
     );
     expect(getUserOpHash).not.toHaveBeenCalled();
+    expect(getAccountOwner).not.toHaveBeenCalled();
   });
 
   it("rejects (403) fail-closed for a P256/passkey-only account (owner == zero address)", async () => {
