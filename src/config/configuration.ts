@@ -41,6 +41,12 @@ export default () => {
     policyEnabled: process.env.POLICY_ENABLED === "true",
     policyPerTxMaxWei: process.env.POLICY_PER_TX_MAX_WEI || undefined,
     policyRecipientAllowlist: parseAllowlist(process.env.POLICY_RECIPIENT_ALLOWLIST || ""),
+    // Layer-1 (on-chain IPolicyRegistry, Fix 2 Stage 2). Empty = layer-1 off.
+    // ethSentinel: asset key for native ETH in checkPolicy — default 0xEee… per
+    // airaccount-contract #110 (Q4, pending SP final confirm).
+    policyRegistryAddress: process.env.POLICY_REGISTRY_ADDRESS || undefined,
+    policyEthSentinel:
+      process.env.POLICY_ETH_SENTINEL || "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,

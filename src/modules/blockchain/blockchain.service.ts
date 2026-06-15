@@ -293,6 +293,54 @@ export class BlockchainService {
     }
   }
 
+  /**
+   * Read the DVT policy decision for one decoded call from the on-chain
+   * IPolicyRegistry (Fix 2 Stage 2 — layer 1). This is the sender-keyed,
+   * validation-time `view` defined by SuperPaymaster #283 and confirmed by
+   * airaccount-contract #110:
+   *
+   *   checkPolicy(sender, target, asset, amount, selector)
+   *     -> (PolicyDecision decision, uint256 remainingDaily)
+   *   enum PolicyDecision { ALLOW = 0, REQUIRE_DVT = 1, REJECT = 2 }
+   *
+   * The registry is the SAME source slashing references (node-policy-source ==
+   * slash-source), so a node that honors this read cannot be unfairly slashed.
+   * Read-only — works without a wallet.
+   */
+  async checkPolicy(
+    registryAddress: string,
+    sender: string,
+    target: string,
+    asset: string,
+    amount: ethers.BigNumberish,
+    selector: string
+  ): Promise<{ decision: number; remainingDaily: bigint }> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+
+    const abi = [
+      "function checkPolicy(address sender, address target, address asset, uint256 amount, bytes4 selector) view returns (uint8 decision, uint256 remainingDaily)",
+    ];
+    const contract = new ethers.Contract(registryAddress, abi, this.provider);
+
+    try {
+      const [decision, remainingDaily] = await contract.checkPolicy(
+        sender,
+        target,
+        asset,
+        amount,
+        selector
+      );
+      return { decision: Number(decision), remainingDaily: BigInt(remainingDaily) };
+    } catch (error: any) {
+      this.logger.error(
+        `checkPolicy revert on registry ${registryAddress} for sender ${sender}: ${error.message}`
+      );
+      throw error;
+    }
+  }
+
   async getRegisteredNodes(
     contractAddress: string,
     offset: number,

@@ -31,7 +31,7 @@ export class SignatureService {
     // (so only the account owner can probe it). Refuses out-of-policy ops even with a
     // valid — possibly compromised — owner signature; this independence is the DVT
     // tier's value. Fail-closed: rejection is a 403, never a 200-without-signature.
-    const decision = this.policyService.evaluate(userOp);
+    const decision = await this.policyService.evaluate(userOp);
     if (!decision.allowed) {
       this.logger.warn(`DVT policy rejected sign for ${userOp.sender}: ${decision.reason}`);
       throw new ForbiddenException("operation rejected by node policy");
