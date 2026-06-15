@@ -1,6 +1,6 @@
 {
   "name": "yetanotheraa-validator",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Production-ready BLS signature validation infrastructure for ERC-4337 account abstraction",
   "main": "dist/main.js",
   "type": "module",
