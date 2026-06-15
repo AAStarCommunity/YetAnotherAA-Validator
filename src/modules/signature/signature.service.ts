@@ -25,7 +25,7 @@ export class SignatureService {
     // signature. Fail-closed and uniform with the Stage 1 gate — rejection is a 403,
     // never a 200-with-no-signature. The decision is local to this node (owner/CA
     // cannot change it), which is the source of the DVT tier's independence.
-    const decision = this.policyService.evaluate(userOp);
+    const decision = await this.policyService.evaluate(userOp);
     if (!decision.allowed) {
       this.logger.warn(`DVT policy rejected sign for ${userOp.sender}: ${decision.reason}`);
       throw new ForbiddenException("operation rejected by node policy");
