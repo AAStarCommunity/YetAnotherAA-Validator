@@ -130,8 +130,12 @@ describe("PolicyService — layer 2 (node-operator floor)", () => {
   });
 
   it("fails closed on an empty/malformed callData when enabled", async () => {
-    const svc = makeService({ policyEnabled: true });
+    const svc = makeService({ policyEnabled: true, policyPerTxMaxWei: "100" });
     expect((await svc.evaluate(userOpWith("0x"))).allowed).toBe(false);
+  });
+
+  it("fails fast at construction when enabled with no rules [Codex Low]", () => {
+    expect(() => makeService({ policyEnabled: true })).toThrow(/no policy configured/);
   });
 });
 
@@ -140,10 +144,13 @@ describe("PolicyService — layer 1 (on-chain IPolicyRegistry)", () => {
 
   it("is off when no registry configured (layer-2 only)", async () => {
     let called = false;
-    const svc = makeService({ policyEnabled: true }, async () => {
-      called = true;
-      return { decision: 2, remainingDaily: 0n };
-    });
+    const svc = makeService(
+      { policyEnabled: true, policyPerTxMaxWei: "1000000000000000000" },
+      async () => {
+        called = true;
+        return { decision: 2, remainingDaily: 0n };
+      }
+    );
     expect((await svc.evaluate(userOpWith(executeCallData(RECIPIENT, 5n)))).allowed).toBe(true);
     expect(called).toBe(false); // registry never consulted
   });
@@ -223,7 +230,7 @@ describe("PolicyService — layer 1 (on-chain IPolicyRegistry)", () => {
     await svc.evaluate(userOpWith(erc20TransferCallData(TOKEN, RECIPIENT, 1_000_000n)));
     expect(seen[0].asset.toLowerCase()).toBe(TOKEN.toLowerCase()); // asset = the token
     expect(seen[0].amount).toBe(1_000_000n); // amount from calldata, NOT 0
-    expect(seen[0].target.toLowerCase()).toBe(RECIPIENT.toLowerCase()); // real recipient
+    expect(seen[0].target.toLowerCase()).toBe(TOKEN.toLowerCase()); // checkPolicy target = contract (call.to)
   });
 
   it("captures ERC-20 approve(spender, amount) so allowances are gated [Codex F7]", async () => {
@@ -240,19 +247,35 @@ describe("PolicyService — layer 1 (on-chain IPolicyRegistry)", () => {
     await svc.evaluate(userOpWith(erc20ApproveCallData(TOKEN, SPENDER, 999_999n)));
     expect(seen[0].asset.toLowerCase()).toBe(TOKEN.toLowerCase());
     expect(seen[0].amount).toBe(999_999n); // approved amount gated, not 0
-    expect(seen[0].target.toLowerCase()).toBe(SPENDER.toLowerCase());
+    expect(seen[0].target.toLowerCase()).toBe(TOKEN.toLowerCase()); // checkPolicy target = contract
   });
 
-  it("layer-2 allowlist checks the REAL ERC-20 recipient, not the token contract [Codex F3]", async () => {
-    const TOKEN = "0x" + "cc".repeat(20); // token contract NOT in allowlist
-    // allowlist only RECIPIENT — a transfer to RECIPIENT must pass (recipient allowlisted),
-    // a transfer to OTHER must fail, even though both call the same (non-listed) token.
-    const allow = makeService({ policyEnabled: true, policyRecipientAllowlist: [RECIPIENT] });
+  it("layer-2 allowlist must cover BOTH contract and recipient (augment) [Codex F3]", async () => {
+    const TOKEN = "0x" + "cc".repeat(20);
+    // both token and recipient listed → allowed
+    const ok = makeService({ policyEnabled: true, policyRecipientAllowlist: [TOKEN, RECIPIENT] });
     expect(
-      (await allow.evaluate(userOpWith(erc20TransferCallData(TOKEN, RECIPIENT, 1n)))).allowed
+      (await ok.evaluate(userOpWith(erc20TransferCallData(TOKEN, RECIPIENT, 1n)))).allowed
     ).toBe(true);
-    const deny = makeService({ policyEnabled: true, policyRecipientAllowlist: [RECIPIENT] });
-    const d = await deny.evaluate(userOpWith(erc20TransferCallData(TOKEN, OTHER, 1n)));
+    // recipient NOT listed → rejected
+    const noRecip = makeService({ policyEnabled: true, policyRecipientAllowlist: [TOKEN] });
+    expect(
+      (await noRecip.evaluate(userOpWith(erc20TransferCallData(TOKEN, OTHER, 1n)))).allowed
+    ).toBe(false);
+    // token contract NOT listed → rejected (recipient alone is not enough)
+    const noToken = makeService({ policyEnabled: true, policyRecipientAllowlist: [RECIPIENT] });
+    const d = await noToken.evaluate(userOpWith(erc20TransferCallData(TOKEN, RECIPIENT, 1n)));
+    expect(d.allowed).toBe(false);
+    expect(d.reason).toMatch(/not in allowlist/);
+  });
+
+  it("blocks selector-collision: malicious contract masquerading as a token transfer [Codex F3 regression]", async () => {
+    const MALICIOUS = "0x" + "66".repeat(20);
+    // execute(MALICIOUS, 0, transfer(RECIPIENT, 1)) — MALICIOUS's calldata collides with
+    // the transfer selector + an allowlisted recipient. The contract (MALICIOUS) is NOT
+    // allowlisted, so it MUST be rejected — not waved through as a benign token transfer.
+    const svc = makeService({ policyEnabled: true, policyRecipientAllowlist: [RECIPIENT] });
+    const d = await svc.evaluate(userOpWith(erc20TransferCallData(MALICIOUS, RECIPIENT, 1n)));
     expect(d.allowed).toBe(false);
     expect(d.reason).toMatch(/not in allowlist/);
   });

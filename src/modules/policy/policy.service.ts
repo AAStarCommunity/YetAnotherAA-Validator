@@ -43,9 +43,18 @@ interface DecodedCall {
   selector: string;
 }
 
-/** The policy-relevant view of a call: who/what/how-much actually moves. */
+/**
+ * The policy-relevant view of a call. `contract` and `recipient` are kept SEPARATE
+ * on purpose: a selector match alone must never let a call masquerade as a token
+ * transfer and skip the contract check (the F3-augment fix). For a real ERC-20
+ * transfer these differ (contract = token, recipient = payee); for native/generic
+ * calls they coincide (both = execute's dest).
+ */
 interface PolicyCall {
-  target: string;
+  /** The contract actually being called (execute's dest) — the ContractScope key. */
+  contract: string;
+  /** Value recipient: decoded payee/spender for token ops, else the contract. */
+  recipient: string;
   asset: string;
   amount: bigint;
   selector: string;
@@ -100,6 +109,18 @@ export class PolicyService {
       "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
     if (this.enabled) {
+      // Fail fast on a no-op gate: POLICY_ENABLED=true with zero rules would silently
+      // allow everything, giving operators a false sense of enforcement.
+      if (
+        !this.registryAddress &&
+        this.perTxMaxWei === null &&
+        this.recipientAllowlist.size === 0
+      ) {
+        throw new Error(
+          "POLICY_ENABLED=true but no policy configured — set POLICY_REGISTRY_ADDRESS, " +
+            "POLICY_PER_TX_MAX_WEI, and/or POLICY_RECIPIENT_ALLOWLIST. Refusing to start a no-op gate."
+        );
+      }
       this.logger.log(
         `DVT policy gate ENABLED — perTxMaxWei=${this.perTxMaxWei ?? "unset"}, ` +
           `allowlist=${this.recipientAllowlist.size} entries, ` +
@@ -152,10 +173,16 @@ export class PolicyService {
           reason: `call[${i}] value ${call.value} exceeds perTxMaxWei ${this.perTxMaxWei}`,
         };
       }
-      // Allowlist checks the REAL recipient (decoded), not the token contract (Codex F3).
-      const target = pcs[i].target;
-      if (this.recipientAllowlist.size > 0 && !this.recipientAllowlist.has(target.toLowerCase())) {
-        return { allowed: false, reason: `call[${i}] recipient ${target} not in allowlist` };
+      // Allowlist must cover EVERY address the call touches — both the contract being
+      // called AND the decoded recipient (augment, not replace). Checking only the
+      // decoded recipient would let execute(maliciousContract, 0, transferSelector‖
+      // allowlistedAddr‖x) masquerade as a token transfer and skip the contract check.
+      if (this.recipientAllowlist.size > 0) {
+        for (const addr of [pcs[i].contract, pcs[i].recipient]) {
+          if (!this.recipientAllowlist.has(addr.toLowerCase())) {
+            return { allowed: false, reason: `call[${i}] address ${addr} not in allowlist` };
+          }
+        }
       }
     }
 
@@ -166,10 +193,13 @@ export class PolicyService {
       try {
         results = await Promise.all(
           pcs.map(pc =>
+            // ContractScope key = the contract actually called (call.to), NOT the
+            // decoded recipient — so a selector-collision call can't be checked as a
+            // benign token transfer while the real target goes unexamined.
             this.blockchainService.checkPolicy(
               this.registryAddress,
               userOp.sender,
-              pc.target,
+              pc.contract,
               pc.asset,
               pc.amount,
               pc.selector
@@ -258,7 +288,8 @@ export class PolicyService {
     if (call.selector === ERC20_TRANSFER) {
       const [to, amount] = ABI.decode(["address", "uint256"], "0x" + call.func.slice(10));
       return {
-        target: to as string,
+        contract: call.to,
+        recipient: to as string,
         asset: call.to,
         amount: amount as bigint,
         selector: call.selector,
@@ -271,7 +302,8 @@ export class PolicyService {
         "0x" + call.func.slice(10)
       );
       return {
-        target: to as string,
+        contract: call.to,
+        recipient: to as string,
         asset: call.to,
         amount: amount as bigint,
         selector: call.selector,
@@ -282,7 +314,8 @@ export class PolicyService {
     if (call.selector === ERC20_APPROVE) {
       const [spender, amount] = ABI.decode(["address", "uint256"], "0x" + call.func.slice(10));
       return {
-        target: spender as string,
+        contract: call.to,
+        recipient: spender as string,
         asset: call.to,
         amount: amount as bigint,
         selector: call.selector,
@@ -291,7 +324,8 @@ export class PolicyService {
     // Native ETH movement: the value leaving the account is execute()'s `value`.
     if (call.value > 0n) {
       return {
-        target: call.to,
+        contract: call.to,
+        recipient: call.to,
         asset: this.ethSentinel,
         amount: call.value,
         selector: call.selector,
@@ -299,7 +333,13 @@ export class PolicyService {
     }
     // Generic contract call: no native value, no recognized token transfer.
     // amount 0 → only the registry's per-contract ContractScope (allow/velocity) applies.
-    return { target: call.to, asset: call.to, amount: 0n, selector: call.selector };
+    return {
+      contract: call.to,
+      recipient: call.to,
+      asset: call.to,
+      amount: 0n,
+      selector: call.selector,
+    };
   }
 
   /** 4-byte selector of an inner call payload, or NULL_SELECTOR for a bare transfer. */
