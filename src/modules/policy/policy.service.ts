@@ -51,8 +51,10 @@ interface PolicyCall {
   selector: string;
 }
 
-// IPolicyRegistry.PolicyDecision enum.
-const REJECT = 2;
+// IPolicyRegistry.PolicyDecision enum. Co-sign ONLY on these known-good values;
+// REJECT (2) and any unknown/future variant (e.g. a v2 REQUIRE_EXTRA) fail closed.
+const ALLOW = 0;
+const REQUIRE_DVT = 1;
 
 // Account call surface (contracts/src/AAStarAccountBase.sol).
 const EXECUTE_SELECTOR = ethers.id("execute(address,uint256,bytes)").slice(0, 10);
@@ -64,6 +66,9 @@ const NULL_SELECTOR = "0x00000000";
 // limits apply to token transfers (the common case), not just native ETH.
 const ERC20_TRANSFER = ethers.id("transfer(address,uint256)").slice(0, 10);
 const ERC20_TRANSFER_FROM = ethers.id("transferFrom(address,address,uint256)").slice(0, 10);
+// approve() authorizes future spend — gate the approved amount too, else an
+// infinite approval is invisible to the amount checks (Codex F7).
+const ERC20_APPROVE = ethers.id("approve(address,uint256)").slice(0, 10);
 
 const ABI = new ethers.AbiCoder();
 
@@ -128,50 +133,63 @@ export class PolicyService {
       return { allowed: false, reason: "no decodable calls in callData (fail-closed)" };
     }
 
+    // Normalize each call ONCE to its policy-relevant (target, asset, amount, selector).
+    // Throws on a malformed token payload → fail-closed. Reused by both layers so the
+    // operator floor sees the REAL recipient/amount, not just the immediate `to`.
+    let pcs: PolicyCall[];
+    try {
+      pcs = calls.map(c => this.normalizeForPolicy(c));
+    } catch (e: any) {
+      return { allowed: false, reason: `undecodable transfer (fail-closed): ${e?.message ?? e}` };
+    }
+
     // Layer 2 — node-operator floor (local, owner/CA cannot override).
     for (const [i, call] of calls.entries()) {
+      // perTxMaxWei is a NATIVE-wei cap → only the native value of the call.
       if (this.perTxMaxWei !== null && call.value > this.perTxMaxWei) {
         return {
           allowed: false,
           reason: `call[${i}] value ${call.value} exceeds perTxMaxWei ${this.perTxMaxWei}`,
         };
       }
-      if (this.recipientAllowlist.size > 0 && !this.recipientAllowlist.has(call.to.toLowerCase())) {
-        return { allowed: false, reason: `call[${i}] recipient ${call.to} not in allowlist` };
+      // Allowlist checks the REAL recipient (decoded), not the token contract (Codex F3).
+      const target = pcs[i].target;
+      if (this.recipientAllowlist.size > 0 && !this.recipientAllowlist.has(target.toLowerCase())) {
+        return { allowed: false, reason: `call[${i}] recipient ${target} not in allowlist` };
       }
     }
 
     // Layer 1 — per-account on-chain registry (if configured). Fail-closed on revert.
+    // Checks run concurrently (Codex F6 — no sequential per-call RPC latency).
     if (this.registryAddress) {
-      for (const [i, call] of calls.entries()) {
-        let pc: PolicyCall;
-        try {
-          pc = this.normalizeForPolicy(call);
-        } catch (e: any) {
+      let results: { decision: number; remainingDaily: bigint }[];
+      try {
+        results = await Promise.all(
+          pcs.map(pc =>
+            this.blockchainService.checkPolicy(
+              this.registryAddress,
+              userOp.sender,
+              pc.target,
+              pc.asset,
+              pc.amount,
+              pc.selector
+            )
+          )
+        );
+      } catch (e: any) {
+        return {
+          allowed: false,
+          reason: `registry checkPolicy reverted (fail-closed): ${e?.message ?? e}`,
+        };
+      }
+      // Fail-closed: co-sign ONLY on a known-good decision. REJECT and any unknown/
+      // future variant refuse (Codex F4 — was fail-open on anything != REJECT).
+      for (const [i, { decision }] of results.entries()) {
+        if (decision !== ALLOW && decision !== REQUIRE_DVT) {
           return {
             allowed: false,
-            reason: `call[${i}] undecodable transfer (fail-closed): ${e?.message ?? e}`,
+            reason: `call[${i}] registry decision = ${decision} (not ALLOW/REQUIRE_DVT)`,
           };
-        }
-        let decision: number;
-        try {
-          ({ decision } = await this.blockchainService.checkPolicy(
-            this.registryAddress,
-            userOp.sender,
-            pc.target,
-            pc.asset,
-            pc.amount,
-            pc.selector
-          ));
-        } catch (e: any) {
-          return {
-            allowed: false,
-            reason: `call[${i}] registry checkPolicy reverted (fail-closed): ${e?.message ?? e}`,
-          };
-        }
-        // ALLOW / REQUIRE_DVT are both within policy → node may co-sign. REJECT → refuse.
-        if (decision === REJECT) {
-          return { allowed: false, reason: `call[${i}] registry decision = REJECT` };
         }
       }
     }
@@ -232,15 +250,10 @@ export class PolicyService {
    * Throws on a malformed token payload → caller fails closed.
    */
   private normalizeForPolicy(call: DecodedCall): PolicyCall {
-    // Native ETH movement: the value leaving the account is execute()'s `value`.
-    if (call.value > 0n) {
-      return {
-        target: call.to,
-        asset: this.ethSentinel,
-        amount: call.value,
-        selector: call.selector,
-      };
-    }
+    // Token value-moving calls are checked BEFORE the native-value shortcut (Codex F2)
+    // so a token transfer's real (asset, amount, recipient) is always captured — even
+    // if a stray native value is also attached.
+    //
     // ERC-20 transfer(to, amount): asset = the token (call.to), amount from calldata.
     if (call.selector === ERC20_TRANSFER) {
       const [to, amount] = ABI.decode(["address", "uint256"], "0x" + call.func.slice(10));
@@ -261,6 +274,26 @@ export class PolicyService {
         target: to as string,
         asset: call.to,
         amount: amount as bigint,
+        selector: call.selector,
+      };
+    }
+    // ERC-20 approve(spender, amount): an allowance is authorized FUTURE spend — gate
+    // the approved amount so a large/infinite approval is not invisible (Codex F7).
+    if (call.selector === ERC20_APPROVE) {
+      const [spender, amount] = ABI.decode(["address", "uint256"], "0x" + call.func.slice(10));
+      return {
+        target: spender as string,
+        asset: call.to,
+        amount: amount as bigint,
+        selector: call.selector,
+      };
+    }
+    // Native ETH movement: the value leaving the account is execute()'s `value`.
+    if (call.value > 0n) {
+      return {
+        target: call.to,
+        asset: this.ethSentinel,
+        amount: call.value,
         selector: call.selector,
       };
     }

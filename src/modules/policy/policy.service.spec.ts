@@ -37,6 +37,14 @@ function erc20TransferCallData(token: string, to: string, amount: bigint): strin
   return exec + coder.encode(["address", "uint256", "bytes"], [token, 0n, innerFunc]).slice(2);
 }
 
+/** Build callData for execute() wrapping an ERC-20 approve(spender, amount) on `token`. */
+function erc20ApproveCallData(token: string, spender: string, amount: bigint): string {
+  const approveSel = ethers.id("approve(address,uint256)").slice(0, 10);
+  const innerFunc = approveSel + coder.encode(["address", "uint256"], [spender, amount]).slice(2);
+  const exec = ethers.id("execute(address,uint256,bytes)").slice(0, 10);
+  return exec + coder.encode(["address", "uint256", "bytes"], [token, 0n, innerFunc]).slice(2);
+}
+
 function userOpWith(callData: string): PackedUserOp {
   return {
     sender: "0x" + "ab".repeat(20),
@@ -160,7 +168,17 @@ describe("PolicyService — layer 1 (on-chain IPolicyRegistry)", () => {
     }));
     const d = await svc.evaluate(userOpWith(executeCallData(RECIPIENT, 5n)));
     expect(d.allowed).toBe(false);
-    expect(d.reason).toMatch(/REJECT/);
+    expect(d.reason).toMatch(/decision = 2|not ALLOW/);
+  });
+
+  it("fails closed on an UNKNOWN registry decision, not just REJECT [Codex F4]", async () => {
+    const svc = makeService({ policyEnabled: true, policyRegistryAddress: REGISTRY }, async () => ({
+      decision: 3, // future REQUIRE_EXTRA / garbage — must NOT be treated as allow (fail-open)
+      remainingDaily: 0n,
+    }));
+    const d = await svc.evaluate(userOpWith(executeCallData(RECIPIENT, 5n)));
+    expect(d.allowed).toBe(false);
+    expect(d.reason).toMatch(/not ALLOW/);
   });
 
   it("fails closed when checkPolicy reverts", async () => {
@@ -208,6 +226,37 @@ describe("PolicyService — layer 1 (on-chain IPolicyRegistry)", () => {
     expect(seen[0].target.toLowerCase()).toBe(RECIPIENT.toLowerCase()); // real recipient
   });
 
+  it("captures ERC-20 approve(spender, amount) so allowances are gated [Codex F7]", async () => {
+    const TOKEN = "0x" + "cc".repeat(20);
+    const SPENDER = "0x" + "dd".repeat(20);
+    const seen: any[] = [];
+    const svc = makeService(
+      { policyEnabled: true, policyRegistryAddress: REGISTRY },
+      async (_registry, _sender, target, asset, amount) => {
+        seen.push({ target, asset, amount });
+        return { decision: 1, remainingDaily: 0n };
+      }
+    );
+    await svc.evaluate(userOpWith(erc20ApproveCallData(TOKEN, SPENDER, 999_999n)));
+    expect(seen[0].asset.toLowerCase()).toBe(TOKEN.toLowerCase());
+    expect(seen[0].amount).toBe(999_999n); // approved amount gated, not 0
+    expect(seen[0].target.toLowerCase()).toBe(SPENDER.toLowerCase());
+  });
+
+  it("layer-2 allowlist checks the REAL ERC-20 recipient, not the token contract [Codex F3]", async () => {
+    const TOKEN = "0x" + "cc".repeat(20); // token contract NOT in allowlist
+    // allowlist only RECIPIENT — a transfer to RECIPIENT must pass (recipient allowlisted),
+    // a transfer to OTHER must fail, even though both call the same (non-listed) token.
+    const allow = makeService({ policyEnabled: true, policyRecipientAllowlist: [RECIPIENT] });
+    expect(
+      (await allow.evaluate(userOpWith(erc20TransferCallData(TOKEN, RECIPIENT, 1n)))).allowed
+    ).toBe(true);
+    const deny = makeService({ policyEnabled: true, policyRecipientAllowlist: [RECIPIENT] });
+    const d = await deny.evaluate(userOpWith(erc20TransferCallData(TOKEN, OTHER, 1n)));
+    expect(d.allowed).toBe(false);
+    expect(d.reason).toMatch(/not in allowlist/);
+  });
+
   it("REJECTs an over-limit ERC-20 transfer that amount=0 would have missed", async () => {
     const TOKEN = "0x" + "cc".repeat(20);
     const svc = makeService(
@@ -219,7 +268,7 @@ describe("PolicyService — layer 1 (on-chain IPolicyRegistry)", () => {
     );
     const d = await svc.evaluate(userOpWith(erc20TransferCallData(TOKEN, RECIPIENT, 1_000_000n)));
     expect(d.allowed).toBe(false);
-    expect(d.reason).toMatch(/REJECT/);
+    expect(d.reason).toMatch(/decision = 2|not ALLOW/);
   });
 
   it("fails closed on a malformed ERC-20 transfer payload", async () => {
