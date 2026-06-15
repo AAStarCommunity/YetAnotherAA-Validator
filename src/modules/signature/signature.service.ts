@@ -1,23 +1,44 @@
-import { Injectable, BadRequestException } from "@nestjs/common";
+import { Injectable, BadRequestException, ForbiddenException, Logger } from "@nestjs/common";
 import { ethers } from "ethers";
 import { BlsService } from "../bls/bls.service.js";
 import { NodeService } from "../node/node.service.js";
+import { PolicyService } from "../policy/policy.service.js";
 import { SignatureResult, AggregateSignatureResult } from "../../interfaces/signature.interface.js";
 import { sigs, bls, BLS_DST } from "../../utils/bls.util.js";
 import { PackedUserOp } from "../blockchain/blockchain.service.js";
 
 @Injectable()
 export class SignatureService {
+  private readonly logger = new Logger(SignatureService.name);
+
   constructor(
     private readonly blsService: BlsService,
-    private readonly nodeService: NodeService
+    private readonly nodeService: NodeService,
+    private readonly policyService: PolicyService
   ) {}
 
   async signMessage(userOp: PackedUserOp, ownerAuth: string | undefined): Promise<SignatureResult> {
     const node = this.nodeService.getNodeForSigning();
-    // bls.service enforces the Fix 2 Stage 1 owner-authorization gate: it derives the
-    // authoritative userOpHash from userOp and requires a valid owner signature over it.
-    return await this.blsService.signMessage(userOp, ownerAuth, node);
+
+    // Fix 2 Stage 1 owner-auth gate FIRST: derive the authoritative userOpHash and
+    // require a valid owner signature over it. Running this BEFORE the policy gate
+    // (Codex F1) keeps /signature/sign uniformly fail-closed and ensures an
+    // unauthenticated caller can never reach the policy gate — so there is no policy
+    // oracle and no pre-auth on-chain registry RPC (DoS) surface.
+    const userOpHash = await this.blsService.authorizeAndDeriveHash(userOp, ownerAuth);
+
+    // Fix 2 Stage 2 INDEPENDENT policy gate, only reachable AFTER owner-auth passes
+    // (so only the account owner can probe it). Refuses out-of-policy ops even with a
+    // valid — possibly compromised — owner signature; this independence is the DVT
+    // tier's value. Fail-closed: rejection is a 403, never a 200-without-signature.
+    const decision = this.policyService.evaluate(userOp);
+    if (!decision.allowed) {
+      this.logger.warn(`DVT policy rejected sign for ${userOp.sender}: ${decision.reason}`);
+      throw new ForbiddenException("operation rejected by node policy");
+    }
+
+    // Sign the SAME already-authorized derived hash (no re-auth, no TOCTOU).
+    return await this.blsService.signDerivedHash(userOpHash, node);
   }
 
   async aggregateExternalSignatures(signatureStrings: string[]): Promise<AggregateSignatureResult> {
