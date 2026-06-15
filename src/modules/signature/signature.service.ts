@@ -20,20 +20,25 @@ export class SignatureService {
   async signMessage(userOp: PackedUserOp, ownerAuth: string | undefined): Promise<SignatureResult> {
     const node = this.nodeService.getNodeForSigning();
 
-    // Fix 2 Stage 2: the node's INDEPENDENT policy gate. Runs before any signing so
-    // an out-of-policy op is refused even with a valid (possibly compromised) owner
-    // signature. Fail-closed and uniform with the Stage 1 gate — rejection is a 403,
-    // never a 200-with-no-signature. The decision is local to this node (owner/CA
-    // cannot change it), which is the source of the DVT tier's independence.
+    // Fix 2 Stage 1 owner-auth gate FIRST: derive the authoritative userOpHash and
+    // require a valid owner signature over it. Running this BEFORE the policy gate
+    // (Codex F1) keeps /signature/sign uniformly fail-closed and ensures an
+    // unauthenticated caller can never reach the policy gate — so there is no policy
+    // oracle and no pre-auth on-chain registry RPC (DoS) surface.
+    const userOpHash = await this.blsService.authorizeAndDeriveHash(userOp, ownerAuth);
+
+    // Fix 2 Stage 2 INDEPENDENT policy gate, only reachable AFTER owner-auth passes
+    // (so only the account owner can probe it). Refuses out-of-policy ops even with a
+    // valid — possibly compromised — owner signature; this independence is the DVT
+    // tier's value. Fail-closed: rejection is a 403, never a 200-without-signature.
     const decision = this.policyService.evaluate(userOp);
     if (!decision.allowed) {
       this.logger.warn(`DVT policy rejected sign for ${userOp.sender}: ${decision.reason}`);
       throw new ForbiddenException("operation rejected by node policy");
     }
 
-    // bls.service enforces the Fix 2 Stage 1 owner-authorization gate: it derives the
-    // authoritative userOpHash from userOp and requires a valid owner signature over it.
-    return await this.blsService.signMessage(userOp, ownerAuth, node);
+    // Sign the SAME already-authorized derived hash (no re-auth, no TOCTOU).
+    return await this.blsService.signDerivedHash(userOpHash, node);
   }
 
   async aggregateExternalSignatures(signatureStrings: string[]): Promise<AggregateSignatureResult> {

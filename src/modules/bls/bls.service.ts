@@ -44,7 +44,7 @@ export class BlsService {
    * @returns the derived userOpHash to BLS-sign.
    * @throws ForbiddenException on any authorization failure.
    */
-  private async authorizeAndDeriveHash(
+  async authorizeAndDeriveHash(
     userOp: PackedUserOp,
     ownerAuth: string | undefined
   ): Promise<string> {
@@ -127,11 +127,19 @@ export class BlsService {
     ownerAuth: string | undefined,
     node: NodeKeyPair
   ): Promise<SignatureResult> {
-    // Authorization gate (Fix 2 Stage 1): derive the authoritative userOpHash from
-    // the full UserOperation and require a valid owner signature over it. Returns
-    // the SAME derived hash that gets signed below — no caller-supplied hash, no TOCTOU.
+    // Convenience: owner-auth gate then sign. Callers that must run ANOTHER gate
+    // between auth and signing (e.g. the node policy gate) should instead call
+    // authorizeAndDeriveHash() then signDerivedHash() directly, so nothing runs
+    // before owner-auth (no pre-auth oracle / RPC — see signature.service).
     const userOpHash = await this.authorizeAndDeriveHash(userOp, ownerAuth);
+    return this.signDerivedHash(userOpHash, node);
+  }
 
+  /**
+   * BLS-sign an ALREADY-AUTHORIZED derived userOpHash. Only ever call this with a
+   * hash returned by authorizeAndDeriveHash (i.e. after the owner-auth gate passed).
+   */
+  async signDerivedHash(userOpHash: string, node: NodeKeyPair): Promise<SignatureResult> {
     // BLS-sign hashToCurve(userOpHash) using the exact derived hash.
     const messageBytes = ethers.getBytes(userOpHash);
     const messagePoint = await bls.G2.hashToCurve(messageBytes, {
