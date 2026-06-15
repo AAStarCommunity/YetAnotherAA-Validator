@@ -21,10 +21,11 @@ import { PackedUserOp, BlockchainService } from "../blockchain/blockchain.servic
  *   - Layer 2 (node operator, local): perTxMax + recipient allowlist — the operator's
  *     floor that no on-chain state can override. The hard independence guarantee.
  *
- * layer-1 amount semantics: native-value flows map to (asset = ETH sentinel,
- * amount = value); ERC-20 transfer/transferFrom map to (asset = token, amount =
- * the in-calldata amount, target = recipient) so per-asset token limits apply;
- * other contract calls pass (asset = target, amount = 0) for ContractScope only.
+ * layer-1 checkPolicy is keyed by the CONTRACT actually called (call.to) as
+ * `target`, with `asset`/`amount` decoded from the call (native value, or an ERC-20
+ * transfer/transferFrom/approve amount from calldata). The decoded recipient is
+ * checked only by the layer-2 allowlist (alongside the contract — never instead of
+ * it), so a selector collision cannot pose as a benign token transfer.
  * Pending SP final Q4 (ETH sentinel value) / Q5 (governance) — both are
  * configurable constants and do not change the checkPolicy read signature.
  */
