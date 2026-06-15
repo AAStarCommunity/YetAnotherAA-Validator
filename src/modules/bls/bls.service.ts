@@ -1,13 +1,139 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, ForbiddenException, Logger } from "@nestjs/common";
 import { ethers } from "ethers";
 import { bls, sigs, BLS_DST, encodeG2Point } from "../../utils/bls.util.js";
 import { SignatureResult } from "../../interfaces/signature.interface.js";
 import { NodeKeyPair } from "../../interfaces/node.interface.js";
+import { BlockchainService, PackedUserOp } from "../blockchain/blockchain.service.js";
 
 @Injectable()
 export class BlsService {
-  async signMessage(message: string, node: NodeKeyPair): Promise<SignatureResult> {
-    const messageBytes = ethers.getBytes(message);
+  private readonly logger = new Logger(BlsService.name);
+
+  constructor(private readonly blockchainService: BlockchainService) {}
+
+  /**
+   * Fix 2 Stage 1 — owner-authorization gate.
+   *
+   * The node co-signs ONLY when the request carries a valid account-owner ECDSA
+   * signature over the AUTHORITATIVE userOpHash, which is DERIVED from the full
+   * UserOperation (never trusted from the caller). The flow:
+   *
+   *   account     = userOp.sender                                 (derived, not claimed)
+   *   userOpHash  = EntryPoint.getUserOpHash(userOp)              (binds hash↔sender/chain)
+   *   owner       = account.owner()
+   *   require verifyMessage(getBytes(userOpHash), ownerAuth) == owner
+   *   then BLS-sign hashToCurve(userOpHash)  — the SAME derived hash (no TOCTOU)
+   *
+   * Deriving the hash on-chain is what closes the cross-account oracle hole: an
+   * attacker who owns account A cannot get the node to sign account B's userOpHash,
+   * because the hash is computed from `userOp.sender` (= B) and getUserOpHash binds
+   * it to B, chainId, and the EntryPoint. The owner check then requires B's owner.
+   *
+   * Owner-signature convention matches AAStarAirAccountBase.sol `_validateECDSA`:
+   *   bytes32 hash = userOpHash.toEthSignedMessageHash();  // EIP-191 prefix
+   *   ecrecover(hash, v, r, s) == owner                    // `address public owner`
+   * which `ethers.verifyMessage(getBytes(userOpHash), sig)` reproduces exactly.
+   *
+   * Stage 1 handles the ECDSA-owner case only. A P256/passkey-only account
+   * (owner() == 0x0) FAILS CLOSED (see #40 for Stage 2 P256-owner support).
+   *
+   * Fails closed (403) on ANY failure: malformed userOp, getUserOpHash revert,
+   * owner read failure, owner == 0x0, malformed/missing ownerAuth, or recovered
+   * signer != owner. Never signs on failure.
+   *
+   * @returns the derived userOpHash to BLS-sign.
+   * @throws ForbiddenException on any authorization failure.
+   */
+  private async authorizeAndDeriveHash(
+    userOp: PackedUserOp,
+    ownerAuth: string | undefined
+  ): Promise<string> {
+    // Fail-closed shape check (→ 403, never 400): a malformed signing request is
+    // rejected by the same authorization gate as a bad signature, keeping the
+    // endpoint uniformly fail-closed. `sender` must be a valid address (it becomes
+    // the authorized account); the remaining fields must be present so
+    // EntryPoint.getUserOpHash can ABI-encode them (any encoding failure also → 403).
+    let account: string;
+    try {
+      if (!userOp || typeof userOp.sender !== "string") {
+        throw new Error("malformed userOp");
+      }
+      account = ethers.getAddress(userOp.sender); // throws on non-address → 403
+      const requiredFields: (keyof PackedUserOp)[] = [
+        "nonce",
+        "initCode",
+        "callData",
+        "accountGasLimits",
+        "preVerificationGas",
+        "gasFees",
+        "paymasterAndData",
+      ];
+      for (const f of requiredFields) {
+        if (userOp[f] === undefined || userOp[f] === null) {
+          throw new Error(`malformed userOp: missing ${String(f)}`);
+        }
+      }
+    } catch {
+      throw new ForbiddenException("owner authorization required");
+    }
+
+    // Derive the authoritative userOpHash on-chain. This binds the hash to the
+    // sender, chainId, and EntryPoint — a caller cannot substitute another hash.
+    let userOpHash: string;
+    try {
+      userOpHash = await this.blockchainService.getUserOpHash(userOp);
+    } catch {
+      throw new ForbiddenException("owner authorization required");
+    }
+
+    let owner: string;
+    try {
+      owner = await this.blockchainService.getAccountOwner(account);
+    } catch {
+      throw new ForbiddenException("owner authorization required");
+    }
+
+    // Zero owner → P256/passkey-only account, no ECDSA owner to authorize against.
+    // TODO(#40): add P256-owner authorization for passkey-only accounts (Stage 2).
+    if (owner === ethers.ZeroAddress) {
+      throw new ForbiddenException(
+        "owner authorization required: account has no ECDSA owner (P256/passkey-only is not supported in Stage 1, see #40)"
+      );
+    }
+
+    let recovered: string;
+    try {
+      if (typeof ownerAuth !== "string" || ownerAuth.length === 0) {
+        throw new Error("missing ownerAuth");
+      }
+      // EIP-191 over the raw 32-byte derived userOpHash, matching the contract.
+      recovered = ethers.verifyMessage(ethers.getBytes(userOpHash), ownerAuth);
+    } catch {
+      throw new ForbiddenException("owner authorization required");
+    }
+
+    if (ethers.getAddress(recovered) !== owner) {
+      this.logger.warn(
+        `Owner-auth rejected for account ${account}: recovered ${recovered}, expected owner ${owner}`
+      );
+      throw new ForbiddenException("owner authorization required");
+    }
+
+    return userOpHash;
+  }
+
+  async signMessage(
+    userOp: PackedUserOp,
+    ownerAuth: string | undefined,
+    node: NodeKeyPair
+  ): Promise<SignatureResult> {
+    // Authorization gate (Fix 2 Stage 1): derive the authoritative userOpHash from
+    // the full UserOperation and require a valid owner signature over it. Returns
+    // the SAME derived hash that gets signed below — no caller-supplied hash, no TOCTOU.
+    const userOpHash = await this.authorizeAndDeriveHash(userOp, ownerAuth);
+
+    // BLS-sign hashToCurve(userOpHash) using the exact derived hash.
+    const messageBytes = ethers.getBytes(userOpHash);
     const messagePoint = await bls.G2.hashToCurve(messageBytes, {
       DST: BLS_DST,
     });
@@ -22,7 +148,7 @@ export class BlsService {
       signature: this.encodeToEIP2537(signature), // Use EIP-2537 format as default
       signatureCompact: signature.toHex(), // Keep compact format for backward compatibility
       publicKey: publicKey.toHex(),
-      message: message,
+      message: userOpHash,
     };
   }
 

@@ -2,6 +2,19 @@ import { Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 
+/** ERC-4337 v0.7 PackedUserOperation (the exact tuple EntryPoint.getUserOpHash takes). */
+export interface PackedUserOp {
+  sender: string;
+  nonce: ethers.BigNumberish;
+  initCode: string;
+  callData: string;
+  accountGasLimits: string;
+  preVerificationGas: ethers.BigNumberish;
+  gasFees: string;
+  paymasterAndData: string;
+  signature: string;
+}
+
 @Injectable()
 export class BlockchainService {
   private readonly logger = new Logger(BlockchainService.name);
@@ -205,6 +218,77 @@ export class BlockchainService {
       return publicKey;
     } catch (error: any) {
       this.logger.error(`Failed to get node public key: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Read the on-chain owner of an AirAccount.
+   *
+   * Used by the Fix 2 Stage 1 owner-authorization gate. The v0.18 account exposes
+   * `address public owner` (see AAStarAirAccountBase.sol), which Solidity surfaces as
+   * a `owner() view returns (address)` getter. Uses the read-only provider (no wallet
+   * required), so it works on nodes that have no ETH_PRIVATE_KEY configured.
+   */
+  async getAccountOwner(account: string): Promise<string> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+
+    const abi = ["function owner() view returns (address)"];
+    const contract = new ethers.Contract(account, abi, this.provider);
+
+    try {
+      const owner: string = await contract.owner();
+      return ethers.getAddress(owner);
+    } catch (error: any) {
+      this.logger.error(`Failed to read owner() for account ${account}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Derive the authoritative ERC-4337 v0.7 userOpHash for a full UserOperation by
+   * calling `getUserOpHash` on the canonical EntryPoint via the read-only provider.
+   *
+   * This is the binding step of the Fix 2 Stage 1 owner-authorization gate: the
+   * EntryPoint computes the hash from `userOp.sender`, chainId, and the EntryPoint
+   * address itself, so the resulting hash cannot be detached from its account.
+   * A caller therefore cannot pair a signature over their own account's hash with
+   * a victim's UserOperation.
+   */
+  async getUserOpHash(userOp: PackedUserOp): Promise<string> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+
+    const entryPoint = this.configService.get<string>("entryPointAddress");
+    if (!entryPoint) {
+      throw new Error("EntryPoint address not configured");
+    }
+
+    const abi = [
+      "function getUserOpHash((address sender,uint256 nonce,bytes initCode,bytes callData,bytes32 accountGasLimits,uint256 preVerificationGas,bytes32 gasFees,bytes paymasterAndData,bytes signature) userOp) view returns (bytes32)",
+    ];
+    const contract = new ethers.Contract(entryPoint, abi, this.provider);
+
+    try {
+      const hash: string = await contract.getUserOpHash({
+        sender: userOp.sender,
+        nonce: userOp.nonce,
+        initCode: userOp.initCode,
+        callData: userOp.callData,
+        accountGasLimits: userOp.accountGasLimits,
+        preVerificationGas: userOp.preVerificationGas,
+        gasFees: userOp.gasFees,
+        paymasterAndData: userOp.paymasterAndData,
+        signature: userOp.signature,
+      });
+      return hash;
+    } catch (error: any) {
+      this.logger.error(
+        `Failed to derive userOpHash via EntryPoint ${entryPoint}: ${error.message}`
+      );
       throw error;
     }
   }

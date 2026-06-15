@@ -64,15 +64,39 @@ export class SignatureController {
       },
     },
   })
-  @ApiResponse({ status: 400, description: "Invalid input data" })
+  @ApiResponse({ status: 400, description: "Request body is not a JSON object (userOp missing)" })
+  @ApiResponse({
+    status: 403,
+    description:
+      "Owner authorization required — uniform fail-closed. Returned for malformed userOp " +
+      "fields (bad sender / missing fields), getUserOpHash revert, owner read failure, " +
+      "P256/passkey-only account (owner==0x0), and missing/malformed/mismatched ownerAuth",
+  })
   @ApiBody({ type: SignMessageDto })
   @Post("sign")
   async signMessage(@Body(ValidationPipe) signDto: SignMessageDto) {
     this.logger.log(`=== BLS Sign Request ===`);
-    this.logger.log(`Message: ${signDto.message}`);
+    this.logger.log(`userOp.sender: ${signDto.userOp?.sender}`);
 
     try {
-      const result = await this.signatureService.signMessage(signDto.message);
+      // Fix 2 Stage 1: bls.service derives the authoritative userOpHash from the full
+      // UserOperation and rejects with 403 unless ownerAuth is a valid signature by
+      // userOp.sender's on-chain owner over THAT derived hash.
+      const result = await this.signatureService.signMessage(
+        {
+          sender: signDto.userOp.sender,
+          nonce: signDto.userOp.nonce,
+          initCode: signDto.userOp.initCode,
+          callData: signDto.userOp.callData,
+          accountGasLimits: signDto.userOp.accountGasLimits,
+          preVerificationGas: signDto.userOp.preVerificationGas,
+          gasFees: signDto.userOp.gasFees,
+          paymasterAndData: signDto.userOp.paymasterAndData,
+          // signature does not affect v0.7 getUserOpHash; default to 0x.
+          signature: signDto.userOp.signature ?? "0x",
+        },
+        signDto.ownerAuth
+      );
 
       this.logger.log(`✅ Sign Success:`);
       this.logger.log(`  Node ID: ${result.nodeId}`);

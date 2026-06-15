@@ -28,6 +28,10 @@ export default () => {
     ethRpcUrl: process.env.ETH_RPC_URL,
     ethPrivateKey: process.env.ETH_PRIVATE_KEY,
     validatorContractAddress: process.env.VALIDATOR_CONTRACT_ADDRESS,
+    // Canonical ERC-4337 v0.7 EntryPoint (same address across chains). Used to
+    // derive the authoritative userOpHash for the Fix 2 Stage 1 owner-auth gate.
+    entryPointAddress:
+      process.env.ENTRY_POINT_ADDRESS || "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
