@@ -29,6 +29,14 @@ function executeBatchCallData(tos: string[], values: bigint[]): string {
   );
 }
 
+/** Build callData for execute() wrapping an ERC-20 transfer(to, amount) on `token`. */
+function erc20TransferCallData(token: string, to: string, amount: bigint): string {
+  const transferSel = ethers.id("transfer(address,uint256)").slice(0, 10);
+  const innerFunc = transferSel + coder.encode(["address", "uint256"], [to, amount]).slice(2);
+  const exec = ethers.id("execute(address,uint256,bytes)").slice(0, 10);
+  return exec + coder.encode(["address", "uint256", "bytes"], [token, 0n, innerFunc]).slice(2);
+}
+
 function userOpWith(callData: string): PackedUserOp {
   return {
     sender: "0x" + "ab".repeat(20),
@@ -181,6 +189,54 @@ describe("PolicyService — layer 1 (on-chain IPolicyRegistry)", () => {
     expect(seen[0].asset.toLowerCase()).toBe("0x" + "ee".repeat(20));
     expect(seen[0].amount).toBe(777n);
     expect(seen[0].target.toLowerCase()).toBe(RECIPIENT.toLowerCase());
+  });
+
+  it("extracts ERC-20 transfer amount/asset/recipient from inner calldata", async () => {
+    const TOKEN = "0x" + "cc".repeat(20);
+    const seen: any[] = [];
+    const svc = makeService(
+      { policyEnabled: true, policyRegistryAddress: REGISTRY },
+      async (_registry, _sender, target, asset, amount) => {
+        seen.push({ target, asset, amount });
+        return { decision: 1, remainingDaily: 0n };
+      }
+    );
+    // execute(TOKEN, 0, transfer(RECIPIENT, 1_000_000)) — native value is 0.
+    await svc.evaluate(userOpWith(erc20TransferCallData(TOKEN, RECIPIENT, 1_000_000n)));
+    expect(seen[0].asset.toLowerCase()).toBe(TOKEN.toLowerCase()); // asset = the token
+    expect(seen[0].amount).toBe(1_000_000n); // amount from calldata, NOT 0
+    expect(seen[0].target.toLowerCase()).toBe(RECIPIENT.toLowerCase()); // real recipient
+  });
+
+  it("REJECTs an over-limit ERC-20 transfer that amount=0 would have missed", async () => {
+    const TOKEN = "0x" + "cc".repeat(20);
+    const svc = makeService(
+      { policyEnabled: true, policyRegistryAddress: REGISTRY },
+      async (_r, _s, _t, _a, amount) => ({
+        decision: amount > 500_000n ? 2 : 1, // registry rejects over-cap token spend
+        remainingDaily: 0n,
+      })
+    );
+    const d = await svc.evaluate(userOpWith(erc20TransferCallData(TOKEN, RECIPIENT, 1_000_000n)));
+    expect(d.allowed).toBe(false);
+    expect(d.reason).toMatch(/REJECT/);
+  });
+
+  it("fails closed on a malformed ERC-20 transfer payload", async () => {
+    const TOKEN = "0x" + "cc".repeat(20);
+    const exec = ethers.id("execute(address,uint256,bytes)").slice(0, 10);
+    const transferSel = ethers.id("transfer(address,uint256)").slice(0, 10);
+    // transfer selector but truncated args → decode throws → fail-closed
+    const badInner = transferSel + "00";
+    const callData =
+      exec + coder.encode(["address", "uint256", "bytes"], [TOKEN, 0n, badInner]).slice(2);
+    const svc = makeService({ policyEnabled: true, policyRegistryAddress: REGISTRY }, async () => ({
+      decision: 1,
+      remainingDaily: 0n,
+    }));
+    const d = await svc.evaluate(userOpWith(callData));
+    expect(d.allowed).toBe(false);
+    expect(d.reason).toMatch(/undecodable transfer/);
   });
 
   it("layer-2 floor still applies before layer-1 (operator floor wins)", async () => {

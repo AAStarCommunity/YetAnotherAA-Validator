@@ -21,11 +21,12 @@ import { PackedUserOp, BlockchainService } from "../blockchain/blockchain.servic
  *   - Layer 2 (node operator, local): perTxMax + recipient allowlist — the operator's
  *     floor that no on-chain state can override. The hard independence guarantee.
  *
- * v1 layer-1 scope: native-value flows map to (asset = ETH sentinel, amount = value);
- * token/contract calls pass (asset = target, amount = value) + selector, so the
- * registry's per-contract ContractScope applies. ERC20 in-calldata amount extraction
- * is a follow-up. Pending SP final Q4 (ETH sentinel value) / Q5 (governance) — both
- * are configurable constants and do not change the checkPolicy read signature.
+ * layer-1 amount semantics: native-value flows map to (asset = ETH sentinel,
+ * amount = value); ERC-20 transfer/transferFrom map to (asset = token, amount =
+ * the in-calldata amount, target = recipient) so per-asset token limits apply;
+ * other contract calls pass (asset = target, amount = 0) for ContractScope only.
+ * Pending SP final Q4 (ETH sentinel value) / Q5 (governance) — both are
+ * configurable constants and do not change the checkPolicy read signature.
  */
 export interface PolicyDecision {
   allowed: boolean;
@@ -36,7 +37,17 @@ export interface PolicyDecision {
 interface DecodedCall {
   to: string;
   value: bigint;
+  /** Inner call payload (the ERC-20/contract call the account makes). */
+  func: string;
   /** 4-byte selector of the inner call (0x00000000 if none / plain transfer). */
+  selector: string;
+}
+
+/** The policy-relevant view of a call: who/what/how-much actually moves. */
+interface PolicyCall {
+  target: string;
+  asset: string;
+  amount: bigint;
   selector: string;
 }
 
@@ -47,6 +58,12 @@ const REJECT = 2;
 const EXECUTE_SELECTOR = ethers.id("execute(address,uint256,bytes)").slice(0, 10);
 const EXECUTE_BATCH_SELECTOR = ethers.id("executeBatch(address[],uint256[],bytes[])").slice(0, 10);
 const NULL_SELECTOR = "0x00000000";
+
+// ERC-20 value-moving calls — the moved amount lives in the inner calldata, not
+// in execute()'s native `value`. Extracting it is what lets per-asset amount
+// limits apply to token transfers (the common case), not just native ETH.
+const ERC20_TRANSFER = ethers.id("transfer(address,uint256)").slice(0, 10);
+const ERC20_TRANSFER_FROM = ethers.id("transferFrom(address,address,uint256)").slice(0, 10);
 
 const ABI = new ethers.AbiCoder();
 
@@ -127,17 +144,24 @@ export class PolicyService {
     // Layer 1 — per-account on-chain registry (if configured). Fail-closed on revert.
     if (this.registryAddress) {
       for (const [i, call] of calls.entries()) {
-        const isNative = call.value > 0n;
-        const asset = isNative ? this.ethSentinel : call.to;
+        let pc: PolicyCall;
+        try {
+          pc = this.normalizeForPolicy(call);
+        } catch (e: any) {
+          return {
+            allowed: false,
+            reason: `call[${i}] undecodable transfer (fail-closed): ${e?.message ?? e}`,
+          };
+        }
         let decision: number;
         try {
           ({ decision } = await this.blockchainService.checkPolicy(
             this.registryAddress,
             userOp.sender,
-            call.to,
-            asset,
-            call.value,
-            call.selector
+            pc.target,
+            pc.asset,
+            pc.amount,
+            pc.selector
           ));
         } catch (e: any) {
           return {
@@ -174,6 +198,7 @@ export class PolicyService {
         {
           to: dest as string,
           value: value as bigint,
+          func: func as string,
           selector: this.innerSelector(func as string),
         },
       ];
@@ -190,11 +215,58 @@ export class PolicyService {
       return destArr.map((to, i) => ({
         to,
         value: valueArr[i],
+        func: funcArr[i],
         selector: this.innerSelector(funcArr[i]),
       }));
     }
 
     throw new Error(`unsupported callData selector ${selector}`);
+  }
+
+  /**
+   * Reduce a decoded call to what the policy actually cares about: which asset
+   * moves, how much, and to whom. Native ETH's amount is execute()'s `value`;
+   * an ERC-20 transfer's amount lives in the inner calldata (value == 0), so it
+   * must be decoded — otherwise per-asset token limits see amount 0 and never fire
+   * (the gap a compromised owner draining stablecoins would slip through).
+   * Throws on a malformed token payload → caller fails closed.
+   */
+  private normalizeForPolicy(call: DecodedCall): PolicyCall {
+    // Native ETH movement: the value leaving the account is execute()'s `value`.
+    if (call.value > 0n) {
+      return {
+        target: call.to,
+        asset: this.ethSentinel,
+        amount: call.value,
+        selector: call.selector,
+      };
+    }
+    // ERC-20 transfer(to, amount): asset = the token (call.to), amount from calldata.
+    if (call.selector === ERC20_TRANSFER) {
+      const [to, amount] = ABI.decode(["address", "uint256"], "0x" + call.func.slice(10));
+      return {
+        target: to as string,
+        asset: call.to,
+        amount: amount as bigint,
+        selector: call.selector,
+      };
+    }
+    // ERC-20 transferFrom(from, to, amount): value pulled to `to`; asset = the token.
+    if (call.selector === ERC20_TRANSFER_FROM) {
+      const [, to, amount] = ABI.decode(
+        ["address", "address", "uint256"],
+        "0x" + call.func.slice(10)
+      );
+      return {
+        target: to as string,
+        asset: call.to,
+        amount: amount as bigint,
+        selector: call.selector,
+      };
+    }
+    // Generic contract call: no native value, no recognized token transfer.
+    // amount 0 → only the registry's per-contract ContractScope (allow/velocity) applies.
+    return { target: call.to, asset: call.to, amount: 0n, selector: call.selector };
   }
 
   /** 4-byte selector of an inner call payload, or NULL_SELECTOR for a bare transfer. */
