@@ -150,3 +150,18 @@ hash，故 DVT co-sign 路径必须用独立 entry point 传 `userOpHash`。→ 
 PolicyRegistry 的 schema 应**对齐/复用 grant-session 的 scoping 字段模型**，避免重造。→
 ⏳ 待 **airaccount-contract #110**
 确认：每账户「合约 + 资产 + 数额」自定义限额的**实现进展**，以及 PolicyRegistry 能否直接复用 grant-session 原语。
+
+## 11. 部署地址 + 启用（layer-1）
+
+SuperPaymaster 已将 IPolicyRegistry 部署上链（v5.4，PR SuperPaymaster#285）。
+
+| 网络 | PolicyRegistry 地址 |
+| --- | --- |
+| Sepolia | `0x37e4E40e69Fb7d5C3fbAA0F52A4002D27472Ff29` |
+
+**启用 layer-1**：把上面地址填到节点 env `POLICY_REGISTRY_ADDRESS`（+ `POLICY_ENABLED=true`）即可，无需改码。
+`POLICY_ETH_SENTINEL` 默认 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`（与合约一致）。
+
+**端到端实测（已验证）**：对 Sepolia 上述地址调 `checkPolicy(sender,target,ETH哨兵,1000,0x00000000)`
+→ 返回 `decision=0 (ALLOW)`、`remainingDaily=2^256-1`，即未开通账户的 opt-in default-ALLOW，
+ABI/接线与部署合约逐字段一致。
