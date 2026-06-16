@@ -1,9 +1,25 @@
-# YetAnotherAA-Validator
+# aNode DVT 说明 (YetAnotherAA-Validator)
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-A complete BLS signature infrastructure for ERC-4337 account abstraction,
-combining off-chain signature aggregation services with on-chain verification
-smart contracts.
+
+**aNode** = Mycelium DVT 共签节点；本仓库是 aNode 的参考实现（已发布
+**v1.1.0**）—— 一套 ERC-4337
+BLS 签名基础设施：链下签名聚合服务 + 链上验证合约，作为账户的「独立第二因子」防 owner-key 被盗。
+
+### 📘 aNode DVT 运维 & 快速上手
+
+- **运维手册（启动/监控/停止/恢复/报错/修复 + 生产 aNode 启动步骤）** →
+  [`docs/aNode-dvt-operations.md`](docs/aNode-dvt-operations.md)
+- **本地多节点服务（一键）** →
+  `./scripts/e2e/dvt-nodes.sh start|status|info|logs|stop`（见
+  [`scripts/e2e/README.md`](scripts/e2e/README.md)）
+- **DVT 生产化设计** →
+  [`docs/design/dvt-e2e-and-production.md`](docs/design/dvt-e2e-and-production.md)
+- **签名格式规范 / 策略治理** →
+  [`docs/design/dvt-node-protocol.md`](docs/design/dvt-node-protocol.md) ·
+  [`docs/design/dvt-policy-governance.md`](docs/design/dvt-policy-governance.md)
+- **跨仓库协调 hub** →
+  [issue #42](https://github.com/AAStarCommunity/YetAnotherAA-Validator/issues/42)
 
 > **Note**: This package was extracted from the
 > [YetAnotherAA](https://github.com/fanhousanbu/YetAnotherAA) monorepo to serve
