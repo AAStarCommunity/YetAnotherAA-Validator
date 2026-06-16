@@ -4,6 +4,41 @@ All notable changes to YetAnotherAA-Validator (the DVT BLS signer node) are
 documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [1.2.0] — 2026-06-16 — DVT v1 program RELEASED + aNode node service
+
+Marks the cross-repo **DVT v1** milestone: protocol frozen, all four
+implementing repos delivered, real on-chain evidence chain complete, and all
+program issues closed (coordination hub
+[#42](https://github.com/AAStarCommunity/YetAnotherAA-Validator/issues/42)
+closed). This repo (the **aNode** reference node) ships the operational tooling.
+
+### Added
+
+- **aNode node service & ops** — `scripts/e2e/dvt-nodes.sh` one-click
+  `start/status/info/logs/stop` for N running nodes; `gen-nodes.mjs`,
+  `selftest.mjs`, `realnode-e2e.mjs`, `handleops-tx.mjs`.
+- **Real-node E2E proven on Sepolia** — 3 running v1.1.0 nodes co-sign (Stage-1
+  gated) → aggregate → `AAStarBLSAlgorithm.validate = 0 VALID`; negative control
+  = 1. Independently reproduced SDK-side by aastar-sdk #76.
+- **Docs** — `docs/aNode-dvt-operations.md` (operations runbook:
+  start/monitor/stop/ recover/error/fix + production aNode startup);
+  `docs/design/dvt-e2e-and-production.md` (production-readiness design); README
+  retitled **“aNode DVT 说明”** with a Features section.
+
+### Cross-repo (DVT v1, all CLOSED)
+
+- SuperPaymaster #283 (ROLE*DVT + IPolicyRegistry, deployed v5.4.0-beta.1) ·
+  airaccount-contract #110 (on-chain combined-sig validate, full handleOps
+  Tier2/3) · AirAccount #70 (C1 binding vector) · aastar-sdk #63 (SDK assembly +
+  real-node E2E) · Brood #3 (PGL incentive). Shared format byte-aligned: DST
+  `\_POP*`, EIP-2537 encoding, registration-slot bit order, `[nodeIds][blsSig]`
+  wire.
+
+### Production hardening (tracked separately, NOT in v1 scope)
+
+node BLS key → KMS/HSM · M-of-N real operators · public node URLs · #40 Stage 2
+passkey-owner auth · out-of-band confirmation · live slashing · mainnet audit.
+
 ## [1.1.0] — 2026-06-15 — DVT Fix 2 (Stage 1 + Stage 2)
 
 The DVT node-side release of the cross-repo **DVT program** (coordination hub:
