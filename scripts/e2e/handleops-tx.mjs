@@ -53,6 +53,8 @@ const EP_ABI = [
   "function depositTo(address account) payable",
   "function balanceOf(address account) view returns (uint256)",
   "function handleOps((address sender,uint256 nonce,bytes initCode,bytes callData,bytes32 accountGasLimits,uint256 preVerificationGas,bytes32 gasFees,bytes paymasterAndData,bytes signature)[] ops, address beneficiary)",
+  "error FailedOp(uint256 opIndex, string reason)",
+  "error FailedOpWithRevert(uint256 opIndex, string reason, bytes inner)",
 ];
 const acct = new ethers.Contract(ACCOUNT, ACCOUNT_ABI, owner);
 const ep = new ethers.Contract(ENTRY, EP_ABI, owner);
@@ -169,15 +171,12 @@ try {
   await ep.handleOps.staticCall([userOp], owner.address);
   console.log("[simulation] ✅ passes — sending real tx");
 } catch (e) {
+  const data = e.data || e.info?.error?.data || e.error?.data;
   console.log("[simulation] ❌ revert:", e.shortMessage || e.message);
-  if (e.data) {
-    try {
-      console.log("  FailedOp:", ep.interface.parseError(e.data)?.args);
-    } catch {
-      console.log("  raw data:", e.data?.slice(0, 80));
-    }
+  console.log("  raw data:", typeof data === "string" ? data.slice(0, 200) : data);
+  if (typeof data === "string" && data.length >= 10) {
+    try { const p = ep.interface.parseError(data); console.log("  decoded:", p?.name, JSON.stringify(p?.args, (k,v)=>typeof v==="bigint"?v.toString():v)); } catch (err) { console.log("  (undecodable selector", data.slice(0,10) + ")"); }
   }
-  if (e.revert) console.log("  reason:", e.revert.args);
   process.exit(1);
 }
 console.log("[handleOps] submitting...");

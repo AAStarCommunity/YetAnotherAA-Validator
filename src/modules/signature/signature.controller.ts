@@ -1,4 +1,5 @@
-import { Controller, Post, Body, ValidationPipe, Logger } from "@nestjs/common";
+import { Controller, Post, Body, ValidationPipe, Logger, UseGuards } from "@nestjs/common";
+import { ThrottleGuard } from "../../common/throttle.guard.js";
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from "@nestjs/swagger";
 import { SignatureService } from "./signature.service.js";
 import { SignMessageDto } from "../../dto/sign.dto.js";
@@ -33,6 +34,7 @@ export class VerifySignatureDto {
 
 @ApiTags("signature")
 @Controller("signature")
+@UseGuards(ThrottleGuard)
 export class SignatureController {
   private readonly logger = new Logger(SignatureController.name);
 
