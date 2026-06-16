@@ -19,3 +19,5 @@ dist/
 
 # IDE
 .vscode/
+# notification contacts (per-account chat ids / emails — never commit)
+notify-contacts.json

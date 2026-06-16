@@ -48,6 +48,13 @@ export default () => {
     policyEthSentinel:
       process.env.POLICY_ETH_SENTINEL || "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
 
+    // Multi-channel user notification (#52). Opt-in; fire-and-forget (never blocks
+    // signing). Contacts file is git-ignored. threshold 0 = notify every co-sign.
+    notifyEnabled: process.env.NOTIFY_ENABLED === "true",
+    notifyThresholdWei: process.env.NOTIFY_THRESHOLD_WEI || "0",
+    telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || undefined,
+    notifyContactsFile: process.env.NOTIFY_CONTACTS_FILE || undefined,
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),

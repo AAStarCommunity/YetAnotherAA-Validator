@@ -4,9 +4,10 @@ import { SignatureController } from "./signature.controller.js";
 import { BlsModule } from "../bls/bls.module.js";
 import { NodeModule } from "../node/node.module.js";
 import { PolicyModule } from "../policy/policy.module.js";
+import { NotificationModule } from "../notification/notification.module.js";
 
 @Module({
-  imports: [BlsModule, NodeModule, PolicyModule],
+  imports: [BlsModule, NodeModule, PolicyModule, NotificationModule],
   providers: [SignatureService],
   controllers: [SignatureController],
   exports: [SignatureService],
