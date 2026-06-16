@@ -1,0 +1,7 @@
+{
+  "0xYourAccountAddressLowercase": {
+    "telegramChatId": "123456789",
+    "email": "user@example.com",
+    "nostrPubkey": "npub1..."
+  }
+}

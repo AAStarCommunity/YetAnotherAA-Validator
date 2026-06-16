@@ -19,3 +19,14 @@ dist/
 
 # IDE
 .vscode/
+
+# DVT e2e runtime (keys/logs/pids)
+.e2e/
+
+# notification contacts (per-account chat ids / emails — never commit)
+notify-contacts.json
+
+# env / secrets
+.env.sepolia
+.env.*
+.env*.local

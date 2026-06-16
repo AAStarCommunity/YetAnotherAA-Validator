@@ -1,4 +1,5 @@
-import { Controller, Post, Body, ValidationPipe, Logger } from "@nestjs/common";
+import { Controller, Post, Body, ValidationPipe, Logger, UseGuards } from "@nestjs/common";
+import { ThrottleGuard } from "../../common/throttle.guard.js";
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from "@nestjs/swagger";
 import { SignatureService } from "./signature.service.js";
 import { SignMessageDto } from "../../dto/sign.dto.js";
@@ -33,6 +34,7 @@ export class VerifySignatureDto {
 
 @ApiTags("signature")
 @Controller("signature")
+@UseGuards(ThrottleGuard)
 export class SignatureController {
   private readonly logger = new Logger(SignatureController.name);
 
@@ -64,15 +66,44 @@ export class SignatureController {
       },
     },
   })
-  @ApiResponse({ status: 400, description: "Invalid input data" })
+  @ApiResponse({ status: 400, description: "Request body is not a JSON object (userOp missing)" })
+  @ApiResponse({
+    status: 403,
+    description:
+      "Owner authorization required — uniform fail-closed. Returned for malformed userOp " +
+      "fields (bad sender / missing fields), getUserOpHash revert, owner read failure, " +
+      "P256/passkey-only account (owner==0x0), and missing/malformed/mismatched ownerAuth",
+  })
   @ApiBody({ type: SignMessageDto })
   @Post("sign")
   async signMessage(@Body(ValidationPipe) signDto: SignMessageDto) {
     this.logger.log(`=== BLS Sign Request ===`);
-    this.logger.log(`Message: ${signDto.message}`);
+    this.logger.log(`userOp.sender: ${signDto.userOp?.sender}`);
 
     try {
-      const result = await this.signatureService.signMessage(signDto.message);
+      // Fix 2 Stage 1: bls.service derives the authoritative userOpHash from the full
+      // UserOperation and rejects with 403 unless ownerAuth is a valid signature by
+      // userOp.sender's on-chain owner over THAT derived hash.
+      const result = await this.signatureService.signMessage(
+        {
+          sender: signDto.userOp.sender,
+          nonce: signDto.userOp.nonce,
+          initCode: signDto.userOp.initCode,
+          callData: signDto.userOp.callData,
+          accountGasLimits: signDto.userOp.accountGasLimits,
+          preVerificationGas: signDto.userOp.preVerificationGas,
+          gasFees: signDto.userOp.gasFees,
+          paymasterAndData: signDto.userOp.paymasterAndData,
+          // signature does not affect v0.7 getUserOpHash; default to 0x.
+          signature: signDto.userOp.signature ?? "0x",
+        },
+        signDto.ownerAuth
+      );
+
+      if ("status" in result) {
+        this.logger.log(`⏳ Pending out-of-band confirmation: ${result.userOpHash}`);
+        return result;
+      }
 
       this.logger.log(`✅ Sign Success:`);
       this.logger.log(`  Node ID: ${result.nodeId}`);
@@ -88,6 +119,18 @@ export class SignatureController {
       this.logger.error(`❌ Sign Failed: ${error.message}`);
       throw error;
     }
+  }
+
+  @ApiOperation({ summary: "Approve a high-value op pending out-of-band confirmation" })
+  @ApiResponse({ status: 200, description: "Confirmation result { confirmed: boolean }" })
+  @Post("confirm")
+  confirm(@Body() body: { userOpHash?: string; token?: string }) {
+    const ok =
+      typeof body?.userOpHash === "string" &&
+      typeof body?.token === "string" &&
+      this.signatureService.confirm(body.userOpHash, body.token);
+    this.logger.log(`Confirm ${body?.userOpHash}: ${ok ? "accepted" : "rejected"}`);
+    return { confirmed: ok };
   }
 
   @ApiOperation({ summary: "Aggregate multiple BLS signatures" })

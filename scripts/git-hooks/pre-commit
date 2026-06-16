@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Secret-leak guard. Enable: git config core.hooksPath scripts/git-hooks (npm "prepare" does this).
+node "$(git rev-parse --show-toplevel)/scripts/git-hooks/check-secrets.mjs" || exit 1

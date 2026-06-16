@@ -1,13 +1,74 @@
-# YetAnotherAA-Validator
+# aNode DVT 说明 (YetAnotherAA-Validator)
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-A complete BLS signature infrastructure for ERC-4337 account abstraction,
-combining off-chain signature aggregation services with on-chain verification
-smart contracts.
+
+**aNode** = Mycelium DVT 共签节点；本仓库是 aNode 的参考实现（已发布
+**v1.1.0**）—— 一套 ERC-4337
+BLS 签名基础设施：链下签名聚合服务 + 链上验证合约，作为账户的「独立第二因子」防 owner-key 被盗。
+
+### 📘 aNode DVT 运维 & 快速上手
+
+- **运维手册（启动/监控/停止/恢复/报错/修复 + 生产 aNode 启动步骤）** →
+  [`docs/aNode-dvt-operations.md`](docs/aNode-dvt-operations.md)
+- **本地多节点服务（一键）** →
+  `./scripts/e2e/dvt-nodes.sh start|status|info|logs|stop`（见
+  [`scripts/e2e/README.md`](scripts/e2e/README.md)）
+- **DVT 生产化设计** →
+  [`docs/design/dvt-e2e-and-production.md`](docs/design/dvt-e2e-and-production.md)
+- **签名格式规范 / 策略治理** →
+  [`docs/design/dvt-node-protocol.md`](docs/design/dvt-node-protocol.md) ·
+  [`docs/design/dvt-policy-governance.md`](docs/design/dvt-policy-governance.md)
+- **跨仓库协调 hub** →
+  [issue #42](https://github.com/AAStarCommunity/YetAnotherAA-Validator/issues/42)
+
+## 上下游依赖（PINNED）/ Upstream & downstream
+
+本节钉住 aNode 集成的跨仓库依赖。**任一上游升级须先核对对齐再发版**：`node scripts/check-deps.mjs`
+（内置依赖检查 skill：比对各上游最新发布、链上合约存在性与已集成基线）。
+
+| 仓库                                    | 关系                   | 钉定基线                 | 集成点                                                                                                                                                  |
+| --------------------------------------- | ---------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **AAStarCommunity/SuperPaymaster**      | UPSTREAM               | `v5.4.0-beta.1-redeploy` | PolicyRegistry `0x8c2488d46d5447418558c38AA6441720df656094`（2026-06-16 fresh redeploy；layer-1 `checkPolicy`）+ ROLE_DVT 注册 + BLSAggregator          |
+| **AAStarCommunity/airaccount-contract** | 协作（链上验签消费方） | `v0.19.0-beta.2`         | `AAStarBLSAlgorithm` `0x68c381Ad3A2e3380F22840008027E9Ec2783F43A`：`validate(userOpHash, [nodeIds][blsSig])`，DST `_POP_`，messagePoint 链上重算（#45） |
+| **AAStarCommunity/AirAccount (KMS)**    | UPSTREAM               | `v0.23.0`                | `ownerAuth` = 账户 `owner()` 的 EIP-191 secp256k1 签名（KMS 产）；C1 绑定 `challenge=SHA256(nonce‖userOpHash)`                                          |
+
+**下游 /
+Downstream**：[`AAStarCommunity/aastar-sdk` #63](https://github.com/AAStarCommunity/aastar-sdk/issues/63)（运行时组装方）。
+**约定：本仓库每次发版（尤其消费方契约变化时），主动向 aastar-sdk 提 issue 通知更新。**
 
 > **Note**: This package was extracted from the
 > [YetAnotherAA](https://github.com/fanhousanbu/YetAnotherAA) monorepo to serve
 > as a standalone microservice.
+
+## 功能与特性 / Features
+
+aNode 让 ERC-4337 账户多一道**独立的、owner 和 CA 都改不动的第二因子**——owner 私钥被盗也守得住。
+
+- **Stage 1 — owner 授权门**：节点只为携带账户 `owner()`
+  ECDSA 签名（`ownerAuth`，EIP-191）的请求共签，且 `userOpHash` 由节点自己经
+  `EntryPoint.getUserOpHash` 链上派生（不信任调用方传入）。任何失败统一 **403
+  fail-closed**，关闭跨账户预言机洞。
+- **Stage 2 — 独立策略门**（两层 AND，opt-in `POLICY_ENABLED`）：
+  - **Layer 2 节点本地底线**：单笔限额 + 合约/收款人白名单（owner/CA 改不了）。
+  - **Layer 1 链上 PolicyRegistry**：`checkPolicy`
+    按账户限额（per-asset/合约/数额，含 ERC-20 `transfer/transferFrom/approve`
+    金额解码）；仅 `ALLOW/REQUIRE_DVT` 放行，其余 fail-closed。
+- **BLS12-381 门限聚合签名**：`hashToCurve(userOpHash, DST=…_POP_)`，EIP-2537 编码，链上
+  `AAStarBLSAlgorithm.validate` 验证（messagePoint 链上重算，#45 防重放）；wire
+  `[nodeIds][blsSig]`，位序按注册 slot。
+- **节点服务 & 运维工具**：一键
+  `scripts/e2e/dvt-nodes.sh start|status|info|logs|stop`；gossip
+  P2P 节点发现；Swagger `/api`；REST
+  `/signature/sign|aggregate`、`/node/info|register`。
+- **多版本合约**：EntryPoint v0.6/v0.7/v0.8 +
+  CREATE2 确定性账户/工厂（`contracts/`）。
+- **真实链上验证**：real-node
+  E2E 已在 Sepolia 坐实（`AAStarBLSAlgorithm.validate = 0`，负向控制 = 1）。
+
+> 命门：安全增益全来自**独立性**（独立 key
+> / 独立策略 / 独立通道），盲签 = 橡皮图章。详见
+> [`docs/aNode-dvt-operations.md`](docs/aNode-dvt-operations.md) 与
+> [`docs/design/`](docs/design/)。
 
 ## Components
 
