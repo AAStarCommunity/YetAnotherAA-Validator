@@ -34,9 +34,20 @@ documented here. Format loosely follows
 
 ### Dependencies
 
-- Pinned: SuperPaymaster `v5.4.0-beta.1`, airaccount-contract `v0.18.0-beta.2`,
-  AirAccount `v0.23.0`. Re-pinned AirAccount `v0.22.0 → v0.23.0` (Sigsum
-  transparency log; orthogonal to the ownerAuth contract — node unaffected).
+- Pinned: SuperPaymaster `v5.4.0-beta.1` (PolicyRegistry `0x37e4E40e…` unchanged
+  after the 2026-06-16 Sepolia redeploy), airaccount-contract `v0.19.0-beta.2`,
+  AirAccount `v0.23.0`.
+- **Re-pinned airaccount-contract `v0.18.0-beta.2 → v0.19.0-beta.2`**
+  (redeploy): `AAStarBLSAlgorithm`
+  `0xA9EE4f8A… → 0x68c381Ad3A2e3380F22840008027E9Ec2783F43A`. **No Solidity
+  logic change** — verifier/wire identical; the node's on-chain BLS validate was
+  re-verified `= 0` against the new contract. Address-pin update only, no
+  code/signing change.
+- Re-pinned AirAccount `v0.22.0 → v0.23.0` (Sigsum transparency log; orthogonal
+  to the ownerAuth contract — node unaffected).
+- `scripts/check-deps.mjs` upgraded to parse the canonical address from each
+  dependency's release notes (catches a same-tag REDEPLOY, not just version
+  bumps); run via `npm run check-deps`.
 
 ### Notes
 

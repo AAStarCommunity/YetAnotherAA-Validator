@@ -25,7 +25,8 @@
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --passWithNoTests",
     "test:ci": "NODE_OPTIONS=--experimental-vm-modules jest --ci --coverage --maxWorkers=2 --passWithNoTests",
     "type-check": "tsc --noEmit",
-    "prepare": "git config core.hooksPath scripts/git-hooks || true"
+    "prepare": "git config core.hooksPath scripts/git-hooks || true",
+    "check-deps": "node scripts/check-deps.mjs"
   },
   "dependencies": {
     "@nestjs/cli": "^11.0.10",
