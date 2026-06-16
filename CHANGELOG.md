@@ -27,11 +27,11 @@ closed). This repo (the **aNode** reference node) ships the operational tooling.
 
 ### Cross-repo (DVT v1, all CLOSED)
 
-- SuperPaymaster #283 (ROLE*DVT + IPolicyRegistry, deployed v5.4.0-beta.1) ·
+- SuperPaymaster #283 (`ROLE_DVT` + IPolicyRegistry, deployed v5.4.0-beta.1) ·
   airaccount-contract #110 (on-chain combined-sig validate, full handleOps
   Tier2/3) · AirAccount #70 (C1 binding vector) · aastar-sdk #63 (SDK assembly +
   real-node E2E) · Brood #3 (PGL incentive). Shared format byte-aligned: DST
-  `\_POP*`, EIP-2537 encoding, registration-slot bit order, `[nodeIds][blsSig]`
+  `_POP_`, EIP-2537 encoding, registration-slot bit order, `[nodeIds][blsSig]`
   wire.
 
 ### Production hardening (tracked separately, NOT in v1 scope)
