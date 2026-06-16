@@ -21,7 +21,7 @@
    ENTRY_POINT_ADDRESS=0x0000000071727De22E5E9d8BAf0edAc6f37da032   # v0.7 canonical
    PORT=3001
    POLICY_ENABLED=true                 # 生产开策略门（见下）
-   POLICY_REGISTRY_ADDRESS=0x37e4E40e69Fb7d5C3fbAA0F52A4002D27472Ff29  # SP PolicyRegistry (Sepolia)
+   POLICY_REGISTRY_ADDRESS=0x8c2488d46d5447418558c38AA6441720df656094  # SP PolicyRegistry (Sepolia, v5.4.0-beta.1-redeploy 2026-06-16)
    ETH_PRIVATE_KEY=<只在需链上注册/写时配；只签名可不配>
    ```
 3. **构建 + 启动**：`npm ci && npm run build && npm run start:prod`。

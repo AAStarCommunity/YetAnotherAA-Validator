@@ -129,8 +129,8 @@ key、独立策略（本地 layer-2 + 链上 layer-1）、独立通道（节点 
 - **≥门限个运行中的 YetAnotherAA-Validator
   v1.1.0 实例**（独立 key/策略/通道；理想 M-of-N 跨运营方）。
 - **AirAccount KMS/TEE**：产主签 + passkey 授权绑定。
-- **SuperPaymaster**：PolicyRegistry（已部署 Sepolia `0x37e4E40e…`）+
-  BLSAggregator + 授权 consumer。
+- **SuperPaymaster**：PolicyRegistry（已部署 Sepolia
+  `0x8c2488d4…`，v5.4.0-beta.1-redeploy）+ BLSAggregator + 授权 consumer。
 - **aastar-sdk 运行时**：组装 + 提交（待 cut release / npm 发布）。
 - **RPC 端点**（Sepolia/mainnet）+ bundler（SuperRelay 或公共）。
 - **gossip 网络**：节点发现（≥3 节点）。

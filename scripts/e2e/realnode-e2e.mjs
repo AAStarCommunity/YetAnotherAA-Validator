@@ -22,11 +22,12 @@ const env = Object.fromEntries(
 );
 const RPCS = [env.SEPOLIA_RPC_URL].filter(Boolean); // others rotated/dead
 const ENTRY = env.ENTRY_POINT_ADDRESS || env.ENTRYPOINT_ADDRESS;
-// Pinned current AAStarBLSAlgorithm (airaccount-contract v0.19.0-beta.2); env-overridable.
-const BLS_ALG =
-  env.AIRACCOUNT_V019_BLS_ALGORITHM ||
-  env.AIRACCOUNT_BLS_ALGORITHM ||
-  "0x68c381Ad3A2e3380F22840008027E9Ec2783F43A";
+// Pinned current AAStarBLSAlgorithm (airaccount-contract v0.19.0-beta.2). The pinned
+// constant is authoritative; only an EXPLICIT, version-matched override is honored.
+// NB: we deliberately do NOT fall back to the generic `AIRACCOUNT_BLS_ALGORITHM` — that
+// var in older .env files points at a stale contract (a pre-v0.18 deploy) where these
+// test nodes are not registered, which silently makes validate() return 1 (reject).
+const BLS_ALG = env.AIRACCOUNT_V019_BLS_ALGORITHM || "0x68c381Ad3A2e3380F22840008027E9Ec2783F43A";
 const ACCOUNT = process.env.E2E_ACCOUNT || "0x45Dfe3D5938fDf5a8D30641C3FDA9c9fb1F31ba9";
 const owner = new ethers.Wallet(env.PRIVATE_KEY_SUPPLIER);
 const PORTS = [3001, 3002, 3003];

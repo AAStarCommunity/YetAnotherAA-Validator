@@ -155,9 +155,9 @@ PolicyRegistry 的 schema 应**对齐/复用 grant-session 的 scoping 字段模
 
 SuperPaymaster 已将 IPolicyRegistry 部署上链（v5.4，PR SuperPaymaster#285）。
 
-| 网络    | PolicyRegistry 地址                          |
-| ------- | -------------------------------------------- |
-| Sepolia | `0x37e4E40e69Fb7d5C3fbAA0F52A4002D27472Ff29` |
+| 网络    | PolicyRegistry 地址                                                               |
+| ------- | --------------------------------------------------------------------------------- |
+| Sepolia | `0x8c2488d46d5447418558c38AA6441720df656094` (v5.4.0-beta.1-redeploy, 2026-06-16) |
 
 **启用 layer-1**：把上面地址填到节点 env `POLICY_REGISTRY_ADDRESS`（+
 `POLICY_ENABLED=true`）即可，无需改码。 `POLICY_ETH_SENTINEL` 默认

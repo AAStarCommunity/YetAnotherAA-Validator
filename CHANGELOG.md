@@ -34,9 +34,17 @@ documented here. Format loosely follows
 
 ### Dependencies
 
-- Pinned: SuperPaymaster `v5.4.0-beta.1` (PolicyRegistry `0x37e4E40e…` unchanged
-  after the 2026-06-16 Sepolia redeploy), airaccount-contract `v0.19.0-beta.2`,
-  AirAccount `v0.23.0`.
+- Pinned: SuperPaymaster `v5.4.0-beta.1-redeploy`, airaccount-contract
+  `v0.19.0-beta.2`, AirAccount `v0.23.0`.
+- **Re-pinned SuperPaymaster PolicyRegistry (2026-06-16 fresh Sepolia
+  redeploy)**:
+  `0x37e4E40e69Fb7d5C3fbAA0F52A4002D27472Ff29 → 0x8c2488d46d5447418558c38AA6441720df656094`
+  (same bytecode, new address; the whole v5.4 stack — SuperPaymaster proxy,
+  Registry, TimelockController, X402Facilitator — was redeployed under the
+  annotated tag `v5.4.0-beta.1-redeploy`, which ships **no GitHub release**).
+  The node's layer-1 `checkPolicy` read was re-verified against the new registry
+  (`decision=0 ALLOW`). Update `POLICY_REGISTRY_ADDRESS` to the new address when
+  `POLICY_ENABLED=true`.
 - **Re-pinned airaccount-contract `v0.18.0-beta.2 → v0.19.0-beta.2`**
   (redeploy): `AAStarBLSAlgorithm`
   `0xA9EE4f8A… → 0x68c381Ad3A2e3380F22840008027E9Ec2783F43A`. **No Solidity
@@ -45,9 +53,13 @@ documented here. Format loosely follows
   code/signing change.
 - Re-pinned AirAccount `v0.22.0 → v0.23.0` (Sigsum transparency log; orthogonal
   to the ownerAuth contract — node unaffected).
-- `scripts/check-deps.mjs` upgraded to parse the canonical address from each
-  dependency's release notes (catches a same-tag REDEPLOY, not just version
-  bumps); run via `npm run check-deps`.
+- `scripts/check-deps.mjs` upgraded to resolve each dependency's canonical
+  address from its committed **deploy-config JSON on the default branch**
+  (`deployments/config.sepolia.json`), not just GitHub release notes — this is
+  what catches a **doc-less redeploy** shipped under an annotated `*-redeploy`
+  tag with no release (exactly how the PolicyRegistry move above slipped past
+  the old release-only check). It also scans all tags and flags
+  `-redeploy`/variant tags. Run via `npm run check-deps`.
 
 ### Notes
 
