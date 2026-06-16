@@ -55,6 +55,12 @@ export default () => {
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || undefined,
     notifyContactsFile: process.env.NOTIFY_CONTACTS_FILE || undefined,
 
+    // Per-IP rate limiting on signature endpoints (#50 hardening ⑦). Opt-in;
+    // bounds pre-auth on-chain RPC amplification. Default off = behavior unchanged.
+    rateLimitEnabled: process.env.RATE_LIMIT_ENABLED === "true",
+    rateLimitWindowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10),
+    rateLimitMax: parseInt(process.env.RATE_LIMIT_MAX || "30", 10),
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),
