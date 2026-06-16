@@ -4,6 +4,45 @@ All notable changes to YetAnotherAA-Validator (the DVT BLS signer node) are
 documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [1.3.0] — 2026-06-16 — node hardening + dependency pinning
+
+### Added
+
+- **Per-IP rate limiting** on `/signature/*` (#50 ⑦; opt-in
+  `RATE_LIMIT_ENABLED`) — bounds pre-auth on-chain RPC amplification; over-limit
+  → 429.
+- **Multi-channel large-spend notification** (#52; Telegram first; opt-in
+  `NOTIFY_ENABLED`) — after a high-value co-sign, fire-and-forget alerts the
+  user; never blocks/fails signing.
+- **Out-of-band confirmation, scheme A** (#50 ⑤; opt-in `CONFIRM_ENABLED`) — a
+  high-value co-sign is **withheld** until the user approves a one-time token
+  sent over an independent channel;
+  `POST /signature/confirm {userOpHash, token}` releases it. **Fail-closed** if
+  undeliverable. Single-use + TTL. The defense against owner-key compromise.
+- **`scripts/check-deps.mjs`** — built-in upstream/downstream dependency check
+  (release tags + on-chain presence vs the pinned baseline).
+- **Pre-commit secret scanner** (`scripts/git-hooks/`) — blocks committing
+  secret files / credentials; `prepare` sets `core.hooksPath`.
+- README **上下游依赖 (PINNED)** section.
+
+### Changed (consumer-facing)
+
+- `POST /signature/sign` may return
+  `{ status: "pending_confirmation", userOpHash }` instead of a signature when
+  `CONFIRM_ENABLED` + the op is high-value. Consumers (aastar-sdk) must handle
+  this response and the `/signature/confirm` flow.
+
+### Dependencies
+
+- Pinned: SuperPaymaster `v5.4.0-beta.1`, airaccount-contract `v0.18.0-beta.2`,
+  AirAccount `v0.23.0`. Re-pinned AirAccount `v0.22.0 → v0.23.0` (Sigsum
+  transparency log; orthogonal to the ownerAuth contract — node unaffected).
+
+### Notes
+
+- All gates are opt-in (default off → behavior unchanged). Email + Nostr
+  channels deferred to a later version (#52).
+
 ## [1.2.0] — 2026-06-16 — DVT v1 program RELEASED + aNode node service
 
 Marks the cross-repo **DVT v1** milestone: protocol frozen, all four
