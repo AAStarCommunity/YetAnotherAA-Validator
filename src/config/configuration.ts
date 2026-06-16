@@ -55,6 +55,12 @@ export default () => {
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || undefined,
     notifyContactsFile: process.env.NOTIFY_CONTACTS_FILE || undefined,
 
+    // Out-of-band confirmation (scheme A, #50 ⑤). Opt-in; a high-value op is withheld
+    // until the user approves over an independent channel. Fail-closed if undeliverable.
+    confirmEnabled: process.env.CONFIRM_ENABLED === "true",
+    confirmThresholdWei: process.env.CONFIRM_THRESHOLD_WEI || "0",
+    confirmTtlMs: parseInt(process.env.CONFIRM_TTL_MS || "600000", 10),
+
     // Per-IP rate limiting on signature endpoints (#50 hardening ⑦). Opt-in;
     // bounds pre-auth on-chain RPC amplification. Default off = behavior unchanged.
     rateLimitEnabled: process.env.RATE_LIMIT_ENABLED === "true",

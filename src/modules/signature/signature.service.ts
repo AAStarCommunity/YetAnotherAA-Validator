@@ -4,9 +4,17 @@ import { BlsService } from "../bls/bls.service.js";
 import { NodeService } from "../node/node.service.js";
 import { PolicyService } from "../policy/policy.service.js";
 import { NotificationService } from "../notification/notification.service.js";
+import { ConfirmationService } from "../confirmation/confirmation.service.js";
 import { SignatureResult, AggregateSignatureResult } from "../../interfaces/signature.interface.js";
 import { sigs, bls, BLS_DST } from "../../utils/bls.util.js";
 import { PackedUserOp } from "../blockchain/blockchain.service.js";
+
+/** Returned (instead of a signature) when a high-value op awaits out-of-band confirmation. */
+export interface PendingConfirmation {
+  status: "pending_confirmation";
+  userOpHash: string;
+  message: string;
+}
 
 @Injectable()
 export class SignatureService {
@@ -16,10 +24,14 @@ export class SignatureService {
     private readonly blsService: BlsService,
     private readonly nodeService: NodeService,
     private readonly policyService: PolicyService,
-    private readonly notificationService: NotificationService
+    private readonly notificationService: NotificationService,
+    private readonly confirmationService: ConfirmationService
   ) {}
 
-  async signMessage(userOp: PackedUserOp, ownerAuth: string | undefined): Promise<SignatureResult> {
+  async signMessage(
+    userOp: PackedUserOp,
+    ownerAuth: string | undefined
+  ): Promise<SignatureResult | PendingConfirmation> {
     const node = this.nodeService.getNodeForSigning();
 
     // Fix 2 Stage 1 owner-auth gate FIRST: derive the authoritative userOpHash and
@@ -39,13 +51,36 @@ export class SignatureService {
       throw new ForbiddenException("operation rejected by node policy");
     }
 
-    // Sign the SAME already-authorized derived hash (no re-auth, no TOCTOU).
+    // Out-of-band confirmation gate (#50 ⑤ scheme A): a high-value op is withheld until
+    // the user approves over an independent channel — defends against owner-key compromise.
+    const gate = await this.confirmationService.gate(userOp, userOpHash);
+    if (gate === "undeliverable") {
+      this.logger.warn(`Confirmation undeliverable for ${userOp.sender} — refusing high-value op`);
+      throw new ForbiddenException(
+        "high-value operation requires out-of-band confirmation, but no contact channel is configured"
+      );
+    }
+    if (gate === "pending") {
+      this.logger.log(`Awaiting out-of-band confirmation for ${userOpHash}`);
+      return {
+        status: "pending_confirmation",
+        userOpHash,
+        message: "high-value operation pending out-of-band confirmation; approve via your channel",
+      };
+    }
+
+    // gate is "not_required" or "confirmed" → sign the same already-authorized hash.
     const result = await this.blsService.signDerivedHash(userOpHash, node);
 
     // Fire-and-forget large-spend notification (#52). Must never block or fail signing.
     this.notificationService.notifyLargeSpend(userOp, userOpHash);
 
     return result;
+  }
+
+  /** Approve a pending high-value op (out-of-band confirmation, #50 ⑤). */
+  confirm(userOpHash: string, token: string): boolean {
+    return this.confirmationService.confirm(userOpHash, token);
   }
 
   async aggregateExternalSignatures(signatureStrings: string[]): Promise<AggregateSignatureResult> {

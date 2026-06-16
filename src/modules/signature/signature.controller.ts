@@ -100,6 +100,11 @@ export class SignatureController {
         signDto.ownerAuth
       );
 
+      if ("status" in result) {
+        this.logger.log(`⏳ Pending out-of-band confirmation: ${result.userOpHash}`);
+        return result;
+      }
+
       this.logger.log(`✅ Sign Success:`);
       this.logger.log(`  Node ID: ${result.nodeId}`);
       this.logger.log(
@@ -114,6 +119,18 @@ export class SignatureController {
       this.logger.error(`❌ Sign Failed: ${error.message}`);
       throw error;
     }
+  }
+
+  @ApiOperation({ summary: "Approve a high-value op pending out-of-band confirmation" })
+  @ApiResponse({ status: 200, description: "Confirmation result { confirmed: boolean }" })
+  @Post("confirm")
+  confirm(@Body() body: { userOpHash?: string; token?: string }) {
+    const ok =
+      typeof body?.userOpHash === "string" &&
+      typeof body?.token === "string" &&
+      this.signatureService.confirm(body.userOpHash, body.token);
+    this.logger.log(`Confirm ${body?.userOpHash}: ${ok ? "accepted" : "rejected"}`);
+    return { confirmed: ok };
   }
 
   @ApiOperation({ summary: "Aggregate multiple BLS signatures" })
