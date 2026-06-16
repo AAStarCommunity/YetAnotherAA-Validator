@@ -18,4 +18,10 @@ node_modules/
 dist/
 
 # IDE
-.vscode/
+.vscode/.e2e/
+.e2e/
+
+# env / secrets
+.env.sepolia
+.env.*
+.env*.local
