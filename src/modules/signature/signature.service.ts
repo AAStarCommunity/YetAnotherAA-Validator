@@ -3,6 +3,7 @@ import { ethers } from "ethers";
 import { BlsService } from "../bls/bls.service.js";
 import { NodeService } from "../node/node.service.js";
 import { PolicyService } from "../policy/policy.service.js";
+import { NotificationService } from "../notification/notification.service.js";
 import { SignatureResult, AggregateSignatureResult } from "../../interfaces/signature.interface.js";
 import { sigs, bls, BLS_DST } from "../../utils/bls.util.js";
 import { PackedUserOp } from "../blockchain/blockchain.service.js";
@@ -14,7 +15,8 @@ export class SignatureService {
   constructor(
     private readonly blsService: BlsService,
     private readonly nodeService: NodeService,
-    private readonly policyService: PolicyService
+    private readonly policyService: PolicyService,
+    private readonly notificationService: NotificationService
   ) {}
 
   async signMessage(userOp: PackedUserOp, ownerAuth: string | undefined): Promise<SignatureResult> {
@@ -38,7 +40,12 @@ export class SignatureService {
     }
 
     // Sign the SAME already-authorized derived hash (no re-auth, no TOCTOU).
-    return await this.blsService.signDerivedHash(userOpHash, node);
+    const result = await this.blsService.signDerivedHash(userOpHash, node);
+
+    // Fire-and-forget large-spend notification (#52). Must never block or fail signing.
+    this.notificationService.notifyLargeSpend(userOp, userOpHash);
+
+    return result;
   }
 
   async aggregateExternalSignatures(signatureStrings: string[]): Promise<AggregateSignatureResult> {

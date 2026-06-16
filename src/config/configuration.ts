@@ -48,6 +48,13 @@ export default () => {
     policyEthSentinel:
       process.env.POLICY_ETH_SENTINEL || "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
 
+    // Multi-channel user notification (#52). Opt-in; fire-and-forget (never blocks
+    // signing). Contacts file is git-ignored. threshold 0 = notify every co-sign.
+    notifyEnabled: process.env.NOTIFY_ENABLED === "true",
+    notifyThresholdWei: process.env.NOTIFY_THRESHOLD_WEI || "0",
+    telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || undefined,
+    notifyContactsFile: process.env.NOTIFY_CONTACTS_FILE || undefined,
+
     // Per-IP rate limiting on signature endpoints (#50 hardening ⑦). Opt-in;
     // bounds pre-auth on-chain RPC amplification. Default off = behavior unchanged.
     rateLimitEnabled: process.env.RATE_LIMIT_ENABLED === "true",
