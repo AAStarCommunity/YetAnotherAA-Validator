@@ -109,6 +109,23 @@ export class NotificationService {
     }
   }
 
+  /** Whether an account has any registered out-of-band contact (used by confirmation). */
+  hasContact(account: string): boolean {
+    return this.contacts.has((account || "").toLowerCase());
+  }
+
+  /**
+   * Send an arbitrary message to an account's contacts over EVERY channel. Used by the
+   * out-of-band CONFIRMATION flow (which must know delivery succeeded). Returns true if
+   * at least one channel delivered. Awaited (unlike the fire-and-forget notify path).
+   */
+  async sendToAccount(account: string, message: string): Promise<boolean> {
+    const contact = this.contacts.get((account || "").toLowerCase());
+    if (!contact || this.channels.length === 0) return false;
+    const results = await Promise.allSettled(this.channels.map(ch => ch.send(contact, message)));
+    return results.some(r => r.status === "fulfilled");
+  }
+
   /**
    * Decide whether/what to notify. Returns null when disabled, below threshold, or no
    * contact. Pure (no I/O) — the testable core of notifyLargeSpend.
