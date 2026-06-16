@@ -39,10 +39,14 @@ documented here. Format loosely follows
 - **Re-pinned SuperPaymaster PolicyRegistry (2026-06-16 fresh Sepolia
   redeploy)**:
   `0x37e4E40e69Fb7d5C3fbAA0F52A4002D27472Ff29 → 0x8c2488d46d5447418558c38AA6441720df656094`
-  (same bytecode, new address; the whole v5.4 stack — SuperPaymaster proxy,
-  Registry, TimelockController, X402Facilitator — was redeployed under the
-  annotated tag `v5.4.0-beta.1-redeploy`, which ships **no GitHub release**).
-  The node's layer-1 `checkPolicy` read was re-verified against the new registry
+  **identical source/logic** — `PolicyRegistry.sol` is byte-for-byte the same as
+  the integrated `v5.4.0-beta.1`; the deployed bytecode differs only by the
+  `immutable` constructor args (new timelock/guardian/initialConsumer), and the
+  `checkPolicy(address,address,address,uint256,bytes4) → (uint8,uint256)` ABI is
+  unchanged. The whole v5.4 stack — SuperPaymaster proxy, Registry,
+  TimelockController, X402Facilitator — was redeployed under the annotated tag
+  `v5.4.0-beta.1-redeploy`, which ships **no GitHub release**. The node's
+  layer-1 `checkPolicy` read was re-verified against the new registry
   (`decision=0 ALLOW`). Update `POLICY_REGISTRY_ADDRESS` to the new address when
   `POLICY_ENABLED=true`.
 - **Re-pinned airaccount-contract `v0.18.0-beta.2 → v0.19.0-beta.2`**
