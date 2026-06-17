@@ -4,6 +4,7 @@ import { ethers } from "ethers";
 import { randomBytes } from "crypto";
 import { PackedUserOp } from "../blockchain/blockchain.service.js";
 import { NotificationService } from "../notification/notification.service.js";
+import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 
 /** Result of the confirmation gate for a co-sign request. */
 export type GateResult = "not_required" | "confirmed" | "pending" | "undeliverable";
@@ -48,11 +49,18 @@ export class ConfirmationService {
 
   constructor(
     configService: ConfigService,
-    private readonly notificationService: NotificationService
+    private readonly notificationService: NotificationService,
+    capabilityRegistry?: CapabilityRegistry
   ) {
     this.enabled = configService.get<boolean>("confirmEnabled") === true;
     this.thresholdWei = BigInt(configService.get<string>("confirmThresholdWei") ?? "0");
     this.ttlMs = configService.get<number>("confirmTtlMs") ?? 600_000; // 10 min default
+    capabilityRegistry?.register({
+      name: "confirm",
+      class: "infra-app",
+      description: "Out-of-band confirmation gate for high-value ops (#50 ⑤)",
+      enabled: this.enabled,
+    });
     if (this.enabled) {
       this.logger.log(
         `Out-of-band confirmation ENABLED — threshold=${this.thresholdWei} wei, ttl=${this.ttlMs}ms`

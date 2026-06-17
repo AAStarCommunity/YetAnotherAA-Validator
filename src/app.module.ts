@@ -6,10 +6,12 @@ import { BlockchainModule } from "./modules/blockchain/blockchain.module.js";
 import { GossipModule } from "./modules/gossip/gossip.module.js";
 import { DashboardModule } from "./modules/dashboard/dashboard.module.js";
 import { AppConfigModule } from "./config/config.module.js";
+import { CapabilityModule } from "./modules/capability/capability.module.js";
 
 @Module({
   imports: [
-    AppConfigModule, // This must be first to validate env vars on startup
+    AppConfigModule, // must be first — validates env vars on startup
+    CapabilityModule, // global singleton registry; must load before optional modules
     BlsModule,
     NodeModule,
     SignatureModule,
