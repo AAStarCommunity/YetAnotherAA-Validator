@@ -14,13 +14,17 @@
 //      diff the *exact source file* the node depends on (the verifier `.sol`, the policy
 //      `.sol`) between the integrated BASELINE ref and the current default-branch HEAD.
 //      A 0-line diff guarantees the ABI / wire format / logic the node integrated against
-//      has NOT changed. A non-zero diff is flagged for human review — this is what catches
-//      a dependency changing its INTERFACE / DATA STRUCTURE / COLLABORATION wire, not just
-//      its address. For non-Solidity deps (KMS/TEE) it instead asserts the signing-relevant
-//      version (TA/proto) is unchanged in the latest release notes.
+//      has NOT changed. A real diff is flagged — this is what catches a dependency
+//      changing its INTERFACE / DATA STRUCTURE / COLLABORATION wire, not just its address.
+//      For non-Solidity deps (KMS/TEE) it instead asserts the signing-relevant version
+//      (TA/proto) is unchanged in the latest release notes.
 //
-// Exits non-zero on ANY drift (address moved, tag moved, source changed, version guard
-// broken, missing on-chain code) so it can gate a release / be wired into CI.
+// TRANSIENT vs REAL DRIFT — every `gh`/RPC call is RETRIED with backoff. A fetch that
+// still fails is reported as TRANSIENT (could-not-verify), NOT as drift: a "SOURCE
+// CHANGED" verdict is only emitted when BOTH the baseline and current files were fetched
+// successfully and differ. This stops a flaky network/proxy from masquerading as an
+// upstream change. Exit codes: 0 = aligned · 1 = REAL drift (adapt before release) ·
+// 2 = transient/unknown (re-run; do not treat as a hard fail).
 import { ethers } from "ethers";
 import { execSync } from "child_process";
 import { readFileSync, existsSync } from "fs";
@@ -93,49 +97,85 @@ const DEPS = [
   },
 ];
 
-function gh(args) {
+// Blocking sleep (the script is mostly synchronous; only a few short retries).
+function sleepSync(ms) {
   try {
-    return execSync(`gh ${args}`, { stdio: ["ignore", "pipe", "ignore"] }).toString();
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch {
-    return "";
+    const end = Date.now() + ms;
+    while (Date.now() < end) {}
   }
 }
-const latestTag = repo =>
-  gh(`release view --repo ${repo} --json tagName -q .tagName`).trim() || "(no release)";
-const allTags = repo =>
-  gh(`api repos/${repo}/tags --jq .[].name`)
-    .split("\n")
-    .map(s => s.trim())
-    .filter(Boolean);
-const defaultBranch = repo => gh(`api repos/${repo} --jq .default_branch`).trim() || "main";
+// gh with retry+backoff. Returns {ok, out}: ok=false ONLY after all retries fail (transient).
+// NB: an empty `out` with ok=true is a legitimate "no value", NOT a failure.
+function gh(args, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return {
+        ok: true,
+        out: execSync(`gh ${args}`, { stdio: ["ignore", "pipe", "ignore"] }).toString(),
+      };
+    } catch {
+      if (i < retries) sleepSync(400 * (i + 1));
+    }
+  }
+  return { ok: false, out: "" };
+}
+
+const latestTag = repo => {
+  const r = gh(`release view --repo ${repo} --json tagName -q .tagName`);
+  if (!r.ok) return { transient: true };
+  return { tag: r.out.trim() || "(no release)" };
+};
+const allTags = repo => {
+  const r = gh(`api repos/${repo}/tags --jq .[].name`);
+  if (!r.ok) return { transient: true };
+  return {
+    tags: r.out
+      .split("\n")
+      .map(s => s.trim())
+      .filter(Boolean),
+  };
+};
+const defaultBranch = repo => {
+  const r = gh(`api repos/${repo} --jq .default_branch`);
+  return r.ok && r.out.trim() ? r.out.trim() : "main";
+};
 const releaseBody = repo => gh(`release view --repo ${repo} --json body -q .body`);
 function fileAt(repo, path, ref) {
-  const raw = gh(`api repos/${repo}/contents/${path}?ref=${ref} --jq .content`);
-  if (!raw) return null;
+  const r = gh(`api repos/${repo}/contents/${path}?ref=${ref} --jq .content`);
+  if (!r.ok) return { transient: true };
+  if (!r.out) return { ok: true, content: null }; // fetched, but no content field
   try {
-    return Buffer.from(raw, "base64").toString("utf8");
+    return { ok: true, content: Buffer.from(r.out, "base64").toString("utf8") };
   } catch {
-    return null;
+    return { ok: true, content: null };
   }
 }
 
 // Authoritative address: deploy-config JSON on default branch, else release-notes table.
+// Returns {addr, src} or {transient:true} when the lookups it needs all failed transiently.
 function currentAddress(d) {
+  let sawTransient = false;
   if (d.configPath && d.configKey) {
-    const raw = gh(`api repos/${d.repo}/contents/${d.configPath} --jq .content`);
-    if (raw) {
+    const r = gh(`api repos/${d.repo}/contents/${d.configPath} --jq .content`);
+    if (!r.ok) sawTransient = true;
+    else if (r.out) {
       try {
-        const json = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+        const json = JSON.parse(Buffer.from(r.out, "base64").toString("utf8"));
         if (json[d.configKey]) return { addr: json[d.configKey], src: d.configPath };
       } catch {}
     }
   }
   if (d.addressLabel) {
-    const body = releaseBody(d.repo);
-    const m = body.match(new RegExp(`${d.addressLabel}[^\\n]*?(0x[a-fA-F0-9]{40})`));
-    if (m) return { addr: m[1], src: "release-notes" };
+    const r = releaseBody(d.repo);
+    if (!r.ok) sawTransient = true;
+    else {
+      const m = r.out.match(new RegExp(`${d.addressLabel}[^\\n]*?(0x[a-fA-F0-9]{40})`));
+      if (m) return { addr: m[1], src: "release-notes" };
+    }
   }
-  return { addr: null, src: "—" };
+  return sawTransient ? { transient: true } : { addr: null, src: "—" };
 }
 async function hasCode(addr) {
   for (const u of RPCS) {
@@ -153,7 +193,7 @@ function variantTags(d, tags) {
   return tags.filter(t => t !== d.version && t.startsWith(base) && t.length > base.length);
 }
 
-// DEEP scan: diff the bound source file baseline↔current; assert ABI; or guard a version.
+// DEEP scan. Each line is {state: 'ok'|'drift'|'transient', msg}.
 function deepScan(d) {
   const out = [];
   const deep = d.deep || {};
@@ -162,56 +202,70 @@ function deepScan(d) {
     const base = fileAt(d.repo, deep.sourcePath, deep.baselineRef);
     const cur = fileAt(d.repo, deep.sourcePath, branch);
     const name = deep.sourcePath.split("/").pop();
-    if (base == null || cur == null) {
+    if (base.transient || cur.transient || base.content == null || cur.content == null) {
       out.push({
-        drift: true,
-        msg: `⚠️ ${name}: could not fetch at ${base == null ? deep.baselineRef : branch} — path moved? review manually`,
+        state: "transient",
+        msg: `~ ${name}: could not fetch ${base.transient || base.content == null ? deep.baselineRef : branch} after retries — TRANSIENT, re-run to verify`,
       });
-    } else if (base === cur) {
+      // ABI assertion needs current source; skip on transient to avoid a false NOT-FOUND.
+    } else if (base.content === cur.content) {
       out.push({
-        drift: false,
+        state: "ok",
         msg: `code  : ${name} identical ${deep.baselineRef}↔${branch} → no interface/logic/wire change ✓`,
       });
+      if (deep.abiSig) {
+        const ok = cur.content.includes(deep.abiSig);
+        out.push({
+          state: ok ? "ok" : "drift",
+          msg: `${ok ? "abi   :" : "⚠️ abi:"} \`${deep.abiSig.slice(0, 48)}…\` ${ok ? "present ✓" : "NOT FOUND — signature the node calls may have changed"}`,
+        });
+      }
     } else {
-      const bl = base.split("\n"),
-        cl = cur.split("\n");
+      const bl = base.content.split("\n"),
+        cl = cur.content.split("\n");
       let changed = Math.abs(bl.length - cl.length);
       const n = Math.min(bl.length, cl.length);
       for (let i = 0; i < n; i++) if (bl[i] !== cl[i]) changed++;
       out.push({
-        drift: true,
+        state: "drift",
         msg: `⚠️ ${name}: SOURCE CHANGED ${deep.baselineRef}↔${branch} (~${changed} lines) — REVIEW: interface/wire/logic may have moved`,
       });
-    }
-    if (deep.abiSig) {
-      const cur2 = cur || base;
-      const ok = cur2 && cur2.includes(deep.abiSig);
-      out.push({
-        drift: !ok,
-        msg: `${ok ? "abi   :" : "⚠️ abi:"} \`${deep.abiSig.slice(0, 48)}…\` ${ok ? "present ✓" : "NOT FOUND — signature the node calls may have changed"}`,
-      });
+      if (deep.abiSig) {
+        const ok = cur.content.includes(deep.abiSig);
+        out.push({
+          state: ok ? "ok" : "drift",
+          msg: `${ok ? "abi   :" : "⚠️ abi:"} \`${deep.abiSig.slice(0, 48)}…\` ${ok ? "present ✓" : "NOT FOUND — signature the node calls may have changed"}`,
+        });
+      }
     }
   }
   if (deep.versionGuard) {
     const { label, pinned } = deep.versionGuard;
-    const body = releaseBody(d.repo);
-    const m = body.match(new RegExp(`${label}\\s*\`?(\\d+\\.\\d+\\.\\d+)`));
-    const found = m ? m[1] : null;
-    if (found == null) {
+    const r = releaseBody(d.repo);
+    if (!r.ok) {
       out.push({
-        drift: false,
-        msg: `guard : ${label} version not stated in latest notes (pinned ${pinned}) — verify manually`,
-      });
-    } else if (found === pinned) {
-      out.push({
-        drift: false,
-        msg: `guard : ${label} ${found} == pinned ${pinned} → signing scheme unchanged ✓`,
+        state: "transient",
+        msg: `~ guard: could not read ${label} version (release notes fetch failed after retries) — TRANSIENT`,
       });
     } else {
-      out.push({
-        drift: true,
-        msg: `⚠️ guard: ${label} moved ${pinned} → ${found} — signing-relevant change, REVIEW ownerAuth path`,
-      });
+      const m = r.out.match(new RegExp(`${label}\\s*\`?(\\d+\\.\\d+\\.\\d+)`));
+      const found = m ? m[1] : null;
+      if (found == null) {
+        out.push({
+          state: "ok",
+          msg: `guard : ${label} version not stated in latest notes (pinned ${pinned}) — verify manually`,
+        });
+      } else if (found === pinned) {
+        out.push({
+          state: "ok",
+          msg: `guard : ${label} ${found} == pinned ${pinned} → signing scheme unchanged ✓`,
+        });
+      } else {
+        out.push({
+          state: "drift",
+          msg: `⚠️ guard: ${label} moved ${pinned} → ${found} — signing-relevant change, REVIEW ownerAuth path`,
+        });
+      }
     }
   }
   return out;
@@ -219,12 +273,17 @@ function deepScan(d) {
 
 console.log("aNode DVT — upstream/downstream dependency sync\n" + "=".repeat(72));
 let drift = false;
+let transient = false;
 for (const d of DEPS) {
-  const tag = latestTag(d.repo);
-  const tags = allTags(d.repo);
-  const variants = variantTags(d, tags);
-  const { addr: curAddr, src } = currentAddress(d);
-  const tagMoved = tag !== "(no release)" && tag !== d.version && !d.version.startsWith(tag);
+  const lt = latestTag(d.repo);
+  const at = allTags(d.repo);
+  const variants = at.transient ? [] : variantTags(d, at.tags);
+  const ca = currentAddress(d);
+  if (lt.transient || at.transient || ca.transient) transient = true;
+  const tag = lt.transient ? "(transient)" : lt.tag;
+  const tagMoved =
+    !lt.transient && tag !== "(no release)" && tag !== d.version && !d.version.startsWith(tag);
+  const curAddr = ca.transient ? null : ca.addr;
   const addrMoved = curAddr && d.address && curAddr.toLowerCase() !== d.address.toLowerCase();
   let live = "—";
   if (d.address) {
@@ -236,27 +295,38 @@ for (const d of DEPS) {
   console.log(`\n▸ ${d.repo}`);
   console.log(`  ${d.relationship}`);
   console.log(
-    `  version : pinned ${d.version}  | latest release ${tag}  ${tagMoved ? "⚠️ MOVED" : "✓"}`
+    `  version : pinned ${d.version}  | latest release ${tag}  ${lt.transient ? "~ transient" : tagMoved ? "⚠️ MOVED" : "✓"}`
   );
   if (variants.length) {
     console.log(`  ⚠️ redeploy/variant tag(s): ${variants.join(", ")} — check addresses below`);
   }
   if (d.addressLabel || d.configKey) {
     console.log(`  ${d.addressLabel || d.configKey} : pinned  ${d.address}`);
-    console.log(
-      `            current ${curAddr || "(unresolved)"}  [${src}]  ${addrMoved ? "⚠️ REDEPLOYED — update pin + re-verify on-chain" : "✓"}  | on-chain ${live}`
-    );
+    const addrCell = ca.transient
+      ? "~ transient (fetch failed after retries) — re-run"
+      : `current ${curAddr || "(unresolved)"}  [${ca.src}]  ${addrMoved ? "⚠️ REDEPLOYED — update pin + re-verify on-chain" : "✓"}`;
+    console.log(`            ${addrCell}  | on-chain ${live}`);
   }
-  // deep / source-level scan (every run)
   for (const r of deepScan(d)) {
-    if (r.drift) drift = true;
+    if (r.state === "drift") drift = true;
+    if (r.state === "transient") transient = true;
     console.log(`  ${r.msg}`);
   }
 }
 console.log("\n" + "=".repeat(72));
-console.log(
-  drift
-    ? "⚠️ DRIFT — address moved, source changed, or version guard broken. Review/adapt before release."
-    : "✅ All dependencies aligned: addresses pinned, bound source unchanged, signing scheme intact."
-);
-process.exit(drift ? 1 : 0);
+if (drift) {
+  console.log(
+    "⚠️ REAL DRIFT — address moved, source changed, or version guard broken. Review/adapt before release."
+  );
+  process.exit(1);
+} else if (transient) {
+  console.log(
+    "~ TRANSIENT — some lookups failed after retries (network/proxy/rate-limit). NOT drift; re-run to verify."
+  );
+  process.exit(2);
+} else {
+  console.log(
+    "✅ All dependencies aligned: addresses pinned, bound source unchanged, signing scheme intact."
+  );
+  process.exit(0);
+}

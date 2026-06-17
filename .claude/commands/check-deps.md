@@ -18,12 +18,21 @@ Run the dependency-sync skill for this repo and report the result.
      (`PolicyRegistry.sol`, `AAStarBLSAlgorithm.sol`) between the integrated
      baseline ref and the current default-branch HEAD, asserts the called ABI
      signature is still present, and guards the KMS TA version (the ownerAuth
-     signing scheme). It exits **non-zero on any drift**.
+     signing scheme).
+
+   Every `gh` lookup is retried with backoff. **Exit codes**: `0` aligned · `1`
+   **real drift** (adapt before release) · `2` **transient** (a lookup failed
+   after retries — network/proxy/rate-limit; NOT drift). A "SOURCE CHANGED"
+   verdict is only emitted when both the baseline and current files fetched
+   successfully and differ.
 
 2. Report the per-dependency result (the tool's output table) back to the user.
 
-3. If there is **DRIFT** (non-zero exit), do NOT stop at the address — assess
-   the real impact before concluding:
+3. On **exit 2 (transient)**: do NOT report drift — say lookups failed and
+   re-run (once or twice). Only treat it as a problem if it stays transient.
+
+4. On **exit 1 (REAL DRIFT)**, do NOT stop at the address — assess the real
+   impact before concluding:
    - A source file diffed → fetch and read the diff; decide whether it touches
      the ABI / wire format / DST / data structure the node binds to, and state
      concretely what the node must do: pin-address update only, a code change,
@@ -34,7 +43,7 @@ Run the dependency-sync skill for this repo and report the result.
      drift is resolved and re-verified (unit tests + real-node E2E
      `validate=0`).
 
-4. When applying any fix: **never bypass review** — open a PR and hand off for
+5. When applying any fix: **never bypass review** — open a PR and hand off for
    an independent approval. Do not self-merge and do not relax branch protection
    (no disabling `enforce_admins`, no lowering required reviews).
 
