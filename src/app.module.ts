@@ -7,6 +7,7 @@ import { GossipModule } from "./modules/gossip/gossip.module.js";
 import { DashboardModule } from "./modules/dashboard/dashboard.module.js";
 import { AppConfigModule } from "./config/config.module.js";
 import { CapabilityModule } from "./modules/capability/capability.module.js";
+import { KeeperModule } from "./modules/keeper/keeper.module.js";
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { CapabilityModule } from "./modules/capability/capability.module.js";
     BlockchainModule,
     GossipModule,
     DashboardModule,
+    KeeperModule,
   ],
 })
 export class AppModule {}
