@@ -4,12 +4,16 @@ import { bls, sigs, BLS_DST, encodeG2Point } from "../../utils/bls.util.js";
 import { SignatureResult } from "../../interfaces/signature.interface.js";
 import { NodeKeyPair } from "../../interfaces/node.interface.js";
 import { BlockchainService, PackedUserOp } from "../blockchain/blockchain.service.js";
+import { SignerService } from "../signer/signer.service.js";
 
 @Injectable()
 export class BlsService {
   private readonly logger = new Logger(BlsService.name);
 
-  constructor(private readonly blockchainService: BlockchainService) {}
+  constructor(
+    private readonly blockchainService: BlockchainService,
+    private readonly signerService: SignerService
+  ) {}
 
   /**
    * Fix 2 Stage 1 — owner-authorization gate.
@@ -146,9 +150,11 @@ export class BlsService {
       DST: BLS_DST,
     });
 
-    const privateKeyBytes = this.hexToBytes(node.privateKey.substring(2));
-    const publicKey = sigs.getPublicKey(privateKeyBytes);
-    const signature = await sigs.sign(messagePoint as any, privateKeyBytes);
+    // Key custody behind the pluggable BlsSigner port (default = local key). The signing
+    // algorithm/wire is unchanged (conformance-bound); only WHERE the key lives is abstracted.
+    const signer = this.signerService.forNode(node);
+    const publicKey = await signer.getPublicKey();
+    const signature = await signer.sign(messagePoint as any);
 
     // Return both compact and EIP-2537 formats
     return {

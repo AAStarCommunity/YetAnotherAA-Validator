@@ -67,6 +67,11 @@ export default () => {
     rateLimitWindowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10),
     rateLimitMax: parseInt(process.env.RATE_LIMIT_MAX || "30", 10),
 
+    // BLS key-custody backend (#50; arch #67). "local" (default) = in-process key from
+    // node_state.json. Future: "kms"/"hsm" via a BLS-capable HSM. Signing output is
+    // backend-independent (algorithm/wire is the fixed kernel — see conformance/).
+    signerBackend: process.env.SIGNER_BACKEND || "local",
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),
