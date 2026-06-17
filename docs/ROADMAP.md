@@ -74,7 +74,9 @@ conformance 基线。
 
 - **BLS 私钥 → KMS/HSM 可插拔 signer**(借 [#62] 的 AWS KMS / Cloudflare
   Secrets 调研)— 安全底线。
-- **Email + Nostr 通知通道**(补齐独立通道)。
+- **Telegram
+  bot 通知到指定已注册账户**:用户把自己的 Telegram 账户注册/绑定到节点,大额共签等事件经 bot 私信发到**该指定账户**(per-account 绑定,非全局频道)。**Email
+  / Nostr 通道延后**(后续版本)。
 - **常驻 Price Keeper Phase 1**([#58]):节点 24/7,顺带兜底链上价格新鲜。
 - **协议 spec + OpenAPI 升为唯一真相源** + `conformance/`
   向量正式纳入 CI([#63])。
