@@ -367,4 +367,55 @@ export class BlockchainService {
       throw error;
     }
   }
+
+  // ── Price Keeper (Phase 1, #58) ────────────────────────────────────────────
+
+  /**
+   * Read SuperPaymaster's cached-price freshness info.
+   * ABI confirmed against SuperPaymaster v5.4.x `getCachedPriceInfo()` + `priceStalenessThreshold()`.
+   */
+  async getPriceInfo(
+    paymasterAddress: string
+  ): Promise<{ updatedAt: bigint; threshold: bigint }> {
+    const abi = [
+      "function getCachedPriceInfo() view returns (uint256 price, uint256 updatedAt)",
+      "function priceStalenessThreshold() view returns (uint256)",
+    ];
+    const contract = new ethers.Contract(paymasterAddress, abi, this.provider);
+    const [, updatedAt] = await contract.getCachedPriceInfo();
+    const threshold = await contract.priceStalenessThreshold();
+    return { updatedAt: BigInt(updatedAt), threshold: BigInt(threshold) };
+  }
+
+  /** Read Chainlink AggregatorV3 `latestRoundData().updatedAt` (unix seconds). */
+  async getChainlinkUpdatedAt(feedAddress: string): Promise<bigint> {
+    const abi = [
+      "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
+    ];
+    const contract = new ethers.Contract(feedAddress, abi, this.provider);
+    const [, , , updatedAt] = await contract.latestRoundData();
+    return BigInt(updatedAt);
+  }
+
+  /** Current network base-fee in gwei (0 on chains without EIP-1559). */
+  async getBaseFeeGwei(): Promise<bigint> {
+    const block = await this.provider.getBlock("latest");
+    const baseFee = block?.baseFeePerGas ?? 0n;
+    return BigInt(baseFee) / 1_000_000_000n;
+  }
+
+  /**
+   * Call SuperPaymaster.updatePrice() — pushes a fresh Chainlink price on-chain.
+   * Requires a wallet (ETH_PRIVATE_KEY or KEEPER_PRIVATE_KEY).
+   * Returns the transaction hash.
+   */
+  async updatePrice(paymasterAddress: string): Promise<string> {
+    if (!this.wallet) {
+      throw new Error("Keeper: no wallet configured — set ETH_PRIVATE_KEY or KEEPER_PRIVATE_KEY");
+    }
+    const abi = ["function updatePrice() external"];
+    const contract = new ethers.Contract(paymasterAddress, abi, this.wallet);
+    const tx: ethers.TransactionResponse = await contract.updatePrice();
+    return tx.hash;
+  }
 }

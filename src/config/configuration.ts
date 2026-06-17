@@ -72,6 +72,19 @@ export default () => {
     // backend-independent (algorithm/wire is the fixed kernel — see conformance/).
     signerBackend: process.env.SIGNER_BACKEND || "local",
 
+    // Price Keeper (#58). Opt-in; keeps SuperPaymaster cachedPrice permanently fresh via
+    // on-chain updatePrice() calls when approaching the staleness threshold. Requires
+    // ETH_PRIVATE_KEY (or a dedicated KEEPER_PRIVATE_KEY in a future phase). Default off.
+    // KEEPER_CHAINLINK_FEED defaults to the canonical Sepolia ETH/USD feed.
+    keeperEnabled: process.env.KEEPER_ENABLED === "true",
+    keeperIntervalMs: parseInt(process.env.KEEPER_INTERVAL_MS || "60000", 10),
+    keeperRefreshBufferS: process.env.KEEPER_REFRESH_BUFFER_S || "300",
+    keeperMaxUpdatesPerDay: parseInt(process.env.KEEPER_MAX_UPDATES_PER_DAY || "48", 10),
+    keeperMaxBaseFeeGwei: process.env.KEEPER_MAX_BASE_FEE_GWEI || "50",
+    keeperPaymasterAddress: process.env.KEEPER_PAYMASTER_ADDRESS || "",
+    keeperChainlinkFeed:
+      process.env.KEEPER_CHAINLINK_FEED || "0x694AA1769357215DE4FAC081bf1f309aDC325306",
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),
