@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { existsSync, readFileSync } from "fs";
 import { PackedUserOp } from "../blockchain/blockchain.service.js";
+import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 
 /** Per-account contact targets (loaded from a git-ignored file, never committed). */
 export interface Contact {
@@ -57,10 +58,17 @@ export class NotificationService {
     configService: ConfigService,
     /** Test seam: inject channels/contacts; production builds them from config. */
     channels?: NotificationChannel[],
-    contacts?: Map<string, Contact>
+    contacts?: Map<string, Contact>,
+    capabilityRegistry?: CapabilityRegistry
   ) {
     this.enabled = configService.get<boolean>("notifyEnabled") === true;
     this.thresholdWei = BigInt(configService.get<string>("notifyThresholdWei") ?? "0");
+    capabilityRegistry?.register({
+      name: "notify",
+      class: "infra-app",
+      description: "Large-spend Telegram notification, fire-and-forget (#52)",
+      enabled: this.enabled,
+    });
 
     if (channels) {
       this.channels = channels;
