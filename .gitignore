@@ -20,6 +20,9 @@ dist/
 # IDE
 .vscode/
 
+# CodeGraph local index (per-machine, rebuilt via `codegraph init -i`)
+.codegraph/
+
 # DVT e2e runtime (keys/logs/pids)
 .e2e/
 
