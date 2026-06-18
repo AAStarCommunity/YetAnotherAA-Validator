@@ -49,6 +49,56 @@
 
 > 想看每条对应的技术参数（合约字段、env 配置项），见下文第 7 节的深度分析。
 
+### 这张表怎么来的：逐条代码追溯（我读了哪些 / 没读哪些）
+
+下面给出每条"保险"的**判断依据（核心代码 file:line）**、**核心路径**、以及它**实现在节点
+本仓库还是上游合约**。`路径` 一律从 `SignatureService.signMessage` 起。
+
+1. **每种币的"单笔上限"** — 上游合约 (Layer1)
+   - 依据：`PolicyRegistry.sol` `checkPolicy` 的 `if (amount > ap.perTxHardCap) return REJECT`（ASSET 维度）。
+   - 节点侧：`policy.service.ts` `normalizeForPolicy` 把每个 call 解成 `(asset, amount)`，`evaluate` 调 `blockchainService.checkPolicy(sender, contract, asset, amount, selector)`（`blockchain.service.ts` `checkPolicy`）。
+   - 路径：`signMessage → policyService.evaluate → normalizeForPolicy → blockchain.checkPolicy → 链上 ap.perTxHardCap`。
+
+2. **每种币的"每日上限"** — 上游合约 (Layer1)
+   - 依据：`PolicyRegistry.sol` `checkPolicy` 的 `dailyLimit + windowSeconds` 窗口判断（`projected > ap.dailyLimit → REJECT`，返回 `remainingDaily`）；写侧 `recordSpend`（`onlyAuthorizedConsumer`）推进计数。
+   - 路径：同上；额度计数由授权 consumer（DVT/paymaster）回写。
+
+3. **只能转给信任的地址** — 双层
+   - 节点 Layer2：`policy.service.ts` `evaluate` 里对 `recipientAllowlist` 检查 **被调合约 + 解出的真实收款人两者**；配置 `POLICY_RECIPIENT_ALLOWLIST`（`configuration.ts`）。
+   - 合约 Layer1：`PolicyRegistry.sol` `checkPolicy` 的 `ContractScope.allowed` + `_selectorAllowed[sender][target][selector]`。
+
+4. **大额要你本人再点头** — 节点本仓库
+   - 依据：`confirmation.service.ts` `gate()`；触发条件 `nativeValue(userOp) >= thresholdWei`；配置 `CONFIRM_ENABLED/THRESHOLD_WEI/TTL_MS`。
+   - 路径：`signMessage → confirmationService.gate → not_required / pending / undeliverable / confirmed`。
+   - ⚠️ **诚实标注**：`nativeValue` **只解 `execute()` 的原生 ETH value**（非 `execute` / 代币转账 → 返回 0 → 不触发此门）。即**这道确认门只按原生 ETH 金额触发**；代币大额由策略门的 per-token 限额（第 1/2 条）来管，不走这道确认。
+
+5. **大额必须多方共同签** — 合约标记 + 链上验签（**强制点未完全核到，最弱的一条**）
+   - 标记依据：`PolicyRegistry.sol` `checkPolicy` 的 `dvtTriggerAmount`（`amount ≥ 触发 → REQUIRE_DVT`）与 `ContractScope.requireDVTAlways`。
+   - 最终强制：`contracts/src/AAStarValidator.sol` `validateAggregateSignature` 验聚合签名。
+   - ⚠️ **诚实标注**：该 validator **只要求 `nodeIds.length > 0` + pairing 通过，我没在其中看到硬编码的 k-of-n 最小签名数阈值**。"到底要凑几个节点"取决于**账户 `validateUserOp` / 协调器的配置**，这部分我**未完整追踪**。所以"必须多方"目前我只能确认到"合约会标记 REQUIRE_DVT + validator 验聚合"，**最小节点数的强制点尚未核实**。
+
+6. **被盗时一键冻结** — 上游合约 (Layer1)
+   - 依据：`PolicyRegistry.sol` `checkPolicy` 首条 `if (_frozen[sender]) return REJECT`（最高优先级）；`freezeSender`（`onlyGuardianOrTimelock`，即时）。
+
+7. **放宽规则有"冷静期"** — 上游合约治理
+   - 依据：放宽类 `setAssetPolicy / setContractScope / unfreezeSender` 是 `onlyTimelock`（OZ TimelockController，`minDelay = 2 days`）；收紧/冻结类 `tightenAssetPolicy / tightenContractScope / freezeSender` 是 `onlyGuardianOrTimelock`（即时）；`timelock` 地址 `immutable`。
+
+8. **节点自己核账，不被忽悠** — 节点本仓库
+   - 依据：`bls.service.ts` `authorizeAndDeriveHash` 内：`getUserOpHash` 自算哈希、`getAccountOwner` 自读 owner、`ethers.verifyMessage(getBytes(userOpHash), ownerAuth)` 自验；`policy.service.ts` `decodeCalls / normalizeForPolicy` 自解金额与收款人。
+   - 路径：`signMessage → authorizeAndDeriveHash`（一切结论由节点从链上 / calldata 重算）。
+
+9. **日常小额照常用** — 双层
+   - 节点：`policy.service.ts` `evaluate` 在 `!enabled` 时直接 `{allowed: true}`。
+   - 合约：`PolicyRegistry.sol` `checkPolicy` 的 **opt-in 默认 ALLOW**——未配置的维度不约束，`remainingDaily = type(uint256).max`。
+
+**覆盖说明（我实际读了什么）：**
+- ✅ 完整读过（节点本仓库）：`signature.service.ts`(`signMessage`)、`bls.service.ts`(`authorizeAndDeriveHash`)、`policy.service.ts`(`evaluate` / `decodeCalls` / `normalizeForPolicy` 全部分支含 transfer/transferFrom/approve/native/generic / 常量 / allowlist)、`blockchain.service.ts`(`checkPolicy` / `getUserOpHash` / `getAccountOwner`)、`confirmation.service.ts`(`gate` / `nativeValue` / `confirm`)、`configuration.ts`(相关键)、`sign.dto.ts`。
+- ✅ 读过（上游合约）：`PolicyRegistry.sol` 的 `checkPolicy` 全体 + 治理 modifier + `recordSpend / setAssetPolicy / tighten* / freezeSender` 签名。`AssetPolicy / ContractScope` 字段由"使用处 + setter 入参"确认；**未单独打开 `IPolicyRegistry` 接口看 struct 定义体**。
+- ⚠️ **未完整读 / 待核**：`contracts/src/AAStarValidator.sol` 只扫了 `validateAggregateSignature` 头部，**未逐行读 pairing / 聚合实现**；**账户合约 `validateUserOp` 中"需要多少个节点签名"的阈值未追踪**（直接影响第 5 条）；`notification.service.ts` `notifyLargeSpend` 未读（不在表内，是 fire-and-forget 通知）。
+
+> 一句话：第 1–4、6–9 条都已落到具体代码 file:line；**第 5 条（最小节点数强制）是目前唯一
+> 尚未核实到强制点的**，需要再读 `AAStarValidator` 的聚合实现与账户 `validateUserOp` 的阈值。
+
 ---
 
 ## 2. 在交易生命周期中的角色
@@ -257,35 +307,34 @@ selector / 速率 / 强制 DVT）的细粒度策略 + 冻结开关。**
 1. **callData 解码面有限**：只解 `execute` / `executeBatch`。非标准账户调用面（自定义
    multicall、其它 ABI）→ **fail-closed 拒签**（安全，但可能误伤合法操作）。
 
-2. **只解一层调用**：能解出 `execute(token, 0, transfer(to, amt))` 的真实收款人；但若
-   目标是一个**路由 / 代理合约**（DEX router、bridge、自定义合约），策略只看到"直接目标"，
-   **看不穿合约内部把钱最终转去哪**。`execute(DEXrouter, 0, swap(...))` 这类——只要 router
-   在白名单，恶意 router 仍可能挪走资金。**approve→swap / bridge 类攻击是真实盲区。**
+2. **只解一层调用 + 泛化合约调用看不出金额**：`normalizeForPolicy` 能把
+   `transfer` / `transferFrom` / `approve` / 原生转账解出真实 `(asset, amount, recipient)`
+   （含 approve 的授权额度，见 `policy.service.ts` `ERC20_APPROVE` 分支 / Codex F7），但
+   对**泛化合约调用**（`execute(DEXrouter, 0, swap(...))` 等）解不出内部金额 → `amount = 0`，
+   只剩 **CONTRACT-SCOPE 维度（目标白名单 / selector / 速率 / requireDVT）** 兜底。也就是说：
+   只要那个 router / bridge 在白名单内，**策略看不穿它内部把钱最终转去哪**——多跳 / 代理 /
+   swap 类的资金流是真实盲区，要靠"只把可信合约加白名单 + 对它设速率 / requireDVT"来缓解。
 
-3. **`approve` 的"授权额度"看不见**：节点的 `normalizeForPolicy` 只把 `transfer` /
-   `transferFrom` 解成 `amount`；`approve(attacker, max)` 不在其中 → 节点传给 registry 的
-   `amount` 不是授权额度。所以 **ASSET 维度的 `perTxHardCap` / `dailyLimit` 卡不到 approve
-   的额度大小**。但 registry 的 **CONTRACT-SCOPE 维度仍能管控 approve**：通过 selector 白名单
-   （不放行 `approve` selector 即 REJECT）或 `requireDVTAlways`。**结论：approve 能否被挡取决
-   于 registry 的 selector / target 规则，而非金额阈值**——配置时务必显式处理 approve selector。
+   > 注：approve 不是盲区——它的授权额度会被解出并按 ASSET 维度（`perTxHardCap` /
+   > `dailyLimit` / `dvtTriggerAmount`）和 Layer2 白名单（按 spender）一起管控。
 
-4. **本地 Layer2 是"粗底线"，不是代币金额关**：`POLICY_PER_TX_MAX_WEI` 只卡**原生 ETH**，
+3. **本地 Layer2 是"粗底线"，不是代币金额关**：`POLICY_PER_TX_MAX_WEI` 只卡**原生 ETH**，
    这是设计取舍（本地 env 只做最粗的运营兜底）。**代币的单笔顶 / 日额度由 Layer1 的
    `AssetPolicy`（`perTxHardCap` / `dailyLimit`）完整承担**——见 7.1(A)，对任意 token 都能配。
    因此这不是"漏洞"，而是分工：**要管代币金额，就配 Layer1 registry**。真正的注意点是下一条——
    **没配 registry 的账户在 Layer1 是 unrestricted（opt-in 默认 ALLOW）**，此时只剩本地白名单/
    原生上限兜底，务必为高价值账户在链上配齐 `AssetPolicy` / `ContractScope`。
 
-5. **依赖聚合阈值与节点独立性**：DVT 的"拒签即可阻断"只有在**链上 validator 要求足够多
+4. **依赖聚合阈值与节点独立性**：DVT 的"拒签即可阻断"只有在**链上 validator 要求足够多
    节点签名**、且**各节点由独立运营方、独立执行诚实策略**时才成立。若阈值是 k-of-n 且攻击者
    控制了 k 个节点 / 让多数节点用同一份被篡改的配置，则可绕过。**去中心化程度 = 安全上限。**
 
-6. **节点主机安全**：Layer2 策略是 env 配置，攻陷节点主机 = 可改 env / 关策略。Layer1
+5. **节点主机安全**：Layer2 策略是 env 配置，攻陷节点主机 = 可改 env / 关策略。Layer1
    在链上，篡改门槛更高。**Layer2 的强度受限于主机安全；高价值场景应以 Layer1 为准。**
 
-7. **不防 owner 在策略内作恶 / 误操作**：策略只划边界，边界内的转账 DVT 照签（设计如此）。
+6. **不防 owner 在策略内作恶 / 误操作**：策略只划边界，边界内的转账 DVT 照签（设计如此）。
 
-8. **不覆盖 gas / paymaster 维度**：策略看 callData 的 value/recipient，不看 gas 字段；
+7. **不覆盖 gas / paymaster 维度**：策略看 callData 的 value/recipient，不看 gas 字段；
    gas griefing / paymaster 滥用不在本门射程内。
 
 > 设计取向：**凡是看不清的，一律 fail-closed 拒签**（解码失败、registry revert、未知
