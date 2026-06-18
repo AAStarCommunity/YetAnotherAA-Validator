@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import { KeeperService } from "./keeper.service.js";
 
 const PAYMASTER = "0x" + "12".repeat(20);
@@ -86,9 +87,16 @@ describe("KeeperService", () => {
     // nowS=1100 → age=100 → timeUntilStale=3500 > 300 → skip
     const blockchain = makeBlockchain({
       getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
-      updatePrice: async () => { throw new Error("should not be called"); },
+      updatePrice: async () => {
+        throw new Error("should not be called");
+      },
     });
-    const svc = new KeeperService(makeBlockchain(blockchain as any), makeNotify(), makeConfig(), clockAt(1_100_000));
+    const svc = new KeeperService(
+      makeBlockchain(blockchain as any),
+      makeNotify(),
+      makeConfig(),
+      clockAt(1_100_000)
+    );
     await svc.tick();
     // no throw → update was NOT called
   });
@@ -97,7 +105,10 @@ describe("KeeperService", () => {
     const updatePriceCalled: boolean[] = [];
     const blockchain = makeBlockchain({
       getChainlinkUpdatedAt: async () => 999n, // ≤ updatedAt=1000 → skip
-      updatePrice: async () => { updatePriceCalled.push(true); return "0x"; },
+      updatePrice: async () => {
+        updatePriceCalled.push(true);
+        return "0x";
+      },
     });
     const svc = new KeeperService(blockchain, makeNotify(), makeConfig(), NOW_NEAR_EXPIRY);
     await svc.tick();
@@ -108,7 +119,10 @@ describe("KeeperService", () => {
     const updatePriceCalled: boolean[] = [];
     const blockchain = makeBlockchain({
       getBaseFeeGwei: async () => 100n, // > maxBaseFeeGwei=50
-      updatePrice: async () => { updatePriceCalled.push(true); return "0x"; },
+      updatePrice: async () => {
+        updatePriceCalled.push(true);
+        return "0x";
+      },
     });
     const svc = new KeeperService(blockchain, makeNotify(), makeConfig(), NOW_NEAR_EXPIRY);
     await svc.tick();
@@ -118,7 +132,10 @@ describe("KeeperService", () => {
   it("tick: calls updatePrice when all conditions met", async () => {
     const updatePriceCalled: string[] = [];
     const blockchain = makeBlockchain({
-      updatePrice: async () => { updatePriceCalled.push("called"); return "0xTXHASH"; },
+      updatePrice: async () => {
+        updatePriceCalled.push("called");
+        return "0xTXHASH";
+      },
     });
     const svc = new KeeperService(blockchain, makeNotify(), makeConfig(), NOW_NEAR_EXPIRY);
     await svc.tick();
@@ -128,7 +145,10 @@ describe("KeeperService", () => {
   it("tick: skips when daily cap reached", async () => {
     const updatePriceCalled: boolean[] = [];
     const blockchain = makeBlockchain({
-      updatePrice: async () => { updatePriceCalled.push(true); return "0x"; },
+      updatePrice: async () => {
+        updatePriceCalled.push(true);
+        return "0x";
+      },
     });
     const svc = new KeeperService(
       blockchain,
@@ -148,7 +168,9 @@ describe("KeeperService", () => {
   it("tick: does not throw when updatePrice fails — sends notification", async () => {
     const notify = makeNotify();
     const blockchain = makeBlockchain({
-      updatePrice: async () => { throw new Error("reverted"); },
+      updatePrice: async () => {
+        throw new Error("reverted");
+      },
     });
     const svc = new KeeperService(blockchain, notify, makeConfig(), NOW_NEAR_EXPIRY);
     await expect(svc.tick()).resolves.toBeUndefined(); // must not throw
@@ -160,7 +182,10 @@ describe("KeeperService", () => {
   it("tick: daily counter resets on a new day", async () => {
     const updatePriceCalled: boolean[] = [];
     const blockchain = makeBlockchain({
-      updatePrice: async () => { updatePriceCalled.push(true); return "0x"; },
+      updatePrice: async () => {
+        updatePriceCalled.push(true);
+        return "0x";
+      },
     });
     // Day 0: t=4_350_000 (near expiry, day 0 = floor(4350000/86400000)=0)
     let now = 4_350_000;
@@ -180,11 +205,68 @@ describe("KeeperService", () => {
     expect(updatePriceCalled).toHaveLength(2);
   });
 
-  it("onApplicationShutdown clears the timer", () => {
+  it("onApplicationShutdown clears the startup timer scheduled at bootstrap", () => {
     const svc = new KeeperService(makeBlockchain(), makeNotify(), makeConfig(), clockAt(0));
     svc.onApplicationBootstrap();
-    expect((svc as any).timer).not.toBeNull();
-    svc.onApplicationShutdown();
+    // First tick is phase-jittered via setTimeout, so the interval timer is not
+    // armed yet — the startup timer holds the pending first tick.
+    expect((svc as any).startupTimer).not.toBeNull();
     expect((svc as any).timer).toBeNull();
+    svc.onApplicationShutdown();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((svc as any).timer).toBeNull();
+  });
+
+  it("computeJitterMs: phase offset stays within [0, intervalMs)", () => {
+    const mk = (rand: number) =>
+      new KeeperService(
+        makeBlockchain(),
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        clockAt(0),
+        undefined,
+        () => rand
+      );
+    expect(mk(0).computeJitterMs()).toBe(0);
+    expect(mk(0.5).computeJitterMs()).toBe(30_000);
+    // random() is in [0,1); the offset must never reach the full interval.
+    expect(mk(0.999999).computeJitterMs()).toBeLessThan(60_000);
+    expect(mk(0.999999).computeJitterMs()).toBeGreaterThanOrEqual(0);
+  });
+
+  it("jitter: first tick fires after the offset, then the interval is armed", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0x";
+        },
+      });
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        undefined,
+        () => 0.5 // jitter = 30_000ms
+      );
+      svc.onApplicationBootstrap();
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      // advanceTimersByTimeAsync flushes the awaited microtasks in tick()
+      // between timer callbacks, so the full async chain settles.
+      await jest.advanceTimersByTimeAsync(30_000);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).startupTimer).toBeNull();
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+      expect((svc as any).timer).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

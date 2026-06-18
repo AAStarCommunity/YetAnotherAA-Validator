@@ -18,9 +18,13 @@ import { CapabilityRegistry } from "../capability/capability-registry.service.js
  *   - KEEPER_MAX_UPDATES_PER_DAY: daily cap, resets at UTC midnight (default 48)
  *   - KEEPER_MAX_BASE_FEE_GWEI: skip if network baseFee too high (default 50 gwei)
  *
- * Multi-node dedup: rely on the on-chain gas-saving strategy (only update near
- * expiry) — two nodes rarely hit the same update window simultaneously. Phase 2
- * may add jitter or leader election if needed.
+ * Multi-node redundancy (3-5 keepers per chain for failover): each keeper is
+ * idempotent — it checks the on-chain price first and skips if still fresh, so
+ * once any keeper updates, the rest see a fresh price and skip. To stop several
+ * keepers that boot together from hitting the same staleness window in the same
+ * tick and firing duplicate updatePrice() txs, the first tick is phase-jittered
+ * across [0, intervalMs). A coordination registry / lease is deferred until the
+ * duplicate-tx rate actually warrants it.
  *
  * Phase 2 adds CEX price failover when Chainlink is stale/unresponsive.
  */
@@ -35,7 +39,9 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
   private readonly paymasterAddress: string;
   private readonly chainlinkFeed: string;
   private readonly clock: () => number;
+  private readonly random: () => number;
 
+  private startupTimer: ReturnType<typeof setTimeout> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private updatesToday = 0;
   private lastDayNumber = 0;
@@ -46,7 +52,9 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
     private readonly config: ConfigService,
     /** Test seam: controls `Date.now()` so time-based logic is deterministic. */
     clock?: () => number,
-    capabilityRegistry?: CapabilityRegistry
+    capabilityRegistry?: CapabilityRegistry,
+    /** Test seam: controls the startup phase jitter (default Math.random). */
+    random?: () => number
   ) {
     this.enabled = config.get<boolean>("keeperEnabled") === true;
     this.intervalMs = config.get<number>("keeperIntervalMs") ?? 60_000;
@@ -56,6 +64,7 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
     this.paymasterAddress = config.get<string>("keeperPaymasterAddress") ?? "";
     this.chainlinkFeed = config.get<string>("keeperChainlinkFeed") ?? "";
     this.clock = clock ?? (() => Date.now());
+    this.random = random ?? (() => Math.random());
 
     capabilityRegistry?.register({
       name: "keeper",
@@ -68,25 +77,44 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
   onApplicationBootstrap(): void {
     if (!this.enabled) return;
     if (!this.paymasterAddress) {
-      this.logger.warn("Keeper: KEEPER_ENABLED=true but KEEPER_PAYMASTER_ADDRESS not set — disabled");
+      this.logger.warn(
+        "Keeper: KEEPER_ENABLED=true but KEEPER_PAYMASTER_ADDRESS not set — disabled"
+      );
       return;
     }
     this.lastDayNumber = this.todayNumber();
-    this.timer = setInterval(
-      () => void this.tick().catch(e => this.logger.error(`Keeper tick error: ${String(e)}`)),
-      this.intervalMs
-    );
+    // Phase-jitter the first tick across [0, intervalMs) so redundant keepers
+    // that boot together don't all fire updatePrice() in the same window.
+    const jitterMs = this.computeJitterMs();
+    this.startupTimer = setTimeout(() => {
+      this.startupTimer = null;
+      void this.tick().catch(e => this.logger.error(`Keeper tick error: ${String(e)}`));
+      this.timer = setInterval(
+        () => void this.tick().catch(e => this.logger.error(`Keeper tick error: ${String(e)}`)),
+        this.intervalMs
+      );
+    }, jitterMs);
     this.logger.log(
-      `Price Keeper ENABLED — interval=${this.intervalMs}ms paymaster=${this.paymasterAddress} ` +
-        `buffer=${this.refreshBufferS}s cap=${this.maxUpdatesPerDay}/day maxBaseFee=${this.maxBaseFeeGwei}gwei`
+      `Price Keeper ENABLED — interval=${this.intervalMs}ms jitter=${jitterMs}ms ` +
+        `paymaster=${this.paymasterAddress} buffer=${this.refreshBufferS}s ` +
+        `cap=${this.maxUpdatesPerDay}/day maxBaseFee=${this.maxBaseFeeGwei}gwei`
     );
   }
 
   onApplicationShutdown(): void {
+    if (this.startupTimer !== null) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = null;
+    }
     if (this.timer !== null) {
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  /** Startup phase offset in [0, intervalMs). Visible for testing. */
+  computeJitterMs(): number {
+    return Math.floor(this.random() * this.intervalMs);
   }
 
   /**
