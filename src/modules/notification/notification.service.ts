@@ -56,7 +56,11 @@ export class NotificationService {
 
   constructor(
     configService: ConfigService,
-    /** Test seam: inject channels/contacts; production builds them from config. */
+    /**
+     * Test seam: inject channels/contacts; production builds them from config.
+     * @Optional() is REQUIRED — without it NestJS DI tries to resolve the Array/Map
+     * param types as providers and the app fails to boot (UnknownDependenciesException).
+     */
     @Optional() channels?: NotificationChannel[],
     @Optional() contacts?: Map<string, Contact>,
     @Optional() capabilityRegistry?: CapabilityRegistry
