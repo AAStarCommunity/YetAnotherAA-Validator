@@ -32,6 +32,14 @@ describe("SignerService / LocalKeySigner (BLS key-custody port)", () => {
     expect(sig.mp).toEqual({ point: true });
   });
 
+  it("LocalKeySigner rejects malformed private keys (fail-fast, not silent bad key)", () => {
+    expect(() => new LocalKeySigner("0x" + "11".repeat(31))).toThrow(/32 bytes/); // too short (31)
+    expect(() => new LocalKeySigner("0x" + "11".repeat(33))).toThrow(/32 bytes/); // too long (33)
+    expect(() => new LocalKeySigner("0x" + "0".repeat(63))).toThrow(/32 bytes/); // odd length
+    expect(() => new LocalKeySigner("0x" + "zz".repeat(32))).toThrow(/32 bytes/); // non-hex
+    expect(() => new LocalKeySigner(node.privateKey)).not.toThrow(); // valid 32-byte key
+  });
+
   it("forNode returns a local signer by default", () => {
     const svc = new SignerService({ get: () => undefined } as any);
     const signer = svc.forNode(node);
