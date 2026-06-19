@@ -1,4 +1,10 @@
-import { Injectable, Logger, OnApplicationBootstrap, OnApplicationShutdown } from "@nestjs/common";
+import {
+  Injectable,
+  Logger,
+  Optional,
+  OnApplicationBootstrap,
+  OnApplicationShutdown,
+} from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { NotificationService } from "../notification/notification.service.js";
@@ -51,10 +57,10 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
     private readonly notificationService: NotificationService,
     private readonly config: ConfigService,
     /** Test seam: controls `Date.now()` so time-based logic is deterministic. */
-    clock?: () => number,
-    capabilityRegistry?: CapabilityRegistry,
+    @Optional() clock?: () => number,
+    @Optional() capabilityRegistry?: CapabilityRegistry,
     /** Test seam: controls the startup phase jitter (default Math.random). */
-    random?: () => number
+    @Optional() random?: () => number
   ) {
     this.enabled = config.get<boolean>("keeperEnabled") === true;
     this.intervalMs = config.get<number>("keeperIntervalMs") ?? 60_000;

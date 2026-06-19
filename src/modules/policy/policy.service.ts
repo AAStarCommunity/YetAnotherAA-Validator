@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { PackedUserOp, BlockchainService } from "../blockchain/blockchain.service.js";
@@ -99,7 +99,7 @@ export class PolicyService {
   constructor(
     private readonly configService: ConfigService,
     private readonly blockchainService: BlockchainService,
-    capabilityRegistry?: CapabilityRegistry
+    @Optional() capabilityRegistry?: CapabilityRegistry
   ) {
     this.enabled = this.configService.get<boolean>("policyEnabled") === true;
     capabilityRegistry?.register({

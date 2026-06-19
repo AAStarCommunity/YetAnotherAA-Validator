@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { randomBytes } from "crypto";
@@ -50,7 +50,7 @@ export class ConfirmationService {
   constructor(
     configService: ConfigService,
     private readonly notificationService: NotificationService,
-    capabilityRegistry?: CapabilityRegistry
+    @Optional() capabilityRegistry?: CapabilityRegistry
   ) {
     this.enabled = configService.get<boolean>("confirmEnabled") === true;
     this.thresholdWei = BigInt(configService.get<string>("confirmThresholdWei") ?? "0");

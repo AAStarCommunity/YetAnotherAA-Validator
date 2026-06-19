@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { existsSync, readFileSync } from "fs";
@@ -57,9 +57,9 @@ export class NotificationService {
   constructor(
     configService: ConfigService,
     /** Test seam: inject channels/contacts; production builds them from config. */
-    channels?: NotificationChannel[],
-    contacts?: Map<string, Contact>,
-    capabilityRegistry?: CapabilityRegistry
+    @Optional() channels?: NotificationChannel[],
+    @Optional() contacts?: Map<string, Contact>,
+    @Optional() capabilityRegistry?: CapabilityRegistry
   ) {
     this.enabled = configService.get<boolean>("notifyEnabled") === true;
     this.thresholdWei = BigInt(configService.get<string>("notifyThresholdWei") ?? "0");
