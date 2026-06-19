@@ -1,4 +1,4 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { existsSync, readFileSync } from "fs";
@@ -55,9 +55,13 @@ export class NotificationService {
 
   constructor(
     configService: ConfigService,
-    /** Test seam: inject channels/contacts; production builds them from config. */
-    channels?: NotificationChannel[],
-    contacts?: Map<string, Contact>
+    /**
+     * Test seam: inject channels/contacts; production builds them from config.
+     * @Optional() is REQUIRED — without it NestJS DI tries to resolve the Array/Map
+     * param types as providers and the app fails to boot (UnknownDependenciesException).
+     */
+    @Optional() channels?: NotificationChannel[],
+    @Optional() contacts?: Map<string, Contact>
   ) {
     this.enabled = configService.get<boolean>("notifyEnabled") === true;
     this.thresholdWei = BigInt(configService.get<string>("notifyThresholdWei") ?? "0");
