@@ -1,7 +1,8 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { PackedUserOp, BlockchainService } from "../blockchain/blockchain.service.js";
+import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 
 /**
  * Fix 2 Stage 2 — DVT node INDEPENDENT policy gate (owner-compromise protection).
@@ -97,9 +98,16 @@ export class PolicyService {
 
   constructor(
     private readonly configService: ConfigService,
-    private readonly blockchainService: BlockchainService
+    private readonly blockchainService: BlockchainService,
+    @Optional() capabilityRegistry?: CapabilityRegistry
   ) {
     this.enabled = this.configService.get<boolean>("policyEnabled") === true;
+    capabilityRegistry?.register({
+      name: "policy",
+      class: "infra-core",
+      description: "DVT independent signing policy gate (Fix 2 Stage 2, #40)",
+      enabled: this.enabled,
+    });
     const max = this.configService.get<string>("policyPerTxMaxWei");
     this.perTxMaxWei = max ? BigInt(max) : null;
     const allow = this.configService.get<string[]>("policyRecipientAllowlist") ?? [];
