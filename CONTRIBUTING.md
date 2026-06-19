@@ -1,7 +1,9 @@
 # Contributing Guide
 
-> Part of [Mycelium Protocol](https://github.com/AAStarCommunity/Brood) ecosystem.  
-> Full contribution guide & CLA text: [protocol/CONTRIBUTING.md](https://github.com/AAStarCommunity/Brood/blob/main/protocol/CONTRIBUTING.md)
+> Part of [Mycelium Protocol](https://github.com/AAStarCommunity/Brood)
+> ecosystem.  
+> Full contribution guide & CLA text:
+> [protocol/CONTRIBUTING.md](https://github.com/AAStarCommunity/Brood/blob/main/protocol/CONTRIBUTING.md)
 
 ---
 
@@ -17,13 +19,17 @@
 
 ## 签署 CLA
 
-本项目要求所有贡献者签署 **CLA（贡献者许可协议）**，以确保项目对所有贡献代码有清晰的法律授权。
+本项目要求所有贡献者签署
+**CLA（贡献者许可协议）**，以确保项目对所有贡献代码有清晰的法律授权。
 
-> **CLA 是什么**：你签一次的声明："我提交的代码是我的原创（或我有权提交），授权本项目在 Apache 2.0 下使用。"  
+> **CLA 是什么**：你签一次的声明："我提交的代码是我的原创（或我有权提交），授权本项目在 Apache
+> 2.0 下使用。"  
 > **为什么需要**：没有明确授权，项目分发你的代码存在法律漏洞。  
 > **怎么签**：提交 PR 后，`@cla-assistant` 机器人自动评论并引导你签名，只需 1 分钟，永久有效，只签一次。
 
-完整 CLA 协议文本：[CLA.md](https://github.com/AAStarCommunity/Brood/blob/main/protocol/CLA.md) | [中文参考译本](https://github.com/AAStarCommunity/Brood/blob/main/protocol/CLA-zh.md)
+完整 CLA 协议文本：[CLA.md](https://github.com/AAStarCommunity/Brood/blob/main/protocol/CLA.md)
+|
+[中文参考译本](https://github.com/AAStarCommunity/Brood/blob/main/protocol/CLA-zh.md)
 
 ---
 
@@ -40,4 +46,6 @@ Fork → 新建分支 → 写代码 → 提交 PR → 签 CLA → Review → Mer
 ## License
 
 Contributions are licensed under [Apache License 2.0](LICENSE).  
-See [NOTICE](./NOTICE) · [TRADEMARK.md](./TRADEMARK.md) · [LICENSE-zh.md](./LICENSE-zh.md) · [TRADEMARK-zh.md](./TRADEMARK-zh.md) for details.
+See [NOTICE](./NOTICE) · [TRADEMARK.md](./TRADEMARK.md) ·
+[LICENSE-zh.md](./LICENSE-zh.md) · [TRADEMARK-zh.md](./TRADEMARK-zh.md) for
+details.
