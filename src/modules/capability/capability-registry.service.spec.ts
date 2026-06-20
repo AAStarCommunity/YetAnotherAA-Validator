@@ -12,7 +12,12 @@ describe("CapabilityRegistry", () => {
   });
 
   it("registers and lists a capability", () => {
-    registry.register({ name: "policy", class: "infra-core", description: "DVT policy gate", enabled: true });
+    registry.register({
+      name: "policy",
+      class: "infra-core",
+      description: "DVT policy gate",
+      enabled: true,
+    });
     const list = registry.list();
     expect(list).toHaveLength(1);
     expect(list[0].name).toBe("policy");
@@ -20,12 +25,22 @@ describe("CapabilityRegistry", () => {
   });
 
   it("isEnabled returns true for an enabled capability", () => {
-    registry.register({ name: "notify", class: "infra-app", description: "notifications", enabled: true });
+    registry.register({
+      name: "notify",
+      class: "infra-app",
+      description: "notifications",
+      enabled: true,
+    });
     expect(registry.isEnabled("notify")).toBe(true);
   });
 
   it("isEnabled returns false for a disabled capability", () => {
-    registry.register({ name: "confirm", class: "infra-app", description: "OOB confirm", enabled: false });
+    registry.register({
+      name: "confirm",
+      class: "infra-app",
+      description: "OOB confirm",
+      enabled: false,
+    });
     expect(registry.isEnabled("confirm")).toBe(false);
   });
 
