@@ -107,15 +107,16 @@
 - 发布需登记的节点集合（建议 ≥3 独立实例）全部
   `isRegistered=true`，`getRegisteredNodeCount` 匹配。
 
-### 2.4 其他疑虑（清单）
+### 2.4 账户与依赖（已定，见 §8）
 
-- 🔴
-  **ECDSA 回退风险**：参考账户 V6/V7/V8（`AAStarAccountBase`）有 owner-ECDSA 独签回退，owner 私钥持有者可绕过 DVT（见
-  `DVT_VALUE.md` §4/§7.5）。**testnet
-  E2E 必须明确用"强制 BLS 路径"的账户，或在 release notes 标注此限制**。
-- 协调器 /
-  Bundler：testnet 上由谁运行？（SuperRelay？公共 bundler？需确定，见 §3）
-- viem 迁移（#88）：是否在此版本前完成？建议**之后**单独里程碑，不阻塞 testnet 发布。
+- ✅
+  **账户：用强制 BLS 的正式账户（无 ECDSA 回退）**。testnet 按主网级标准来，只是用测试网的测试 owner。
+  **不使用本 repo 的 demo 账户 V6/V7/V8**（它们有 owner-ECDSA 独签回退，owner 私钥可绕过 DVT）。→
+  **落地依赖**：testnet E2E 绑定的账户必须是走 BLS
+  validator、禁用 owner 单签的正式账户合约（AirAccount 生产账户）。**发布前需确认该正式账户合约地址/版本**（airaccount-contract 侧），并验证"owner 单签无法绕过 DVT"。
+- ✅ **Bundler：用 Pimlico / Alchemy 的 bundler RPC**（`eth_sendUserOperation`
+  等），不自建。
+- ✅ **viem 迁移（#88）**：排在 testnet 发布**之后**，不阻塞本发布。
 
 ---
 
@@ -142,7 +143,7 @@
 
 - **上游**：aastar-sdk（构造 userOp）、KMS（owner 私钥出 ownerAuth）、协调器（收集/聚合）。
 - **下游**：PolicyRegistry（读策略）、AAStarBLSAlgorithm（链上验聚合）、EntryPoint +
-  Bundler（提交执行）。
+  Bundler（**Pimlico / Alchemy bundler RPC**，提交执行）。
 
 ---
 
@@ -172,7 +173,9 @@
 
 - fail-closed：坏 ownerAuth→403、缺字段→400/403、跨账户 hash 替换被拒。
 - 策略门（开启时）：超额/陌生收款人/registry REJECT → 拒签。
-- **ECDSA 回退**：在参考账户上验证 owner 独签能绕过 DVT（记录为已知限制），并在"强制 BLS 账户"上验证不能绕过。
+- **强制 BLS（无回退）**：在正式账户上验证
+  **owner 单签（普通 ECDSA）无法绕过 DVT** ——必须 BLS 聚合签名才能通过
+  `validateUserOp`（这是用正式账户而非 demo 账户的核心目的，见 §2.4/§8）。
 - stale 合约：连错版本 validator → validate=1（确认 env 一致性防呆）。
 
 ### 4.4 自动化 runner（要我落地）
@@ -203,10 +206,8 @@ release 真正完成的前置。
 
 ### 6.1 版本
 
-- 建议 **v1.5.0**（minor）：语义 =
-  "首个测试网正式发布"。理由：相对 v1.4.0（本地特性集）这是面向 testnet 的新能力里程碑，非纯补丁。
-- （备选：`v1.4.1-testnet`
-  预发布 tag——若想强调"测试网预览"。建议正式 minor 更清晰。）
+- **v1.5.0**（minor，已定）：语义 =
+  "首个测试网正式发布"。相对 v1.4.0（本地特性集）这是面向 testnet 的新能力里程碑。
 
 ### 6.2 发布流程（门禁链，按 `RELEASING.md` 扩展）
 
@@ -216,7 +217,7 @@ release 真正完成的前置。
 3. testnet-e2e 全链路绿（L1→L3）+ 负路径/安全用例绿
 4. Codex 全链路挑战通过（findings 已闭环）
 5. 版本 bump → PR → 独立 review → 合并 master（勿自合）
-6. tag vX.Y.0 + gh release create（notes 含：依赖 pin 表 + E2E 报告 + Codex 结论 + 已知限制如 ECDSA 回退）
+6. tag v1.5.0 + gh release create（notes 含：依赖 pin 表 + E2E 报告 + Codex 结论 + 强制 BLS 账户验证）
 7. 在 #42（DVT program）登记本仓库 testnet 发布成功
 ```
 
@@ -224,9 +225,10 @@ release 真正完成的前置。
 
 - 依赖 pin 表（§1.1，发布时刻的版本/地址 + check-deps 绿截图/输出）
 - testnet 合约地址（§2.1）+ 已注册节点集合
-- E2E 报告（L1→L3，含 txHash）
+- E2E 报告（L1→L3，含 txHash + bundler 提交记录）
 - Codex 挑战结论
-- **已知限制**（ECDSA 回退等）
+- **账户模型**：强制 BLS 正式账户（owner 单签无法绕过 DVT，已验证）
+- 节点部署：多机/多实例（模拟多方运营）
 
 ---
 
@@ -243,11 +245,15 @@ release 真正完成的前置。
 
 ---
 
-## 8. 风险 / 未决（请 review 时拍板）
+## 8. 决策（已拍板 2026-06-20）
 
-1. **协调器 / Bundler 谁来跑 testnet**？（SuperRelay / 公共 bundler / 自建）——L3
-   E2E 依赖它。
-2. **ECDSA 回退**：testnet 用强制 BLS 账户，还是接受回退并在 notes 标注限制？
-3. **版本号**：v1.5.0 vs v1.4.1-testnet？
-4. **viem 迁移（#88）** 排在 testnet 发布之前还是之后？（建议之后。）
-5. **节点托管**：3 个独立实例放哪（同机多端口 vs 多机 vs 多运营方）？testnet 阶段可单机多端口，但要在 notes 说明"非真正去中心化"。
+| #   | 议题                  | 决定                                                                                                                                                                               |
+| --- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Bundler**           | 用 **Pimlico / Alchemy 的 bundler RPC URL**（`eth_sendUserOperation` 等），不自建。L3 E2E 通过它把 UserOp 提交上链。                                                               |
+| 2   | **账户 / ECDSA 回退** | **不用回退**。按主网正式标准：用**强制 BLS 的正式账户**（禁用 owner 单签），测试网上用测试 owner。**不用 demo 账户 V6/V7/V8**。落地依赖：确认 AirAccount 正式账户合约（见 §2.4）。 |
+| 3   | **版本号**            | **v1.5.0**                                                                                                                                                                         |
+| 4   | **viem 迁移 (#88)**   | 排在 testnet 发布**之后**，不阻塞。                                                                                                                                                |
+| 5   | **节点托管**          | **多节点（多机/多实例）部署，模拟真实多方运营效果** —— 不用单机多端口糊弄。                                                                                                        |
+
+> 这些决定已回填进 §2.4 / §4.3 / §6.1。落地前唯一仍需外部确认的是
+> **#2 的正式账户合约地址/版本**（airaccount-contract 侧）。
