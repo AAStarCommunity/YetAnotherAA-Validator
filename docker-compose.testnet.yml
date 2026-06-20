@@ -1,0 +1,74 @@
+# Always-on testnet DVT — 3 independent signer nodes + a Cloudflare named tunnel.
+#
+# Anyone can clone this repo and stand up their OWN DVT:
+#   1. cp deploy/.env.testnet.example deploy/.env.testnet  &&  fill it in
+#   2. put each node's node_state.json (its OWN secret BLS key) in deploy/node{1,2,3}/
+#   3. docker compose -f docker-compose.testnet.yml --env-file deploy/.env.testnet up -d --build
+#   4. register each node's BLS pubkey on the validator (see deploy/README.md)
+#
+# The cloudflared sidecar exposes the 3 nodes at stable public hostnames you configure
+# in the Cloudflare dashboard (Public Hostnames → http://dvt-node-N:300N). See deploy/README.md.
+name: dvt-testnet
+
+x-dvt-env: &dvt-env
+  ETH_RPC_URL: ${ETH_RPC_URL:?set ETH_RPC_URL in deploy/.env.testnet}
+  VALIDATOR_CONTRACT_ADDRESS: ${VALIDATOR_CONTRACT_ADDRESS:?set VALIDATOR_CONTRACT_ADDRESS (v0.20.0 = 0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174)}
+  ENTRY_POINT_ADDRESS: ${ENTRY_POINT_ADDRESS:-0x0000000071727De22E5E9d8BAf0edAc6f37da032}
+  POLICY_ENABLED: ${POLICY_ENABLED:-false}
+  POLICY_REGISTRY_ADDRESS: ${POLICY_REGISTRY_ADDRESS:-}
+
+x-dvt-node: &dvt-node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: aastar-dvt:latest
+  restart: unless-stopped
+  networks: [dvt]
+
+services:
+  dvt-node-1:
+    <<: *dvt-node
+    container_name: dvt-node-1
+    environment:
+      <<: *dvt-env
+      PORT: 3001
+      PUBLIC_URL: ${NODE1_PUBLIC_URL:-}
+    volumes:
+      - ./deploy/node1/node_state.json:/app/node_state.json:ro
+    ports: ["127.0.0.1:3001:3001"] # localhost-only; public access is via the tunnel
+
+  dvt-node-2:
+    <<: *dvt-node
+    container_name: dvt-node-2
+    environment:
+      <<: *dvt-env
+      PORT: 3002
+      PUBLIC_URL: ${NODE2_PUBLIC_URL:-}
+    volumes:
+      - ./deploy/node2/node_state.json:/app/node_state.json:ro
+    ports: ["127.0.0.1:3002:3002"]
+
+  dvt-node-3:
+    <<: *dvt-node
+    container_name: dvt-node-3
+    environment:
+      <<: *dvt-env
+      PORT: 3003
+      PUBLIC_URL: ${NODE3_PUBLIC_URL:-}
+    volumes:
+      - ./deploy/node3/node_state.json:/app/node_state.json:ro
+    ports: ["127.0.0.1:3003:3003"]
+
+  # Cloudflare named tunnel (token-based). Public hostnames are configured in the
+  # Cloudflare dashboard and point at http://dvt-node-N:300N (same docker network).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: dvt-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/.env.testnet}
+    networks: [dvt]
+    depends_on: [dvt-node-1, dvt-node-2, dvt-node-3]
+
+networks:
+  dvt:
+    driver: bridge
