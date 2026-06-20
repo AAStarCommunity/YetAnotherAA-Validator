@@ -23,7 +23,9 @@ mkdir -p "$RUN"
 PORTS=(4001 4002 4003)
 HOSTS=(dvt1 dvt2 dvt3)
 
-cf_running() { pgrep -f "cloudflared tunnel.*run" >/dev/null 2>&1; }
+# Precise: only OUR cloudflared, tracked by pid file — never pkill (would kill
+# other tunnels on a shared host).
+cf_running() { [ -f "$RUN/cloudflared.pid" ] && kill -0 "$(cat "$RUN/cloudflared.pid" 2>/dev/null)" 2>/dev/null; }
 
 start() {
   [ -f "$DIST" ] || { echo "build dist…"; npm run build >/dev/null; }
@@ -60,10 +62,15 @@ stop() {
     lsof -ti "tcp:${PORTS[$((i - 1))]}" 2>/dev/null | xargs kill 2>/dev/null || true
     rm -f "$RUN/node$i.pid"
   done
-  [ -f "$RUN/cloudflared.pid" ] && kill "$(cat "$RUN/cloudflared.pid")" 2>/dev/null || true
-  pkill -f "cloudflared tunnel.*run" 2>/dev/null || true
-  rm -f "$RUN/cloudflared.pid"
-  echo "stopped 3 nodes + cloudflared"
+  # Precise: kill ONLY our tracked cloudflared pid — never pkill (a shared host may
+  # run other tunnels). If the pid file is gone we leave all cloudflared alone.
+  if [ -f "$RUN/cloudflared.pid" ]; then
+    kill "$(cat "$RUN/cloudflared.pid")" 2>/dev/null || true
+    rm -f "$RUN/cloudflared.pid"
+    echo "stopped 3 nodes + our cloudflared"
+  else
+    echo "stopped 3 nodes (no tracked cloudflared.pid — other tunnels untouched)"
+  fi
 }
 
 status() {

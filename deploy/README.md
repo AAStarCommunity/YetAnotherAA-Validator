@@ -98,10 +98,29 @@ approval):**
 
 ## 5. Launch
 
+**Option A — Docker (recommended for always-on hosts, e.g. Mac mini):**
+
 ```bash
 docker compose -f docker-compose.testnet.yml --env-file deploy/.env.testnet up -d --build
 docker compose -f docker-compose.testnet.yml ps     # all healthy
 ```
+
+**Option B — local-process manager script (no Docker):** runs the 3 nodes on
+4001/2/3 + the cloudflared named tunnel as plain processes. Full lifecycle:
+
+```bash
+./deploy/dvt-testnet.sh start       # build (if needed) + boot 3 nodes + cloudflared
+./deploy/dvt-testnet.sh status      # local nodes + cloudflared + public dvt*.aastar.io
+./deploy/dvt-testnet.sh info        # nodeId + public URL + pubkey per node
+./deploy/dvt-testnet.sh logs 1      # tail node 1 (use `logs cf` for the tunnel)
+./deploy/dvt-testnet.sh restart     # stop then start
+./deploy/dvt-testnet.sh stop        # stop the 3 nodes + OUR cloudflared (pid-tracked,
+                                    # never pkill — other tunnels on the host are safe)
+```
+
+Reads `deploy/.env.testnet` + `deploy/.cf-run-token` +
+`deploy/node{1,2,3}/node_state.json`; runtime logs/pids in `deploy/.run/`
+(git-ignored).
 
 ## 6. Verify (public)
 
