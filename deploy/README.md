@@ -61,15 +61,29 @@ third-party operator **cannot self-register**; the validator owner must register
 your nodeId + pubkey (or use the SuperPaymaster staking-based registration path,
 where applicable).
 
-- For the AAStar testnet: open an issue / ping the validator owner with each
-  node's `nodeId` and `publicKey` (from step 1) to get registered on
-  `0xAF525A…`.
-- Verify: `isRegistered(nodeId) == true` and `getRegisteredNodeCount()` includes
-  your nodes.
+**(a) AAStar testnet (owner-registered, fastest):** open an issue / ping the
+validator owner with each node's `nodeId` + `publicKey` (from step 1) to get
+registered on `0xAF525A…`. Verify `isRegistered(nodeId) == true` and
+`getRegisteredNodeCount()` includes your nodes.
 
-> Until `registerPublicKey` becomes permissionless/staked, registration is a
-> coordination step — this is the honest limitation of "anyone runs a node" on
-> the current contract.
+**(b) Permissionless via staking (run your OWN community DVT, no owner
+approval):**
+
+1. **Buy the governance token** at
+   [launch.mushroom.cv](https://launch.mushroom.cv).
+2. **Stake** by interacting with the registry contract directly on Etherscan
+   (connect wallet → `stake(...)` → register your node), which authorizes your
+   node without the validator owner.
+3. **Stand up your community DVT** — your own nodes + your own domain
+   (`dvt.xxx.com`, `dvt.xxx.net`, ≥3 for a real N-of-M).
+4. **Or use COS72** (open-source; self-host or run locally) and follow its
+   guided flow to do **buy → stake → deploy → activate** end-to-end.
+
+> Path (a) is the owner-coordinated bootstrap for the AAStar reference nodes;
+> path (b) is the permissionless route any community uses to run an independent
+> DVT. Until the staking path is fully wired on the current
+> `AAStarBLSAlgorithm`, (a) is the interim for testnet — (b) is the target for
+> true multi-party.
 
 ## 4. Cloudflare named tunnel
 
