@@ -77,9 +77,10 @@
 3. **`.github/workflows/deps-watch.yml`**（新）：**定时**（如每日）跑
    `check-deps`，发现 drift
    **自动开 issue**（标题含 dep + 漂移类型）→ 这就是"自动发现上游变动"。
-4. **统一 env 源**（本轮已把 `realnode-e2e.mjs`/`dvt-nodes.sh`/`common.env` 统一到 v0.20.0
-   canonical 地址，见 §2.2）：进一步收敛为"单一真相源"（脚本地址 == `check-deps` pin）由
-   `release-preflight` 校验，杜绝多版本 key 散落。
+4. **统一 env 源**（本轮已把 `realnode-e2e.mjs`/`dvt-nodes.sh`/`common.env`
+   统一到 v0.20.0
+   canonical 地址，见 §2.2）：进一步收敛为"单一真相源"（脚本地址 == `check-deps`
+   pin）由 `release-preflight` 校验，杜绝多版本 key 散落。
 
 ---
 
