@@ -38,3 +38,4 @@ notify-contacts.json
 deploy/node*/node_state.json
 deploy/.env.testnet
 deploy/.cf-run-token
+deploy/.run/
