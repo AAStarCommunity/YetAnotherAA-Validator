@@ -119,9 +119,20 @@
 
 - ✅
   **账户：用强制 BLS 的正式账户（无 ECDSA 回退）**。testnet 按主网级标准来，只是用测试网的测试 owner。
-  **不使用本 repo 的 demo 账户 V6/V7/V8**（它们有 owner-ECDSA 独签回退，owner 私钥可绕过 DVT）。→
-  **落地依赖**：testnet E2E 绑定的账户必须是走 BLS
-  validator、禁用 owner 单签的正式账户合约（AirAccount 生产账户）。**发布前需确认该正式账户合约地址/版本**（airaccount-contract 侧），并验证"owner 单签无法绕过 DVT"。
+  **不使用本 repo 的 demo 账户 V6/V7/V8**（它们有 owner-ECDSA 独签回退，owner 私钥可绕过 DVT）。
+  - **已核定（2026-06-20，airaccount-contract
+    v0.20.0 源码为证，#93）**：正式账户 `AAStarAirAccount`
+    是 algId 路由账户，**默认含 owner-ECDSA(`0x02`) 路径**——并非天然 mandatory-BLS。要禁用 owner 单签，必须
+    **guard-enabled 账户 + `approvedAlgIds=[0x01 BLS only]`**（排除
+    `0x02`）：此时 owner-ECDSA UserOp 被算法白名单门拒（enforce 在
+    `AAStarAirAccountV7.sol:247-251`）=
+    mandatory-BLS、无回退。**无 guard 时白名单不强制**（owner 单签仍通过）。
+  - SDK 侧用 `buildInitConfig` 设 `approvedAlgIds` + 走
+    **guard-enabled 工厂路径** 部署该账户。
+  - **核定方式 = 实测负路径（§4.3）**：对该账户发一笔纯 owner-ECDSA(`0x02`) 签名的 UserOp
+    → 必须**被拒**；正路径 DVT BLS-triple 共签 → `validate()===0`
+    真 tx。两条都过才算 mandatory-BLS 验证完成。节点可达后我按此配置跑 DVT
+    E2E 核验。
 - ✅ **Bundler：用 Pimlico / Alchemy 的 bundler RPC**（`eth_sendUserOperation`
   等），不自建。
 - ✅ **viem 迁移（#88）**：排在 testnet 发布**之后**，不阻塞本发布。
