@@ -33,3 +33,8 @@ notify-contacts.json
 .env.sepolia
 .env.*
 .env*.local
+
+# Testnet deploy secrets (BLS keys + tunnel token / RPC)
+deploy/node*/node_state.json
+deploy/.env.testnet
+deploy/.cf-run-token

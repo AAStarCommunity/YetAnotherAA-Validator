@@ -1,0 +1,36 @@
+{
+  "_comment": "Default testnet DVT config for @aastar/sdk. These are AAStar's 3 always-on testnet DVT nodes with INDEPENDENT secret keys (not the public BLS_TEST fixtures). nodeIds are registered on the v0.20.0 validator (0xAF525A). The 3 URLs go live once the Cloudflare named tunnel is up; validated on-chain (validate===0 + ECDSA rejected) at first run.",
+  "network": "sepolia",
+  "chainId": 11155111,
+  "validator": "0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174",
+  "validatorVersion": "airaccount-contract v0.20.0 (AAStarBLSAlgorithm)",
+  "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+  "entryPointVersion": "v0.7",
+  "conventions": {
+    "userOpHash": "EntryPoint.getUserOpHash(PackedUserOp)",
+    "ownerAuth": "owner EIP-191 ECDSA over getBytes(userOpHash)",
+    "proofWire": "EIP-2537 G1/G2 (matches src/utils/bls.util.ts; SDK dvtWire confirmed in-sync)",
+    "mandatoryBlsAccount": "guard-enabled + approvedAlgIds=[0x01] (excludes 0x02 ECDSA); enforce AAStarAirAccountV7.sol:247-251"
+  },
+  "nodes": [
+    {
+      "url": "https://dvt1.aastar.io",
+      "nodeId": "0x2df775b934046ddd210828fb5096ea8a15bb18a145dae5bd94535375c319c53f"
+    },
+    {
+      "url": "https://dvt2.aastar.io",
+      "nodeId": "0xd907ad728a7091c5cc628d9c7c71ae8d69f062a39533a2890bea3c299bacd201"
+    },
+    {
+      "url": "https://dvt3.aastar.io",
+      "nodeId": "0xd4f954361cdb2b2d89a631c939b6f930de5b2c5753911d2be7fb1ecc9f17a60e"
+    }
+  ],
+  "endpoints": {
+    "sign": "POST {url}/signature/sign  body: {userOp, ownerAuth}  -> {nodeId, signature(EIP-2537), publicKey}",
+    "aggregate": "POST {url}/signature/aggregate",
+    "verify": "POST {url}/signature/verify",
+    "info": "GET {url}/node/info",
+    "openapi": "GET {url}/api"
+  }
+}
