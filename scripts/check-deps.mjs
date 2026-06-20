@@ -71,14 +71,14 @@ const DEPS = [
     repo: "AAStarCommunity/airaccount-contract",
     relationship:
       "COLLABORATOR — on-chain CONSUMER of node's aggregated BLS sig (AAStarBLSAlgorithm.validate)",
-    version: "v0.19.0-beta.2",
+    version: "v0.20.0",
     configPath: null,
     configKey: null,
     addressLabel: "BLSAlgorithm",
-    address: "0x68c381Ad3A2e3380F22840008027E9Ec2783F43A",
+    address: "0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174",
     deep: {
       sourcePath: "src/validators/AAStarBLSAlgorithm.sol",
-      baselineRef: "v0.19.0-beta.2",
+      baselineRef: "v0.20.0",
       abiSig: "function validate(bytes32 hash, bytes calldata signature)",
     },
   },
