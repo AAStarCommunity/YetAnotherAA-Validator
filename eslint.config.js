@@ -32,6 +32,7 @@ export default [
         clearImmediate: "readonly",
         atob: "readonly",
         btoa: "readonly",
+        fetch: "readonly", // Node 18+ global fetch (used by notification.service.ts)
         jest: "readonly",
         describe: "readonly",
         it: "readonly",
