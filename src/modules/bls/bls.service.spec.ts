@@ -25,7 +25,6 @@ jest.unstable_mockModule("../../utils/bls.util.js", () => {
 
 const { BlsService } = await import("./bls.service.js");
 const { BlockchainService } = await import("../blockchain/blockchain.service.js");
-type BlockchainService = InstanceType<typeof BlockchainService>;
 // LocalKeySigner imports the (mocked) bls.util sigs — must load AFTER the mock above.
 const { LocalKeySigner } = await import("../signer/local-key.signer.js");
 import type { PackedUserOp } from "../blockchain/blockchain.service.js";
@@ -88,7 +87,10 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
   beforeEach(() => {
     getAccountOwner = jest.fn<(account: string) => Promise<string>>();
     getUserOpHash = jest.fn<(userOp: PackedUserOp) => Promise<string>>();
-    const blockchain = { getAccountOwner, getUserOpHash } as unknown as BlockchainService;
+    const blockchain = {
+      getAccountOwner,
+      getUserOpHash,
+    } as unknown as InstanceType<typeof BlockchainService>;
     // Default local-key signer (byte-identical to the pre-port signing path).
     const signer = {
       forNode: (n: { privateKey: string }) => new LocalKeySigner(n.privateKey),

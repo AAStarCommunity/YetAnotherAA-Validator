@@ -16,7 +16,7 @@ ensure() {
   [ -f "$DIST" ] || { echo "build dist..."; npm run build >/dev/null; }
   [ -f "$E2E/node1/node_state.json" ] || { echo "gen node keys..."; node scripts/e2e/gen-nodes.mjs; }
   if [ ! -f "$E2E/common.env" ]; then
-    node -e 'const fs=require("fs");const s=x=>x.replace(/^["\x27]|["\x27]$/g,"");const e=Object.fromEntries(fs.readFileSync(".env.sepolia","utf8").split("\n").filter(l=>l.includes("=")).map(l=>{const i=l.indexOf("=");return [l.slice(0,i).trim(),s(l.slice(i+1).trim())]}));fs.writeFileSync(".e2e/common.env",["ETH_RPC_URL="+(e.SEPOLIA_RPC_URL||e.RPC_URL),"VALIDATOR_CONTRACT_ADDRESS="+e.AIRACCOUNT_V018_BLS_ALGORITHM,"ENTRY_POINT_ADDRESS="+(e.ENTRY_POINT_ADDRESS||e.ENTRYPOINT_ADDRESS),"POLICY_ENABLED=false",""].join("\n"))'
+    node -e 'const fs=require("fs");const s=x=>x.replace(/^["\x27]|["\x27]$/g,"");const e=Object.fromEntries(fs.readFileSync(".env.sepolia","utf8").split("\n").filter(l=>l.includes("=")).map(l=>{const i=l.indexOf("=");return [l.slice(0,i).trim(),s(l.slice(i+1).trim())]}));fs.writeFileSync(".e2e/common.env",["ETH_RPC_URL="+(e.SEPOLIA_RPC_URL||e.RPC_URL),"VALIDATOR_CONTRACT_ADDRESS="+(e.AIRACCOUNT_V020_BLS_ALGORITHM||"0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174"),"ENTRY_POINT_ADDRESS="+(e.ENTRY_POINT_ADDRESS||e.ENTRYPOINT_ADDRESS),"POLICY_ENABLED=false",""].join("\n"))'
   fi
 }
 start() {

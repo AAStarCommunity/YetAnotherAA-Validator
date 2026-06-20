@@ -374,9 +374,7 @@ export class BlockchainService {
    * Read SuperPaymaster's cached-price freshness info.
    * ABI confirmed against SuperPaymaster v5.4.x `getCachedPriceInfo()` + `priceStalenessThreshold()`.
    */
-  async getPriceInfo(
-    paymasterAddress: string
-  ): Promise<{ updatedAt: bigint; threshold: bigint }> {
+  async getPriceInfo(paymasterAddress: string): Promise<{ updatedAt: bigint; threshold: bigint }> {
     const abi = [
       "function getCachedPriceInfo() view returns (uint256 price, uint256 updatedAt)",
       "function priceStalenessThreshold() view returns (uint256)",

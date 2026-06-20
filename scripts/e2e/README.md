@@ -9,7 +9,7 @@ etc.). See `#42` and `docs/design/dvt-e2e-and-production.md`.
 ## Prereqs
 
 - `.env.sepolia` at repo root with: `SEPOLIA_RPC_URL[,2,3]`,
-  `ENTRY_POINT_ADDRESS`, `AIRACCOUNT_V018_BLS_ALGORITHM`,
+  `ENTRY_POINT_ADDRESS`, `AIRACCOUNT_V020_BLS_ALGORITHM`,
   `BLS_TEST_NODE_ID_1/2`, `BLS_TEST_PRIVATE_KEY_1/2`, `PRIVATE_KEY_SUPPLIER` (=
   the test account's ECDSA `owner()`).
 - `npm run build` (the manager runs it automatically if `dist/` is missing).

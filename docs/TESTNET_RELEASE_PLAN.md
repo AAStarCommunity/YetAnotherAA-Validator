@@ -33,12 +33,12 @@
 
 ### 1.1 依赖清单（本节点绑定的上下游，来源 `scripts/check-deps.mjs`）
 
-| 角色     | 仓库                | 绑定物                                          | 当前 pin                         | 校验维度               |
-| -------- | ------------------- | ----------------------------------------------- | -------------------------------- | ---------------------- |
-| **上游** | SuperPaymaster      | `PolicyRegistry.checkPolicy`（layer-1 策略）    | `v5.4.0-beta.1` · `0x8c2488…`    | 地址 + 源码 diff + ABI |
-| **下游** | airaccount-contract | `AAStarBLSAlgorithm.validate`（链上验聚合签名） | `v0.19.0-beta.2` · `0x68c381Ad…` | 地址 + 源码 diff + ABI |
-| **上游** | AirAccount (KMS)    | owner secp256k1 `ownerAuth`（Stage-1 验签）     | TA `0.5.0`                       | TA/签名方案版本守卫    |
-| 规范     | EntryPoint v0.7     | `getUserOpHash`                                 | `0x0000…71727De2…`               | 固定规范地址           |
+| 角色     | 仓库                | 绑定物                                          | 当前 pin                      | 校验维度               |
+| -------- | ------------------- | ----------------------------------------------- | ----------------------------- | ---------------------- |
+| **上游** | SuperPaymaster      | `PolicyRegistry.checkPolicy`（layer-1 策略）    | `v5.4.0-beta.1` · `0x8c2488…` | 地址 + 源码 diff + ABI |
+| **下游** | airaccount-contract | `AAStarBLSAlgorithm.validate`（链上验聚合签名） | `v0.20.0` · `0xAF525A…`       | 地址 + 源码 diff + ABI |
+| **上游** | AirAccount (KMS)    | owner secp256k1 `ownerAuth`（Stage-1 验签）     | TA `0.5.0`                    | TA/签名方案版本守卫    |
+| 规范     | EntryPoint v0.7     | `getUserOpHash`                                 | `0x0000…71727De2…`            | 固定规范地址           |
 
 ### 1.2 "如何确定是最新且与我一致的版本"
 
@@ -77,8 +77,10 @@
 3. **`.github/workflows/deps-watch.yml`**（新）：**定时**（如每日）跑
    `check-deps`，发现 drift
    **自动开 issue**（标题含 dep + 漂移类型）→ 这就是"自动发现上游变动"。
-4. **统一 env 源**：消除 `realnode-e2e.mjs` 用 `V018` 而 pin 是 `V019`
-   的不一致（见 §2.2），单一 `.env.sepolia` key 为准。
+4. **统一 env 源**（本轮已把 `realnode-e2e.mjs`/`dvt-nodes.sh`/`common.env`
+   统一到 v0.20.0
+   canonical 地址，见 §2.2）：进一步收敛为"单一真相源"（脚本地址 == `check-deps`
+   pin）由 `release-preflight` 校验，杜绝多版本 key 散落。
 
 ---
 
@@ -86,26 +88,32 @@
 
 ### 2.1 权威地址（以 `check-deps` 为准，发布前重新核对）
 
-| 用途                                | 地址                                         | 版本                               |
-| ----------------------------------- | -------------------------------------------- | ---------------------------------- |
-| BLS 验证器（下游消费聚合签名）      | `0x68c381Ad3A2e3380F22840008027E9Ec2783F43A` | airaccount-contract v0.19.0-beta.2 |
-| PolicyRegistry（上游 layer-1 策略） | `0x8c2488d46d5447418558c38AA6441720df656094` | SuperPaymaster v5.4.0-beta.1       |
-| EntryPoint v0.7                     | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | 规范                               |
+| 用途                                | 地址                                         | 版本                            |
+| ----------------------------------- | -------------------------------------------- | ------------------------------- |
+| BLS 验证器（下游消费聚合签名）      | `0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174` | airaccount-contract **v0.20.0** |
+| PolicyRegistry（上游 layer-1 策略） | `0x8c2488d46d5447418558c38AA6441720df656094` | SuperPaymaster v5.4.0-beta.1    |
+| EntryPoint v0.7                     | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | 规范                            |
 
-### 2.2 ⚠️ 必须先消除的不一致
+### 2.2 版本漂移历史（已处理）
 
-- `realnode-e2e.mjs` / `.e2e/common.env` 历史用
-  **V018**（`AIRACCOUNT_V018_BLS_ALGORITHM`），但 canonical 最新是
-  **V019**。本轮已把集群 `common.env`
-  切到 V019、node3 注册到 V019；**发布前要把 E2E 脚本与所有 env 统一到 V019（canonical）**，否则 validate 会对错合约。
+- 验证器经历 V018 → V019（`0x68c381Ad`）→
+  **v0.20.0（`0xAF525A`，redeploy，源码 identical）**。每次 redeploy 都换地址但接口不变（纯地址漂移）。
+- **2026-06-20 已迁移到 v0.20.0**：re-pin `check-deps`、统一
+  `dvt-nodes.sh`/`realnode-e2e.mjs`/`common.env` 到 `0xAF525A`、re-register
+  node3、集群切换重启。**发布前以 `check-deps` 绿为准**（任何后续 redeploy 由
+  `deps-watch.yml` 自动发现）。
 
 ### 2.3 节点链上注册流程
 
-- 每个节点用 `registerPublicKey(bytes32 nodeId, bytes publicKey)` 注册到
-  **V019**（`onlyOwner`；publicKey 为 **128-byte EIP-2537 G1**
-  编码，非 48-byte 压缩——见本轮 node3 注册经验）。
-- 发布需登记的节点集合（建议 ≥3 独立实例）全部
-  `isRegistered=true`，`getRegisteredNodeCount` 匹配。
+- 每个节点用 `registerPublicKey(bytes32 nodeId, bytes publicKey)`
+  注册到当前 canonical validator（`onlyOwner`；publicKey 为 **128-byte EIP-2537
+  G1** 编码，非 48-byte 压缩——见 node3 注册经验）。
+- 发布需登记的节点集合（≥3）全部 `isRegistered=true`，`getRegisteredNodeCount`
+  匹配。
+- 🔑
+  **testnet 用 3 套独立、保密的 BLS 私钥，各自 register**——**不复用公开测试夹具
+  `BLS_TEST_1/2`** （其私钥在 `.env.sepolia`
+  公开，任何人可签）。复用夹具只是"3 个进程"，不是"3 个独立运营方"；真·多方运营要求每节点密钥独立保密（与 §8 决策 5"模拟真实多方运营"配套）。本地调试集群可继续用夹具图方便。
 
 ### 2.4 账户与依赖（已定，见 §8）
 
