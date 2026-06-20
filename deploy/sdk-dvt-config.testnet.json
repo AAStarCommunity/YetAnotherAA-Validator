@@ -1,0 +1,36 @@
+{
+  "_comment": "Default testnet DVT config for @aastar/sdk. The 3 URLs go live once dvt1/2/3.aastar.io are deployed (see deploy/README.md). The nodeIds are already registered on the v0.20.0 validator and were used in the cross-repo E2E (issue #93), so the SDK can write this as the default test fixture now.",
+  "network": "sepolia",
+  "chainId": 11155111,
+  "validator": "0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174",
+  "validatorVersion": "airaccount-contract v0.20.0 (AAStarBLSAlgorithm)",
+  "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+  "entryPointVersion": "v0.7",
+  "conventions": {
+    "userOpHash": "EntryPoint.getUserOpHash(PackedUserOp)",
+    "ownerAuth": "owner EIP-191 ECDSA over getBytes(userOpHash)",
+    "proofWire": "EIP-2537 G1/G2 (matches src/utils/bls.util.ts; SDK dvtWire confirmed in-sync)",
+    "mandatoryBlsAccount": "guard-enabled + approvedAlgIds=[0x01] (excludes 0x02 ECDSA); enforce AAStarAirAccountV7.sol:247-251"
+  },
+  "nodes": [
+    {
+      "url": "https://dvt1.aastar.io",
+      "nodeId": "0xb548c8e23d2df1158ebb19fe07eb1ac4d9c47f13b3c9d3aed83b206930506a6d"
+    },
+    {
+      "url": "https://dvt2.aastar.io",
+      "nodeId": "0x7f7e6290d0588435c6d12093b420fafc5b4c7ab23c73645ca7186189dca9537c"
+    },
+    {
+      "url": "https://dvt3.aastar.io",
+      "nodeId": "0x0000000000000000000000000000000026634443cf9b489ac6de4b7e2989004f"
+    }
+  ],
+  "endpoints": {
+    "sign": "POST {url}/signature/sign  body: {userOp, ownerAuth}  -> {nodeId, signature(EIP-2537), publicKey}",
+    "aggregate": "POST {url}/signature/aggregate",
+    "verify": "POST {url}/signature/verify",
+    "info": "GET {url}/node/info",
+    "openapi": "GET {url}/api"
+  }
+}
