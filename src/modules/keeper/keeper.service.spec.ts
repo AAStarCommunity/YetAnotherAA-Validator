@@ -205,6 +205,49 @@ describe("KeeperService", () => {
     expect(updatePriceCalled).toHaveLength(2);
   });
 
+  it("tick: refreshes every paymaster in a comma-separated list (independent thresholds)", async () => {
+    const updated: string[] = [];
+    const blockchain = makeBlockchain({
+      // both stale at NOW_NEAR_EXPIRY (updatedAt=1000, threshold=3600)
+      getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+      updatePrice: async (addr?: string) => {
+        updated.push(addr ?? "?");
+        return "0xTX";
+      },
+    } as any);
+    const a = "0x" + "aa".repeat(20);
+    const b = "0x" + "bb".repeat(20);
+    const svc = new KeeperService(
+      blockchain,
+      makeNotify(),
+      makeConfig({ keeperPaymasterAddress: `${a}, ${b}` }),
+      NOW_NEAR_EXPIRY
+    );
+    await svc.tick();
+    expect(updated).toEqual([a, b]);
+  });
+
+  it("tick: shared daily cap stops mid-list", async () => {
+    const updated: string[] = [];
+    const blockchain = makeBlockchain({
+      getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+      updatePrice: async (addr?: string) => {
+        updated.push(addr ?? "?");
+        return "0xTX";
+      },
+    } as any);
+    const a = "0x" + "aa".repeat(20);
+    const b = "0x" + "bb".repeat(20);
+    const svc = new KeeperService(
+      blockchain,
+      makeNotify(),
+      makeConfig({ keeperPaymasterAddress: `${a},${b}`, keeperMaxUpdatesPerDay: 1 }),
+      NOW_NEAR_EXPIRY
+    );
+    await svc.tick();
+    expect(updated).toEqual([a]); // cap=1 → only the first paymaster updates
+  });
+
   it("onApplicationShutdown clears the startup timer scheduled at bootstrap", () => {
     const svc = new KeeperService(makeBlockchain(), makeNotify(), makeConfig(), clockAt(0));
     svc.onApplicationBootstrap();
