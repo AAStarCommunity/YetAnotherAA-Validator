@@ -36,7 +36,13 @@ start() {
     [ -f "$REPO/deploy/node$i/node_state.json" ] || { echo "missing deploy/node$i/node_state.json — gen keys (deploy/README.md §1)"; exit 1; }
     (
       cd "$REPO/deploy/node$i"
-      set -a; . "$ENVF"; set +a
+      # Shared base env, then per-node overrides (deploy/node$i/.env) so each node
+      # can carry its OWN keys — e.g. an independent RELAY_OPERATOR_PK / keeper key
+      # — instead of sharing one. The per-node file is git-ignored.
+      set -a
+      . "$ENVF"
+      [ -f "$REPO/deploy/node$i/.env" ] && . "$REPO/deploy/node$i/.env"
+      set +a
       export PORT="$port"
       nohup node "$DIST" >"$RUN/node$i.log" 2>&1 &
       echo $! >"$RUN/node$i.pid"
@@ -80,6 +86,17 @@ status() {
     if curl -s -m 4 "http://localhost:$port/node/info" >/dev/null 2>&1; then echo "  node$i :$port  ✅ UP"; else echo "  node$i :$port  ❌ down"; fi
   done
   cf_running && echo "cloudflared:  ✅ running" || echo "cloudflared:  ❌ down"
+  echo "relay (#98, optional):"
+  for i in 1 2 3; do
+    local port="${PORTS[$((i - 1))]}"
+    local body
+    body="$(curl -s -m 4 "http://localhost:$port/relay/health" 2>/dev/null || true)"
+    case "$body" in
+      *'"status":"ok"'*) echo "  node$i relay: ✅ enabled" ;;
+      *'"status":"disabled"'*) echo "  node$i relay: ⚪ disabled" ;;
+      *) echo "  node$i relay: ❌ down" ;;
+    esac
+  done
   echo "public:"
   for h in "${HOSTS[@]}"; do
     if curl -s -m 8 "https://$h.aastar.io/node/info" >/dev/null 2>&1; then echo "  https://$h.aastar.io  ✅"; else echo "  https://$h.aastar.io  ❌"; fi

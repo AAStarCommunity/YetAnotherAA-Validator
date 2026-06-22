@@ -39,3 +39,6 @@ deploy/node*/node_state.json
 deploy/.env.testnet
 deploy/.cf-run-token
 deploy/.run/
+
+# Per-node env overrides (independent keys: relay operator, keeper)
+deploy/node*/.env

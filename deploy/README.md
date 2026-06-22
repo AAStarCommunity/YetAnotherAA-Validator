@@ -140,6 +140,45 @@ Provide: the 3 public hostnames, the 3 `nodeId`s, and the userOpHash convention
 (EntryPoint v0.7 `getUserOpHash` + EIP-191 `ownerAuth`). See
 [`docs/HOW_TO_INTEGRATION.md`](../docs/HOW_TO_INTEGRATION.md).
 
+## 8. Optional: gasless purchase relay (#98)
+
+The node can also run the **launch token-sale relay** so the gasless
+GToken/aPNTs purchase flow stops depending on a single centralized Cloudflare
+Worker. When enabled it exposes `POST /v3/relay` (wire-compatible with the old
+Worker) and submits buys (EIP-3009 + BuyIntent → BuyHelper) paying gas from a
+dedicated hot wallet. Each node is an **independent relayer** — the SDK points
+`relayerUrl` at any node and fails over.
+
+This is orthogonal to BLS co-signing (buyer + operator are plain EOAs; no
+UserOperation, no validator, no aggregation), so it never affects the 403
+owner-auth signing path.
+
+Turn it on with a **separate, funded key per node**. `dvt-testnet.sh` loads the
+shared `deploy/.env.testnet` first, then overlays a per-node `deploy/node$i/.env`
+(git-ignored) — put each node's own relay key there:
+
+```bash
+# shared, once — in deploy/.env.testnet:
+RELAY_ENABLED=true
+
+# per node — in deploy/node1/.env, deploy/node2/.env, deploy/node3/.env:
+RELAY_OPERATOR_PK=0x<this node's dedicated, funded hot-wallet key>   # NOT the validator-owner key
+
+# generate a fresh key + print its address to fund (repeat per node):
+node -e 'const w=require("ethers").Wallet.createRandom(); console.log("RELAY_OPERATOR_PK="+w.privateKey, "\naddress (fund with Sepolia ETH):", w.address)'
+
+./deploy/dvt-testnet.sh restart
+curl -s https://dvt1.aastar.io/relay/health | jq .     # {status:"ok", operator:0x…}
+```
+
+Public relay endpoints: `https://dvt{1,2,3}.aastar.io/v3/relay`.
+
+⚠️ `RELAY_OPERATOR_PK` is a **public-facing gas-paying key** — keep it
+dedicated, fund each node's address with Sepolia ETH, and never reuse the
+validator-owner key. Addresses default to the Sepolia Path-A sale stack;
+override `RELAY_*` for a different deployment. See
+[`.env.testnet.example`](./.env.testnet.example) for all knobs.
+
 ---
 
 ## Notes
