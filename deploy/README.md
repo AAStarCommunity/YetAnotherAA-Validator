@@ -140,6 +140,34 @@ Provide: the 3 public hostnames, the 3 `nodeId`s, and the userOpHash convention
 (EntryPoint v0.7 `getUserOpHash` + EIP-191 `ownerAuth`). See
 [`docs/HOW_TO_INTEGRATION.md`](../docs/HOW_TO_INTEGRATION.md).
 
+## 8. Optional: gasless purchase relay (#98)
+
+The node can also run the **launch token-sale relay** so the gasless
+GToken/aPNTs purchase flow stops depending on a single centralized Cloudflare
+Worker. When enabled it exposes `POST /v3/relay` (wire-compatible with the old
+Worker) and submits buys (EIP-3009 + BuyIntent → BuyHelper) paying gas from a
+dedicated hot wallet. Each node is an **independent relayer** — the SDK points
+`relayerUrl` at any node and fails over.
+
+This is orthogonal to BLS co-signing (buyer + operator are plain EOAs; no
+UserOperation, no validator, no aggregation), so it never affects the 403
+owner-auth signing path.
+
+```bash
+# in deploy/.env.testnet (per node — use a SEPARATE funded key each):
+RELAY_ENABLED=true
+RELAY_OPERATOR_PK=0x<dedicated funded hot-wallet key>   # NOT the validator-owner key
+
+# verify after launch:
+curl -s https://dvt-node-1.yourdomain.com/relay/health | jq .   # {status:"ok", operator:0x…}
+```
+
+⚠️ `RELAY_OPERATOR_PK` is a **public-facing gas-paying key** — keep it
+dedicated, fund each node's key with Sepolia ETH, and never reuse the
+validator-owner key. Addresses default to the Sepolia Path-A sale stack;
+override `RELAY_*` for a different deployment. See
+[`.env.testnet.example`](./.env.testnet.example) for all knobs.
+
 ---
 
 ## Notes

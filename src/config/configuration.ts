@@ -85,6 +85,30 @@ export default () => {
     keeperChainlinkFeed:
       process.env.KEEPER_CHAINLINK_FEED || "0x694AA1769357215DE4FAC081bf1f309aDC325306",
 
+    // Gasless purchase relay (#98). Opt-in; ports the launch-sale relayer (v3:
+    // EIP-3009 + BuyIntent → BuyHelper) into the node so the token sale no longer
+    // depends on a single centralized Cloudflare Worker. Default off. Requires a
+    // DEDICATED RELAY_OPERATOR_PK (funded hot wallet that pays gas) — it does NOT
+    // fall back to ETH_PRIVATE_KEY, keeping the public-facing gas key isolated
+    // from the validator-owner key. Addresses default to the Sepolia Path-A stack.
+    relayEnabled: process.env.RELAY_ENABLED === "true",
+    relayOperatorPk: process.env.RELAY_OPERATOR_PK || undefined,
+    relayRpcUrl: process.env.RELAY_RPC_URL || undefined,
+    relayChainId: parseInt(process.env.RELAY_CHAIN_ID || "11155111", 10),
+    relayBuyHelper: process.env.RELAY_BUY_HELPER || undefined,
+    relayUsdc: process.env.RELAY_USDC || undefined,
+    relayGtoken: process.env.RELAY_GTOKEN || undefined,
+    relayApnts: process.env.RELAY_APNTS || undefined,
+    relayMaxPaymentAmount: process.env.RELAY_MAX_PAYMENT_USDC || undefined,
+    relayRateLimitPerAddressPerHour: parseInt(
+      process.env.RELAY_RATE_LIMIT_PER_ADDRESS_PER_HOUR || "5",
+      10
+    ),
+    relayRateLimitGlobalPerHour: parseInt(
+      process.env.RELAY_RATE_LIMIT_GLOBAL_PER_HOUR || "100",
+      10
+    ),
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),

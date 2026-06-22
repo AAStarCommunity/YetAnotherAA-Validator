@@ -8,6 +8,7 @@ import { DashboardModule } from "./modules/dashboard/dashboard.module.js";
 import { AppConfigModule } from "./config/config.module.js";
 import { CapabilityModule } from "./modules/capability/capability.module.js";
 import { KeeperModule } from "./modules/keeper/keeper.module.js";
+import { RelayModule } from "./modules/relay/relay.module.js";
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { KeeperModule } from "./modules/keeper/keeper.module.js";
     GossipModule,
     DashboardModule,
     KeeperModule,
+    RelayModule,
   ],
 })
 export class AppModule {}
