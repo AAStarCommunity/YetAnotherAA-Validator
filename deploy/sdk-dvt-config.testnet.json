@@ -1,36 +1,79 @@
 {
-  "_comment": "Default testnet DVT config for @aastar/sdk. These are AAStar's 3 always-on testnet DVT nodes with INDEPENDENT secret keys (not the public BLS_TEST fixtures). nodeIds are registered on the v0.20.0 validator (0xAF525A). The 3 URLs go live once the Cloudflare named tunnel is up; validated on-chain (validate===0 + ECDSA rejected) at first run.",
-  "network": "sepolia",
-  "chainId": 11155111,
-  "validator": "0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174",
-  "validatorVersion": "airaccount-contract v0.20.0 (AAStarBLSAlgorithm)",
-  "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
-  "entryPointVersion": "v0.7",
-  "conventions": {
-    "userOpHash": "EntryPoint.getUserOpHash(PackedUserOp)",
-    "ownerAuth": "owner EIP-191 ECDSA over getBytes(userOpHash)",
-    "proofWire": "EIP-2537 G1/G2 (matches src/utils/bls.util.ts; SDK dvtWire confirmed in-sync)",
-    "mandatoryBlsAccount": "guard-enabled + approvedAlgIds=[0x01] (excludes 0x02 ECDSA); enforce AAStarAirAccountV7.sol:247-251"
-  },
-  "nodes": [
-    {
-      "url": "https://dvt1.aastar.io",
-      "nodeId": "0x2df775b934046ddd210828fb5096ea8a15bb18a145dae5bd94535375c319c53f"
+  "_comment": "Canonical DVT integration config for @aastar/sdk. AAStar runs 3 always-on DVT nodes per environment with INDEPENDENT secret keys (NOT the public BLS_TEST fixtures). Each node bundles three capabilities: BLS co-signing (DVT), the gasless purchase relay (#98), and a server-side price keeper (#58). To switch networks the SDK only changes `active` and re-reads environments[active] — no code change, frictionless testnet->mainnet. Mainnet is a placeholder until deployed (same shape, swap urls + addresses).",
+  "schemaVersion": "1.0",
+  "active": "sepolia",
+  "environments": {
+    "sepolia": {
+      "network": "sepolia",
+      "chainId": 11155111,
+      "status": "LIVE (verified 2026-06-22)",
+      "validator": "0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174",
+      "validatorVersion": "airaccount-contract v0.20.0 (AAStarBLSAlgorithm)",
+      "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+      "entryPointVersion": "v0.7",
+      "conventions": {
+        "userOpHash": "EntryPoint.getUserOpHash(PackedUserOp) — node derives it; never send a bare hash",
+        "ownerAuth": "owner EIP-191 ECDSA over getBytes(userOpHash)",
+        "proofWire": "EIP-2537 G1/G2 (matches src/utils/bls.util.ts)",
+        "failClosed": "POST /signature/sign returns 403 for every rejected request (never 400)",
+        "mandatoryBlsAccount": "guard-enabled + approvedAlgIds=[0x01] (excludes 0x02 ECDSA)"
+      },
+      "dvtNodes": [
+        {
+          "url": "https://dvt1.aastar.io",
+          "nodeId": "0x2df775b934046ddd210828fb5096ea8a15bb18a145dae5bd94535375c319c53f",
+          "pubkey": "0x8067dfd1f98fd1258c0eed3886d234f81eea9371b595a1a278a49c71f8f5eda74639fa043948f7fc0ee3e6b8ec9b8555"
+        },
+        {
+          "url": "https://dvt2.aastar.io",
+          "nodeId": "0xd907ad728a7091c5cc628d9c7c71ae8d69f062a39533a2890bea3c299bacd201",
+          "pubkey": "0xb2fcf33a6ee467e9945734bbaadfd85574d98bb5a3bb75c9a78e68807290883a1e90d3b75b911b9ebc19db0bd2db9173"
+        },
+        {
+          "url": "https://dvt3.aastar.io",
+          "nodeId": "0xd4f954361cdb2b2d89a631c939b6f930de5b2c5753911d2be7fb1ecc9f17a60e",
+          "pubkey": "0x89ffc557d29bc3a11caf3bb3ae8fb6bbd17c60a8e26e9b6be6dbaf8b5f33a3ef8a3d29e765a53f436b3b7dddd3ce8fac"
+        }
+      ],
+      "capabilities": {
+        "dvtSigning": {
+          "endpoints": {
+            "sign": "POST {url}/signature/sign  body: {userOp:PackedUserOp(v0.7), ownerAuth} -> {nodeId, signature(EIP-2537), publicKey}",
+            "aggregate": "POST {url}/signature/aggregate",
+            "verify": "POST {url}/signature/verify",
+            "info": "GET {url}/node/info -> {nodeId, publicKey, ...}",
+            "openapi": "GET {url}/api"
+          }
+        },
+        "relay": {
+          "endpoint": "POST {url}/v3/relay",
+          "health": "GET {url}/relay/health -> {status:'ok', operator}",
+          "request": "{ intent:{buyer,paymentToken,paymentAmount,targetToken,recipient,minOut,deadline,nonce}, buyIntentSig, transferAuth:{validAfter,v,r,s} }",
+          "response": "{ txHash, matchedRule, status:'submitted' }",
+          "errorCodes": "INVALID_SHAPE/EXPIRED/SIGNATURE_INVALID->400, NOT_WHITELISTED->403, RATE_LIMITED->429, SUBMIT_FAILED->502, INFRA_NOT_READY->503",
+          "whitelist": {
+            "paymentToken_usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+            "targetToken_gtoken": "0x20a051502a7AE6e40cfFd6EBe59057538E698984",
+            "targetToken_apnts": "0x9e66B457E0ABb1F139FD8A596d00f784eBA2873b",
+            "buyHelper": "0x0EA2AEd239574F4e875Ae570C67825da845E7e66"
+          },
+          "caps": { "perTxMaxUsdc6dec": "864000000", "perAddressPerHour": 5, "globalPerHour": 100 },
+          "failover": "3 independent relayers — pick any node, retry next on 5xx/timeout"
+        },
+        "keeper": {
+          "note": "Server-side; no client API. Keeps paymaster cachedPrice fresh so gasless quotes don't fail on stale price.",
+          "paymasters": {
+            "superPaymaster": "0x030025f40d509b1a99547bAEb3795bD27F7182b7",
+            "paymasterV4_community": "0x957852251f44570dc2B60Dde0954f191FF3372eE"
+          }
+        },
+        "health": "GET {url}/health -> {status:'ok', capabilities:[{name,enabled}]}"
+      }
     },
-    {
-      "url": "https://dvt2.aastar.io",
-      "nodeId": "0xd907ad728a7091c5cc628d9c7c71ae8d69f062a39533a2890bea3c299bacd201"
-    },
-    {
-      "url": "https://dvt3.aastar.io",
-      "nodeId": "0xd4f954361cdb2b2d89a631c939b6f930de5b2c5753911d2be7fb1ecc9f17a60e"
+    "mainnet": {
+      "network": "mainnet",
+      "chainId": 1,
+      "status": "NOT DEPLOYED — placeholder. Same shape; swap dvtNodes urls + nodeIds + all addresses, then set active='mainnet'."
     }
-  ],
-  "endpoints": {
-    "sign": "POST {url}/signature/sign  body: {userOp, ownerAuth}  -> {nodeId, signature(EIP-2537), publicKey}",
-    "aggregate": "POST {url}/signature/aggregate",
-    "verify": "POST {url}/signature/verify",
-    "info": "GET {url}/node/info",
-    "openapi": "GET {url}/api"
   }
 }
