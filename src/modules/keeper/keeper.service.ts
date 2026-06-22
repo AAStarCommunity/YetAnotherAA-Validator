@@ -42,7 +42,8 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
   private readonly refreshBufferS: bigint;
   private readonly maxUpdatesPerDay: number;
   private readonly maxBaseFeeGwei: bigint;
-  private readonly paymasterAddress: string;
+  /** One or more paymasters to keep fresh (KEEPER_PAYMASTER_ADDRESS, comma-separated). */
+  private readonly paymasterAddresses: string[];
   private readonly chainlinkFeed: string;
   private readonly clock: () => number;
   private readonly random: () => number;
@@ -67,7 +68,10 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
     this.refreshBufferS = BigInt(config.get<string>("keeperRefreshBufferS") ?? "300");
     this.maxUpdatesPerDay = config.get<number>("keeperMaxUpdatesPerDay") ?? 48;
     this.maxBaseFeeGwei = BigInt(config.get<string>("keeperMaxBaseFeeGwei") ?? "50");
-    this.paymasterAddress = config.get<string>("keeperPaymasterAddress") ?? "";
+    this.paymasterAddresses = (config.get<string>("keeperPaymasterAddress") ?? "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
     this.chainlinkFeed = config.get<string>("keeperChainlinkFeed") ?? "";
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
@@ -75,14 +79,15 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
     capabilityRegistry?.register({
       name: "keeper",
       class: "infra-app",
-      description: "Chainlink price keeper — keeps SuperPaymaster cachedPrice fresh (#58)",
+      description:
+        "Chainlink price keeper — keeps SuperPaymaster / PaymasterV4 cachedPrice fresh (#58)",
       enabled: this.enabled,
     });
   }
 
   onApplicationBootstrap(): void {
     if (!this.enabled) return;
-    if (!this.paymasterAddress) {
+    if (this.paymasterAddresses.length === 0) {
       this.logger.warn(
         "Keeper: KEEPER_ENABLED=true but KEEPER_PAYMASTER_ADDRESS not set — disabled"
       );
@@ -102,7 +107,7 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
     }, jitterMs);
     this.logger.log(
       `Price Keeper ENABLED — interval=${this.intervalMs}ms jitter=${jitterMs}ms ` +
-        `paymaster=${this.paymasterAddress} buffer=${this.refreshBufferS}s ` +
+        `paymasters=[${this.paymasterAddresses.join(", ")}] buffer=${this.refreshBufferS}s ` +
         `cap=${this.maxUpdatesPerDay}/day maxBaseFee=${this.maxBaseFeeGwei}gwei`
     );
   }
@@ -142,17 +147,34 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
       return;
     }
 
-    // Read on-chain price freshness.
-    const { updatedAt, threshold } = await this.blockchainService.getPriceInfo(
-      this.paymasterAddress
-    );
-    const nowS = BigInt(Math.floor(this.clock() / 1000));
-    const age = nowS - updatedAt;
-    const timeUntilStale = threshold - age;
+    // Guardrail: skip the whole tick if gas is expensive (one read per tick).
+    const baseFeeGwei = await this.blockchainService.getBaseFeeGwei();
+    if (baseFeeGwei > this.maxBaseFeeGwei) {
+      this.logger.warn(
+        `Keeper: baseFee ${baseFeeGwei} gwei > max ${this.maxBaseFeeGwei} gwei, skipping`
+      );
+      return;
+    }
 
+    const nowS = BigInt(Math.floor(this.clock() / 1000));
+    // Each paymaster is independent (its own staleness threshold). The daily cap
+    // is shared across all of them; stop once it's exhausted this tick.
+    for (const addr of this.paymasterAddresses) {
+      if (this.updatesToday >= this.maxUpdatesPerDay) break;
+      await this.refreshOne(addr, nowS);
+    }
+  }
+
+  /**
+   * Refresh a single paymaster if its cached price is approaching staleness AND
+   * Chainlink has a newer reading. Never throws; logs + notifies on failure.
+   */
+  private async refreshOne(paymaster: string, nowS: bigint): Promise<void> {
+    const { updatedAt, threshold } = await this.blockchainService.getPriceInfo(paymaster);
+    const timeUntilStale = threshold - (nowS - updatedAt);
     if (timeUntilStale > this.refreshBufferS) {
       this.logger.debug(
-        `Keeper: price fresh — stale in ${timeUntilStale}s (buffer=${this.refreshBufferS}s)`
+        `Keeper: ${paymaster} fresh — stale in ${timeUntilStale}s (buffer=${this.refreshBufferS}s)`
       );
       return;
     }
@@ -163,32 +185,24 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
     );
     if (chainlinkUpdatedAt <= updatedAt) {
       this.logger.debug(
-        `Keeper: Chainlink not updated since last price (chainlink=${chainlinkUpdatedAt} ≤ price=${updatedAt}), skipping`
-      );
-      return;
-    }
-
-    // Guardrail: skip if gas is expensive.
-    const baseFeeGwei = await this.blockchainService.getBaseFeeGwei();
-    if (baseFeeGwei > this.maxBaseFeeGwei) {
-      this.logger.warn(
-        `Keeper: baseFee ${baseFeeGwei} gwei > max ${this.maxBaseFeeGwei} gwei, skipping`
+        `Keeper: ${paymaster} Chainlink not updated since last price ` +
+          `(chainlink=${chainlinkUpdatedAt} ≤ price=${updatedAt}), skipping`
       );
       return;
     }
 
     try {
-      const txHash = await this.blockchainService.updatePrice(this.paymasterAddress);
+      const txHash = await this.blockchainService.updatePrice(paymaster);
       this.updatesToday++;
       this.logger.log(
-        `Keeper: updatePrice() → ${txHash} (${this.updatesToday}/${this.maxUpdatesPerDay} today)`
+        `Keeper: ${paymaster} updatePrice() → ${txHash} (${this.updatesToday}/${this.maxUpdatesPerDay} today)`
       );
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.logger.error(`Keeper: updatePrice() failed — ${msg}`);
+      this.logger.error(`Keeper: ${paymaster} updatePrice() failed — ${msg}`);
       // Fire-and-forget alert (notification failure must never block the keeper loop).
       void this.notificationService
-        .sendToAccount(this.paymasterAddress, `[Keeper] updatePrice failed: ${msg}`)
+        .sendToAccount(paymaster, `[Keeper] updatePrice failed: ${msg}`)
         .catch(() => {});
     }
   }

@@ -375,12 +375,19 @@ export class BlockchainService {
    * ABI confirmed against SuperPaymaster v5.4.x `getCachedPriceInfo()` + `priceStalenessThreshold()`.
    */
   async getPriceInfo(paymasterAddress: string): Promise<{ updatedAt: bigint; threshold: bigint }> {
+    // Both SuperPaymaster v3 (PriceCache: int256 price, uint256 updatedAt, uint80
+    // roundId, uint8 decimals) and PaymasterV4 (uint208 price, uint48 updatedAt)
+    // expose `cachedPrice()` — NOT `getCachedPriceInfo()` (which reverts on the
+    // current deployments). ABI encoding pads each field to its own word, so
+    // `updatedAt` is the 2nd return value in BOTH; a single minimal 2-field ABI
+    // reads it correctly for either type. (ABI mirrors @aastar/sdk PaymasterClient;
+    // the node stays standalone — no SDK runtime dep, per the DVT↛SDK contract.)
     const abi = [
-      "function getCachedPriceInfo() view returns (uint256 price, uint256 updatedAt)",
+      "function cachedPrice() view returns (uint256 price, uint256 updatedAt)",
       "function priceStalenessThreshold() view returns (uint256)",
     ];
     const contract = new ethers.Contract(paymasterAddress, abi, this.provider);
-    const [, updatedAt] = await contract.getCachedPriceInfo();
+    const [, updatedAt] = await contract.cachedPrice();
     const threshold = await contract.priceStalenessThreshold();
     return { updatedAt: BigInt(updatedAt), threshold: BigInt(threshold) };
   }

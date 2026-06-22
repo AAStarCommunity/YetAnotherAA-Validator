@@ -72,10 +72,14 @@ export default () => {
     // backend-independent (algorithm/wire is the fixed kernel — see conformance/).
     signerBackend: process.env.SIGNER_BACKEND || "local",
 
-    // Price Keeper (#58). Opt-in; keeps SuperPaymaster cachedPrice permanently fresh via
+    // Price Keeper (#58). Opt-in; keeps paymaster cachedPrice permanently fresh via
     // on-chain updatePrice() calls when approaching the staleness threshold. Requires
     // ETH_PRIVATE_KEY (or a dedicated KEEPER_PRIVATE_KEY in a future phase). Default off.
     // KEEPER_CHAINLINK_FEED defaults to the canonical Sepolia ETH/USD feed.
+    // KEEPER_PAYMASTER_ADDRESS is comma-separated — keep multiple paymasters fresh with
+    // one keeper (e.g. SuperPaymaster + a community PaymasterV4). The reader binds to
+    // `cachedPrice()` (returns price, updatedAt) which both SuperPaymaster v3 and
+    // PaymasterV4 expose; each paymaster's own priceStalenessThreshold is honored.
     keeperEnabled: process.env.KEEPER_ENABLED === "true",
     keeperIntervalMs: parseInt(process.env.KEEPER_INTERVAL_MS || "60000", 10),
     keeperRefreshBufferS: process.env.KEEPER_REFRESH_BUFFER_S || "300",
