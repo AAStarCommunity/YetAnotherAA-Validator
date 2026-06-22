@@ -33,6 +33,9 @@ notify-contacts.json
 .env.sepolia
 .env.*
 .env*.local
+# but DO track committed example templates (no secrets)
+!*.example
+!deploy/*.example
 
 # Testnet deploy secrets (BLS keys + tunnel token / RPC)
 deploy/node*/node_state.json
