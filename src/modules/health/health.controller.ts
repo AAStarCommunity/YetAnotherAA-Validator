@@ -3,21 +3,50 @@ import { ApiOperation, ApiTags } from "@nestjs/swagger";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 
 /**
- * Top-level liveness endpoint. Plain `GET /health` is the conventional probe
- * (Docker/Cloudflare/uptime monitors hit it); the node previously only exposed
- * `/node/info` and `/relay/health`, so a bare `/health` 404'd. This always
- * returns 200 while the process is up and lists which optional capabilities are
- * enabled (relay, keeper, policy, …) from the global CapabilityRegistry.
+ * Root + liveness endpoints. Plain `GET /health` is the conventional probe
+ * (Docker/Cloudflare/uptime monitors hit it), and `GET /` is the bare-domain
+ * landing — both previously 404'd. They always return 200 while the process is
+ * up and list which optional capabilities are enabled (relay, keeper, policy, …)
+ * from the global CapabilityRegistry.
  */
 @ApiTags("health")
-@Controller("health")
+@Controller()
 export class HealthController {
   constructor(@Optional() private readonly capabilities?: CapabilityRegistry) {}
 
   @Get()
+  @ApiOperation({ summary: "Service index — identity + enabled capabilities + endpoint map" })
+  root(): {
+    service: string;
+    status: string;
+    capabilities: Array<{ name: string; enabled: boolean }>;
+    endpoints: Record<string, string>;
+  } {
+    return {
+      service: "aastar-dvt-node",
+      status: "ok",
+      capabilities: this.capList(),
+      endpoints: {
+        health: "GET /health",
+        node: "GET /node/info",
+        sign: "POST /signature/sign",
+        aggregate: "POST /signature/aggregate",
+        verify: "POST /signature/verify",
+        relay: "POST /v3/relay",
+        relayHealth: "GET /relay/health",
+        admin: "GET /admin",
+        docs: "GET /api",
+      },
+    };
+  }
+
+  @Get("health")
   @ApiOperation({ summary: "Liveness check + enabled capabilities" })
   health(): { status: string; capabilities: Array<{ name: string; enabled: boolean }> } {
-    const caps = (this.capabilities?.list() ?? []).map(c => ({ name: c.name, enabled: c.enabled }));
-    return { status: "ok", capabilities: caps };
+    return { status: "ok", capabilities: this.capList() };
+  }
+
+  private capList(): Array<{ name: string; enabled: boolean }> {
+    return (this.capabilities?.list() ?? []).map(c => ({ name: c.name, enabled: c.enabled }));
   }
 }
