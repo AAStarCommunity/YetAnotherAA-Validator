@@ -191,6 +191,18 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
       return;
     }
 
+    // Final guard against redundant keepers: the staleness read above is from the
+    // start of the tick; another keeper may have updated the price since. Static-
+    // simulate updatePrice() right before submitting — if it would revert (price
+    // already fresh / not ready), skip instead of broadcasting a doomed tx that
+    // burns gas and jams the operator's nonce queue.
+    if (!(await this.blockchainService.canUpdatePrice(paymaster))) {
+      this.logger.debug(
+        `Keeper: ${paymaster} updatePrice would revert (already fresh / not ready), skipping`
+      );
+      return;
+    }
+
     try {
       const txHash = await this.blockchainService.updatePrice(paymaster);
       this.updatesToday++;

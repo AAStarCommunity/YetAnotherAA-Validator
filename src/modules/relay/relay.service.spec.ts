@@ -171,9 +171,16 @@ describe("RelayService", () => {
   describe("rate limiting", () => {
     it("enforces the per-address hourly cap", async () => {
       const svc = makeService();
-      // Inject a stub wallet so relay() proceeds past INFRA_NOT_READY.
+      // Inject a stub wallet (with a provider for the fee-bump) so relay()
+      // proceeds past INFRA_NOT_READY.
       (svc as any).wallet = {
         address: buyer.address,
+        provider: {
+          getFeeData: async () => ({
+            maxFeePerGas: 3_000_000_000n,
+            maxPriorityFeePerGas: 2_000_000_000n,
+          }),
+        },
         sendTransaction: async () => ({ hash: "0xdead" }),
       };
 

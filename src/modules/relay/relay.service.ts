@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional, OnApplicationBootstrap } from "@nestjs/co
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
+import { bumpedFees } from "../../utils/gas.util.js";
 import { RelayV3Dto } from "./dto/relay.dto.js";
 import {
   BUY_INTENT_DOMAIN_NAME,
@@ -298,10 +299,15 @@ export class RelayService implements OnApplicationBootstrap {
 
   private async sendTx(callData: string, matchedRule: string): Promise<RelayResult> {
     try {
+      // Bump fees (estimate +15%, priority floor) so the tx mines promptly — a
+      // BuyIntent carries a deadline, and an underpriced tx that mines late
+      // reverts on-chain with Expired (still burning the operator's gas).
+      const fees = await bumpedFees(this.wallet!.provider!);
       const tx = await this.wallet!.sendTransaction({
         to: this.buyHelper,
         data: callData,
         value: 0n,
+        ...fees,
       });
       this.logger.log(`Relay submitted ${matchedRule} → ${tx.hash}`);
       return { ok: true, txHash: tx.hash, matchedRule };

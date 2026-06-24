@@ -86,6 +86,10 @@ export default () => {
     keeperMaxUpdatesPerDay: parseInt(process.env.KEEPER_MAX_UPDATES_PER_DAY || "48", 10),
     keeperMaxBaseFeeGwei: process.env.KEEPER_MAX_BASE_FEE_GWEI || "50",
     keeperPaymasterAddress: process.env.KEEPER_PAYMASTER_ADDRESS || "",
+    // Dedicated keeper signer — keep it SEPARATE from RELAY_OPERATOR_PK so the
+    // keeper's updatePrice() nonce queue can't contend with relay submissions on
+    // one EOA. Falls back to ETH_PRIVATE_KEY only when unset.
+    keeperPrivateKey: process.env.KEEPER_PRIVATE_KEY || undefined,
     keeperChainlinkFeed:
       process.env.KEEPER_CHAINLINK_FEED || "0x694AA1769357215DE4FAC081bf1f309aDC325306",
 

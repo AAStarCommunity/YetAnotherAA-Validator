@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
+import { bumpedFees } from "../../utils/gas.util.js";
 
 /** ERC-4337 v0.7 PackedUserOperation (the exact tuple EntryPoint.getUserOpHash takes). */
 export interface PackedUserOp {
@@ -20,6 +21,11 @@ export class BlockchainService {
   private readonly logger = new Logger(BlockchainService.name);
   private provider: ethers.Provider;
   private wallet: ethers.Wallet;
+  /** Dedicated keeper signer (KEEPER_PRIVATE_KEY) — kept SEPARATE from the relay
+   *  operator key and the admin/registration key so the keeper's updatePrice()
+   *  nonce queue can't contend with relay submissions on the same EOA. Falls back
+   *  to `wallet` (ETH_PRIVATE_KEY) only when KEEPER_PRIVATE_KEY is unset. */
+  private keeperWallet?: ethers.Wallet;
 
   constructor(private configService: ConfigService) {
     this.initializeProvider();
@@ -35,16 +41,31 @@ export class BlockchainService {
       this.logger.warn(
         "ETH_PRIVATE_KEY not set or using placeholder, blockchain operations will be disabled"
       );
-      return;
+    } else {
+      try {
+        this.wallet = new ethers.Wallet(privateKey, this.provider);
+        this.logger.log(`Blockchain service initialized with wallet: ${this.wallet.address}`);
+      } catch (error: any) {
+        this.logger.error(`Invalid private key provided: ${error.message}`);
+        this.logger.warn("Blockchain write operations will be disabled");
+      }
     }
 
-    try {
-      this.wallet = new ethers.Wallet(privateKey, this.provider);
-      this.logger.log(`Blockchain service initialized with wallet: ${this.wallet.address}`);
-    } catch (error: any) {
-      this.logger.error(`Invalid private key provided: ${error.message}`);
-      this.logger.warn("Blockchain write operations will be disabled");
+    // Dedicated keeper signer (optional). Unset → keeper reuses `wallet`.
+    const keeperKey = this.configService.get<string>("keeperPrivateKey");
+    if (keeperKey && /^0x[0-9a-fA-F]{64}$/.test(keeperKey)) {
+      try {
+        this.keeperWallet = new ethers.Wallet(keeperKey, this.provider);
+        this.logger.log(`Keeper signer (dedicated): ${this.keeperWallet.address}`);
+      } catch (error: any) {
+        this.logger.error(`Invalid KEEPER_PRIVATE_KEY: ${error.message}`);
+      }
     }
+  }
+
+  /** Signer the keeper uses for updatePrice() — dedicated key if set, else the admin wallet. */
+  private get keeperSigner(): ethers.Wallet | undefined {
+    return this.keeperWallet ?? this.wallet;
   }
 
   async registerNodeOnChain(
@@ -410,17 +431,40 @@ export class BlockchainService {
   }
 
   /**
-   * Call SuperPaymaster.updatePrice() — pushes a fresh Chainlink price on-chain.
-   * Requires a wallet (ETH_PRIVATE_KEY or KEEPER_PRIVATE_KEY).
-   * Returns the transaction hash.
+   * Static-simulate updatePrice() WITHOUT sending a tx. Returns true if it would
+   * succeed, false if it would revert (e.g. SuperPaymaster's OracleError when the
+   * cached price is already as fresh as Chainlink). The keeper calls this right
+   * before submitting so that, when several redundant keepers tick close together,
+   * only the first actually spends gas — the rest see the just-updated price and
+   * skip instead of broadcasting a doomed (revert) tx. Cheap eth_call, no nonce.
+   */
+  async canUpdatePrice(paymasterAddress: string): Promise<boolean> {
+    const signer = this.keeperSigner;
+    const abi = ["function updatePrice() external"];
+    const contract = new ethers.Contract(paymasterAddress, abi, signer ?? this.provider);
+    try {
+      await contract.updatePrice.staticCall();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Call SuperPaymaster/PaymasterV4 updatePrice() — pushes a fresh Chainlink price
+   * on-chain. Uses the dedicated keeper signer (KEEPER_PRIVATE_KEY) when set, and
+   * bumps the EIP-1559 fees (estimate +15%, priority floor) so the tx mines
+   * promptly instead of sitting underpriced. Returns the transaction hash.
    */
   async updatePrice(paymasterAddress: string): Promise<string> {
-    if (!this.wallet) {
-      throw new Error("Keeper: no wallet configured — set ETH_PRIVATE_KEY or KEEPER_PRIVATE_KEY");
+    const signer = this.keeperSigner;
+    if (!signer) {
+      throw new Error("Keeper: no wallet configured — set KEEPER_PRIVATE_KEY or ETH_PRIVATE_KEY");
     }
     const abi = ["function updatePrice() external"];
-    const contract = new ethers.Contract(paymasterAddress, abi, this.wallet);
-    const tx: ethers.TransactionResponse = await contract.updatePrice();
+    const contract = new ethers.Contract(paymasterAddress, abi, signer);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.updatePrice(fees);
     return tx.hash;
   }
 }
