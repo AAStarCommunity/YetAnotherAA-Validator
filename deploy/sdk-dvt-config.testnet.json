@@ -55,7 +55,7 @@
             "paymentToken_usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
             "targetToken_gtoken": "0x20a051502a7AE6e40cfFd6EBe59057538E698984",
             "targetToken_apnts": "0x9e66B457E0ABb1F139FD8A596d00f784eBA2873b",
-            "buyHelper": "0x0EA2AEd239574F4e875Ae570C67825da845E7e66"
+            "buyHelper": "0xF78f898413ef069C870A554f47B66eC6D9c5B429"
           },
           "caps": { "perTxMaxUsdc6dec": "864000000", "perAddressPerHour": 5, "globalPerHour": 100 },
           "failover": "3 independent relayers — pick any node, retry next on 5xx/timeout"
