@@ -7,6 +7,11 @@ stable hostname.
 
 > This is the reproducible path behind the AAStar testnet DVT. The same compose
 > file is what the reference deployment runs.
+>
+> **Deploying to mainnet?** This page is the **testnet** runbook. For production
+> (mainnet) — test↔prod differences, prerequisites, the prod runbook, full
+> regression, and upstream/downstream notification — see
+> [`docs/PRODUCTION_DEPLOYMENT.md`](../docs/PRODUCTION_DEPLOYMENT.md).
 
 ## Prerequisites
 

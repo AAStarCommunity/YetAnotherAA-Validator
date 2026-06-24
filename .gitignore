@@ -40,6 +40,7 @@ notify-contacts.json
 # Testnet deploy secrets (BLS keys + tunnel token / RPC)
 deploy/node*/node_state.json
 deploy/.env.testnet
+deploy/.env.mainnet
 deploy/.cf-run-token
 deploy/.run/
 
