@@ -25,6 +25,7 @@ function makeBlockchain(
     getChainlinkUpdatedAt: () => Promise<bigint>;
     getBaseFeeGwei: () => Promise<bigint>;
     updatePrice: () => Promise<string>;
+    canUpdatePrice: () => Promise<boolean>;
   }> = {}
 ): any {
   return {
@@ -32,6 +33,8 @@ function makeBlockchain(
     getChainlinkUpdatedAt: overrides.getChainlinkUpdatedAt ?? (async () => 2000n),
     getBaseFeeGwei: overrides.getBaseFeeGwei ?? (async () => 10n),
     updatePrice: overrides.updatePrice ?? (async () => "0xabc"),
+    // Default: the on-chain static-sim says the update would succeed.
+    canUpdatePrice: overrides.canUpdatePrice ?? (async () => true),
   };
 }
 
@@ -140,6 +143,22 @@ describe("KeeperService", () => {
     const svc = new KeeperService(blockchain, makeNotify(), makeConfig(), NOW_NEAR_EXPIRY);
     await svc.tick();
     expect(updatePriceCalled).toHaveLength(1);
+  });
+
+  it("tick: skips submit when static-sim says updatePrice would revert (another keeper won)", async () => {
+    const updatePriceCalled: boolean[] = [];
+    const blockchain = makeBlockchain({
+      // stale + chainlink newer (would normally submit), but the pre-submit
+      // static-sim reverts → another keeper already refreshed it → skip.
+      canUpdatePrice: async () => false,
+      updatePrice: async () => {
+        updatePriceCalled.push(true);
+        return "0x";
+      },
+    });
+    const svc = new KeeperService(blockchain, makeNotify(), makeConfig(), NOW_NEAR_EXPIRY);
+    await svc.tick();
+    expect(updatePriceCalled).toHaveLength(0);
   });
 
   it("tick: skips when daily cap reached", async () => {
