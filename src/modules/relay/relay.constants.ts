@@ -39,13 +39,13 @@ export const EXECUTE_BUY_FRAGMENT =
   " bytes buyIntentSig," +
   " (uint256 validAfter,uint8 v,bytes32 r,bytes32 s) transferAuth)";
 
-/** Sepolia Path-A canonical-bound stack; buyHelper = onlyRelayer redeploy 2026-06-23
- *  (MushroomDAO/launch#21 — whitelists the 3 DVT operators). Override via env in prod. */
+/** Sepolia Path-A canonical-bound stack; buyHelper = audit-fix redeploy 2026-06-24
+ *  (MushroomDAO/launch#27 — receiveWithAuthorization, whitelists the 3 DVT operators). Override via env in prod. */
 export const SEPOLIA_DEFAULTS = {
   usdc: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
   gtoken: "0x20a051502a7AE6e40cfFd6EBe59057538E698984",
   apnts: "0x9e66B457E0ABb1F139FD8A596d00f784eBA2873b",
-  buyHelper: "0xF78f898413ef069C870A554f47B66eC6D9c5B429",
+  buyHelper: "0x8d08fBD8297355BC93397820AE1CfFD884BEaA00",
   chainId: 11155111,
 } as const;
 
