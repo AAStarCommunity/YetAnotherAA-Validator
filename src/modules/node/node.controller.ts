@@ -7,10 +7,10 @@ import { NodeService } from "./node.service.js";
 export class NodeController {
   constructor(private readonly nodeService: NodeService) {}
 
-  @ApiOperation({ summary: "Get current node information" })
+  @ApiOperation({ summary: "Get current node information (private key never exposed)" })
   @ApiResponse({
     status: 200,
-    description: "Current node information with hidden private key",
+    description: "Current node information — the private key is omitted entirely",
     schema: {
       type: "object",
       properties: {
@@ -20,21 +20,18 @@ export class NodeController {
         },
         nodeName: { type: "string", description: "Name of the node" },
         publicKey: { type: "string", description: "Public key in hex format" },
-        privateKey: {
-          type: "string",
-          description: "Always hidden for security",
-        },
         createdAt: { type: "string", description: "Node creation timestamp" },
       },
     },
   })
   @Get("info")
   getCurrentNodeInfo() {
-    const nodeState = this.nodeService.getCurrentNode();
-    return {
-      ...nodeState,
-      privateKey: "***HIDDEN***",
-    };
+    // Strip the private key OUT of the response (not just mask its value) so the
+    // public endpoint never even names the field. Other callers read the key via
+    // NodeService.getNodeForSigning(), not this DTO.
+    const { privateKey: _omitted, ...safe } = this.nodeService.getCurrentNode();
+    void _omitted;
+    return safe;
   }
 
   @ApiOperation({ summary: "Register current node on-chain" })
