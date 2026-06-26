@@ -60,6 +60,12 @@ export default () => {
     confirmEnabled: process.env.CONFIRM_ENABLED === "true",
     confirmThresholdWei: process.env.CONFIRM_THRESHOLD_WEI || "0",
     confirmTtlMs: parseInt(process.env.CONFIRM_TTL_MS || "600000", 10),
+    // KMS endpoint for passkey out-of-band confirmation (path-2, #124/#193): the node
+    // delegates WebAuthn RP verification to KMS (POST /verify-confirm-assertion) and
+    // resolves verified contacts (GET /contact/{account}). Use a DEDICATED per-node,
+    // revocable API key (it reads PII). Unset → passkey confirm fail-closed.
+    kmsBaseUrl: process.env.KMS_BASE_URL || undefined,
+    kmsApiKey: process.env.KMS_API_KEY || undefined,
 
     // Per-IP rate limiting on signature endpoints (#50 hardening ⑦). Opt-in;
     // bounds pre-auth on-chain RPC amplification. Default off = behavior unchanged.

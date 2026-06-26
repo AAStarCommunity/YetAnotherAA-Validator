@@ -136,16 +136,31 @@ export class SignatureController {
     return { userOpHash, ...s };
   }
 
-  @ApiOperation({ summary: "Approve a high-value op pending out-of-band confirmation" })
-  @ApiResponse({ status: 200, description: "Confirmation result { confirmed: boolean }" })
+  @ApiOperation({
+    summary: "Approve a high-value op pending out-of-band confirmation (passkey path-2 or legacy token)",
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      "{ status: 'confirmed'|'rejected', confirmed: boolean }. Pass `passkey` " +
+      "(raw AuthenticationResponseJSON, #124 path-2 — KMS RP verifies) or legacy `token`.",
+  })
   @Post("confirm")
-  confirm(@Body() body: { userOpHash?: string; token?: string }) {
-    const ok =
-      typeof body?.userOpHash === "string" &&
-      typeof body?.token === "string" &&
-      this.signatureService.confirm(body.userOpHash, body.token);
-    this.logger.log(`Confirm ${body?.userOpHash}: ${ok ? "accepted" : "rejected"}`);
-    return { confirmed: ok };
+  async confirm(
+    @Body() body: { userOpHash?: string; token?: string; passkey?: unknown }
+  ): Promise<{ status: "confirmed" | "rejected"; confirmed: boolean }> {
+    let ok = false;
+    if (typeof body?.userOpHash === "string") {
+      if (body.passkey) {
+        ok = await this.signatureService.confirmWithPasskey(body.userOpHash, body.passkey);
+      } else if (typeof body.token === "string") {
+        ok = this.signatureService.confirm(body.userOpHash, body.token);
+      }
+    }
+    this.logger.log(
+      `Confirm ${body?.userOpHash} (${body?.passkey ? "passkey" : "token"}): ${ok ? "accepted" : "rejected"}`
+    );
+    return { status: ok ? "confirmed" : "rejected", confirmed: ok };
   }
 
   @ApiOperation({ summary: "Aggregate multiple BLS signatures" })

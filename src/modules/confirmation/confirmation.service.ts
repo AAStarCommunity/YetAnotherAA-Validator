@@ -2,9 +2,17 @@ import { Injectable, Logger, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { randomBytes } from "crypto";
+import axios from "axios";
 import { PackedUserOp } from "../blockchain/blockchain.service.js";
 import { NotificationService } from "../notification/notification.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
+
+/** Out-of-band approval factor injected for testing the KMS RP verification. */
+export type KmsVerifyFn = (
+  account: string,
+  userOpHash: string,
+  passkey: unknown
+) => Promise<boolean>;
 
 /** Result of the confirmation gate for a co-sign request. */
 export type GateResult = "not_required" | "confirmed" | "pending" | "undeliverable";
@@ -16,6 +24,8 @@ interface Pending {
   token: string;
   confirmed: boolean;
   expiry: number;
+  /** Account (userOp.sender) — passed to KMS for passkey RP verification (path-2). */
+  account: string;
 }
 
 const EXECUTE_SELECTOR = ethers.id("execute(address,uint256,bytes)").slice(0, 10);
@@ -48,16 +58,25 @@ export class ConfirmationService {
   private readonly enabled: boolean;
   private readonly thresholdWei: bigint;
   private readonly ttlMs: number;
+  private readonly kmsBaseUrl: string;
+  private readonly kmsApiKey: string;
+  /** KMS RP verification (test seam — defaults to the real HTTP call). */
+  private readonly kmsVerify: KmsVerifyFn;
   private readonly pending = new Map<string, Pending>();
 
   constructor(
     configService: ConfigService,
     private readonly notificationService: NotificationService,
-    @Optional() capabilityRegistry?: CapabilityRegistry
+    @Optional() capabilityRegistry?: CapabilityRegistry,
+    /** Test seam: inject a fake KMS verifier. Production uses the real HTTP call. */
+    @Optional() kmsVerify?: KmsVerifyFn
   ) {
     this.enabled = configService.get<boolean>("confirmEnabled") === true;
     this.thresholdWei = BigInt(configService.get<string>("confirmThresholdWei") ?? "0");
     this.ttlMs = configService.get<number>("confirmTtlMs") ?? 600_000; // 10 min default
+    this.kmsBaseUrl = (configService.get<string>("kmsBaseUrl") ?? "").replace(/\/$/, "");
+    this.kmsApiKey = configService.get<string>("kmsApiKey") ?? "";
+    this.kmsVerify = kmsVerify ?? ((a, u, p) => this.realKmsVerify(a, u, p));
     capabilityRegistry?.register({
       name: "confirm",
       class: "infra-app",
@@ -96,7 +115,12 @@ export class ConfirmationService {
     // New high-value op → require out-of-band approval.
     if (!this.notificationService.hasContact(userOp.sender)) return "undeliverable";
     const token = "0x" + randomBytes(16).toString("hex");
-    this.pending.set(userOpHash, { token, confirmed: false, expiry: now + this.ttlMs });
+    this.pending.set(userOpHash, {
+      token,
+      confirmed: false,
+      expiry: now + this.ttlMs,
+      account: userOp.sender ?? "",
+    });
     const msg =
       `🔐 DVT confirmation required for ${userOp.sender}.\n` +
       `Op ${userOpHash}\nApprove only if you initiated it. Confirm token: ${token}`;
@@ -131,6 +155,69 @@ export class ConfirmationService {
     if (!p || p.expiry <= Date.now() || p.token !== token) return false;
     p.confirmed = true;
     return true;
+  }
+
+  /**
+   * Approve a pending op via a passkey (WebAuthn) assertion — path-2 (#124, #193).
+   * The passkey is a factor INDEPENDENT of the owner key, so this approval survives
+   * owner-key compromise (a stolen secp256k1 owner key alone cannot produce it).
+   *
+   * Two checks, both must pass (fail-closed):
+   *   1. local binding: clientDataJSON.type == "webauthn.get" AND challenge == base64url(userOpHash)
+   *      — the assertion is bound to THIS op (the node enforces this itself).
+   *   2. KMS RP verify: the WebAuthn assertion is cryptographically valid for the
+   *      account's registered passkey (the RP lives in KMS, not the node).
+   * `passkey` is the raw `navigator.credentials.get()` AuthenticationResponseJSON.
+   */
+  async confirmWithPasskey(userOpHash: string, passkey: unknown): Promise<boolean> {
+    const p = this.pending.get(userOpHash);
+    if (!p || p.expiry <= Date.now()) return false;
+
+    if (!this.assertionBindsTo(passkey, userOpHash)) {
+      this.logger.warn(`Passkey confirm ${userOpHash}: clientData challenge ≠ userOpHash — rejected`);
+      return false;
+    }
+    const verified = await this.kmsVerify(p.account, userOpHash, passkey).catch(e => {
+      this.logger.error(`Passkey confirm ${userOpHash}: KMS verify threw — ${String(e)}`);
+      return false; // fail-closed
+    });
+    if (!verified) return false;
+
+    p.confirmed = true;
+    return true;
+  }
+
+  /** clientDataJSON.type == "webauthn.get" AND its challenge == base64url(userOpHash). */
+  private assertionBindsTo(passkey: unknown, userOpHash: string): boolean {
+    try {
+      const cdjB64 = (passkey as { response?: { clientDataJSON?: unknown } })?.response
+        ?.clientDataJSON;
+      if (typeof cdjB64 !== "string") return false;
+      const cdj = JSON.parse(Buffer.from(cdjB64, "base64url").toString("utf8"));
+      if (cdj?.type !== "webauthn.get") return false;
+      const expected = Buffer.from(userOpHash.replace(/^0x/, ""), "hex").toString("base64url");
+      return cdj?.challenge === expected;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Real KMS RP verification — POST /verify-confirm-assertion (per-node x-api-key). Fail-closed. */
+  private async realKmsVerify(
+    account: string,
+    userOpHash: string,
+    passkey: unknown
+  ): Promise<boolean> {
+    if (!this.kmsBaseUrl) {
+      this.logger.error("Passkey confirm: KMS_BASE_URL not set — fail-closed");
+      return false;
+    }
+    const res = await axios.post(
+      `${this.kmsBaseUrl}/verify-confirm-assertion`,
+      { account, userOpHash, passkey },
+      { headers: { "x-api-key": this.kmsApiKey }, timeout: 8000 }
+    );
+    return res.data?.verified === true;
   }
 
   private nativeValue(userOp: PackedUserOp): bigint {
