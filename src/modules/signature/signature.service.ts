@@ -12,7 +12,10 @@ import { PackedUserOp } from "../blockchain/blockchain.service.js";
 /** Returned (instead of a signature) when a high-value op awaits out-of-band confirmation. */
 export interface PendingConfirmation {
   status: "pending_confirmation";
+  /** Pollable id — feed to GET /signature/confirmation/:userOpHash. */
   userOpHash: string;
+  /** Unix-ms expiry; after this the op must be re-submitted (it re-arms). null if unknown. */
+  expiresAt: number | null;
   message: string;
 }
 
@@ -62,9 +65,11 @@ export class SignatureService {
     }
     if (gate === "pending") {
       this.logger.log(`Awaiting out-of-band confirmation for ${userOpHash}`);
+      const { expiresAt } = this.confirmationService.getStatus(userOpHash);
       return {
         status: "pending_confirmation",
         userOpHash,
+        expiresAt,
         message: "high-value operation pending out-of-band confirmation; approve via your channel",
       };
     }
@@ -81,6 +86,11 @@ export class SignatureService {
   /** Approve a pending high-value op (out-of-band confirmation, #50 ⑤). */
   confirm(userOpHash: string, token: string): boolean {
     return this.confirmationService.confirm(userOpHash, token);
+  }
+
+  /** Read-only poll of a pending confirmation's status (#124, for SDK/UI). */
+  getConfirmationStatus(userOpHash: string) {
+    return this.confirmationService.getStatus(userOpHash);
   }
 
   async aggregateExternalSignatures(signatureStrings: string[]): Promise<AggregateSignatureResult> {
