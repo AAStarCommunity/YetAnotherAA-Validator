@@ -42,7 +42,29 @@ function make(config: Record<string, unknown>, n: any): ConfirmationService {
   return new ConfirmationService({ get: (k: string) => config[k] } as any, n);
 }
 
+/** Build a service with an injected KMS verifier (path-2 test seam). */
+function makeKms(config: Record<string, unknown>, n: any, kmsVerify: any): ConfirmationService {
+  return new ConfirmationService({ get: (k: string) => config[k] } as any, n, undefined, kmsVerify);
+}
+
 const HASH = "0x" + "cd".repeat(32);
+
+/** base64url of a hex string's bytes. */
+function challengeOf(hash: string): string {
+  return Buffer.from(hash.replace(/^0x/, ""), "hex").toString("base64url");
+}
+/** A raw AuthenticationResponseJSON whose clientDataJSON binds `challengeB64`. */
+function passkeyWithChallenge(challengeB64: string): unknown {
+  const clientDataJSON = Buffer.from(
+    JSON.stringify({ type: "webauthn.get", challenge: challengeB64, origin: "https://kms.aastar.io" })
+  ).toString("base64url");
+  return {
+    id: "cred",
+    rawId: "cred",
+    type: "public-key",
+    response: { authenticatorData: "AAAA", clientDataJSON, signature: "BBBB" },
+  };
+}
 
 describe("ConfirmationService — out-of-band confirmation (scheme A, #50 ⑤)", () => {
   it("not_required when disabled", async () => {
@@ -110,6 +132,59 @@ describe("ConfirmationService — out-of-band confirmation (scheme A, #50 ⑤)",
     expect(svc.getStatus(HASH).status).toBe("approved");
     // read-only: polling didn't consume it — the gate still releases it
     expect(await svc.gate(executeUserOp(101n), HASH)).toBe("confirmed");
+  });
+
+  it("confirmWithPasskey: valid binding + KMS verified → confirmed, account passed, gate releases", async () => {
+    const calls: Array<{ a: string; u: string }> = [];
+    const svc = makeKms(
+      { confirmEnabled: true, confirmThresholdWei: "100" },
+      notif(true),
+      async (a: string, u: string) => {
+        calls.push({ a, u });
+        return true;
+      }
+    );
+    await svc.gate(executeUserOp(101n), HASH);
+    expect(await svc.confirmWithPasskey(HASH, passkeyWithChallenge(challengeOf(HASH)))).toBe(true);
+    expect(calls[0]).toEqual({ a: ACCOUNT, u: HASH }); // account (userOp.sender) forwarded to KMS
+    expect(await svc.gate(executeUserOp(101n), HASH)).toBe("confirmed");
+  });
+
+  it("confirmWithPasskey: challenge ≠ userOpHash → rejected, KMS NOT called", async () => {
+    let called = false;
+    const svc = makeKms({ confirmEnabled: true, confirmThresholdWei: "100" }, notif(true), async () => {
+      called = true;
+      return true;
+    });
+    await svc.gate(executeUserOp(101n), HASH);
+    // assertion bound to a different hash → local binding check fails first
+    expect(
+      await svc.confirmWithPasskey(HASH, passkeyWithChallenge(challengeOf("0x" + "00".repeat(32))))
+    ).toBe(false);
+    expect(called).toBe(false);
+  });
+
+  it("confirmWithPasskey: binding ok but KMS verified:false → rejected (fail-closed)", async () => {
+    const svc = makeKms(
+      { confirmEnabled: true, confirmThresholdWei: "100" },
+      notif(true),
+      async () => false
+    );
+    await svc.gate(executeUserOp(101n), HASH);
+    expect(await svc.confirmWithPasskey(HASH, passkeyWithChallenge(challengeOf(HASH)))).toBe(false);
+  });
+
+  it("confirmWithPasskey: KMS throws → rejected (fail-closed)", async () => {
+    const svc = makeKms({ confirmEnabled: true, confirmThresholdWei: "100" }, notif(true), async () => {
+      throw new Error("kms down");
+    });
+    await svc.gate(executeUserOp(101n), HASH);
+    expect(await svc.confirmWithPasskey(HASH, passkeyWithChallenge(challengeOf(HASH)))).toBe(false);
+  });
+
+  it("confirmWithPasskey: no pending entry → false", async () => {
+    const svc = makeKms({ confirmEnabled: true, confirmThresholdWei: "100" }, notif(true), async () => true);
+    expect(await svc.confirmWithPasskey(HASH, passkeyWithChallenge(challengeOf(HASH)))).toBe(false);
   });
 
   it("getStatus: expired once TTL elapsed (ttl=0)", async () => {

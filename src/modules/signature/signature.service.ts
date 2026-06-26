@@ -88,6 +88,11 @@ export class SignatureService {
     return this.confirmationService.confirm(userOpHash, token);
   }
 
+  /** Approve via a passkey (WebAuthn) assertion — path-2, KMS RP verify (#124/#193). */
+  confirmWithPasskey(userOpHash: string, passkey: unknown): Promise<boolean> {
+    return this.confirmationService.confirmWithPasskey(userOpHash, passkey);
+  }
+
   /** Read-only poll of a pending confirmation's status (#124, for SDK/UI). */
   getConfirmationStatus(userOpHash: string) {
     return this.confirmationService.getStatus(userOpHash);
