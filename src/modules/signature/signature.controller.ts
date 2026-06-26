@@ -1,4 +1,4 @@
-import { Controller, Post, Body, ValidationPipe, Logger, UseGuards } from "@nestjs/common";
+import { Controller, Post, Get, Param, Body, ValidationPipe, Logger, UseGuards } from "@nestjs/common";
 import { ThrottleGuard } from "../../common/throttle.guard.js";
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from "@nestjs/swagger";
 import { SignatureService } from "./signature.service.js";
@@ -119,6 +119,21 @@ export class SignatureController {
       this.logger.error(`❌ Sign Failed: ${error.message}`);
       throw error;
     }
+  }
+
+  @ApiOperation({ summary: "Poll out-of-band confirmation status (#124, for SDK/UI)" })
+  @ApiResponse({
+    status: 200,
+    description:
+      "{ userOpHash, status: pending|approved|expired|not_found, expiresAt }. " +
+      "approved → re-submit POST /signature/sign to release the signature; " +
+      "not_found → never created or already consumed by a successful sign; " +
+      "expired → TTL elapsed (re-submitting sign re-arms a new confirmation).",
+  })
+  @Get("confirmation/:userOpHash")
+  getConfirmationStatus(@Param("userOpHash") userOpHash: string) {
+    const s = this.signatureService.getConfirmationStatus(userOpHash);
+    return { userOpHash, ...s };
   }
 
   @ApiOperation({ summary: "Approve a high-value op pending out-of-band confirmation" })

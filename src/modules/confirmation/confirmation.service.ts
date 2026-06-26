@@ -9,6 +9,9 @@ import { CapabilityRegistry } from "../capability/capability-registry.service.js
 /** Result of the confirmation gate for a co-sign request. */
 export type GateResult = "not_required" | "confirmed" | "pending" | "undeliverable";
 
+/** Read-only poll status of a pending confirmation (for SDK/UI; see getStatus). */
+export type ConfirmationStatus = "pending" | "approved" | "expired" | "not_found";
+
 interface Pending {
   token: string;
   confirmed: boolean;
@@ -103,6 +106,23 @@ export class ConfirmationService {
       return "undeliverable";
     }
     return "pending";
+  }
+
+  /**
+   * Read-only status of a pending confirmation — does NOT consume it (for SDK/UI
+   * polling, #124). The single-use consumption happens in gate() when the sign is
+   * re-submitted after approval.
+   *   not_found = never created, or already consumed by a successful sign
+   *   pending   = awaiting out-of-band approval
+   *   approved  = approved; re-submit the sign to release the signature
+   *   expired   = TTL elapsed without approval (the implicit "rejected"; explicit
+   *               reject isn't modeled — letting it expire is how a user declines)
+   */
+  getStatus(userOpHash: string): { status: ConfirmationStatus; expiresAt: number | null } {
+    const p = this.pending.get(userOpHash);
+    if (!p) return { status: "not_found", expiresAt: null };
+    if (p.expiry <= Date.now()) return { status: "expired", expiresAt: p.expiry };
+    return { status: p.confirmed ? "approved" : "pending", expiresAt: p.expiry };
   }
 
   /** Approve a pending op by its userOpHash + the out-of-band token. Single-use. */

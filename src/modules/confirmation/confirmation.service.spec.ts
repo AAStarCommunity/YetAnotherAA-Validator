@@ -95,6 +95,30 @@ describe("ConfirmationService — out-of-band confirmation (scheme A, #50 ⑤)",
     expect(await svc.gate(executeUserOp(101n), HASH)).toBe("pending");
   });
 
+  it("getStatus: not_found before any gate, pending after, approved after confirm (read-only)", async () => {
+    const n = notif(true);
+    const svc = make({ confirmEnabled: true, confirmThresholdWei: "100" }, n);
+    expect(svc.getStatus(HASH)).toEqual({ status: "not_found", expiresAt: null });
+
+    await svc.gate(executeUserOp(101n), HASH);
+    const pend = svc.getStatus(HASH);
+    expect(pend.status).toBe("pending");
+    expect(typeof pend.expiresAt).toBe("number");
+
+    const token = n.sent[0].match(/Confirm token: (0x[0-9a-f]+)/)![1];
+    svc.confirm(HASH, token);
+    expect(svc.getStatus(HASH).status).toBe("approved");
+    // read-only: polling didn't consume it — the gate still releases it
+    expect(await svc.gate(executeUserOp(101n), HASH)).toBe("confirmed");
+  });
+
+  it("getStatus: expired once TTL elapsed (ttl=0)", async () => {
+    const n = notif(true);
+    const svc = make({ confirmEnabled: true, confirmThresholdWei: "100", confirmTtlMs: 0 }, n);
+    await svc.gate(executeUserOp(101n), HASH);
+    expect(svc.getStatus(HASH).status).toBe("expired");
+  });
+
   it("expires a pending confirmation (ttl=0)", async () => {
     const n = notif(true);
     const svc = make({ confirmEnabled: true, confirmThresholdWei: "100", confirmTtlMs: 0 }, n);
