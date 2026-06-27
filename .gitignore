@@ -46,3 +46,6 @@ deploy/.run/
 
 # Per-node env overrides (independent keys: relay operator, keeper)
 deploy/node*/.env
+
+# test coverage report
+coverage/
