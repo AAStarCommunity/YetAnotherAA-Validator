@@ -86,14 +86,19 @@ const DEPS = [
     repo: "AAStarCommunity/AirAccount",
     relationship:
       "UPSTREAM — KMS produces account owner secp256k1 sig (ownerAuth) Stage-1 verifies; C1 binding",
-    version: "v0.23.0",
+    version: "v0.26.1",
     configPath: null,
     configKey: null,
     addressLabel: null, // KMS/TA — no on-chain contract this node binds to
     address: null,
     // The signing scheme lives in the TEE Trusted App, NOT the host. ownerAuth verification
     // only breaks if the TA signing changes — so guard the TA (and proto) version.
-    deep: { versionGuard: { label: "TA", pinned: "0.5.0" } },
+    // Re-pinned v0.23.0→v0.26.1 / TA 0.5.0→0.8.0 (2026-06-27): reviewed every TA bump
+    // 0.6/0.7/0.8 — all in WebAuthn rpId / P256 session-key / agent-key paths, NONE touch
+    // the secp256k1 ownerAuth-over-userOpHash scheme this node's Stage-1 gate verifies.
+    // KMS verifyConfirmAssertion/getContact (path-2, #124/#126) are now address-keyed
+    // (userOp.sender), matching our impl. v0.27.0 was host-only (TA unchanged at 0.8.0).
+    deep: { versionGuard: { label: "TA", pinned: "0.8.0" } },
   },
 ];
 
