@@ -177,7 +177,11 @@ export class ConfirmationService {
       this.logger.warn(`Passkey confirm ${userOpHash}: clientData challenge ≠ userOpHash — rejected`);
       return false;
     }
-    const verified = await this.kmsVerify(p.account, userOpHash, passkey).catch(e => {
+    // Lowercase the account before the KMS call — defense-in-depth so a checksummed
+    // (EIP-55) userOp.sender always matches KMS's address key. KMS normalizes to
+    // lowercase internally (AirAccount v0.27.2), but we don't depend on that here.
+    const account = (p.account || "").toLowerCase();
+    const verified = await this.kmsVerify(account, userOpHash, passkey).catch(e => {
       this.logger.error(`Passkey confirm ${userOpHash}: KMS verify threw — ${String(e)}`);
       return false; // fail-closed
     });

@@ -150,6 +150,23 @@ describe("ConfirmationService — out-of-band confirmation (scheme A, #50 ⑤)",
     expect(await svc.gate(executeUserOp(101n), HASH)).toBe("confirmed");
   });
 
+  it("confirmWithPasskey: lowercases the account before the KMS call (defense-in-depth)", async () => {
+    const seen: string[] = [];
+    const svc = makeKms(
+      { confirmEnabled: true, confirmThresholdWei: "100" },
+      notif(true),
+      async (a: string) => {
+        seen.push(a);
+        return true;
+      }
+    );
+    const MIXED = "0xAbCdEf0000000000000000000000000000000011";
+    const hash = "0x" + "ee".repeat(32);
+    await svc.gate({ ...executeUserOp(101n), sender: MIXED }, hash);
+    expect(await svc.confirmWithPasskey(hash, passkeyWithChallenge(challengeOf(hash)))).toBe(true);
+    expect(seen[0]).toBe(MIXED.toLowerCase()); // checksummed sender → lowercased to KMS
+  });
+
   it("confirmWithPasskey: challenge ≠ userOpHash → rejected, KMS NOT called", async () => {
     let called = false;
     const svc = makeKms({ confirmEnabled: true, confirmThresholdWei: "100" }, notif(true), async () => {
