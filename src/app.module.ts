@@ -9,6 +9,7 @@ import { AppConfigModule } from "./config/config.module.js";
 import { CapabilityModule } from "./modules/capability/capability.module.js";
 import { KeeperModule } from "./modules/keeper/keeper.module.js";
 import { RelayModule } from "./modules/relay/relay.module.js";
+import { X402FacilitatorModule } from "./modules/x402-facilitator/x402-facilitator.module.js";
 import { HealthModule } from "./modules/health/health.module.js";
 
 @Module({
@@ -23,6 +24,7 @@ import { HealthModule } from "./modules/health/health.module.js";
     DashboardModule,
     KeeperModule,
     RelayModule,
+    X402FacilitatorModule,
     HealthModule,
   ],
 })

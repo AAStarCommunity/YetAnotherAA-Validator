@@ -7,7 +7,9 @@ import { ConfigService } from "@nestjs/config";
 import { GossipService } from "./modules/gossip/gossip.service.js";
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // rawBody: true exposes the unparsed request body (req.rawBody) so the optional
+  // x402 HMAC challenge guard can verify HMAC over the exact bytes the client signed.
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   app.useGlobalPipes(
     new ValidationPipe({
