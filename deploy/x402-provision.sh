@@ -38,12 +38,14 @@ APNTS=0x696A73701b104c6cCBbAadDD2216788ea08EaB89
 PNTS=0xE6579A90dc498a710008de12119812D0FB7aA224
 ROLE_PAYMASTER_SUPER="$(cast keccak 'PAYMASTER_SUPER')" # 0x2024516755f4…
 
-# Derive the 3 operator addresses from the per-node env (the keys never leave the host).
+# Read the 3 operator ADDRESSES from the per-node env (never the keys — so no operator
+# private key reaches a cast CLI / `ps`). X402_OPERATOR_ADDRESS is written alongside
+# X402_OPERATOR_PK when the keys are generated.
 ops=()
 for i in 1 2 3; do
-  pk="$(grep -E '^X402_OPERATOR_PK=' "$REPO/deploy/node$i/.env" | cut -d= -f2)"
-  [ -n "$pk" ] || { echo "node$i: no X402_OPERATOR_PK in deploy/node$i/.env"; exit 1; }
-  ops+=("$(cast wallet address --private-key "$pk")")
+  addr="$(grep -E '^X402_OPERATOR_ADDRESS=' "$REPO/deploy/node$i/.env" | cut -d= -f2)"
+  [ -n "$addr" ] || { echo "node$i: no X402_OPERATOR_ADDRESS in deploy/node$i/.env"; exit 1; }
+  ops+=("$addr")
 done
 echo "operators: dvt1=${ops[0]} dvt2=${ops[1]} dvt3=${ops[2]}"
 

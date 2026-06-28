@@ -31,10 +31,38 @@ AUTH=(--private-key "$AASTAR_OWNER_KEY")
 has() { [ "$(cast call "$REGISTRY" 'hasRole(bytes32,address)(bool)' "$1" "$2" --rpc-url "$RPC_URL")" = "true" ]; }
 approve() { cast send "$GTOKEN" 'approve(address,uint256)' "$STAKING" "$1" "${AUTH[@]}" --rpc-url "$RPC_URL" >/dev/null; }
 mint() { echo "  + safeMintForRole $3"; cast send "$REGISTRY" 'safeMintForRole(bytes32,address,bytes)' "$1" "$2" "$4" "${AUTH[@]}" --rpc-url "$RPC_URL" >/dev/null; }
+# Read operator ADDRESSES (never the keys) so no operator private key reaches a cast CLI / `ps`.
+op_addr() { grep -E '^X402_OPERATOR_ADDRESS=' "$REPO/deploy/node$1/.env" | cut -d= -f2; }
+
+# Sponsor address (for the pre-flight) without exposing the key: prefer the keystore
+# account; else derive from the env key (already used by the --private-key sends below).
+if [ -n "${AASTAR_ACCOUNT:-}" ]; then
+  SPONSOR="$(cast wallet address --account "$AASTAR_ACCOUNT")"
+else
+  SPONSOR="$(cast wallet address --private-key "$AASTAR_OWNER_KEY")"
+fi
+
+# Pre-flight: the sponsor must hold ROLE_COMMUNITY (safeMintForRole gates on it) and
+# enough GToken to cover every operator still needing registration (~85 GToken each:
+# 30 community ticket + 50 stake + 5 super ticket). Fail BEFORE any tx so we never
+# stop mid-loop in a half-registered state under `set -e`.
+has "$ROLE_COMMUNITY" "$SPONSOR" || { echo "sponsor $SPONSOR lacks ROLE_COMMUNITY — safeMintForRole would revert"; exit 1; }
+need=0
+for i in 1 2 3; do
+  OP="$(op_addr "$i")"
+  [ -n "$OP" ] || { echo "node$i: no X402_OPERATOR_ADDRESS in deploy/node$i/.env"; exit 1; }
+  has "$ROLE_COMMUNITY" "$OP" || need=$((need + 35))
+  has "$ROLE_SUPER" "$OP" || need=$((need + 55))
+done
+if [ "$need" -gt 0 ]; then
+  bal_wei="$(cast call "$GTOKEN" 'balanceOf(address)(uint256)' "$SPONSOR" --rpc-url "$RPC_URL" | awk '{print $1}')"
+  bal_gt="$(cast --to-unit "$bal_wei" ether)"
+  echo "sponsor $SPONSOR GToken=$bal_gt, need ≈ $need for unregistered operators"
+  awk -v b="$bal_gt" -v n="$need" 'BEGIN{ if (b+0 < n+0) exit 1 }' || { echo "INSUFFICIENT GToken (have $bal_gt, need ~$need)"; exit 1; }
+fi
 
 for i in 1 2 3; do
-  pk="$(grep -E '^X402_OPERATOR_PK=' "$REPO/deploy/node$i/.env" | cut -d= -f2)"
-  OP="$(cast wallet address --private-key "$pk")"
+  OP="$(op_addr "$i")"
   echo "== dvt$i operator $OP =="
 
   if has "$ROLE_COMMUNITY" "$OP"; then
