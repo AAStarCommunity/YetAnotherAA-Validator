@@ -180,20 +180,40 @@ pointing at `https://dvt{1,2,3}.aastar.io/x402` once these nodes are deployed.
 
 ---
 
-## 4. Optional HMAC anti-spam guard (`/x402/settle`)
+## 4. Optional auth headers (`/x402/settle`) — `createAuthHeaders` scheme
 
-Opt-in via `ENABLE_HMAC_CHALLENGE=true` + `HMAC_SECRET`. Recommended for PUBLIC
+Opt-in via `X402_AUTH_ENABLED=true` + `X402_AUTH_SECRET`. Recommended for PUBLIC
 nodes to blunt replay/bot spam on the gas-spending settle path. **Not a security
 gate** — the on-chain authorization is authoritative.
 
-1. Client calls `/x402/settle` with no HMAC headers → **402** carrying
-   `X-Challenge: <ts>:hmac(secret, "challenge:<ts>")` (self-verifying, 5-min
-   TTL, no server state).
-2. Client recomputes `X-Payment-HMAC = hmac(challenge, rawBody)` and replays
-   with both `X-Challenge` and `X-Payment-HMAC`. HMAC covers the raw request
-   bytes (`main.ts` enables `rawBody: true`).
+The scheme is **stateless HMAC**, shaped to map 1:1 onto the SDK's
+`FacilitatorConfig.createAuthHeaders()` (which must return headers with no prior
+round-trip). Two headers on `POST /x402/settle`:
 
-When disabled (default), the guard is a no-op.
+```
+X-X402-Timestamp: <unix epoch ms>
+X-X402-Auth:      hex HMAC-SHA256(X402_AUTH_SECRET, `${timestamp}.${rawBody}`)
+```
+
+The node accepts iff `|now − timestamp| ≤ X402_AUTH_TTL_MS` (default 300 000)
+and the HMAC matches (constant-time) over the **raw** request bytes (`main.ts`
+sets `rawBody: true`). On failure: 401 (missing/stale), 403 (HMAC mismatch).
+`/verify` and `/supported` stay open. When disabled (default) the guard is a
+no-op.
+
+SDK side — `createAuthHeaders()` returns, for the body it will POST:
+
+```ts
+const ts = Date.now();
+const auth = hmacSha256Hex(secret, `${ts}.${JSON.stringify(body)}`);
+return { settle: { "X-X402-Timestamp": String(ts), "X-X402-Auth": auth } };
+```
+
+> Replaces the earlier challenge-response HMAC (which needed a server-issued
+> `X-Challenge` and so couldn't fit `createAuthHeaders`). Settle replay is
+> already neutralised on-chain — the X402Facilitator nonce is single-use — so a
+> TTL-bounded stateless HMAC is sufficient. A golden header vector lives in
+> `conformance/x402/fixtures.json` (`authHeader`).
 
 ---
 
@@ -208,9 +228,10 @@ X402_OPERATOR_PK=0x…            # DEDICATED key — NOT ETH_PRIVATE_KEY / RELA
 X402_FEE_BPS=200
 X402_CHAIN_ID=11155111
 X402_RPC_URL=https://…          # falls back to ETH_RPC_URL
-# Optional anti-spam
-ENABLE_HMAC_CHALLENGE=true
-HMAC_SECRET=<32-byte random>
+# Optional stateless-HMAC auth on /x402/settle (see §4)
+X402_AUTH_ENABLED=true
+X402_AUTH_SECRET=<32-byte random>
+X402_AUTH_TTL_MS=300000
 ```
 
 | Default asset | Token | Sepolia address                              | Scheme   |
@@ -261,7 +282,39 @@ transferFrom allowance firewall).
 
 ---
 
-## 7. Source provenance
+## 7. Conformance fixtures & live round-trip
+
+`conformance/x402/fixtures.json` holds the **golden wire vectors** — the exact
+`/x402/{verify,settle}` request bodies a conformant SDK emits (one `direct`, one
+`eip-3009`, signed by a fixed key), plus the values the DVT derives (effective
+nonce, ordered settle args, payer) and the `authHeader` vector. It is the
+cross-repo contract: `x402-conformance.spec.ts` drives the DVT off-chain against
+it, and the SDK can load the same JSON to assert its `createPayment` produces
+byte-identical envelopes. Regenerate with:
+
+```bash
+node scripts/x402/gen-conformance-fixtures.mjs > conformance/x402/fixtures.json
+```
+
+Once a node exposes `/x402` (testnet operator provisioned per §6), a live
+round-trip:
+
+```bash
+BODY=$(jq -c '.vectors[1].body' conformance/x402/fixtures.json)   # eip-3009 vector
+curl -s -X POST https://<node>/x402/verify -H 'content-type: application/json' -d "$BODY"
+# → { "isValid": true, "payer": "0x…" }   (verify is off-chain; open by default)
+curl -s -X POST https://<node>/x402/settle -H 'content-type: application/json' -d "$BODY"
+# → { "success": true, "transaction": "0x…", "network": "eip155:11155111", "payer": "0x…" }
+```
+
+(With `X402_AUTH_ENABLED`, add the §4 `X-X402-Timestamp` / `X-X402-Auth`
+headers. The fixture vectors use placeholder addresses, so a real round-trip
+needs an envelope signed for the deployed token/facilitator and a funded,
+provisioned operator.)
+
+---
+
+## 8. Source provenance
 
 - HTTP contract: `aastar-sdk/packages/x402/src/{facilitator,types}.ts`.
 - verify/settle logic ported (viem → ethers v6) from the battle-tested reference

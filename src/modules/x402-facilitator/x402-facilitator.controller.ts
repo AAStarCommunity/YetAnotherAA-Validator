@@ -1,8 +1,17 @@
-import { Body, Controller, Get, HttpException, HttpStatus, Post, UseGuards } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpException,
+  HttpStatus,
+  Post,
+  UseGuards,
+} from "@nestjs/common";
 import { ApiOperation, ApiTags } from "@nestjs/swagger";
 import { X402FacilitatorService } from "./x402-facilitator.service.js";
 import { FacilitatorRequestDto } from "./dto/facilitator.dto.js";
-import { HmacChallengeGuard } from "./hmac-challenge.guard.js";
+import { X402AuthGuard } from "./x402-auth.guard.js";
 
 /**
  * x402 v2 facilitator endpoints (#130), wire-compatible with the SDK's
@@ -19,7 +28,7 @@ import { HmacChallengeGuard } from "./hmac-challenge.guard.js";
  *    outcomes (isValid:false / success:false carry the reason) so the SDK reads the
  *    result instead of throwing.
  *  - HTTP 503 only when the module is disabled/misconfigured on this node.
- *  - The optional HMAC guard may pre-empt /settle with 402/400/403 (anti-spam handshake).
+ *  - The optional stateless HMAC auth guard may pre-empt /settle with 401/403 (X402AuthGuard).
  */
 @ApiTags("x402-facilitator")
 @Controller("x402")
@@ -27,6 +36,7 @@ export class X402FacilitatorController {
   constructor(private readonly service: X402FacilitatorService) {}
 
   @Post("verify")
+  @HttpCode(HttpStatus.OK) // discriminated 200 body (not Nest's POST-default 201) per the documented contract
   @ApiOperation({ summary: "x402 verify — off-chain payment signature/expiry/replay check" })
   async verify(
     @Body() body: FacilitatorRequestDto
@@ -39,7 +49,8 @@ export class X402FacilitatorController {
   }
 
   @Post("settle")
-  @UseGuards(HmacChallengeGuard)
+  @HttpCode(HttpStatus.OK) // discriminated 200 body (not Nest's POST-default 201) per the documented contract
+  @UseGuards(X402AuthGuard)
   @ApiOperation({ summary: "x402 settle — submit the on-chain X402Facilitator settlement" })
   async settle(@Body() body: FacilitatorRequestDto): Promise<{
     success: boolean;

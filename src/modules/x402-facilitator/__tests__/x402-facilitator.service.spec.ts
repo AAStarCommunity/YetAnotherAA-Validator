@@ -16,6 +16,8 @@ const USDC = ethers.getAddress("0x" + "11".repeat(20)); // not supported → eip
 const PAY_TO = ethers.getAddress("0x" + "44".repeat(20));
 const NONCE = "0x" + "55".repeat(32);
 
+// TEST-ONLY deterministic keys (all-0x11 / all-0x22). They never hold funds —
+// they exist only to produce reproducible signatures in these unit tests.
 const payer = new ethers.Wallet("0x" + "11".repeat(32));
 const stranger = new ethers.Wallet("0x" + "22".repeat(32));
 
