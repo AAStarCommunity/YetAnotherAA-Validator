@@ -1,5 +1,7 @@
+import { jest } from "@jest/globals";
 import { readFileSync } from "fs";
 import { resolve } from "path";
+import { Logger } from "@nestjs/common";
 import { X402FacilitatorService } from "../x402-facilitator.service.js";
 import { X402AuthGuard, HEADER_TIMESTAMP, HEADER_AUTH } from "../x402-auth.guard.js";
 
@@ -133,6 +135,33 @@ describe("x402 conformance (golden wire vectors)", () => {
     it("is a no-op when disabled", () => {
       const off = new X402AuthGuard({ get: () => undefined } as any, () => tsMs);
       expect(off.canActivate(ctx({}, rawBody))).toBe(true);
+    });
+
+    it("warns at STARTUP when enabled without a secret (not just on first settle)", () => {
+      const warn = jest.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      try {
+        new X402AuthGuard(
+          { get: (k: string) => ({ x402AuthEnabled: true, x402AuthSecret: "" })[k] } as any,
+          () => tsMs
+        );
+        expect(warn).toHaveBeenCalledWith(expect.stringMatching(/X402_AUTH_SECRET/));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("logs a diagnostic (once) when rawBody is unavailable, then still authenticates", () => {
+      const warn = jest.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      try {
+        const body = { hello: "x402" };
+        const hdrs = X402AuthGuard.computeHeaders(secret, tsMs, JSON.stringify(body));
+        const req = { header: (k: string) => hdrs[k], rawBody: undefined, body };
+        const noRawCtx = { switchToHttp: () => ({ getRequest: () => req }) } as any;
+        expect(guard().canActivate(noRawCtx)).toBe(true);
+        expect(warn).toHaveBeenCalledWith(expect.stringMatching(/rawBody unavailable/));
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 });

@@ -4,6 +4,8 @@ import {
   HttpException,
   HttpStatus,
   Injectable,
+  Logger,
+  Optional,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { createHmac, timingSafeEqual } from "crypto";
@@ -35,16 +37,35 @@ export const HEADER_AUTH = "X-X402-Auth";
  */
 @Injectable()
 export class X402AuthGuard implements CanActivate {
+  private readonly logger = new Logger(X402AuthGuard.name);
+
   private readonly enabled: boolean;
   private readonly secret: string;
   private readonly ttlMs: number;
   private readonly now: () => number;
 
-  constructor(config: ConfigService, now?: () => number) {
+  /** Warn at most once per process when rawBody is missing (a deploy misconfig). */
+  private rawBodyWarned = false;
+
+  constructor(
+    config: ConfigService,
+    /** Test seam for the TTL clock; @Optional so Nest DI passes undefined at runtime. */
+    @Optional() now?: () => number
+  ) {
     this.enabled = config.get<boolean>("x402AuthEnabled") === true;
     this.secret = config.get<string>("x402AuthSecret") ?? "";
     this.ttlMs = config.get<number>("x402AuthTtlMs") ?? 300_000;
     this.now = now ?? (() => Date.now());
+
+    // Surface the misconfiguration at STARTUP, not on the first settle request:
+    // an operator who sets X402_AUTH_ENABLED without a secret would otherwise only
+    // discover it when a real settle comes in and gets a 503.
+    if (this.enabled && !this.secret) {
+      this.logger.warn(
+        "x402: X402_AUTH_ENABLED=true but X402_AUTH_SECRET is empty — every " +
+          "/x402/settle will be rejected (503) until a secret is set"
+      );
+    }
   }
 
   canActivate(context: ExecutionContext): boolean {
@@ -74,7 +95,25 @@ export class X402AuthGuard implements CanActivate {
       );
     }
 
-    const rawBody = req.rawBody?.toString("utf8") ?? JSON.stringify(req.body ?? {});
+    // The HMAC must cover the EXACT bytes the client signed. main.ts enables
+    // `rawBody: true`; if it's somehow absent we fall back to re-serialising the
+    // parsed body, which can differ byte-for-byte (key order/whitespace) and make
+    // every HMAC mismatch. That failure is otherwise indistinguishable from a real
+    // bad signature, so log a one-time server-side diagnostic pointing at the cause.
+    let rawBody: string;
+    if (req.rawBody !== undefined) {
+      rawBody = req.rawBody.toString("utf8");
+    } else {
+      rawBody = JSON.stringify(req.body ?? {});
+      if (!this.rawBodyWarned) {
+        this.rawBodyWarned = true;
+        this.logger.warn(
+          "x402: req.rawBody unavailable — HMAC computed over a re-serialised body, " +
+            "which may not byte-match the client and will reject valid requests. " +
+            "Ensure NestFactory.create(AppModule, { rawBody: true }) is set (see main.ts)."
+        );
+      }
+    }
     const expected = createHmac("sha256", this.secret).update(`${ts}.${rawBody}`).digest("hex");
     if (!safeEqualHex(expected, auth)) {
       throw new HttpException(

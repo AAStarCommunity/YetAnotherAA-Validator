@@ -24,6 +24,8 @@ const NONCE = "0x" + "55".repeat(32);
 const VALID_BEFORE = 2_000_000_000; // fixed future (s); tests pin now below this
 const VALID_AFTER_EIP3009 = 1_000_000_000;
 
+// TEST-ONLY deterministic key (all-0x11). NEVER holds funds; used solely to make
+// the golden fixtures reproducible. Do not reuse anywhere real.
 const payer = new ethers.Wallet("0x" + "11".repeat(32));
 
 const X402_AUTH_TYPES = {

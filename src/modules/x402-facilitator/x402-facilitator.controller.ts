@@ -1,4 +1,13 @@
-import { Body, Controller, Get, HttpException, HttpStatus, Post, UseGuards } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpException,
+  HttpStatus,
+  Post,
+  UseGuards,
+} from "@nestjs/common";
 import { ApiOperation, ApiTags } from "@nestjs/swagger";
 import { X402FacilitatorService } from "./x402-facilitator.service.js";
 import { FacilitatorRequestDto } from "./dto/facilitator.dto.js";
@@ -27,6 +36,7 @@ export class X402FacilitatorController {
   constructor(private readonly service: X402FacilitatorService) {}
 
   @Post("verify")
+  @HttpCode(HttpStatus.OK) // discriminated 200 body (not Nest's POST-default 201) per the documented contract
   @ApiOperation({ summary: "x402 verify — off-chain payment signature/expiry/replay check" })
   async verify(
     @Body() body: FacilitatorRequestDto
@@ -39,6 +49,7 @@ export class X402FacilitatorController {
   }
 
   @Post("settle")
+  @HttpCode(HttpStatus.OK) // discriminated 200 body (not Nest's POST-default 201) per the documented contract
   @UseGuards(X402AuthGuard)
   @ApiOperation({ summary: "x402 settle — submit the on-chain X402Facilitator settlement" })
   async settle(@Body() body: FacilitatorRequestDto): Promise<{
