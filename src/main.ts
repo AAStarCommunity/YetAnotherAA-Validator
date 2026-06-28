@@ -1,10 +1,14 @@
 import "reflect-metadata";
+import { createRequire } from "module";
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module.js";
 import { ValidationPipe } from "@nestjs/common";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import { ConfigService } from "@nestjs/config";
 import { GossipService } from "./modules/gossip/gossip.service.js";
+
+const require = createRequire(import.meta.url);
+const { version: APP_VERSION } = require("../package.json") as { version: string };
 
 async function bootstrap() {
   // rawBody: true exposes the unparsed request body (req.rawBody) so the optional
@@ -25,7 +29,7 @@ async function bootstrap() {
   const config = new DocumentBuilder()
     .setTitle("BLS Signer Service API")
     .setDescription("API documentation for ERC4337 BLS signature aggregation service")
-    .setVersion("1.0")
+    .setVersion(APP_VERSION)
     .addTag("signature", "Signature operations")
     .addTag("node", "Node management")
     .addTag("admin", "Admin panel for node management")

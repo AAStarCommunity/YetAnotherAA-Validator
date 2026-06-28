@@ -1,6 +1,10 @@
+import { createRequire } from "module";
 import { Controller, Get, Optional } from "@nestjs/common";
 import { ApiOperation, ApiTags } from "@nestjs/swagger";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
+
+const require = createRequire(import.meta.url);
+const { version: APP_VERSION } = require("../../../package.json") as { version: string };
 
 /**
  * Root + liveness endpoints. Plain `GET /health` is the conventional probe
@@ -42,8 +46,8 @@ export class HealthController {
 
   @Get("health")
   @ApiOperation({ summary: "Liveness check + enabled capabilities" })
-  health(): { status: string; capabilities: Array<{ name: string; enabled: boolean }> } {
-    return { status: "ok", capabilities: this.capList() };
+  health(): { status: string; version: string; capabilities: Array<{ name: string; enabled: boolean }> } {
+    return { status: "ok", version: APP_VERSION, capabilities: this.capList() };
   }
 
   private capList(): Array<{ name: string; enabled: boolean }> {
