@@ -36,7 +36,7 @@
     "@nestjs/core": "^11.1.27",
     "@nestjs/platform-express": "^11.1.27",
     "@nestjs/swagger": "^11.4.4",
-    "@noble/curves": "^2.0.1",
+    "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
     "@types/node": "^25.9.3",
     "@types/uuid": "^11.0.0",
