@@ -138,10 +138,13 @@ export default () => {
     x402FeeBPS: parseInt(process.env.X402_FEE_BPS || "200", 10),
     x402ChainId: parseInt(process.env.X402_CHAIN_ID || "11155111", 10),
     x402RpcUrl: process.env.X402_RPC_URL || undefined,
-    // Optional anti-spam HMAC challenge on /x402/settle (public nodes). Honors the
-    // reference node's env names (ENABLE_HMAC_CHALLENGE / HMAC_SECRET).
-    x402HmacEnabled: process.env.ENABLE_HMAC_CHALLENGE === "true",
-    x402HmacSecret: process.env.HMAC_SECRET || undefined,
+    // Optional stateless HMAC request-auth on /x402/settle (public nodes), shaped to
+    // map onto the SDK's FacilitatorConfig.createAuthHeaders(): the client sends
+    // X-X402-Timestamp + X-X402-Auth = HMAC-SHA256(secret, `${ts}.${rawBody}`); the
+    // node accepts within X402_AUTH_TTL_MS. Default off → settle unchanged.
+    x402AuthEnabled: process.env.X402_AUTH_ENABLED === "true",
+    x402AuthSecret: process.env.X402_AUTH_SECRET || undefined,
+    x402AuthTtlMs: parseInt(process.env.X402_AUTH_TTL_MS || "300000", 10),
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,

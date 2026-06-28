@@ -4,3 +4,6 @@ contracts/lib/
 contracts/out/
 
 contracts/cache/
+
+# Generated x402 conformance fixtures (byte-exact generator output; see scripts/x402/)
+conformance/x402/fixtures.json
