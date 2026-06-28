@@ -30,18 +30,18 @@
     "conformance": "node conformance/reference.mjs --check conformance/vectors.json"
   },
   "dependencies": {
-    "@nestjs/cli": "^11.0.10",
+    "@nestjs/cli": "^11.0.23",
     "@nestjs/common": "^11.1.27",
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.1.27",
     "@nestjs/platform-express": "^11.1.27",
     "@nestjs/swagger": "^11.4.4",
-    "@noble/curves": "^2.0.1",
+    "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
-    "@types/node": "^25.9.3",
+    "@types/node": "^26.0.1",
     "@types/uuid": "^11.0.0",
     "@types/ws": "^8.18.1",
-    "axios": "^1.18.0",
+    "axios": "^1.18.1",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "ethers": "^6.17.0",
@@ -50,7 +50,7 @@
     "swagger-ui-express": "^5.0.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.2",
-    "uuid": "^14.0.0",
+    "uuid": "^14.0.1",
     "ws": "^8.21.0"
   },
   "keywords": [
@@ -82,12 +82,12 @@
     "@jest/globals": "^30.4.1",
     "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.44.1",
-    "@typescript-eslint/parser": "^8.61.1",
+    "@typescript-eslint/eslint-plugin": "^8.62.0",
+    "@typescript-eslint/parser": "^8.62.0",
     "eslint": "^9.38.0",
     "jest": "^30.4.2",
     "prettier": "^3.8.4",
-    "prettier-plugin-solidity": "^2.1.0",
+    "prettier-plugin-solidity": "^2.3.1",
     "ts-jest": "^29.4.5"
   }
 }
