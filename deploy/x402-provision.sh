@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Provision the 3 testnet DVT x402 facilitator operators on-chain (#130 §6).
+#
+# The node services are already LIVE (/x402/verify + /x402/supported work). This
+# script does the remaining ON-CHAIN, OWNER-KEY steps that let /x402/settle succeed.
+# It needs PRIVILEGED keys that do NOT live in this repo:
+#
+#   AASTAR_OWNER_KEY   controls X402Facilitator + aPNTs + Registry  (owner 0xb5600060e6de5E11D3636731964218E53caadf0E)
+#   MYCELIUM_OWNER_KEY controls PNTs                                (owner 0xEcAACb915f7D92e9916f449F7ad42BD0408733c9)  [optional — only for PNTs settlement]
+#   FUNDER_KEY         any funded Sepolia EOA, to gas the 3 operators            [optional — skip if you fund them another way]
+#
+# Per-operator, this grants the two MANDATORY gates the contract checks:
+#   1. Registry.grantRole(keccak256("PAYMASTER_SUPER"), operator)   — both settle paths
+#   2. aPNTs.addApprovedFacilitator(operator)                       — direct (xPNTs) path
+#      PNTs.addApprovedFacilitator(operator)                        — direct path (Mycelium key)
+#   3. X402Facilitator.setOperatorFacilitatorFee(operator, 200)     — optional fee override
+#   4. fund operator with FUND_ETH Sepolia ETH                      — gas to submit settlements
+#
+# Usage:
+#   RPC_URL=https://… AASTAR_OWNER_KEY=0x… [MYCELIUM_OWNER_KEY=0x…] [FUNDER_KEY=0x…] \
+#     ./deploy/x402-provision.sh
+#
+# Idempotent: skips a step if the operator already has the role / approval. Needs foundry (cast).
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+: "${RPC_URL:?set RPC_URL (Sepolia)}"
+: "${AASTAR_OWNER_KEY:?set AASTAR_OWNER_KEY (owns X402Facilitator + aPNTs + Registry)}"
+FUND_ETH="${FUND_ETH:-0.05}"
+
+X402_FACILITATOR=0xfe1DB01e1d6622e722B92ed5993af61325DB92aF
+REGISTRY=0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71
+APNTS=0x696A73701b104c6cCBbAadDD2216788ea08EaB89
+PNTS=0xE6579A90dc498a710008de12119812D0FB7aA224
+ROLE_PAYMASTER_SUPER="$(cast keccak 'PAYMASTER_SUPER')" # 0x2024516755f4…
+
+# Derive the 3 operator addresses from the per-node env (the keys never leave the host).
+ops=()
+for i in 1 2 3; do
+  pk="$(grep -E '^X402_OPERATOR_PK=' "$REPO/deploy/node$i/.env" | cut -d= -f2)"
+  [ -n "$pk" ] || { echo "node$i: no X402_OPERATOR_PK in deploy/node$i/.env"; exit 1; }
+  ops+=("$(cast wallet address --private-key "$pk")")
+done
+echo "operators: dvt1=${ops[0]} dvt2=${ops[1]} dvt3=${ops[2]}"
+
+send() { echo "  + $1"; cast send "$2" "$3" "${@:4}" --rpc-url "$RPC_URL" >/dev/null; }
+
+for idx in 0 1 2; do
+  OP="${ops[$idx]}"; n=$((idx + 1))
+  echo "== dvt$n operator $OP =="
+
+  # 1. PAYMASTER_SUPER role (mandatory, both paths)
+  if [ "$(cast call "$REGISTRY" 'hasRole(bytes32,address)(bool)' "$ROLE_PAYMASTER_SUPER" "$OP" --rpc-url "$RPC_URL")" = "true" ]; then
+    echo "  = already has PAYMASTER_SUPER"
+  else
+    send "grant PAYMASTER_SUPER" "$REGISTRY" 'grantRole(bytes32,address)' "$ROLE_PAYMASTER_SUPER" "$OP" --private-key "$AASTAR_OWNER_KEY"
+  fi
+
+  # 2. aPNTs approved facilitator (direct path)
+  if [ "$(cast call "$APNTS" 'approvedFacilitators(address)(bool)' "$OP" --rpc-url "$RPC_URL")" = "true" ]; then
+    echo "  = already approved on aPNTs"
+  else
+    send "aPNTs addApprovedFacilitator" "$APNTS" 'addApprovedFacilitator(address)' "$OP" --private-key "$AASTAR_OWNER_KEY"
+  fi
+
+  # 2b. PNTs approved facilitator (needs the Mycelium owner key; optional)
+  if [ -n "${MYCELIUM_OWNER_KEY:-}" ]; then
+    if [ "$(cast call "$PNTS" 'approvedFacilitators(address)(bool)' "$OP" --rpc-url "$RPC_URL")" = "true" ]; then
+      echo "  = already approved on PNTs"
+    else
+      send "PNTs addApprovedFacilitator" "$PNTS" 'addApprovedFacilitator(address)' "$OP" --private-key "$MYCELIUM_OWNER_KEY"
+    fi
+  else
+    echo "  ~ skipping PNTs (set MYCELIUM_OWNER_KEY to enable PNTs settlement)"
+  fi
+
+  # 3. operator fee override (optional)
+  send "setOperatorFacilitatorFee 200" "$X402_FACILITATOR" 'setOperatorFacilitatorFee(address,uint256)' "$OP" 200 --private-key "$AASTAR_OWNER_KEY"
+
+  # 4. gas funding (optional)
+  if [ -n "${FUNDER_KEY:-}" ]; then
+    bal="$(cast balance "$OP" --rpc-url "$RPC_URL")"
+    if [ "$bal" = "0" ]; then
+      echo "  + fund $FUND_ETH ETH"; cast send "$OP" --value "${FUND_ETH}ether" --private-key "$FUNDER_KEY" --rpc-url "$RPC_URL" >/dev/null
+    else
+      echo "  = already funded ($bal wei)"
+    fi
+  else
+    echo "  ~ skipping funding (set FUNDER_KEY, or fund $OP with ~$FUND_ETH Sepolia ETH manually)"
+  fi
+done
+
+echo "done. Verify: curl -s https://dvt1.aastar.io/x402/supported | jq, then a live settle round-trip per docs §7."

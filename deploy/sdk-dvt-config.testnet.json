@@ -57,7 +57,11 @@
             "targetToken_apnts": "0x9e66B457E0ABb1F139FD8A596d00f784eBA2873b",
             "buyHelper": "0x8d08fBD8297355BC93397820AE1CfFD884BEaA00"
           },
-          "caps": { "perTxMaxUsdc6dec": "864000000", "perAddressPerHour": 5, "globalPerHour": 100 },
+          "caps": {
+            "perTxMaxUsdc6dec": "864000000",
+            "perAddressPerHour": 5,
+            "globalPerHour": 100
+          },
           "failover": "3 independent relayers — pick any node, retry next on 5xx/timeout"
         },
         "keeper": {
@@ -67,7 +71,40 @@
             "paymasterV4_community": "0x957852251f44570dc2B60Dde0954f191FF3372eE"
           }
         },
-        "health": "GET {url}/health -> {status:'ok', capabilities:[{name,enabled}]}"
+        "health": "GET {url}/health -> {status:'ok', capabilities:[{name,enabled}]}",
+        "x402": {
+          "_status": "endpoints LIVE (verify/supported); settle PENDING operator on-chain provisioning + gas (see docs/x402-facilitator.md §6)",
+          "endpoints": {
+            "verify": "POST {url}/x402/verify  body: {x402Version:2, paymentPayload, paymentRequirements} -> {isValid, invalidReason?, payer?}",
+            "settle": "POST {url}/x402/settle  -> {success, transaction?, network?, payer?, errorReason?}",
+            "supported": "GET {url}/x402/supported -> {kinds:[{x402Version,scheme,network,extra:{settlementSchemes,assets,feeBPS,facilitatorContract,operator}}], extensions}"
+          },
+          "facilitatorContract": "0xfe1DB01e1d6622e722B92ed5993af61325DB92aF",
+          "supportedAssets": {
+            "apnts_aastar": "0x696A73701b104c6cCBbAadDD2216788ea08EaB89",
+            "pnts_mycelium": "0xE6579A90dc498a710008de12119812D0FB7aA224"
+          },
+          "feeBPS": 200,
+          "extraSchema": "paymentRequirements.extra: { settlement?:\"direct\"|\"eip-3009\", maxFee?, salt?, name?, version? } — see docs/x402-facilitator.md §2",
+          "authHeaders": "optional stateless HMAC on /settle (X-X402-Timestamp + X-X402-Auth=HMAC-SHA256(secret, `${ts}.${rawBody}`)); off unless X402_AUTH_ENABLED",
+          "facilitators": [
+            {
+              "url": "https://dvt1.aastar.io/x402",
+              "operator": "0xF92DC383c74eA30d7791b929d5872daD18679516",
+              "supportedAssets": ["apnts_aastar", "pnts_mycelium"]
+            },
+            {
+              "url": "https://dvt2.aastar.io/x402",
+              "operator": "0x2e72A258FD9e1C69B2B2bB6ED8bC7E94773f7b00",
+              "supportedAssets": ["apnts_aastar", "pnts_mycelium"]
+            },
+            {
+              "url": "https://dvt3.aastar.io/x402",
+              "operator": "0x368f8Cb8cCA42174B03156cEa761BaE31cEE5C94",
+              "supportedAssets": ["apnts_aastar", "pnts_mycelium"]
+            }
+          ]
+        }
       }
     },
     "mainnet": {
