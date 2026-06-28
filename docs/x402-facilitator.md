@@ -266,14 +266,29 @@ cast send $APNTS_TOKEN "addApprovedFacilitator(address)" $OPERATOR_ADDRESS \
 cast send $PNTS_TOKEN  "addApprovedFacilitator(address)" $OPERATOR_ADDRESS \
   --private-key $COMMUNITY_OWNER_KEY --rpc-url $RPC_URL
 
-# 3. Grant the PAYMASTER_SUPER role in the Registry (onlyOwner). The role hash is
-#    keccak256("PAYMASTER_SUPER") — note: NO "ROLE_" prefix in the hashed string.
-cast send $REGISTRY "grantRole(bytes32,address)" \
-  $(cast keccak "PAYMASTER_SUPER") $OPERATOR_ADDRESS \
-  --private-key $DEPLOYER_KEY --rpc-url $RPC_URL
+# 3. PAYMASTER_SUPER role — NOT an owner grantRole. ⚠️ The Registry
+#    (SuperPaymaster contracts/src/core/Registry.sol) is NOT OpenZeppelin
+#    AccessControl. There is no admin grantRole; on-chain checks confirm getRoleAdmin
+#    reverts and the deployer lacks DEFAULT_ADMIN_ROLE. The role is acquired ONLY by
+#    the OPERATOR ITSELF:
+#      Registry.registerRole(keccak256("PAYMASTER_SUPER"), operator, roleData)   // msg.sender == operator
+#    and it requires, FIRST, that the operator already holds ROLE_COMMUNITY, then a
+#    STAKE of minStake GToken (config = 50e18) + ticketPrice via GTOKEN_STAKING, plus an
+#    SBT mint. So each facilitator operator must be onboarded as a staked community
+#    paymaster — a governance/economic step, not a deployer one-liner.
 ```
 
-The `direct` path requires the operator be in
+> ⚠️ **Registry role-grant correction (verified on-chain 2026-06-28).** The
+> issue #130 runbook's `Registry.grantRole(...)` is wrong (third runbook error):
+> the Registry is staking-based, so `grantRole` reverts. Granting
+> PAYMASTER_SUPER to a DVT x402 operator means registering that operator as a
+> **staked community paymaster** (`registerRole` self-call + ROLE_COMMUNITY +
+> ~50 GToken). This is an open AAStar/SuperPaymaster decision: (a) onboard+stake
+> each operator, (b) add a lighter facilitator-only gate to `X402Facilitator`,
+> or (c) another approach. `deploy/x402-provision.sh` detects-and-reports this
+> rather than attempting it.
+
+The `direct` path also requires the operator be in
 `IxPNTsToken(asset).approvedFacilitators(operator)` for each supported token —
 established by step 2's `addApprovedFacilitator` (callable only by the token's
 `communityOwner`; revocable instantly via `removeApprovedFacilitator` for

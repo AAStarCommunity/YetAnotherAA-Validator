@@ -9,8 +9,10 @@
 #   MYCELIUM_OWNER_KEY controls PNTs                                (owner 0xEcAACb915f7D92e9916f449F7ad42BD0408733c9)  [optional — only for PNTs settlement]
 #   FUNDER_KEY         any funded Sepolia EOA, to gas the 3 operators            [optional — skip if you fund them another way]
 #
-# Per-operator, this grants the two MANDATORY gates the contract checks:
-#   1. Registry.grantRole(keccak256("PAYMASTER_SUPER"), operator)   — both settle paths
+# Per-operator this does the steps an owner key CAN do:
+#   1. PAYMASTER_SUPER role — DETECT ONLY. The Registry is staking-based (registerRole,
+#      msg.sender==user, needs ROLE_COMMUNITY + ~50 GToken stake); an owner CANNOT grant
+#      it. Settle reverts without it — the script flags this; resolve per docs §6.
 #   2. aPNTs.addApprovedFacilitator(operator)                       — direct (xPNTs) path
 #      PNTs.addApprovedFacilitator(operator)                        — direct path (Mycelium key)
 #   3. X402Facilitator.setOperatorFacilitatorFee(operator, 200)     — optional fee override
@@ -59,15 +61,25 @@ FUNDER_AUTH=();   while IFS= read -r l; do FUNDER_AUTH+=("$l");     done < <(fun
 
 send() { echo "  + $1"; cast send "$2" "$3" "${@:4}" --rpc-url "$RPC_URL" >/dev/null; }
 
+ROLE_BLOCKED=0
 for idx in 0 1 2; do
   OP="${ops[$idx]}"; n=$((idx + 1))
   echo "== dvt$n operator $OP =="
 
-  # 1. PAYMASTER_SUPER role (mandatory, both paths)
+  # 1. PAYMASTER_SUPER role (MANDATORY for both settle paths) — DETECT ONLY.
+  #    Registry (contracts/src/core/Registry.sol) is NOT OZ AccessControl: there is no
+  #    owner `grantRole`. The role is acquired ONLY by the OPERATOR ITSELF calling
+  #    Registry.registerRole(ROLE_PAYMASTER_SUPER, op, data) (msg.sender == user), which
+  #    requires (a) the operator already holds ROLE_COMMUNITY, and (b) staking minStake
+  #    GToken (50e18) + ticketPrice via GTOKEN_STAKING + an SBT mint. That is a
+  #    community-onboarding + staking flow an owner key CANNOT perform on the operator's
+  #    behalf — so this script does NOT attempt it. See docs/x402-facilitator.md §6.
   if [ "$(cast call "$REGISTRY" 'hasRole(bytes32,address)(bool)' "$ROLE_PAYMASTER_SUPER" "$OP" --rpc-url "$RPC_URL")" = "true" ]; then
-    echo "  = already has PAYMASTER_SUPER"
+    echo "  = has PAYMASTER_SUPER"
   else
-    send "grant PAYMASTER_SUPER" "$REGISTRY" 'grantRole(bytes32,address)' "$ROLE_PAYMASTER_SUPER" "$OP" "${AASTAR_AUTH[@]}"
+    echo "  ✗ MISSING PAYMASTER_SUPER → settle WILL revert. The operator must self-register"
+    echo "    (Registry.registerRole: needs ROLE_COMMUNITY + ~50 GToken stake + ticket). docs §6."
+    ROLE_BLOCKED=1
   fi
 
   # 2. aPNTs approved facilitator (direct path)
@@ -110,4 +122,10 @@ for idx in 0 1 2; do
   fi
 done
 
+if [ "$ROLE_BLOCKED" = "1" ]; then
+  echo
+  echo "⚠ One or more operators lack PAYMASTER_SUPER — /x402/settle stays BLOCKED until they"
+  echo "  are registered via the Registry staking flow (NOT this script). approvedFacilitators"
+  echo "  + funding above are correct prep, but settle reverts without the role. See docs §6."
+fi
 echo "done. Verify: curl -s https://dvt1.aastar.io/x402/supported | jq, then a live settle round-trip per docs §7."
