@@ -1,4 +1,13 @@
-import { Controller, Post, Get, Param, Body, ValidationPipe, Logger, UseGuards } from "@nestjs/common";
+import {
+  Controller,
+  Post,
+  Get,
+  Param,
+  Body,
+  ValidationPipe,
+  Logger,
+  UseGuards,
+} from "@nestjs/common";
 import { ThrottleGuard } from "../../common/throttle.guard.js";
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from "@nestjs/swagger";
 import { SignatureService } from "./signature.service.js";
@@ -137,7 +146,8 @@ export class SignatureController {
   }
 
   @ApiOperation({
-    summary: "Approve a high-value op pending out-of-band confirmation (passkey path-2 or legacy token)",
+    summary:
+      "Approve a high-value op pending out-of-band confirmation (passkey path-2 or legacy token)",
   })
   @ApiResponse({
     status: 200,

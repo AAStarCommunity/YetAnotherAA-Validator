@@ -159,8 +159,8 @@ UserOperation, no validator, no aggregation), so it never affects the 403
 owner-auth signing path.
 
 Turn it on with a **separate, funded key per node**. `dvt-testnet.sh` loads the
-shared `deploy/.env.testnet` first, then overlays a per-node `deploy/node$i/.env`
-(git-ignored) — put each node's own relay key there:
+shared `deploy/.env.testnet` first, then overlays a per-node
+`deploy/node$i/.env` (git-ignored) — put each node's own relay key there:
 
 ```bash
 # shared, once — in deploy/.env.testnet:

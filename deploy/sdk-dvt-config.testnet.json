@@ -57,7 +57,11 @@
             "targetToken_apnts": "0x9e66B457E0ABb1F139FD8A596d00f784eBA2873b",
             "buyHelper": "0x8d08fBD8297355BC93397820AE1CfFD884BEaA00"
           },
-          "caps": { "perTxMaxUsdc6dec": "864000000", "perAddressPerHour": 5, "globalPerHour": 100 },
+          "caps": {
+            "perTxMaxUsdc6dec": "864000000",
+            "perAddressPerHour": 5,
+            "globalPerHour": 100
+          },
           "failover": "3 independent relayers — pick any node, retry next on 5xx/timeout"
         },
         "keeper": {
