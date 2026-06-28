@@ -20,7 +20,9 @@
 #   RPC_URL=https://… AASTAR_OWNER_KEY=0x… [MYCELIUM_OWNER_KEY=0x…] [FUNDER_KEY=0x…] \
 #     ./deploy/x402-provision.sh
 #
-# Idempotent: skips a step if the operator already has the role / approval. Needs foundry (cast).
+# Idempotent: skips every step the chain already reflects (role granted, facilitator
+# approved, fee already 200, operator already funded) — safe to re-run with no extra txs.
+# Keys are read from env (or a keystore account, *_ACCOUNT, to keep them off `ps`). Needs foundry (cast).
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -43,6 +45,18 @@ for i in 1 2 3; do
 done
 echo "operators: dvt1=${ops[0]} dvt2=${ops[1]} dvt3=${ops[2]}"
 
+# Auth flags: PREFER a foundry keystore account (the key never appears on the cast
+# CLI, so it is not visible in `ps aux`). Set AASTAR_ACCOUNT / MYCELIUM_ACCOUNT /
+# FUNDER_ACCOUNT to a `cast wallet import`-ed account name; otherwise fall back to the
+# raw env key via --private-key (fine on a single-user host, but the expanded value
+# is briefly visible in `ps` — use the keystore mode on shared/CI hosts).
+aastar_auth()   { if [ -n "${AASTAR_ACCOUNT:-}" ];   then printf '%s\n%s\n' --account "$AASTAR_ACCOUNT";   else printf '%s\n%s\n' --private-key "$AASTAR_OWNER_KEY"; fi; }
+mycelium_auth() { if [ -n "${MYCELIUM_ACCOUNT:-}" ]; then printf '%s\n%s\n' --account "$MYCELIUM_ACCOUNT"; else printf '%s\n%s\n' --private-key "${MYCELIUM_OWNER_KEY:-}"; fi; }
+funder_auth()   { if [ -n "${FUNDER_ACCOUNT:-}" ];   then printf '%s\n%s\n' --account "$FUNDER_ACCOUNT";   else printf '%s\n%s\n' --private-key "${FUNDER_KEY:-}"; fi; }
+AASTAR_AUTH=();   while IFS= read -r l; do AASTAR_AUTH+=("$l");     done < <(aastar_auth)
+MYCELIUM_AUTH=(); while IFS= read -r l; do MYCELIUM_AUTH+=("$l"); done < <(mycelium_auth)
+FUNDER_AUTH=();   while IFS= read -r l; do FUNDER_AUTH+=("$l");     done < <(funder_auth)
+
 send() { echo "  + $1"; cast send "$2" "$3" "${@:4}" --rpc-url "$RPC_URL" >/dev/null; }
 
 for idx in 0 1 2; do
@@ -53,40 +67,46 @@ for idx in 0 1 2; do
   if [ "$(cast call "$REGISTRY" 'hasRole(bytes32,address)(bool)' "$ROLE_PAYMASTER_SUPER" "$OP" --rpc-url "$RPC_URL")" = "true" ]; then
     echo "  = already has PAYMASTER_SUPER"
   else
-    send "grant PAYMASTER_SUPER" "$REGISTRY" 'grantRole(bytes32,address)' "$ROLE_PAYMASTER_SUPER" "$OP" --private-key "$AASTAR_OWNER_KEY"
+    send "grant PAYMASTER_SUPER" "$REGISTRY" 'grantRole(bytes32,address)' "$ROLE_PAYMASTER_SUPER" "$OP" "${AASTAR_AUTH[@]}"
   fi
 
   # 2. aPNTs approved facilitator (direct path)
   if [ "$(cast call "$APNTS" 'approvedFacilitators(address)(bool)' "$OP" --rpc-url "$RPC_URL")" = "true" ]; then
     echo "  = already approved on aPNTs"
   else
-    send "aPNTs addApprovedFacilitator" "$APNTS" 'addApprovedFacilitator(address)' "$OP" --private-key "$AASTAR_OWNER_KEY"
+    send "aPNTs addApprovedFacilitator" "$APNTS" 'addApprovedFacilitator(address)' "$OP" "${AASTAR_AUTH[@]}"
   fi
 
-  # 2b. PNTs approved facilitator (needs the Mycelium owner key; optional)
-  if [ -n "${MYCELIUM_OWNER_KEY:-}" ]; then
+  # 2b. PNTs approved facilitator (needs the Mycelium owner key/account; optional)
+  if [ -n "${MYCELIUM_OWNER_KEY:-}" ] || [ -n "${MYCELIUM_ACCOUNT:-}" ]; then
     if [ "$(cast call "$PNTS" 'approvedFacilitators(address)(bool)' "$OP" --rpc-url "$RPC_URL")" = "true" ]; then
       echo "  = already approved on PNTs"
     else
-      send "PNTs addApprovedFacilitator" "$PNTS" 'addApprovedFacilitator(address)' "$OP" --private-key "$MYCELIUM_OWNER_KEY"
+      send "PNTs addApprovedFacilitator" "$PNTS" 'addApprovedFacilitator(address)' "$OP" "${MYCELIUM_AUTH[@]}"
     fi
   else
-    echo "  ~ skipping PNTs (set MYCELIUM_OWNER_KEY to enable PNTs settlement)"
+    echo "  ~ skipping PNTs (set MYCELIUM_OWNER_KEY/MYCELIUM_ACCOUNT to enable PNTs settlement)"
   fi
 
-  # 3. operator fee override (optional)
-  send "setOperatorFacilitatorFee 200" "$X402_FACILITATOR" 'setOperatorFacilitatorFee(address,uint256)' "$OP" 200 --private-key "$AASTAR_OWNER_KEY"
+  # 3. operator fee override (optional) — idempotent: skip when already 200, so a
+  #    re-run doesn't burn 3 redundant on-chain txs.
+  curfee="$(cast call "$X402_FACILITATOR" 'operatorFacilitatorFees(address)(uint256)' "$OP" --rpc-url "$RPC_URL" | awk '{print $1}')"
+  if [ "$curfee" = "200" ]; then
+    echo "  = operator fee already 200"
+  else
+    send "setOperatorFacilitatorFee 200" "$X402_FACILITATOR" 'setOperatorFacilitatorFee(address,uint256)' "$OP" 200 "${AASTAR_AUTH[@]}"
+  fi
 
   # 4. gas funding (optional)
-  if [ -n "${FUNDER_KEY:-}" ]; then
+  if [ -n "${FUNDER_KEY:-}" ] || [ -n "${FUNDER_ACCOUNT:-}" ]; then
     bal="$(cast balance "$OP" --rpc-url "$RPC_URL")"
     if [ "$bal" = "0" ]; then
-      echo "  + fund $FUND_ETH ETH"; cast send "$OP" --value "${FUND_ETH}ether" --private-key "$FUNDER_KEY" --rpc-url "$RPC_URL" >/dev/null
+      echo "  + fund $FUND_ETH ETH"; cast send "$OP" --value "${FUND_ETH}ether" "${FUNDER_AUTH[@]}" --rpc-url "$RPC_URL" >/dev/null
     else
       echo "  = already funded ($bal wei)"
     fi
   else
-    echo "  ~ skipping funding (set FUNDER_KEY, or fund $OP with ~$FUND_ETH Sepolia ETH manually)"
+    echo "  ~ skipping funding (set FUNDER_KEY/FUNDER_ACCOUNT, or fund $OP with ~$FUND_ETH Sepolia ETH manually)"
   fi
 done
 
