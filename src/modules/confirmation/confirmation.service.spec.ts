@@ -56,7 +56,11 @@ function challengeOf(hash: string): string {
 /** A raw AuthenticationResponseJSON whose clientDataJSON binds `challengeB64`. */
 function passkeyWithChallenge(challengeB64: string): unknown {
   const clientDataJSON = Buffer.from(
-    JSON.stringify({ type: "webauthn.get", challenge: challengeB64, origin: "https://kms.aastar.io" })
+    JSON.stringify({
+      type: "webauthn.get",
+      challenge: challengeB64,
+      origin: "https://kms.aastar.io",
+    })
   ).toString("base64url");
   return {
     id: "cred",
@@ -169,10 +173,14 @@ describe("ConfirmationService — out-of-band confirmation (scheme A, #50 ⑤)",
 
   it("confirmWithPasskey: challenge ≠ userOpHash → rejected, KMS NOT called", async () => {
     let called = false;
-    const svc = makeKms({ confirmEnabled: true, confirmThresholdWei: "100" }, notif(true), async () => {
-      called = true;
-      return true;
-    });
+    const svc = makeKms(
+      { confirmEnabled: true, confirmThresholdWei: "100" },
+      notif(true),
+      async () => {
+        called = true;
+        return true;
+      }
+    );
     await svc.gate(executeUserOp(101n), HASH);
     // assertion bound to a different hash → local binding check fails first
     expect(
@@ -192,15 +200,23 @@ describe("ConfirmationService — out-of-band confirmation (scheme A, #50 ⑤)",
   });
 
   it("confirmWithPasskey: KMS throws → rejected (fail-closed)", async () => {
-    const svc = makeKms({ confirmEnabled: true, confirmThresholdWei: "100" }, notif(true), async () => {
-      throw new Error("kms down");
-    });
+    const svc = makeKms(
+      { confirmEnabled: true, confirmThresholdWei: "100" },
+      notif(true),
+      async () => {
+        throw new Error("kms down");
+      }
+    );
     await svc.gate(executeUserOp(101n), HASH);
     expect(await svc.confirmWithPasskey(HASH, passkeyWithChallenge(challengeOf(HASH)))).toBe(false);
   });
 
   it("confirmWithPasskey: no pending entry → false", async () => {
-    const svc = makeKms({ confirmEnabled: true, confirmThresholdWei: "100" }, notif(true), async () => true);
+    const svc = makeKms(
+      { confirmEnabled: true, confirmThresholdWei: "100" },
+      notif(true),
+      async () => true
+    );
     expect(await svc.confirmWithPasskey(HASH, passkeyWithChallenge(challengeOf(HASH)))).toBe(false);
   });
 

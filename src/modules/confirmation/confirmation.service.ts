@@ -174,7 +174,9 @@ export class ConfirmationService {
     if (!p || p.expiry <= Date.now()) return false;
 
     if (!this.assertionBindsTo(passkey, userOpHash)) {
-      this.logger.warn(`Passkey confirm ${userOpHash}: clientData challenge ≠ userOpHash — rejected`);
+      this.logger.warn(
+        `Passkey confirm ${userOpHash}: clientData challenge ≠ userOpHash — rejected`
+      );
       return false;
     }
     // Lowercase the account before the KMS call — defense-in-depth so a checksummed
