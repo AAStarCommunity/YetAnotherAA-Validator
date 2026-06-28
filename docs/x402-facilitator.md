@@ -299,6 +299,16 @@ transferFrom allowance firewall).
 
 ## 7. Conformance fixtures & live round-trip
 
+> ✅ **Testnet LIVE (2026-06-28).** All 3 operators were registered as staked
+> community paymasters via `deploy/x402-register-operators.sh` (ROLE_COMMUNITY +
+> PAYMASTER_SUPER, ~85 GToken each, sponsored by 0xb560), then
+> `deploy/x402-provision.sh` set aPNTs/PNTs `approvedFacilitator` + fee + gas. A
+> real **direct settle** went through dvt1: 1 aPNTs from the payer → 0.98 to the
+> recipient + 0.02 (2% fee) retained, tx
+> `0xc5bad0afadb8a78639fc0614a6fbd38a5160f3730ffef2b8f77eaf8fb8725a87` (status
+> 1). So `/x402/{verify,settle,supported}` are fully operational on
+> dvt{1,2,3}.aastar.io.
+
 `conformance/x402/fixtures.json` holds the **golden wire vectors** — the exact
 `/x402/{verify,settle}` request bodies a conformant SDK emits (one `direct`, one
 `eip-3009`, signed by a fixed key), plus the values the DVT derives (effective
