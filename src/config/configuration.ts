@@ -123,6 +123,26 @@ export default () => {
       10
     ),
 
+    // x402 payment facilitator (#130). Opt-in; operates the x402 facilitator service
+    // (verify off-chain → settle on the standalone X402Facilitator contract) as a DVT
+    // node module, mirroring relay. Default off → behavior unchanged. Requires a
+    // DEDICATED X402_OPERATOR_PK (funded EOA holding ROLE_PAYMASTER_SUPER + listed in
+    // each supported xPNTs token's approvedFacilitators) — it does NOT fall back to
+    // ETH_PRIVATE_KEY or RELAY_OPERATOR_PK, keeping the public settlement key isolated.
+    // X402_SUPPORTED_ASSETS are the xPNTs the operator is approved for (settled `direct`);
+    // anything else settles via EIP-3009. Addresses default to the Sepolia v5.4.1 stack.
+    x402FacilitatorEnabled: process.env.X402_FACILITATOR_ENABLED === "true",
+    x402FacilitatorContract: process.env.X402_FACILITATOR_CONTRACT || undefined,
+    x402SupportedAssets: parseAllowlist(process.env.X402_SUPPORTED_ASSETS || ""),
+    x402OperatorPk: process.env.X402_OPERATOR_PK || undefined,
+    x402FeeBPS: parseInt(process.env.X402_FEE_BPS || "200", 10),
+    x402ChainId: parseInt(process.env.X402_CHAIN_ID || "11155111", 10),
+    x402RpcUrl: process.env.X402_RPC_URL || undefined,
+    // Optional anti-spam HMAC challenge on /x402/settle (public nodes). Honors the
+    // reference node's env names (ENABLE_HMAC_CHALLENGE / HMAC_SECRET).
+    x402HmacEnabled: process.env.ENABLE_HMAC_CHALLENGE === "true",
+    x402HmacSecret: process.env.HMAC_SECRET || undefined,
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),
