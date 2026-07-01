@@ -27,7 +27,10 @@
     "type-check": "tsc --noEmit",
     "prepare": "git config core.hooksPath scripts/git-hooks || true",
     "check-deps": "node scripts/check-deps.mjs",
-    "conformance": "node conformance/reference.mjs --check conformance/vectors.json"
+    "conformance": "node conformance/reference.mjs --check conformance/vectors.json",
+    "release:major": "npm version major --no-git-tag-version && npm run build && echo '✅ Bumped to '$(jq -r .version package.json)",
+    "release:minor": "npm version minor --no-git-tag-version && npm run build && echo '✅ Bumped to '$(jq -r .version package.json)",
+    "release:patch": "npm version patch --no-git-tag-version && npm run build && echo '✅ Bumped to '$(jq -r .version package.json)"
   },
   "dependencies": {
     "@nestjs/cli": "^11.0.23",
