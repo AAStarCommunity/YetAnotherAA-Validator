@@ -124,25 +124,60 @@ export class BlsService {
   /**
    * BLS-sign an ALREADY-AUTHORIZED derived userOpHash. Only ever call this with a
    * hash returned by authorizeAndDeriveHash (i.e. after the owner-auth gate passed).
+   *
+   * In Hybrid mode (feat/rust-signer): delegates to local Rust signer on 127.0.0.1:5001
+   * In Node.js mode: uses local @noble/curves
    */
   async signDerivedHash(userOpHash: string, node: NodeKeyPair): Promise<SignatureResult> {
-    // BLS-sign hashToCurve(userOpHash) using the exact derived hash.
+    // Try Rust signer first (if available on localhost)
+    const rustSignerUrl = "http://127.0.0.1:5001/sign";
+
+    try {
+      const response = await fetch(rustSignerUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_op_hash: userOpHash,
+          node_id: node.nodeId,
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json() as { signature: string; public_key: string };
+        this.logger.debug(`Signed via Rust signer: ${node.nodeId}`);
+        return {
+          nodeId: node.nodeId,
+          signature: data.signature, // Already in EIP-2537 format from Rust
+          signatureCompact: data.signature, // Rust returns full format
+          publicKey: data.public_key,
+          message: userOpHash,
+        };
+      } else {
+        this.logger.warn(
+          `Rust signer HTTP error ${response.status}, falling back to Node.js`
+        );
+      }
+    } catch (error: any) {
+      this.logger.debug(
+        `Rust signer unavailable (${error.message}), falling back to Node.js local signing`
+      );
+    }
+
+    // Fallback: use Node.js local signing (@noble/curves)
+    this.logger.debug(`Using local Node.js signing for ${node.nodeId}`);
     const messageBytes = ethers.getBytes(userOpHash);
     const messagePoint = await bls.G2.hashToCurve(messageBytes, {
       DST: BLS_DST,
     });
 
-    // Key custody behind the pluggable BlsSigner port (default = local key). The signing
-    // algorithm/wire is unchanged (conformance-bound); only WHERE the key lives is abstracted.
     const signer = this.signerService.forNode(node);
     const publicKey = await signer.getPublicKey();
     const signature = await signer.sign(messagePoint as any);
 
-    // Return both compact and EIP-2537 formats
     return {
       nodeId: node.nodeId,
-      signature: this.encodeToEIP2537(signature), // Use EIP-2537 format as default
-      signatureCompact: signature.toHex(), // Keep compact format for backward compatibility
+      signature: this.encodeToEIP2537(signature),
+      signatureCompact: signature.toHex(),
       publicKey: publicKey.toHex(),
       message: userOpHash,
     };
