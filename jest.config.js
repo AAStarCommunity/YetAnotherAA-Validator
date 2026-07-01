@@ -16,6 +16,7 @@ export default {
   testMatch: ["**/__tests__/**/*.ts", "**/?(*.)+(spec|test).ts"],
   testPathIgnorePatterns: [
     "/node_modules/",
+    "/dist/",
     "/contracts/lib/",
     "/contracts/out/",
     "/contracts/cache/",

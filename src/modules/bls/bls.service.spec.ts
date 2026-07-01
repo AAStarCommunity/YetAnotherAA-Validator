@@ -77,6 +77,7 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
   let service: InstanceType<typeof BlsService>;
   let getAccountOwner: jest.Mock<(account: string) => Promise<string>>;
   let getUserOpHash: jest.Mock<(userOp: PackedUserOp) => Promise<string>>;
+  let isValidOwnerAuth: jest.Mock<(account: string, userOpHash: string, ownerAuth: string) => Promise<boolean>>;
 
   // Sign a hash exactly the way the account owner signs the UserOperation:
   // EIP-191 prefix over the raw 32-byte hash.
@@ -87,9 +88,11 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
   beforeEach(() => {
     getAccountOwner = jest.fn<(account: string) => Promise<string>>();
     getUserOpHash = jest.fn<(userOp: PackedUserOp) => Promise<string>>();
+    isValidOwnerAuth = jest.fn<(account: string, userOpHash: string, ownerAuth: string) => Promise<boolean>>();
     const blockchain = {
       getAccountOwner,
       getUserOpHash,
+      isValidOwnerAuth,
     } as unknown as InstanceType<typeof BlockchainService>;
     // Default local-key signer (byte-identical to the pre-port signing path).
     const signer = {
@@ -101,13 +104,14 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
   it("signs and returns a signature when ownerAuth recovers to the derived-hash owner", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
     getAccountOwner.mockResolvedValue(ownerWallet.address);
+    isValidOwnerAuth.mockResolvedValue(true);
     const ownerAuth = await signEip191(ownerWallet, derivedHash);
 
     const result = await service.signMessage(makeUserOp(victimAccount), ownerAuth, node);
 
     // account must be derived from userOp.sender, not caller-claimed.
-    expect(getAccountOwner).toHaveBeenCalledWith(victimAccount);
     expect(getUserOpHash).toHaveBeenCalledTimes(1);
+    expect(isValidOwnerAuth).toHaveBeenCalledWith(victimAccount, derivedHash, ownerAuth);
     expect(result.nodeId).toBe(node.nodeId);
     expect(result.signature).toMatch(/^0x[0-9a-f]+$/);
     expect(result.signatureCompact).toBeTruthy();
@@ -120,16 +124,16 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
   // victim account B by supplying B's userOp + A-owner's signature. Because:
   //   - account = userOp.sender = B  (derived, attacker cannot lie)
   //   - userOpHash is derived from B's userOp via EntryPoint
-  //   - the gate requires B's on-chain owner to have signed that hash
-  // The attacker's signature recovers to A's owner != B's owner → 403.
+  //   - the contract validates against B's authorization logic
+  // The attacker's signature (or WebAuthn) doesn't validate against B → eth_call returns false → 403.
   it("CRITICAL: rejects (403) cross-account oracle — attacker owns a different account", async () => {
     const attackerWallet = ethers.Wallet.createRandom();
     // The node always derives the hash from the submitted userOp (the victim's).
     getUserOpHash.mockResolvedValue(derivedHash);
-    // The submitted userOp is the VICTIM's account; its on-chain owner is ownerWallet.
-    getAccountOwner.mockResolvedValue(ownerWallet.address);
-    // Attacker signs the (derived) victim hash with their OWN key — they own a
-    // different account, not the victim's.
+    // The submitted userOp is the VICTIM's account; contract validation returns false.
+    isValidOwnerAuth.mockResolvedValue(false);
+    // Attacker signs the (derived) victim hash with their OWN key — the contract
+    // (authorizing against victim's owner/keys) rejects it.
     const ownerAuth = await signEip191(attackerWallet as unknown as ethers.Wallet, derivedHash);
 
     await expect(
@@ -137,9 +141,9 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
-  it("rejects (403) when userOp.sender's owner != ownerAuth signer", async () => {
+  it("rejects (403) when ownerAuth is invalid (isValidOwnerAuth returns false)", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockResolvedValue(ownerWallet.address);
+    isValidOwnerAuth.mockResolvedValue(false);
     const wrongSigner = ethers.Wallet.createRandom();
     const ownerAuth = await signEip191(wrongSigner as unknown as ethers.Wallet, derivedHash);
 
@@ -150,9 +154,9 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
 
   it("attacker cannot substitute a different hash — only the EntryPoint-derived hash is signed", async () => {
     // Owner signs SOME OTHER hash; the node only ever derives & checks against the
-    // EntryPoint hash, so a sig over an unrelated hash never authorizes.
+    // EntryPoint hash, so the contract validation against that other hash fails.
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockResolvedValue(ownerWallet.address);
+    isValidOwnerAuth.mockResolvedValue(false);
     const otherHash = "0x" + "11".repeat(32);
     const ownerAuth = await signEip191(ownerWallet, otherHash);
 
@@ -163,7 +167,6 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
 
   it("rejects (403) when EntryPoint.getUserOpHash reverts", async () => {
     getUserOpHash.mockRejectedValue(new Error("execution reverted"));
-    getAccountOwner.mockResolvedValue(ownerWallet.address);
     const ownerAuth = await signEip191(ownerWallet, derivedHash);
 
     await expect(
@@ -173,7 +176,7 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
 
   it("rejects (403, not 400) when ownerAuth is malformed", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockResolvedValue(ownerWallet.address);
+    isValidOwnerAuth.mockResolvedValue(false);
 
     await expect(
       service.signMessage(makeUserOp(victimAccount), "0xdeadbeef", node)
@@ -182,7 +185,7 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
 
   it("rejects (403, not 400) when ownerAuth is missing/undefined", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockResolvedValue(ownerWallet.address);
+    isValidOwnerAuth.mockResolvedValue(false);
 
     await expect(
       service.signMessage(makeUserOp(victimAccount), undefined, node)
@@ -191,7 +194,7 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
 
   it("rejects (403, not 400) when userOp.sender is not a valid address", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockResolvedValue(ownerWallet.address);
+    isValidOwnerAuth.mockResolvedValue(true);
     const ownerAuth = await signEip191(ownerWallet, derivedHash);
     const bad = { ...makeUserOp(victimAccount), sender: "not-an-address" };
 
@@ -200,12 +203,12 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
     );
     // Shape rejected before any chain read.
     expect(getUserOpHash).not.toHaveBeenCalled();
-    expect(getAccountOwner).not.toHaveBeenCalled();
+    expect(isValidOwnerAuth).not.toHaveBeenCalled();
   });
 
   it("rejects (403, not 400) when a required userOp field is missing", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockResolvedValue(ownerWallet.address);
+    isValidOwnerAuth.mockResolvedValue(true);
     const ownerAuth = await signEip191(ownerWallet, derivedHash);
     const bad = { ...makeUserOp(victimAccount) } as Partial<PackedUserOp>;
     delete bad.callData;
@@ -214,12 +217,13 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
       ForbiddenException
     );
     expect(getUserOpHash).not.toHaveBeenCalled();
-    expect(getAccountOwner).not.toHaveBeenCalled();
+    expect(isValidOwnerAuth).not.toHaveBeenCalled();
   });
 
-  it("rejects (403) fail-closed for a P256/passkey-only account (owner == zero address)", async () => {
+  it("rejects (403) fail-closed when isValidOwnerAuth eth_call fails (e.g. P256 passkey validation rejection)", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockResolvedValue(ethers.ZeroAddress);
+    isValidOwnerAuth.mockResolvedValue(false);
+    // Attempt with a WebAuthn blob (or any ownerAuth); contract validation fails.
     const ownerAuth = await signEip191(ownerWallet, derivedHash);
 
     await expect(
@@ -227,9 +231,9 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
-  it("rejects (403) fail-closed when the on-chain owner read fails", async () => {
+  it("rejects (403) fail-closed when isValidOwnerAuth eth_call throws (rpc failure)", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockRejectedValue(new Error("rpc down"));
+    isValidOwnerAuth.mockRejectedValue(new Error("rpc down"));
     const ownerAuth = await signEip191(ownerWallet, derivedHash);
 
     await expect(
@@ -237,12 +241,14 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
-  it("matches owner regardless of address checksum casing", async () => {
+  it("signs when isValidOwnerAuth returns true regardless of address checksum casing", async () => {
     getUserOpHash.mockResolvedValue(derivedHash);
-    getAccountOwner.mockResolvedValue(ethers.getAddress(ownerWallet.address));
+    isValidOwnerAuth.mockResolvedValue(true);
     const ownerAuth = await signEip191(ownerWallet, derivedHash);
 
     const result = await service.signMessage(makeUserOp(victimAccount), ownerAuth, node);
     expect(result.nodeId).toBe(node.nodeId);
+    // eth_call was made with the checksum-normalized account address.
+    expect(isValidOwnerAuth).toHaveBeenCalledWith(victimAccount, derivedHash, ownerAuth);
   });
 });

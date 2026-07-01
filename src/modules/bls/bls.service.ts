@@ -16,34 +16,31 @@ export class BlsService {
   ) {}
 
   /**
-   * Fix 2 Stage 1 — owner-authorization gate.
+   * Fix 2 Stage 1 & 2 — owner-authorization gate (ERC-1271 style view).
    *
-   * The node co-signs ONLY when the request carries a valid account-owner ECDSA
-   * signature over the AUTHORITATIVE userOpHash, which is DERIVED from the full
-   * UserOperation (never trusted from the caller). The flow:
+   * The node co-signs ONLY when the account validates the ownerAuth over the
+   * AUTHORITATIVE userOpHash (which is DERIVED from the full UserOperation, never
+   * trusted from the caller). The flow:
    *
    *   account     = userOp.sender                                 (derived, not claimed)
    *   userOpHash  = EntryPoint.getUserOpHash(userOp)              (binds hash↔sender/chain)
-   *   owner       = account.owner()
-   *   require verifyMessage(getBytes(userOpHash), ownerAuth) == owner
+   *   isValid     = account.isValidOwnerAuth(userOpHash, ownerAuth) [eth_call view]
+   *   require isValid returns magic value 0x1626ba7e
    *   then BLS-sign hashToCurve(userOpHash)  — the SAME derived hash (no TOCTOU)
    *
    * Deriving the hash on-chain is what closes the cross-account oracle hole: an
    * attacker who owns account A cannot get the node to sign account B's userOpHash,
    * because the hash is computed from `userOp.sender` (= B) and getUserOpHash binds
-   * it to B, chainId, and the EntryPoint. The owner check then requires B's owner.
+   * it to B, chainId, and the EntryPoint.
    *
-   * Owner-signature convention matches AAStarAirAccountBase.sol `_validateECDSA`:
-   *   bytes32 hash = userOpHash.toEthSignedMessageHash();  // EIP-191 prefix
-   *   ecrecover(hash, v, r, s) == owner                    // `address public owner`
-   * which `ethers.verifyMessage(getBytes(userOpHash), sig)` reproduces exactly.
-   *
-   * Stage 1 handles the ECDSA-owner case only. A P256/passkey-only account
-   * (owner() == 0x0) FAILS CLOSED (see #40 for Stage 2 P256-owner support).
+   * By eth_calling the account's `isValidOwnerAuth` view, DVT delegates all signature
+   * verification logic to the contract (ECDSA owner, P256 device-passkey, or future
+   * auth schemes). DVT NEVER implements P256/WebAuthn locally, ensuring zero drift
+   * from the on-chain validation. The account is the single source of truth.
    *
    * Fails closed (403) on ANY failure: malformed userOp, getUserOpHash revert,
-   * owner read failure, owner == 0x0, malformed/missing ownerAuth, or recovered
-   * signer != owner. Never signs on failure.
+   * isValidOwnerAuth revert/timeout, eth_call failure, or magic value mismatch.
+   * Never signs on failure.
    *
    * @returns the derived userOpHash to BLS-sign.
    * @throws ForbiddenException on any authorization failure.
@@ -90,36 +87,21 @@ export class BlsService {
       throw new ForbiddenException("owner authorization required");
     }
 
-    let owner: string;
-    try {
-      owner = await this.blockchainService.getAccountOwner(account);
-    } catch {
-      throw new ForbiddenException("owner authorization required");
-    }
-
-    // Zero owner → P256/passkey-only account, no ECDSA owner to authorize against.
-    // TODO(#40): add P256-owner authorization for passkey-only accounts (Stage 2).
-    if (owner === ethers.ZeroAddress) {
-      throw new ForbiddenException(
-        "owner authorization required: account has no ECDSA owner (P256/passkey-only is not supported in Stage 1, see #40)"
-      );
-    }
-
-    let recovered: string;
+    // Validate ownerAuth via ERC-1271 style account view (eth_call isValidOwnerAuth).
+    // The account handles all signature verification logic (ECDSA, P256 passkey, etc.)
+    // and returns magic value 0x1626ba7e if valid. DVT never implements crypto locally.
+    let isValid: boolean;
     try {
       if (typeof ownerAuth !== "string" || ownerAuth.length === 0) {
         throw new Error("missing ownerAuth");
       }
-      // EIP-191 over the raw 32-byte derived userOpHash, matching the contract.
-      recovered = ethers.verifyMessage(ethers.getBytes(userOpHash), ownerAuth);
+      isValid = await this.blockchainService.isValidOwnerAuth(account, userOpHash, ownerAuth);
     } catch {
       throw new ForbiddenException("owner authorization required");
     }
 
-    if (ethers.getAddress(recovered) !== owner) {
-      this.logger.warn(
-        `Owner-auth rejected for account ${account}: recovered ${recovered}, expected owner ${owner}`
-      );
+    if (!isValid) {
+      this.logger.warn(`Owner-auth rejected for account ${account}: eth_call isValidOwnerAuth returned false`);
       throw new ForbiddenException("owner authorization required");
     }
 
