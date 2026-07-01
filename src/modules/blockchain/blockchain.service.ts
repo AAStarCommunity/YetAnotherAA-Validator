@@ -451,8 +451,8 @@ export class BlockchainService {
       throw new Error("Blockchain provider not configured");
     }
 
-    // ERC-1271 magic value for isValidSignature / isValidOwnerAuth
-    const MAGIC_VALUE = "0x1626ba7e";
+    // AAStarAirAccount custom magic value for isValidOwnerAuth (not standard ERC-1271)
+    const MAGIC_VALUE = "0xa0cf00cf";
 
     const abi = [
       "function isValidOwnerAuth(bytes32 userOpHash, bytes calldata ownerAuth) view returns (bytes4)",
