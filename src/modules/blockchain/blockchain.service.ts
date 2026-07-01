@@ -431,6 +431,46 @@ export class BlockchainService {
   }
 
   /**
+   * Validate owner authorization via ERC-1271 style view: eth_call the account's
+   * `isValidOwnerAuth(userOpHash, ownerAuth)` and verify it returns the magic value.
+   *
+   * This replaces local ECDSA/P256 verification, ensuring DVT never drifts from the
+   * contract's actual validation logic. The account is the single source of truth.
+   *
+   * @param account The account address to call
+   * @param userOpHash The derived userOpHash to validate against
+   * @param ownerAuth The owner authorization (ECDSA signature or WebAuthn blob)
+   * @returns true if the account returns the magic value; false otherwise (fail-closed)
+   */
+  async isValidOwnerAuth(
+    account: string,
+    userOpHash: string,
+    ownerAuth: string
+  ): Promise<boolean> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+
+    // AAStarAirAccount custom magic value for isValidOwnerAuth (not standard ERC-1271)
+    const MAGIC_VALUE = "0xa0cf00cf";
+
+    const abi = [
+      "function isValidOwnerAuth(bytes32 userOpHash, bytes calldata ownerAuth) view returns (bytes4)",
+    ];
+    const contract = new ethers.Contract(account, abi, this.provider);
+
+    try {
+      const result = await contract.isValidOwnerAuth(userOpHash, ownerAuth);
+      return result === MAGIC_VALUE;
+    } catch (error: any) {
+      this.logger.warn(
+        `isValidOwnerAuth eth_call failed for account ${account}: ${error.message}`
+      );
+      return false;
+    }
+  }
+
+  /**
    * Static-simulate updatePrice() WITHOUT sending a tx. Returns true if it would
    * succeed, false if it would revert (e.g. SuperPaymaster's OracleError when the
    * cached price is already as fresh as Chainlink). The keeper calls this right

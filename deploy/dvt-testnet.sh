@@ -108,6 +108,19 @@ status() {
       *) echo "  node$i keeper: ❌ down" ;;
     esac
   done
+  echo "x402-facilitator (optional):"
+  for i in 1 2 3; do
+    local port="${PORTS[$((i - 1))]}"
+    local h
+    h="$(curl -s -m 4 "http://localhost:$port/health" 2>/dev/null || true)"
+    case "$h" in
+      *'"name":"x402-facilitator","enabled":true'*) echo "  node$i facilitator: ✅ enabled" ;;
+      *'"name":"x402-facilitator","enabled":false'*) echo "  node$i facilitator: ⚪ disabled" ;;
+      *) echo "  node$i facilitator: ❌ down" ;;
+    esac
+  done
+  echo "price-keeper (standalone):"
+  if pgrep -f "keeper.ts.*sepolia" >/dev/null 2>&1; then echo "  price-keeper: ✅ running"; else echo "  price-keeper: ❌ not running (see aastar-sdk/run-keeper.sh)"; fi
   echo "public:"
   for h in "${HOSTS[@]}"; do
     if curl -s -m 8 "https://$h.aastar.io/node/info" >/dev/null 2>&1; then echo "  https://$h.aastar.io  ✅"; else echo "  https://$h.aastar.io  ❌"; fi

@@ -186,6 +186,155 @@ override `RELAY_*` for a different deployment. See
 
 ---
 
+## 9. 运维手册（macOS 本地部署）
+
+### 服务一览
+
+共 2 个进程，6 个逻辑服务：
+
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| DVT node 1 | 4001 | BLS 联合签名节点 |
+| DVT node 2 | 4002 | BLS 联合签名节点 |
+| DVT node 3 | 4003 | BLS 联合签名节点 |
+| cloudflared | — | 将三节点暴露为 dvt1/2/3.aastar.io |
+| relay（内置） | 同节点端口 | Gasless 代币购买中继，`POST /v3/relay` |
+| keeper（内置） | 同节点端口 | 节点签名策略 / 心跳 |
+| x402-facilitator（内置） | 同节点端口 | x402 支付撮合 |
+| **price-keeper** | — | 独立进程，每 3 分钟刷新 SuperPaymaster 价格预言机 |
+
+> relay / keeper / x402-facilitator 是 DVT 节点的内置模块，随节点启停，不需要单独管理。
+> price-keeper 是独立进程，由 LaunchAgent 托管。
+
+---
+
+### 查看所有服务状态
+
+```bash
+cd ~/Dev/aastar/YetAnotherAA-Validator
+./deploy/dvt-testnet.sh status
+```
+
+输出示例：
+```
+local nodes:
+  node1 :4001  ✅ UP
+  node2 :4002  ✅ UP
+  node3 :4003  ✅ UP
+cloudflared:  ✅ running
+relay (#98, optional):
+  node1 relay: ✅ enabled  ...
+keeper (#58, optional):
+  node1 keeper: ✅ enabled  ...
+x402-facilitator (optional):
+  node1 facilitator: ✅ enabled  ...
+price-keeper (standalone):
+  price-keeper: ✅ running
+public:
+  https://dvt1.aastar.io  ✅  ...
+```
+
+---
+
+### 启动
+
+```bash
+cd ~/Dev/aastar/YetAnotherAA-Validator
+
+# 启动 DVT 三节点 + cloudflared（含 relay / keeper / facilitator）
+./deploy/dvt-testnet.sh start
+
+# 启动 price-keeper（通常由 LaunchAgent 自动启动，手动启动用这个）
+cd ~/Dev/aastar/aastar-sdk
+./run-keeper.sh sepolia
+```
+
+### 停止
+
+```bash
+cd ~/Dev/aastar/YetAnotherAA-Validator
+
+# 停止 DVT 三节点 + cloudflared
+./deploy/dvt-testnet.sh stop
+
+# 停止 price-keeper
+pkill -f "keeper.ts.*sepolia"
+```
+
+### 重启
+
+```bash
+cd ~/Dev/aastar/YetAnotherAA-Validator
+
+# 重启 DVT 三节点 + cloudflared
+./deploy/dvt-testnet.sh restart
+
+# 重启 price-keeper（通过 LaunchAgent）
+launchctl kickstart -k gui/$(id -u)/io.aastar.price-keeper
+```
+
+---
+
+### 查看日志
+
+```bash
+cd ~/Dev/aastar/YetAnotherAA-Validator
+
+# DVT 节点日志（1 / 2 / 3 任选）
+./deploy/dvt-testnet.sh logs 1
+./deploy/dvt-testnet.sh logs 2
+./deploy/dvt-testnet.sh logs 3
+
+# cloudflared 隧道日志
+./deploy/dvt-testnet.sh logs cf
+
+# price-keeper 日志
+tail -f ~/Dev/aastar/aastar-sdk/keeper.log
+```
+
+---
+
+### 开机自启（macOS LaunchAgent）
+
+两个 plist 已配置在 `~/Library/LaunchAgents/`，Mac 登录后自动启动，无需手动操作：
+
+| plist 文件 | 管理的服务 | 崩溃自动重启 |
+|-----------|----------|------------|
+| `io.aastar.dvt-testnet.plist` | DVT 三节点 + cloudflared | 否（脚本后台化后退出属正常） |
+| `io.aastar.price-keeper.plist` | price-keeper | 是 |
+
+手动加载 / 卸载（通常不需要）：
+
+```bash
+# 加载（开机自启生效）
+launchctl load ~/Library/LaunchAgents/io.aastar.dvt-testnet.plist
+launchctl load ~/Library/LaunchAgents/io.aastar.price-keeper.plist
+
+# 卸载（取消自启）
+launchctl unload ~/Library/LaunchAgents/io.aastar.dvt-testnet.plist
+launchctl unload ~/Library/LaunchAgents/io.aastar.price-keeper.plist
+```
+
+检查 LaunchAgent 运行状态：
+
+```bash
+launchctl list io.aastar.dvt-testnet
+launchctl list io.aastar.price-keeper
+# PID 有值 = 正在运行；LastExitStatus = 0 = 上次正常退出
+```
+
+---
+
+### ⚠️ price-keeper 为什么不能停
+
+price-keeper 每 3 分钟调用一次 `SuperPaymaster.updatePrice()`。
+一旦停止 → aPNTs 价格过期 → `getRealtimeTokenCost` revert → 用户看到
+`InsufficientBalance`（哪怕账户有 1000 万 aPNTs 也没用）。
+
+签名账户：anni EOA `0xEcAACb915f7D92e9916f449F7ad42BD0408733c9`（持有 `PRICE_UPDATER_ROLE`）。
+
+---
+
 ## Notes
 
 - **Independence is the point** (TESTNET_RELEASE_PLAN §5): real multi-party
