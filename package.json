@@ -38,7 +38,7 @@
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.1.27",
     "@nestjs/platform-express": "^11.1.27",
-    "@nestjs/swagger": "^11.4.4",
+    "@nestjs/swagger": "^11.4.5",
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
     "@types/node": "^26.0.1",
