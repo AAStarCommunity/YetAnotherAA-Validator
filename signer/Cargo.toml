@@ -4,31 +4,22 @@ version = "1.7.1"
 edition = "2021"
 
 [dependencies]
-# BLS12-381 signature
-blst = { version = "0.3.11", features = ["from-subtle"] }
+# BLS12-381 signature (production-grade, same scheme as @noble/curves longSignatures)
+blst = "0.3.13"
 
-# Web server (minimal)
-tokio = { version = "1.35", features = ["full"] }
+# Web server (loopback-only HTTP)
+tokio = { version = "1.35", features = ["rt-multi-thread", "net", "macros"] }
 axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Crypto
-sha2 = "0.10"
 hex = "0.4"
 
 # Error handling
-anyhow = "1.0"
 thiserror = "1.0"
-
-# Environment
-dotenv = "0.15"
 
 [profile.release]
 opt-level = 3

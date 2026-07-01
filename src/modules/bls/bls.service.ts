@@ -143,13 +143,19 @@ export class BlsService {
       });
 
       if (response.ok) {
-        const data = await response.json() as { signature: string; public_key: string };
+        const data = (await response.json()) as {
+          signature: string;
+          signature_compact: string;
+          public_key: string;
+        };
         this.logger.debug(`Signed via Rust signer: ${node.nodeId}`);
+        // Rust output is byte-for-byte identical to the @noble/curves path
+        // (verified by the golden-vector test in signer/src/bls.rs).
         return {
           nodeId: node.nodeId,
-          signature: data.signature, // Already in EIP-2537 format from Rust
-          signatureCompact: data.signature, // Rust returns full format
-          publicKey: data.public_key,
+          signature: data.signature, // EIP-2537 (0x-prefixed)
+          signatureCompact: data.signature_compact, // compressed G2, 96 bytes
+          publicKey: data.public_key, // compressed G1, 48 bytes
           message: userOpHash,
         };
       } else {

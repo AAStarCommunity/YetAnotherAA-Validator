@@ -1,5 +1,5 @@
 pub mod bls;
 pub mod error;
+pub mod keystore;
 
-pub use bls::BlsSigner;
 pub use error::SignerError;

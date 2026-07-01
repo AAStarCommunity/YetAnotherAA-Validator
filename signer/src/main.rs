@@ -1,42 +1,43 @@
-use axum::{
-    extract::Json,
-    http::StatusCode,
-    routing::post,
-    Router,
-};
+use axum::{extract::Json, routing::get, routing::post, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use tracing::info;
+use tracing::{debug, info};
 
 mod bls;
 mod error;
+mod keystore;
 
-use bls::BlsSigner;
 use error::SignerError;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SignRequest {
-    /// userOpHash (32 bytes, hex-encoded)
+    /// userOpHash (32 bytes, hex "0x…")
     pub user_op_hash: String,
-    /// node_id for key lookup
+    /// node identity — selects which node_state.json key to sign with
     pub node_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct SignResponse {
+    /// EIP-2537 uncompressed G2 (256 bytes) — the `signature` field the DVT sends on
     pub signature: String,
+    /// IETF compressed G2 (96 bytes) — backward-compatible compact form
+    pub signature_compact: String,
+    /// IETF compressed G1 pubkey (48 bytes)
     pub public_key: String,
 }
 
-async fn sign(
-    Json(req): Json<SignRequest>,
-) -> Result<Json<SignResponse>, SignerError> {
-    let signer = BlsSigner::new();
-    let (sig, pubkey) = signer.sign(&req.user_op_hash, &req.node_id)?;
+async fn sign(Json(req): Json<SignRequest>) -> Result<Json<SignResponse>, SignerError> {
+    let sk = keystore::resolve_private_key(&req.node_id)?;
+    let hash = bls::decode_hash(&req.user_op_hash)?;
+    let out = bls::sign_hash(&sk, &hash)?;
+
+    debug!(node_id = %req.node_id, "signed via rust signer");
 
     Ok(Json(SignResponse {
-        signature: sig,
-        public_key: pubkey,
+        signature: out.signature_eip2537,
+        signature_compact: out.signature_compact,
+        public_key: out.public_key,
     }))
 }
 
@@ -44,28 +45,29 @@ async fn sign(
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("aastar_bls_signer=debug".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "aastar_bls_signer=debug".into()),
         )
         .init();
 
     let app = Router::new()
         .route("/sign", post(sign))
-        .route("/health", axum::routing::get(|| async { "OK" }));
+        .route("/health", get(|| async { "OK" }));
 
-    // 🔒 SECURITY: Listen ONLY on localhost (127.0.0.1:5001)
-    // - Completely isolated from network
-    // - Only local Node.js process can call
-    // - No external access possible
-    let addr = SocketAddr::from(([127, 0, 0, 1], 5001));
+    // 🔒 SECURITY: bind ONLY to loopback (127.0.0.1). The signer holds node private
+    // keys and MUST NOT be reachable from any external interface — only the local
+    // Node.js DVT process on the same host may call it. Never change to 0.0.0.0.
+    let port: u16 = std::env::var("SIGNER_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5001);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-    info!("🔒 BLS Signer starting on {} (LOCAL ONLY)", addr);
+    info!("🔒 BLS Signer on http://{} (LOOPBACK ONLY)", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .expect("Failed to bind to localhost:5001");
+        .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
-    axum::serve(listener, app)
-        .await
-        .expect("Server failed");
+    axum::serve(listener, app).await.expect("server failed");
 }
