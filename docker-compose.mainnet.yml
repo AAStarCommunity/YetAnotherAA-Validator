@@ -15,6 +15,10 @@
 #   - restart: unless-stopped        → crash / OOM / host-reboot recovery
 #   - healthcheck + autoheal sidecar → HUNG-but-alive recovery (serving stopped)
 name: dvt-mainnet
+# ⚠️ PREFLIGHT: deploy/node1/node_state.json MUST exist before `up`. A missing
+# bind-mount source makes Docker silently create an EMPTY DIRECTORY there, which
+# mounts over /app/node_state.json and breaks the node confusingly. Guard with:
+#   test -f deploy/node1/node_state.json || { echo "missing node1 key"; exit 1; }
 
 services:
   dvt-node-1:
@@ -65,7 +69,11 @@ services:
     restart: unless-stopped
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/.env.mainnet}
     networks: [dvt]
-    depends_on: [dvt-node-1]
+    # Wait until the node is actually SERVING (healthy), not merely started — else the
+    # tunnel routes to a node that isn't answering yet (502s on boot).
+    depends_on:
+      dvt-node-1:
+        condition: service_healthy
 
   # Restarts any container labelled autoheal=true that Docker marks UNHEALTHY.
   autoheal:

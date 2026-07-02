@@ -106,6 +106,10 @@ approval):**
 **Option A — Docker (recommended for always-on hosts, e.g. Mac mini):**
 
 ```bash
+# PREFLIGHT: every node key must exist first — a missing bind-mount source makes
+# Docker silently create an empty DIRECTORY over /app/node_state.json (confusing break).
+for i in 1 2 3; do test -f deploy/node$i/node_state.json || { echo "missing node$i key"; exit 1; }; done
+
 docker compose -f docker-compose.testnet.yml --env-file deploy/.env.testnet up -d --build
 docker compose -f docker-compose.testnet.yml ps     # all healthy
 ```

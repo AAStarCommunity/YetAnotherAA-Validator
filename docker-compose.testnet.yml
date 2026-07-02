@@ -9,6 +9,10 @@
 # The cloudflared sidecar exposes the 3 nodes at stable public hostnames you configure
 # in the Cloudflare dashboard (Public Hostnames → http://dvt-node-N:300N). See deploy/README.md.
 name: dvt-testnet
+# ⚠️ PREFLIGHT: each deploy/node{1,2,3}/node_state.json MUST exist before `up`.
+# A missing bind-mount source makes Docker silently create an EMPTY DIRECTORY there,
+# which mounts over /app/node_state.json and breaks the node confusingly. Guard with:
+#   for i in 1 2 3; do test -f deploy/node$i/node_state.json || { echo "missing node$i key"; exit 1; }; done
 
 x-dvt-env: &dvt-env
   ETH_RPC_URL: ${ETH_RPC_URL:?set ETH_RPC_URL in deploy/.env.testnet}
@@ -87,7 +91,15 @@ services:
     restart: unless-stopped
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/.env.testnet}
     networks: [dvt]
-    depends_on: [dvt-node-1, dvt-node-2, dvt-node-3]
+    # Wait until each node is actually SERVING (healthy), not merely started — else
+    # the tunnel comes up and routes to nodes that aren't answering yet (502s on boot).
+    depends_on:
+      dvt-node-1:
+        condition: service_healthy
+      dvt-node-2:
+        condition: service_healthy
+      dvt-node-3:
+        condition: service_healthy
 
   # Self-heal layer 2 (executor): restarts any container marked `autoheal=true` that
   # Docker reports UNHEALTHY. This is what turns a failing healthcheck into an actual
