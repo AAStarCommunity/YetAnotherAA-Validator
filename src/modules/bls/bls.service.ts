@@ -101,7 +101,9 @@ export class BlsService {
     }
 
     if (!isValid) {
-      this.logger.warn(`Owner-auth rejected for account ${account}: eth_call isValidOwnerAuth returned false`);
+      this.logger.warn(
+        `Owner-auth rejected for account ${account}: eth_call isValidOwnerAuth returned false`
+      );
       throw new ForbiddenException("owner authorization required");
     }
 
