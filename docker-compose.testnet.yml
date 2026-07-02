@@ -22,8 +22,28 @@ x-dvt-node: &dvt-node
     context: .
     dockerfile: Dockerfile
   image: aastar-dvt:latest
+  # Self-heal layer 1: restart on crash / OOM / non-zero exit + on host reboot.
   restart: unless-stopped
   networks: [dvt]
+  # Self-heal layer 2: detect a HUNG-but-alive process (serving stopped, port still
+  # bound → restart:unless-stopped alone would NOT catch it). The autoheal sidecar
+  # watches this status and restarts the container when it goes unhealthy.
+  # Uses the Dockerfile HEALTHCHECK ($PORT-aware); overridden here for visibility.
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "node",
+        "-e",
+        "fetch('http://127.0.0.1:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+      ]
+    interval: 30s
+    timeout: 5s
+    start_period: 20s
+    retries: 3
+  # Opt the container into autoheal (only containers with this label are watched).
+  labels:
+    autoheal: "true"
 
 services:
   dvt-node-1:
@@ -68,6 +88,23 @@ services:
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/.env.testnet}
     networks: [dvt]
     depends_on: [dvt-node-1, dvt-node-2, dvt-node-3]
+
+  # Self-heal layer 2 (executor): restarts any container marked `autoheal=true` that
+  # Docker reports UNHEALTHY. This is what turns a failing healthcheck into an actual
+  # restart — `restart: unless-stopped` only reacts to exit, not to "unhealthy".
+  # Mounts the Docker socket read-only-ish (needs write to restart); scoped by label.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: dvt-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal # only watch containers with label autoheal=true
+      AUTOHEAL_INTERVAL: 10 # check every 10s
+      AUTOHEAL_START_PERIOD: 30 # grace before first check
+      CURL_TIMEOUT: 30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [dvt]
 
 networks:
   dvt:

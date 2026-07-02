@@ -110,6 +110,34 @@ docker compose -f docker-compose.testnet.yml --env-file deploy/.env.testnet up -
 docker compose -f docker-compose.testnet.yml ps     # all healthy
 ```
 
+Self-heal is built in (issue #100):
+
+- **`restart: unless-stopped`** — recovers from crash / OOM / non-zero exit and
+  auto-starts on host reboot.
+- **`healthcheck` + `autoheal` sidecar** — recovers from a _hung-but-alive_
+  process (port still bound but `/health` stopped answering — which `restart:`
+  alone does NOT catch). Each node's healthcheck probes `/health`; the
+  `willfarrell/autoheal` container watches for `unhealthy` status (label
+  `autoheal=true`) and restarts it.
+
+```bash
+docker compose -f docker-compose.testnet.yml ps          # STATUS shows (healthy)
+docker inspect --format '{{.State.Health.Status}}' dvt-node-1   # healthy | unhealthy
+docker logs dvt-autoheal                                  # restart events
+```
+
+For **mainnet**, use `docker-compose.mainnet.yml` (single-host DVT + Keeper +
+Relay three-in-one, same self-heal).
+
+> **HA (整机宕机) — 单机自愈的边界.** The self-heal above covers _process_
+> failure on one host; it does NOT cover the whole host dying (still a single
+> point). Relay/Keeper are stateless → scale to ≥2 hosts freely (SDK supports
+> multi-URL failover). DVT co-signing HA is achieved by running a **second
+> operator with its OWN pre-registered BLS key** and an N-of-M threshold — NOT
+> by cloning the key (which is unsafe and unnecessary). BLS keys stay encrypted
+> at rest on each host (EIP-2335, planned #50④), never in a shared KMS. See
+> issue #100 / #50.
+
 **Option B — local-process manager script (no Docker):** runs the 3 nodes on
 4001/2/3 + the cloudflared named tunnel as plain processes. Full lifecycle:
 
@@ -192,19 +220,19 @@ override `RELAY_*` for a different deployment. See
 
 共 2 个进程，6 个逻辑服务：
 
-| 服务 | 端口 | 说明 |
-|------|------|------|
-| DVT node 1 | 4001 | BLS 联合签名节点 |
-| DVT node 2 | 4002 | BLS 联合签名节点 |
-| DVT node 3 | 4003 | BLS 联合签名节点 |
-| cloudflared | — | 将三节点暴露为 dvt1/2/3.aastar.io |
-| relay（内置） | 同节点端口 | Gasless 代币购买中继，`POST /v3/relay` |
-| keeper（内置） | 同节点端口 | 节点签名策略 / 心跳 |
-| x402-facilitator（内置） | 同节点端口 | x402 支付撮合 |
-| **price-keeper** | — | 独立进程，每 3 分钟刷新 SuperPaymaster 价格预言机 |
+| 服务                     | 端口       | 说明                                              |
+| ------------------------ | ---------- | ------------------------------------------------- |
+| DVT node 1               | 4001       | BLS 联合签名节点                                  |
+| DVT node 2               | 4002       | BLS 联合签名节点                                  |
+| DVT node 3               | 4003       | BLS 联合签名节点                                  |
+| cloudflared              | —          | 将三节点暴露为 dvt1/2/3.aastar.io                 |
+| relay（内置）            | 同节点端口 | Gasless 代币购买中继，`POST /v3/relay`            |
+| keeper（内置）           | 同节点端口 | 节点签名策略 / 心跳                               |
+| x402-facilitator（内置） | 同节点端口 | x402 支付撮合                                     |
+| **price-keeper**         | —          | 独立进程，每 3 分钟刷新 SuperPaymaster 价格预言机 |
 
-> relay / keeper / x402-facilitator 是 DVT 节点的内置模块，随节点启停，不需要单独管理。
-> price-keeper 是独立进程，由 LaunchAgent 托管。
+> relay / keeper /
+> x402-facilitator 是 DVT 节点的内置模块，随节点启停，不需要单独管理。price-keeper 是独立进程，由 LaunchAgent 托管。
 
 ---
 
@@ -216,6 +244,7 @@ cd ~/Dev/aastar/YetAnotherAA-Validator
 ```
 
 输出示例：
+
 ```
 local nodes:
   node1 :4001  ✅ UP
@@ -296,12 +325,13 @@ tail -f ~/Dev/aastar/aastar-sdk/keeper.log
 
 ### 开机自启（macOS LaunchAgent）
 
-两个 plist 已配置在 `~/Library/LaunchAgents/`，Mac 登录后自动启动，无需手动操作：
+两个 plist 已配置在
+`~/Library/LaunchAgents/`，Mac 登录后自动启动，无需手动操作：
 
-| plist 文件 | 管理的服务 | 崩溃自动重启 |
-|-----------|----------|------------|
-| `io.aastar.dvt-testnet.plist` | DVT 三节点 + cloudflared | 否（脚本后台化后退出属正常） |
-| `io.aastar.price-keeper.plist` | price-keeper | 是 |
+| plist 文件                     | 管理的服务               | 崩溃自动重启                 |
+| ------------------------------ | ------------------------ | ---------------------------- |
+| `io.aastar.dvt-testnet.plist`  | DVT 三节点 + cloudflared | 否（脚本后台化后退出属正常） |
+| `io.aastar.price-keeper.plist` | price-keeper             | 是                           |
 
 手动加载 / 卸载（通常不需要）：
 
@@ -327,11 +357,12 @@ launchctl list io.aastar.price-keeper
 
 ### ⚠️ price-keeper 为什么不能停
 
-price-keeper 每 3 分钟调用一次 `SuperPaymaster.updatePrice()`。
-一旦停止 → aPNTs 价格过期 → `getRealtimeTokenCost` revert → 用户看到
+price-keeper 每 3 分钟调用一次 `SuperPaymaster.updatePrice()`。一旦停止 →
+aPNTs 价格过期 → `getRealtimeTokenCost` revert → 用户看到
 `InsufficientBalance`（哪怕账户有 1000 万 aPNTs 也没用）。
 
-签名账户：anni EOA `0xEcAACb915f7D92e9916f449F7ad42BD0408733c9`（持有 `PRICE_UPDATER_ROLE`）。
+签名账户：anni EOA `0xEcAACb915f7D92e9916f449F7ad42BD0408733c9`（持有
+`PRICE_UPDATER_ROLE`）。
 
 ---
 

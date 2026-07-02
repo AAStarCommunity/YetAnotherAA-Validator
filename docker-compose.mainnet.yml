@@ -1,0 +1,86 @@
+# Mainnet DVT — single-host, self-healing (issue #100).
+#
+# One operator = one host running the "three-in-one": DVT co-signing + Keeper
+# (price keep-alive) + Relay (gasless). Multiple operators each run this → N-of-M.
+# High availability across operators comes from running independent hosts (see the
+# HA discussion / Plan B: a second operator with its OWN pre-registered BLS key),
+# NOT from cloning one key. This file gives per-host self-heal only.
+#
+#   1. cp deploy/.env.mainnet.example deploy/.env.mainnet  &&  fill it in
+#   2. put this host's node_state.json (its OWN secret BLS key) in deploy/node1/
+#   3. docker compose -f docker-compose.mainnet.yml --env-file deploy/.env.mainnet up -d --build
+#   4. register this node's BLS pubkey on the mainnet validator (see deploy/README.md)
+#
+# Self-heal:
+#   - restart: unless-stopped        → crash / OOM / host-reboot recovery
+#   - healthcheck + autoheal sidecar → HUNG-but-alive recovery (serving stopped)
+name: dvt-mainnet
+
+services:
+  dvt-node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aastar-dvt:latest
+    container_name: dvt-mainnet-node-1
+    restart: unless-stopped
+    environment:
+      ETH_RPC_URL: ${ETH_RPC_URL:?set ETH_RPC_URL in deploy/.env.mainnet}
+      VALIDATOR_CONTRACT_ADDRESS: ${VALIDATOR_CONTRACT_ADDRESS:?set VALIDATOR_CONTRACT_ADDRESS (mainnet)}
+      ENTRY_POINT_ADDRESS: ${ENTRY_POINT_ADDRESS:-0x0000000071727De22E5E9d8BAf0edAc6f37da032}
+      PORT: 3001
+      PUBLIC_URL: ${NODE1_PUBLIC_URL:-}
+      # Owner-authorization gate is always on (eth_call isValidOwnerAuth).
+      POLICY_ENABLED: ${POLICY_ENABLED:-false}
+      POLICY_REGISTRY_ADDRESS: ${POLICY_REGISTRY_ADDRESS:-}
+      # Relay (gasless) — needs a funded mainnet operator key (KEEP SEPARATE from BLS key).
+      RELAY_ENABLED: ${RELAY_ENABLED:-false}
+      RELAY_OPERATOR_PK: ${RELAY_OPERATOR_PK:-}
+      # Keeper (price keep-alive) — needs a funded mainnet key (SEPARATE again).
+      KEEPER_ENABLED: ${KEEPER_ENABLED:-false}
+      KEEPER_PRIVATE_KEY: ${KEEPER_PRIVATE_KEY:-}
+      KEEPER_PAYMASTER_ADDRESS: ${KEEPER_PAYMASTER_ADDRESS:-}
+    volumes:
+      - ./deploy/node1/node_state.json:/app/node_state.json:ro
+    ports: ["127.0.0.1:3001:3001"] # localhost-only; public access via the tunnel
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    labels:
+      autoheal: "true"
+    networks: [dvt]
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: dvt-mainnet-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/.env.mainnet}
+    networks: [dvt]
+    depends_on: [dvt-node-1]
+
+  # Restarts any container labelled autoheal=true that Docker marks UNHEALTHY.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: dvt-mainnet-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 10
+      AUTOHEAL_START_PERIOD: 30
+      CURL_TIMEOUT: 30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [dvt]
+
+networks:
+  dvt:
+    driver: bridge
