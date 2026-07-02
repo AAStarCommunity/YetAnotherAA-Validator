@@ -77,7 +77,9 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
   let service: InstanceType<typeof BlsService>;
   let getAccountOwner: jest.Mock<(account: string) => Promise<string>>;
   let getUserOpHash: jest.Mock<(userOp: PackedUserOp) => Promise<string>>;
-  let isValidOwnerAuth: jest.Mock<(account: string, userOpHash: string, ownerAuth: string) => Promise<boolean>>;
+  let isValidOwnerAuth: jest.Mock<
+    (account: string, userOpHash: string, ownerAuth: string) => Promise<boolean>
+  >;
 
   // Sign a hash exactly the way the account owner signs the UserOperation:
   // EIP-191 prefix over the raw 32-byte hash.
@@ -88,7 +90,8 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
   beforeEach(() => {
     getAccountOwner = jest.fn<(account: string) => Promise<string>>();
     getUserOpHash = jest.fn<(userOp: PackedUserOp) => Promise<string>>();
-    isValidOwnerAuth = jest.fn<(account: string, userOpHash: string, ownerAuth: string) => Promise<boolean>>();
+    isValidOwnerAuth =
+      jest.fn<(account: string, userOpHash: string, ownerAuth: string) => Promise<boolean>>();
     const blockchain = {
       getAccountOwner,
       getUserOpHash,

@@ -19,7 +19,9 @@ export class HealthController {
   constructor(@Optional() private readonly capabilities?: CapabilityRegistry) {}
 
   @Get()
-  @ApiOperation({ summary: "Service index — identity + version + enabled capabilities + endpoint map" })
+  @ApiOperation({
+    summary: "Service index — identity + version + enabled capabilities + endpoint map",
+  })
   root(): {
     service: string;
     status: string;
@@ -48,7 +50,11 @@ export class HealthController {
 
   @Get("health")
   @ApiOperation({ summary: "Liveness check + enabled capabilities" })
-  health(): { status: string; version: string; capabilities: Array<{ name: string; enabled: boolean }> } {
+  health(): {
+    status: string;
+    version: string;
+    capabilities: Array<{ name: string; enabled: boolean }>;
+  } {
     return { status: "ok", version: APP_VERSION, capabilities: this.capList() };
   }
 
