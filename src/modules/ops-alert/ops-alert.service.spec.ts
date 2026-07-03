@@ -72,4 +72,45 @@ describe("OpsAlertService", () => {
       svc.send({ node: "dvt", level: "warn", message: "x", timestamp: "t" })
     ).rejects.toThrow("aastar-monitor HTTP 500");
   });
+
+  // ── Telegram transport (the aastar-monitor bot) ──────────────────────────
+  it("sends via Telegram Bot API when bot token + chat id are set", async () => {
+    const svc = new OpsAlertService(
+      cfg({
+        opsAlertEnabled: true,
+        opsAlertBotToken: "123:ABC",
+        opsAlertChatId: "777",
+        opsAlertNode: "dvt1",
+      })
+    );
+    expect(svc.isEnabled()).toBe(true);
+    await svc.send({ node: "dvt1", level: "critical", message: "keeper failed", timestamp: "t" });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, any];
+    expect(url).toBe("https://api.telegram.org/bot123:ABC/sendMessage");
+    const body = JSON.parse(init.body);
+    expect(body.chat_id).toBe("777");
+    expect(body.text).toBe("🔴 [dvt1] keeper failed"); // critical → red icon
+  });
+
+  it("Telegram takes priority over webhook when both are configured", async () => {
+    const svc = new OpsAlertService(
+      cfg({
+        opsAlertEnabled: true,
+        opsAlertBotToken: "t",
+        opsAlertChatId: "1",
+        opsAlertUrl: "http://webhook",
+      })
+    );
+    await svc.send({ node: "dvt", level: "info", message: "hi", timestamp: "t" });
+    const [url] = fetchMock.mock.calls[0] as [string, any];
+    expect(url).toContain("api.telegram.org");
+  });
+
+  it("Telegram not enabled with token but no chat id", () => {
+    const svc = new OpsAlertService(cfg({ opsAlertEnabled: true, opsAlertBotToken: "t" }));
+    expect(svc.isEnabled()).toBe(false);
+    svc.alert("info", "x");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
