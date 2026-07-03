@@ -91,6 +91,34 @@ ln -sfn /opt/aastar-dvt/releases/<old-version> /opt/aastar-dvt/current
 systemctl restart aastar-dvt@node1
 ```
 
+## Optional: hybrid Rust signer (faster BLS on ARM)
+
+Delegate BLS signing to a local Rust signer (byte-identical output —
+golden-vector verified — and faster on the A55). Fully optional: if the signer
+is down the DVT falls back to in-process Node signing. Best fit for this
+constrained board.
+
+```bash
+# (on your Mac) cross-build the arm64 signer — no Docker, uses cargo-zigbuild:
+#   rustup target add aarch64-unknown-linux-gnu && brew install zig && cargo install cargo-zigbuild
+./signer/build-arm64.sh          # → signer/dist-arm64/aastar-bls-signer (aarch64 glibc)
+
+# (plan b) sanity-check raw signing throughput ON THE BOARD before wiring it in:
+scp signer/dist-arm64/aastar-bls-signer root@<board>:/tmp/
+ssh root@<board> '/tmp/aastar-bls-signer --bench'   # prints ms/sig + sig/s (Node ≈ 150 ms/sig)
+
+# (plan c) install it as a loopback service next to the DVT node:
+scp -r deploy/imx93 root@<board>:/tmp/imx93
+ssh root@<board> 'cd /tmp/imx93 && ./install-signer.sh /tmp/aastar-bls-signer node1'
+#   → enables aastar-bls-signer@node1 (127.0.0.1:5001, key-holding hardening),
+#     sets RUST_SIGNER_URL in the node env, restarts the DVT.
+```
+
+Verify the DVT is routing to it:
+`journalctl -u aastar-dvt@node1 | grep 'Rust signer'` (“Signed via Rust
+signer”). Set `RUST_SIGNER_REQUIRED=true` in the node env to fail closed instead
+of falling back to Node.
+
 ## HA (whole-board failure)
 
 Per-board self-heal does NOT cover the board dying. DVT co-signing HA = a

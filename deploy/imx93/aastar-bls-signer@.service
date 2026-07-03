@@ -1,0 +1,40 @@
+# Rust BLS signer (hybrid, plan c) for node %i, on i.MX93.
+# Runs the loopback-only Rust signer alongside the Node DVT so BLS signing is delegated
+# to it (byte-identical output, faster on ARM). The DVT reaches it via RUST_SIGNER_URL=
+# http://127.0.0.1:5001; if this service is down the DVT falls back to in-process Node
+# signing (unless RUST_SIGNER_REQUIRED=true). Enable:  systemctl enable --now aastar-bls-signer@node1
+[Unit]
+Description=AAStar Rust BLS signer (loopback) for %i
+After=network.target
+
+[Service]
+Type=simple
+Environment=SIGNER_PORT=5001
+# The signer resolves THIS node's BLS key from its node_state.json (read-only).
+Environment=NODE_STATE_DIR=/opt/aastar-dvt/state/%i
+ExecStart=/opt/aastar-dvt/signer/aastar-bls-signer
+WorkingDirectory=/opt/aastar-dvt/state/%i
+
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- hardening: this process holds the raw BLS key in memory ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# It only READS the key; nothing needs to be writable.
+ReadOnlyPaths=/opt/aastar-dvt/state/%i
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Loopback-only is enforced in-process (binds 127.0.0.1); also restrict at the unit.
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

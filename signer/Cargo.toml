@@ -1,0 +1,27 @@
+[package]
+name = "aastar-bls-signer"
+version = "1.7.1"
+edition = "2021"
+
+[dependencies]
+# BLS12-381 signature (production-grade, same scheme as @noble/curves longSignatures)
+blst = "0.3.13"
+
+# Web server (loopback-only HTTP)
+tokio = { version = "1.35", features = ["rt-multi-thread", "net", "macros"] }
+axum = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+
+# Error handling
+thiserror = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

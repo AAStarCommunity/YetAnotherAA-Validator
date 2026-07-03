@@ -55,6 +55,13 @@ export default () => {
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || undefined,
     notifyContactsFile: process.env.NOTIFY_CONTACTS_FILE || undefined,
 
+    // Hybrid signing (feat/rust-signer): when set, BLS signing is delegated to a local
+    // Rust signer over loopback HTTP (byte-identical output, faster on ARM). UNSET →
+    // pure in-process Node signing (no probe, zero overhead). On any Rust error the node
+    // falls back to Node signing unless RUST_SIGNER_REQUIRED=true (then it fails closed).
+    rustSignerUrl: process.env.RUST_SIGNER_URL || undefined,
+    rustSignerRequired: process.env.RUST_SIGNER_REQUIRED === "true",
+
     // Operator alerting → aastar-monitor Telegram bot (#100). Opt-in; fire-and-forget
     // (never blocks signing/relaying). Distinct from NOTIFY_* (which alerts end users).
     // Two transports (Telegram takes priority): OPS_ALERT_BOT_TOKEN + OPS_ALERT_CHAT_ID

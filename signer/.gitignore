@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Cross-build output (arm64 binary for the board)
+/dist-arm64/
