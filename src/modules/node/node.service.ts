@@ -6,6 +6,7 @@ import { join } from "path";
 import { BlsService } from "../bls/bls.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { randomBytes, createHash } from "crypto";
+import { decryptKeystore, isKeystore } from "../../utils/keystore.util.js";
 
 @Injectable()
 export class NodeService implements OnModuleInit {
@@ -48,17 +49,49 @@ export class NodeService implements OnModuleInit {
   }
 
   private loadExistingNodeState(): void {
+    let state: NodeState;
     try {
-      const stateData = readFileSync(this.nodeStateFilePath, "utf8");
-      this.nodeState = JSON.parse(stateData);
+      state = JSON.parse(readFileSync(this.nodeStateFilePath, "utf8"));
     } catch (error: any) {
       throw new Error(`Failed to load node state: ${error.message}`);
     }
+    this.nodeState = this.resolvePrivateKey(state);
+  }
+
+  /**
+   * Resolve the in-memory private key (#5). If the on-disk state carries an EIP-2335
+   * `keystore`, decrypt it with NODE_KEY_PASSPHRASE and populate `privateKey`. Plaintext
+   * `privateKey` (dev/legacy) is used as-is. Fails closed: an encrypted keystore with no
+   * passphrase — or a wrong one — throws, so the node never boots with an unusable key.
+   */
+  private resolvePrivateKey(state: NodeState): NodeState {
+    if (isKeystore(state.keystore)) {
+      const passphrase = this.configService.get<string>("keyPassphrase");
+      if (!passphrase) {
+        throw new Error(
+          "node_state.json holds an encrypted keystore but NODE_KEY_PASSPHRASE is not set"
+        );
+      }
+      const secret = decryptKeystore(state.keystore, passphrase); // throws on wrong passphrase
+      state.privateKey = "0x" + Buffer.from(secret).toString("hex");
+      this.logger.log("BLS key loaded from encrypted keystore (EIP-2335)");
+    } else if (!state.privateKey) {
+      throw new Error("node_state.json has neither a keystore nor a plaintext privateKey");
+    }
+    return state;
   }
 
   saveNodeState(): void {
     try {
-      writeFileSync(this.nodeStateFilePath, JSON.stringify(this.nodeState, null, 2), "utf8");
+      // SECURITY (#5): when the key is stored encrypted (keystore present), NEVER write
+      // the in-memory-decrypted plaintext privateKey back to disk — that would defeat
+      // the at-rest encryption. Persist the keystore form only.
+      let toWrite = this.nodeState;
+      if (this.nodeState && isKeystore(this.nodeState.keystore)) {
+        const { privateKey: _omit, ...rest } = this.nodeState;
+        toWrite = rest as NodeState;
+      }
+      writeFileSync(this.nodeStateFilePath, JSON.stringify(toWrite, null, 2), "utf8");
     } catch (error: any) {
       throw new Error(`Failed to save node state: ${error.message}`);
     }
