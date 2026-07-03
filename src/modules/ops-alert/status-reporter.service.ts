@@ -46,7 +46,11 @@ export class StatusReporterService implements OnApplicationBootstrap, OnApplicat
   }
 
   onApplicationBootstrap(): void {
-    if (this.intervalMs <= 0 || !this.opsAlert.isEnabled()) return;
+    // Defensive: a non-finite interval (bad env) must never reach setInterval, or it
+    // fires continuously. Config already guards this; belt-and-braces here too.
+    if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0 || !this.opsAlert.isEnabled()) {
+      return;
+    }
     this.startedAtMs = this.clock();
     this.opsAlert.alert("info", `🟢 online — v${APP_VERSION}`);
     this.timer = setInterval(() => void this.report(), this.intervalMs);
