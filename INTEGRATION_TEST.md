@@ -2,12 +2,12 @@
 
 ## 当前状态
 
-| 组件 | 状态 | 备注 |
-|------|------|------|
-| Rust Signer 骨架 | ✅ 完成 | 代码 + 文档 + 安全配置 |
-| Node.js DVT 集成 | ✅ 完成 | signDerivedHash() 改造完毕 |
-| 单元测试 | ✅ 145/145 通过 | 包括降级模式 |
-| 集成测试 | 🔄 本文档 | 本地运行验证 |
+| 组件             | 状态            | 备注                       |
+| ---------------- | --------------- | -------------------------- |
+| Rust Signer 骨架 | ✅ 完成         | 代码 + 文档 + 安全配置     |
+| Node.js DVT 集成 | ✅ 完成         | signDerivedHash() 改造完毕 |
+| 单元测试         | ✅ 145/145 通过 | 包括降级模式               |
+| 集成测试         | 🔄 本文档       | 本地运行验证               |
 
 ## 测试场景
 
@@ -16,12 +16,14 @@
 **前置条件**：Rust signer 未启动
 
 **步骤**：
+
 ```bash
 npm run start:dev
 # 日志应显示: "Rust signer unavailable (fetch failed), falling back to Node.js local signing"
 ```
 
 **验证**：
+
 ```bash
 # 在另一个终端测试签名端点
 curl -X POST http://localhost:4001/signature/sign \
@@ -43,6 +45,7 @@ curl -X POST http://localhost:4001/signature/sign \
 **前置条件**：编译 Rust signer
 
 **步骤 1: 编译 Rust signer**
+
 ```bash
 cd signer
 cargo build --release
@@ -50,6 +53,7 @@ cargo build --release
 ```
 
 **步骤 2: 启动 Rust signer**
+
 ```bash
 # 终端 1
 cd signer
@@ -58,12 +62,14 @@ cd signer
 ```
 
 **步骤 3: 验证 Rust signer 在线**
+
 ```bash
 curl http://127.0.0.1:5001/health
 # 应返回: OK
 ```
 
 **步骤 4: 启动 Node.js DVT**
+
 ```bash
 # 终端 2
 npm run start:dev
@@ -71,6 +77,7 @@ npm run start:dev
 ```
 
 **步骤 5: 测试签名端点**
+
 ```bash
 curl -X POST http://localhost:4001/signature/sign \
   -H "Content-Type: application/json" \
@@ -85,6 +92,7 @@ curl -X POST http://localhost:4001/signature/sign \
 ```
 
 **预期结果**：
+
 - ✅ Rust signer HTTP 200
 - ✅ DVT 日志显示 "Signed via Rust signer"
 - ✅ 签名有效且与 Node.js 模式兼容
@@ -96,6 +104,7 @@ curl -X POST http://localhost:4001/signature/sign \
 **模拟 Rust signer 崩溃**
 
 **步骤**：
+
 ```bash
 # 终端 1 正在运行 Rust signer
 # 在终端 1 按 Ctrl+C 杀死它
@@ -108,6 +117,7 @@ curl -X POST http://localhost:4001/signature/sign ...
 ```
 
 **预期结果**：
+
 - ✅ DVT 自动降级
 - ✅ 签名仍然成功（用 Node.js）
 - ✅ 用户无感知故障
@@ -119,6 +129,7 @@ curl -X POST http://localhost:4001/signature/sign ...
 验证 Rust 签名和 Node.js 签名在链上行为一致
 
 **步骤**：
+
 ```bash
 # 1. 用 Node.js 签名
 npm run build
@@ -138,6 +149,7 @@ PORT=4001 npm run start:dev
 ```
 
 **预期结果**：
+
 - ✅ 两个签名格式相同（EIP-2537）
 - ✅ 都通过链上验证
 - ✅ 输出格式 100% 兼容
@@ -158,17 +170,18 @@ ab -n 100 -c 1 -p payload.json http://localhost:4001/signature/sign
 
 **预期结果**（单核 ARM A55）：
 
-| 模式 | 平均响应时间 | Min | Max | 吞吐 (req/sec) |
-|------|-------------|-----|-----|--------------|
-| Node.js | ~200ms | 150ms | 300ms | 5 |
-| Hybrid | ~130ms | 100ms | 200ms | 7.5 |
-| 改进 | -35% | - | - | +50% |
+| 模式    | 平均响应时间 | Min   | Max   | 吞吐 (req/sec) |
+| ------- | ------------ | ----- | ----- | -------------- |
+| Node.js | ~200ms       | 150ms | 300ms | 5              |
+| Hybrid  | ~130ms       | 100ms | 200ms | 7.5            |
+| 改进    | -35%         | -     | -     | +50%           |
 
 ---
 
 ## 故障排除
 
 ### "Connection refused at 127.0.0.1:5001"
+
 ```bash
 # 检查 Rust signer 是否运行
 lsof -ti :5001
@@ -179,6 +192,7 @@ cd signer
 ```
 
 ### "Key not found for node: node_test"
+
 ```bash
 # 检查 node_state.json 存在
 ls deploy/node1/node_state.json
@@ -188,6 +202,7 @@ cat deploy/node1/node_state.json | jq .
 ```
 
 ### 签名不一致
+
 ```bash
 # 对比两种模式的签名输出
 # Node.js 模式日志: "Using local Node.js signing"
@@ -217,4 +232,5 @@ cat deploy/node1/node_state.json | jq .
 
 - 📖 [Hybrid 架构](HYBRID_ARCHITECTURE.md)
 - 📖 [Rust Signer README](signer/README.md)
-- 🔗 [提交历史](https://github.com/AAStarCommunity/YetAnotherAA-Validator/tree/feat/rust-signer)
+- 🔗
+  [提交历史](https://github.com/AAStarCommunity/YetAnotherAA-Validator/tree/feat/rust-signer)

@@ -5,12 +5,14 @@
 ## 🔒 安全设计
 
 ### 网络隔离
+
 - **仅监听 127.0.0.1:5001**（localhost）
 - 完全不对外暴露
 - 操作系统级别防护（kernel 路由）
 - 不能被外部网络访问
 
 ### 私钥保护
+
 - 仅从本地 `node_state.json` 加载
 - 内存中不落地
 - 进程退出即销毁
@@ -19,6 +21,7 @@
 ## 快速开始
 
 ### 编译
+
 ```bash
 cd signer
 cargo build --release
@@ -27,6 +30,7 @@ cargo build --release
 输出：`target/release/aastar-bls-signer`（单个二进制，~20MB）
 
 ### 运行
+
 ```bash
 # 方案 1: 直接运行
 ./target/release/aastar-bls-signer
@@ -38,9 +42,11 @@ cargo build --release
 ## API
 
 ### POST `/sign`
+
 签名 userOpHash
 
 **请求**：
+
 ```json
 {
   "user_op_hash": "0x8bb1b199f427dfc49e5fe40f2f3278cb1a48587824b78263051c8c4d81d77a81",
@@ -49,6 +55,7 @@ cargo build --release
 ```
 
 **响应**：
+
 ```json
 {
   "signature": "0xab...cd (256 bytes)",
@@ -57,9 +64,11 @@ cargo build --release
 ```
 
 ### GET `/health`
+
 健康检查
 
 **响应**：
+
 ```
 OK
 ```
@@ -67,6 +76,7 @@ OK
 ## 与 Node.js DVT 集成
 
 ### 架构
+
 ```
 Node.js DVT (port 4001)
     │
@@ -109,6 +119,7 @@ async signDerivedHash(userOpHash: string, node: NodeKeyPair): Promise<SignatureR
 ## 生产部署（i.MX93）
 
 ### 方案 A: 手工启动
+
 ```bash
 # 同一设备上
 systemctl start aastar-bls-signer
@@ -116,6 +127,7 @@ systemctl start aastar-dvt
 ```
 
 ### 方案 B: supervisord 管理（推荐）
+
 ```ini
 [program:aastar-bls-signer]
 command=/opt/aastar/signer/target/release/aastar-bls-signer
@@ -131,6 +143,7 @@ stdout_logfile=/var/log/aastar-dvt.log
 ```
 
 ### 方案 C: Docker (if arm64 available)
+
 ```dockerfile
 FROM rust:latest as builder
 WORKDIR /build
@@ -162,14 +175,17 @@ CMD ["aastar-bls-signer"]
 ## 故障排除
 
 ### "Connection refused"
+
 - 确保 Rust signer 已启动
 - 检查 `lsof -ti :5001`
 
 ### "Key not found for node: X"
+
 - 确保 `deploy/nodeX/node_state.json` 存在
 - 检查 JSON 格式和 privateKey 字段
 
 ### 性能慢
+
 - 检查 CPU：`top` 看 Rust signer 占用
 - 检查 RPC 延迟：主要瓶颈在 eth_call，不是签名
 

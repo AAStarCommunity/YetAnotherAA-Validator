@@ -3,6 +3,7 @@
 ## 概述
 
 本仓库现支持 **Hybrid 混合架构**：
+
 - **Node.js DVT** — 授权、策略、gossip、REST API
 - **Rust Signer** — BLS12-381 签名（高性能、轻量、安全隔离）
 
@@ -11,12 +12,13 @@
 ```
 计算成本分布：
 BLS 签名       ████████████████ 85%  ← Rust 负责
-BLS 聚合       ███ 10%                ← Rust 负责  
+BLS 聚合       ███ 10%                ← Rust 负责
 授权检查       ██ 3%                  ← Node.js
 策略评估       █ 2%                   ← Node.js
 ```
 
 **收益**：
+
 - ✅ 性能提升 60%+ （只在签名层）
 - ✅ i.MX93 可直接运行（内存 30MB vs 150MB）
 - ✅ Node.js 迭代快，Rust signer 独立稳定
@@ -25,6 +27,7 @@ BLS 聚合       ███ 10%                ← Rust 负责
 ## 安全设计
 
 ### 网络隔离
+
 ```
 外网 ─ [不可达]
                ↑
@@ -42,12 +45,14 @@ BLS 聚合       ███ 10%                ← Rust 负责
 ```
 
 **隔离手段**：
+
 - Rust signer 只监听 `127.0.0.1:5001`
 - 操作系统路由表禁止外网访问
 - 无 VPN/代理/NAT 穿透
 - 无 HTTP Basic Auth（本地即免认证）
 
 ### 密钥安全
+
 - 私钥仅在 Rust signer 内存中
 - Node.js DVT 无法接触
 - 进程退出即销毁
@@ -171,18 +176,19 @@ curl -X POST http://127.0.0.1:5001/sign \
 
 ### i.MX93 上的实测
 
-| 指标 | 纯 Node.js | Hybrid (Rust Signer) |
-|------|-----------|----------------------|
-| 内存占用 | ~180MB | ~150MB Node.js + ~30MB Signer = 180MB |
-| 单签名耗时 | ~150ms | ~80ms (BLS) + 10ms (HTTP) = ~90ms |
-| 吞吐（sig/sec） | ~6 | ~11 |
-| CPU 占用 | 60% (单核饱和) | 40% (两核分散) |
+| 指标            | 纯 Node.js     | Hybrid (Rust Signer)                  |
+| --------------- | -------------- | ------------------------------------- |
+| 内存占用        | ~180MB         | ~150MB Node.js + ~30MB Signer = 180MB |
+| 单签名耗时      | ~150ms         | ~80ms (BLS) + 10ms (HTTP) = ~90ms     |
+| 吞吐（sig/sec） | ~6             | ~11                                   |
+| CPU 占用        | 60% (单核饱和) | 40% (两核分散)                        |
 
 **结论**：性能提升 50-80%，内存保持，CPU 更均衡。
 
 ## 故障排除
 
 ### "Connection refused at 127.0.0.1:5001"
+
 ```bash
 # 检查 signer 是否在运行
 lsof -ti :5001
@@ -191,6 +197,7 @@ lsof -ti :5001
 ```
 
 ### "Key not found for node: node_test"
+
 ```bash
 # 确保 node_state.json 存在
 ls deploy/node1/node_state.json
@@ -199,6 +206,7 @@ cat deploy/node1/node_state.json | jq .
 ```
 
 ### 防火墙阻止了本地连接
+
 ```bash
 # 检查防火墙规则
 sudo ufw status
