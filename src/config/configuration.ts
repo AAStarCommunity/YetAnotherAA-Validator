@@ -95,6 +95,12 @@ export default () => {
     // backend-independent (algorithm/wire is the fixed kernel — see conformance/).
     signerBackend: process.env.SIGNER_BACKEND || "local",
 
+    // EIP-2335 keystore passphrase (#5, #50 ④). When node_state.json holds an encrypted
+    // keystore, this decrypts it at boot. Supply it from OUTSIDE the machine's disk —
+    // an env var injected at boot (systemd LoadCredential, an orchestrator, or typed).
+    // Never store it next to the keystore. Unset + encrypted keystore → fail to boot.
+    keyPassphrase: process.env.NODE_KEY_PASSPHRASE || undefined,
+
     // Price Keeper (#58). Opt-in; keeps paymaster cachedPrice permanently fresh via
     // on-chain updatePrice() calls when approaching the staleness threshold. Requires
     // ETH_PRIVATE_KEY (or a dedicated KEEPER_PRIVATE_KEY in a future phase). Default off.
