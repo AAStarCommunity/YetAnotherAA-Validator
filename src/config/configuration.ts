@@ -57,12 +57,18 @@ export default () => {
 
     // Operator alerting → aastar-monitor Telegram bot (#100). Opt-in; fire-and-forget
     // (never blocks signing/relaying). Distinct from NOTIFY_* (which alerts end users).
-    // OPS_ALERT_NODE labels which node raised the alert. AASTAR_MONITOR_TOKEN is an
-    // optional bearer token if the bot's webhook requires auth.
+    // Two transports (Telegram takes priority): OPS_ALERT_BOT_TOKEN + OPS_ALERT_CHAT_ID
+    // send straight to the bot's chat; OR AASTAR_MONITOR_URL (+ optional token) for a
+    // generic webhook. OPS_ALERT_NODE labels which node raised the alert.
     opsAlertEnabled: process.env.OPS_ALERT_ENABLED === "true",
+    opsAlertBotToken: process.env.OPS_ALERT_BOT_TOKEN || undefined,
+    opsAlertChatId: process.env.OPS_ALERT_CHAT_ID || undefined,
     opsAlertUrl: process.env.AASTAR_MONITOR_URL || undefined,
     opsAlertToken: process.env.AASTAR_MONITOR_TOKEN || undefined,
     opsAlertNode: process.env.OPS_ALERT_NODE || undefined,
+    // Scheduled status heartbeat (#100). 0 = off. Pushes a periodic "still alive +
+    // health check" summary to the ops channel, plus online/offline on boot/shutdown.
+    opsStatusIntervalMs: parseInt(process.env.OPS_STATUS_INTERVAL_MS || "0", 10),
 
     // Out-of-band confirmation (scheme A, #50 ⑤). Opt-in; a high-value op is withheld
     // until the user approves over an independent channel. Fail-closed if undeliverable.
