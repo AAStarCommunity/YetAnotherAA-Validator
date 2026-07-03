@@ -49,3 +49,4 @@ deploy/node*/.env
 
 # test coverage report
 coverage/
+dist-bundle/
