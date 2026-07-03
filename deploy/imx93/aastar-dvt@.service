@@ -1,0 +1,44 @@
+# systemd template unit for an AAStar DVT node on i.MX93 (Yocto, glibc).
+# Instance name = node id, e.g. `aastar-dvt@node1`. Enable/start:
+#   systemctl enable --now aastar-dvt@node1
+#
+# Self-heal layer 1: Restart=always → recover from crash / OOM / non-zero exit,
+# and (via `enable`) auto-start on boot. The hung-but-alive case is handled by the
+# companion aastar-dvt-health@.timer (probes /health, restarts on failure).
+[Unit]
+Description=AAStar DVT signer node (%i)
+Documentation=https://github.com/AAStarCommunity/YetAnotherAA-Validator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Per-node config: PORT, ETH_RPC_URL, VALIDATOR_CONTRACT_ADDRESS, relay/keeper keys…
+EnvironmentFile=/opt/aastar-dvt/env/%i.env
+# The BLS private key for THIS node (its own node_state.json). cwd = state dir so the
+# app finds ./node_state.json exactly like the dev/script deployments.
+WorkingDirectory=/opt/aastar-dvt/state/%i
+ExecStart=/opt/aastar-dvt/current/node /opt/aastar-dvt/current/dist/main.js
+
+Restart=always
+RestartSec=3
+# Don't let a crash-loop hammer the flash/CPU: cap restarts, back off if it storms.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- hardening (defence in depth for a key-holding process) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Only the state dir is writable; everything else read-only.
+ReadWritePaths=/opt/aastar-dvt/state/%i
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Resource guard rails for a 2GB board (tune per node count).
+MemoryMax=512M
+MemoryHigh=384M
+
+[Install]
+WantedBy=multi-user.target
