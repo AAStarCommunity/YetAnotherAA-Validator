@@ -43,6 +43,14 @@ async fn sign(Json(req): Json<SignRequest>) -> Result<Json<SignResponse>, Signer
 
 #[tokio::main]
 async fn main() {
+    // `--bench` mode (rust-signer plan b): time N signatures and print, then exit.
+    // Cross-built for the target board so the hybrid perf premise is validated on the
+    // REAL i.MX93 hardware, not extrapolated from a dev Mac. No server, no keys needed.
+    if std::env::args().any(|a| a == "--bench") {
+        run_bench();
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -70,4 +78,34 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
     axum::serve(listener, app).await.expect("server failed");
+}
+
+/// Time BLS signing throughput on this machine (used with `--bench`).
+fn run_bench() {
+    use std::time::Instant;
+    // Fixed sk=…01 + a fixed 32-byte hash (same as the golden-vector test).
+    let sk = bls::decode_sk("0000000000000000000000000000000000000000000000000000000000000001")
+        .expect("sk");
+    let hash = bls::decode_hash("8bb1b199f427dfc49e5fe40f2f3278cb1a48587824b78263051c8c4d81d77a81")
+        .expect("hash");
+    let n: u32 = std::env::var("BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+
+    // Warm up (first blst call pays one-time init).
+    let _ = bls::sign_hash(&sk, &hash).expect("sign");
+
+    let t0 = Instant::now();
+    for _ in 0..n {
+        let _ = bls::sign_hash(&sk, &hash).expect("sign");
+    }
+    let elapsed = t0.elapsed();
+    let per = elapsed / n;
+    let per_ms = per.as_secs_f64() * 1000.0;
+    let per_sec = 1.0 / per.as_secs_f64();
+    println!(
+        "aastar-bls-signer bench: {n} sigs in {:.3}s → {:.3} ms/sig ({:.0} sig/s)",
+        elapsed.as_secs_f64(),
+        per_ms,
+        per_sec
+    );
+    println!("(compare: Node.js @noble/curves path is ~150 ms/sig)");
 }

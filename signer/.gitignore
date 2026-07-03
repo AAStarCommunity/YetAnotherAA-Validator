@@ -14,3 +14,6 @@ Cargo.lock
 # Environment
 .env
 .env.local
+
+# Cross-build output (arm64 binary for the board)
+/dist-arm64/
