@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional, OnApplicationBootstrap } from "@nestjs/co
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
+import { OpsAlertService } from "../ops-alert/ops-alert.service.js";
 import { bumpedFees } from "../../utils/gas.util.js";
 import { RelayV3Dto } from "./dto/relay.dto.js";
 import {
@@ -70,7 +71,9 @@ export class RelayService implements OnApplicationBootstrap {
     private readonly config: ConfigService,
     @Optional() capabilityRegistry?: CapabilityRegistry,
     /** Test seam: controls `Date.now()` for deadline/rate-limit windows. */
-    @Optional() now?: () => number
+    @Optional() now?: () => number,
+    /** Operator alerting → aastar-monitor (#100). Optional; no-op when unconfigured. */
+    @Optional() private readonly opsAlert?: OpsAlertService
   ) {
     this.enabledByConfig = config.get<boolean>("relayEnabled") === true;
     this.operatorPk = config.get<string>("relayOperatorPk") ?? "";
@@ -316,6 +319,7 @@ export class RelayService implements OnApplicationBootstrap {
         (e as { shortMessage?: string })?.shortMessage ??
         (e instanceof Error ? e.message : String(e));
       this.logger.error(`Relay submit failed: ${msg}`);
+      this.opsAlert?.alert("critical", `relay submit failed: ${msg}`);
       return { ok: false, code: "SUBMIT_FAILED", reason: msg };
     }
   }

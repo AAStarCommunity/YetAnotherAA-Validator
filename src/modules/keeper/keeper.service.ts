@@ -9,6 +9,7 @@ import { ConfigService } from "@nestjs/config";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { NotificationService } from "../notification/notification.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
+import { OpsAlertService } from "../ops-alert/ops-alert.service.js";
 
 /**
  * Price Keeper Phase 1 (#58) — keeps SuperPaymaster cachedPrice permanently fresh.
@@ -61,7 +62,9 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
     @Optional() clock?: () => number,
     @Optional() capabilityRegistry?: CapabilityRegistry,
     /** Test seam: controls the startup phase jitter (default Math.random). */
-    @Optional() random?: () => number
+    @Optional() random?: () => number,
+    /** Operator alerting → aastar-monitor (#100). Optional; no-op when unconfigured. */
+    @Optional() private readonly opsAlert?: OpsAlertService
   ) {
     this.enabled = config.get<boolean>("keeperEnabled") === true;
     this.intervalMs = config.get<number>("keeperIntervalMs") ?? 60_000;
@@ -216,6 +219,8 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
       void this.notificationService
         .sendToAccount(paymaster, `[Keeper] updatePrice failed: ${msg}`)
         .catch(() => {});
+      // Operator ops alert → aastar-monitor (no-op unless configured).
+      this.opsAlert?.alert("critical", `keeper updatePrice failed for ${paymaster}: ${msg}`);
     }
   }
 

@@ -55,6 +55,15 @@ export default () => {
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || undefined,
     notifyContactsFile: process.env.NOTIFY_CONTACTS_FILE || undefined,
 
+    // Operator alerting → aastar-monitor Telegram bot (#100). Opt-in; fire-and-forget
+    // (never blocks signing/relaying). Distinct from NOTIFY_* (which alerts end users).
+    // OPS_ALERT_NODE labels which node raised the alert. AASTAR_MONITOR_TOKEN is an
+    // optional bearer token if the bot's webhook requires auth.
+    opsAlertEnabled: process.env.OPS_ALERT_ENABLED === "true",
+    opsAlertUrl: process.env.AASTAR_MONITOR_URL || undefined,
+    opsAlertToken: process.env.AASTAR_MONITOR_TOKEN || undefined,
+    opsAlertNode: process.env.OPS_ALERT_NODE || undefined,
+
     // Out-of-band confirmation (scheme A, #50 ⑤). Opt-in; a high-value op is withheld
     // until the user approves over an independent channel. Fail-closed if undeliverable.
     confirmEnabled: process.env.CONFIRM_ENABLED === "true",

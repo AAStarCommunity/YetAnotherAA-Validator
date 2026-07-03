@@ -7,6 +7,7 @@ import { GossipModule } from "./modules/gossip/gossip.module.js";
 import { DashboardModule } from "./modules/dashboard/dashboard.module.js";
 import { AppConfigModule } from "./config/config.module.js";
 import { CapabilityModule } from "./modules/capability/capability.module.js";
+import { OpsAlertModule } from "./modules/ops-alert/ops-alert.module.js";
 import { KeeperModule } from "./modules/keeper/keeper.module.js";
 import { RelayModule } from "./modules/relay/relay.module.js";
 import { X402FacilitatorModule } from "./modules/x402-facilitator/x402-facilitator.module.js";
@@ -16,6 +17,7 @@ import { HealthModule } from "./modules/health/health.module.js";
   imports: [
     AppConfigModule, // must be first — validates env vars on startup
     CapabilityModule, // global singleton registry; must load before optional modules
+    OpsAlertModule, // global operator-alert push (#100); must load before keeper/relay
     BlsModule,
     NodeModule,
     SignatureModule,
