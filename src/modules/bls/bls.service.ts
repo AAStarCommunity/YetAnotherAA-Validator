@@ -1,4 +1,5 @@
-import { Injectable, ForbiddenException, Logger } from "@nestjs/common";
+import { Injectable, ForbiddenException, Logger, Optional } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { bls, sigs, BLS_DST, encodeG2Point } from "../../utils/bls.util.js";
 import { SignatureResult } from "../../interfaces/signature.interface.js";
@@ -12,7 +13,10 @@ export class BlsService {
 
   constructor(
     private readonly blockchainService: BlockchainService,
-    private readonly signerService: SignerService
+    private readonly signerService: SignerService,
+    // @Optional() so existing 2-arg constructions (unit tests) keep working; when the
+    // DI container provides it, hybrid Rust-signer config is read from here.
+    @Optional() private readonly configService?: ConfigService
   ) {}
 
   /**
@@ -101,7 +105,9 @@ export class BlsService {
     }
 
     if (!isValid) {
-      this.logger.warn(`Owner-auth rejected for account ${account}: eth_call isValidOwnerAuth returned false`);
+      this.logger.warn(
+        `Owner-auth rejected for account ${account}: eth_call isValidOwnerAuth returned false`
+      );
       throw new ForbiddenException("owner authorization required");
     }
 
@@ -125,56 +131,66 @@ export class BlsService {
    * BLS-sign an ALREADY-AUTHORIZED derived userOpHash. Only ever call this with a
    * hash returned by authorizeAndDeriveHash (i.e. after the owner-auth gate passed).
    *
-   * In Hybrid mode (feat/rust-signer): delegates to local Rust signer on 127.0.0.1:5001
-   * In Node.js mode: uses local @noble/curves
+   * Hybrid mode: when RUST_SIGNER_URL is set, signing is delegated to a local Rust
+   * signer over loopback HTTP (byte-identical output — verified by the golden-vector
+   * test in signer/src/bls.rs — and faster on ARM). When UNSET, signs in-process with
+   * @noble/curves and never touches the network (no probe, zero overhead). On any Rust
+   * error it falls back to Node signing, unless RUST_SIGNER_REQUIRED=true (fail-closed).
    */
   async signDerivedHash(userOpHash: string, node: NodeKeyPair): Promise<SignatureResult> {
-    // Try Rust signer first (if available on localhost)
-    const rustSignerUrl = "http://127.0.0.1:5001/sign";
-
-    try {
-      const response = await fetch(rustSignerUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          user_op_hash: userOpHash,
-          node_id: node.nodeId,
-        }),
-      });
-
-      if (response.ok) {
-        const data = (await response.json()) as {
-          signature: string;
-          signature_compact: string;
-          public_key: string;
-        };
-        this.logger.debug(`Signed via Rust signer: ${node.nodeId}`);
-        // Rust output is byte-for-byte identical to the @noble/curves path
-        // (verified by the golden-vector test in signer/src/bls.rs).
-        return {
-          nodeId: node.nodeId,
-          signature: data.signature, // EIP-2537 (0x-prefixed)
-          signatureCompact: data.signature_compact, // compressed G2, 96 bytes
-          publicKey: data.public_key, // compressed G1, 48 bytes
-          message: userOpHash,
-        };
-      } else {
+    const base = this.configService?.get<string>("rustSignerUrl");
+    if (base) {
+      try {
+        return await this.signViaRust(base, userOpHash, node);
+      } catch (error: any) {
+        if (this.configService?.get<boolean>("rustSignerRequired") === true) {
+          // Production wants Rust — surface the failure instead of silently degrading.
+          this.logger.error(`Rust signer required but failed: ${error?.message ?? error}`);
+          throw error;
+        }
         this.logger.warn(
-          `Rust signer HTTP error ${response.status}, falling back to Node.js`
+          `Rust signer unavailable (${error?.message ?? error}), falling back to Node.js signing`
         );
       }
-    } catch (error: any) {
-      this.logger.debug(
-        `Rust signer unavailable (${error.message}), falling back to Node.js local signing`
-      );
     }
+    return this.signViaNode(userOpHash, node);
+  }
 
-    // Fallback: use Node.js local signing (@noble/curves)
-    this.logger.debug(`Using local Node.js signing for ${node.nodeId}`);
-    const messageBytes = ethers.getBytes(userOpHash);
-    const messagePoint = await bls.G2.hashToCurve(messageBytes, {
-      DST: BLS_DST,
+  /** Delegate signing to the local Rust signer. Throws on any transport/HTTP error. */
+  private async signViaRust(
+    base: string,
+    userOpHash: string,
+    node: NodeKeyPair
+  ): Promise<SignatureResult> {
+    const url = `${base.replace(/\/+$/, "")}/sign`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_op_hash: userOpHash, node_id: node.nodeId }),
     });
+    if (!response.ok) {
+      throw new Error(`Rust signer HTTP ${response.status}`);
+    }
+    const data = (await response.json()) as {
+      signature: string;
+      signature_compact: string;
+      public_key: string;
+    };
+    this.logger.debug(`Signed via Rust signer: ${node.nodeId}`);
+    // Byte-for-byte identical to the @noble/curves path (golden-vector verified).
+    return {
+      nodeId: node.nodeId,
+      signature: data.signature, // EIP-2537 (0x-prefixed)
+      signatureCompact: data.signature_compact, // compressed G2, 96 bytes
+      publicKey: data.public_key, // compressed G1, 48 bytes
+      message: userOpHash,
+    };
+  }
+
+  /** In-process @noble/curves signing (the default / fallback path). */
+  private async signViaNode(userOpHash: string, node: NodeKeyPair): Promise<SignatureResult> {
+    const messageBytes = ethers.getBytes(userOpHash);
+    const messagePoint = await bls.G2.hashToCurve(messageBytes, { DST: BLS_DST });
 
     const signer = this.signerService.forNode(node);
     const publicKey = await signer.getPublicKey();
