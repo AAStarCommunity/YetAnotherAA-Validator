@@ -62,6 +62,23 @@ export default () => {
     rustSignerUrl: process.env.RUST_SIGNER_URL || undefined,
     rustSignerRequired: process.env.RUST_SIGNER_REQUIRED === "true",
 
+    // Operator alerting → aastar-monitor Telegram bot (#100). Opt-in; fire-and-forget
+    // (never blocks signing/relaying). Distinct from NOTIFY_* (which alerts end users).
+    // Two transports (Telegram takes priority): OPS_ALERT_BOT_TOKEN + OPS_ALERT_CHAT_ID
+    // send straight to the bot's chat; OR AASTAR_MONITOR_URL (+ optional token) for a
+    // generic webhook. OPS_ALERT_NODE labels which node raised the alert.
+    opsAlertEnabled: process.env.OPS_ALERT_ENABLED === "true",
+    opsAlertBotToken: process.env.OPS_ALERT_BOT_TOKEN || undefined,
+    opsAlertChatId: process.env.OPS_ALERT_CHAT_ID || undefined,
+    opsAlertUrl: process.env.AASTAR_MONITOR_URL || undefined,
+    opsAlertToken: process.env.AASTAR_MONITOR_TOKEN || undefined,
+    opsAlertNode: process.env.OPS_ALERT_NODE || undefined,
+    // Scheduled status heartbeat (#100). 0 = off. Pushes a periodic "still alive +
+    // health check" summary to the ops channel, plus online/offline on boot/shutdown.
+    // `|| 0` guards a non-numeric value (parseInt → NaN) from leaking through as an
+    // interval, which would make setInterval fire continuously (eval#299).
+    opsStatusIntervalMs: parseInt(process.env.OPS_STATUS_INTERVAL_MS || "0", 10) || 0,
+
     // Out-of-band confirmation (scheme A, #50 ⑤). Opt-in; a high-value op is withheld
     // until the user approves over an independent channel. Fail-closed if undeliverable.
     confirmEnabled: process.env.CONFIRM_ENABLED === "true",

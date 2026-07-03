@@ -442,11 +442,7 @@ export class BlockchainService {
    * @param ownerAuth The owner authorization (ECDSA signature or WebAuthn blob)
    * @returns true if the account returns the magic value; false otherwise (fail-closed)
    */
-  async isValidOwnerAuth(
-    account: string,
-    userOpHash: string,
-    ownerAuth: string
-  ): Promise<boolean> {
+  async isValidOwnerAuth(account: string, userOpHash: string, ownerAuth: string): Promise<boolean> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
@@ -463,9 +459,7 @@ export class BlockchainService {
       const result = await contract.isValidOwnerAuth(userOpHash, ownerAuth);
       return result === MAGIC_VALUE;
     } catch (error: any) {
-      this.logger.warn(
-        `isValidOwnerAuth eth_call failed for account ${account}: ${error.message}`
-      );
+      this.logger.warn(`isValidOwnerAuth eth_call failed for account ${account}: ${error.message}`);
       return false;
     }
   }

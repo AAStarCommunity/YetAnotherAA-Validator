@@ -1,0 +1,14 @@
+# Fires the health probe every 30s (mirrors the Docker healthcheck cadence).
+# Enable per node:  systemctl enable --now aastar-dvt-health@node1.timer
+[Unit]
+Description=Periodic health probe for aastar-dvt@%i
+
+[Timer]
+# First check 30s after boot, then every 30s. Persistent=false — no catch-up bursts.
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=aastar-dvt-health@%i.service
+
+[Install]
+WantedBy=timers.target

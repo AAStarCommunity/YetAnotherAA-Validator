@@ -63,5 +63,6 @@ export type RelayErrorCode =
   | "SIGNATURE_INVALID"
   | "NOT_WHITELISTED"
   | "RATE_LIMITED"
+  | "PREFLIGHT_REVERTED"
   | "SUBMIT_FAILED"
   | "INFRA_NOT_READY";
