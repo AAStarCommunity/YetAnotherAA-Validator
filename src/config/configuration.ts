@@ -68,7 +68,9 @@ export default () => {
     opsAlertNode: process.env.OPS_ALERT_NODE || undefined,
     // Scheduled status heartbeat (#100). 0 = off. Pushes a periodic "still alive +
     // health check" summary to the ops channel, plus online/offline on boot/shutdown.
-    opsStatusIntervalMs: parseInt(process.env.OPS_STATUS_INTERVAL_MS || "0", 10),
+    // `|| 0` guards a non-numeric value (parseInt → NaN) from leaking through as an
+    // interval, which would make setInterval fire continuously (eval#299).
+    opsStatusIntervalMs: parseInt(process.env.OPS_STATUS_INTERVAL_MS || "0", 10) || 0,
 
     // Out-of-band confirmation (scheme A, #50 ⑤). Opt-in; a high-value op is withheld
     // until the user approves over an independent channel. Fail-closed if undeliverable.

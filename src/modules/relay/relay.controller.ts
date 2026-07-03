@@ -52,6 +52,9 @@ export class RelayController {
         return 429;
       case "INFRA_NOT_READY":
         return 503;
+      case "PREFLIGHT_REVERTED":
+        // The request would revert on-chain — a client/intent problem, not our infra.
+        return 422;
       case "SUBMIT_FAILED":
         return 502;
       default:

@@ -301,6 +301,23 @@ export class RelayService implements OnApplicationBootstrap {
   }
 
   private async sendTx(callData: string, matchedRule: string): Promise<RelayResult> {
+    // #3 (#100) eth_call preflight: static-call the exact tx first. A call that WOULD
+    // revert (expired intent, bad signature that slipped validation, insufficient
+    // allowance, paused contract…) is rejected here for FREE — no gas burned — instead
+    // of submitting a doomed tx that spends the operator's ETH. Also blunts griefing:
+    // an attacker spamming revert-bound requests can no longer drain the hot wallet.
+    // Best-effort (state can change before submit), so a later on-chain revert is still
+    // caught by the sendTransaction catch below.
+    try {
+      await this.wallet!.call({ to: this.buyHelper, data: callData, value: 0n });
+    } catch (e: unknown) {
+      const msg =
+        (e as { shortMessage?: string })?.shortMessage ??
+        (e instanceof Error ? e.message : String(e));
+      this.logger.warn(`Relay preflight reverted — not submitting (${matchedRule}): ${msg}`);
+      return { ok: false, code: "PREFLIGHT_REVERTED", reason: msg };
+    }
+
     try {
       // Bump fees (estimate +15%, priority floor) so the tx mines promptly — a
       // BuyIntent carries a deadline, and an underpriced tx that mines late

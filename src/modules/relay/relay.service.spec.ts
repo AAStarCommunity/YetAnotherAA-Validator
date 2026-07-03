@@ -172,7 +172,7 @@ describe("RelayService", () => {
     it("enforces the per-address hourly cap", async () => {
       const svc = makeService();
       // Inject a stub wallet (with a provider for the fee-bump) so relay()
-      // proceeds past INFRA_NOT_READY.
+      // proceeds past INFRA_NOT_READY. `call` = the #3 preflight (succeeds here).
       (svc as any).wallet = {
         address: buyer.address,
         provider: {
@@ -181,6 +181,7 @@ describe("RelayService", () => {
             maxPriorityFeePerGas: 2_000_000_000n,
           }),
         },
+        call: async () => "0x",
         sendTransaction: async () => ({ hash: "0xdead" }),
       };
 
@@ -190,6 +191,53 @@ describe("RelayService", () => {
       expect(r1.ok).toBe(true);
       expect(r2.ok).toBe(true);
       expect(r3).toMatchObject({ ok: false, code: "RATE_LIMITED" });
+    });
+  });
+
+  describe("eth_call preflight (#3)", () => {
+    it("rejects a would-revert tx WITHOUT submitting (no gas burned)", async () => {
+      const svc = makeService();
+      let submitted = false;
+      (svc as any).wallet = {
+        address: buyer.address,
+        provider: {
+          getFeeData: async () => ({ maxFeePerGas: 3_000_000_000n, maxPriorityFeePerGas: 2n }),
+        },
+        // Preflight reverts → sendTransaction must NOT be reached.
+        call: async () => {
+          throw Object.assign(new Error("execution reverted: Expired"), {
+            shortMessage: "execution reverted: Expired",
+          });
+        },
+        sendTransaction: async () => {
+          submitted = true;
+          return { hash: "0xdead" };
+        },
+      };
+
+      const r = await svc.relay(await signedBody());
+      expect(r).toMatchObject({ ok: false, code: "PREFLIGHT_REVERTED" });
+      expect(submitted).toBe(false); // the whole point: no doomed tx, no gas spent
+    });
+
+    it("submits when the preflight call succeeds", async () => {
+      const svc = makeService();
+      let submitted = false;
+      (svc as any).wallet = {
+        address: buyer.address,
+        provider: {
+          getFeeData: async () => ({ maxFeePerGas: 3_000_000_000n, maxPriorityFeePerGas: 2n }),
+        },
+        call: async () => "0x",
+        sendTransaction: async () => {
+          submitted = true;
+          return { hash: "0xbeef" };
+        },
+      };
+
+      const r = await svc.relay(await signedBody());
+      expect(r).toMatchObject({ ok: true, txHash: "0xbeef" });
+      expect(submitted).toBe(true);
     });
   });
 });
