@@ -165,18 +165,22 @@ contract AAStarValidatorTest is Test {
         validator.registerPublicKey(NODE_ID_1, PARTICIPANT_KEY_2);
     }
 
-    function test_RegisterPublicKey_AnyoneCanRegister() public {
-        // After removing onlyOwner modifier, anyone should be able to register
+    function test_RegisterPublicKey_BootstrapIsOwnerOnly() public {
+        // Plan A v3 (#163): in bootstrap mode (requireStake=false, default) registration is
+        // owner-only — the old "anyone, no stake" path is removed (Sybil/rogue-key risk).
         address nonOwner = address(0x5678);
         vm.prank(nonOwner);
-
-        vm.expectEmit(true, false, false, true);
-        emit PublicKeyRegistered(NODE_ID_1, PARTICIPANT_KEY_1);
-
+        vm.expectRevert("Bootstrap: only owner");
         validator.registerPublicKey(NODE_ID_1, PARTICIPANT_KEY_1);
 
+        // Owner can register in bootstrap; the node is marked bootstrap + bound to owner.
+        vm.expectEmit(true, false, false, true);
+        emit PublicKeyRegistered(NODE_ID_1, PARTICIPANT_KEY_1);
+        validator.registerPublicKey(NODE_ID_1, PARTICIPANT_KEY_1);
         assertEq(validator.registeredKeys(NODE_ID_1), PARTICIPANT_KEY_1, "Key should be registered");
         assertTrue(validator.isRegistered(NODE_ID_1), "Node should be marked as registered");
+        assertTrue(validator.isBootstrap(NODE_ID_1), "bootstrap node");
+        assertEq(validator.nodeOperator(NODE_ID_1), address(this), "operator = owner in bootstrap");
     }
 
     // =============================================================

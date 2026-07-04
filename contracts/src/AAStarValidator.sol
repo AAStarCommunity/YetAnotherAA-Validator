@@ -21,6 +21,14 @@ pragma solidity ^0.8.19;
  * - Support batch operations
  * - Support signature verification through node identifiers
  */
+/// @dev Minimal read-interface into the SuperPaymaster Registry (economic single source
+///      of truth). AAStarValidator READS role+stake; it never manages stake itself.
+///      Matches Registry.hasRole (public mapping getter) + getEffectiveStake view.
+interface IDVTRegistry {
+    function hasRole(bytes32 roleId, address user) external view returns (bool);
+    function getEffectiveStake(address user, bytes32 roleId) external view returns (uint256);
+}
+
 contract AAStarValidator {
     // =============================================================
     //                           STORAGE
@@ -37,6 +45,26 @@ contract AAStarValidator {
 
     /// @dev Contract owner for administrative functions
     address public owner;
+
+    // --- Stake-binding (issue #163, Plan A v3) -----------------------------------
+    /// @dev The operator (EOA / Safe) that owns a nodeId — the slashing/economic anchor.
+    mapping(bytes32 => address) public nodeOperator;
+    /// @dev Reverse 1:1 lock — one active nodeId per operator in staked mode (anti-Sybil:
+    ///      one GToken stake cannot back many signing identities).
+    mapping(address => bytes32) public operatorNode;
+    /// @dev Nodes registered by the owner during bootstrap (no stake). Retired once
+    ///      requireStake is turned on (migration boundary — no permanent bypass).
+    mapping(bytes32 => bool) public isBootstrap;
+
+    /// @dev SuperPaymaster Registry (stake source of truth). Owner/Safe-settable.
+    address public registry;
+    /// @dev When true, registerPublicKey is permissionless-but-staked and bootstrap nodes
+    ///      stop being accepted in verification. When false, owner-only bootstrap (default).
+    bool public requireStake;
+    /// @dev Minimum locked GToken stake under ROLE_DVT to register/stay active.
+    uint256 public minStake;
+    /// @dev DVT role id in the SuperPaymaster Registry.
+    bytes32 public constant ROLE_DVT = keccak256("DVT");
 
     /// @dev Modifier to restrict access to owner only
     modifier onlyOwner() {
@@ -91,6 +119,13 @@ contract AAStarValidator {
     event PublicKeyRevoked(bytes32 indexed nodeId);
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    // --- Stake-binding (Plan A v3) ---
+    event NodeBound(bytes32 indexed nodeId, address indexed operator);
+    event NodeDeactivated(bytes32 indexed nodeId, address indexed operator);
+    event RegistrySet(address indexed registry);
+    event RequireStakeSet(bool requireStake);
+    event MinStakeSet(uint256 minStake);
 
     function validateAggregateSignature(
         bytes32[] calldata nodeIds,
@@ -193,6 +228,10 @@ contract AAStarValidator {
 
         for (uint256 i = 0; i < nodeIds.length; i++) {
             require(isRegistered[nodeIds[i]], "Node not registered");
+            // Migration boundary (Plan A v3): once staking is mandatory, bootstrap-era
+            // nodes are no longer accepted until they re-register via the staked path.
+            // Cheap per-node read; NOT a full per-verify stake re-check (that's syncNode).
+            require(!(requireStake && isBootstrap[nodeIds[i]]), "Bootstrap node retired");
             publicKeys[i] = registeredKeys[nodeIds[i]];
         }
     }
@@ -455,8 +494,19 @@ contract AAStarValidator {
     // =============================================================
 
     /**
-     * @dev Register public key for new node
-     * Anyone can register, but in the future must verify PNT token staking
+     * @dev Register a node's BLS public key, binding it to a staked operator (Plan A v3).
+     *
+     * Two modes, controlled by `requireStake`:
+     *  - requireStake == false (bootstrap, default): owner-only, records nodeId->pubkey and
+     *    marks it `isBootstrap` (retired once staking is turned on). Preserves the initial
+     *    permissioned launch where the owner grows the quorum.
+     *  - requireStake == true (permissionless-but-staked): the OPERATOR (msg.sender) calls;
+     *    they must hold ROLE_DVT and >= minStake locked GToken in the SuperPaymaster
+     *    Registry, and one operator may back only ONE active nodeId (anti-Sybil).
+     *
+     * NOTE (increment 1): does NOT yet enforce BLS proof-of-possession. Because the
+     * aggregate verifier sums pubkeys (rogue-key vulnerable), PoP MUST be added before
+     * relying on requireStake=true in production. Tracked in #163.
      *
      * @param nodeId Unique node identifier
      * @param publicKey G1 public key (128 bytes)
@@ -466,16 +516,75 @@ contract AAStarValidator {
         require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
         require(!isRegistered[nodeId], "Node already registered");
 
-        // TODO: Verify that msg.sender has staked PNT tokens before allowing registration
-        // Example implementation:
-        // IPNTToken pntToken = IPNTToken(pntTokenAddress);
-        // require(pntToken.getStakedAmount(msg.sender) >= minimumStakeAmount, "Insufficient PNT stake");
+        if (requireStake) {
+            // Permissionless-but-staked: caller is the operator; one node per operator.
+            require(operatorNode[msg.sender] == bytes32(0), "Operator already has a node");
+            require(_isStaked(msg.sender), "Operator not staked for ROLE_DVT");
+            nodeOperator[nodeId] = msg.sender;
+            operatorNode[msg.sender] = nodeId;
+            emit NodeBound(nodeId, msg.sender);
+        } else {
+            // Bootstrap: owner registers; bind operator = owner as a placeholder and mark
+            // the node bootstrap so it retires when staking becomes mandatory.
+            require(msg.sender == owner, "Bootstrap: only owner");
+            nodeOperator[nodeId] = owner;
+            isBootstrap[nodeId] = true;
+        }
 
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
         registeredNodes.push(nodeId);
 
         emit PublicKeyRegistered(nodeId, publicKey);
+    }
+
+    /**
+     * @dev Permissionless re-validation: deactivate a node whose economic backing is gone.
+     *  - a staked node whose operator lost ROLE_DVT or dropped below minStake, or
+     *  - a bootstrap node once requireStake has been turned on (migration boundary).
+     * Anyone (a keeper) may call it — the check is authoritative, not the caller.
+     */
+    function syncNode(bytes32 nodeId) external {
+        require(isRegistered[nodeId], "Node not registered");
+        bool stale = isBootstrap[nodeId] ? requireStake : !_isStaked(nodeOperator[nodeId]);
+        require(stale, "Node still active");
+        _deactivate(nodeId);
+        emit NodeDeactivated(nodeId, nodeOperator[nodeId]);
+    }
+
+    /// @dev True if `op` holds ROLE_DVT and >= minStake locked GToken in the Registry.
+    function _isStaked(address op) internal view returns (bool) {
+        if (registry == address(0) || op == address(0)) return false;
+        IDVTRegistry r = IDVTRegistry(registry);
+        return r.hasRole(ROLE_DVT, op) && r.getEffectiveStake(op, ROLE_DVT) >= minStake;
+    }
+
+    /// @dev Remove a node from the active set + clear its operator binding.
+    function _deactivate(bytes32 nodeId) internal {
+        address op = nodeOperator[nodeId];
+        isRegistered[nodeId] = false;
+        delete registeredKeys[nodeId];
+        delete nodeOperator[nodeId];
+        delete isBootstrap[nodeId];
+        if (op != address(0) && operatorNode[op] == nodeId) delete operatorNode[op];
+        // registeredNodes[] is an unordered enumeration; leave the stale id (isRegistered
+        // gates all reads). Compaction is a gas trade-off deferred to a later pass.
+    }
+
+    // --- Owner/Safe governance (transfer owner to a Gnosis Safe after init) --------
+    function setRegistry(address _registry) external onlyOwner {
+        registry = _registry;
+        emit RegistrySet(_registry);
+    }
+
+    function setRequireStake(bool _v) external onlyOwner {
+        requireStake = _v;
+        emit RequireStakeSet(_v);
+    }
+
+    function setMinStake(uint256 _v) external onlyOwner {
+        minStake = _v;
+        emit MinStakeSet(_v);
     }
 
     /**
