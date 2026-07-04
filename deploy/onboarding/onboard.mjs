@@ -37,6 +37,36 @@ function loadState() {
   return JSON.parse(readFileSync(STATE, "utf8"));
 }
 
+// PoP domain (must match AAStarValidator's KAT / the contract's expected DST).
+const POP_DST = "AASTAR_DVT_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_";
+
+// EIP-2537 encodings (the on-chain wire): G1 = 128 bytes, G2 = 256 bytes, each Fp padded
+// to 64 (16 zero + 48). Matches the contract + src/utils/bls.util.ts.
+const _fp = x => {
+  const s = x.toString(16).padStart(96, "0");
+  const b = new Uint8Array(48);
+  for (let i = 0; i < 48; i++) b[i] = parseInt(s.substr(i * 2, 2), 16);
+  return b;
+};
+function eip2537G1(point) {
+  const a = point.toAffine();
+  const r = new Uint8Array(128);
+  r.set(_fp(a.x), 16);
+  r.set(_fp(a.y), 80);
+  return "0x" + Buffer.from(r).toString("hex");
+}
+function eip2537G2(point) {
+  const a = point.toAffine();
+  const r = new Uint8Array(256);
+  r.set(_fp(a.x.c0), 16);
+  r.set(_fp(a.x.c1), 80);
+  r.set(_fp(a.y.c0), 144);
+  r.set(_fp(a.y.c1), 208);
+  return "0x" + Buffer.from(r).toString("hex");
+}
+// nodeId = keccak256(EIP-2537 G1 pubkey) — matches AAStarValidator.registerWithProof.
+const derivedNodeId = eip2537PubHex => ethers.keccak256(eip2537PubHex);
+
 // --- step 1: generate the node's own BLS key ---------------------------------
 function keygen() {
   if (existsSync(STATE)) {
@@ -54,8 +84,11 @@ function keygen() {
       break;
     } catch {}
   } while (true);
-  const nodeId = "0x" + randomBytes(32).toString("hex");
-  const publicKey = sigs.getPublicKey(sk).toHex();
+  const pubPoint = sigs.getPublicKey(sk);
+  const publicKey = pubPoint.toHex();
+  const publicKeyEip2537 = eip2537G1(pubPoint);
+  // Staked path: nodeId is DERIVED from the pubkey (matches registerWithProof on-chain).
+  const nodeId = derivedNodeId(publicKeyEip2537);
   writeFileSync(
     STATE,
     JSON.stringify(
@@ -64,6 +97,7 @@ function keygen() {
         nodeName: "dvt-community",
         privateKey: "0x" + Buffer.from(sk).toString("hex"),
         publicKey,
+        publicKeyEip2537,
         createdAt: new Date().toISOString(),
         description: "community DVT node",
       },
@@ -72,9 +106,43 @@ function keygen() {
     )
   );
   ok(`generated ${STATE}`);
-  info(`nodeId=${nodeId}`);
+  info(`nodeId=${nodeId}  (= keccak256(EIP-2537 pubkey) — the staked-path nodeId)`);
   warn("this file holds your SECRET key — never commit/share it. Encrypt it: docs/KEYSTORE.md");
-  return { nodeId, publicKey };
+  return { nodeId, publicKey, publicKeyEip2537 };
+}
+
+// --- staked path: produce the BLS proof-of-possession + registerWithProof params.
+// Usage: onboard.mjs pop <operatorAddress>   (the EOA/Safe that stakes + registers)
+async function pop() {
+  const s = loadState() || die("no key yet — run `keygen` first");
+  const operator =
+    arg && ethers.isAddress(arg) ? ethers.getAddress(arg) : die("usage: pop <operatorAddress>");
+  const sk = Uint8Array.from(Buffer.from(s.privateKey.replace(/^0x/, ""), "hex"));
+  const pubHex = s.publicKeyEip2537 || eip2537G1(sigs.getPublicKey(sk));
+
+  // popPoint = hash_to_G2(operatorAddress, POP_DST); popSig = sk * popPoint.
+  const msg = ethers.getBytes(operator); // 20-byte address
+  const popPoint = await bls.G2.hashToCurve(msg, { DST: POP_DST });
+  const popSig = await sigs.sign(popPoint, sk);
+
+  console.log("\n── registerWithProof params (call from your operator EOA/Safe) ──");
+  console.log(
+    JSON.stringify(
+      {
+        nodeId: derivedNodeId(pubHex),
+        operator,
+        publicKey: pubHex,
+        popPoint: eip2537G2(popPoint),
+        popSig: eip2537G2(popSig),
+      },
+      null,
+      2
+    )
+  );
+  console.log(
+    "\nThen (from the operator EOA/Safe): (1) stake GToken + Registry.registerRole(ROLE_DVT)\n" +
+      "on SuperPaymaster, (2) AAStarValidator.registerWithProof(publicKey, popPoint, popSig)."
+  );
 }
 
 // --- step 2: the registration request to hand to AAStar ----------------------
@@ -161,6 +229,7 @@ const main = {
   keygen,
   "register-request": registerRequest,
   "wait-register": waitRegister,
+  pop, // staked path: emit registerWithProof(pubkey, popPoint, popSig) params
   verify: () => verify(arg),
   all: async () => {
     keygen();
