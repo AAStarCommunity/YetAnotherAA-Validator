@@ -514,6 +514,7 @@ contract AAStarValidator {
     function registerPublicKey(bytes32 nodeId, bytes calldata publicKey) external {
         require(nodeId != bytes32(0), "Invalid node ID");
         require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
+        require(!_isInfinity(publicKey), "pubkey is infinity");
         require(!isRegistered[nodeId], "Node already registered");
 
         // Bootstrap-only path: owner registers (permissioned launch). Once staking is
@@ -552,6 +553,11 @@ contract AAStarValidator {
     ) external {
         require(requireStake, "Staked registration disabled");
         require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
+        // Reject the point-at-infinity encoding (all-zero). e(_, infinity)=1, so an
+        // infinity pubkey/popPoint/popSig would make the PoP pairing trivially pass with
+        // NO secret known — the rogue-key bypass this check exists to close. Non-infinity
+        // but off-subgroup points are rejected by the pairing precompile's subgroup check.
+        require(!_isInfinity(publicKey), "pubkey is infinity");
         bytes32 nodeId = keccak256(publicKey); // derived — not caller-chosen (no squatting)
         require(!isRegistered[nodeId], "Node already registered");
         require(operatorNode[msg.sender] == bytes32(0), "Operator already has a node");
@@ -576,12 +582,23 @@ contract AAStarValidator {
         bytes calldata popSig
     ) internal view returns (bool) {
         if (popPoint.length != G2_POINT_LENGTH || popSig.length != G2_POINT_LENGTH) return false;
+        // Defence in depth: infinity in any pairing operand makes e(...)=1 trivially.
+        if (_isInfinity(pubkey) || _isInfinity(popPoint) || _isInfinity(popSig)) return false;
         bytes memory negPk = _negateG1Point(pubkey);
         bytes memory pairingData = _buildPairingDataFromComponents(negPk, popSig, popPoint);
         (bool ok, bytes memory result) = PAIRING_PRECOMPILE.staticcall{ gas: _calculateRequiredGas(1) }(
             pairingData
         );
         return ok && result.length == 32 && bytes32(result) == bytes32(uint256(1));
+    }
+
+    /// @dev EIP-2537 encodes the point at infinity as all-zero bytes. Reject it wherever a
+    ///      non-degenerate point is required (a pairing with infinity is the identity in GT).
+    function _isInfinity(bytes calldata point) internal pure returns (bool) {
+        for (uint256 i = 0; i < point.length; i++) {
+            if (point[i] != 0) return false;
+        }
+        return true;
     }
 
     /**
@@ -592,10 +609,11 @@ contract AAStarValidator {
      */
     function syncNode(bytes32 nodeId) external {
         require(isRegistered[nodeId], "Node not registered");
-        bool stale = isBootstrap[nodeId] ? requireStake : !_isStaked(nodeOperator[nodeId]);
+        address op = nodeOperator[nodeId]; // capture before _deactivate clears it
+        bool stale = isBootstrap[nodeId] ? requireStake : !_isStaked(op);
         require(stale, "Node still active");
         _deactivate(nodeId);
-        emit NodeDeactivated(nodeId, nodeOperator[nodeId]);
+        emit NodeDeactivated(nodeId, op);
     }
 
     /// @dev True if `op` holds ROLE_DVT and >= minStake locked GToken in the Registry.
@@ -640,6 +658,9 @@ contract AAStarValidator {
      * @param newPublicKey New G1 public key (128 bytes)
      */
     function updatePublicKey(bytes32 nodeId, bytes calldata newPublicKey) external onlyOwner {
+        // Once staking is mandatory, keys are managed only via the staked path (nodeId is
+        // keccak(pubkey) + fresh PoP). An owner key-swap would break that invariant.
+        require(!requireStake, "Staking on: re-register via registerWithProof");
         require(isRegistered[nodeId], "Node not registered");
         require(newPublicKey.length == G1_POINT_LENGTH, "Invalid public key length");
 
@@ -657,6 +678,13 @@ contract AAStarValidator {
     function revokePublicKey(bytes32 nodeId) external onlyOwner {
         require(isRegistered[nodeId], "Node not registered");
 
+        // Clear the operator binding too, or operatorNode[op] would stay pointing at a
+        // revoked node and strand the operator's 1:1 slot forever (syncNode can't fix it
+        // once isRegistered is false).
+        address op = nodeOperator[nodeId];
+        if (op != address(0) && operatorNode[op] == nodeId) delete operatorNode[op];
+        delete nodeOperator[nodeId];
+        delete isBootstrap[nodeId];
         delete registeredKeys[nodeId];
         isRegistered[nodeId] = false;
 
@@ -679,14 +707,22 @@ contract AAStarValidator {
      * @param publicKeys Corresponding public key array
      */
     function batchRegisterPublicKeys(bytes32[] calldata nodeIds, bytes[] calldata publicKeys) external onlyOwner {
+        // Bootstrap-only, same as registerPublicKey: once staking is mandatory this owner
+        // path would let stake-less/PoP-less nodes into the active set.
+        require(!requireStake, "Staking on: use registerWithProof");
         require(nodeIds.length == publicKeys.length, "Array length mismatch");
         require(nodeIds.length > 0, "Empty arrays");
 
         for (uint256 i = 0; i < nodeIds.length; i++) {
             require(nodeIds[i] != bytes32(0), "Invalid node ID");
             require(publicKeys[i].length == G1_POINT_LENGTH, "Invalid public key length");
+            require(!_isInfinity(publicKeys[i]), "pubkey is infinity");
             require(!isRegistered[nodeIds[i]], "Node already registered");
 
+            // Mark bootstrap + bind operator=owner so these nodes are consistent with the
+            // registerPublicKey bootstrap path (and retire when requireStake turns on).
+            nodeOperator[nodeIds[i]] = owner;
+            isBootstrap[nodeIds[i]] = true;
             registeredKeys[nodeIds[i]] = publicKeys[i];
             isRegistered[nodeIds[i]] = true;
             registeredNodes.push(nodeIds[i]);

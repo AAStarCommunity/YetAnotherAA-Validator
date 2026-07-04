@@ -143,4 +143,65 @@ contract AAStarValidatorStakeBindingTest is Test {
         vm.expectRevert("Only owner can call this function");
         validator.setRequireStake(true);
     }
+
+    // --- Codex fixes: infinity-point PoP bypass (was a critical hole) ------------
+    function test_PoP_rejectsInfinityPopPointAndSig() public {
+        validator.setRequireStake(true);
+        _stake(operator1, MIN_STAKE);
+        bytes memory zeroG2 = new bytes(256); // EIP-2537 infinity = all-zero
+        vm.prank(operator1);
+        // Without the fix this passed for ANY pubkey with no secret known.
+        vm.expectRevert("Invalid proof-of-possession");
+        validator.registerWithProof(V1_PUB, zeroG2, zeroG2);
+    }
+
+    function test_registerWithProof_rejectsInfinityPubkey() public {
+        validator.setRequireStake(true);
+        _stake(operator1, MIN_STAKE);
+        bytes memory zeroG1 = new bytes(128);
+        bytes memory zeroG2 = new bytes(256);
+        vm.prank(operator1);
+        vm.expectRevert("pubkey is infinity");
+        validator.registerWithProof(zeroG1, zeroG2, zeroG2);
+    }
+
+    function test_bootstrap_rejectsInfinityPubkey() public {
+        bytes memory zeroG1 = new bytes(128);
+        vm.expectRevert("pubkey is infinity");
+        validator.registerPublicKey(keccak256("x"), zeroG1);
+    }
+
+    // --- Codex fixes: revoke clears the 1:1 binding -----------------------------
+    function test_revoke_clearsOperatorBinding() public {
+        validator.setRequireStake(true);
+        _stake(operator1, MIN_STAKE);
+        vm.prank(operator1);
+        validator.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
+        bytes32 nodeId = keccak256(V1_PUB);
+
+        validator.revokePublicKey(nodeId); // owner revokes
+        assertEq(validator.operatorNode(operator1), bytes32(0), "1:1 slot freed");
+
+        // operator can now register a fresh node (V2) — not stranded
+        vm.prank(operator1);
+        validator.registerWithProof(V2_PUB, V2_POP_POINT, V2_POP_SIG);
+        assertTrue(validator.isRegistered(keccak256(V2_PUB)));
+    }
+
+    // --- Codex fixes: owner bootstrap paths disabled once staking is on ---------
+    function test_batchRegister_revertsWhenStaking() public {
+        validator.setRequireStake(true);
+        bytes32[] memory ids = new bytes32[](1);
+        bytes[] memory keys = new bytes[](1);
+        ids[0] = keccak256("n");
+        keys[0] = V1_PUB;
+        vm.expectRevert("Staking on: use registerWithProof");
+        validator.batchRegisterPublicKeys(ids, keys);
+    }
+
+    function test_updatePublicKey_revertsWhenStaking() public {
+        validator.setRequireStake(true);
+        vm.expectRevert("Staking on: re-register via registerWithProof");
+        validator.updatePublicKey(keccak256("n"), V1_PUB);
+    }
 }
