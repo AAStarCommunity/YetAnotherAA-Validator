@@ -44,6 +44,26 @@ start() {
       [ -f "$REPO/deploy/node$i/.env" ] && . "$REPO/deploy/node$i/.env"
       set +a
       export PORT="$port"
+      # The app reads PUBLIC_URL / GOSSIP_PUBLIC_URL (docker-compose maps these from
+      # NODEi_PUBLIC_URL; the bare-process path must too, else gossip announces
+      # http://localhost:$port and the roster/mesh is wrong). Derive the wss gossip
+      # endpoint from the public https URL; peers mesh via GOSSIP_BOOTSTRAP_PEERS.
+      pub_var="NODE${i}_PUBLIC_URL"
+      pub_url="${!pub_var:-}"
+      if [ -n "$pub_url" ]; then
+        export PUBLIC_URL="$pub_url"
+        export GOSSIP_PUBLIC_URL="${pub_url/https:/wss:}/ws"
+        # Seed the mesh from all three nodes' gossip endpoints (the node drops its own
+        # self-reference); unset GOSSIP_BOOTSTRAP_PEERS in .env.testnet keeps it default.
+        if [ -z "${GOSSIP_BOOTSTRAP_PEERS:-}" ]; then
+          seeds=""
+          for j in 1 2 3; do
+            jv="NODE${j}_PUBLIC_URL"; ju="${!jv:-}"
+            [ -n "$ju" ] && seeds="${seeds:+$seeds,}${ju/https:/wss:}/ws"
+          done
+          export GOSSIP_BOOTSTRAP_PEERS="$seeds"
+        fi
+      fi
       nohup node "$DIST" >"$RUN/node$i.log" 2>&1 &
       echo $! >"$RUN/node$i.pid"
     )
