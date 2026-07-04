@@ -199,9 +199,25 @@ contract AAStarValidatorStakeBindingTest is Test {
         validator.batchRegisterPublicKeys(ids, keys);
     }
 
-    function test_updatePublicKey_revertsWhenStaking() public {
+    function test_updatePublicKey_bootstrapNodeRevertsWhenStaking() public {
+        bytes32 nodeId = keccak256("boot");
+        validator.registerPublicKey(nodeId, V1_PUB); // bootstrap node (requireStake=false)
         validator.setRequireStake(true);
         vm.expectRevert("Staking on: re-register via registerWithProof");
-        validator.updatePublicKey(keccak256("n"), V1_PUB);
+        validator.updatePublicKey(nodeId, V2_PUB);
+    }
+
+    // Codex #163 verification pass: owner cannot toggle staking off, mutate a STAKED
+    // (non-bootstrap) node's key to a PoP-less one, and toggle back on.
+    function test_updatePublicKey_cannotMutateStakedNode() public {
+        validator.setRequireStake(true);
+        _stake(operator1, MIN_STAKE);
+        vm.prank(operator1);
+        validator.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
+        bytes32 stakedNode = keccak256(V1_PUB);
+
+        validator.setRequireStake(false); // owner toggles staking off
+        vm.expectRevert("Not a bootstrap node"); // staked node key is immutable
+        validator.updatePublicKey(stakedNode, V2_PUB);
     }
 }

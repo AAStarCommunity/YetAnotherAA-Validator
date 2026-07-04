@@ -658,11 +658,16 @@ contract AAStarValidator {
      * @param newPublicKey New G1 public key (128 bytes)
      */
     function updatePublicKey(bytes32 nodeId, bytes calldata newPublicKey) external onlyOwner {
-        // Once staking is mandatory, keys are managed only via the staked path (nodeId is
-        // keccak(pubkey) + fresh PoP). An owner key-swap would break that invariant.
-        require(!requireStake, "Staking on: re-register via registerWithProof");
+        // Only bootstrap nodes' keys are owner-mutable. A staked node is immutable-key
+        // (nodeId == keccak(pubkey), PoP-bound); to change it, re-register via
+        // registerWithProof. Otherwise the owner could toggle staking off, swap a staked
+        // node to a rogue/PoP-less key, and toggle back on — injecting an unbacked signer
+        // (the exact owner-injection this design removes). Codex #163 review.
         require(isRegistered[nodeId], "Node not registered");
+        require(isBootstrap[nodeId], "Not a bootstrap node");
+        require(!requireStake, "Staking on: re-register via registerWithProof");
         require(newPublicKey.length == G1_POINT_LENGTH, "Invalid public key length");
+        require(!_isInfinity(newPublicKey), "pubkey is infinity");
 
         bytes memory oldKey = registeredKeys[nodeId];
         registeredKeys[nodeId] = newPublicKey;
