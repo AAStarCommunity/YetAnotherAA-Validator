@@ -21,6 +21,14 @@ pragma solidity ^0.8.19;
  * - Support batch operations
  * - Support signature verification through node identifiers
  */
+/// @dev Minimal read-interface into the SuperPaymaster Registry (economic single source
+///      of truth). AAStarValidator READS role+stake; it never manages stake itself.
+///      Matches Registry.hasRole (public mapping getter) + getEffectiveStake view.
+interface IDVTRegistry {
+    function hasRole(bytes32 roleId, address user) external view returns (bool);
+    function getEffectiveStake(address user, bytes32 roleId) external view returns (uint256);
+}
+
 contract AAStarValidator {
     // =============================================================
     //                           STORAGE
@@ -37,6 +45,26 @@ contract AAStarValidator {
 
     /// @dev Contract owner for administrative functions
     address public owner;
+
+    // --- Stake-binding (issue #163, Plan A v3) -----------------------------------
+    /// @dev The operator (EOA / Safe) that owns a nodeId — the slashing/economic anchor.
+    mapping(bytes32 => address) public nodeOperator;
+    /// @dev Reverse 1:1 lock — one active nodeId per operator in staked mode (anti-Sybil:
+    ///      one GToken stake cannot back many signing identities).
+    mapping(address => bytes32) public operatorNode;
+    /// @dev Nodes registered by the owner during bootstrap (no stake). Retired once
+    ///      requireStake is turned on (migration boundary — no permanent bypass).
+    mapping(bytes32 => bool) public isBootstrap;
+
+    /// @dev SuperPaymaster Registry (stake source of truth). Owner/Safe-settable.
+    address public registry;
+    /// @dev When true, registerPublicKey is permissionless-but-staked and bootstrap nodes
+    ///      stop being accepted in verification. When false, owner-only bootstrap (default).
+    bool public requireStake;
+    /// @dev Minimum locked GToken stake under ROLE_DVT to register/stay active.
+    uint256 public minStake;
+    /// @dev DVT role id in the SuperPaymaster Registry.
+    bytes32 public constant ROLE_DVT = keccak256("DVT");
 
     /// @dev Modifier to restrict access to owner only
     modifier onlyOwner() {
@@ -91,6 +119,13 @@ contract AAStarValidator {
     event PublicKeyRevoked(bytes32 indexed nodeId);
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    // --- Stake-binding (Plan A v3) ---
+    event NodeBound(bytes32 indexed nodeId, address indexed operator);
+    event NodeDeactivated(bytes32 indexed nodeId, address indexed operator);
+    event RegistrySet(address indexed registry);
+    event RequireStakeSet(bool requireStake);
+    event MinStakeSet(uint256 minStake);
 
     function validateAggregateSignature(
         bytes32[] calldata nodeIds,
@@ -193,6 +228,10 @@ contract AAStarValidator {
 
         for (uint256 i = 0; i < nodeIds.length; i++) {
             require(isRegistered[nodeIds[i]], "Node not registered");
+            // Migration boundary (Plan A v3): once staking is mandatory, bootstrap-era
+            // nodes are no longer accepted until they re-register via the staked path.
+            // Cheap per-node read; NOT a full per-verify stake re-check (that's syncNode).
+            require(!(requireStake && isBootstrap[nodeIds[i]]), "Bootstrap node retired");
             publicKeys[i] = registeredKeys[nodeIds[i]];
         }
     }
@@ -455,8 +494,19 @@ contract AAStarValidator {
     // =============================================================
 
     /**
-     * @dev Register public key for new node
-     * Anyone can register, but in the future must verify PNT token staking
+     * @dev Register a node's BLS public key, binding it to a staked operator (Plan A v3).
+     *
+     * Two modes, controlled by `requireStake`:
+     *  - requireStake == false (bootstrap, default): owner-only, records nodeId->pubkey and
+     *    marks it `isBootstrap` (retired once staking is turned on). Preserves the initial
+     *    permissioned launch where the owner grows the quorum.
+     *  - requireStake == true (permissionless-but-staked): the OPERATOR (msg.sender) calls;
+     *    they must hold ROLE_DVT and >= minStake locked GToken in the SuperPaymaster
+     *    Registry, and one operator may back only ONE active nodeId (anti-Sybil).
+     *
+     * NOTE (increment 1): does NOT yet enforce BLS proof-of-possession. Because the
+     * aggregate verifier sums pubkeys (rogue-key vulnerable), PoP MUST be added before
+     * relying on requireStake=true in production. Tracked in #163.
      *
      * @param nodeId Unique node identifier
      * @param publicKey G1 public key (128 bytes)
@@ -464,12 +514,16 @@ contract AAStarValidator {
     function registerPublicKey(bytes32 nodeId, bytes calldata publicKey) external {
         require(nodeId != bytes32(0), "Invalid node ID");
         require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
+        require(!_isInfinity(publicKey), "pubkey is infinity");
         require(!isRegistered[nodeId], "Node already registered");
 
-        // TODO: Verify that msg.sender has staked PNT tokens before allowing registration
-        // Example implementation:
-        // IPNTToken pntToken = IPNTToken(pntTokenAddress);
-        // require(pntToken.getStakedAmount(msg.sender) >= minimumStakeAmount, "Insufficient PNT stake");
+        // Bootstrap-only path: owner registers (permissioned launch). Once staking is
+        // mandatory, the staked path (registerWithProof) is the only way in — this keeps
+        // the rogue-key-vulnerable no-PoP registration off the permissionless surface.
+        require(!requireStake, "Staking on: use registerWithProof");
+        require(msg.sender == owner, "Bootstrap: only owner");
+        nodeOperator[nodeId] = owner;
+        isBootstrap[nodeId] = true;
 
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
@@ -479,14 +533,141 @@ contract AAStarValidator {
     }
 
     /**
+     * @dev Permissionless-but-staked registration (Plan A v3). The OPERATOR (msg.sender)
+     * registers their own node: stake-gated, one node per operator, nodeId derived from
+     * the pubkey (no squatting), and a BLS proof-of-possession that closes the rogue-key
+     * hole in the aggregate verifier (you cannot PoP a key whose secret you don't hold).
+     *
+     * PoP: prove e(g1, popSig) == e(pubkey, popPoint). popPoint is the caller-provided G2
+     * message point their BLS key signed; soundness of possession holds for ANY popPoint
+     * (forging needs the pubkey's secret), so no on-chain hash-to-curve is required.
+     *
+     * @param publicKey  G1 public key (128 bytes, EIP-2537)
+     * @param popPoint   G2 message point the key signed (256 bytes)
+     * @param popSig     G2 BLS signature over popPoint by `publicKey` (256 bytes)
+     */
+    function registerWithProof(
+        bytes calldata publicKey,
+        bytes calldata popPoint,
+        bytes calldata popSig
+    ) external {
+        require(requireStake, "Staked registration disabled");
+        require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
+        // Reject the point-at-infinity encoding (all-zero). e(_, infinity)=1, so an
+        // infinity pubkey/popPoint/popSig would make the PoP pairing trivially pass with
+        // NO secret known — the rogue-key bypass this check exists to close. Non-infinity
+        // but off-subgroup points are rejected by the pairing precompile's subgroup check.
+        require(!_isInfinity(publicKey), "pubkey is infinity");
+        bytes32 nodeId = keccak256(publicKey); // derived — not caller-chosen (no squatting)
+        require(!isRegistered[nodeId], "Node already registered");
+        require(operatorNode[msg.sender] == bytes32(0), "Operator already has a node");
+        require(_isStaked(msg.sender), "Operator not staked for ROLE_DVT");
+        require(_verifyPoP(publicKey, popPoint, popSig), "Invalid proof-of-possession");
+
+        nodeOperator[nodeId] = msg.sender;
+        operatorNode[msg.sender] = nodeId;
+        registeredKeys[nodeId] = publicKey;
+        isRegistered[nodeId] = true;
+        registeredNodes.push(nodeId);
+
+        emit NodeBound(nodeId, msg.sender);
+        emit PublicKeyRegistered(nodeId, publicKey);
+    }
+
+    /// @dev BLS proof-of-possession: e(g1, popSig) == e(pubkey, popPoint). Reuses the same
+    ///      pairing construction as aggregate verification (generator, sig | -pubkey, point).
+    function _verifyPoP(
+        bytes calldata pubkey,
+        bytes calldata popPoint,
+        bytes calldata popSig
+    ) internal view returns (bool) {
+        if (popPoint.length != G2_POINT_LENGTH || popSig.length != G2_POINT_LENGTH) return false;
+        // Defence in depth: infinity in any pairing operand makes e(...)=1 trivially.
+        if (_isInfinity(pubkey) || _isInfinity(popPoint) || _isInfinity(popSig)) return false;
+        bytes memory negPk = _negateG1Point(pubkey);
+        bytes memory pairingData = _buildPairingDataFromComponents(negPk, popSig, popPoint);
+        (bool ok, bytes memory result) = PAIRING_PRECOMPILE.staticcall{ gas: _calculateRequiredGas(1) }(
+            pairingData
+        );
+        return ok && result.length == 32 && bytes32(result) == bytes32(uint256(1));
+    }
+
+    /// @dev EIP-2537 encodes the point at infinity as all-zero bytes. Reject it wherever a
+    ///      non-degenerate point is required (a pairing with infinity is the identity in GT).
+    function _isInfinity(bytes calldata point) internal pure returns (bool) {
+        for (uint256 i = 0; i < point.length; i++) {
+            if (point[i] != 0) return false;
+        }
+        return true;
+    }
+
+    /**
+     * @dev Permissionless re-validation: deactivate a node whose economic backing is gone.
+     *  - a staked node whose operator lost ROLE_DVT or dropped below minStake, or
+     *  - a bootstrap node once requireStake has been turned on (migration boundary).
+     * Anyone (a keeper) may call it — the check is authoritative, not the caller.
+     */
+    function syncNode(bytes32 nodeId) external {
+        require(isRegistered[nodeId], "Node not registered");
+        address op = nodeOperator[nodeId]; // capture before _deactivate clears it
+        bool stale = isBootstrap[nodeId] ? requireStake : !_isStaked(op);
+        require(stale, "Node still active");
+        _deactivate(nodeId);
+        emit NodeDeactivated(nodeId, op);
+    }
+
+    /// @dev True if `op` holds ROLE_DVT and >= minStake locked GToken in the Registry.
+    function _isStaked(address op) internal view returns (bool) {
+        if (registry == address(0) || op == address(0)) return false;
+        IDVTRegistry r = IDVTRegistry(registry);
+        return r.hasRole(ROLE_DVT, op) && r.getEffectiveStake(op, ROLE_DVT) >= minStake;
+    }
+
+    /// @dev Remove a node from the active set + clear its operator binding.
+    function _deactivate(bytes32 nodeId) internal {
+        address op = nodeOperator[nodeId];
+        isRegistered[nodeId] = false;
+        delete registeredKeys[nodeId];
+        delete nodeOperator[nodeId];
+        delete isBootstrap[nodeId];
+        if (op != address(0) && operatorNode[op] == nodeId) delete operatorNode[op];
+        // registeredNodes[] is an unordered enumeration; leave the stale id (isRegistered
+        // gates all reads). Compaction is a gas trade-off deferred to a later pass.
+    }
+
+    // --- Owner/Safe governance (transfer owner to a Gnosis Safe after init) --------
+    function setRegistry(address _registry) external onlyOwner {
+        registry = _registry;
+        emit RegistrySet(_registry);
+    }
+
+    function setRequireStake(bool _v) external onlyOwner {
+        requireStake = _v;
+        emit RequireStakeSet(_v);
+    }
+
+    function setMinStake(uint256 _v) external onlyOwner {
+        minStake = _v;
+        emit MinStakeSet(_v);
+    }
+
+    /**
      * @dev Update public key for registered node
      *
      * @param nodeId Unique node identifier
      * @param newPublicKey New G1 public key (128 bytes)
      */
     function updatePublicKey(bytes32 nodeId, bytes calldata newPublicKey) external onlyOwner {
+        // Only bootstrap nodes' keys are owner-mutable. A staked node is immutable-key
+        // (nodeId == keccak(pubkey), PoP-bound); to change it, re-register via
+        // registerWithProof. Otherwise the owner could toggle staking off, swap a staked
+        // node to a rogue/PoP-less key, and toggle back on — injecting an unbacked signer
+        // (the exact owner-injection this design removes). Codex #163 review.
         require(isRegistered[nodeId], "Node not registered");
+        require(isBootstrap[nodeId], "Not a bootstrap node");
+        require(!requireStake, "Staking on: re-register via registerWithProof");
         require(newPublicKey.length == G1_POINT_LENGTH, "Invalid public key length");
+        require(!_isInfinity(newPublicKey), "pubkey is infinity");
 
         bytes memory oldKey = registeredKeys[nodeId];
         registeredKeys[nodeId] = newPublicKey;
@@ -502,6 +683,13 @@ contract AAStarValidator {
     function revokePublicKey(bytes32 nodeId) external onlyOwner {
         require(isRegistered[nodeId], "Node not registered");
 
+        // Clear the operator binding too, or operatorNode[op] would stay pointing at a
+        // revoked node and strand the operator's 1:1 slot forever (syncNode can't fix it
+        // once isRegistered is false).
+        address op = nodeOperator[nodeId];
+        if (op != address(0) && operatorNode[op] == nodeId) delete operatorNode[op];
+        delete nodeOperator[nodeId];
+        delete isBootstrap[nodeId];
         delete registeredKeys[nodeId];
         isRegistered[nodeId] = false;
 
@@ -524,14 +712,22 @@ contract AAStarValidator {
      * @param publicKeys Corresponding public key array
      */
     function batchRegisterPublicKeys(bytes32[] calldata nodeIds, bytes[] calldata publicKeys) external onlyOwner {
+        // Bootstrap-only, same as registerPublicKey: once staking is mandatory this owner
+        // path would let stake-less/PoP-less nodes into the active set.
+        require(!requireStake, "Staking on: use registerWithProof");
         require(nodeIds.length == publicKeys.length, "Array length mismatch");
         require(nodeIds.length > 0, "Empty arrays");
 
         for (uint256 i = 0; i < nodeIds.length; i++) {
             require(nodeIds[i] != bytes32(0), "Invalid node ID");
             require(publicKeys[i].length == G1_POINT_LENGTH, "Invalid public key length");
+            require(!_isInfinity(publicKeys[i]), "pubkey is infinity");
             require(!isRegistered[nodeIds[i]], "Node already registered");
 
+            // Mark bootstrap + bind operator=owner so these nodes are consistent with the
+            // registerPublicKey bootstrap path (and retire when requireStake turns on).
+            nodeOperator[nodeIds[i]] = owner;
+            isBootstrap[nodeIds[i]] = true;
             registeredKeys[nodeIds[i]] = publicKeys[i];
             isRegistered[nodeIds[i]] = true;
             registeredNodes.push(nodeIds[i]);
