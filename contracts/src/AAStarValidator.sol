@@ -516,26 +516,72 @@ contract AAStarValidator {
         require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
         require(!isRegistered[nodeId], "Node already registered");
 
-        if (requireStake) {
-            // Permissionless-but-staked: caller is the operator; one node per operator.
-            require(operatorNode[msg.sender] == bytes32(0), "Operator already has a node");
-            require(_isStaked(msg.sender), "Operator not staked for ROLE_DVT");
-            nodeOperator[nodeId] = msg.sender;
-            operatorNode[msg.sender] = nodeId;
-            emit NodeBound(nodeId, msg.sender);
-        } else {
-            // Bootstrap: owner registers; bind operator = owner as a placeholder and mark
-            // the node bootstrap so it retires when staking becomes mandatory.
-            require(msg.sender == owner, "Bootstrap: only owner");
-            nodeOperator[nodeId] = owner;
-            isBootstrap[nodeId] = true;
-        }
+        // Bootstrap-only path: owner registers (permissioned launch). Once staking is
+        // mandatory, the staked path (registerWithProof) is the only way in — this keeps
+        // the rogue-key-vulnerable no-PoP registration off the permissionless surface.
+        require(!requireStake, "Staking on: use registerWithProof");
+        require(msg.sender == owner, "Bootstrap: only owner");
+        nodeOperator[nodeId] = owner;
+        isBootstrap[nodeId] = true;
 
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
         registeredNodes.push(nodeId);
 
         emit PublicKeyRegistered(nodeId, publicKey);
+    }
+
+    /**
+     * @dev Permissionless-but-staked registration (Plan A v3). The OPERATOR (msg.sender)
+     * registers their own node: stake-gated, one node per operator, nodeId derived from
+     * the pubkey (no squatting), and a BLS proof-of-possession that closes the rogue-key
+     * hole in the aggregate verifier (you cannot PoP a key whose secret you don't hold).
+     *
+     * PoP: prove e(g1, popSig) == e(pubkey, popPoint). popPoint is the caller-provided G2
+     * message point their BLS key signed; soundness of possession holds for ANY popPoint
+     * (forging needs the pubkey's secret), so no on-chain hash-to-curve is required.
+     *
+     * @param publicKey  G1 public key (128 bytes, EIP-2537)
+     * @param popPoint   G2 message point the key signed (256 bytes)
+     * @param popSig     G2 BLS signature over popPoint by `publicKey` (256 bytes)
+     */
+    function registerWithProof(
+        bytes calldata publicKey,
+        bytes calldata popPoint,
+        bytes calldata popSig
+    ) external {
+        require(requireStake, "Staked registration disabled");
+        require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
+        bytes32 nodeId = keccak256(publicKey); // derived — not caller-chosen (no squatting)
+        require(!isRegistered[nodeId], "Node already registered");
+        require(operatorNode[msg.sender] == bytes32(0), "Operator already has a node");
+        require(_isStaked(msg.sender), "Operator not staked for ROLE_DVT");
+        require(_verifyPoP(publicKey, popPoint, popSig), "Invalid proof-of-possession");
+
+        nodeOperator[nodeId] = msg.sender;
+        operatorNode[msg.sender] = nodeId;
+        registeredKeys[nodeId] = publicKey;
+        isRegistered[nodeId] = true;
+        registeredNodes.push(nodeId);
+
+        emit NodeBound(nodeId, msg.sender);
+        emit PublicKeyRegistered(nodeId, publicKey);
+    }
+
+    /// @dev BLS proof-of-possession: e(g1, popSig) == e(pubkey, popPoint). Reuses the same
+    ///      pairing construction as aggregate verification (generator, sig | -pubkey, point).
+    function _verifyPoP(
+        bytes calldata pubkey,
+        bytes calldata popPoint,
+        bytes calldata popSig
+    ) internal view returns (bool) {
+        if (popPoint.length != G2_POINT_LENGTH || popSig.length != G2_POINT_LENGTH) return false;
+        bytes memory negPk = _negateG1Point(pubkey);
+        bytes memory pairingData = _buildPairingDataFromComponents(negPk, popSig, popPoint);
+        (bool ok, bytes memory result) = PAIRING_PRECOMPILE.staticcall{ gas: _calculateRequiredGas(1) }(
+            pairingData
+        );
+        return ok && result.length == 32 && bytes32(result) == bytes32(uint256(1));
     }
 
     /**

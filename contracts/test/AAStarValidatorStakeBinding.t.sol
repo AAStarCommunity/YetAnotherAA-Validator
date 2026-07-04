@@ -22,22 +22,24 @@ contract AAStarValidatorStakeBindingTest is Test {
 
     bytes32 constant ROLE_DVT = keccak256("DVT");
     uint256 constant MIN_STAKE = 30 ether;
-    // 128-byte G1 keys (content irrelevant for the binding logic under test).
-    bytes KEY_A = new bytes(128);
-    bytes KEY_B = new bytes(128);
-    bytes32 constant NODE_A = keccak256("nodeA");
-    bytes32 constant NODE_B = keccak256("nodeB");
-
     address operator1 = address(0xA1);
     address operator2 = address(0xA2);
+
+    // Known-answer PoP vectors (noble @noble/curves, DST AASTAR_DVT_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_).
+    // e(g1, POP_SIG) == e(PUB, POP_POINT) holds (noble verify=true).
+    bytes V1_PUB = hex"000000000000000000000000000000001928f3beb93519eecf0145da903b40a4c97dca00b21f12ac0df3be9116ef2ef27b2ae6bcd4c5bc2d54ef5a70627efcb700000000000000000000000000000000108dadbaa4b636445639d5ae3089b3c43a8a1d47818edd1839d7383959a41c10fdc66849cfa1b08c5a11ec7e28981a1c";
+    bytes V1_POP_POINT = hex"00000000000000000000000000000000086f6d0cdf889dc6d987ee9c5446c45b206775fcf7c60ebde4e1e0250fb04be1a86a296bae0bad3bc81f27a76ada86d50000000000000000000000000000000007906cd1575d26570463bee46945d8ef77539df93d13e22aef436f0d538bb28d916d581fe1d71bbc0d62c7ba4b8edccb000000000000000000000000000000000389f33b01cdf1a04f541764ddf51ec2dbed718f2398f75f3fce7725c072d9340263ae52e06b7bf52eb3ab7ec72ca92000000000000000000000000000000000137ab9e24a3c0f637ae65f212458ed1a10250d85da32ae5bf72842062c6819149945d2c7091607690f3c61f53e52c8b9";
+    bytes V1_POP_SIG = hex"00000000000000000000000000000000022bd720bb56d00b92f4995e3e4342b2cb7fb8ca8d54e58ff20adc76760c2340c2b1e119a19db8640cffad3f0e41c850000000000000000000000000000000000eafa2b92b141289b6e189c9a0a4d3b1b9a9cd0e5d51b43482b7a1b261134049a601bda9fabb054c36e790fb6b6ca3e7000000000000000000000000000000000b6232777504abec794edddee6bb8b38b9fa3292d2376a3ddaed676bf0b5406c981292eb50ec1b2d8dffec72f1f9aab400000000000000000000000000000000019da6fdf9a09dd3b32c75176c36426118bab60496b3583c817dde359dadf72fc87ddd09a192bd32766938a92cf4ff5c";
+
+    bytes V2_PUB = hex"0000000000000000000000000000000019cdf3807146e68e041314ca93e1fee0991224ec2a74beb2866816fd0826ce7b6263ee31e953a86d1b72cc2215a577930000000000000000000000000000000007481b1f261aabacf45c6e4fc278055441bfaf99f604d1f835c0752ac9742b4522c9f5c77db40989e7da608505d48616";
+    bytes V2_POP_POINT = hex"000000000000000000000000000000000f73f219e773dd1ef6fe2d10a5c49921d8cdd723b33b34087a52617d067a2de251e945553c8bd9734ad664fb6f345fce00000000000000000000000000000000123a13ec0543aeed2afad244f7e4c9bc20ee778d6354947cbea7410820f8d907f5c025bb8e8598cbf5902a7982e1b323000000000000000000000000000000000c02e3e68f26c168a018698ba779272abe9ff0279d6f5280afc9fb3ab0160c06ecbddf2d33d0423b79a2751695f51a11000000000000000000000000000000000eaaecfea4c6ce69a92154ca4b2804d2f7017d468be09aeb0de61c4dbe2c2553afe4193e20a948afc382b97a2d36e8e4";
+    bytes V2_POP_SIG = hex"000000000000000000000000000000000142a94144f05fff297d81f022f4a81023db248cd04b17530e474c0a264a4a1970f53d0fdd2c75eb40767f198461e08e0000000000000000000000000000000004dfd312738238f2004bde8c5376d6262f6ae91ff8ba8d94fa4c840b1682fcfb1994738cf7a861f34411f0d3eead6f79000000000000000000000000000000000f0db21327df7234d3dab4e226caadea2f1447fa9ea5969db23d84dcf0b985c93de4dcf45041cb8c23ea8e276d0a60350000000000000000000000000000000000c933d07622ca99f9f8d9648354c07ab2d41fb7804d43f605adea83f6e4713e2d66e3ad0790ec39bf193ef3529c6693";
 
     function setUp() public {
         validator = new AAStarValidator(); // deployer (this) = owner
         registry = new StakeRegistry();
         validator.setRegistry(address(registry));
         validator.setMinStake(MIN_STAKE);
-        KEY_A[0] = 0x01;
-        KEY_B[0] = 0x02;
     }
 
     function _stake(address op, uint256 amount) internal {
@@ -45,44 +47,59 @@ contract AAStarValidatorStakeBindingTest is Test {
         registry.setStake(op, amount);
     }
 
-    // --- staked mode: permissionless-but-staked ---------------------------------
-    function test_StakedMode_operatorRegisters() public {
+    // --- staked registration with PoP -------------------------------------------
+    function test_registerWithProof_success() public {
         validator.setRequireStake(true);
         _stake(operator1, MIN_STAKE);
 
         vm.prank(operator1);
-        validator.registerPublicKey(NODE_A, KEY_A);
+        validator.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
 
-        assertTrue(validator.isRegistered(NODE_A));
-        assertEq(validator.nodeOperator(NODE_A), operator1);
-        assertEq(validator.operatorNode(operator1), NODE_A);
-        assertFalse(validator.isBootstrap(NODE_A));
+        bytes32 nodeId = keccak256(V1_PUB);
+        assertTrue(validator.isRegistered(nodeId));
+        assertEq(validator.nodeOperator(nodeId), operator1);
+        assertEq(validator.operatorNode(operator1), nodeId);
+        assertFalse(validator.isBootstrap(nodeId));
     }
 
-    function test_StakedMode_rejectsUnstaked() public {
+    function test_registerWithProof_rejectsBadPoP() public {
         validator.setRequireStake(true);
-        // operator1 has no role/stake
+        _stake(operator1, MIN_STAKE);
+        // V1 pubkey with V2's signature/point → pairing fails.
+        vm.prank(operator1);
+        vm.expectRevert("Invalid proof-of-possession");
+        validator.registerWithProof(V1_PUB, V2_POP_POINT, V2_POP_SIG);
+    }
+
+    function test_registerWithProof_rejectsUnstaked() public {
+        validator.setRequireStake(true);
         vm.prank(operator1);
         vm.expectRevert("Operator not staked for ROLE_DVT");
-        validator.registerPublicKey(NODE_A, KEY_A);
+        validator.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
     }
 
-    function test_StakedMode_rejectsBelowMinStake() public {
+    function test_registerWithProof_rejectsBelowMinStake() public {
         validator.setRequireStake(true);
         _stake(operator1, MIN_STAKE - 1);
         vm.prank(operator1);
         vm.expectRevert("Operator not staked for ROLE_DVT");
-        validator.registerPublicKey(NODE_A, KEY_A);
+        validator.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
     }
 
-    function test_StakedMode_oneNodePerOperator() public {
+    function test_registerWithProof_oneNodePerOperator() public {
         validator.setRequireStake(true);
         _stake(operator1, MIN_STAKE);
         vm.startPrank(operator1);
-        validator.registerPublicKey(NODE_A, KEY_A);
+        validator.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
         vm.expectRevert("Operator already has a node"); // anti-Sybil: 1 stake -> 1 node
-        validator.registerPublicKey(NODE_B, KEY_B);
+        validator.registerWithProof(V2_PUB, V2_POP_POINT, V2_POP_SIG);
         vm.stopPrank();
+    }
+
+    function test_registerPublicKey_revertsWhenStaking() public {
+        validator.setRequireStake(true);
+        vm.expectRevert("Staking on: use registerWithProof");
+        validator.registerPublicKey(keccak256("x"), V1_PUB);
     }
 
     // --- syncNode: deactivate stale nodes ---------------------------------------
@@ -90,36 +107,35 @@ contract AAStarValidatorStakeBindingTest is Test {
         validator.setRequireStake(true);
         _stake(operator1, MIN_STAKE);
         vm.prank(operator1);
-        validator.registerPublicKey(NODE_A, KEY_A);
+        validator.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
+        bytes32 nodeId = keccak256(V1_PUB);
 
-        // operator exits stake
         registry.setStake(operator1, 0);
         registry.setRole(ROLE_DVT, operator1, false);
 
-        validator.syncNode(NODE_A); // anyone can call
-        assertFalse(validator.isRegistered(NODE_A), "deactivated");
-        assertEq(validator.operatorNode(operator1), bytes32(0), "binding cleared -> can re-stake+register");
+        validator.syncNode(nodeId); // anyone can call
+        assertFalse(validator.isRegistered(nodeId), "deactivated");
+        assertEq(validator.operatorNode(operator1), bytes32(0), "binding cleared -> can re-stake");
     }
 
     function test_syncNode_revertsWhenStillActive() public {
         validator.setRequireStake(true);
         _stake(operator1, MIN_STAKE);
         vm.prank(operator1);
-        validator.registerPublicKey(NODE_A, KEY_A);
+        validator.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
         vm.expectRevert("Node still active");
-        validator.syncNode(NODE_A);
+        validator.syncNode(keccak256(V1_PUB));
     }
 
     // --- migration boundary: bootstrap nodes retire when staking turns on -------
     function test_migrationBoundary_bootstrapRetiredOnToggle() public {
-        // bootstrap register (owner, requireStake=false)
-        validator.registerPublicKey(NODE_A, KEY_A);
-        assertTrue(validator.isBootstrap(NODE_A));
+        bytes32 nodeId = keccak256("bootnode");
+        validator.registerPublicKey(nodeId, V1_PUB); // bootstrap (owner, requireStake=false)
+        assertTrue(validator.isBootstrap(nodeId));
 
-        // turn staking on -> bootstrap node can be synced out
         validator.setRequireStake(true);
-        validator.syncNode(NODE_A);
-        assertFalse(validator.isRegistered(NODE_A), "bootstrap node retired");
+        validator.syncNode(nodeId);
+        assertFalse(validator.isRegistered(nodeId), "bootstrap node retired");
     }
 
     function test_onlyOwner_setters() public {
