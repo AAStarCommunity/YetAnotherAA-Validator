@@ -1,0 +1,32 @@
+[
+  {
+    "nodeId": "0xd4f954361cdb2b2d89a631c939b6f930de5b2c5753911d2be7fb1ecc9f17a60e",
+    "publicKey": "89ffc557d29bc3a11caf3bb3ae8fb6bbd17c60a8e26e9b6be6dbaf8b5f33a3ef8a3d29e765a53f436b3b7dddd3ce8fac",
+    "apiEndpoint": "https://dvt3.aastar.io",
+    "gossipEndpoint": "wss://dvt3.aastar.io/ws",
+    "status": "active",
+    "lastSeen": "2026-07-05T03:32:17.647Z",
+    "region": "local",
+    "capabilities": [
+      "bls-signing",
+      "message-aggregation"
+    ],
+    "version": "1.0.0",
+    "heartbeatCount": 0
+  },
+  {
+    "nodeId": "0x2df775b934046ddd210828fb5096ea8a15bb18a145dae5bd94535375c319c53f",
+    "publicKey": "8067dfd1f98fd1258c0eed3886d234f81eea9371b595a1a278a49c71f8f5eda74639fa043948f7fc0ee3e6b8ec9b8555",
+    "apiEndpoint": "https://dvt1.aastar.io",
+    "gossipEndpoint": "wss://dvt1.aastar.io/ws",
+    "status": "active",
+    "lastSeen": "2026-07-05T03:32:17.647Z",
+    "region": "local",
+    "capabilities": [
+      "bls-signing",
+      "message-aggregation"
+    ],
+    "version": "1.0.0",
+    "heartbeatCount": 0
+  }
+]
