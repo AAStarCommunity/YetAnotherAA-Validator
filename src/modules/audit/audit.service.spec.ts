@@ -569,6 +569,37 @@ describe("AuditService", () => {
     expect(archive.records.every(r => r.proposalTx === undefined)).toBe(true);
   });
 
+  it("Fix (PK): archive.put failure does NOT suppress retry — evidence never lost", async () => {
+    let putCalls = 0;
+    const records: SlashProof[] = [];
+    const flakyArchive: IProofArchive = {
+      async put(proof: SlashProof) {
+        putCalls++;
+        if (putCalls === 1) throw new Error("ENOSPC: disk full");
+        records.push(proof);
+        return { proofHash: proof.proofHash, location: `mem://${proof.proofHash}` };
+      },
+      async has(proofHash: string) {
+        return records.some(r => r.proofHash === proofHash);
+      },
+      async count() {
+        return records.length;
+      },
+    };
+    const blockchain = overLimitBlockchain({
+      createSlashProposal: async () => ({ txHash: "0xABC", proposalId: 1n }),
+    });
+    blockchain.getBlockNumber = async () => 5000; // SAME violation@block both ticks
+    const svc = makeService(blockchain, makeConfig(), flakyArchive);
+
+    await svc.tick(); // put throws → recordStableKey NOT reached
+    expect(records).toHaveLength(0);
+    // The in-memory stableKey must NOT have suppressed the same violation — a later tick retries.
+    await svc.tick();
+    expect(putCalls).toBe(2);
+    expect(records).toHaveLength(1); // evidence eventually persisted (invariant held)
+  });
+
   // ── FIX 4: proof carries the REAL on-chain proposal id (no fabrication) ─────────
   it("Fix 4: the proof carries the REAL on-chain proposal id parsed from the event", async () => {
     const blockchain = overLimitBlockchain({

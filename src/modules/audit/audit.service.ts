@@ -544,11 +544,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       ...(proposalIdNote ? { proposalIdNote } : {}),
     };
 
-    // Mark this exact violation@block handled BEFORE archiving so a same-block re-tick can't
-    // double-file. (The cooldown was already armed on ATTEMPT above.)
-    this.recordStableKey(stableKey);
-
+    // Archive the evidence FIRST, then mark the violation@block handled. If archive.put throws
+    // (disk full / IO error), recordStableKey is NOT reached, so a later tick re-attempts the
+    // archive rather than the in-memory stableKey silently suppressing it for cooldownMs — the
+    // "evidence never lost" invariant. (The on-chain tx is still cooldown-gated above, so a retry
+    // re-archives without re-sending a proposal.)
     const { location } = await this.archive.put(proof);
+    this.recordStableKey(stableKey);
     this.logger.warn(
       `Audit: ${v.operator} VIOLATION ${v.rule} — proof ${proofHash} archived at ${location}` +
         (proposalTx ? ` (proposal ${proposalTx})` : " (proposal NOT filed)")
