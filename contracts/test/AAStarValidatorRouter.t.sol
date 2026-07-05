@@ -38,23 +38,51 @@ contract AAStarValidatorRouterTest is Test {
         PUB[1] = hex"0000000000000000000000000000000000fd75ebcc0a21649e3177bcce15426da0e4f25d6828fbf4038d4d7ed3bd4421de3ef61d70f794687b12b2d571971a550000000000000000000000000000000004523f5a3915fc57ee889cdb057e3e76109112d125217546ccfe26810c99b130d1b27820595ad61c7527dc5bbb132a90";
     }
 
+    /// nodeIds ascending (the router wire contract: strictly-increasing ⇒ distinct participants).
+    /// AGG_SIG is order-independent (a commutative point sum), so ordering the ids doesn't change it.
+    function _sortedIds() internal view returns (bytes32 lo, bytes32 hi) {
+        bytes32 a = keccak256(PUB[0]);
+        bytes32 b = keccak256(PUB[1]);
+        (lo, hi) = a < b ? (a, b) : (b, a);
+    }
+
     /// Register both nodes via the bootstrap path (requireStake off), then assert validate() ==
     /// 0 for the valid aggregate and non-zero for a tampered signature.
     function test_router_validate_valid_and_tampered_bootstrap() public {
         validator.registerPublicKey(keccak256(PUB[0]), PUB[0]);
         validator.registerPublicKey(keccak256(PUB[1]), PUB[1]);
+        (bytes32 lo, bytes32 hi) = _sortedIds();
 
-        bytes memory sig = abi.encodePacked(keccak256(PUB[0]), keccak256(PUB[1]), AGG_SIG);
+        bytes memory sig = abi.encodePacked(lo, hi, AGG_SIG);
         assertEq(validator.validate(USER_OP_HASH, sig), 0, "valid aggregate must pass (return 0)");
 
         // Tamper the last byte of the aggregate signature to verification must fail (non-zero).
-        bytes memory tampered = abi.encodePacked(keccak256(PUB[0]), keccak256(PUB[1]), AGG_SIG);
+        bytes memory tampered = abi.encodePacked(lo, hi, AGG_SIG);
         tampered[tampered.length - 1] = bytes1(uint8(tampered[tampered.length - 1]) ^ 0x01);
         assertTrue(validator.validate(USER_OP_HASH, tampered) != 0, "tampered signature must fail (non-zero)");
 
         // A wrong userOpHash (message-point re-derivation binds to it) must also fail.
         bytes32 wrongHash = bytes32(uint256(USER_OP_HASH) ^ 1);
         assertTrue(validator.validate(wrongHash, sig) != 0, "wrong userOpHash must fail (op-binding)");
+    }
+
+    /// Codex round-1 fixes: validate() must reject duplicate / unordered / oversize / unregistered
+    /// nodeIds — all as a uniform non-reverting `return 1`, so no single node can inflate a quorum.
+    function test_router_validate_rejects_dupe_unordered_oversize_unregistered() public {
+        validator.registerPublicKey(keccak256(PUB[0]), PUB[0]);
+        validator.registerPublicKey(keccak256(PUB[1]), PUB[1]);
+        (bytes32 lo, bytes32 hi) = _sortedIds();
+
+        // Medium-1: a single node repeated ([nid,nid]) must NOT pass as a 2-of-N quorum.
+        assertEq(validator.validate(USER_OP_HASH, abi.encodePacked(lo, lo, AGG_SIG)), 1, "duplicate nodeId to 1");
+        // Not strictly-increasing (descending) to 1.
+        assertEq(validator.validate(USER_OP_HASH, abi.encodePacked(hi, lo, AGG_SIG)), 1, "unordered nodeIds to 1");
+        // Low-2: an unregistered nodeId to 1 (must NOT revert).
+        bytes32 ghost = keccak256("not-registered");
+        assertEq(validator.validate(USER_OP_HASH, abi.encodePacked(ghost, new bytes(256))), 1, "unregistered to 1");
+        // Low-1: > MAX_NODE_COUNT (100) nodeIds to 1 before any heavy work.
+        bytes memory oversize = new bytes(101 * 32 + 256);
+        assertEq(validator.validate(USER_OP_HASH, oversize), 1, "oversize nodeId count to 1");
     }
 
     /// Same golden vector, but through the permissionless-but-staked path (Plan A v3): PoP-less
@@ -95,7 +123,9 @@ contract AAStarValidatorRouterTest is Test {
         bool legacy = validator.validateAggregateSignature(nodeIds, AGG_SIG, MESSAGE_POINT);
         assertTrue(legacy, "legacy calldata path verifies");
 
-        bytes memory sig = abi.encodePacked(nodeIds[0], nodeIds[1], AGG_SIG);
+        // Router path requires ascending nodeIds (strictly-increasing wire contract).
+        (bytes32 lo, bytes32 hi) = _sortedIds();
+        bytes memory sig = abi.encodePacked(lo, hi, AGG_SIG);
         assertEq(validator.validate(USER_OP_HASH, sig), 0, "router path agrees with legacy path");
     }
 }

@@ -131,6 +131,11 @@ contract AAStarValidator is IAAStarAlgorithm {
     uint256 private constant XMD_LEN = 256;
     uint256 private constant XMD_ELL = 8;
 
+    /// @dev Upper bound on nodeIds in a single `validate()` call — bounds the router entry point's
+    ///      pre-pairing work (parse + storage reads + G1 aggregation) so a large payload cannot
+    ///      gas-grief the bundler. Matches the legacy account parser's cap.
+    uint256 private constant MAX_NODE_COUNT = 100;
+
     // =============================================================
     //                           EVENTS
     // =============================================================
@@ -209,9 +214,10 @@ contract AAStarValidator is IAAStarAlgorithm {
     ///      replayed against userOpHash_B). nodeCount = (signature.length - 256) / 32.
     ///
     ///      ERC-7562: this is `view` and reads ONLY this validator's own `registeredKeys` /
-    ///      `isRegistered` / `isBootstrap` storage — no external calls. It returns 1 on malformed
-    ///      input rather than reverting; it still reverts (via the memory key lookup) on an
-    ///      unregistered / retired-bootstrap node, exactly as the source contract does.
+    ///      `isRegistered` / `isBootstrap` storage — no external calls. It is uniformly
+    ///      fail-closed: EVERY malformed / unregistered / retired-bootstrap / non-quorum input
+    ///      returns 1 rather than reverting (the account calls it under try/catch, treating a
+    ///      revert as fail; returning 1 keeps the failure signal uniform).
     function validate(bytes32 hash, bytes calldata signature) external view override returns (uint256) {
         // Parse: variable-length nodeIds + 256-byte BLS sig (messagePoint dropped — see above).
         uint256 fixedLen = G2_POINT_LENGTH; // 256
@@ -221,9 +227,24 @@ contract AAStarValidator is IAAStarAlgorithm {
         if (nodeIdsBytes == 0 || nodeIdsBytes % 32 != 0) return 1;
 
         uint256 nodeCount = nodeIdsBytes / 32;
+        if (nodeCount > MAX_NODE_COUNT) return 1; // gas-griefing bound
+
         bytes32[] memory nodeIds = new bytes32[](nodeCount);
+        bytes32 prevId = bytes32(0);
         for (uint256 i = 0; i < nodeCount; i++) {
-            nodeIds[i] = bytes32(signature[i * 32:(i + 1) * 32]);
+            bytes32 nid = bytes32(signature[i * 32:(i + 1) * 32]);
+            // Strictly-increasing nodeIds ⇒ distinct participants. Blocks a single node inflating
+            // the aggregate by repeating itself (`[nid,nid,…]` with the self-aggregated `k·sig`) to
+            // fake an M-of-N quorum: the pairing is valid for the multiset, but only one distinct
+            // node signed. Requires the caller to send nodeIds ascending — the same ordered-signer
+            // discipline SP BLSAggregator enforces via its signerMask; it is the router wire
+            // contract (the off-chain aggregator sorts before submitting).
+            if (i != 0 && nid <= prevId) return 1;
+            prevId = nid;
+            // Fail-closed (not revert) on an unregistered or retired-bootstrap node.
+            if (!isRegistered[nid]) return 1;
+            if (requireStake && isBootstrap[nid]) return 1;
+            nodeIds[i] = nid;
         }
 
         bytes calldata blsSignature = signature[nodeIdsBytes:nodeIdsBytes + G2_POINT_LENGTH];
