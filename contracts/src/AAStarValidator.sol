@@ -29,7 +29,16 @@ interface IDVTRegistry {
     function getEffectiveStake(address user, bytes32 roleId) external view returns (uint256);
 }
 
-contract AAStarValidator {
+/// @dev Router-mountable algorithm interface (ported from airaccount-contract). A router can
+///      dispatch to any validator implementing this: `validate(hash, signature)` recomputes the
+///      message point on-chain from `hash` (the ERC-4337 userOpHash) and verifies the aggregate
+///      BLS signature against it. Returns 0 on success, non-zero on failure; MUST NOT revert on
+///      malformed signature input (returns 1) so a router can treat all validators uniformly.
+interface IAAStarAlgorithm {
+    function validate(bytes32 hash, bytes calldata signature) external view returns (uint256);
+}
+
+contract AAStarValidator is IAAStarAlgorithm {
     // =============================================================
     //                           STORAGE
     // =============================================================
@@ -106,6 +115,27 @@ contract AAStarValidator {
     uint256 private constant P_HIGH = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f624;
     uint256 private constant P_LOW = 0x1eabfffeb153ffffb9feffffffffaaab;
 
+    // --- RFC 9380 hash_to_curve constants (ported from airaccount AAStarBLSAlgorithm) --------
+    /// @dev Domain separation tag for suite BLS12381G2_XMD:SHA-256_SSWU_RO_ with the POP suffix.
+    ///      MUST byte-match the off-chain DVT signer (src/utils/bls.util.ts BLS_DST) so the
+    ///      on-chain message point equals `bls12_381.G2.hashToCurve(userOpHash, {DST})` (43 bytes).
+    bytes private constant DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+    /// @dev BLS12-381 base field modulus p as 48-byte big-endian (= P_HIGH‖P_LOW); MODEXP modulus.
+    bytes private constant FIELD_MODULUS =
+        hex"1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab";
+
+    /// @dev EIP-2537 MAP_FP2_TO_G2 input length (an Fp2 element = two 64-byte Fp coordinates).
+    uint256 private constant FP2_INPUT_LENGTH = 128;
+    /// @dev expand_message_xmd output length for G2: count(2)×m(2)×L(64) = 256 → ell = 8 SHA-256 blocks.
+    uint256 private constant XMD_LEN = 256;
+    uint256 private constant XMD_ELL = 8;
+
+    /// @dev Upper bound on nodeIds in a single `validate()` call — bounds the router entry point's
+    ///      pre-pairing work (parse + storage reads + G1 aggregation) so a large payload cannot
+    ///      gas-grief the bundler. Matches the legacy account parser's cap.
+    uint256 private constant MAX_NODE_COUNT = 100;
+
     // =============================================================
     //                           EVENTS
     // =============================================================
@@ -169,6 +199,288 @@ contract AAStarValidator {
             isValid,
             gasUsed
         );
+    }
+
+    // =============================================================
+    //           ROUTER ENTRY POINT (IAAStarAlgorithm.validate)
+    // =============================================================
+
+    /// @inheritdoc IAAStarAlgorithm
+    /// @dev Ported from airaccount-contract AAStarBLSAlgorithm.validate (issue #45 Fix 1, Option B).
+    ///      Signature layout is `[nodeIds...][blsSignature(256)]` — NO caller-supplied messagePoint.
+    ///      The message point is recomputed on-chain from `hash` (the ERC-4337 userOpHash) via RFC
+    ///      9380 hash_to_curve and the pairing is verified against THAT, binding the aggregate to
+    ///      this exact operation (a (messagePoint, aggSig) produced for userOpHash_A cannot be
+    ///      replayed against userOpHash_B). nodeCount = (signature.length - 256) / 32.
+    ///
+    ///      ERC-7562: this is `view` and reads ONLY this validator's own `registeredKeys` /
+    ///      `isRegistered` / `isBootstrap` storage — no external calls. It is uniformly
+    ///      fail-closed: EVERY malformed / unregistered / retired-bootstrap / non-quorum input
+    ///      returns 1 rather than reverting (the account calls it under try/catch, treating a
+    ///      revert as fail; returning 1 keeps the failure signal uniform).
+    function validate(bytes32 hash, bytes calldata signature) external view override returns (uint256) {
+        // Parse: variable-length nodeIds + 256-byte BLS sig (messagePoint dropped — see above).
+        uint256 fixedLen = G2_POINT_LENGTH; // 256
+        if (signature.length <= fixedLen) return 1;
+
+        uint256 nodeIdsBytes = signature.length - fixedLen;
+        if (nodeIdsBytes == 0 || nodeIdsBytes % 32 != 0) return 1;
+
+        uint256 nodeCount = nodeIdsBytes / 32;
+        if (nodeCount > MAX_NODE_COUNT) return 1; // gas-griefing bound
+
+        bytes32[] memory nodeIds = new bytes32[](nodeCount);
+        bytes32 prevId = bytes32(0);
+        for (uint256 i = 0; i < nodeCount; i++) {
+            bytes32 nid = bytes32(signature[i * 32:(i + 1) * 32]);
+            // Strictly-increasing nodeIds ⇒ distinct participants. Blocks a single node inflating
+            // the aggregate by repeating itself (`[nid,nid,…]` with the self-aggregated `k·sig`) to
+            // fake an M-of-N quorum: the pairing is valid for the multiset, but only one distinct
+            // node signed. Requires the caller to send nodeIds ascending — the same ordered-signer
+            // discipline SP BLSAggregator enforces via its signerMask; it is the router wire
+            // contract (the off-chain aggregator sorts before submitting).
+            if (i != 0 && nid <= prevId) return 1;
+            prevId = nid;
+            // Fail-closed (not revert) on an unregistered or retired-bootstrap node.
+            if (!isRegistered[nid]) return 1;
+            if (requireStake && isBootstrap[nid]) return 1;
+            nodeIds[i] = nid;
+        }
+
+        bytes calldata blsSignature = signature[nodeIdsBytes:nodeIdsBytes + G2_POINT_LENGTH];
+
+        // Reject point-at-infinity: pairings with infinity evaluate to the identity in GT and
+        // would let a zero signature satisfy the BLS factor.
+        if (_isG2InfinityCalldata(blsSignature)) return 1;
+
+        // issue #45 Fix 1: recompute the message point from userOpHash (same DST/suite as the DVT).
+        bytes memory messagePoint = _hashToG2(hash);
+        // Defensive: hash_to_curve never returns infinity, but assert it (keeps the prior invariant).
+        if (_isG2InfinityMemory(messagePoint)) return 1;
+
+        // Copy the calldata sig slice into memory for the memory-based pairing path used by validate().
+        bytes memory blsSigMem = blsSignature;
+
+        bool valid = _validateBLSSignatureMem(nodeIds, blsSigMem, messagePoint);
+        return valid ? 0 : 1;
+    }
+
+    // =============================================================
+    //             RFC 9380 hash_to_curve (issue #45 Fix 1)
+    // =============================================================
+
+    /// @notice Map a 32-byte message (the userOpHash) to a BLS12-381 G2 point, byte-identical to
+    ///         `bls12_381.G2.hashToCurve(getBytes(message), { DST })` in noble-curves (the DVT).
+    /// @dev Exposed as an external view for golden-vector testing / off-chain cross-checking.
+    ///      No security impact: it is a pure function of `message` (no storage, no msg.sender).
+    function hashToG2(bytes32 message) external view returns (bytes memory) {
+        return _hashToG2(message);
+    }
+
+    /// @dev RFC 9380 `hash_to_curve` for suite BLS12381G2_XMD:SHA-256_SSWU_RO_.
+    ///      1. expand_message_xmd(message, DST, 256) → 256 uniform bytes.
+    ///      2. hash_to_field → two Fp2 elements u0,u1 (four 64-byte chunks reduced mod p).
+    ///      3. MAP_FP2_TO_G2(u0), MAP_FP2_TO_G2(u1)   (EIP-2537 0x11; isogeny + cofactor clearing).
+    ///      4. G2ADD(q0, q1)                          (EIP-2537 0x0d).
+    ///      Step 4 equals RFC's clear_cofactor(map(u0)+map(u1)) because cofactor clearing is a
+    ///      scalar multiplication and therefore distributes over point addition.
+    function _hashToG2(bytes32 message) internal view returns (bytes memory point) {
+        bytes memory uniform = _expandMessageXmd(message); // 256 bytes
+
+        // RFC 9380 §5.3 ordering: u0 = (chunk0, chunk1), u1 = (chunk2, chunk3); each chunk mod p
+        // is the c0/c1 coordinate of the Fp2 element, encoded EIP-2537-style (16-byte left pad).
+        bytes memory map0 = new bytes(FP2_INPUT_LENGTH);
+        bytes memory map1 = new bytes(FP2_INPUT_LENGTH);
+        _placeFieldElement(map0, 0, uniform, 0); // u0.c0
+        _placeFieldElement(map0, 1, uniform, 1); // u0.c1
+        _placeFieldElement(map1, 0, uniform, 2); // u1.c0
+        _placeFieldElement(map1, 1, uniform, 3); // u1.c1
+
+        bytes memory q0 = _mapFp2ToG2(map0);
+        bytes memory q1 = _mapFp2ToG2(map1);
+        point = _g2AddPoints(q0, q1);
+    }
+
+    /// @dev RFC 9380 §5.3.1 expand_message_xmd with SHA-256, len_in_bytes = 256, ell = 8.
+    function _expandMessageXmd(bytes32 message) internal view returns (bytes memory uniform) {
+        // DST_prime = DST || I2OSP(len(DST), 1)
+        bytes memory dstPrime = abi.encodePacked(DST, uint8(DST.length));
+        // msg_prime = Z_pad(s_in_bytes=64) || msg || I2OSP(len_in_bytes,2) || I2OSP(0,1) || DST_prime
+        bytes memory msgPrime = abi.encodePacked(
+            new bytes(64), // Z_pad
+            message,
+            uint16(XMD_LEN), // l_i_b_str = I2OSP(256,2) = 0x0100
+            uint8(0),
+            dstPrime
+        );
+        bytes32 b0 = sha256(msgPrime);
+        bytes32 b1 = sha256(abi.encodePacked(b0, uint8(1), dstPrime));
+
+        uniform = new bytes(XMD_LEN);
+        _writeWord(uniform, 0, b1);
+        bytes32 prev = b1;
+        for (uint256 i = 2; i <= XMD_ELL; i++) {
+            bytes32 bi = sha256(abi.encodePacked(b0 ^ prev, uint8(i), dstPrime));
+            _writeWord(uniform, (i - 1) * 32, bi);
+            prev = bi;
+        }
+    }
+
+    /// @dev Reduce the `chunkIndex`-th 64-byte chunk of `uniform` mod p (via MODEXP, exp = 1) and
+    ///      write the 48-byte result into `mapInput` at the EIP-2537 Fp slot (`slot` ∈ {0,1}).
+    function _placeFieldElement(
+        bytes memory mapInput,
+        uint256 slot,
+        bytes memory uniform,
+        uint256 chunkIndex
+    ) internal view {
+        // MODEXP input (EIP-198): Blen(32)|Elen(32)|Mlen(32)|B(64)|E(1)|M(48) = 209 bytes.
+        bytes memory input = new bytes(209);
+        bytes memory modulus = FIELD_MODULUS;
+        // out is the Fp slot inside mapInput: slot 0 → bytes[16:64], slot 1 → bytes[80:128].
+        uint256 dstOff = slot == 0 ? 16 : 80;
+        assembly {
+            let p := add(input, 0x20)
+            mstore(p, 64) // Blen
+            mstore(add(p, 32), 1) // Elen
+            mstore(add(p, 64), 48) // Mlen
+            // B: 64 bytes from uniform[chunkIndex*64 :]
+            mcopy(add(p, 96), add(add(uniform, 0x20), mul(chunkIndex, 64)), 64)
+            mstore8(add(p, 160), 1) // E = 0x01
+            mcopy(add(p, 161), add(modulus, 0x20), 48) // M = p
+            // MODEXP (0x05) → 48-byte reduced value written straight into the map slot.
+            let ok := staticcall(gas(), 0x05, p, 209, add(add(mapInput, 0x20), dstOff), 48)
+            if iszero(ok) { revert(0, 0) }
+        }
+    }
+
+    /// @dev EIP-2537 BLS12_MAP_FP2_TO_G2 (0x11): Fp2 (128 bytes) → G2 point (256 bytes).
+    function _mapFp2ToG2(bytes memory fp2) internal view returns (bytes memory out) {
+        out = new bytes(G2_POINT_LENGTH);
+        assembly {
+            // MAP_FP2_TO_G2 (0x11)
+            let ok := staticcall(gas(), 0x11, add(fp2, 0x20), FP2_INPUT_LENGTH, add(out, 0x20), 256)
+            if iszero(ok) { revert(0, 0) }
+        }
+    }
+
+    /// @dev EIP-2537 BLS12_G2ADD (0x0d): add two G2 points (memory operands).
+    function _g2AddPoints(bytes memory a, bytes memory b) internal view returns (bytes memory out) {
+        out = new bytes(G2_POINT_LENGTH);
+        assembly {
+            let input := mload(0x40)
+            mstore(0x40, add(input, 512))
+            mcopy(input, add(a, 0x20), 256)
+            mcopy(add(input, 256), add(b, 0x20), 256)
+            // G2ADD (0x0d)
+            let ok := staticcall(gas(), 0x0d, input, 512, add(out, 0x20), 256)
+            if iszero(ok) { revert(0, 0) }
+        }
+    }
+
+    /// @dev Write a 32-byte word into `buf` at byte offset `off`.
+    function _writeWord(bytes memory buf, uint256 off, bytes32 val) internal pure {
+        assembly {
+            mstore(add(add(buf, 0x20), off), val)
+        }
+    }
+
+    /// @dev Returns true if a G2 point (256-byte EIP-2537 format) in calldata is the point at infinity.
+    function _isG2InfinityCalldata(bytes calldata point) internal pure returns (bool) {
+        if (point.length != G2_POINT_LENGTH) return false;
+        for (uint256 i = 0; i < G2_POINT_LENGTH; i++) {
+            if (point[i] != 0) return false;
+        }
+        return true;
+    }
+
+    /// @dev Returns true if a G2 point (256-byte EIP-2537 format) in memory is the point at infinity.
+    function _isG2InfinityMemory(bytes memory point) internal pure returns (bool) {
+        if (point.length != G2_POINT_LENGTH) return false;
+        for (uint256 i = 0; i < G2_POINT_LENGTH; i++) {
+            if (point[i] != 0) return false;
+        }
+        return true;
+    }
+
+    // =============================================================
+    //      MEMORY-BASED BLS VERIFICATION (used only by validate())
+    // =============================================================
+    // These mirror the calldata-based chain
+    // (_validateBLSSignature/_getPublicKeysByNodes/_validateWithNegatedKey/
+    //  _buildPairingDataFromComponents) but take `bytes memory` operands, because validate()
+    // produces messagePoint and the BLS sig in memory. The calldata chain is left byte-for-byte
+    // unchanged (it backs validateAggregateSignature / verifyAggregateSignature / Plan-A-v3).
+
+    /// @dev Memory sibling of _getPublicKeysByNodes. Preserves BOTH invariants: node must be
+    ///      registered, and a retired bootstrap node is rejected once requireStake is on.
+    function _getPublicKeysByNodesMem(bytes32[] memory nodeIds) internal view returns (bytes[] memory publicKeys) {
+        publicKeys = new bytes[](nodeIds.length);
+
+        for (uint256 i = 0; i < nodeIds.length; i++) {
+            require(isRegistered[nodeIds[i]], "Node not registered");
+            // Migration boundary (Plan A v3): once staking is mandatory, bootstrap-era nodes are
+            // no longer accepted until they re-register via the staked path.
+            require(!(requireStake && isBootstrap[nodeIds[i]]), "Bootstrap node retired");
+            publicKeys[i] = registeredKeys[nodeIds[i]];
+        }
+    }
+
+    /// @dev Memory sibling of _validateBLSSignature. Reuses the existing memory helpers
+    ///      _aggregatePublicKeysFromMemory and _negateG1Point.
+    function _validateBLSSignatureMem(
+        bytes32[] memory nodeIds,
+        bytes memory signature,
+        bytes memory messagePoint
+    ) internal view returns (bool isValid) {
+        bytes[] memory publicKeys = _getPublicKeysByNodesMem(nodeIds);
+        bytes memory aggregatedKey = _aggregatePublicKeysFromMemory(publicKeys);
+        bytes memory negatedAggregatedKey = _negateG1Point(aggregatedKey);
+        return _validateWithNegatedKeyMem(negatedAggregatedKey, signature, messagePoint, nodeIds.length);
+    }
+
+    /// @dev Memory sibling of _validateWithNegatedKey.
+    function _validateWithNegatedKeyMem(
+        bytes memory negatedAggregatedKey,
+        bytes memory signature,
+        bytes memory messagePoint,
+        uint256 nodeCount
+    ) internal view returns (bool isValid) {
+        bytes memory pairingData = _buildPairingDataMem(negatedAggregatedKey, signature, messagePoint);
+        uint256 requiredGas = _calculateRequiredGas(nodeCount);
+
+        (bool callSuccess, bytes memory result) = PAIRING_PRECOMPILE.staticcall{ gas: requiredGas }(pairingData);
+        if (!callSuccess) {
+            return false;
+        }
+        isValid = result.length == 32 && bytes32(result) == bytes32(uint256(1));
+    }
+
+    /// @dev Memory sibling of _buildPairingDataFromComponents. Identical byte layout:
+    ///      [generator(128) | signature(256) | aggregatedKey(128) | messagePoint(256)] = 768 bytes.
+    function _buildPairingDataMem(
+        bytes memory aggregatedKey,
+        bytes memory signature,
+        bytes memory messagePoint
+    ) internal pure returns (bytes memory pairingData) {
+        pairingData = new bytes(768);
+
+        // First pairing: (generator, signature)
+        for (uint256 i = 0; i < G1_POINT_LENGTH; i++) {
+            pairingData[i] = GENERATOR_POINT[i];
+        }
+        for (uint256 i = 0; i < G2_POINT_LENGTH; i++) {
+            pairingData[G1_POINT_LENGTH + i] = signature[i];
+        }
+
+        // Second pairing: (aggregated key, message point)
+        uint256 secondPairingOffset = PAIRING_LENGTH;
+        for (uint256 i = 0; i < G1_POINT_LENGTH; i++) {
+            pairingData[secondPairingOffset + i] = aggregatedKey[i];
+        }
+        for (uint256 i = 0; i < G2_POINT_LENGTH; i++) {
+            pairingData[secondPairingOffset + G1_POINT_LENGTH + i] = messagePoint[i];
+        }
     }
 
     // =============================================================
