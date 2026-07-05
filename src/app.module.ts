@@ -11,6 +11,7 @@ import { OpsAlertModule } from "./modules/ops-alert/ops-alert.module.js";
 import { KeeperModule } from "./modules/keeper/keeper.module.js";
 import { RelayModule } from "./modules/relay/relay.module.js";
 import { X402FacilitatorModule } from "./modules/x402-facilitator/x402-facilitator.module.js";
+import { AuditModule } from "./modules/audit/audit.module.js";
 import { HealthModule } from "./modules/health/health.module.js";
 
 @Module({
@@ -27,6 +28,7 @@ import { HealthModule } from "./modules/health/health.module.js";
     KeeperModule,
     RelayModule,
     X402FacilitatorModule,
+    AuditModule,
     HealthModule,
   ],
 })

@@ -423,6 +423,197 @@ export class BlockchainService {
     return BigInt(updatedAt);
   }
 
+  // ── DVT Phase 2 audit (目标2, increment 1) ─────────────────────────────────
+  //
+  // Read-only SuperPaymaster-stack views used by AuditService to evaluate the
+  // credit-over-limit rule, plus the one write (createProposal) that files a
+  // slash proposal. All reads use the shared read-only provider (no wallet
+  // required); the write uses the admin wallet (ETH_PRIVATE_KEY).
+
+  /**
+   * Current chain head block number. AuditService reads it ONCE per operator and pins
+   * every subsequent view read to it (blockTag) so all rule inputs come from one block —
+   * no cross-block / phantom mixing of creditLimit, availableCredit and debt.
+   */
+  async getBlockNumber(): Promise<number> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    return this.provider.getBlockNumber();
+  }
+
+  /** Runtime bytecode at `address` ("0x" when there's no contract). Used for a fail-closed
+   *  bootstrap existence check before the audit poll trusts an address. */
+  async getCode(address: string, blockTag?: number): Promise<string> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    return this.provider.getCode(address, blockTag);
+  }
+
+  /** Registry.getCreditLimit(operator) — the operator's on-chain credit ceiling (wei-scaled). */
+  async getCreditLimit(
+    registryAddress: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<bigint> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function getCreditLimit(address account) view returns (uint256)"];
+    const contract = new ethers.Contract(registryAddress, abi, this.provider);
+    return BigInt(await contract.getCreditLimit(operator, { blockTag }));
+  }
+
+  /**
+   * Best-effort operator debt read: `getDebt(address) view returns (uint256)`, tried on the
+   * SuperPaymaster / Registry credit-debt system (SP v5 recordDebt/getDebt). Returns the debt
+   * as a bigint, or `null` when the read reverts / the getter is absent — the caller MUST treat
+   * `null` as "debt unknown" and SKIP (fail-safe: never guess an over-limit from missing data).
+   */
+  async getDebt(contractAddress: string, operator: string, blockTag?: number): Promise<bigint | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function getDebt(address account) view returns (uint256)"];
+    const contract = new ethers.Contract(contractAddress, abi, this.provider);
+    try {
+      const debt = await contract.getDebt(operator, { blockTag });
+      return BigInt(debt);
+    } catch (error: any) {
+      this.logger.warn(`getDebt read failed on ${contractAddress} for ${operator}: ${error.message}`);
+      return null;
+    }
+  }
+
+  /** Registry.globalReputation(operator) — the operator's global reputation score. */
+  async getGlobalReputation(
+    registryAddress: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<bigint> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function globalReputation(address account) view returns (uint256)"];
+    const contract = new ethers.Contract(registryAddress, abi, this.provider);
+    return BigInt(await contract.globalReputation(operator, { blockTag }));
+  }
+
+  /** SuperPaymaster.getAvailableCredit(operator) — remaining credit (creditLimit − debt). */
+  async getAvailableCredit(
+    superPaymasterAddress: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<bigint> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function getAvailableCredit(address account) view returns (uint256)"];
+    const contract = new ethers.Contract(superPaymasterAddress, abi, this.provider);
+    return BigInt(await contract.getAvailableCredit(operator, { blockTag }));
+  }
+
+  /**
+   * GTokenStaking.roleLocks(operator, role) — the operator's staked amount locked
+   * behind a role (role = keccak256("DVT") for ROLE_DVT). The mapping returns a
+   * struct whose exact shape varies across GTokenStaking versions; we only need the
+   * leading `amount` word, so a single-field ABI reads it for either layout. Auxiliary
+   * (informational) evidence — best-effort: reverts/decode errors resolve to 0.
+   */
+  async getRoleLockAmount(
+    gtokenStakingAddress: string,
+    operator: string,
+    role: string,
+    blockTag?: number
+  ): Promise<bigint> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function roleLocks(address account, bytes32 role) view returns (uint256 amount)"];
+    const contract = new ethers.Contract(gtokenStakingAddress, abi, this.provider);
+    try {
+      const amount = await contract.roleLocks(operator, role, { blockTag });
+      return BigInt(amount);
+    } catch (error: any) {
+      this.logger.warn(
+        `roleLocks read failed on ${gtokenStakingAddress} for ${operator}: ${error.message}`
+      );
+      return 0n;
+    }
+  }
+
+  /**
+   * File a slash proposal on the DVTValidator:
+   *   createProposal(address operator, uint8 level, string reason) returns (uint256 id)
+   * Uses the admin wallet (ETH_PRIVATE_KEY). This is the proposal-INTENT only — the
+   * multi-node BLS quorum co-sign + BLSAggregator.verifyAndExecute is deferred to
+   * increment 2 (see AuditService.coordinateQuorumCoSign).
+   *
+   * The contract assigns an auto-incrementing `uint256 id` and emits `ProposalCreated`.
+   * A transaction's Solidity return value is NOT recoverable off-chain, so the REAL id is
+   * parsed from the emitted event in the receipt (best-effort). Returns both the tx hash and
+   * the on-chain proposal id (`proposalId` is `null` when the event can't be found — e.g. an
+   * older contract with a different event shape — so the caller never fabricates an id).
+   */
+  async createSlashProposal(
+    dvtValidatorAddress: string,
+    operator: string,
+    level: number,
+    reason: string
+  ): Promise<{ txHash: string; proposalId: bigint | null }> {
+    if (!this.wallet) {
+      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+    }
+    // Minimal fragment set: the write function plus the event we parse the real id from.
+    const abi = [
+      "function createProposal(address operator, uint8 level, string reason) returns (uint256)",
+      "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
+    ];
+    const iface = new ethers.Interface(abi);
+    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.createProposal(
+      operator,
+      level,
+      reason,
+      fees
+    );
+    this.logger.log(`createProposal(${operator}, ${level}) submitted: ${tx.hash}`);
+    // Await the receipt: a dropped/reverted proposal must NOT be recorded as success.
+    // Throw on failure so the caller archives the evidence but records proposalTx=null.
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(
+        `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+      );
+    }
+    // Parse the REAL on-chain proposal id from the emitted ProposalCreated event. Best-effort:
+    // decode by topic, ignore unrelated logs, and fall back to null (never fabricate an id).
+    let proposalId: bigint | null = null;
+    for (const log of receipt.logs) {
+      try {
+        const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+        if (parsed && parsed.name === "ProposalCreated") {
+          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+          break;
+        }
+      } catch {
+        // Not a ProposalCreated log (or from another contract) — skip.
+      }
+    }
+    if (proposalId === null) {
+      this.logger.warn(
+        `createProposal ${tx.hash} confirmed but no ProposalCreated event found — id unresolved`
+      );
+    }
+    this.logger.log(
+      `createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}` +
+        (proposalId !== null ? ` (proposalId ${proposalId})` : "")
+    );
+    return { txHash: tx.hash, proposalId };
+  }
+
   /** Current network base-fee in gwei (0 on chains without EIP-1559). */
   async getBaseFeeGwei(): Promise<bigint> {
     const block = await this.provider.getBlock("latest");
