@@ -423,6 +423,102 @@ export class BlockchainService {
     return BigInt(updatedAt);
   }
 
+  // ── DVT Phase 2 audit (目标2, increment 1) ─────────────────────────────────
+  //
+  // Read-only SuperPaymaster-stack views used by AuditService to evaluate the
+  // credit-over-limit rule, plus the one write (createProposal) that files a
+  // slash proposal. All reads use the shared read-only provider (no wallet
+  // required); the write uses the admin wallet (ETH_PRIVATE_KEY).
+
+  /** Registry.getCreditLimit(operator) — the operator's on-chain credit ceiling (wei-scaled). */
+  async getCreditLimit(registryAddress: string, operator: string): Promise<bigint> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function getCreditLimit(address account) view returns (uint256)"];
+    const contract = new ethers.Contract(registryAddress, abi, this.provider);
+    return BigInt(await contract.getCreditLimit(operator));
+  }
+
+  /** Registry.globalReputation(operator) — the operator's global reputation score. */
+  async getGlobalReputation(registryAddress: string, operator: string): Promise<bigint> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function globalReputation(address account) view returns (uint256)"];
+    const contract = new ethers.Contract(registryAddress, abi, this.provider);
+    return BigInt(await contract.globalReputation(operator));
+  }
+
+  /** SuperPaymaster.getAvailableCredit(operator) — remaining credit (creditLimit − debt). */
+  async getAvailableCredit(superPaymasterAddress: string, operator: string): Promise<bigint> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function getAvailableCredit(address account) view returns (uint256)"];
+    const contract = new ethers.Contract(superPaymasterAddress, abi, this.provider);
+    return BigInt(await contract.getAvailableCredit(operator));
+  }
+
+  /**
+   * GTokenStaking.roleLocks(operator, role) — the operator's staked amount locked
+   * behind a role (role = keccak256("DVT") for ROLE_DVT). The mapping returns a
+   * struct whose exact shape varies across GTokenStaking versions; we only need the
+   * leading `amount` word, so a single-field ABI reads it for either layout. Auxiliary
+   * (informational) evidence — best-effort: reverts/decode errors resolve to 0.
+   */
+  async getRoleLockAmount(
+    gtokenStakingAddress: string,
+    operator: string,
+    role: string
+  ): Promise<bigint> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function roleLocks(address account, bytes32 role) view returns (uint256 amount)"];
+    const contract = new ethers.Contract(gtokenStakingAddress, abi, this.provider);
+    try {
+      const amount = await contract.roleLocks(operator, role);
+      return BigInt(amount);
+    } catch (error: any) {
+      this.logger.warn(
+        `roleLocks read failed on ${gtokenStakingAddress} for ${operator}: ${error.message}`
+      );
+      return 0n;
+    }
+  }
+
+  /**
+   * File a slash proposal on the DVTValidator:
+   *   createProposal(address operator, uint8 level, string reason)
+   * Uses the admin wallet (ETH_PRIVATE_KEY). This is the proposal-INTENT only — the
+   * multi-node BLS quorum co-sign + BLSAggregator.verifyAndExecute is deferred to
+   * increment 2 (see AuditService.coordinateQuorumCoSign). Returns the tx hash.
+   */
+  async createSlashProposal(
+    dvtValidatorAddress: string,
+    operator: string,
+    level: number,
+    reason: string
+  ): Promise<string> {
+    if (!this.wallet) {
+      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+    }
+    const abi = [
+      "function createProposal(address operator, uint8 level, string reason) returns (bytes32)",
+    ];
+    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.createProposal(
+      operator,
+      level,
+      reason,
+      fees
+    );
+    this.logger.log(`createProposal(${operator}, ${level}) submitted: ${tx.hash}`);
+    return tx.hash;
+  }
+
   /** Current network base-fee in gwei (0 on chains without EIP-1559). */
   async getBaseFeeGwei(): Promise<bigint> {
     const block = await this.provider.getBlock("latest");

@@ -50,3 +50,6 @@ deploy/node*/.env
 # test coverage report
 coverage/
 dist-bundle/
+deploy/.dvt-test-registration.env
+deploy/node*/data/
+audit-proofs/

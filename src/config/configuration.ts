@@ -176,6 +176,30 @@ export default () => {
     x402AuthSecret: process.env.X402_AUTH_SECRET || undefined,
     x402AuthTtlMs: parseInt(process.env.X402_AUTH_TTL_MS || "300000", 10),
 
+    // DVT Phase 2 (目标2) — autonomous audit of SuperPaymaster operators (#—, increment 1).
+    // Opt-in; default off → behavior unchanged. When enabled, a background poll reads each
+    // watchlisted operator's on-chain credit / reputation / stake state from the SuperPaymaster
+    // stack and, on a confirmed credit-over-limit violation, archives a content-addressed slash
+    // proof and files a slash proposal on the DVTValidator. The multi-node BLS quorum co-sign +
+    // verifyAndExecute is DEFERRED to increment 2 (needs gossip aggregation across DVT nodes).
+    //
+    // AUDIT_WATCHLIST: comma-separated operator addresses to monitor.
+    // AUDIT_CREDIT_THRESHOLD_BPS: flag when debt usage ≥ this fraction of the credit limit
+    //   (10000 bps = 100% = availableCredit exhausted / debt exceeds limit).
+    // Registry defaults to the Sepolia SuperPaymaster registry; SuperPaymaster / DVTValidator /
+    // GTokenStaking addresses must be supplied per deployment.
+    auditEnabled: process.env.AUDIT_ENABLED === "true",
+    auditIntervalMs: parseInt(process.env.AUDIT_INTERVAL_MS || "60000", 10),
+    auditWatchlist: parseAllowlist(process.env.AUDIT_WATCHLIST || ""),
+    auditCreditThresholdBps: parseInt(process.env.AUDIT_CREDIT_THRESHOLD_BPS || "10000", 10),
+    auditProofDir: process.env.AUDIT_PROOF_DIR || "./audit-proofs",
+    auditChainId: parseInt(process.env.AUDIT_CHAIN_ID || "11155111", 10),
+    auditRegistryAddress:
+      process.env.AUDIT_REGISTRY_ADDRESS || "0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71",
+    auditSuperPaymasterAddress: process.env.AUDIT_SUPER_PAYMASTER_ADDRESS || undefined,
+    auditDvtValidatorAddress: process.env.AUDIT_DVT_VALIDATOR_ADDRESS || undefined,
+    auditGtokenStakingAddress: process.env.AUDIT_GTOKEN_STAKING_ADDRESS || undefined,
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),
