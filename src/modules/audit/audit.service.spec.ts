@@ -7,6 +7,8 @@ const REGISTRY = "0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71";
 const SUPER_PAYMASTER = "0x" + "34".repeat(20);
 const DVT_VALIDATOR = "0x" + "56".repeat(20);
 const GTOKEN_STAKING = "0x" + "78".repeat(20);
+/** aPNTs xPNTs token — where getDebt actually lives (per the real SP ABI). */
+const APNTS_TOKEN = "0x696A73701b104c6cCBbAadDD2216788ea08EaB89";
 const BLOCK = 12_345;
 
 const BASE_CONFIG: Record<string, unknown> = {
@@ -20,6 +22,7 @@ const BASE_CONFIG: Record<string, unknown> = {
   auditSuperPaymasterAddress: SUPER_PAYMASTER,
   auditDvtValidatorAddress: DVT_VALIDATOR,
   auditGtokenStakingAddress: GTOKEN_STAKING,
+  auditApntsTokenAddress: APNTS_TOKEN,
   auditProofDir: "./audit-proofs-test",
 };
 
@@ -38,8 +41,13 @@ function makeBlockchain(
     getBlockNumber: () => Promise<number>;
     getCode: (addr: string) => Promise<string>;
     getCreditLimit: (addr: string, op: string, bt?: number) => Promise<bigint>;
-    getAvailableCredit: (addr: string, op: string, bt?: number) => Promise<bigint>;
-    getDebt: (addr: string, op: string, bt?: number) => Promise<bigint | null>;
+    getAvailableCredit: (
+      addr: string,
+      op: string,
+      token: string,
+      bt?: number
+    ) => Promise<bigint>;
+    getDebt: (tokenAddr: string, op: string, bt?: number) => Promise<bigint | null>;
     getGlobalReputation: (addr: string, op: string, bt?: number) => Promise<bigint>;
     getRoleLockAmount: (...args: any[]) => Promise<bigint>;
     createSlashProposal: (...args: any[]) => Promise<{ txHash: string; proposalId: bigint | null }>;
@@ -284,7 +292,12 @@ describe("AuditService", () => {
       seen.limit = bt;
       return 1000n;
     };
-    blockchain.getAvailableCredit = async (_a: string, _o: string, bt?: number) => {
+    blockchain.getAvailableCredit = async (
+      _a: string,
+      _o: string,
+      _token: string,
+      bt?: number
+    ) => {
       seen.avail = bt;
       return 0n;
     };
@@ -668,6 +681,69 @@ describe("AuditService", () => {
     await svc.tick(); // prune runs at tick start → the stale entries are evicted
     expect((svc as any).proposedStableKeys.size).toBe(0);
     expect((svc as any).lastProposalAt.size).toBe(0);
+  });
+
+  // ── REAL SP ABI: debt lives on the xPNTs TOKEN, credit takes (user, token) ──────
+  it("reads debt from the aPNTs TOKEN and passes the token to getAvailableCredit", async () => {
+    const debtTargets: string[] = [];
+    const creditArgs: Array<{ sp: string; op: string; token: string }> = [];
+    const blockchain = overLimitBlockchain({
+      getDebt: async (tokenAddr: string, _op: string) => {
+        debtTargets.push(tokenAddr);
+        return 2000n;
+      },
+      getAvailableCredit: async (sp: string, op: string, token: string) => {
+        creditArgs.push({ sp, op, token });
+        return 0n;
+      },
+    });
+    const svc = makeService(blockchain, makeConfig(), makeArchive());
+    await svc.tick();
+    // getDebt is called against the TOKEN, never the SuperPaymaster or Registry.
+    expect(debtTargets).toEqual([APNTS_TOKEN]);
+    // getAvailableCredit gets (superPaymaster, operator, token).
+    expect(creditArgs).toEqual([{ sp: SUPER_PAYMASTER, op: OPERATOR, token: APNTS_TOKEN }]);
+  });
+
+  it("fail-closed: a missing aPNTs token address → DISABLED, never schedules", async () => {
+    const svc = makeService(
+      makeBlockchain(),
+      makeConfig({ auditApntsTokenAddress: undefined }),
+      makeArchive()
+    );
+    await svc.onApplicationBootstrap();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  it("archives the REAL 7-field messageHash matching BLSAggregator.verifyAndExecute", async () => {
+    const now = 1_700_000_000_000;
+    const blockchain = overLimitBlockchain({
+      createSlashProposal: async () => ({ txHash: "0xTX", proposalId: 7n }),
+    });
+    const archive = makeArchive();
+    const svc = makeService(blockchain, makeConfig(), archive, clockAt(now));
+    await svc.tick();
+
+    const proof = archive.records[0];
+    const epoch = Math.floor(now / 1000);
+    const expected = ethers.keccak256(
+      new ethers.AbiCoder().encode(
+        ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256"],
+        [7n, OPERATOR, 1, [], [], epoch, 11155111]
+      )
+    );
+    expect(proof.messageHash).toBe(expected);
+  });
+
+  it("unresolved proposal id → messageHash placeholder '0x' (no on-chain proposal to sign)", async () => {
+    const blockchain = overLimitBlockchain({
+      createSlashProposal: async () => ({ txHash: "0xDEF", proposalId: null }),
+    });
+    const archive = makeArchive();
+    const svc = makeService(blockchain, makeConfig(), archive);
+    await svc.tick();
+    expect(archive.records[0].messageHash).toBe("0x");
   });
 
   it("coordinateQuorumCoSign is deferred to increment 2 (throws)", async () => {

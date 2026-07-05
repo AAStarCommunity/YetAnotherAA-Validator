@@ -466,22 +466,24 @@ export class BlockchainService {
   }
 
   /**
-   * Best-effort operator debt read: `getDebt(address) view returns (uint256)`, tried on the
-   * SuperPaymaster / Registry credit-debt system (SP v5 recordDebt/getDebt). Returns the debt
-   * as a bigint, or `null` when the read reverts / the getter is absent — the caller MUST treat
-   * `null` as "debt unknown" and SKIP (fail-safe: never guess an over-limit from missing data).
+   * Best-effort operator debt read: `getDebt(address user) view returns (uint256)` on the xPNTs
+   * TOKEN contract (`tokenAddress`) — NOT SuperPaymaster/Registry. Per the verified SP ABI, debt
+   * lives on the xPNTs token itself (IxPNTsToken.getDebt), and SuperPaymaster.getAvailableCredit
+   * internally reads `creditLimit - IxPNTsToken(token).getDebt(user)`. Returns the debt as a bigint,
+   * or `null` when the read reverts / the getter is absent — the caller MUST treat `null` as "debt
+   * unknown" and SKIP (fail-safe: never guess an over-limit from missing data).
    */
-  async getDebt(contractAddress: string, operator: string, blockTag?: number): Promise<bigint | null> {
+  async getDebt(tokenAddress: string, operator: string, blockTag?: number): Promise<bigint | null> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
-    const abi = ["function getDebt(address account) view returns (uint256)"];
-    const contract = new ethers.Contract(contractAddress, abi, this.provider);
+    const abi = ["function getDebt(address user) view returns (uint256)"];
+    const contract = new ethers.Contract(tokenAddress, abi, this.provider);
     try {
       const debt = await contract.getDebt(operator, { blockTag });
       return BigInt(debt);
     } catch (error: any) {
-      this.logger.warn(`getDebt read failed on ${contractAddress} for ${operator}: ${error.message}`);
+      this.logger.warn(`getDebt read failed on token ${tokenAddress} for ${operator}: ${error.message}`);
       return null;
     }
   }
@@ -500,18 +502,23 @@ export class BlockchainService {
     return BigInt(await contract.globalReputation(operator, { blockTag }));
   }
 
-  /** SuperPaymaster.getAvailableCredit(operator) — remaining credit (creditLimit − debt). */
+  /**
+   * SuperPaymaster.getAvailableCredit(user, token) — remaining credit for `operator` against a
+   * specific xPNTs `token`. Per the verified SP ABI this takes TWO args (user, token) and returns
+   * `creditLimit - IxPNTsToken(token).getDebt(user)` clamped ≥0.
+   */
   async getAvailableCredit(
     superPaymasterAddress: string,
     operator: string,
+    token: string,
     blockTag?: number
   ): Promise<bigint> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
-    const abi = ["function getAvailableCredit(address account) view returns (uint256)"];
+    const abi = ["function getAvailableCredit(address user, address token) view returns (uint256)"];
     const contract = new ethers.Contract(superPaymasterAddress, abi, this.provider);
-    return BigInt(await contract.getAvailableCredit(operator, { blockTag }));
+    return BigInt(await contract.getAvailableCredit(operator, token, { blockTag }));
   }
 
   /**
