@@ -67,7 +67,9 @@ interface PolicyCall {
 const ALLOW = 0;
 const REQUIRE_DVT = 1;
 
-// Account call surface (contracts/src/AAStarAccountBase.sol).
+// Account call surface — the standard ERC-4337 execute/executeBatch selectors of the
+// production account (airaccount-contract's AAStarAirAccountV7; the local reference
+// accounts were retired, see contracts/README.md).
 const EXECUTE_SELECTOR = ethers.id("execute(address,uint256,bytes)").slice(0, 10);
 const EXECUTE_BATCH_SELECTOR = ethers.id("executeBatch(address[],uint256[],bytes[])").slice(0, 10);
 const NULL_SELECTOR = "0x00000000";

@@ -44,32 +44,23 @@ ERC-4337 compliant smart contract wallets with:
 - **Flexible Validation**: Support for both AAStarValidator and standard ECDSA
 - **Modular Design**: Clean separation between account logic and validation
 
-#### AAStarAccountFactory (v0.6/v0.7/v0.8)
-
-Factory contracts for deterministic account deployment:
-
-- **CREATE2 Deployment**: Deterministic account addresses
-- **Salt-based**: Support for multiple accounts per creator
-- **Version-specific**: Separate factories for each EntryPoint version
+> The account + factory contracts were retired (#163 Phase 1) — see the note below. Account
+> deployment now lives in `airaccount-contract`.
 
 ## Project Structure
+
+> **Note (#163 Phase 1):** the ERC-4337 account + factory contracts (`AAStarAccountBase`,
+> `AAStarAccountV6/7/8`, `AAStarAccountFactoryV6/7/8`) and their `DeployAAStar*` bundle scripts
+> were **retired**. This repo now ships the DVT **validator only**; the production account line is
+> `airaccount-contract`'s `AAStarAirAccountV7` (EntryPoint v0.7, behind its ValidatorRouter).
+> `AAStarValidator` is router-mountable via `IAAStarAlgorithm.validate()` (algId 0x01).
 
 ```
 contracts/
 ├── src/
-│   ├── AAStarValidator.sol              # BLS validator contract
-│   ├── AAStarAccountBase.sol            # Base account implementation
-│   ├── AAStarAccountV6.sol              # EntryPoint v0.6 account
-│   ├── AAStarAccountV7.sol              # EntryPoint v0.7 account
-│   ├── AAStarAccountV8.sol              # EntryPoint v0.8 account
-│   ├── AAStarAccountFactoryV6.sol       # v0.6 factory
-│   ├── AAStarAccountFactoryV7.sol       # v0.7 factory
-│   ├── AAStarAccountFactoryV8.sol       # v0.8 factory
-│   └── interfaces/                      # Contract interfaces
+│   └── AAStarValidator.sol              # DVT BLS validator + IAAStarAlgorithm.validate() (algId 0x01)
 ├── script/
-│   ├── DeployAAStar.s.sol              # v0.6 deployment script
-│   ├── DeployAAStarV7.s.sol            # v0.7 deployment script
-│   └── DeployAAStarV8.s.sol            # v0.8 deployment script
+│   └── DeployStakeBoundValidator.s.sol # deploy + wire to SuperPaymaster Registry (Plan A v3)
 ├── test/                                # Contract tests
 ├── lib/                                 # Dependencies (Foundry)
 ├── foundry.toml                         # Foundry configuration
