@@ -1,4 +1,3 @@
-import { jest } from "@jest/globals";
 import { AuditService } from "./audit.service.js";
 import { IProofArchive, SlashProof, computeProofHash } from "./proof-archive.js";
 
@@ -7,10 +6,12 @@ const REGISTRY = "0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71";
 const SUPER_PAYMASTER = "0x" + "34".repeat(20);
 const DVT_VALIDATOR = "0x" + "56".repeat(20);
 const GTOKEN_STAKING = "0x" + "78".repeat(20);
+const BLOCK = 12_345;
 
 const BASE_CONFIG: Record<string, unknown> = {
   auditEnabled: true,
   auditIntervalMs: 60_000,
+  auditCooldownMs: 3_600_000,
   auditWatchlist: [OPERATOR],
   auditCreditThresholdBps: 10_000,
   auditChainId: 11155111,
@@ -27,22 +28,29 @@ function makeConfig(overrides: Record<string, unknown> = {}) {
 }
 
 /**
- * Blockchain mock. Defaults model a HEALTHY operator (availableCredit == creditLimit →
- * usage 0bps → no violation). Override getAvailableCredit to model exhausted credit.
+ * Blockchain mock. Defaults model a HEALTHY operator: debt (0) ≤ creditLimit (1000) → no
+ * violation. Override getDebt to model a genuine over-limit (debt > creditLimit). getCode
+ * returns real bytecode so the fail-closed bootstrap existence check passes by default.
  */
 function makeBlockchain(
   overrides: Partial<{
-    getCreditLimit: () => Promise<bigint>;
-    getAvailableCredit: () => Promise<bigint>;
-    getGlobalReputation: () => Promise<bigint>;
-    getRoleLockAmount: () => Promise<bigint>;
+    getBlockNumber: () => Promise<number>;
+    getCode: (addr: string) => Promise<string>;
+    getCreditLimit: (addr: string, op: string, bt?: number) => Promise<bigint>;
+    getAvailableCredit: (addr: string, op: string, bt?: number) => Promise<bigint>;
+    getDebt: (addr: string, op: string, bt?: number) => Promise<bigint | null>;
+    getGlobalReputation: (addr: string, op: string, bt?: number) => Promise<bigint>;
+    getRoleLockAmount: (...args: any[]) => Promise<bigint>;
     createSlashProposal: (...args: any[]) => Promise<string>;
     getWalletAddress: () => string | null;
   }> = {}
 ): any {
   return {
+    getBlockNumber: overrides.getBlockNumber ?? (async () => BLOCK),
+    getCode: overrides.getCode ?? (async () => "0x60006000fd"),
     getCreditLimit: overrides.getCreditLimit ?? (async () => 1000n),
     getAvailableCredit: overrides.getAvailableCredit ?? (async () => 1000n),
+    getDebt: overrides.getDebt ?? (async () => 0n),
     getGlobalReputation: overrides.getGlobalReputation ?? (async () => 500n),
     getRoleLockAmount: overrides.getRoleLockAmount ?? (async () => 42n),
     createSlashProposal: overrides.createSlashProposal ?? (async () => "0xPROPOSALTX"),
@@ -61,6 +69,9 @@ function makeArchive(): IProofArchive & { records: SlashProof[] } {
       if (existing >= 0) records[existing] = proof;
       else records.push(proof);
       return { proofHash: proof.proofHash, location: `mem://${proof.proofHash}` };
+    },
+    async has(proofHash: string) {
+      return records.some(r => r.proofHash === proofHash);
     },
     async count() {
       return records.length;
@@ -86,6 +97,16 @@ function makeService(
   return new AuditService(blockchain, config, makeRegistry(), clock, () => 0, archive);
 }
 
+/** A blockchain whose operator is genuinely OVER limit: debt (2000) > creditLimit (1000). */
+function overLimitBlockchain(overrides: Record<string, any> = {}) {
+  return makeBlockchain({
+    getCreditLimit: async () => 1000n,
+    getAvailableCredit: async () => 0n,
+    getDebt: async () => 2000n,
+    ...overrides,
+  });
+}
+
 describe("AuditService", () => {
   it("registers the audit capability (enabled) with the CapabilityRegistry", () => {
     const registry = makeRegistry();
@@ -93,16 +114,16 @@ describe("AuditService", () => {
     expect(registry.registered).toContain("audit");
   });
 
-  it("disabled → onApplicationBootstrap never schedules a tick", () => {
+  it("disabled → onApplicationBootstrap never schedules a tick", async () => {
     const svc = makeService(makeBlockchain(), makeConfig({ auditEnabled: false }), makeArchive());
-    svc.onApplicationBootstrap();
+    await svc.onApplicationBootstrap();
     expect((svc as any).startupTimer).toBeNull();
     expect((svc as any).timer).toBeNull();
   });
 
-  it("enabled → onApplicationBootstrap schedules a phase-jittered first tick", () => {
+  it("enabled → onApplicationBootstrap schedules a phase-jittered first tick", async () => {
     const svc = makeService(makeBlockchain(), makeConfig(), makeArchive());
-    svc.onApplicationBootstrap();
+    await svc.onApplicationBootstrap();
     // First tick is phase-jittered via setTimeout — startupTimer holds it, interval not armed.
     expect((svc as any).startupTimer).not.toBeNull();
     expect((svc as any).timer).toBeNull();
@@ -110,16 +131,43 @@ describe("AuditService", () => {
     expect((svc as any).startupTimer).toBeNull();
   });
 
-  it("enabled but empty watchlist → does not schedule", () => {
+  it("enabled but empty watchlist → does not schedule", async () => {
     const svc = makeService(makeBlockchain(), makeConfig({ auditWatchlist: [] }), makeArchive());
-    svc.onApplicationBootstrap();
+    await svc.onApplicationBootstrap();
     expect((svc as any).startupTimer).toBeNull();
   });
 
-  it("healthy operator (availableCredit == limit) → no detection, no proposal", async () => {
+  // ── MEDIUM 1: config fail-closed ──────────────────────────────────────────────
+  it("fail-closed: a missing required contract address → DISABLED, never schedules", async () => {
+    const svc = makeService(
+      makeBlockchain(),
+      makeConfig({ auditDvtValidatorAddress: undefined }),
+      makeArchive()
+    );
+    await svc.onApplicationBootstrap();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  it("fail-closed: an address with no on-chain code (getCode=0x) → DISABLED", async () => {
+    const blockchain = makeBlockchain({ getCode: async () => "0x" });
+    const svc = makeService(blockchain, makeConfig(), makeArchive());
+    await svc.onApplicationBootstrap();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  it("fail-closed: an invalid chainId → DISABLED", async () => {
+    const svc = makeService(makeBlockchain(), makeConfig({ auditChainId: 0 }), makeArchive());
+    await svc.onApplicationBootstrap();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  // ── CRITICAL 1: at-limit ≠ over-limit ─────────────────────────────────────────
+  it("healthy operator (debt 0 ≤ limit) → no detection, no proposal", async () => {
     const created: any[] = [];
     const blockchain = makeBlockchain({
-      getAvailableCredit: async () => 1000n, // == limit → usage 0bps
       createSlashProposal: async (...args: any[]) => {
         created.push(args);
         return "0xTX";
@@ -132,11 +180,45 @@ describe("AuditService", () => {
     expect(archive.records).toHaveLength(0);
   });
 
-  it("credit-over-limit → files a proposal AND archives a content-addressed proof with evidence", async () => {
+  it("AT exactly the limit (debt == creditLimit) → NOT flagged (at limit, not over)", async () => {
     const created: any[] = [];
     const blockchain = makeBlockchain({
       getCreditLimit: async () => 1000n,
-      getAvailableCredit: async () => 0n, // debt == limit → usage 10000bps ≥ threshold
+      getAvailableCredit: async () => 0n, // fully used, but that is AT the limit
+      getDebt: async () => 1000n, // debt == limit → NOT over
+      createSlashProposal: async (...args: any[]) => {
+        created.push(args);
+        return "0xTX";
+      },
+    });
+    const archive = makeArchive();
+    const svc = makeService(blockchain, makeConfig(), archive);
+    await svc.tick();
+    expect(created).toHaveLength(0);
+    expect(archive.records).toHaveLength(0);
+  });
+
+  it("fail-safe: debt unreadable (getDebt → null) → SKIP even when availableCredit is 0", async () => {
+    const created: any[] = [];
+    const blockchain = makeBlockchain({
+      getCreditLimit: async () => 1000n,
+      getAvailableCredit: async () => 0n,
+      getDebt: async () => null, // BOTH SP and Registry reads revert
+      createSlashProposal: async (...args: any[]) => {
+        created.push(args);
+        return "0xTX";
+      },
+    });
+    const archive = makeArchive();
+    const svc = makeService(blockchain, makeConfig(), archive);
+    await svc.tick();
+    expect(created).toHaveLength(0);
+    expect(archive.records).toHaveLength(0);
+  });
+
+  it("STRICT over-limit (debt > limit) → files a proposal AND archives a content-addressed proof", async () => {
+    const created: any[] = [];
+    const blockchain = overLimitBlockchain({
       createSlashProposal: async (...args: any[]) => {
         created.push(args);
         return "0xPROPOSALTX";
@@ -160,26 +242,26 @@ describe("AuditService", () => {
     expect(proof.version).toBe("dvt-slash-proof/1");
     expect(proof.operator).toBe(OPERATOR);
     expect(proof.slashLevel).toBe(1);
-    expect(proof.executedTx).toBe("0xPROPOSALTX");
+    expect(proof.proposalTx).toBe("0xPROPOSALTX");
 
-    // Evidence captured, with the raw view sources.
+    // Evidence captured, with the raw view sources + the pinned block.
     expect(proof.evidence.rule).toBe("credit-over-limit");
-    expect(proof.evidence.observed).toBe("1000"); // debt
+    expect(proof.evidence.observed).toBe("2000"); // debt
     expect(proof.evidence.threshold).toBe("1000"); // creditLimit
+    expect(proof.evidence.violationBlock).toBe(BLOCK);
     const sourceNames = proof.evidence.sources.map(s => s.name);
     expect(sourceNames).toContain("Registry.getCreditLimit");
+    expect(sourceNames).toContain("SuperPaymaster.getDebt");
     expect(sourceNames).toContain("SuperPaymaster.getAvailableCredit");
 
-    // proofHash is a real content address: recomputing from the immutable core matches.
+    // proofHash is a real content address over ON-CHAIN identity: recomputing matches.
     const recomputed = computeProofHash({
-      version: proof.version,
       chainId: proof.chainId,
       operator: proof.operator,
-      slashLevel: proof.slashLevel,
-      reason: proof.reason,
-      epoch: proof.epoch,
-      messageHash: proof.messageHash,
-      evidence: proof.evidence,
+      rule: proof.evidence.rule,
+      creditLimit: proof.evidence.threshold,
+      debt: proof.evidence.observed,
+      violationBlock: proof.evidence.violationBlock,
     });
     expect(recomputed).toBe(proof.proofHash);
     expect(proof.proofHash).toMatch(/^0x[0-9a-f]{64}$/);
@@ -191,23 +273,142 @@ describe("AuditService", () => {
     expect(status.archivedProofCount).toBe(1);
   });
 
+  // ── CRITICAL 2: block-pinned reads ────────────────────────────────────────────
+  it("pins EVERY rule input to one block (blockTag threaded from a single getBlockNumber)", async () => {
+    const seen: Record<string, number | undefined> = {};
+    const blockchain = overLimitBlockchain();
+    blockchain.getBlockNumber = async () => 999;
+    blockchain.getCreditLimit = async (_a: string, _o: string, bt?: number) => {
+      seen.limit = bt;
+      return 1000n;
+    };
+    blockchain.getAvailableCredit = async (_a: string, _o: string, bt?: number) => {
+      seen.avail = bt;
+      return 0n;
+    };
+    blockchain.getDebt = async (_a: string, _o: string, bt?: number) => {
+      seen.debt = bt;
+      return 2000n;
+    };
+    const archive = makeArchive();
+    const svc = makeService(blockchain, makeConfig(), archive);
+    await svc.tick();
+    expect(seen.limit).toBe(999);
+    expect(seen.avail).toBe(999);
+    expect(seen.debt).toBe(999);
+    expect(archive.records[0].evidence.violationBlock).toBe(999);
+  });
+
+  // ── HIGH 3: proofHash is wall-clock-free (stable across nodes/ticks) ───────────
+  it("same on-chain violation → same proofHash regardless of observedAt (two nodes agree)", async () => {
+    const nodeA = makeService(overLimitBlockchain(), makeConfig(), makeArchive(), clockAt(1_000));
+    await nodeA.tick();
+    const hashA = (await nodeA.getStatus()).recentDetections[0].proofHash;
+
+    // A different node observing the same violation at a very different wall-clock time.
+    const nodeB = makeService(
+      overLimitBlockchain(),
+      makeConfig(),
+      makeArchive(),
+      clockAt(9_999_999_999)
+    );
+    await nodeB.tick();
+    const hashB = (await nodeB.getStatus()).recentDetections[0].proofHash;
+
+    expect(hashA).toBe(hashB);
+  });
+
   it("content-address is deterministic + idempotent: same violation twice → one archived proof", async () => {
-    const blockchain = makeBlockchain({
-      getCreditLimit: async () => 1000n,
-      getAvailableCredit: async () => 0n,
+    const created: any[] = [];
+    const blockchain = overLimitBlockchain({
+      createSlashProposal: async (...args: any[]) => {
+        created.push(args);
+        return "0xTX";
+      },
     });
     const archive = makeArchive();
-    // Fixed clock so epoch (derived from observedAt) is identical across both ticks → same proofHash.
     const svc = makeService(blockchain, makeConfig(), archive, clockAt(1_700_000_000_000));
     await svc.tick();
     await svc.tick();
     expect(archive.records).toHaveLength(1);
   });
 
-  it("proposal write failure → proof still archived (evidence never lost)", async () => {
-    const blockchain = makeBlockchain({
-      getCreditLimit: async () => 1000n,
-      getAvailableCredit: async () => 0n,
+  // ── HIGH 1: dedup prevents re-proposing the same violation ─────────────────────
+  it("dedup: same violation@block over many ticks → exactly ONE proposal", async () => {
+    const created: any[] = [];
+    const blockchain = overLimitBlockchain({
+      createSlashProposal: async (...args: any[]) => {
+        created.push(args);
+        return "0xTX";
+      },
+    });
+    const archive = makeArchive();
+    const svc = makeService(blockchain, makeConfig(), archive, clockAt(1_700_000_000_000));
+    await svc.tick();
+    await svc.tick();
+    await svc.tick();
+    expect(created).toHaveLength(1);
+  });
+
+  it("dedup: an already-archived proof (prior process) → no new proposal", async () => {
+    const created: any[] = [];
+    const blockchain = overLimitBlockchain({
+      createSlashProposal: async (...args: any[]) => {
+        created.push(args);
+        return "0xTX";
+      },
+    });
+    // Pre-seed the archive with the exact proof for this violation@block.
+    const archive = makeArchive();
+    const identityHash = computeProofHash({
+      chainId: 11155111,
+      operator: OPERATOR,
+      rule: "credit-over-limit",
+      creditLimit: "1000",
+      debt: "2000",
+      violationBlock: BLOCK,
+    });
+    (archive.records as SlashProof[]).push({ proofHash: identityHash } as SlashProof);
+    const svc = makeService(blockchain, makeConfig(), archive);
+    await svc.tick();
+    expect(created).toHaveLength(0);
+  });
+
+  it("cooldown: an ongoing violation whose block advances is not re-proposed until cooldown elapses", async () => {
+    const created: any[] = [];
+    let block = 1000;
+    let now = 1_700_000_000_000;
+    const blockchain = overLimitBlockchain({
+      createSlashProposal: async (...args: any[]) => {
+        created.push(args);
+        return "0xTX";
+      },
+    });
+    blockchain.getBlockNumber = async () => block;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditCooldownMs: 3_600_000 }),
+      makeArchive(),
+      () => now
+    );
+
+    // Tick 1 at block 1000 → proposes, arms cooldown.
+    await svc.tick();
+    // Tick 2 shortly after at a NEW block 1001 (ongoing violation) → within cooldown → skip.
+    block = 1001;
+    now += 60_000;
+    await svc.tick();
+    expect(created).toHaveLength(1);
+
+    // Tick 3 after the cooldown elapses at yet another new block → re-proposes once.
+    block = 1002;
+    now += 3_600_001;
+    await svc.tick();
+    expect(created).toHaveLength(2);
+  });
+
+  it("proposal write failure → proof still archived (evidence never lost), proposalTx null", async () => {
+    const blockchain = overLimitBlockchain({
       createSlashProposal: async () => {
         throw new Error("reverted: not authorized");
       },
@@ -216,7 +417,7 @@ describe("AuditService", () => {
     const svc = makeService(blockchain, makeConfig(), archive);
     await expect(svc.tick()).resolves.toBeUndefined(); // never throws
     expect(archive.records).toHaveLength(1);
-    expect(archive.records[0].executedTx).toBeUndefined();
+    expect(archive.records[0].proposalTx).toBeUndefined();
     const status = await svc.getStatus();
     expect(status.recentDetections[0].proposalTx).toBeNull();
   });
@@ -224,9 +425,7 @@ describe("AuditService", () => {
   it("tick sweeps every operator; one failing operator does not abort the rest", async () => {
     const op2 = "0x" + "ab".repeat(20);
     const created: string[] = [];
-    const blockchain = makeBlockchain({
-      getCreditLimit: async () => 1000n,
-      getAvailableCredit: async () => 0n,
+    const blockchain = overLimitBlockchain({
       createSlashProposal: async (_addr: string, operator: string) => {
         created.push(operator);
         return "0xTX";
@@ -248,6 +447,32 @@ describe("AuditService", () => {
     );
     await svc.tick();
     expect(created).toEqual([op2]);
+  });
+
+  // ── HIGH 2: single-flight ─────────────────────────────────────────────────────
+  it("single-flight: an overlapping tick is skipped while one is in-flight", async () => {
+    let blockCalls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(res => {
+      release = res;
+    });
+    const blockchain = overLimitBlockchain();
+    blockchain.getBlockNumber = async () => {
+      blockCalls++;
+      await gate; // suspend the first tick mid-flight
+      return BLOCK;
+    };
+    const svc = makeService(blockchain, makeConfig(), makeArchive());
+
+    const p1 = svc.tick(); // enters, sets tickInFlight, suspends on the gate
+    const p2 = svc.tick(); // overlapping → must skip immediately
+    await p2;
+    expect(blockCalls).toBe(1); // second tick never started auditing
+
+    release();
+    await p1;
+    expect(blockCalls).toBe(1);
+    expect((svc as any).tickInFlight).toBe(false);
   });
 
   it("coordinateQuorumCoSign is deferred to increment 2 (throws)", async () => {

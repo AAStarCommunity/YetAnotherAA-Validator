@@ -430,34 +430,88 @@ export class BlockchainService {
   // slash proposal. All reads use the shared read-only provider (no wallet
   // required); the write uses the admin wallet (ETH_PRIVATE_KEY).
 
+  /**
+   * Current chain head block number. AuditService reads it ONCE per operator and pins
+   * every subsequent view read to it (blockTag) so all rule inputs come from one block —
+   * no cross-block / phantom mixing of creditLimit, availableCredit and debt.
+   */
+  async getBlockNumber(): Promise<number> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    return this.provider.getBlockNumber();
+  }
+
+  /** Runtime bytecode at `address` ("0x" when there's no contract). Used for a fail-closed
+   *  bootstrap existence check before the audit poll trusts an address. */
+  async getCode(address: string, blockTag?: number): Promise<string> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    return this.provider.getCode(address, blockTag);
+  }
+
   /** Registry.getCreditLimit(operator) — the operator's on-chain credit ceiling (wei-scaled). */
-  async getCreditLimit(registryAddress: string, operator: string): Promise<bigint> {
+  async getCreditLimit(
+    registryAddress: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<bigint> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
     const abi = ["function getCreditLimit(address account) view returns (uint256)"];
     const contract = new ethers.Contract(registryAddress, abi, this.provider);
-    return BigInt(await contract.getCreditLimit(operator));
+    return BigInt(await contract.getCreditLimit(operator, { blockTag }));
+  }
+
+  /**
+   * Best-effort operator debt read: `getDebt(address) view returns (uint256)`, tried on the
+   * SuperPaymaster / Registry credit-debt system (SP v5 recordDebt/getDebt). Returns the debt
+   * as a bigint, or `null` when the read reverts / the getter is absent — the caller MUST treat
+   * `null` as "debt unknown" and SKIP (fail-safe: never guess an over-limit from missing data).
+   */
+  async getDebt(contractAddress: string, operator: string, blockTag?: number): Promise<bigint | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function getDebt(address account) view returns (uint256)"];
+    const contract = new ethers.Contract(contractAddress, abi, this.provider);
+    try {
+      const debt = await contract.getDebt(operator, { blockTag });
+      return BigInt(debt);
+    } catch (error: any) {
+      this.logger.warn(`getDebt read failed on ${contractAddress} for ${operator}: ${error.message}`);
+      return null;
+    }
   }
 
   /** Registry.globalReputation(operator) — the operator's global reputation score. */
-  async getGlobalReputation(registryAddress: string, operator: string): Promise<bigint> {
+  async getGlobalReputation(
+    registryAddress: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<bigint> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
     const abi = ["function globalReputation(address account) view returns (uint256)"];
     const contract = new ethers.Contract(registryAddress, abi, this.provider);
-    return BigInt(await contract.globalReputation(operator));
+    return BigInt(await contract.globalReputation(operator, { blockTag }));
   }
 
   /** SuperPaymaster.getAvailableCredit(operator) — remaining credit (creditLimit − debt). */
-  async getAvailableCredit(superPaymasterAddress: string, operator: string): Promise<bigint> {
+  async getAvailableCredit(
+    superPaymasterAddress: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<bigint> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
     const abi = ["function getAvailableCredit(address account) view returns (uint256)"];
     const contract = new ethers.Contract(superPaymasterAddress, abi, this.provider);
-    return BigInt(await contract.getAvailableCredit(operator));
+    return BigInt(await contract.getAvailableCredit(operator, { blockTag }));
   }
 
   /**
@@ -470,7 +524,8 @@ export class BlockchainService {
   async getRoleLockAmount(
     gtokenStakingAddress: string,
     operator: string,
-    role: string
+    role: string,
+    blockTag?: number
   ): Promise<bigint> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
@@ -478,7 +533,7 @@ export class BlockchainService {
     const abi = ["function roleLocks(address account, bytes32 role) view returns (uint256 amount)"];
     const contract = new ethers.Contract(gtokenStakingAddress, abi, this.provider);
     try {
-      const amount = await contract.roleLocks(operator, role);
+      const amount = await contract.roleLocks(operator, role, { blockTag });
       return BigInt(amount);
     } catch (error: any) {
       this.logger.warn(
@@ -516,6 +571,15 @@ export class BlockchainService {
       fees
     );
     this.logger.log(`createProposal(${operator}, ${level}) submitted: ${tx.hash}`);
+    // Await the receipt: a dropped/reverted proposal must NOT be recorded as success.
+    // Throw on failure so the caller archives the evidence but records proposalTx=null.
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(
+        `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+      );
+    }
+    this.logger.log(`createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}`);
     return tx.hash;
   }
 

@@ -37,7 +37,15 @@ export interface Evidence {
   threshold: string;
   /** Each raw source reading that supports the detection. */
   sources: EvidenceSource[];
-  /** Unix ms when the observation was made. */
+  /**
+   * Block number ALL rule inputs were pinned to (from one provider.getBlockNumber()).
+   * Part of the content-address identity — two nodes reading the same block agree.
+   */
+  violationBlock: number;
+  /**
+   * Unix ms when the observation was made. Kept for humans ONLY — deliberately
+   * EXCLUDED from the content-address identity so wall-clock never perturbs proofHash.
+   */
   observedAt: number;
 }
 
@@ -68,15 +76,32 @@ export interface SlashProof {
   /** Per-node attestations — empty until increment 2. */
   attestations: Record<string, string>;
   createdAt: number;
-  /** Tx hash of the createProposal call, when the proposal-intent was filed. */
-  executedTx?: string;
+  /**
+   * Tx hash of the createProposal SUBMISSION (proposal-intent), when filed. This is the
+   * proposal tx, NOT the slash execution — execution (BLSAggregator.verifyAndExecute) is
+   * the deferred increment-2 step. Undefined when no proposal was filed.
+   */
+  proposalTx?: string;
 }
 
-/** The immutable subset that defines a detection — the content-address preimage. */
-export type ProofCore = Pick<
-  SlashProof,
-  "version" | "chainId" | "operator" | "slashLevel" | "reason" | "epoch" | "messageHash" | "evidence"
->;
+/**
+ * The ON-CHAIN identity that content-addresses a detection. Deliberately excludes all
+ * wall-clock (observedAt / epoch / createdAt) so two DVT nodes observing the SAME on-chain
+ * violation — same operator, same debt/limit, pinned to the same block — derive the SAME
+ * proofHash. This is what makes the archive content-addressed and cross-node de-duplicating.
+ */
+export interface ProofIdentity {
+  chainId: number;
+  operator: string;
+  /** Rule id, e.g. "credit-over-limit". */
+  rule: string;
+  /** On-chain credit limit at violationBlock (stringified). */
+  creditLimit: string;
+  /** On-chain debt at violationBlock (stringified). */
+  debt: string;
+  /** Block all rule inputs were pinned to. */
+  violationBlock: number;
+}
 
 /** Deterministic JSON with recursively sorted keys — a stable content-address preimage. */
 function stableStringify(value: unknown): string {
@@ -93,19 +118,22 @@ function stableStringify(value: unknown): string {
 
 /**
  * Content-address a detection: keccak256 over the canonical (sorted-key) serialization
- * of its immutable core. Deterministic — the same evidence always yields the same hash,
- * which is what makes the archive tamper-evident and de-duplicating.
+ * of its ON-CHAIN identity. Deterministic and wall-clock-free — the same on-chain
+ * violation always yields the same hash, which is what makes the archive tamper-evident,
+ * de-duplicating, and stable across nodes/ticks.
  */
-export function computeProofHash(core: ProofCore): string {
-  return ethers.keccak256(ethers.toUtf8Bytes(stableStringify(core)));
+export function computeProofHash(identity: ProofIdentity): string {
+  return ethers.keccak256(ethers.toUtf8Bytes(stableStringify(identity)));
 }
 
 /**
  * Proof archive backend. `put` is idempotent on `proofHash` (same evidence overwrites
- * the same file), so redundant detections across ticks don't multiply records.
+ * the same file), so redundant detections across ticks don't multiply records. `has`
+ * lets a proposer skip re-proposing a violation whose proof is already archived.
  */
 export interface IProofArchive {
   put(proof: SlashProof): Promise<{ proofHash: string; location: string }>;
+  has(proofHash: string): Promise<boolean>;
   count(): Promise<number>;
 }
 
@@ -118,6 +146,15 @@ export class LocalProofArchive implements IProofArchive {
     const location = path.join(this.dir, `${proof.proofHash}.json`);
     await fs.writeFile(location, JSON.stringify(proof, null, 2), "utf8");
     return { proofHash: proof.proofHash, location };
+  }
+
+  async has(proofHash: string): Promise<boolean> {
+    try {
+      await fs.access(path.join(this.dir, `${proofHash}.json`));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async count(): Promise<number> {
@@ -137,6 +174,10 @@ export class LocalProofArchive implements IProofArchive {
  */
 export class IpfsProofArchive implements IProofArchive {
   async put(): Promise<{ proofHash: string; location: string }> {
+    throw new Error("IpfsProofArchive not implemented — increment 3");
+  }
+
+  async has(): Promise<boolean> {
     throw new Error("IpfsProofArchive not implemented — increment 3");
   }
 

@@ -184,18 +184,22 @@ export default () => {
     // verifyAndExecute is DEFERRED to increment 2 (needs gossip aggregation across DVT nodes).
     //
     // AUDIT_WATCHLIST: comma-separated operator addresses to monitor.
-    // AUDIT_CREDIT_THRESHOLD_BPS: flag when debt usage ≥ this fraction of the credit limit
-    //   (10000 bps = 100% = availableCredit exhausted / debt exceeds limit).
-    // Registry defaults to the Sepolia SuperPaymaster registry; SuperPaymaster / DVTValidator /
-    // GTokenStaking addresses must be supplied per deployment.
+    // AUDIT_CREDIT_THRESHOLD_BPS: additional margin ON TOP of strict over-limit — flag only
+    //   when debt STRICTLY exceeds the limit AND debt*10000/limit ≥ this (10000 bps = 100%).
+    // FAIL-CLOSED: when AUDIT_ENABLED=true, ALL of AUDIT_REGISTRY_ADDRESS /
+    //   AUDIT_SUPER_PAYMASTER_ADDRESS / AUDIT_DVT_VALIDATOR_ADDRESS must be set explicitly
+    //   (no silent default), and each must have on-chain code (getCode != "0x") at bootstrap
+    //   or the audit self-disables. GTokenStaking is optional (auxiliary evidence only).
+    // AUDIT_COOLDOWN_MS: min gap between proposals for the same operator+rule so an ongoing
+    //   violation is not re-proposed every tick (default 1h).
     auditEnabled: process.env.AUDIT_ENABLED === "true",
     auditIntervalMs: parseInt(process.env.AUDIT_INTERVAL_MS || "60000", 10),
+    auditCooldownMs: parseInt(process.env.AUDIT_COOLDOWN_MS || "3600000", 10),
     auditWatchlist: parseAllowlist(process.env.AUDIT_WATCHLIST || ""),
     auditCreditThresholdBps: parseInt(process.env.AUDIT_CREDIT_THRESHOLD_BPS || "10000", 10),
     auditProofDir: process.env.AUDIT_PROOF_DIR || "./audit-proofs",
     auditChainId: parseInt(process.env.AUDIT_CHAIN_ID || "11155111", 10),
-    auditRegistryAddress:
-      process.env.AUDIT_REGISTRY_ADDRESS || "0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71",
+    auditRegistryAddress: process.env.AUDIT_REGISTRY_ADDRESS || undefined,
     auditSuperPaymasterAddress: process.env.AUDIT_SUPER_PAYMASTER_ADDRESS || undefined,
     auditDvtValidatorAddress: process.env.AUDIT_DVT_VALIDATOR_ADDRESS || undefined,
     auditGtokenStakingAddress: process.env.AUDIT_GTOKEN_STAKING_ADDRESS || undefined,
