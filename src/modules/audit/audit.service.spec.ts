@@ -261,7 +261,8 @@ describe("AuditService", () => {
     expect(proof.evidence.violationBlock).toBe(BLOCK);
     const sourceNames = proof.evidence.sources.map(s => s.name);
     expect(sourceNames).toContain("Registry.getCreditLimit");
-    expect(sourceNames).toContain("SuperPaymaster.getDebt");
+    // Debt evidence must name the REAL source — the aPNTs xPNTs token, not SuperPaymaster.
+    expect(sourceNames).toContain(`IxPNTsToken(${APNTS_TOKEN}).getDebt`);
     expect(sourceNames).toContain("SuperPaymaster.getAvailableCredit");
 
     // proofHash is a real content address over ON-CHAIN identity: recomputing matches.

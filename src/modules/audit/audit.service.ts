@@ -386,7 +386,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       `(usage ${usageBps}bps ≥ ${this.creditThresholdBps}bps, availableCredit ${availableCredit}, block ${violationBlock})`;
     const sources: EvidenceSource[] = [
       { type: "view", name: "Registry.getCreditLimit", value: creditLimit.toString(), block: violationBlock },
-      { type: "view", name: "SuperPaymaster.getDebt", value: debt.toString(), block: violationBlock },
+      {
+        type: "view",
+        name: `IxPNTsToken(${this.apntsTokenAddress}).getDebt`,
+        value: debt.toString(),
+        block: violationBlock,
+      },
       {
         type: "view",
         name: "SuperPaymaster.getAvailableCredit",
