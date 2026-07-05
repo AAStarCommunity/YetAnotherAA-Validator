@@ -545,23 +545,32 @@ export class BlockchainService {
 
   /**
    * File a slash proposal on the DVTValidator:
-   *   createProposal(address operator, uint8 level, string reason)
+   *   createProposal(address operator, uint8 level, string reason) returns (uint256 id)
    * Uses the admin wallet (ETH_PRIVATE_KEY). This is the proposal-INTENT only — the
    * multi-node BLS quorum co-sign + BLSAggregator.verifyAndExecute is deferred to
-   * increment 2 (see AuditService.coordinateQuorumCoSign). Returns the tx hash.
+   * increment 2 (see AuditService.coordinateQuorumCoSign).
+   *
+   * The contract assigns an auto-incrementing `uint256 id` and emits `ProposalCreated`.
+   * A transaction's Solidity return value is NOT recoverable off-chain, so the REAL id is
+   * parsed from the emitted event in the receipt (best-effort). Returns both the tx hash and
+   * the on-chain proposal id (`proposalId` is `null` when the event can't be found — e.g. an
+   * older contract with a different event shape — so the caller never fabricates an id).
    */
   async createSlashProposal(
     dvtValidatorAddress: string,
     operator: string,
     level: number,
     reason: string
-  ): Promise<string> {
+  ): Promise<{ txHash: string; proposalId: bigint | null }> {
     if (!this.wallet) {
       throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
     }
+    // Minimal fragment set: the write function plus the event we parse the real id from.
     const abi = [
-      "function createProposal(address operator, uint8 level, string reason) returns (bytes32)",
+      "function createProposal(address operator, uint8 level, string reason) returns (uint256)",
+      "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
     ];
+    const iface = new ethers.Interface(abi);
     const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.createProposal(
@@ -579,8 +588,30 @@ export class BlockchainService {
         `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
       );
     }
-    this.logger.log(`createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}`);
-    return tx.hash;
+    // Parse the REAL on-chain proposal id from the emitted ProposalCreated event. Best-effort:
+    // decode by topic, ignore unrelated logs, and fall back to null (never fabricate an id).
+    let proposalId: bigint | null = null;
+    for (const log of receipt.logs) {
+      try {
+        const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+        if (parsed && parsed.name === "ProposalCreated") {
+          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+          break;
+        }
+      } catch {
+        // Not a ProposalCreated log (or from another contract) — skip.
+      }
+    }
+    if (proposalId === null) {
+      this.logger.warn(
+        `createProposal ${tx.hash} confirmed but no ProposalCreated event found — id unresolved`
+      );
+    }
+    this.logger.log(
+      `createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}` +
+        (proposalId !== null ? ` (proposalId ${proposalId})` : "")
+    );
+    return { txHash: tx.hash, proposalId };
   }
 
   /** Current network base-fee in gwei (0 on chains without EIP-1559). */

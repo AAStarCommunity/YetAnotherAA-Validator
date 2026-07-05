@@ -44,10 +44,11 @@ export interface AuditDetection {
   operator: string;
   rule: string;
   proofHash: string;
-  proposalId: string;
+  /** Real on-chain proposal id (decimal string), or null when unresolved (not filed / event absent). */
+  proposalId: string | null;
   reason: string;
   detectedAt: number;
-  /** Tx hash of the filed proposal, or null if the write failed / no wallet. */
+  /** Tx hash of the filed proposal, or null if the write failed / no wallet / cooldown-suppressed. */
   proposalTx: string | null;
 }
 
@@ -77,14 +78,18 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   /**
    * Stable-key dedup for the SAME on-chain violation@block: `chainId|operator|rule|block`.
    * Prevents re-proposing/re-archiving the identical block's violation within a process.
+   * Maps stableKey → wall-clock of first handling so stale entries can be pruned (bounded).
    */
-  private readonly proposedStableKeys = new Set<string>();
+  private readonly proposedStableKeys = new Map<string, number>();
   /**
    * Cooldown clock, keyed on the COARSE `chainId|operator|rule` (block-independent), holding
-   * the wall-clock of the last SUCCESSFUL proposal — an ongoing violation whose block advances
-   * every tick is not re-proposed until cooldownMs elapses.
+   * the wall-clock of the last proposal ATTEMPT — an ongoing violation whose block advances
+   * every tick is not re-attempted until cooldownMs elapses, even if every attempt reverts.
+   * Pruned once an entry ages past cooldownMs (the cooldown has expired → entry is dead).
    */
   private readonly lastProposalAt = new Map<string, number>();
+  /** Hard ceiling on either dedup map's size — a defensive LRU-style cap against unbounded growth. */
+  private static readonly MAX_DEDUP_ENTRIES = 10_000;
   /** Bounded ring of the most recent detections, newest first (for GET /audit/status). */
   private readonly recentDetections: AuditDetection[] = [];
   private static readonly MAX_RECENT = 20;
@@ -103,7 +108,23 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.enabled = config.get<boolean>("auditEnabled") === true;
     this.intervalMs = config.get<number>("auditIntervalMs") ?? 60_000;
     this.cooldownMs = config.get<number>("auditCooldownMs") ?? 3_600_000;
-    this.watchlist = (config.get<string[]>("auditWatchlist") ?? []).map(a => a.trim()).filter(Boolean);
+    // Canonicalize every watched operator to its checksummed form ONCE at ingest. All downstream
+    // identity/hash/key derivations (proofHash, stableKey, proposalId, proof.operator) then use the
+    // identical canonical string, so two DVT nodes with differently-cased AUDIT_WATCHLIST entries
+    // derive the SAME proofHash for the SAME violation (content-addressed cross-node dedup). Invalid
+    // addresses are dropped with a warning rather than crashing the process.
+    this.watchlist = (config.get<string[]>("auditWatchlist") ?? [])
+      .map(a => a.trim())
+      .filter(Boolean)
+      .map(a => {
+        try {
+          return ethers.getAddress(a);
+        } catch {
+          this.logger.warn(`Audit: dropping invalid AUDIT_WATCHLIST entry "${a}" (not an address)`);
+          return null;
+        }
+      })
+      .filter((a): a is string => a !== null);
     this.creditThresholdBps = BigInt(config.get<number>("auditCreditThresholdBps") ?? 10_000);
     this.chainId = config.get<number>("auditChainId") ?? 11155111;
     this.registryAddress = config.get<string>("auditRegistryAddress") ?? "";
@@ -214,6 +235,34 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
+   * Record a handled violation@block stable-key with the current wall-clock, keeping the map
+   * bounded: entries past cooldownMs are pruned, and a hard LRU-style cap evicts the oldest if
+   * the map somehow still overflows (defensive against pathological churn within one cooldown).
+   */
+  private recordStableKey(stableKey: string): void {
+    this.proposedStableKeys.set(stableKey, this.clock());
+    if (this.proposedStableKeys.size > AuditService.MAX_DEDUP_ENTRIES) {
+      // Map iteration is insertion-ordered → the first key is the oldest inserted.
+      const oldest = this.proposedStableKeys.keys().next().value;
+      if (oldest !== undefined) this.proposedStableKeys.delete(oldest);
+    }
+  }
+
+  /**
+   * Evict dedup/cooldown entries that have aged past cooldownMs (they can no longer suppress
+   * anything, so keeping them only leaks memory in the long-lived daemon). Called once per tick.
+   */
+  private pruneDedupState(): void {
+    const now = this.clock();
+    for (const [key, ts] of this.proposedStableKeys) {
+      if (now - ts > this.cooldownMs) this.proposedStableKeys.delete(key);
+    }
+    for (const [key, ts] of this.lastProposalAt) {
+      if (now - ts > this.cooldownMs) this.lastProposalAt.delete(key);
+    }
+  }
+
+  /**
    * One audit cycle. Called on every interval tick. Never throws; per-operator errors
    * are logged and do not abort the sweep of the remaining operators.
    */
@@ -226,6 +275,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     }
     this.tickInFlight = true;
     this.lastTickAt = this.clock();
+    // Bound the dedup/cooldown maps so the long-lived daemon never leaks: drop entries that
+    // have aged past cooldownMs (they can no longer suppress anything) before each sweep.
+    this.pruneDedupState();
     try {
       for (const operator of this.watchlist) {
         try {
@@ -249,20 +301,29 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // be mixed across blocks (no phantom over-limit from a mid-read state change).
     const violationBlock = await this.blockchainService.getBlockNumber();
 
-    const creditLimit = await this.blockchainService.getCreditLimit(
-      this.registryAddress,
-      operator,
-      violationBlock
-    );
-    const availableCredit = await this.blockchainService.getAvailableCredit(
-      this.superPaymasterAddress,
-      operator,
-      violationBlock
-    );
-    // GENUINE over-limit needs the operator's ACTUAL debt, read directly (block-pinned).
-    // getDebt is best-effort: null = getter absent / reverted → we CANNOT prove over-limit,
-    // so we SKIP (fail-safe, no proposal) rather than inferring it from availableCredit==0.
-    const debt = await this.readOperatorDebt(operator, violationBlock);
+    // All per-operator reads are pinned to the SAME block; issue them concurrently (5-6 reads)
+    // rather than serially. reputation + DVT stake lock are auxiliary evidence (not part of the
+    // rule) → best-effort with a fallback so they never fail the audit.
+    const [creditLimit, availableCredit, debt, reputation, dvtStake] = await Promise.all([
+      this.blockchainService.getCreditLimit(this.registryAddress, operator, violationBlock),
+      this.blockchainService.getAvailableCredit(this.superPaymasterAddress, operator, violationBlock),
+      // GENUINE over-limit needs the operator's ACTUAL debt, read directly (block-pinned).
+      // getDebt is best-effort: null = getter absent / reverted → we CANNOT prove over-limit,
+      // so we SKIP (fail-safe, no proposal) rather than inferring it from availableCredit==0.
+      this.readOperatorDebt(operator, violationBlock),
+      this.blockchainService
+        .getGlobalReputation(this.registryAddress, operator, violationBlock)
+        .catch(() => -1n),
+      this.gtokenStakingAddress
+        ? this.blockchainService.getRoleLockAmount(
+            this.gtokenStakingAddress,
+            operator,
+            ROLE_DVT,
+            violationBlock
+          )
+        : Promise.resolve(0n),
+    ]);
+
     if (debt === null) {
       this.logger.debug(
         `Audit: ${operator} debt unreadable (getDebt reverted/absent) — SKIP (fail-safe)`
@@ -270,29 +331,31 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       return;
     }
 
-    // Auxiliary evidence (not part of the credit rule): reputation + DVT stake lock.
-    const reputation = await this.blockchainService
-      .getGlobalReputation(this.registryAddress, operator, violationBlock)
-      .catch(() => -1n);
-    const dvtStake = this.gtokenStakingAddress
-      ? await this.blockchainService.getRoleLockAmount(
-          this.gtokenStakingAddress,
-          operator,
-          ROLE_DVT,
-          violationBlock
-        )
-      : 0n;
+    // FAIL-SAFE: creditLimit == 0 means UNCONFIGURED / de-registered, NOT "over limit". Flagging
+    // debt>0 against a zero limit would be an unconditional false positive → SKIP (never slash).
+    if (creditLimit === 0n) {
+      this.logger.debug(
+        `Audit: ${operator} creditLimit=0 (unconfigured/de-registered) — SKIP (fail-safe, not over-limit)`
+      );
+      return;
+    }
+    // CROSS-CONTRACT AGREEMENT: both SuperPaymaster signals must agree before flagging. If
+    // availableCredit > 0 the operator is still within SP's ENFORCED ceiling, so a lower/stale
+    // Registry creditLimit must NOT produce a false over-limit → SKIP. Only when SP itself reports
+    // the credit exhausted (availableCredit == 0) do we trust the debt>limit comparison.
+    if (availableCredit > 0n) {
+      this.logger.debug(
+        `Audit: ${operator} availableCredit=${availableCredit}>0 (within SP ceiling) — SKIP (no false over-limit)`
+      );
+      return;
+    }
 
     // STRICT credit-over-limit rule: flag ONLY a genuine breach where debt EXCEEDS the limit
     // (debt == creditLimit is AT the limit, not over → NOT a violation). creditThresholdBps is
     // an OPTIONAL additional margin on top: debt*10000/limit must also reach it (default 10000).
+    // creditLimit > 0 is guaranteed above, so the ratio is always well-defined.
     const overLimit = debt > creditLimit;
-    const usageBps =
-      creditLimit > 0n
-        ? (debt * 10_000n) / creditLimit
-        : debt > 0n
-          ? this.creditThresholdBps // no limit but has debt → treat as over the margin
-          : 0n;
+    const usageBps = (debt * 10_000n) / creditLimit;
 
     if (!overLimit) {
       this.logger.debug(
@@ -378,20 +441,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       violationBlock: v.violationBlock,
     };
     const proofHash = computeProofHash(identity);
-    // Deterministic proposal id from the same stable dedup key: chainId|operator|rule|block.
-    const proposalId = ethers.keccak256(
-      ABI.encode(
-        ["uint256", "address", "string", "uint256"],
-        [this.chainId, v.operator, v.rule, v.violationBlock]
-      )
-    );
-    // The message a DVT quorum would BLS-sign over the proposal (co-sign is increment 2).
-    const messageHash = ethers.keccak256(
-      ABI.encode(
-        ["bytes32", "address", "uint8", "uint256"],
-        [proposalId, v.operator, v.slashLevel, 0]
-      )
-    );
 
     // ── DEDUP ─────────────────────────────────────────────────────────────────────
     const stableKey = `${this.chainId}|${v.operator}|${v.rule}|${v.violationBlock}`;
@@ -403,30 +452,67 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       );
       return null;
     }
-    // (b) cooldown: an ongoing violation whose block advances each tick must not re-propose
-    //     every interval. Only a SUCCESSFUL proposal arms the cooldown (see below).
+
+    // (b) COOLDOWN gates the on-chain ATTEMPT only (never the archival). An ongoing violation
+    //     whose block advances each tick must not re-send a tx every interval — otherwise a
+    //     persistently-reverting proposal (e.g. proposer not an active validator) would burn
+    //     admin-wallet gas and churn nonces forever. The cooldown is armed on ATTEMPT (below),
+    //     regardless of the tx result, keyed on the COARSE chainId|operator|rule.
     const last = this.lastProposalAt.get(coarseKey);
-    if (last !== undefined && this.clock() - last < this.cooldownMs) {
+    const withinCooldown = last !== undefined && this.clock() - last < this.cooldownMs;
+
+    // File the slash proposal (proposal-INTENT), unless suppressed by the cooldown. Best-effort:
+    // on failure (no wallet / revert) the proof is still archived so the evidence survives.
+    let proposalTx: string | null = null;
+    let onchainProposalId: bigint | null = null;
+    if (withinCooldown) {
       this.logger.debug(
-        `Audit: ${v.operator} ${v.rule} within cooldown (${this.clock() - last}ms < ${this.cooldownMs}ms) — skip`
+        `Audit: ${v.operator} ${v.rule} within cooldown (${this.clock() - (last as number)}ms < ` +
+          `${this.cooldownMs}ms) — attempt suppressed, archiving evidence only`
       );
-      return null;
+    } else {
+      // Arm the cooldown on ATTEMPT (before the result) so a reverting tx still backs off for
+      // cooldownMs instead of retrying every advancing-block tick.
+      this.lastProposalAt.set(coarseKey, this.clock());
+      try {
+        const res = await this.blockchainService.createSlashProposal(
+          this.dvtValidatorAddress,
+          v.operator,
+          v.slashLevel,
+          v.reason
+        );
+        proposalTx = res.txHash;
+        onchainProposalId = res.proposalId;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.error(`Audit: ${v.operator} createProposal failed — ${msg}`);
+      }
     }
 
-    // File the slash proposal (proposal-INTENT). Best-effort: on failure (no wallet / revert)
-    // the proof is still archived so the evidence survives for a later retry.
-    let proposalTx: string | null = null;
-    try {
-      proposalTx = await this.blockchainService.createSlashProposal(
-        this.dvtValidatorAddress,
-        v.operator,
-        v.slashLevel,
-        v.reason
-      );
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.logger.error(`Audit: ${v.operator} createProposal failed — ${msg}`);
-    }
+    // Use the REAL on-chain proposal id (decimal string). When unresolved — attempt suppressed
+    // by cooldown, write failed, or the ProposalCreated event was absent — store null + a clear
+    // note rather than fabricating an id (a fake id would never match the on-chain proposal and
+    // would break increment-2's quorum co-sign / verifyAndExecute).
+    const proposalId: string | null = onchainProposalId !== null ? onchainProposalId.toString() : null;
+    const proposalIdNote = withinCooldown
+      ? "id-unresolved: proposal attempt suppressed by cooldown"
+      : proposalTx === null
+        ? "id-unresolved: proposal write failed"
+        : onchainProposalId === null
+          ? "id-unresolved: ProposalCreated event not found in receipt"
+          : undefined;
+    // The message a DVT quorum would BLS-sign over the proposal (co-sign is increment 2). Bound to
+    // the REAL id; when the id is unresolved the message is a placeholder ("0x") since there is no
+    // on-chain proposal to sign over yet.
+    const messageHash =
+      onchainProposalId !== null
+        ? ethers.keccak256(
+            ABI.encode(
+              ["uint256", "address", "uint8", "uint256"],
+              [onchainProposalId, v.operator, v.slashLevel, 0]
+            )
+          )
+        : "0x";
 
     const proof: SlashProof = {
       version: "dvt-slash-proof/1",
@@ -455,12 +541,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       attestations: {},
       createdAt: this.clock(),
       ...(proposalTx ? { proposalTx } : {}),
+      ...(proposalIdNote ? { proposalIdNote } : {}),
     };
 
     // Mark this exact violation@block handled BEFORE archiving so a same-block re-tick can't
-    // double-file; arm the coarse cooldown only when the proposal actually landed.
-    this.proposedStableKeys.add(stableKey);
-    if (proposalTx) this.lastProposalAt.set(coarseKey, this.clock());
+    // double-file. (The cooldown was already armed on ATTEMPT above.)
+    this.recordStableKey(stableKey);
 
     const { location } = await this.archive.put(proof);
     this.logger.warn(

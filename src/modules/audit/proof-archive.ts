@@ -52,7 +52,14 @@ export interface Evidence {
 /** The durable slash-proof record. Schema version "dvt-slash-proof/1". */
 export interface SlashProof {
   version: "dvt-slash-proof/1";
-  proposalId: string;
+  /**
+   * REAL on-chain proposal id (auto-incrementing uint256, as a decimal string) parsed from the
+   * DVTValidator's ProposalCreated event. `null` when unresolved (proposal not filed, write
+   * reverted, or the event was absent) — never a fabricated value; see `proposalIdNote`.
+   */
+  proposalId: string | null;
+  /** Present only when `proposalId` is null: a human-readable reason the id could not be resolved. */
+  proposalIdNote?: string;
   chainId: number;
   operator: string;
   slashLevel: number;
