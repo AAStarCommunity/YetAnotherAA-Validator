@@ -66,6 +66,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly superPaymasterAddress: string;
   private readonly dvtValidatorAddress: string;
   private readonly gtokenStakingAddress: string;
+  /** xPNTs token the credit-over-limit rule reads operator debt from (getDebt lives on the token). */
+  private readonly apntsTokenAddress: string;
   private readonly archive: IProofArchive;
   private readonly clock: () => number;
   private readonly random: () => number;
@@ -131,6 +133,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.superPaymasterAddress = config.get<string>("auditSuperPaymasterAddress") ?? "";
     this.dvtValidatorAddress = config.get<string>("auditDvtValidatorAddress") ?? "";
     this.gtokenStakingAddress = config.get<string>("auditGtokenStakingAddress") ?? "";
+    this.apntsTokenAddress = config.get<string>("auditApntsTokenAddress") ?? "";
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
     this.archive =
@@ -161,6 +164,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     if (!this.registryAddress) missing.push("AUDIT_REGISTRY_ADDRESS");
     if (!this.superPaymasterAddress) missing.push("AUDIT_SUPER_PAYMASTER_ADDRESS");
     if (!this.dvtValidatorAddress) missing.push("AUDIT_DVT_VALIDATOR_ADDRESS");
+    if (!this.apntsTokenAddress) missing.push("AUDIT_APNTS_TOKEN_ADDRESS");
     if (missing.length > 0) {
       this.enabled = false;
       this.logger.error(
@@ -178,6 +182,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       ["AUDIT_REGISTRY_ADDRESS", this.registryAddress],
       ["AUDIT_SUPER_PAYMASTER_ADDRESS", this.superPaymasterAddress],
       ["AUDIT_DVT_VALIDATOR_ADDRESS", this.dvtValidatorAddress],
+      ["AUDIT_APNTS_TOKEN_ADDRESS", this.apntsTokenAddress],
     ];
     if (this.gtokenStakingAddress) {
       toCheck.push(["AUDIT_GTOKEN_STAKING_ADDRESS", this.gtokenStakingAddress]);
@@ -306,7 +311,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // rule) → best-effort with a fallback so they never fail the audit.
     const [creditLimit, availableCredit, debt, reputation, dvtStake] = await Promise.all([
       this.blockchainService.getCreditLimit(this.registryAddress, operator, violationBlock),
-      this.blockchainService.getAvailableCredit(this.superPaymasterAddress, operator, violationBlock),
+      this.blockchainService.getAvailableCredit(
+        this.superPaymasterAddress,
+        operator,
+        this.apntsTokenAddress,
+        violationBlock
+      ),
       // GENUINE over-limit needs the operator's ACTUAL debt, read directly (block-pinned).
       // getDebt is best-effort: null = getter absent / reverted → we CANNOT prove over-limit,
       // so we SKIP (fail-safe, no proposal) rather than inferring it from availableCredit==0.
@@ -376,7 +386,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       `(usage ${usageBps}bps ≥ ${this.creditThresholdBps}bps, availableCredit ${availableCredit}, block ${violationBlock})`;
     const sources: EvidenceSource[] = [
       { type: "view", name: "Registry.getCreditLimit", value: creditLimit.toString(), block: violationBlock },
-      { type: "view", name: "SuperPaymaster.getDebt", value: debt.toString(), block: violationBlock },
+      {
+        type: "view",
+        name: `IxPNTsToken(${this.apntsTokenAddress}).getDebt`,
+        value: debt.toString(),
+        block: violationBlock,
+      },
       {
         type: "view",
         name: "SuperPaymaster.getAvailableCredit",
@@ -401,14 +416,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * Best-effort operator debt read (block-pinned). Tries the SuperPaymaster credit-debt
-   * system first, then the Registry. Returns null only when NEITHER exposes a readable
-   * getDebt — the caller treats null as "unknown" and skips (never guesses an over-limit).
+   * Best-effort operator debt read (block-pinned). Per the verified SP ABI, debt lives on the
+   * xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT SuperPaymaster/Registry — so this reads the
+   * aPNTs token directly. Returns null when the token's getDebt reverts / is absent — the caller
+   * treats null as "unknown" and skips (never guesses an over-limit from missing data).
    */
   private async readOperatorDebt(operator: string, blockTag: number): Promise<bigint | null> {
-    const fromSp = await this.blockchainService.getDebt(this.superPaymasterAddress, operator, blockTag);
-    if (fromSp !== null) return fromSp;
-    return this.blockchainService.getDebt(this.registryAddress, operator, blockTag);
+    return this.blockchainService.getDebt(this.apntsTokenAddress, operator, blockTag);
   }
 
   /**
@@ -501,15 +515,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         : onchainProposalId === null
           ? "id-unresolved: ProposalCreated event not found in receipt"
           : undefined;
-    // The message a DVT quorum would BLS-sign over the proposal (co-sign is increment 2). Bound to
-    // the REAL id; when the id is unresolved the message is a placeholder ("0x") since there is no
-    // on-chain proposal to sign over yet.
+    // The message a DVT quorum would BLS-sign over the proposal (co-sign is increment 2). This
+    // MUST match BLSAggregator.verifyAndExecute's message-hash preimage (BLSAggregator.sol:406):
+    //   keccak256(abi.encode(proposalId, operator, slashLevel, repUsers[], newScores[], epoch, chainId))
+    // — 7 fields. For a slash-only proposal repUsers/newScores are empty ([]). Bound to the REAL id;
+    // when the id is unresolved the message is a placeholder ("0x") since there is no on-chain
+    // proposal to sign over yet.
+    // TODO(inc-2): epoch must match the value passed to verifyAndExecute at co-sign time.
     const messageHash =
       onchainProposalId !== null
         ? ethers.keccak256(
             ABI.encode(
-              ["uint256", "address", "uint8", "uint256"],
-              [onchainProposalId, v.operator, v.slashLevel, 0]
+              ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256"],
+              [onchainProposalId, v.operator, v.slashLevel, [], [], epoch, this.chainId]
             )
           )
         : "0x";

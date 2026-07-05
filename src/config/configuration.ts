@@ -203,6 +203,11 @@ export default () => {
     auditSuperPaymasterAddress: process.env.AUDIT_SUPER_PAYMASTER_ADDRESS || undefined,
     auditDvtValidatorAddress: process.env.AUDIT_DVT_VALIDATOR_ADDRESS || undefined,
     auditGtokenStakingAddress: process.env.AUDIT_GTOKEN_STAKING_ADDRESS || undefined,
+    // The xPNTs token the credit-over-limit rule reads operator debt from. Debt lives on the
+    // xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT on SuperPaymaster/Registry. Default is the
+    // Sepolia aPNTs token. FAIL-CLOSED: required + must have on-chain code when AUDIT_ENABLED=true.
+    auditApntsTokenAddress:
+      process.env.AUDIT_APNTS_TOKEN_ADDRESS || "0x696A73701b104c6cCBbAadDD2216788ea08EaB89",
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
