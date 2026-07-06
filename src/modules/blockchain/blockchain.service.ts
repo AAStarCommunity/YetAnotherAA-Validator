@@ -621,6 +621,151 @@ export class BlockchainService {
     return { txHash: tx.hash, proposalId };
   }
 
+  /**
+   * File a slash proposal binding the archived evidence (SP #329 4-arg createProposal):
+   *   createProposal(address operator, uint8 level, string reason, bytes32 evidenceHash) returns (uint256 id)
+   * Same admin-wallet + bumped-fees + await-receipt contract as createSlashProposal; the extra
+   * `evidenceHash` (the content-addressed proofHash) binds the on-chain proposal to the archived
+   * proof. Returns the tx hash and the REAL on-chain id parsed from ProposalCreated (`null` when
+   * the event is absent, so the caller never fabricates an id).
+   */
+  async createProposalWithEvidence(
+    dvtValidatorAddress: string,
+    operator: string,
+    level: number,
+    reason: string,
+    evidenceHash: string
+  ): Promise<{ txHash: string; proposalId: bigint | null }> {
+    if (!this.wallet) {
+      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+    }
+    const abi = [
+      "function createProposal(address operator, uint8 level, string reason, bytes32 evidenceHash) returns (uint256)",
+      "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
+    ];
+    const iface = new ethers.Interface(abi);
+    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.createProposal(
+      operator,
+      level,
+      reason,
+      evidenceHash,
+      fees
+    );
+    this.logger.log(`createProposal(${operator}, ${level}, evidence ${evidenceHash}) submitted: ${tx.hash}`);
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(
+        `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+      );
+    }
+    let proposalId: bigint | null = null;
+    for (const log of receipt.logs) {
+      try {
+        const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+        if (parsed && parsed.name === "ProposalCreated") {
+          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+          break;
+        }
+      } catch {
+        // Not a ProposalCreated log (or from another contract) — skip.
+      }
+    }
+    if (proposalId === null) {
+      this.logger.warn(
+        `createProposal ${tx.hash} confirmed but no ProposalCreated event found — id unresolved`
+      );
+    }
+    this.logger.log(
+      `createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}` +
+        (proposalId !== null ? ` (proposalId ${proposalId})` : "")
+    );
+    return { txHash: tx.hash, proposalId };
+  }
+
+  /**
+   * Step 1 of the two-step slash (SP #329):
+   *   queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof)
+   * `proof` is abi.encode(uint256 signerMask, bytes sigG2) from the quorum co-sign over the
+   * step-1 messageHash. Admin wallet + bumped fees + await-receipt (throws on non-success so the
+   * caller logs and archives the evidence anyway). Returns the tx hash.
+   */
+  async queueSlashWithProof(
+    dvtValidatorAddress: string,
+    operator: string,
+    slashLevel: number,
+    epoch: bigint | number,
+    proof: string
+  ): Promise<string> {
+    if (!this.wallet) {
+      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+    }
+    const abi = [
+      "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof) external",
+    ];
+    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.queueSlashWithProof(
+      operator,
+      slashLevel,
+      epoch,
+      proof,
+      fees
+    );
+    this.logger.log(`queueSlashWithProof(${operator}, ${slashLevel}, epoch ${epoch}) submitted: ${tx.hash}`);
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(
+        `queueSlashWithProof tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+      );
+    }
+    this.logger.log(`queueSlashWithProof(${operator}) confirmed in block ${receipt.blockNumber}`);
+    return tx.hash;
+  }
+
+  /**
+   * Step 2 of the two-step slash (SP #329):
+   *   executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof)
+   * For a slash-only proposal repUsers/newScores are empty. `proof` is abi.encode(signerMask, sigG2)
+   * from the quorum co-sign over the step-2 messageHash. Admin wallet + bumped fees +
+   * await-receipt (throws on non-success). Returns the tx hash.
+   */
+  async executeSlashWithProof(
+    dvtValidatorAddress: string,
+    id: bigint | number,
+    repUsers: string[],
+    newScores: Array<bigint | number>,
+    epoch: bigint | number,
+    proof: string
+  ): Promise<string> {
+    if (!this.wallet) {
+      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+    }
+    const abi = [
+      "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof) external",
+    ];
+    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.executeWithProof(
+      id,
+      repUsers,
+      newScores,
+      epoch,
+      proof,
+      fees
+    );
+    this.logger.log(`executeWithProof(id ${id}, epoch ${epoch}) submitted: ${tx.hash}`);
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(
+        `executeWithProof tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+      );
+    }
+    this.logger.log(`executeWithProof(id ${id}) confirmed in block ${receipt.blockNumber}`);
+    return tx.hash;
+  }
+
   /** Current network base-fee in gwei (0 on chains without EIP-1559). */
   async getBaseFeeGwei(): Promise<bigint> {
     const block = await this.provider.getBlock("latest");

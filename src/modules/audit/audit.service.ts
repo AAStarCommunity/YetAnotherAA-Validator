@@ -11,6 +11,14 @@ import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 import type { IProofArchive, SlashProof, EvidenceSource, ProofIdentity } from "./proof-archive.js";
 import { LocalProofArchive, computeProofHash } from "./proof-archive.js";
+import type { IQuorumCoSigner } from "./slash-consensus.js";
+import {
+  SlashLevel,
+  PendingSlotCoSigner,
+  buildQueueMessageHash,
+  buildExecuteMessageHash,
+  encodeProof,
+} from "./slash-consensus.js";
 
 /**
  * DVT Phase 2 (目标2) — autonomous audit of SuperPaymaster operators, increment 1.
@@ -33,8 +41,12 @@ import { LocalProofArchive, computeProofHash } from "./proof-archive.js";
  *   - increment 3: IPFS pinning of proofs.
  */
 
-/** Slash severity for the credit-over-limit rule (uint8 level passed to createProposal). */
-const SLASH_LEVEL_CREDIT_OVER_LIMIT = 1;
+/**
+ * Slash severity for the credit-over-limit rule. Maps to the SP #329 SlashLevel enum: MINOR (=1),
+ * which is 3-of-3 quorum in the N=3 bootstrap. This uint8 is the `level` passed to createProposal
+ * AND the slashLevel bound into both the queue and execute co-sign preimages — they must agree.
+ */
+const SLASH_LEVEL_CREDIT_OVER_LIMIT = SlashLevel.MINOR;
 const RULE_CREDIT_OVER_LIMIT = "credit-over-limit";
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
@@ -65,10 +77,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly registryAddress: string;
   private readonly superPaymasterAddress: string;
   private readonly dvtValidatorAddress: string;
+  private readonly blsAggregatorAddress: string;
   private readonly gtokenStakingAddress: string;
   /** xPNTs token the credit-over-limit rule reads operator debt from (getDebt lives on the token). */
   private readonly apntsTokenAddress: string;
+  /**
+   * SECOND safety gate (increment 2). When false (default) a violation only FILES + ARCHIVES a
+   * slash proposal; the two-step on-chain slash (queue → execute, quorum co-signed) fires only
+   * when both auditEnabled AND this are true — so nothing is auto-slashed until explicitly enabled.
+   */
+  private readonly executeSlash: boolean;
   private readonly archive: IProofArchive;
+  /** Quorum co-sign seam — default PendingSlotCoSigner (fails closed until SP assigns BLS slots). */
+  private readonly coSigner: IQuorumCoSigner;
   private readonly clock: () => number;
   private readonly random: () => number;
 
@@ -105,7 +126,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     /** Test seam: controls the startup phase jitter (default Math.random). */
     @Optional() random?: () => number,
     /** Test seam: injectable archive; defaults to a LocalProofArchive at auditProofDir. */
-    @Optional() archive?: IProofArchive
+    @Optional() archive?: IProofArchive,
+    /** Injected quorum co-signer; defaults to the deferred PendingSlotCoSigner (fails closed). */
+    @Optional() coSigner?: IQuorumCoSigner
   ) {
     this.enabled = config.get<boolean>("auditEnabled") === true;
     this.intervalMs = config.get<number>("auditIntervalMs") ?? 60_000;
@@ -132,12 +155,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.registryAddress = config.get<string>("auditRegistryAddress") ?? "";
     this.superPaymasterAddress = config.get<string>("auditSuperPaymasterAddress") ?? "";
     this.dvtValidatorAddress = config.get<string>("auditDvtValidatorAddress") ?? "";
+    this.blsAggregatorAddress = config.get<string>("auditBlsAggregatorAddress") ?? "";
     this.gtokenStakingAddress = config.get<string>("auditGtokenStakingAddress") ?? "";
     this.apntsTokenAddress = config.get<string>("auditApntsTokenAddress") ?? "";
+    this.executeSlash = config.get<boolean>("auditExecuteSlash") === true;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
     this.archive =
       archive ?? new LocalProofArchive(config.get<string>("auditProofDir") ?? "./audit-proofs");
+    this.coSigner = coSigner ?? new PendingSlotCoSigner();
 
     capabilityRegistry?.register({
       name: "audit",
@@ -219,7 +245,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.logger.log(
       `DVT audit ENABLED — interval=${this.intervalMs}ms jitter=${jitterMs}ms ` +
         `watchlist=[${this.watchlist.join(", ")}] creditThreshold=${this.creditThresholdBps}bps ` +
-        `registry=${this.registryAddress} superPaymaster=${this.superPaymasterAddress}`
+        `registry=${this.registryAddress} superPaymaster=${this.superPaymasterAddress} ` +
+        `dvtValidator=${this.dvtValidatorAddress} blsAggregator=${this.blsAggregatorAddress} ` +
+        `executeSlash=${this.executeSlash} (${this.executeSlash ? "two-step on-chain slash ARMED" : "file+archive ONLY"})`
     );
   }
 
@@ -488,18 +516,38 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // Arm the cooldown on ATTEMPT (before the result) so a reverting tx still backs off for
       // cooldownMs instead of retrying every advancing-block tick.
       this.lastProposalAt.set(coarseKey, this.clock());
-      try {
-        const res = await this.blockchainService.createSlashProposal(
-          this.dvtValidatorAddress,
-          v.operator,
-          v.slashLevel,
-          v.reason
-        );
-        proposalTx = res.txHash;
+      if (this.executeSlash) {
+        // INCREMENT 2 (execute-slash ARMED): the FULL two-step on-chain slash orchestration —
+        // queue (co-signed) → createProposal(evidenceHash=proofHash) → execute (co-signed). Each
+        // step is wrapped so a co-sign/tx failure is logged but the evidence is still archived
+        // below (evidence never lost) and the poll loop never crashes.
+        const res = await this.coordinateQuorumCoSign({
+          operator: v.operator,
+          slashLevel: v.slashLevel,
+          reason: v.reason,
+          epoch,
+          evidenceHash: proofHash,
+        });
+        proposalTx = res.proposalTx;
         onchainProposalId = res.proposalId;
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.logger.error(`Audit: ${v.operator} createProposal failed — ${msg}`);
+      } else {
+        // DEFAULT (execute-slash OFF): only FILE the proposal (proposal-INTENT), binding the
+        // archived evidence via evidenceHash=proofHash. No queue/execute → nothing is slashed.
+        // Best-effort: on failure (no wallet / revert) the proof is still archived below.
+        try {
+          const res = await this.blockchainService.createProposalWithEvidence(
+            this.dvtValidatorAddress,
+            v.operator,
+            v.slashLevel,
+            v.reason,
+            proofHash
+          );
+          proposalTx = res.txHash;
+          onchainProposalId = res.proposalId;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.logger.error(`Audit: ${v.operator} createProposal failed — ${msg}`);
+        }
       }
     }
 
@@ -574,10 +622,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         (proposalTx ? ` (proposal ${proposalTx})` : " (proposal NOT filed)")
     );
 
-    // TODO(increment-2): coordinateQuorumCoSign() — gossip the proposal to the other DVT
-    // nodes, collect their BLS co-signatures into an aggregate, then submit through
-    // BLSAggregator.verifyAndExecute to actually execute the slash. Deferred: needs the
-    // gossip aggregation layer across DVT nodes.
+    // NOTE: the on-chain two-step slash (queue → createProposal → execute) already ran ABOVE
+    // via coordinateQuorumCoSign when executeSlash is armed. It runs BEFORE this archival on
+    // purpose but catches all of its own failures, so the evidence is archived regardless.
 
     const detection: AuditDetection = {
       operator: v.operator,
@@ -596,12 +643,117 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * TODO(increment-2): coordinate the multi-node BLS quorum co-sign over a filed proposal
-   * and submit BLSAggregator.verifyAndExecute. Deferred — requires gossip aggregation across
-   * DVT nodes. Kept as a named seam so the increment-1 flow already points at where it lands.
+   * INCREMENT 2 — the two-step slash-consensus orchestration that turns a filed audit violation
+   * into a real on-chain slash (SP #329). Two INDEPENDENT quorum-co-signed steps bracket the
+   * proposal, run in this exact order:
+   *
+   *   1. QUEUE    — co-sign the 5-field queue preimage → queueSlashWithProof (slash intent).
+   *   2. PROPOSAL — createProposalWithEvidence(evidenceHash=proofHash) → the REAL proposal id,
+   *                 binding the on-chain slash to the archived evidence.
+   *   3. EXECUTE  — co-sign the 8-field execute preimage (bound to that real id + evidenceHash)
+   *                 → executeWithProof (slash-only ⇒ repUsers/newScores empty). Skipped when the
+   *                 proposal id is unresolved (a fabricated id would revert on-chain).
+   *
+   * Each step is wrapped: a co-sign or tx failure is logged and swallowed so the caller still
+   * archives the evidence (evidence never lost) and the poll loop never crashes. With the default
+   * PendingSlotCoSigner every co-sign throws (SP validator slots pending the 24h timelock), so
+   * this reduces to: nothing queued, proposal filed, nothing executed.
+   *
+   * TODO(inc-2 live): the real multi-node gossip BLS aggregation behind coSigner — collect peer
+   * signatures over the messageHash, build the signerMask bitmap by SP-assigned validator slot,
+   * aggregate into sigG2 — lands once SP hands out slots via registerBLSPublicKey.
    */
-  async coordinateQuorumCoSign(): Promise<never> {
-    throw new Error("coordinateQuorumCoSign deferred to increment 2 (gossip BLS aggregation)");
+  async coordinateQuorumCoSign(args: {
+    operator: string;
+    slashLevel: number;
+    reason: string;
+    epoch: number;
+    evidenceHash: string;
+  }): Promise<{
+    proposalTx: string | null;
+    proposalId: bigint | null;
+    queueTx: string | null;
+    executeTx: string | null;
+  }> {
+    const { operator, slashLevel, reason, epoch, evidenceHash } = args;
+    let queueTx: string | null = null;
+    let proposalTx: string | null = null;
+    let proposalId: bigint | null = null;
+    let executeTx: string | null = null;
+
+    // ── Step 1: QUEUE (quorum co-signed) ──────────────────────────────────────────
+    try {
+      const queueMsgHash = buildQueueMessageHash(operator, slashLevel, epoch, this.chainId);
+      const { signerMask, sigG2 } = await this.coSigner.coSign(queueMsgHash);
+      const proof = encodeProof(signerMask, sigG2);
+      queueTx = await this.blockchainService.queueSlashWithProof(
+        this.dvtValidatorAddress,
+        operator,
+        slashLevel,
+        epoch,
+        proof
+      );
+      this.logger.warn(`Audit: ${operator} slash QUEUED (tx ${queueTx})`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error(
+        `Audit: ${operator} slash queue step failed — ${msg} (evidence archived; slash not queued)`
+      );
+    }
+
+    // ── Step 2: file the proposal (binds evidenceHash=proofHash) ───────────────────
+    try {
+      const res = await this.blockchainService.createProposalWithEvidence(
+        this.dvtValidatorAddress,
+        operator,
+        slashLevel,
+        reason,
+        evidenceHash
+      );
+      proposalTx = res.txHash;
+      proposalId = res.proposalId;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Audit: ${operator} createProposal failed — ${msg}`);
+    }
+
+    // ── Step 3: EXECUTE (quorum co-signed) — only with a REAL proposal id ───────────
+    if (proposalId === null) {
+      this.logger.error(
+        `Audit: ${operator} slash execute SKIPPED — no real proposalId ` +
+          `(createProposal failed or ProposalCreated absent); a fabricated id would revert`
+      );
+      return { proposalTx, proposalId, queueTx, executeTx };
+    }
+    try {
+      const execMsgHash = buildExecuteMessageHash(
+        proposalId,
+        operator,
+        slashLevel,
+        epoch,
+        this.chainId,
+        evidenceHash
+      );
+      const { signerMask, sigG2 } = await this.coSigner.coSign(execMsgHash);
+      const proof = encodeProof(signerMask, sigG2);
+      executeTx = await this.blockchainService.executeSlashWithProof(
+        this.dvtValidatorAddress,
+        proposalId,
+        [], // slash-only ⇒ no reputation users
+        [], // slash-only ⇒ no reputation scores
+        epoch,
+        proof
+      );
+      this.logger.warn(
+        `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error(
+        `Audit: ${operator} slash execute step failed — ${msg} (evidence archived; slash not executed)`
+      );
+    }
+    return { proposalTx, proposalId, queueTx, executeTx };
   }
 
   /** Read-only status for GET /audit/status. No secrets. */

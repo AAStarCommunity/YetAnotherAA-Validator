@@ -201,8 +201,20 @@ export default () => {
     auditChainId: parseInt(process.env.AUDIT_CHAIN_ID || "11155111", 10),
     auditRegistryAddress: process.env.AUDIT_REGISTRY_ADDRESS || undefined,
     auditSuperPaymasterAddress: process.env.AUDIT_SUPER_PAYMASTER_ADDRESS || undefined,
-    auditDvtValidatorAddress: process.env.AUDIT_DVT_VALIDATOR_ADDRESS || undefined,
+    // DVTValidator (SP #329 finalized interface). Default is the Sepolia deployment.
+    auditDvtValidatorAddress:
+      process.env.AUDIT_DVT_VALIDATOR_ADDRESS || "0x568b1486BFE036e603eA11f0D03Dc47fa62c9E0e",
+    // BLSAggregator (SP #329). Currently informational — the on-chain queue/execute writes go
+    // through DVTValidator; the aggregator address is recorded for the future live gossip
+    // co-sign that will aggregate peer BLS signatures by SP-assigned validator slot.
+    auditBlsAggregatorAddress:
+      process.env.AUDIT_BLS_AGGREGATOR_ADDRESS || "0xF51c029879685Ced8fbCfa4b647c2eAe50Cd8B13",
     auditGtokenStakingAddress: process.env.AUDIT_GTOKEN_STAKING_ADDRESS || undefined,
+    // SECOND safety gate (increment 2). AUDIT_ENABLED alone only FILES slash proposals; the
+    // two-step on-chain slash (queueSlashWithProof → executeWithProof, each quorum co-signed)
+    // fires ONLY when this is ALSO "true". Default FALSE so nothing is auto-slashed until an
+    // operator explicitly opts in AND the SP validator slots (registerBLSPublicKey) are ready.
+    auditExecuteSlash: process.env.AUDIT_EXECUTE_SLASH === "true",
     // The xPNTs token the credit-over-limit rule reads operator debt from. Debt lives on the
     // xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT on SuperPaymaster/Registry. Default is the
     // Sepolia aPNTs token. FAIL-CLOSED: required + must have on-chain code when AUDIT_ENABLED=true.

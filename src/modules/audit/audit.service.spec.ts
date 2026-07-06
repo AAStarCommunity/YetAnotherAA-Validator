@@ -1,6 +1,12 @@
 import { ethers } from "ethers";
 import { AuditService } from "./audit.service.js";
 import { IProofArchive, SlashProof, computeProofHash } from "./proof-archive.js";
+import {
+  IQuorumCoSigner,
+  buildQueueMessageHash,
+  buildExecuteMessageHash,
+  encodeProof,
+} from "./slash-consensus.js";
 
 const OPERATOR = "0x" + "12".repeat(20);
 const REGISTRY = "0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71";
@@ -50,7 +56,11 @@ function makeBlockchain(
     getDebt: (tokenAddr: string, op: string, bt?: number) => Promise<bigint | null>;
     getGlobalReputation: (addr: string, op: string, bt?: number) => Promise<bigint>;
     getRoleLockAmount: (...args: any[]) => Promise<bigint>;
-    createSlashProposal: (...args: any[]) => Promise<{ txHash: string; proposalId: bigint | null }>;
+    createProposalWithEvidence: (
+      ...args: any[]
+    ) => Promise<{ txHash: string; proposalId: bigint | null }>;
+    queueSlashWithProof: (...args: any[]) => Promise<string>;
+    executeSlashWithProof: (...args: any[]) => Promise<string>;
     getWalletAddress: () => string | null;
   }> = {}
 ): any {
@@ -62,9 +72,27 @@ function makeBlockchain(
     getDebt: overrides.getDebt ?? (async () => 0n),
     getGlobalReputation: overrides.getGlobalReputation ?? (async () => 500n),
     getRoleLockAmount: overrides.getRoleLockAmount ?? (async () => 42n),
-    createSlashProposal:
-      overrides.createSlashProposal ?? (async () => ({ txHash: "0xPROPOSALTX", proposalId: 7n })),
+    createProposalWithEvidence:
+      overrides.createProposalWithEvidence ??
+      (async () => ({ txHash: "0xPROPOSALTX", proposalId: 7n })),
+    queueSlashWithProof: overrides.queueSlashWithProof ?? (async () => "0xQUEUETX"),
+    executeSlashWithProof: overrides.executeSlashWithProof ?? (async () => "0xEXECUTETX"),
     getWalletAddress: overrides.getWalletAddress ?? (() => "0x" + "99".repeat(20)),
+  };
+}
+
+/** A deterministic mock quorum co-signer that always succeeds (fixed mask + sig). */
+function makeCoSigner(
+  signerMask = 0b111n,
+  sigG2 = "0x" + "ab".repeat(64)
+): IQuorumCoSigner & { calls: string[] } {
+  const calls: string[] = [];
+  return {
+    calls,
+    async coSign(messageHash: string) {
+      calls.push(messageHash);
+      return { signerMask, sigG2 };
+    },
   };
 }
 
@@ -102,9 +130,10 @@ function makeService(
   blockchain: any,
   config: any,
   archive: IProofArchive,
-  clock: () => number = clockAt(1_700_000_000_000)
+  clock: () => number = clockAt(1_700_000_000_000),
+  coSigner?: IQuorumCoSigner
 ) {
-  return new AuditService(blockchain, config, makeRegistry(), clock, () => 0, archive);
+  return new AuditService(blockchain, config, makeRegistry(), clock, () => 0, archive, coSigner);
 }
 
 /** A blockchain whose operator is genuinely OVER limit: debt (2000) > creditLimit (1000). */
@@ -178,7 +207,7 @@ describe("AuditService", () => {
   it("healthy operator (debt 0 ≤ limit) → no detection, no proposal", async () => {
     const created: any[] = [];
     const blockchain = makeBlockchain({
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -196,7 +225,7 @@ describe("AuditService", () => {
       getCreditLimit: async () => 1000n,
       getAvailableCredit: async () => 0n, // fully used, but that is AT the limit
       getDebt: async () => 1000n, // debt == limit → NOT over
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -214,7 +243,7 @@ describe("AuditService", () => {
       getCreditLimit: async () => 1000n,
       getAvailableCredit: async () => 0n,
       getDebt: async () => null, // BOTH SP and Registry reads revert
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -229,7 +258,7 @@ describe("AuditService", () => {
   it("STRICT over-limit (debt > limit) → files a proposal AND archives a content-addressed proof", async () => {
     const created: any[] = [];
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xPROPOSALTX", proposalId: 7n };
       },
@@ -337,7 +366,7 @@ describe("AuditService", () => {
   it("content-address is deterministic + idempotent: same violation twice → one archived proof", async () => {
     const created: any[] = [];
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -353,7 +382,7 @@ describe("AuditService", () => {
   it("dedup: same violation@block over many ticks → exactly ONE proposal", async () => {
     const created: any[] = [];
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -369,7 +398,7 @@ describe("AuditService", () => {
   it("dedup: an already-archived proof (prior process) → no new proposal", async () => {
     const created: any[] = [];
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -395,7 +424,7 @@ describe("AuditService", () => {
     let block = 1000;
     let now = 1_700_000_000_000;
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -425,7 +454,7 @@ describe("AuditService", () => {
 
   it("proposal write failure → proof still archived (evidence never lost), proposalTx null", async () => {
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async () => {
+      createProposalWithEvidence: async () => {
         throw new Error("reverted: not authorized");
       },
     });
@@ -442,7 +471,7 @@ describe("AuditService", () => {
     const op2 = "0x" + "ab".repeat(20);
     const created: string[] = [];
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async (_addr: string, operator: string) => {
+      createProposalWithEvidence: async (_addr: string, operator: string) => {
         created.push(operator);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -526,7 +555,7 @@ describe("AuditService", () => {
       getCreditLimit: async () => 0n, // unconfigured / de-registered
       getAvailableCredit: async () => 0n,
       getDebt: async () => 5000n, // has debt, but a zero limit must NOT be treated as over-limit
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -541,7 +570,7 @@ describe("AuditService", () => {
   it("Fix 2: creditLimit>0 with debt>limit (credit exhausted) → proposal filed", async () => {
     const created: any[] = [];
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -557,7 +586,7 @@ describe("AuditService", () => {
     let block = 5000;
     let now = 1_700_000_000_000;
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async () => {
+      createProposalWithEvidence: async () => {
         attempts++;
         throw new Error("reverted: proposer not an active validator");
       },
@@ -601,7 +630,7 @@ describe("AuditService", () => {
       },
     };
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async () => ({ txHash: "0xABC", proposalId: 1n }),
+      createProposalWithEvidence: async () => ({ txHash: "0xABC", proposalId: 1n }),
     });
     blockchain.getBlockNumber = async () => 5000; // SAME violation@block both ticks
     const svc = makeService(blockchain, makeConfig(), flakyArchive);
@@ -617,7 +646,7 @@ describe("AuditService", () => {
   // ── FIX 4: proof carries the REAL on-chain proposal id (no fabrication) ─────────
   it("Fix 4: the proof carries the REAL on-chain proposal id parsed from the event", async () => {
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async () => ({ txHash: "0xABC", proposalId: 4242n }),
+      createProposalWithEvidence: async () => ({ txHash: "0xABC", proposalId: 4242n }),
     });
     const archive = makeArchive();
     const svc = makeService(blockchain, makeConfig(), archive);
@@ -632,7 +661,7 @@ describe("AuditService", () => {
 
   it("Fix 4: an unresolved id (event absent) → proposalId null + note, never fabricated", async () => {
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async () => ({ txHash: "0xDEF", proposalId: null }),
+      createProposalWithEvidence: async () => ({ txHash: "0xDEF", proposalId: null }),
     });
     const archive = makeArchive();
     const svc = makeService(blockchain, makeConfig(), archive);
@@ -649,7 +678,7 @@ describe("AuditService", () => {
       getCreditLimit: async () => 1000n, // stale/low Registry limit
       getAvailableCredit: async () => 500n, // SP says the operator is still within its ceiling
       getDebt: async () => 2000n, // exceeds the Registry limit ONLY
-      createSlashProposal: async (...args: any[]) => {
+      createProposalWithEvidence: async (...args: any[]) => {
         created.push(args);
         return { txHash: "0xTX", proposalId: 7n };
       },
@@ -720,7 +749,7 @@ describe("AuditService", () => {
   it("archives the REAL 7-field messageHash matching BLSAggregator.verifyAndExecute", async () => {
     const now = 1_700_000_000_000;
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async () => ({ txHash: "0xTX", proposalId: 7n }),
+      createProposalWithEvidence: async () => ({ txHash: "0xTX", proposalId: 7n }),
     });
     const archive = makeArchive();
     const svc = makeService(blockchain, makeConfig(), archive, clockAt(now));
@@ -739,7 +768,7 @@ describe("AuditService", () => {
 
   it("unresolved proposal id → messageHash placeholder '0x' (no on-chain proposal to sign)", async () => {
     const blockchain = overLimitBlockchain({
-      createSlashProposal: async () => ({ txHash: "0xDEF", proposalId: null }),
+      createProposalWithEvidence: async () => ({ txHash: "0xDEF", proposalId: null }),
     });
     const archive = makeArchive();
     const svc = makeService(blockchain, makeConfig(), archive);
@@ -747,9 +776,169 @@ describe("AuditService", () => {
     expect(archive.records[0].messageHash).toBe("0x");
   });
 
-  it("coordinateQuorumCoSign is deferred to increment 2 (throws)", async () => {
-    const svc = makeService(makeBlockchain(), makeConfig(), makeArchive());
-    await expect(svc.coordinateQuorumCoSign()).rejects.toThrow(/increment 2/);
+  // ── INCREMENT 2: two-step slash-consensus orchestration ─────────────────────────
+
+  /** A blockchain whose write calls are recorded in a shared, ordered log. */
+  function recordingBlockchain(order: string[], overrides: Record<string, any> = {}) {
+    return overLimitBlockchain({
+      queueSlashWithProof: async (...args: any[]) => {
+        order.push("queue");
+        return `0xQUEUE:${JSON.stringify(args.slice(1, 4))}`;
+      },
+      createProposalWithEvidence: async (...args: any[]) => {
+        order.push("create");
+        (recordingBlockchain as any).lastCreateArgs = args;
+        return { txHash: "0xPROPOSALTX", proposalId: 7n };
+      },
+      executeSlashWithProof: async (...args: any[]) => {
+        order.push("execute");
+        (recordingBlockchain as any).lastExecuteArgs = args;
+        return "0xEXECUTETX";
+      },
+      ...overrides,
+    });
+  }
+
+  it("default (executeSlash off): files the proposal but NEVER queues/executes a slash", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order);
+    const archive = makeArchive();
+    // Default config has no auditExecuteSlash → the second safety gate is closed.
+    const svc = makeService(blockchain, makeConfig(), archive, undefined, makeCoSigner());
+    await svc.tick();
+    expect(order).toEqual(["create"]); // proposal filed, no queue/execute
+    expect(archive.records).toHaveLength(1);
+    // The filed proposal binds the archived evidence: evidenceHash === proofHash.
+    const createArgs = (recordingBlockchain as any).lastCreateArgs;
+    expect(createArgs[4]).toBe(archive.records[0].proofHash);
+  });
+
+  it("executeSlash=true: calls queue → createProposalWithEvidence → execute in that order", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order);
+    const archive = makeArchive();
+    const coSigner = makeCoSigner();
+    const now = 1_700_000_000_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      clockAt(now),
+      coSigner
+    );
+    await svc.tick();
+
+    // Exact on-chain call order.
+    expect(order).toEqual(["queue", "create", "execute"]);
+    expect(archive.records).toHaveLength(1);
+    const proof = archive.records[0];
+    const epoch = Math.floor(now / 1000);
+
+    // createProposalWithEvidence bound the archived evidence: (dvt, op, level, reason, proofHash).
+    const createArgs = (recordingBlockchain as any).lastCreateArgs;
+    expect(createArgs[0]).toBe(DVT_VALIDATOR);
+    expect(createArgs[1]).toBe(OPERATOR);
+    expect(createArgs[2]).toBe(1); // SlashLevel.MINOR
+    expect(createArgs[4]).toBe(proof.proofHash);
+
+    // execute used the REAL proposal id (7) with empty rep arrays + the same epoch.
+    const execArgs = (recordingBlockchain as any).lastExecuteArgs;
+    expect(execArgs[0]).toBe(DVT_VALIDATOR);
+    expect(execArgs[1]).toBe(7n);
+    expect(execArgs[2]).toEqual([]);
+    expect(execArgs[3]).toEqual([]);
+    expect(execArgs[4]).toBe(epoch);
+
+    // The quorum co-signer was invoked exactly twice — over the queue then the execute preimage.
+    expect(coSigner.calls).toHaveLength(2);
+    const expectedQueue = buildQueueMessageHash(OPERATOR, 1, epoch, 11155111);
+    const expectedExec = buildExecuteMessageHash(7n, OPERATOR, 1, epoch, 11155111, proof.proofHash);
+    expect(coSigner.calls[0]).toBe(expectedQueue);
+    expect(coSigner.calls[1]).toBe(expectedExec);
+
+    // The execute step carried the abi-encoded proof (uint256 signerMask, bytes sigG2).
+    const expectedProof = encodeProof(0b111n, "0x" + "ab".repeat(64));
+    expect(execArgs[5]).toBe(expectedProof);
+  });
+
+  it("executeSlash=true + real proposalId: execute is bound to that exact id", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, {
+      createProposalWithEvidence: async () => ({ txHash: "0xABC", proposalId: 4242n }),
+      executeSlashWithProof: async (...args: any[]) => {
+        order.push("execute");
+        (recordingBlockchain as any).lastExecuteArgs = args;
+        return "0xEXECUTETX";
+      },
+    });
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      makeArchive(),
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    expect((recordingBlockchain as any).lastExecuteArgs[1]).toBe(4242n);
+  });
+
+  it("executeSlash=true but proposalId unresolved (event absent) → execute is SKIPPED", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, {
+      createProposalWithEvidence: async () => {
+        order.push("create");
+        return { txHash: "0xDEF", proposalId: null };
+      },
+    });
+    const archive = makeArchive();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    // A fabricated id would revert on-chain, so execute must not run; queue + proposal still did.
+    expect(order).toEqual(["queue", "create"]);
+    expect(archive.records).toHaveLength(1);
+  });
+
+  it("executeSlash=true with the default PendingSlotCoSigner stub → co-sign throws, caught, evidence archived", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order);
+    const archive = makeArchive();
+    // No coSigner injected → defaults to PendingSlotCoSigner, whose coSign throws.
+    const svc = makeService(blockchain, makeConfig({ auditExecuteSlash: true }), archive);
+    // The tick must survive the stub's throw (loop never crashes).
+    await expect(svc.tick()).resolves.toBeUndefined();
+    // queue co-sign threw (queue skipped) but the proposal was still filed; execute co-sign
+    // also threw (execute skipped) — yet the evidence is archived regardless.
+    expect(order).toEqual(["create"]);
+    expect(archive.records).toHaveLength(1);
+    expect(archive.records[0].proposalTx).toBe("0xPROPOSALTX");
+  });
+
+  it("executeSlash=true: a queue tx failure is caught; proposal + execute still proceed, evidence archived", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, {
+      queueSlashWithProof: async () => {
+        order.push("queue-fail");
+        throw new Error("reverted: queue not authorized");
+      },
+    });
+    const archive = makeArchive();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await expect(svc.tick()).resolves.toBeUndefined();
+    // queue reverted but was swallowed; create + execute still ran; evidence archived.
+    expect(order).toEqual(["queue-fail", "create", "execute"]);
+    expect(archive.records).toHaveLength(1);
   });
 
   it("computeJitterMs stays within [0, intervalMs)", () => {
