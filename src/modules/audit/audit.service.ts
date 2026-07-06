@@ -90,6 +90,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * when both auditEnabled AND this are true — so nothing is auto-slashed until explicitly enabled.
    */
   private readonly executeSlash: boolean;
+  /** Confirmation depth for the finalized-block fallback (finding-3, reorg-safe evidence). */
+  private readonly finalityConfirmations: number;
+  /** How far back to scan on-chain slash-executed events for the durable guard (finding-2). */
+  private readonly slashLookbackBlocks: number;
   private readonly archive: IProofArchive;
   /** Quorum co-sign seam — default PendingSlotCoSigner (fails closed until SP assigns BLS slots). */
   private readonly coSigner: IQuorumCoSigner;
@@ -173,6 +177,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.gtokenStakingAddress = config.get<string>("auditGtokenStakingAddress") ?? "";
     this.apntsTokenAddress = config.get<string>("auditApntsTokenAddress") ?? "";
     this.executeSlash = config.get<boolean>("auditExecuteSlash") === true;
+    this.finalityConfirmations = config.get<number>("auditFinalityConfirmations") ?? 12;
+    this.slashLookbackBlocks = config.get<number>("auditSlashLookbackBlocks") ?? 50_000;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
     this.archive =
@@ -300,8 +306,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * Record that an on-chain slash EXECUTED for this operator+rule so the armed execute path does
-   * not re-slash the same ongoing condition on later ticks. Bounded by a defensive LRU-style cap.
+   * Record (in-memory only) that an on-chain slash EXECUTED for this operator+rule so the armed
+   * execute path does not re-slash the same ongoing condition on later ticks. Bounded by a
+   * defensive LRU-style cap. Durability across restart is handled separately via the archive
+   * journal (recordCoarseSlashed / archive.recordSlashed).
    */
   private markCoarseSlashed(coarseKey: string): void {
     this.slashedCoarseKeys.add(coarseKey);
@@ -312,11 +320,35 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * Clear the coarse over-slash guard once the operator is observed HEALTHY for a rule — the
-   * violation has resolved, so a genuinely new future violation is allowed to slash again.
+   * Record an executed slash in BOTH the in-memory guard and the DURABLE archive journal
+   * (finding-2), so an in-process restart reloads the marker and does not re-slash the same
+   * sustained condition. The archive write is best-effort: a journal IO failure must not abort
+   * the audit (the on-chain slash already happened; the in-memory guard still holds this run).
    */
-  private clearCoarseSlashed(operator: string, rule: string): void {
-    this.slashedCoarseKeys.delete(this.coarseKey(operator, rule));
+  private async recordCoarseSlashed(coarseKey: string): Promise<void> {
+    this.markCoarseSlashed(coarseKey);
+    try {
+      await this.archive.recordSlashed(coarseKey);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Audit: failed to persist durable slashed marker ${coarseKey} — ${msg}`);
+    }
+  }
+
+  /**
+   * Clear the coarse over-slash guard (in-memory AND durable journal) once the operator is
+   * observed HEALTHY for a rule — the violation has resolved, so a genuinely new future violation
+   * is allowed to slash again. The durable removal is best-effort (a healthy read is not itself
+   * safety-critical; the on-chain slash-executed scan remains as the conservative backstop).
+   */
+  private async clearCoarseSlashed(operator: string, rule: string): Promise<void> {
+    const coarseKey = this.coarseKey(operator, rule);
+    this.slashedCoarseKeys.delete(coarseKey);
+    try {
+      await this.archive.removeSlashed(coarseKey);
+    } catch {
+      // best-effort — a stale durable marker is re-checked against the chain scan anyway.
+    }
   }
 
   /**
@@ -368,9 +400,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * credit-over-limit rule. On a confirmed violation, archive a proof and file a proposal.
    */
   async auditOperator(operator: string): Promise<void> {
-    // Pin EVERY rule input to ONE block so creditLimit, availableCredit and debt can never
-    // be mixed across blocks (no phantom over-limit from a mid-read state change).
-    const violationBlock = await this.blockchainService.getBlockNumber();
+    // Pin EVERY rule input to ONE FINALIZED block (finding-3) so creditLimit, availableCredit and
+    // debt can never be mixed across blocks (no phantom over-limit from a mid-read state change)
+    // AND the block the irreversible slash is justified by cannot be undone by a reorg. The block
+    // HASH is recorded in the evidence so the justification is pinned to a specific finalized block.
+    const { number: violationBlock, hash: violationBlockHash } =
+      await this.blockchainService.getViolationBlock(this.finalityConfirmations);
 
     // All per-operator reads are pinned to the SAME block; issue them concurrently (5-6 reads)
     // rather than serially. reputation + DVT stake lock are auxiliary evidence (not part of the
@@ -413,7 +448,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.debug(
         `Audit: ${operator} creditLimit=0 (unconfigured/de-registered) — SKIP (fail-safe, not over-limit)`
       );
-      this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
+      await this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
       return;
     }
     // CROSS-CONTRACT AGREEMENT: both SuperPaymaster signals must agree before flagging. If
@@ -424,7 +459,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.debug(
         `Audit: ${operator} availableCredit=${availableCredit}>0 (within SP ceiling) — SKIP (no false over-limit)`
       );
-      this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
+      await this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
       return;
     }
 
@@ -439,14 +474,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.debug(
         `Audit: ${operator} not over limit (debt=${debt} ≤ limit=${creditLimit}, usage=${usageBps}bps)`
       );
-      this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
+      await this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
       return;
     }
     if (usageBps < this.creditThresholdBps) {
       this.logger.debug(
         `Audit: ${operator} over limit but under margin (usage=${usageBps}bps < ${this.creditThresholdBps}bps)`
       );
-      this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
+      await this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
       return;
     }
 
@@ -480,6 +515,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       creditLimit,
       debt,
       violationBlock,
+      violationBlockHash,
       sources,
       observedAt,
     });
@@ -508,6 +544,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     creditLimit: bigint;
     debt: bigint;
     violationBlock: number;
+    violationBlockHash: string;
     sources: EvidenceSource[];
     observedAt: number;
   }): Promise<AuditDetection | null> {
@@ -561,6 +598,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         threshold: v.creditLimit.toString(),
         sources: v.sources,
         violationBlock: v.violationBlock,
+        violationBlockHash: v.violationBlockHash,
         observedAt: v.observedAt,
       },
       proposalId: null,
@@ -599,7 +637,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           `${this.cooldownMs}ms) — attempt suppressed, archiving evidence only`
       );
       proposalIdNote = "id-unresolved: proposal attempt suppressed by cooldown";
-    } else if (this.executeSlash && (await this.isCoarseAlreadySlashed(coarseKey, v.operator))) {
+    } else if (
+      this.executeSlash &&
+      (await this.isCoarseAlreadySlashed(coarseKey, v.operator, v.violationBlock))
+    ) {
       // ARMED path OVER-SLASH GUARD (finding-4/5): a slash already executed (in-memory) or is
       // pending on-chain for this operator+rule → do NOT queue/execute the same ongoing condition
       // again, even after cooldownMs with an advancing block. Evidence is still archived (above).
@@ -615,21 +656,29 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // file-only (create only) paths go through coordinateQuorumCoSign — one createProposalWith-
       // Evidence call site. Every step catches its own failure so the evidence stays archived and
       // the poll loop never crashes.
-      const res = await this.coordinateQuorumCoSign({
-        operator: v.operator,
-        slashLevel: v.slashLevel,
-        reason: v.reason,
-        epoch,
-        evidenceHash: proofHash,
-      });
+      // Pass the in-flight `proof` so coordinateQuorumCoSign RE-ARCHIVES it after each CONFIRMED
+      // on-chain step (finding-4): a crash between a confirmed queue/execute tx and the final
+      // archive below can no longer lose that tx record — durable state always reflects what was
+      // actually submitted.
+      const res = await this.coordinateQuorumCoSign(
+        {
+          operator: v.operator,
+          slashLevel: v.slashLevel,
+          reason: v.reason,
+          epoch,
+          evidenceHash: proofHash,
+        },
+        proof
+      );
       proposalTx = res.proposalTx;
       onchainProposalId = res.proposalId;
       queueTx = res.queueTx;
       executeTx = res.executeTx;
       if (res.queueMessageHash) proof.queueMessageHash = res.queueMessageHash;
       if (executeTx !== null) {
-        // A slash actually executed → arm the over-slash guard + record the real co-sign material.
-        this.markCoarseSlashed(coarseKey);
+        // A slash actually executed → arm the DURABLE over-slash guard (in-memory + archive journal,
+        // finding-2) so a restart does not re-slash, and record the real co-sign material.
+        await this.recordCoarseSlashed(coarseKey);
         proof.signerMask = res.signerMask;
         proof.sigG2 = res.sigG2;
       }
@@ -641,13 +690,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       }
     }
 
-    // ── FINAL proof.messageHash = the 8-field EXECUTE preimage actually signed + submitted ──────
+    // ── FINAL proof.messageHash = the 8-field EXECUTE preimage actually SUBMITTED ────────────────
     // (finding-1) buildExecuteMessageHash(proposalId, operator, slashLevel, epoch, chainId,
     // evidenceHash=proofHash) — the SAME message the quorum co-signs and executeWithProof carries.
-    // When the id is unresolved there is no on-chain proposal to sign over → "0x" + a clear note.
+    // (finding-5) messageHash is set ONLY when the execute tx actually landed. When the proposal id
+    // resolved but NO execute was submitted (file-only path, or execute skipped/failed), the
+    // computed-but-unsubmitted preimage is kept under intendedExecuteMessageHash — never conflated
+    // with a submitted one. When the id is unresolved there is no preimage to compute at all → "0x".
     const proposalId: string | null = onchainProposalId !== null ? onchainProposalId.toString() : null;
     if (onchainProposalId !== null) {
-      proof.messageHash = buildExecuteMessageHash(
+      const executePreimage = buildExecuteMessageHash(
         onchainProposalId,
         v.operator,
         v.slashLevel,
@@ -655,7 +707,20 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         this.chainId,
         proofHash
       );
-      delete proof.messageHashNote;
+      if (executeTx !== null) {
+        // The execute actually ran: this IS the submitted preimage.
+        proof.messageHash = executePreimage;
+        delete proof.messageHashNote;
+        delete proof.intendedExecuteMessageHash;
+      } else {
+        // Proposal filed but nothing executed (file-only, or execute skipped/failed): the preimage
+        // is only an INTENT, kept out of messageHash so the record is unambiguous (finding-5).
+        proof.messageHash = "0x";
+        proof.intendedExecuteMessageHash = executePreimage;
+        proof.messageHashNote =
+          proposalIdNote ??
+          "intent-only: execute preimage computed but NOT submitted (see intendedExecuteMessageHash)";
+      }
     } else {
       proof.messageHash = "0x";
       proof.messageHashNote = proposalIdNote ?? "id-unresolved: no on-chain proposal to sign over";
@@ -697,14 +762,54 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * Is a slash already in effect for this operator+rule? Checks the in-memory coarse guard first
-   * (fast, within-process), then a best-effort on-chain pending-slash read (the durable, restart-
-   * surviving signal). On the current SP the getter is absent so isSlashPending returns null →
-   * unknown → falls back to the in-memory guard. A true on-chain flag is cached into the in-memory
-   * guard so subsequent ticks short-circuit without another RPC.
+   * Is a slash already in effect for this operator+rule? Layered guards, cheapest → most durable:
+   *
+   *   1. IN-MEMORY coarse guard (fast, within-process).
+   *   2. DURABLE archive journal (finding-2) — an executed-slash marker persisted to disk, so an
+   *      in-process RESTART reloads it and does not re-slash a still-sustained violation. Cached
+   *      back into the in-memory guard on a hit.
+   *   3. ON-CHAIN slash-executed EVENTS (finding-2) — SlashExecutedWithProof / SlashExecuted within
+   *      a recent block window on the BLSAggregator and SuperPaymaster. An emitted event is a
+   *      permanent on-chain fact, so this is the authoritative, restart-surviving guard even if the
+   *      local journal was lost. A hit is persisted to BOTH the durable journal and the memory guard.
+   *   4. Best-effort on-chain PENDING flag (isSlashPending) — null ("unknown") on the current SP
+   *      (private `_pendingSlash`), so it only helps a future deployment that exposes a getter.
+   *
+   * `violationBlock` bounds the event scan window (`violationBlock - slashLookbackBlocks`). Every
+   * remote read is best-effort: an error is swallowed and treated as "no signal", never "not slashed".
    */
-  private async isCoarseAlreadySlashed(coarseKey: string, operator: string): Promise<boolean> {
+  private async isCoarseAlreadySlashed(
+    coarseKey: string,
+    operator: string,
+    violationBlock: number
+  ): Promise<boolean> {
     if (this.slashedCoarseKeys.has(coarseKey)) return true;
+
+    // (2) DURABLE journal — survives a restart within the same process/disk.
+    try {
+      if (await this.archive.hasSlashed(coarseKey)) {
+        this.markCoarseSlashed(coarseKey); // cache in-memory (do not re-write the marker)
+        return true;
+      }
+    } catch {
+      // best-effort: journal read error → fall through to the on-chain scan.
+    }
+
+    // (3) ON-CHAIN slash-executed events — the authoritative cross-restart guard.
+    try {
+      const fromBlock = Math.max(0, violationBlock - this.slashLookbackBlocks);
+      const scanTargets = [this.blsAggregatorAddress, this.superPaymasterAddress].filter(Boolean);
+      for (const target of scanTargets) {
+        if (await this.blockchainService.getRecentSlashExecuted(target, operator, fromBlock)) {
+          await this.recordCoarseSlashed(coarseKey); // persist durable + memory
+          return true;
+        }
+      }
+    } catch {
+      // best-effort: RPC/range error → fall through to the pending flag.
+    }
+
+    // (4) Best-effort on-chain pending flag (null/unknown on the current SP).
     try {
       const pending = await this.blockchainService.isSlashPending(this.superPaymasterAddress, operator);
       if (pending === true) {
@@ -712,7 +817,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         return true;
       }
     } catch {
-      // best-effort: getter absent / RPC error → unknown, rely on the in-memory guard only.
+      // best-effort: getter absent / RPC error → unknown, rely on the guards above.
     }
     return false;
   }
@@ -726,13 +831,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    *                 binding the on-chain slash to the archived evidence. ALWAYS runs.
    *   3. EXECUTE  — (ARMED only) co-sign the 8-field execute preimage (bound to that real id +
    *                 evidenceHash) → executeWithProof (slash-only ⇒ repUsers/newScores empty).
-   *                 Skipped when the proposal id is unresolved (a fabricated id would revert).
+   *                 STRICTLY contingent on the TWO-STEP SAFETY (finding-1): it runs ONLY when the
+   *                 queue step CONFIRMED (queueTx !== null) AND the proposal id resolved. If the
+   *                 queue co-sign/tx failed, the whole slash aborts to file+archive only — a slash
+   *                 must never execute without its confirmed queue pre-flag.
    *
    * When executeSlash is OFF (default) only step 2 runs — the file-only path: proposal filed +
    * evidence bound, nothing queued or slashed. Each step is wrapped: a co-sign or tx failure is
    * logged and swallowed so the caller still archives the evidence (evidence never lost) and the
    * poll loop never crashes. With the default PendingSlotCoSigner every co-sign throws (SP
    * validator slots pending the 24h timelock), so the armed path reduces to just the proposal.
+   *
+   * When `proof` is passed, it is RE-ARCHIVED after each CONFIRMED on-chain step (finding-4) so a
+   * crash between a confirmed tx and the caller's final archive cannot lose that tx record.
    *
    * Returns the queue/proposal/execute tx hashes, the real proposalId, the queueMessageHash (armed
    * path, so the caller can archive the co-signed queue preimage), and the EXECUTE co-sign material
@@ -742,13 +853,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * signatures over the messageHash, build the signerMask bitmap by SP-assigned validator slot,
    * aggregate into sigG2 — lands once SP hands out slots via registerBLSPublicKey.
    */
-  async coordinateQuorumCoSign(args: {
-    operator: string;
-    slashLevel: number;
-    reason: string;
-    epoch: number;
-    evidenceHash: string;
-  }): Promise<{
+  async coordinateQuorumCoSign(
+    args: {
+      operator: string;
+      slashLevel: number;
+      reason: string;
+      epoch: number;
+      evidenceHash: string;
+    },
+    proof?: SlashProof
+  ): Promise<{
     proposalTx: string | null;
     proposalId: bigint | null;
     queueTx: string | null;
@@ -767,20 +881,39 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     let signerMask = "0x";
     let sigG2 = "0x";
 
+    // Re-archive the in-flight proof after a CONFIRMED on-chain step (finding-4). Best-effort: a
+    // journal IO error must not abort the orchestration (the on-chain tx already happened, and the
+    // caller re-archives once more at the end). Idempotent on proofHash.
+    const persistStep = async (): Promise<void> => {
+      if (!proof) return;
+      try {
+        await this.archive.put(proof);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.error(`Audit: ${operator} per-step re-archive failed — ${msg}`);
+      }
+    };
+
     // ── Step 1: QUEUE (ARMED only, quorum co-signed) ──────────────────────────────
     if (armed) {
       try {
         queueMessageHash = buildQueueMessageHash(operator, slashLevel, epoch, this.chainId);
         const cosign = await this.coSigner.coSign(queueMessageHash);
-        const proof = encodeProof(cosign.signerMask, cosign.sigG2);
+        const encoded = encodeProof(cosign.signerMask, cosign.sigG2);
         queueTx = await this.blockchainService.queueSlashWithProof(
           this.dvtValidatorAddress,
           operator,
           slashLevel,
           epoch,
-          proof
+          encoded
         );
         this.logger.warn(`Audit: ${operator} slash QUEUED (tx ${queueTx})`);
+        // Durable BEFORE execute: the confirmed queueTx is persisted now (finding-4).
+        if (proof) {
+          proof.queueTx = queueTx;
+          proof.queueMessageHash = queueMessageHash;
+          await persistStep();
+        }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         this.logger.error(
@@ -805,9 +938,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.error(`Audit: ${operator} createProposal failed — ${msg}`);
     }
 
-    // ── Step 3: EXECUTE (ARMED only, quorum co-signed) — only with a REAL proposal id ──
+    // ── Step 3: EXECUTE (ARMED only) — TWO-STEP SAFETY: confirmed queue + real id required ──
     if (armed) {
-      if (proposalId === null) {
+      if (queueTx === null) {
+        // finding-1: never execute a slash whose queue pre-flag did not confirm. Abort to
+        // file+archive only — the evidence + proposal remain, but no irreversible slash fires.
+        this.logger.error(
+          `Audit: ${operator} slash execute SKIPPED — queue step did not confirm (queueTx null); ` +
+            `two-step safety requires a confirmed queueSlashWithProof before executeWithProof`
+        );
+      } else if (proposalId === null) {
         this.logger.error(
           `Audit: ${operator} slash execute SKIPPED — no real proposalId ` +
             `(createProposal failed or ProposalCreated absent); a fabricated id would revert`
@@ -823,14 +963,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
             evidenceHash
           );
           const cosign = await this.coSigner.coSign(execMsgHash);
-          const proof = encodeProof(cosign.signerMask, cosign.sigG2);
+          const encoded = encodeProof(cosign.signerMask, cosign.sigG2);
           executeTx = await this.blockchainService.executeSlashWithProof(
             this.dvtValidatorAddress,
             proposalId,
             [], // slash-only ⇒ no reputation users
             [], // slash-only ⇒ no reputation scores
             epoch,
-            proof
+            encoded
           );
           // Record the EXECUTE co-sign material so the archived proof references the real slash.
           signerMask = ethers.toBeHex(cosign.signerMask);
@@ -838,6 +978,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           this.logger.warn(
             `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
           );
+          // Durable immediately after the irreversible slash confirms (finding-4).
+          if (proof) {
+            proof.executeTx = executeTx;
+            proof.signerMask = signerMask;
+            proof.sigG2 = sigG2;
+            await persistStep();
+          }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           this.logger.error(

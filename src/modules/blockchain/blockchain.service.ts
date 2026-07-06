@@ -442,6 +442,94 @@ export class BlockchainService {
     return this.provider.getBlockNumber();
   }
 
+  /**
+   * The block an irreversible slash is justified against — a FINALIZED (fallback: safe) block,
+   * returned as `{ number, hash }` (finding-3). Pinning the slash evidence to a finalized block,
+   * and recording its HASH, makes the justification reorg-safe: a reorg that rewrites the chain
+   * head cannot silently invalidate the block the audit read its rule inputs at.
+   *
+   * Order of preference: `provider.getBlock("finalized")`, then `"safe"` (post-Merge PoS tags),
+   * then — for RPCs/chains that expose neither — latest MINUS `confirmations` blocks. Throws only
+   * if even that fallback cannot resolve a block (misconfigured provider). All rule reads are then
+   * block-pinned to the returned `number` (via blockTag), so nothing is read at an unstable head.
+   */
+  async getViolationBlock(
+    confirmations = 12
+  ): Promise<{ number: number; hash: string }> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    for (const tag of ["finalized", "safe"] as const) {
+      try {
+        const b = await this.provider.getBlock(tag);
+        if (b && typeof b.number === "number" && b.hash) {
+          return { number: b.number, hash: b.hash };
+        }
+      } catch {
+        // This RPC/chain does not support the tag — fall through to the next.
+      }
+    }
+    // Fallback: latest minus a confirmation depth (chains without finalized/safe tags).
+    const latest = await this.provider.getBlockNumber();
+    const target = Math.max(0, latest - Math.max(0, confirmations));
+    const b = await this.provider.getBlock(target);
+    if (!b || typeof b.number !== "number" || !b.hash) {
+      throw new Error(
+        `getViolationBlock: could not resolve a finalized/safe block (latest ${latest}, target ${target})`
+      );
+    }
+    return { number: b.number, hash: b.hash };
+  }
+
+  /**
+   * DURABLE (restart-surviving) over-slash guard (finding-2): did `operator` already get slashed
+   * recently on `contractAddress`? Queries the on-chain slash-executed events within a bounded
+   * `[fromBlock, latest]` window and returns true on the first match. Both event shapes are tried
+   * (either can carry the executed slash), each topic-filtered by the indexed `operator`:
+   *
+   *   SuperPaymaster.SlashExecutedWithProof(address indexed operator, uint8 level, ...)
+   *   BLSAggregator.SlashExecuted(uint256 indexed proposalId, address indexed operator, uint8 level)
+   *
+   * Unlike the private `_pendingSlash` (no getter → isSlashPending returns null), an emitted event
+   * is a permanent on-chain fact, so this survives a node restart and is the authoritative guard
+   * against re-slashing a sustained violation. Best-effort: an absent event / RPC range error on a
+   * given filter is swallowed (treated as "no match"); returns false when nothing is found.
+   */
+  async getRecentSlashExecuted(
+    contractAddress: string,
+    operator: string,
+    fromBlock: number
+  ): Promise<boolean> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const iface = new ethers.Interface([
+      "event SlashExecutedWithProof(address indexed operator, uint8 level, uint256 penalty, bytes32 proofHash, uint256 timestamp)",
+      "event SlashExecuted(uint256 indexed proposalId, address indexed operator, uint8 level)",
+    ]);
+    const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
+    const filters = [
+      // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]).
+      { topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic] },
+      // SlashExecuted: proposalId is 1st indexed (topics[1]), operator 2nd (topics[2]).
+      { topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic] },
+    ];
+    for (const f of filters) {
+      try {
+        const logs = await this.provider.getLogs({
+          address: contractAddress,
+          fromBlock: Math.max(0, fromBlock),
+          toBlock: "latest",
+          topics: f.topics as (string | null)[],
+        });
+        if (logs.length > 0) return true;
+      } catch {
+        // Event not defined on this contract, or RPC range/filter error — try the next.
+      }
+    }
+    return false;
+  }
+
   /** Runtime bytecode at `address` ("0x" when there's no contract). Used for a fail-closed
    *  bootstrap existence check before the audit poll trusts an address. */
   async getCode(address: string, blockTag?: number): Promise<string> {

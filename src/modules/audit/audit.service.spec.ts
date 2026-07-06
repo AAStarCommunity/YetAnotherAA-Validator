@@ -16,6 +16,8 @@ const GTOKEN_STAKING = "0x" + "78".repeat(20);
 /** aPNTs xPNTs token — where getDebt actually lives (per the real SP ABI). */
 const APNTS_TOKEN = "0x696A73701b104c6cCBbAadDD2216788ea08EaB89";
 const BLOCK = 12_345;
+/** Finalized-block hash the mock getViolationBlock returns (finding-3 reorg-safe evidence). */
+const BLOCK_HASH = "0x" + "bb".repeat(32);
 
 const BASE_CONFIG: Record<string, unknown> = {
   auditEnabled: true,
@@ -45,6 +47,8 @@ function makeConfig(overrides: Record<string, unknown> = {}) {
 function makeBlockchain(
   overrides: Partial<{
     getBlockNumber: () => Promise<number>;
+    getViolationBlock: (confirmations?: number) => Promise<{ number: number; hash: string }>;
+    getRecentSlashExecuted: (addr: string, op: string, fromBlock: number) => Promise<boolean>;
     getCode: (addr: string) => Promise<string>;
     getCreditLimit: (addr: string, op: string, bt?: number) => Promise<bigint>;
     getAvailableCredit: (
@@ -67,6 +71,15 @@ function makeBlockchain(
 ): any {
   return {
     getBlockNumber: overrides.getBlockNumber ?? (async () => BLOCK),
+    // getViolationBlock delegates to this.getBlockNumber() (non-arrow so `this` binds to the mock),
+    // so tests that reassign blockchain.getBlockNumber keep controlling the pinned violation block.
+    getViolationBlock:
+      overrides.getViolationBlock ??
+      async function (this: any) {
+        return { number: await this.getBlockNumber(), hash: BLOCK_HASH };
+      },
+    // No prior slash by default → the durable on-chain over-slash guard reports "not slashed".
+    getRecentSlashExecuted: overrides.getRecentSlashExecuted ?? (async () => false),
     getCode: overrides.getCode ?? (async () => "0x60006000fd"),
     getCreditLimit: overrides.getCreditLimit ?? (async () => 1000n),
     getAvailableCredit: overrides.getAvailableCredit ?? (async () => 1000n),
@@ -100,10 +113,12 @@ function makeCoSigner(
 }
 
 /** In-memory archive so tests never touch the filesystem. */
-function makeArchive(): IProofArchive & { records: SlashProof[] } {
+function makeArchive(): IProofArchive & { records: SlashProof[]; slashed: Set<string> } {
   const records: SlashProof[] = [];
+  const slashed = new Set<string>();
   return {
     records,
+    slashed,
     async put(proof: SlashProof) {
       // Idempotent on proofHash, like LocalProofArchive.
       const existing = records.findIndex(r => r.proofHash === proof.proofHash);
@@ -116,6 +131,15 @@ function makeArchive(): IProofArchive & { records: SlashProof[] } {
     },
     async count() {
       return records.length;
+    },
+    async recordSlashed(coarseKey: string) {
+      slashed.add(coarseKey);
+    },
+    async hasSlashed(coarseKey: string) {
+      return slashed.has(coarseKey);
+    },
+    async removeSlashed(coarseKey: string) {
+      slashed.delete(coarseKey);
     },
   };
 }
@@ -634,6 +658,11 @@ describe("AuditService", () => {
       async count() {
         return records.length;
       },
+      async recordSlashed() {},
+      async hasSlashed() {
+        return false;
+      },
+      async removeSlashed() {},
     };
     const blockchain = overLimitBlockchain({
       createProposalWithEvidence: async () => ({ txHash: "0xABC", proposalId: 1n }),
@@ -754,8 +783,8 @@ describe("AuditService", () => {
     expect((await svc.getStatus()).enabled).toBe(false);
   });
 
-  // ── FINDING 1: proof.messageHash == the 8-field EXECUTE preimage actually signed + submitted ──
-  it("Finding 1: archives the 8-field EXECUTE preimage (buildExecuteMessageHash) bound to the real id + proofHash", async () => {
+  // ── FINDING 1 / FINDING 5: submitted vs intended EXECUTE preimage ────────────────
+  it("Finding 5: file-only (executeSlash off) records the intendedExecuteMessageHash, NOT messageHash (nothing submitted)", async () => {
     const now = 1_700_000_000_000;
     const blockchain = overLimitBlockchain({
       createProposalWithEvidence: async () => ({ txHash: "0xTX", proposalId: 7n }),
@@ -768,29 +797,34 @@ describe("AuditService", () => {
     // epoch is the violationBlock (deterministic), NOT Math.floor(now/1000).
     const epoch = BLOCK;
     const expected = buildExecuteMessageHash(7n, OPERATOR, 1, epoch, 11155111, proof.proofHash);
-    expect(proof.messageHash).toBe(expected);
-    // Sanity: it is NOT the retired 7-field inc-1 preimage.
+    // finding-5: nothing was submitted (file-only) → messageHash stays "0x"; the computed preimage
+    // is kept, unambiguously, as INTENDED — never conflated with a submitted one.
+    expect(proof.messageHash).toBe("0x");
+    expect(proof.intendedExecuteMessageHash).toBe(expected);
+    expect(proof.messageHashNote).toBeDefined();
+    expect(proof.executeTx).toBeUndefined();
+    // Sanity: the intended preimage is the 8-field one, NOT the retired 7-field inc-1 preimage.
     const retired7field = ethers.keccak256(
       new ethers.AbiCoder().encode(
         ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256"],
         [7n, OPERATOR, 1, [], [], epoch, 11155111]
       )
     );
-    expect(proof.messageHash).not.toBe(retired7field);
-    expect(proof.messageHashNote).toBeUndefined();
+    expect(proof.intendedExecuteMessageHash).not.toBe(retired7field);
   });
 
-  it("Finding 1: the file-only (executeSlash off) path ALSO archives the 8-field execute preimage", async () => {
+  it("Finding 5: file-only path binds the execute preimage as INTENT only (proposalId 9)", async () => {
     const blockchain = overLimitBlockchain({
       createProposalWithEvidence: async () => ({ txHash: "0xTX", proposalId: 9n }),
     });
     const archive = makeArchive();
-    // Default config → executeSlash OFF; no queue/execute, but the proof still binds the execute preimage.
+    // Default config → executeSlash OFF; no queue/execute → intended preimage, not a submitted one.
     const svc = makeService(blockchain, makeConfig(), archive);
     await svc.tick();
     const proof = archive.records[0];
     const expected = buildExecuteMessageHash(9n, OPERATOR, 1, BLOCK, 11155111, proof.proofHash);
-    expect(proof.messageHash).toBe(expected);
+    expect(proof.messageHash).toBe("0x");
+    expect(proof.intendedExecuteMessageHash).toBe(expected);
   });
 
   it("unresolved proposal id → messageHash placeholder '0x' + a note (no on-chain proposal to sign)", async () => {
@@ -962,12 +996,19 @@ describe("AuditService", () => {
     expect(archive.records[0].proposalTx).toBe("0xPROPOSALTX");
   });
 
-  it("executeSlash=true: a queue tx failure is caught; proposal + execute still proceed, evidence archived", async () => {
+  it("Finding 1 (CRITICAL): a queue tx failure ABORTS the slash — execute is NOT called (two-step safety)", async () => {
     const order: string[] = [];
+    let executeCalls = 0;
     const blockchain = recordingBlockchain(order, {
       queueSlashWithProof: async () => {
         order.push("queue-fail");
         throw new Error("reverted: queue not authorized");
+      },
+      executeSlashWithProof: async (...args: any[]) => {
+        executeCalls++;
+        order.push("execute");
+        (recordingBlockchain as any).lastExecuteArgs = args;
+        return "0xEXECUTETX";
       },
     });
     const archive = makeArchive();
@@ -979,9 +1020,20 @@ describe("AuditService", () => {
       makeCoSigner()
     );
     await expect(svc.tick()).resolves.toBeUndefined();
-    // queue reverted but was swallowed; create + execute still ran; evidence archived.
-    expect(order).toEqual(["queue-fail", "create", "execute"]);
+    // finding-1: queue reverted (queueTx null) → execute must NOT run even though the proposal
+    // filed and resolved a real id. A slash never executes without a confirmed queue pre-flag.
+    expect(order).toEqual(["queue-fail", "create"]);
+    expect(executeCalls).toBe(0);
     expect(archive.records).toHaveLength(1);
+    const proof = archive.records[0];
+    // No execute tx recorded, and the (resolvable) execute preimage is kept as INTENT only.
+    expect(proof.executeTx).toBeUndefined();
+    expect(proof.messageHash).toBe("0x");
+    expect(proof.intendedExecuteMessageHash).toBeDefined();
+    // The over-slash guard was NOT armed durably (no slash executed).
+    expect((archive as any).slashed.size).toBe(0);
+    const status = await svc.getStatus();
+    expect(status.recentDetections[0].executeTx).toBeNull();
   });
 
   // ── FINDING 3: epoch is the deterministic violationBlock (cross-node agreement) ──
@@ -1114,6 +1166,11 @@ describe("AuditService", () => {
       async count() {
         return records.length;
       },
+      async recordSlashed() {},
+      async hasSlashed() {
+        return false;
+      },
+      async removeSlashed() {},
     };
     const svc = makeService(
       blockchain,
@@ -1130,6 +1187,177 @@ describe("AuditService", () => {
     // And a post-execute update records the executeTx on the proof (finding-2).
     expect(records[0].executeTx).toBe("0xE");
     expect(records[0].queueTx).toBe("0xQ");
+  });
+
+  // ── FINDING 2: durable, restart-surviving over-slash guard ──────────────────────
+  it("Finding 2: getRecentSlashExecuted=true short-circuits queue/create/execute (on-chain durable guard)", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, { getRecentSlashExecuted: async () => true });
+    const archive = makeArchive();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    // An on-chain SlashExecuted(WithProof) hit → NO on-chain writes this tick; evidence archived.
+    expect(order).toEqual([]);
+    expect(archive.records).toHaveLength(1);
+    expect(archive.records[0].proposalIdNote).toMatch(/over-slash guard/);
+    // The on-chain hit is cached into the DURABLE journal so later ticks/restarts short-circuit.
+    expect(archive.slashed.size).toBe(1);
+  });
+
+  it("Finding 2: getRecentSlashExecuted scans within [violationBlock - lookback, latest]", async () => {
+    let scannedFrom: number | undefined;
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, {
+      getRecentSlashExecuted: async (_addr: string, _op: string, fromBlock: number) => {
+        scannedFrom = fromBlock;
+        return false;
+      },
+    });
+    blockchain.getBlockNumber = async () => 100_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditSlashLookbackBlocks: 40_000 }),
+      makeArchive(),
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    // violationBlock 100000 - lookback 40000 = 60000.
+    expect(scannedFrom).toBe(60_000);
+  });
+
+  it("Finding 2: a durable slashed marker (archive) survives a RESTART → the sustained violation is NOT re-slashed", async () => {
+    const archive = makeArchive();
+    let block = 4000;
+    const now = 1_700_000_000_000;
+
+    // Node instance #1 slashes the operator and persists the durable marker.
+    const order1: string[] = [];
+    const bc1 = recordingBlockchain(order1);
+    bc1.getBlockNumber = async () => block;
+    const svc1 = makeService(
+      bc1,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 1 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+    await svc1.tick();
+    expect(order1.filter(o => o === "execute")).toHaveLength(1);
+    expect(archive.slashed.size).toBe(1); // durable marker persisted to the (shared) archive
+
+    // Simulate a process RESTART: a BRAND-NEW service with FRESH in-memory guards but the SAME
+    // archive (disk). The block ADVANCES so this is not per-block-deduped (a fresh proofHash).
+    block = 4001;
+    const order2: string[] = [];
+    const bc2 = recordingBlockchain(order2);
+    bc2.getBlockNumber = async () => block;
+    const svc2 = makeService(
+      bc2,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 1 }),
+      archive,
+      () => now + 10_000,
+      makeCoSigner()
+    );
+    await svc2.tick();
+    // The durable marker (reloaded from the archive) blocks the re-slash across the restart.
+    expect(order2.filter(o => o === "execute")).toHaveLength(0);
+    // Evidence for the new block is still archived (never lost).
+    expect(archive.records.some(r => r.evidence.violationBlock === 4001)).toBe(true);
+  });
+
+  // ── FINDING 3: evidence pinned to a FINALIZED block + its hash (reorg-safe) ──────
+  it("Finding 3: rule inputs are read at a FINALIZED block and its hash is stored in the evidence", async () => {
+    let confirmationsSeen: number | undefined;
+    const finalizedHash = "0x" + "cc".repeat(32);
+    const seen: Record<string, number | undefined> = {};
+    const blockchain = overLimitBlockchain({
+      getViolationBlock: async (confirmations?: number) => {
+        confirmationsSeen = confirmations;
+        return { number: 777, hash: finalizedHash };
+      },
+    });
+    blockchain.getCreditLimit = async (_a: string, _o: string, bt?: number) => {
+      seen.limit = bt;
+      return 1000n;
+    };
+    blockchain.getAvailableCredit = async (_a: string, _o: string, _t: string, bt?: number) => {
+      seen.avail = bt;
+      return 0n;
+    };
+    blockchain.getDebt = async (_a: string, _o: string, bt?: number) => {
+      seen.debt = bt;
+      return 2000n;
+    };
+    const archive = makeArchive();
+    const svc = makeService(blockchain, makeConfig({ auditFinalityConfirmations: 5 }), archive);
+    await svc.tick();
+    // The configured confirmation depth is threaded to getViolationBlock (finalized-tag fallback).
+    expect(confirmationsSeen).toBe(5);
+    // ALL rule inputs are block-pinned to the finalized number, not a live head.
+    expect(seen.limit).toBe(777);
+    expect(seen.avail).toBe(777);
+    expect(seen.debt).toBe(777);
+    // The evidence records both the finalized number AND its hash (reorg-safe justification).
+    expect(archive.records[0].evidence.violationBlock).toBe(777);
+    expect(archive.records[0].evidence.violationBlockHash).toBe(finalizedHash);
+    // epoch (the co-sign preimage input) is the finalized block too.
+    expect(archive.records[0].epoch).toBe(777);
+  });
+
+  // ── FINDING 4: per-step re-archive (durable after EACH confirmed on-chain step) ──
+  it("Finding 4: the proof is RE-ARCHIVED after each confirmed on-chain step (queue then execute)", async () => {
+    const snapshots: Array<{ queueTx?: string; executeTx?: string }> = [];
+    const records: SlashProof[] = [];
+    const snapArchive: IProofArchive & { slashed: Set<string> } = {
+      slashed: new Set<string>(),
+      async put(proof: SlashProof) {
+        // Snapshot the tx fields AT put time so intermediate durable states are observable.
+        snapshots.push({ queueTx: proof.queueTx, executeTx: proof.executeTx });
+        const i = records.findIndex(r => r.proofHash === proof.proofHash);
+        if (i >= 0) records[i] = proof;
+        else records.push(proof);
+        return { proofHash: proof.proofHash, location: `mem://${proof.proofHash}` };
+      },
+      async has(proofHash: string) {
+        return records.some(r => r.proofHash === proofHash);
+      },
+      async count() {
+        return records.length;
+      },
+      async recordSlashed(k: string) {
+        this.slashed.add(k);
+      },
+      async hasSlashed(k: string) {
+        return this.slashed.has(k);
+      },
+      async removeSlashed(k: string) {
+        this.slashed.delete(k);
+      },
+    };
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order);
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      snapArchive,
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    // A durable snapshot exists AFTER the queue confirmed (queueTx set, executeTx not yet)…
+    expect(snapshots.some(s => s.queueTx !== undefined && s.executeTx === undefined)).toBe(true);
+    // …and one AFTER the execute confirmed (both txs present).
+    expect(snapshots.some(s => s.queueTx !== undefined && s.executeTx !== undefined)).toBe(true);
+    // Final durable state carries both txs.
+    expect(records[0].queueTx).toBeDefined();
+    expect(records[0].executeTx).toBe("0xEXECUTETX");
   });
 
   it("computeJitterMs stays within [0, intervalMs)", () => {
