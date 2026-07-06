@@ -22,10 +22,31 @@ test so a drift fails CI instead of failing in production.
 function isValidOwnerAuth(bytes32 userOpHash, bytes calldata ownerAuth) view returns (bytes4)
 ```
 
-- **Success magic:** `0xa0cf00cf` — this is
-  `selector(isValidOwnerAuth(bytes32,bytes))`, used as the return magic exactly
-  like ERC-1271's `0x1626ba7e = selector(isValidSignature(bytes32,bytes))`. It
-  is **NOT** standard ERC-1271.
+- **Return:** success → `0xa0cf00cf` (=
+  `selector(isValidOwnerAuth(bytes32,bytes))`, used as magic like ERC-1271's
+  `0x1626ba7e = selector(isValidSignature)`, deliberately NOT the ERC-1271
+  magic); failure → `0xffffffff`.
+- **`ownerAuth` wire format** = 1-byte tag ‖ payload (airaccount, stable since
+  v0.23.0 / #159):
+  - `0x01` — owner ECDSA (k1): payload = 65-byte `personal_sign(userOpHash)`
+    (EIP-191, i.e. `sign(toEthSignedMessageHash(userOpHash))`; v normalized to
+    27/28, low-S). recover must == owner EOA.
+  - `0x02` — owner WebAuthn passkey (P256): payload =
+    `abi.encode(bytes authenticatorData, string clientDataJSONPrefix, string clientDataJSONSuffix, uint256 r, uint256 s)`
+    (the account reconstructs clientDataJSON as
+    `prefix ‖ base64url(challenge=userOpHash) ‖ suffix` and P256-verifies `r,s`
+    over `sha256(authenticatorData ‖ sha256(clientDataJSON))`). Exact encoding
+    is airaccount-owned; DVT forwards the payload verbatim. Not used by the k1
+    `e2e_account`.
+  - A **bare** signature with no tag byte → `0xffffffff` → the DVT gate 403s.
+    This is the exact bug KMS hit on CC-22 (`owner.signMessage(...)` without the
+    `0x01` prefix). `userOpHash` is always derived by DVT, never trusted from
+    the caller.
+- **Delivered E2E account (Sepolia, CC-22):**
+  `0x92EA8b02D34A4D5d10f0Db9Ea894e8bC72e292e8` (AAStarAirAccountV7 v0.27.0),
+  owner `0xb5600060e6de5E11D3636731964218E53caadf0E` (= dvt1 operator, so
+  realnode-e2e signs with the same key). Mainnet account: airaccount to deliver
+  post-deploy.
 - **Why delegate:** the account contract is the single source of truth for
   owner-auth (k1 ECDSA / P256 passkey / future schemes). DVT never verifies
   locally → never drifts, and supports passkey accounts whose `owner() == 0x0`.

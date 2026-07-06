@@ -79,7 +79,11 @@ const EP_ABI = [
   "function getUserOpHash((address sender,uint256 nonce,bytes initCode,bytes callData,bytes32 accountGasLimits,uint256 preVerificationGas,bytes32 gasFees,bytes paymasterAndData,bytes signature) userOp) view returns (bytes32)",
 ];
 const userOpHash = await withRpc(p => new ethers.Contract(ENTRY, EP_ABI, p).getUserOpHash(userOp));
-const ownerAuth = await owner.signMessage(ethers.getBytes(userOpHash));
+// ownerAuth = 1-byte tag ‖ payload (airaccount AAStarAirAccountV7 isValidOwnerAuth contract,
+// see docs/INTERFACES.md §1). tag 0x01 = owner ECDSA (k1): personal_sign(userOpHash) EIP-191.
+// A bare signature (no tag) returns 0xffffffff → the gate 403s (the bug KMS hit on CC-22).
+const ownerSig = await owner.signMessage(ethers.getBytes(userOpHash));
+const ownerAuth = "0x01" + ownerSig.slice(2);
 // Do not echo raw process.env values (ACCOUNT / owner.address) — CodeQL's clear-text-logging
 // query flags any process.env value reaching console.log (js/clear-text-logging), and the
 // operator already knows what they passed. Log a non-tainted confirmation instead.

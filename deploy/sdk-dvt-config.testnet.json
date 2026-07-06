@@ -11,9 +11,11 @@
       "validatorVersion": "YetAnotherAA-Validator AAStarValidator (Plan A v3 stake-bound; validate() algId 0x01 + registerWithProof + on-chain RFC-9380). Mounted in airaccount v0.27.0 ValidatorRouter 0xe68d6A7Bb60DA4caE62ceC2439722fc5eEF87a5c (getAlgorithm(0x01)==this). Supersedes airaccount-contract v0.20.0 AAStarBLSAlgorithm 0xAF525A… for new integrations.",
       "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
       "entryPointVersion": "v0.7",
+      "e2eAccount": "0x92EA8b02D34A4D5d10f0Db9Ea894e8bC72e292e8",
+      "e2eAccountNote": "airaccount-contract AAStarAirAccountV7 v0.27.0 implementing isValidOwnerAuth->0xa0cf00cf (CC-22). owner = 0xb5600060e6de5E11D3636731964218E53caadf0E (dvt1 operator). Source: airaccount-contract, NOT DVT-owned — see docs/INTERFACES.md §2.",
       "conventions": {
         "userOpHash": "EntryPoint.getUserOpHash(PackedUserOp) — node derives it; never send a bare hash",
-        "ownerAuth": "account.isValidOwnerAuth(userOpHash, ownerAuth) eth_call → magic 0xa0cf00cf. The account contract is the single source of truth for owner-auth (k1 ECDSA / P256 passkey / future schemes); the DVT node never verifies locally, so it never drifts from on-chain validation. Requires an account implementing isValidOwnerAuth(bytes32,bytes)→0xa0cf00cf (AAStarAirAccountV7).",
+        "ownerAuth": "account.isValidOwnerAuth(userOpHash, ownerAuth) eth_call → success magic 0xa0cf00cf, fail 0xffffffff. The account is the single source of truth (k1 ECDSA / P256 passkey / future); DVT forwards ownerAuth verbatim and never verifies locally. ownerAuth = 1-byte tag ‖ payload: 0x01 = owner ECDSA k1 (65-byte personal_sign(userOpHash), EIP-191); 0x02 = owner WebAuthn passkey (authenticatorData‖clientDataJSON‖…). A bare signature with no tag returns 0xffffffff → 403. Requires an account implementing isValidOwnerAuth(bytes32,bytes) (AAStarAirAccountV7).",
         "proofWire": "EIP-2537 G1/G2 (matches src/utils/bls.util.ts)",
         "failClosed": "POST /signature/sign returns 403 for every rejected request (never 400)",
         "mandatoryBlsAccount": "guard-enabled + approvedAlgIds=[0x01] (excludes 0x02 ECDSA)"
