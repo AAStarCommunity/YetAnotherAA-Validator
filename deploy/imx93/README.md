@@ -74,8 +74,9 @@ units, and enables the node + its health timer. Then:
    node). Mint a fresh independent identity:
    ```bash
    node scripts/gen-node-state.mjs            # writes ./node_state.json (nodeId = keccak256(EIP-2537 pubkey))
-   # optional at-rest encryption (recommended on this board — pick pbkdf2 on the A55):
-   KDF=pbkdf2 node scripts/encrypt-node-key.mjs   # → EIP-2335 keystore; set NODE_KEY_PASSPHRASE at runtime (tmpfs)
+   # optional at-rest encryption (recommended on this board — pick pbkdf2 on the A55).
+   # The path arg is required; the passphrase is read from NODE_KEY_PASSPHRASE (never argv):
+   NODE_KEY_PASSPHRASE='…' KDF=pbkdf2 node scripts/encrypt-node-key.mjs node_state.json  # → EIP-2335 keystore (set NODE_KEY_PASSPHRASE at runtime too, into tmpfs)
    ```
    Place it at `/opt/aastar-dvt/state/node1/node_state.json` (`chmod 600`).
 2. **Fill the env**: `/opt/aastar-dvt/env/node1.env` (PORT, ETH_RPC_URL,

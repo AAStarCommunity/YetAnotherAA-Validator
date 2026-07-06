@@ -14,8 +14,8 @@ node_dev_*.json
 # INDEPENDENT key (node scripts/gen-node-state.mjs, or the /admin dashboard, or an
 # EIP-2335 keystore). node_state.example.json is the committed template. A committed
 # real key would let anyone who reads the repo impersonate the node (CC-22 footgun).
-/node_state.json
-node_dev_*.json
+# Unanchored so a node_state.json in ANY dir is ignored (example keeps its own name).
+node_state.json
 
 # Dependencies
 node_modules/

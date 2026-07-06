@@ -10,7 +10,7 @@
 #
 # Usage (from the repo root, on the board):
 #   ./scripts/build-bare-node.sh
-# Then configure env + node_state.json (see deploy/imx93/RUNBOOK.md) and start:
+# Then configure env + node_state.json (see deploy/imx93/README.md) and start:
 #   node dist/main
 set -euo pipefail
 
@@ -53,4 +53,4 @@ echo "  Next:"
 echo "   1. Generate an INDEPENDENT node key:  node scripts/gen-node-state.mjs"
 echo "      (optional at-rest encryption:       node scripts/encrypt-node-key.mjs, KDF=pbkdf2)"
 echo "   2. Set env: ETH_RPC_URL, VALIDATOR_CONTRACT_ADDRESS, ENTRY_POINT_ADDRESS, PORT"
-echo "   3. Start:   node dist/main   (or a systemd unit — see deploy/imx93/RUNBOOK.md)"
+echo "   3. Start:   node dist/main   (or a systemd unit — see deploy/imx93/README.md)"
