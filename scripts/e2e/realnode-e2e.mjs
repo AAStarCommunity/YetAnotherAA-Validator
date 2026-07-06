@@ -80,9 +80,10 @@ const EP_ABI = [
 ];
 const userOpHash = await withRpc(p => new ethers.Contract(ENTRY, EP_ABI, p).getUserOpHash(userOp));
 const ownerAuth = await owner.signMessage(ethers.getBytes(userOpHash));
-// NB: do NOT log owner.address — it derives from PRIVATE_KEY_SUPPLIER, so CodeQL's
-// clear-text-logging query flags it as logging env-key-derived data (js/clear-text-logging).
-console.log("account:", ACCOUNT);
+// Do not echo raw process.env values (ACCOUNT / owner.address) — CodeQL's clear-text-logging
+// query flags any process.env value reaching console.log (js/clear-text-logging), and the
+// operator already knows what they passed. Log a non-tainted confirmation instead.
+console.log("account: set via E2E_ACCOUNT env");
 console.log("userOpHash:", userOpHash);
 
 // 3 real running nodes co-sign (each enforces Stage 1 owner-auth against on-chain owner())
