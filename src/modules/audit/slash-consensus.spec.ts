@@ -2,9 +2,13 @@ import { ethers } from "ethers";
 import {
   SlashLevel,
   QUEUE_SLASH_TAG,
+  MAX_VALIDATORS,
   PendingSlotCoSigner,
+  CoSignRequest,
   buildQueueMessageHash,
   buildExecuteMessageHash,
+  buildSignerMask,
+  recomputeMessageHash,
   encodeProof,
 } from "./slash-consensus.js";
 
@@ -84,10 +88,111 @@ describe("slash-consensus primitives (SP #329)", () => {
     expect(sig).toBe(sigG2);
   });
 
-  it("PendingSlotCoSigner fails closed: coSign throws the deferred-slot error", async () => {
+  it("PendingSlotCoSigner fails closed: coSign(req) throws the disarmed error", async () => {
     const coSigner = new PendingSlotCoSigner();
-    await expect(coSigner.coSign("0x" + "00".repeat(32))).rejects.toThrow(
-      /quorum co-sign deferred.*registerBLSPublicKey.*24h timelock/s
-    );
+    const req: CoSignRequest = {
+      step: "queue",
+      operator: OPERATOR,
+      slashLevel: SlashLevel.MINOR,
+      epoch: 1,
+      chainId: CHAIN_ID,
+      messageHash: "0x" + "00".repeat(32),
+    };
+    await expect(coSigner.coSign(req)).rejects.toThrow(/quorum co-sign deferred.*disarmed/s);
+  });
+
+  // ── buildSignerMask: PINNED bit convention (slot s → bit s-1) ────────────────────
+  describe("buildSignerMask (slot s → bit s-1)", () => {
+    it("matches the pinned reference values", () => {
+      expect(buildSignerMask([1, 2, 3])).toBe(7n);
+      expect(buildSignerMask([1, 2])).toBe(3n);
+      expect(buildSignerMask([1, 3])).toBe(5n);
+      expect(buildSignerMask([2, 3])).toBe(6n);
+      expect(buildSignerMask([1])).toBe(1n);
+      expect(buildSignerMask([13])).toBe(1n << 12n);
+    });
+
+    it("is order-independent and de-duplicates slots", () => {
+      expect(buildSignerMask([3, 1, 2])).toBe(7n);
+      expect(buildSignerMask([2, 2, 3, 3, 1])).toBe(7n);
+    });
+
+    it("empty slot list → 0n", () => {
+      expect(buildSignerMask([])).toBe(0n);
+    });
+
+    it("rejects slot <= 0", () => {
+      expect(() => buildSignerMask([0])).toThrow(/out of range/);
+      expect(() => buildSignerMask([-1])).toThrow(/out of range/);
+    });
+
+    it(`rejects slot > MAX_VALIDATORS (${MAX_VALIDATORS})`, () => {
+      expect(() => buildSignerMask([MAX_VALIDATORS + 1])).toThrow(/out of range/);
+      expect(() => buildSignerMask([1, 2, 99])).toThrow(/out of range/);
+    });
+
+    it("rejects a non-integer slot", () => {
+      expect(() => buildSignerMask([1.5])).toThrow(/out of range/);
+    });
+  });
+
+  // ── recomputeMessageHash: ONE code path for requester + responders ───────────────
+  describe("recomputeMessageHash", () => {
+    it("queue step === buildQueueMessageHash", () => {
+      const req: CoSignRequest = {
+        step: "queue",
+        operator: OPERATOR,
+        slashLevel: SlashLevel.MINOR,
+        epoch: 1_700_000,
+        chainId: CHAIN_ID,
+        evidenceHash: EVIDENCE_HASH,
+        messageHash: "0x00",
+      };
+      expect(recomputeMessageHash(req)).toBe(
+        buildQueueMessageHash(OPERATOR, SlashLevel.MINOR, 1_700_000, CHAIN_ID)
+      );
+    });
+
+    it("execute step === buildExecuteMessageHash", () => {
+      const req: CoSignRequest = {
+        step: "execute",
+        operator: OPERATOR,
+        slashLevel: SlashLevel.MINOR,
+        epoch: 1_700_000,
+        chainId: CHAIN_ID,
+        proposalId: "42",
+        evidenceHash: EVIDENCE_HASH,
+        messageHash: "0x00",
+      };
+      expect(recomputeMessageHash(req)).toBe(
+        buildExecuteMessageHash(42n, OPERATOR, SlashLevel.MINOR, 1_700_000, CHAIN_ID, EVIDENCE_HASH)
+      );
+    });
+
+    it("execute step without proposalId → throws", () => {
+      const req: CoSignRequest = {
+        step: "execute",
+        operator: OPERATOR,
+        slashLevel: SlashLevel.MINOR,
+        epoch: 1,
+        chainId: CHAIN_ID,
+        evidenceHash: EVIDENCE_HASH,
+        messageHash: "0x00",
+      };
+      expect(() => recomputeMessageHash(req)).toThrow(/proposalId/);
+    });
+
+    it("execute step without evidenceHash → throws", () => {
+      const req: CoSignRequest = {
+        step: "execute",
+        operator: OPERATOR,
+        slashLevel: SlashLevel.MINOR,
+        epoch: 1,
+        chainId: CHAIN_ID,
+        proposalId: "7",
+        messageHash: "0x00",
+      };
+      expect(() => recomputeMessageHash(req)).toThrow(/evidenceHash/);
+    });
   });
 });

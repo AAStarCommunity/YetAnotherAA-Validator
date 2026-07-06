@@ -14,6 +14,8 @@ import {
   GossipConfig,
   GossipStats,
   MessageHistory,
+  CoSignRequestPayload,
+  CoSignResponsePayload,
 } from "./gossip.interfaces.js";
 import { GossipWhitelistValidator } from "./gossip-whitelist-validator.js";
 
@@ -45,6 +47,26 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     gossipRounds: 0,
     lastGossipTime: null,
   };
+
+  /**
+   * DVT slash quorum co-sign (inc-2 live). A single registered handler re-verifies + signs an
+   * incoming request; the gossip service stays ignorant of AuditService (one-way DI). Null when
+   * this node is disarmed → every request is silently refused (fail-closed).
+   */
+  private coSignHandler:
+    | ((payload: CoSignRequestPayload) => Promise<CoSignResponsePayload | null>)
+    | null = null;
+
+  /** In-flight co-sign requests this node originated, keyed by requestId (correlation id). */
+  private pendingCoSign = new Map<
+    string,
+    {
+      responses: Map<string, CoSignResponsePayload>;
+      threshold: number;
+      finish: () => void;
+      timer: NodeJS.Timeout | null;
+    }
+  >();
 
   constructor(
     private configService: ConfigService,
@@ -319,6 +341,14 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
         this.handleHeartbeatMessage(message);
         break;
 
+      case "cosign-request":
+        this.handleCoSignRequest(ws, message);
+        break;
+
+      case "cosign-response":
+        this.handleCoSignResponse(message);
+        break;
+
       default:
         console.log(`Unknown gossip message type: ${message.type}`);
     }
@@ -502,6 +532,116 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       peer.lastSeen = new Date();
       peer.status = "active";
       peer.heartbeatCount++;
+    }
+  }
+
+  // ── DVT slash quorum co-sign transport (inc-2 live) ─────────────────────────────
+  //
+  // POINT-TO-POINT only: co-sign messages are sent with ttl=0 so handleGossipMessage NEVER
+  // flood-propagates them, and each carries a FRESH messageId (correlation is the separate
+  // requestId) so the history-dedup can't drop a legitimate retry. The gossip service runs
+  // ZERO slash logic — it invokes the registered handler and relays the reply, nothing more.
+
+  /**
+   * Register the single co-sign handler (GossipQuorumCoSigner.verifyAndSign). Keeps the gossip
+   * service decoupled from AuditService: it only knows "call this to get a signed response or a
+   * null refusal". A disarmed node never registers one → all requests are silently refused.
+   */
+  registerCoSignHandler(
+    fn: (payload: CoSignRequestPayload) => Promise<CoSignResponsePayload | null>
+  ): void {
+    this.coSignHandler = fn;
+  }
+
+  /**
+   * Broadcast a co-sign request to all connected peers and collect their responses, keyed by
+   * `requestId`. Resolves early once `threshold` DISTINCT signer nodes have replied (dedup by
+   * signerNodeId), or on `timeoutMs` with whatever partial set arrived. Always clears the timer
+   * and the pending entry. `threshold <= 0` resolves immediately with an empty set (the caller
+   * needs no peer signatures beyond its own self-contribution).
+   */
+  async requestCoSignatures(
+    payload: CoSignRequestPayload,
+    opts: { threshold: number; timeoutMs: number }
+  ): Promise<CoSignResponsePayload[]> {
+    return new Promise<CoSignResponsePayload[]>(resolve => {
+      const responses = new Map<string, CoSignResponsePayload>();
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (entry.timer) clearTimeout(entry.timer);
+        this.pendingCoSign.delete(payload.requestId);
+        resolve(Array.from(responses.values()));
+      };
+      const entry = {
+        responses,
+        threshold: opts.threshold,
+        finish,
+        timer: null as NodeJS.Timeout | null,
+      };
+      this.pendingCoSign.set(payload.requestId, entry);
+
+      if (opts.threshold <= 0) {
+        finish();
+        return;
+      }
+      entry.timer = setTimeout(finish, opts.timeoutMs);
+
+      const message: GossipMessage = {
+        type: "cosign-request",
+        from: this.getNodeId(),
+        data: payload,
+        timestamp: Date.now(),
+        ttl: 0, // point-to-point — never flood-propagated
+        messageId: uuidv4(), // fresh per send so history-dedup never drops a retry
+        version: this.nodeState.version,
+      };
+      this.broadcastMessage(message);
+    });
+  }
+
+  /**
+   * Handle an incoming co-sign request: hand it to the registered handler and, if the handler
+   * returns a signed response (non-null), reply on the SAME socket. A null return (refusal) is a
+   * silent, fail-closed no-op. No propagation — this is a directed request/response.
+   */
+  private handleCoSignRequest(ws: WebSocket, message: GossipMessage): void {
+    const handler = this.coSignHandler;
+    if (!handler) return; // disarmed / no handler → silent fail-closed refusal
+    const payload = message.data as CoSignRequestPayload;
+    void handler(payload)
+      .then(resp => {
+        if (resp === null) return; // handler refused → silent
+        const reply: GossipMessage = {
+          type: "cosign-response",
+          from: this.getNodeId(),
+          to: message.from,
+          data: resp,
+          timestamp: Date.now(),
+          ttl: 0, // directed reply — never propagated
+          messageId: uuidv4(),
+          version: this.nodeState.version,
+        };
+        this.sendMessage(ws, reply);
+        this.stats.messagesSent++;
+      })
+      .catch(error => {
+        console.error("Co-sign request handler error:", error);
+      });
+  }
+
+  /** Route a co-sign response back to the originating requestCoSignatures collector. */
+  private handleCoSignResponse(message: GossipMessage): void {
+    const payload = message.data as CoSignResponsePayload;
+    if (!payload || typeof payload.requestId !== "string") return;
+    if (typeof payload.signerNodeId !== "string") return;
+    const pending = this.pendingCoSign.get(payload.requestId);
+    if (!pending) return; // unknown / already-resolved request → ignore
+    // Dedup by signer node id: a peer replying twice does not double-count toward threshold.
+    pending.responses.set(payload.signerNodeId, payload);
+    if (pending.responses.size >= pending.threshold) {
+      pending.finish();
     }
   }
 

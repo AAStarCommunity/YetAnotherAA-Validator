@@ -587,6 +587,99 @@ export class BlockchainService {
     return false;
   }
 
+  // ── BLSAggregator slot registry (inc-2 live gossip co-sign) ────────────────────
+  //
+  // The authoritative slot→validator→BLS-key mapping the quorum co-sign binds against. Slot is
+  // 1-indexed in [1, MAX_VALIDATORS]; signerMask bit `s-1` ⇔ slot `s` (see BLSAggregator.sol
+  // `_reconstructPkAgg`). All reads are best-effort → `null` on revert/absence (fail-closed at
+  // the caller: an unresolvable slot/key means "cannot bind" → refuse to count that signature).
+
+  /**
+   * BLSAggregator.validatorAtSlot(slot) — the validator address bound to a 1-indexed slot.
+   * Returns the checksummed address, or `null` when the slot is empty (zero address) or the read
+   * reverts.
+   */
+  async getValidatorAtSlot(blsAggregatorAddress: string, slot: number): Promise<string | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function validatorAtSlot(uint8 slot) view returns (address)"];
+    const contract = new ethers.Contract(blsAggregatorAddress, abi, this.provider);
+    try {
+      const addr: string = await contract.validatorAtSlot(slot);
+      if (!addr || addr === ethers.ZeroAddress) return null;
+      return ethers.getAddress(addr);
+    } catch (error: any) {
+      this.logger.warn(
+        `validatorAtSlot(${slot}) failed on ${blsAggregatorAddress}: ${error.message}`
+      );
+      return null;
+    }
+  }
+
+  /**
+   * The active BLS G1 public key registered at a slot, as its uncompressed EIP-2537 128-byte
+   * encoding (0x-hex, lowercase) — the concatenation of the on-chain BLS.G1Point words
+   * `x_a || x_b || y_a || y_b`, byte-identical to `BlsService.encodePublicKeyToEIP2537`. Resolves
+   * the slot's validator (validatorAtSlot) then reads BLSAggregator.getBLSPublicKey(validator).
+   * Returns `null` when the slot is empty, the key is inactive (revoked), or the read reverts.
+   * The requester uses this to bind a peer's returned slot to the exact on-chain key.
+   */
+  async getBlsPublicKeyAtSlot(blsAggregatorAddress: string, slot: number): Promise<string | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const validator = await this.getValidatorAtSlot(blsAggregatorAddress, slot);
+    if (!validator) return null;
+    const abi = [
+      "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
+    ];
+    const contract = new ethers.Contract(blsAggregatorAddress, abi, this.provider);
+    try {
+      const res = await contract.getBLSPublicKey(validator);
+      const pk = res.publicKey ?? res[0];
+      const isActive = res.isActive ?? res[2];
+      if (!isActive) return null;
+      const words = [
+        pk.x_a ?? pk[0],
+        pk.x_b ?? pk[1],
+        pk.y_a ?? pk[2],
+        pk.y_b ?? pk[3],
+      ] as string[];
+      if (words.some(w => typeof w !== "string")) return null;
+      const hex = "0x" + words.map(w => w.slice(2)).join("");
+      return hex.toLowerCase();
+    } catch (error: any) {
+      this.logger.warn(
+        `getBLSPublicKey(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Scan slots `1..maxSlots` for the one bound to `operatorEoa` (checksum-compared), returning its
+   * 1-indexed slot or `null` when the operator holds no slot. A node whose operator is at no slot
+   * MUST refuse to participate in the quorum co-sign (fail-closed).
+   */
+  async getSlotForValidator(
+    blsAggregatorAddress: string,
+    operatorEoa: string,
+    maxSlots: number
+  ): Promise<number | null> {
+    let target: string;
+    try {
+      target = ethers.getAddress(operatorEoa);
+    } catch {
+      return null;
+    }
+    for (let slot = 1; slot <= maxSlots; slot++) {
+      const v = await this.getValidatorAtSlot(blsAggregatorAddress, slot);
+      if (v && v === target) return slot;
+    }
+    return null;
+  }
+
   /** Runtime bytecode at `address` ("0x" when there's no contract). Used for a fail-closed
    *  bootstrap existence check before the audit poll trusts an address. */
   async getCode(address: string, blockTag?: number): Promise<string> {

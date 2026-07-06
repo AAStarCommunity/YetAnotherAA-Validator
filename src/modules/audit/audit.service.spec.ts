@@ -3,6 +3,7 @@ import { AuditService } from "./audit.service.js";
 import { IProofArchive, SlashProof, computeProofHash } from "./proof-archive.js";
 import {
   IQuorumCoSigner,
+  CoSignRequest,
   buildQueueMessageHash,
   buildExecuteMessageHash,
   encodeProof,
@@ -97,16 +98,20 @@ function makeBlockchain(
   };
 }
 
-/** A deterministic mock quorum co-signer that always succeeds (fixed mask + sig). */
+/** A deterministic mock quorum co-signer that always succeeds (fixed mask + sig). It records the
+ *  messageHash of each structured CoSignRequest so existing assertions on `calls[i]` still hold. */
 function makeCoSigner(
   signerMask = 0b111n,
   sigG2 = "0x" + "ab".repeat(64)
-): IQuorumCoSigner & { calls: string[] } {
+): IQuorumCoSigner & { calls: string[]; requests: CoSignRequest[] } {
   const calls: string[] = [];
+  const requests: CoSignRequest[] = [];
   return {
     calls,
-    async coSign(messageHash: string) {
-      calls.push(messageHash);
+    requests,
+    async coSign(req: CoSignRequest) {
+      calls.push(req.messageHash);
+      requests.push(req);
       return { signerMask, sigG2 };
     },
   };
