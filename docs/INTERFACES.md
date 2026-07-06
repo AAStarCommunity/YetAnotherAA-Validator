@@ -72,6 +72,16 @@ shape (DVT fills its own `validator` + `dvtNodes` from its mainnet deploy;
 airaccount supplies `e2e_account`), then set `active: "mainnet"`. No code change
 — testnet→mainnet is a config swap.
 
-**Staying fresh:** the DVT-owned fields (`validator`, `dvtNodes`) are the ones
-that went stale before — they can be re-synced from the live nodes'
-`/node/info` + the deploy artifact rather than by hand.
+**Staying fresh (`scripts/sync-dvt-config.mjs`):** the DVT-owned fields
+(`dvtNodes[].nodeId`/`pubkey`, and optionally `validator`) went stale before
+because they were hand-edited. Re-sync them from ground truth instead:
+
+```bash
+npm run config:check          # verify config against each node's live /node/info; exit 1 on drift (CI guard)
+npm run config:sync           # apply: rewrite drifted nodeId/pubkey from live nodes
+node scripts/sync-dvt-config.mjs --validator 0x…   # also check/set the validator from a deploy artifact
+```
+
+`config:check` only touches DVT-owned fields — airaccount-owned fields
+(`e2e_account`, router) are never rewritten. Wire `npm run config:check` into CI
+to fail the build if the committed config drifts from the running nodes.

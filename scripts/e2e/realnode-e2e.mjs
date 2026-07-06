@@ -80,7 +80,9 @@ const EP_ABI = [
 ];
 const userOpHash = await withRpc(p => new ethers.Contract(ENTRY, EP_ABI, p).getUserOpHash(userOp));
 const ownerAuth = await owner.signMessage(ethers.getBytes(userOpHash));
-console.log("account:", ACCOUNT, "owner:", owner.address);
+// NB: do NOT log owner.address — it derives from PRIVATE_KEY_SUPPLIER, so CodeQL's
+// clear-text-logging query flags it as logging env-key-derived data (js/clear-text-logging).
+console.log("account:", ACCOUNT);
 console.log("userOpHash:", userOpHash);
 
 // 3 real running nodes co-sign (each enforces Stage 1 owner-auth against on-chain owner())
