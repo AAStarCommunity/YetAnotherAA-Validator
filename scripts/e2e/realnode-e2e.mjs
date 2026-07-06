@@ -28,7 +28,18 @@ const ENTRY = env.ENTRY_POINT_ADDRESS || env.ENTRYPOINT_ADDRESS;
 // var in older .env files points at a stale contract (an earlier deploy) where these
 // test nodes are not registered, which silently makes validate() return 1 (reject).
 const BLS_ALG = env.AIRACCOUNT_V020_BLS_ALGORITHM || "0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174";
-const ACCOUNT = process.env.E2E_ACCOUNT || "0x45Dfe3D5938fDf5a8D30641C3FDA9c9fb1F31ba9";
+// E2E_ACCOUNT is REQUIRED — no default. The old hardcoded 0x45Dfe3… only implements standard
+// ERC-1271 (0x1626ba7e), NOT the owner-gate's isValidOwnerAuth(bytes32,bytes)→0xa0cf00cf, so it
+// silently fails the owner-auth gate (CC-22). Pass an account that implements 0xa0cf00cf (an
+// AAStarAirAccountV7), e.g. from community.toml's e2e_account.
+const ACCOUNT = process.env.E2E_ACCOUNT;
+if (!ACCOUNT) {
+  console.error(
+    "‼ E2E_ACCOUNT is required (an account implementing isValidOwnerAuth→0xa0cf00cf, e.g. AAStarAirAccountV7). " +
+      "Set E2E_ACCOUNT=0x... and re-run."
+  );
+  process.exit(1);
+}
 const owner = new ethers.Wallet(env.PRIVATE_KEY_SUPPLIER);
 const PORTS = [3001, 3002, 3003];
 

@@ -36,6 +36,22 @@ Resolves the latest LTS `node-v20.x-linux-arm64` (glibc — matches Yocto),
 compiles the app, installs prod-only deps resolved for `linux/arm64`, and tars
 it all up.
 
+### Alternative: on-board bare-node build (KMS-led unified deploy, CC-22)
+
+When DVT is deployed **alongside KMS on one board** via the KMS-led unified
+script, the build happens **on the board** instead of cross-packaging a bundle.
+DVT is pure JS (no native addon), so a bare glibc arm64 Node 20 builds it
+directly — no Docker (the board's docker often lacks buildx / fails layer export
+on ext4 / has no iptables `raw` table):
+
+```bash
+./scripts/build-bare-node.sh     # npm ci && npm run build → dist/main.js (validates Node ≥ 20)
+```
+
+Then generate the node key (below) + set env + run `node dist/main` under
+systemd. The KMS deploy script drives this and writes a shared `community.toml`;
+both bundle and bare-node paths produce the same running node.
+
 ## 2. Copy to the board
 
 ```bash
@@ -53,10 +69,20 @@ cd /tmp/imx93
 This unpacks to `/opt/aastar-dvt/`, symlinks `current`, installs the systemd
 units, and enables the node + its health timer. Then:
 
-1. **Put the node's BLS key**: `/opt/aastar-dvt/state/node1/node_state.json`
-   (its OWN secret key — `chmod 600`; never share/clone it).
+1. **Generate the node's OWN BLS key** — never reuse a committed/shared key
+   (`node_state.json` is git-ignored; a shared key lets anyone impersonate the
+   node). Mint a fresh independent identity:
+   ```bash
+   node scripts/gen-node-state.mjs            # writes ./node_state.json (nodeId = keccak256(EIP-2537 pubkey))
+   # optional at-rest encryption (recommended on this board — pick pbkdf2 on the A55):
+   KDF=pbkdf2 node scripts/encrypt-node-key.mjs   # → EIP-2335 keystore; set NODE_KEY_PASSPHRASE at runtime (tmpfs)
+   ```
+   Place it at `/opt/aastar-dvt/state/node1/node_state.json` (`chmod 600`).
 2. **Fill the env**: `/opt/aastar-dvt/env/node1.env` (PORT, ETH_RPC_URL,
-   VALIDATOR_CONTRACT_ADDRESS; relay/keeper keys if used).
+   VALIDATOR_CONTRACT_ADDRESS; relay/keeper keys if used). The authoritative
+   `VALIDATOR_CONTRACT_ADDRESS` (+ entryPoint) per network lives in
+   [`../sdk-dvt-config.testnet.json`](../sdk-dvt-config.testnet.json) —
+   testnet→mainnet is a config swap, no rebuild.
 3. Restart: `systemctl restart aastar-dvt@node1`.
 
 ## 4. Verify

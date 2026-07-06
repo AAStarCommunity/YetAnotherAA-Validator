@@ -29,7 +29,7 @@ export class BlsService {
    *   account     = userOp.sender                                 (derived, not claimed)
    *   userOpHash  = EntryPoint.getUserOpHash(userOp)              (binds hash↔sender/chain)
    *   isValid     = account.isValidOwnerAuth(userOpHash, ownerAuth) [eth_call view]
-   *   require isValid returns magic value 0x1626ba7e
+   *   require isValid returns magic value 0xa0cf00cf  (AAStarAirAccount isValidOwnerAuth, NOT ERC-1271)
    *   then BLS-sign hashToCurve(userOpHash)  — the SAME derived hash (no TOCTOU)
    *
    * Deriving the hash on-chain is what closes the cross-account oracle hole: an

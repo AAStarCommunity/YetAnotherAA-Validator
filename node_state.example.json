@@ -1,0 +1,10 @@
+{
+  "_README": "TEMPLATE ONLY — do NOT run a node on this file. Copy to node_state.json and replace the key with your OWN independent BLS12-381 key. Generate one with `node scripts/gen-node-state.mjs` (writes a fresh node_state.json to cwd), or create/import via the /admin dashboard, or use an EIP-2335 encrypted keystore (scripts/encrypt-node-key.mjs, KDF=pbkdf2 on embedded boards). A shared/committed key means anyone can impersonate this node.",
+  "nodeId": "0x<keccak256 of the EIP-2537 G1 pubkey — derived, do not hand-edit>",
+  "nodeName": "your-node-name",
+  "privateKey": "0x<32-byte BLS12-381 scalar — OR omit this and provide `keystore` below>",
+  "publicKey": "0x<48-byte compressed G1 pubkey>",
+  "createdAt": "1970-01-01T00:00:00.000Z",
+  "description": "Independent DVT signing node",
+  "_keystore_alt": "For at-rest encryption, replace `privateKey` with a `keystore` object (EIP-2335) and set NODE_KEY_PASSPHRASE at runtime; see scripts/encrypt-node-key.mjs."
+}
