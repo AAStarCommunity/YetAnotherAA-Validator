@@ -240,7 +240,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         this.enabled = false;
-        this.logger.error(`Audit: getCode(${name}=${addr}) failed (${msg}) — DISABLED (fail-closed)`);
+        this.logger.error(
+          `Audit: getCode(${name}=${addr}) failed (${msg}) — DISABLED (fail-closed)`
+        );
         return;
       }
       if (!code || code === "0x") {
@@ -427,8 +429,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // HASH is recorded in the evidence so the justification is pinned to a specific finalized block.
     // tick() resolves this ONCE and shares it across the sweep; a direct caller (tests) may omit it.
     const { number: violationBlock, hash: violationBlockHash } =
-      pinnedBlock ??
-      (await this.blockchainService.getViolationBlock(this.finalityConfirmations));
+      pinnedBlock ?? (await this.blockchainService.getViolationBlock(this.finalityConfirmations));
 
     // All per-operator reads are pinned to the SAME block; issue them concurrently (5-6 reads)
     // rather than serially. reputation + DVT stake lock are auxiliary evidence (not part of the
@@ -513,7 +514,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       `${RULE_CREDIT_OVER_LIMIT}: debt ${debt} EXCEEDS limit ${creditLimit} ` +
       `(usage ${usageBps}bps ≥ ${this.creditThresholdBps}bps, availableCredit ${availableCredit}, block ${violationBlock})`;
     const sources: EvidenceSource[] = [
-      { type: "view", name: "Registry.getCreditLimit", value: creditLimit.toString(), block: violationBlock },
+      {
+        type: "view",
+        name: "Registry.getCreditLimit",
+        value: creditLimit.toString(),
+        block: violationBlock,
+      },
       {
         type: "view",
         name: `IxPNTsToken(${this.apntsTokenAddress}).getDebt`,
@@ -526,8 +532,18 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         value: availableCredit.toString(),
         block: violationBlock,
       },
-      { type: "view", name: "Registry.globalReputation", value: reputation.toString(), block: violationBlock },
-      { type: "view", name: "GTokenStaking.roleLocks(DVT)", value: dvtStake.toString(), block: violationBlock },
+      {
+        type: "view",
+        name: "Registry.globalReputation",
+        value: reputation.toString(),
+        block: violationBlock,
+      },
+      {
+        type: "view",
+        name: "GTokenStaking.roleLocks(DVT)",
+        value: dvtStake.toString(),
+        block: violationBlock,
+      },
     ];
 
     await this.handleViolation({
@@ -720,7 +736,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // resolved but NO execute was submitted (file-only path, or execute skipped/failed), the
     // computed-but-unsubmitted preimage is kept under intendedExecuteMessageHash — never conflated
     // with a submitted one. When the id is unresolved there is no preimage to compute at all → "0x".
-    const proposalId: string | null = onchainProposalId !== null ? onchainProposalId.toString() : null;
+    const proposalId: string | null =
+      onchainProposalId !== null ? onchainProposalId.toString() : null;
     if (onchainProposalId !== null) {
       const executePreimage = buildExecuteMessageHash(
         onchainProposalId,
@@ -852,7 +869,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // (4) Best-effort on-chain pending flag (null/unknown on the current SP).
     let pendingIndeterminate = false;
     try {
-      const pending = await this.blockchainService.isSlashPending(this.superPaymasterAddress, operator);
+      const pending = await this.blockchainService.isSlashPending(
+        this.superPaymasterAddress,
+        operator
+      );
       if (pending === true) {
         this.markCoarseSlashed(coarseKey);
         return true;

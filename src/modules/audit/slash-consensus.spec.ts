@@ -13,7 +13,7 @@ const EVIDENCE_HASH = "0x" + "cd".repeat(32);
 const CHAIN_ID = 11155111;
 
 describe("slash-consensus primitives (SP #329)", () => {
-  it("QUEUE_SLASH_TAG is keccak256 of the UTF-8 literal, matching Solidity keccak256(\"QUEUE_SLASH\")", () => {
+  it('QUEUE_SLASH_TAG is keccak256 of the UTF-8 literal, matching Solidity keccak256("QUEUE_SLASH")', () => {
     expect(QUEUE_SLASH_TAG).toBe(ethers.keccak256(ethers.toUtf8Bytes("QUEUE_SLASH")));
   });
 
@@ -29,13 +29,7 @@ describe("slash-consensus primitives (SP #329)", () => {
     const reference = ethers.keccak256(
       new ethers.AbiCoder().encode(
         ["bytes32", "address", "uint8", "uint256", "uint256"],
-        [
-          ethers.keccak256(ethers.toUtf8Bytes("QUEUE_SLASH")),
-          OPERATOR,
-          slashLevel,
-          epoch,
-          CHAIN_ID,
-        ]
+        [ethers.keccak256(ethers.toUtf8Bytes("QUEUE_SLASH")), OPERATOR, slashLevel, epoch, CHAIN_ID]
       )
     );
     expect(buildQueueMessageHash(OPERATOR, slashLevel, epoch, CHAIN_ID)).toBe(reference);
@@ -61,7 +55,14 @@ describe("slash-consensus primitives (SP #329)", () => {
   it("the queue and execute preimages are distinct (domain separation holds)", () => {
     const epoch = 1_700_000;
     const queue = buildQueueMessageHash(OPERATOR, SlashLevel.MINOR, epoch, CHAIN_ID);
-    const exec = buildExecuteMessageHash(1n, OPERATOR, SlashLevel.MINOR, epoch, CHAIN_ID, EVIDENCE_HASH);
+    const exec = buildExecuteMessageHash(
+      1n,
+      OPERATOR,
+      SlashLevel.MINOR,
+      epoch,
+      CHAIN_ID,
+      EVIDENCE_HASH
+    );
     expect(queue).not.toBe(exec);
   });
 

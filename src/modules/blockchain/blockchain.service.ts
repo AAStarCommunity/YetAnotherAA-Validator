@@ -453,9 +453,7 @@ export class BlockchainService {
    * if even that fallback cannot resolve a block (misconfigured provider). All rule reads are then
    * block-pinned to the returned `number` (via blockTag), so nothing is read at an unstable head.
    */
-  async getViolationBlock(
-    confirmations = 12
-  ): Promise<{ number: number; hash: string }> {
+  async getViolationBlock(confirmations = 12): Promise<{ number: number; hash: string }> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
@@ -525,9 +523,15 @@ export class BlockchainService {
     const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
     const filters = [
       // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]).
-      { name: "SlashExecutedWithProof", topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic] },
+      {
+        name: "SlashExecutedWithProof",
+        topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic],
+      },
       // SlashExecuted: proposalId is 1st indexed (topics[1]), operator 2nd (topics[2]).
-      { name: "SlashExecuted", topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic] },
+      {
+        name: "SlashExecuted",
+        topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic],
+      },
     ];
     for (const f of filters) {
       let logs;
@@ -601,7 +605,9 @@ export class BlockchainService {
       const debt = await contract.getDebt(operator, { blockTag });
       return BigInt(debt);
     } catch (error: any) {
-      this.logger.warn(`getDebt read failed on token ${tokenAddress} for ${operator}: ${error.message}`);
+      this.logger.warn(
+        `getDebt read failed on token ${tokenAddress} for ${operator}: ${error.message}`
+      );
       return null;
     }
   }
@@ -812,7 +818,9 @@ export class BlockchainService {
       evidenceHash,
       fees
     );
-    this.logger.log(`createProposal(${operator}, ${level}, evidence ${evidenceHash}) submitted: ${tx.hash}`);
+    this.logger.log(
+      `createProposal(${operator}, ${level}, evidence ${evidenceHash}) submitted: ${tx.hash}`
+    );
     const receipt = await tx.wait();
     if (!receipt || receipt.status !== 1) {
       throw new Error(
@@ -872,7 +880,9 @@ export class BlockchainService {
       proof,
       fees
     );
-    this.logger.log(`queueSlashWithProof(${operator}, ${slashLevel}, epoch ${epoch}) submitted: ${tx.hash}`);
+    this.logger.log(
+      `queueSlashWithProof(${operator}, ${slashLevel}, epoch ${epoch}) submitted: ${tx.hash}`
+    );
     const receipt = await tx.wait();
     if (!receipt || receipt.status !== 1) {
       throw new Error(

@@ -44,16 +44,18 @@ ERC-4337 compliant smart contract wallets with:
 - **Flexible Validation**: Support for both AAStarValidator and standard ECDSA
 - **Modular Design**: Clean separation between account logic and validation
 
-> The account + factory contracts were retired (#163 Phase 1) — see the note below. Account
-> deployment now lives in `airaccount-contract`.
+> The account + factory contracts were retired (#163 Phase 1) — see the note
+> below. Account deployment now lives in `airaccount-contract`.
 
 ## Project Structure
 
-> **Note (#163 Phase 1):** the ERC-4337 account + factory contracts (`AAStarAccountBase`,
-> `AAStarAccountV6/7/8`, `AAStarAccountFactoryV6/7/8`) and their `DeployAAStar*` bundle scripts
-> were **retired**. This repo now ships the DVT **validator only**; the production account line is
-> `airaccount-contract`'s `AAStarAirAccountV7` (EntryPoint v0.7, behind its ValidatorRouter).
-> `AAStarValidator` is router-mountable via `IAAStarAlgorithm.validate()` (algId 0x01).
+> **Note (#163 Phase 1):** the ERC-4337 account + factory contracts
+> (`AAStarAccountBase`, `AAStarAccountV6/7/8`, `AAStarAccountFactoryV6/7/8`) and
+> their `DeployAAStar*` bundle scripts were **retired**. This repo now ships the
+> DVT **validator only**; the production account line is `airaccount-contract`'s
+> `AAStarAirAccountV7` (EntryPoint v0.7, behind its ValidatorRouter).
+> `AAStarValidator` is router-mountable via `IAAStarAlgorithm.validate()` (algId
+> 0x01).
 
 ```
 contracts/

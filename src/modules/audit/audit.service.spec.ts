@@ -56,12 +56,7 @@ function makeBlockchain(
     ) => Promise<boolean | null>;
     getCode: (addr: string) => Promise<string>;
     getCreditLimit: (addr: string, op: string, bt?: number) => Promise<bigint>;
-    getAvailableCredit: (
-      addr: string,
-      op: string,
-      token: string,
-      bt?: number
-    ) => Promise<bigint>;
+    getAvailableCredit: (addr: string, op: string, token: string, bt?: number) => Promise<bigint>;
     getDebt: (tokenAddr: string, op: string, bt?: number) => Promise<bigint | null>;
     getGlobalReputation: (addr: string, op: string, bt?: number) => Promise<bigint>;
     getRoleLockAmount: (...args: any[]) => Promise<bigint>;
@@ -354,12 +349,7 @@ describe("AuditService", () => {
       seen.limit = bt;
       return 1000n;
     };
-    blockchain.getAvailableCredit = async (
-      _a: string,
-      _o: string,
-      _token: string,
-      bt?: number
-    ) => {
+    blockchain.getAvailableCredit = async (_a: string, _o: string, _token: string, bt?: number) => {
       seen.avail = bt;
       return 0n;
     };
@@ -1357,7 +1347,14 @@ describe("AuditService", () => {
     }
     // Final durable state is likewise consistent.
     expect(records[0].executeTx).toBe("0xEXECUTETX");
-    const finalExpected = buildExecuteMessageHash(7n, OPERATOR, 1, BLOCK, 11155111, records[0].proofHash);
+    const finalExpected = buildExecuteMessageHash(
+      7n,
+      OPERATOR,
+      1,
+      BLOCK,
+      11155111,
+      records[0].proofHash
+    );
     expect(records[0].messageHash).toBe(finalExpected);
   });
 
