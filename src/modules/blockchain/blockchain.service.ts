@@ -3,6 +3,29 @@ import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { bumpedFees } from "../../utils/gas.util.js";
 
+/**
+ * CROSS-REPO INTERFACE CONTRACT — the account owner-auth gate.
+ *
+ * The DVT owner-gate (bls.service.ts) delegates all owner-auth validation to the ACCOUNT
+ * contract via this view (see docs/INTERFACES.md). It is NOT standard ERC-1271: the account
+ * is airaccount-contract's AAStarAirAccountV7, which owns the validation logic (k1 ECDSA /
+ * P256 passkey / future), so DVT never verifies locally and never drifts.
+ *
+ * `OWNER_AUTH_MAGIC` is the function selector of `OWNER_AUTH_FN` used as the success magic
+ * value (exactly how ERC-1271's 0x1626ba7e is selector(isValidSignature(bytes32,bytes))).
+ * The invariant `selector(OWNER_AUTH_FN) === OWNER_AUTH_MAGIC` is LOCKED by a unit test
+ * (blockchain.service.spec.ts) — if airaccount ever changes this interface, updating one
+ * without the other fails CI, forcing a deliberate cross-repo sync. This is the DVT half of
+ * the auto-check; the airaccount half is that airaccount MUST flag a change to this signature
+ * (tracked in docs/INTERFACES.md as a hard dependency).
+ */
+export const OWNER_AUTH_FN = "isValidOwnerAuth(bytes32,bytes)";
+export const OWNER_AUTH_MAGIC = "0xa0cf00cf";
+/** Human-readable ABI for the ethers.Contract call — must stay in sync with OWNER_AUTH_FN. */
+export const OWNER_AUTH_ABI = [
+  "function isValidOwnerAuth(bytes32 userOpHash, bytes calldata ownerAuth) view returns (bytes4)",
+];
+
 /** ERC-4337 v0.7 PackedUserOperation (the exact tuple EntryPoint.getUserOpHash takes). */
 export interface PackedUserOp {
   sender: string;
@@ -959,17 +982,13 @@ export class BlockchainService {
       throw new Error("Blockchain provider not configured");
     }
 
-    // AAStarAirAccount custom magic value for isValidOwnerAuth (not standard ERC-1271)
-    const MAGIC_VALUE = "0xa0cf00cf";
-
-    const abi = [
-      "function isValidOwnerAuth(bytes32 userOpHash, bytes calldata ownerAuth) view returns (bytes4)",
-    ];
-    const contract = new ethers.Contract(account, abi, this.provider);
+    // AAStarAirAccount custom magic value for isValidOwnerAuth (not standard ERC-1271).
+    // Sourced from the single cross-repo interface contract at module top (invariant-tested).
+    const contract = new ethers.Contract(account, OWNER_AUTH_ABI, this.provider);
 
     try {
       const result = await contract.isValidOwnerAuth(userOpHash, ownerAuth);
-      return result === MAGIC_VALUE;
+      return result === OWNER_AUTH_MAGIC;
     } catch (error: any) {
       this.logger.warn(`isValidOwnerAuth eth_call failed for account ${account}: ${error.message}`);
       return false;

@@ -9,8 +9,13 @@ data/*
 node_dev_*.json
 !node_dev_001.json
 
-# Node state files (contains private keys)
-# node_state.json — committed intentionally for Render deployment (ephemeral filesystem)
+# Node state files (contain the node's BLS private key — NEVER commit).
+# The root node_state.json is git-ignored: each deployment MUST generate its own
+# INDEPENDENT key (node scripts/gen-node-state.mjs, or the /admin dashboard, or an
+# EIP-2335 keystore). node_state.example.json is the committed template. A committed
+# real key would let anyone who reads the repo impersonate the node (CC-22 footgun).
+# Unanchored so a node_state.json in ANY dir is ignored (example keeps its own name).
+node_state.json
 
 # Dependencies
 node_modules/

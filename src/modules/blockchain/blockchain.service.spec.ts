@@ -1,5 +1,10 @@
 import { ethers } from "ethers";
-import { BlockchainService } from "./blockchain.service.js";
+import {
+  BlockchainService,
+  OWNER_AUTH_FN,
+  OWNER_AUTH_MAGIC,
+  OWNER_AUTH_ABI,
+} from "./blockchain.service.js";
 
 /**
  * Focused unit tests for the durable over-slash guard read `getRecentSlashExecuted` (Codex round-2
@@ -68,5 +73,29 @@ describe("BlockchainService.getRecentSlashExecuted", () => {
     ]);
     const result = await svc.getRecentSlashExecuted(CONTRACT, OTHER_OPERATOR, LEVEL, 0);
     expect(result).toBe(false);
+  });
+});
+
+/**
+ * Cross-repo interface lock for the owner-auth gate (airaccount-contract AAStarAirAccountV7).
+ * The magic value the DVT gate checks MUST equal the function selector of the delegated view —
+ * if airaccount ever changes this interface, updating OWNER_AUTH_FN/OWNER_AUTH_MAGIC/OWNER_AUTH_ABI
+ * out of step fails CI here, forcing a deliberate sync. See docs/INTERFACES.md.
+ */
+describe("owner-auth cross-repo interface invariant", () => {
+  it("OWNER_AUTH_MAGIC === selector(OWNER_AUTH_FN)", () => {
+    expect(ethers.id(OWNER_AUTH_FN).slice(0, 10)).toBe(OWNER_AUTH_MAGIC);
+  });
+
+  it("OWNER_AUTH_ABI's fragment selector matches OWNER_AUTH_MAGIC (ABI kept in sync)", () => {
+    const iface = new ethers.Interface(OWNER_AUTH_ABI);
+    const frag = iface.getFunction("isValidOwnerAuth");
+    expect(frag).not.toBeNull();
+    expect(frag!.selector).toBe(OWNER_AUTH_MAGIC);
+  });
+
+  it("is NOT the standard ERC-1271 isValidSignature magic (0x1626ba7e)", () => {
+    // Guards against a silent revert to standard ERC-1271, which would accept the wrong accounts.
+    expect(OWNER_AUTH_MAGIC).not.toBe(ethers.id("isValidSignature(bytes32,bytes)").slice(0, 10));
   });
 });
