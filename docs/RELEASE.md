@@ -67,6 +67,14 @@ VALIDATOR=<deployed> NETWORK=<network> ./scripts/sync-validator-abi.sh ../aastar
 
 - Version-bump this repo (`npm run release:patch|minor|major`), tag, GitHub
   release.
+- **Version naming (CC-14 convention):** in all human-readable outward text —
+  release notes, PR titles, issue/board comments — write the product name in
+  full: **`YetAnotherAA-Validator (DVT) vX.Y.Z`**. Never bare-report a number
+  (`v1.9`) that could be confused with `@aastar/sdk 0.37.x` /
+  `airaccount-contract v0.27.0` / `SuperPaymaster v5.4.x` /
+  `AirAccount KMS openapi 0.27.x`. When reporting a cross-repo sync, name both
+  sides. Keep the `package.json`/git-tag version a clean semver (no product name
+  — it breaks npm/CI).
 - If the ABI/address changed, land the SDK PR (step 4) referencing this release.
 - Cross-link: SuperPaymaster #321 (stake source), aastar-sdk #270 (SDK impact),
   #163.
