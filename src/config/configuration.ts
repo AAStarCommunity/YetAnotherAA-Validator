@@ -201,13 +201,43 @@ export default () => {
     auditChainId: parseInt(process.env.AUDIT_CHAIN_ID || "11155111", 10),
     auditRegistryAddress: process.env.AUDIT_REGISTRY_ADDRESS || undefined,
     auditSuperPaymasterAddress: process.env.AUDIT_SUPER_PAYMASTER_ADDRESS || undefined,
-    auditDvtValidatorAddress: process.env.AUDIT_DVT_VALIDATOR_ADDRESS || undefined,
+    // DVTValidator (SP #329 finalized interface). Default is the Sepolia deployment.
+    auditDvtValidatorAddress:
+      process.env.AUDIT_DVT_VALIDATOR_ADDRESS || "0x568b1486BFE036e603eA11f0D03Dc47fa62c9E0e",
+    // BLSAggregator (SP #329). Currently informational — the on-chain queue/execute writes go
+    // through DVTValidator; the aggregator address is recorded for the future live gossip
+    // co-sign that will aggregate peer BLS signatures by SP-assigned validator slot.
+    auditBlsAggregatorAddress:
+      process.env.AUDIT_BLS_AGGREGATOR_ADDRESS || "0xF51c029879685Ced8fbCfa4b647c2eAe50Cd8B13",
     auditGtokenStakingAddress: process.env.AUDIT_GTOKEN_STAKING_ADDRESS || undefined,
+    // SECOND safety gate (increment 2). AUDIT_ENABLED alone only FILES slash proposals; the
+    // two-step on-chain slash (queueSlashWithProof → executeWithProof, each quorum co-signed)
+    // fires ONLY when this is ALSO "true". Default FALSE so nothing is auto-slashed until an
+    // operator explicitly opts in AND the SP validator slots (registerBLSPublicKey) are ready.
+    auditExecuteSlash: process.env.AUDIT_EXECUTE_SLASH === "true",
     // The xPNTs token the credit-over-limit rule reads operator debt from. Debt lives on the
     // xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT on SuperPaymaster/Registry. Default is the
     // Sepolia aPNTs token. FAIL-CLOSED: required + must have on-chain code when AUDIT_ENABLED=true.
     auditApntsTokenAddress:
       process.env.AUDIT_APNTS_TOKEN_ADDRESS || "0x696A73701b104c6cCBbAadDD2216788ea08EaB89",
+    // Reorg-safety (finding-3): the audit reads all rule inputs at a FINALIZED (fallback: safe)
+    // block. On chains that expose neither tag, fall back to latest MINUS this many confirmations.
+    // FLOORED at 1 (never 0): a 0 (or non-numeric) value would make the fallback resolve to the
+    // UNCONFIRMED head (latest − 0), defeating the finality guard. A positive floor guarantees the
+    // fallback is always at least one confirmation behind the head. Default 12.
+    auditFinalityConfirmations: (() => {
+      const parsed = parseInt(process.env.AUDIT_FINALITY_CONFIRMATIONS || "12", 10);
+      return Math.max(1, Number.isFinite(parsed) ? parsed : 12);
+    })(),
+    // Durable over-slash guard (finding-2): how far back to scan slash-executed events when
+    // deciding whether an operator was already slashed (a restart-surviving, on-chain-truth guard).
+    // NOTE (PK finding): on a range-limited RPC, a getLogs span wider than the provider's cap makes
+    // the scan error → indeterminate. When the pending flag is ALSO indeterminate (as on the current
+    // SP deployment, which has no isSlashPending getter), the over-slash guard then fails CLOSED (the
+    // slash is SKIPPED, logged as "indeterminate") — the safe direction, but it suppresses legitimate
+    // slashes. Size this to your RPC's getLogs block-range limit (many public endpoints cap ~10k) so
+    // the scan stays determinate. It is only consulted on the armed executeSlash path.
+    auditSlashLookbackBlocks: parseInt(process.env.AUDIT_SLASH_LOOKBACK_BLOCKS || "50000", 10),
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,

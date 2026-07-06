@@ -442,6 +442,128 @@ export class BlockchainService {
     return this.provider.getBlockNumber();
   }
 
+  /**
+   * The block an irreversible slash is justified against — a FINALIZED (fallback: safe) block,
+   * returned as `{ number, hash }` (finding-3). Pinning the slash evidence to a finalized block,
+   * and recording its HASH, makes the justification reorg-safe: a reorg that rewrites the chain
+   * head cannot silently invalidate the block the audit read its rule inputs at.
+   *
+   * Order of preference: `provider.getBlock("finalized")`, then `"safe"` (post-Merge PoS tags),
+   * then — for RPCs/chains that expose neither — latest MINUS `confirmations` blocks. Throws only
+   * if even that fallback cannot resolve a block (misconfigured provider). All rule reads are then
+   * block-pinned to the returned `number` (via blockTag), so nothing is read at an unstable head.
+   */
+  async getViolationBlock(confirmations = 12): Promise<{ number: number; hash: string }> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    for (const tag of ["finalized", "safe"] as const) {
+      try {
+        const b = await this.provider.getBlock(tag);
+        if (b && typeof b.number === "number" && b.hash) {
+          return { number: b.number, hash: b.hash };
+        }
+      } catch {
+        // This RPC/chain does not support the tag — fall through to the next.
+      }
+    }
+    // Fallback: latest minus a confirmation depth (chains without finalized/safe tags). The
+    // confirmation depth is floored at 1 so the fallback NEVER resolves to the unconfirmed head
+    // (latest − 0): a finality-safe fallback must always sit at least one confirmation back.
+    const latest = await this.provider.getBlockNumber();
+    const target = Math.max(0, latest - Math.max(1, confirmations));
+    const b = await this.provider.getBlock(target);
+    if (!b || typeof b.number !== "number" || !b.hash) {
+      throw new Error(
+        `getViolationBlock: could not resolve a finalized/safe block (latest ${latest}, target ${target})`
+      );
+    }
+    return { number: b.number, hash: b.hash };
+  }
+
+  /**
+   * DURABLE (restart-surviving) over-slash guard (finding-2): did `operator` already get slashed
+   * recently on `contractAddress`? Queries the on-chain slash-executed events within a bounded
+   * `[fromBlock, latest]` window and returns true on the first match. Both event shapes are tried
+   * (either can carry the executed slash), each topic-filtered by the indexed `operator`:
+   *
+   *   SuperPaymaster.SlashExecutedWithProof(address indexed operator, uint8 level, ...)
+   *   BLSAggregator.SlashExecuted(uint256 indexed proposalId, address indexed operator, uint8 level)
+   *
+   * Unlike the private `_pendingSlash` (no getter → isSlashPending returns null), an emitted event
+   * is a permanent on-chain fact, so this survives a node restart and is the authoritative guard
+   * against re-slashing a sustained violation.
+   *
+   * Returns `boolean | null`:
+   *   - `true`  — a matching slash event (operator + slashLevel) exists in the window.
+   *   - `false` — the window was scanned cleanly and NO matching event exists.
+   *   - `null`  — a provider/getLogs error made the scan INDETERMINATE. For a DUPLICATE-slash guard
+   *               on an IRREVERSIBLE action a provider error must NEVER be read as "not slashed"; the
+   *               caller treats `null` as "cannot determine" and fails CLOSED (do-not-slash).
+   *
+   * Match is narrowed to operator + slashLevel (NOT operator alone). `level` is a NON-indexed field
+   * in both events, so it is decoded from the log data and compared. This is INTENTIONALLY
+   * CONSERVATIVE: the audit rule is not itself on-chain, so a same-operator+level slash within the
+   * lookback window OVER-skips (never risks a double slash) rather than under-skips. A slash for a
+   * DIFFERENT level does not mark this rule as already-slashed.
+   */
+  async getRecentSlashExecuted(
+    contractAddress: string,
+    operator: string,
+    slashLevel: number,
+    fromBlock: number
+  ): Promise<boolean | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const iface = new ethers.Interface([
+      "event SlashExecutedWithProof(address indexed operator, uint8 level, uint256 penalty, bytes32 proofHash, uint256 timestamp)",
+      "event SlashExecuted(uint256 indexed proposalId, address indexed operator, uint8 level)",
+    ]);
+    const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
+    const filters = [
+      // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]).
+      {
+        name: "SlashExecutedWithProof",
+        topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic],
+      },
+      // SlashExecuted: proposalId is 1st indexed (topics[1]), operator 2nd (topics[2]).
+      {
+        name: "SlashExecuted",
+        topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic],
+      },
+    ];
+    for (const f of filters) {
+      let logs;
+      try {
+        logs = await this.provider.getLogs({
+          address: contractAddress,
+          fromBlock: Math.max(0, fromBlock),
+          toBlock: "latest",
+          topics: f.topics as (string | null)[],
+        });
+      } catch (error: any) {
+        // FAIL-CLOSED: a getLogs/provider error means the window could NOT be scanned. Return null
+        // ("indeterminate") rather than swallowing to a false "no match" — the caller must not read
+        // an unreadable chain as "safe to slash" for an irreversible action.
+        this.logger.warn(
+          `getRecentSlashExecuted getLogs failed on ${contractAddress} (${f.name}): ${error.message} — indeterminate`
+        );
+        return null;
+      }
+      for (const log of logs) {
+        try {
+          // level is NON-indexed in both events → decode it from the log data and compare.
+          const parsed = iface.parseLog({ topics: log.topics as string[], data: log.data });
+          if (parsed && Number(parsed.args.level) === slashLevel) return true;
+        } catch {
+          // A log the topic filter matched but we could not decode — ignore (not our event shape).
+        }
+      }
+    }
+    return false;
+  }
+
   /** Runtime bytecode at `address` ("0x" when there's no contract). Used for a fail-closed
    *  bootstrap existence check before the audit poll trusts an address. */
   async getCode(address: string, blockTag?: number): Promise<string> {
@@ -483,7 +605,9 @@ export class BlockchainService {
       const debt = await contract.getDebt(operator, { blockTag });
       return BigInt(debt);
     } catch (error: any) {
-      this.logger.warn(`getDebt read failed on token ${tokenAddress} for ${operator}: ${error.message}`);
+      this.logger.warn(
+        `getDebt read failed on token ${tokenAddress} for ${operator}: ${error.message}`
+      );
       return null;
     }
   }
@@ -619,6 +743,196 @@ export class BlockchainService {
         (proposalId !== null ? ` (proposalId ${proposalId})` : "")
     );
     return { txHash: tx.hash, proposalId };
+  }
+
+  /**
+   * Best-effort read of an operator's on-chain pending-slash flag. This is the DURABLE
+   * cross-restart guard against double-slashing a sustained violation (finding-4/5): if a slash
+   * is already queued/pending, the audit must NOT queue+execute another.
+   *
+   * SP #329 keeps `_pendingSlash` PRIVATE with no public getter, so on the current deployment this
+   * call reverts and returns `null` ("unknown") — the caller then falls back to the in-memory
+   * coarse operator|rule guard. Should a future SuperPaymaster expose `pendingSlash(address)`
+   * (or `isSlashPending`), this begins returning the real flag and becomes the authoritative,
+   * restart-surviving guard with no caller change. `null` is treated as "unknown", never "false".
+   */
+  async isSlashPending(
+    superPaymasterAddress: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<boolean | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    // Try both plausible public getter names; either returning a bool answers the question.
+    const abi = [
+      "function pendingSlash(address operator) view returns (bool)",
+      "function isSlashPending(address operator) view returns (bool)",
+    ];
+    const contract = new ethers.Contract(superPaymasterAddress, abi, this.provider);
+    for (const fn of ["pendingSlash", "isSlashPending"] as const) {
+      try {
+        const pending: boolean = await contract[fn](operator, { blockTag });
+        return Boolean(pending);
+      } catch {
+        // getter absent on this deployment — try the next name.
+      }
+    }
+    return null;
+  }
+
+  /**
+   * File a slash proposal binding the archived evidence (SP #329 4-arg createProposal):
+   *   createProposal(address operator, uint8 level, string reason, bytes32 evidenceHash) returns (uint256 id)
+   *
+   * NOTE: the 4-arg `createProposal` selector is ONLY exposed by the #329 DVTValidator
+   * (Sepolia default 0x568b1486BFE036e603eA11f0D03Dc47fa62c9E0e, config-overridable via
+   * AUDIT_DVT_VALIDATOR_ADDRESS), which ships both the legacy 3-arg and this evidence-binding
+   * 4-arg overload. Pointing this at an older 3-arg-only validator would revert (no matching
+   * selector). Same admin-wallet + bumped-fees + await-receipt contract as createSlashProposal;
+   * the extra `evidenceHash` (the content-addressed proofHash) binds the on-chain proposal to the
+   * archived proof. Returns the tx hash and the REAL on-chain id parsed from ProposalCreated
+   * (`null` when the event is absent, so the caller never fabricates an id).
+   */
+  async createProposalWithEvidence(
+    dvtValidatorAddress: string,
+    operator: string,
+    level: number,
+    reason: string,
+    evidenceHash: string
+  ): Promise<{ txHash: string; proposalId: bigint | null }> {
+    if (!this.wallet) {
+      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+    }
+    const abi = [
+      "function createProposal(address operator, uint8 level, string reason, bytes32 evidenceHash) returns (uint256)",
+      "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
+    ];
+    const iface = new ethers.Interface(abi);
+    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.createProposal(
+      operator,
+      level,
+      reason,
+      evidenceHash,
+      fees
+    );
+    this.logger.log(
+      `createProposal(${operator}, ${level}, evidence ${evidenceHash}) submitted: ${tx.hash}`
+    );
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(
+        `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+      );
+    }
+    let proposalId: bigint | null = null;
+    for (const log of receipt.logs) {
+      try {
+        const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+        if (parsed && parsed.name === "ProposalCreated") {
+          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+          break;
+        }
+      } catch {
+        // Not a ProposalCreated log (or from another contract) — skip.
+      }
+    }
+    if (proposalId === null) {
+      this.logger.warn(
+        `createProposal ${tx.hash} confirmed but no ProposalCreated event found — id unresolved`
+      );
+    }
+    this.logger.log(
+      `createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}` +
+        (proposalId !== null ? ` (proposalId ${proposalId})` : "")
+    );
+    return { txHash: tx.hash, proposalId };
+  }
+
+  /**
+   * Step 1 of the two-step slash (SP #329):
+   *   queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof)
+   * `proof` is abi.encode(uint256 signerMask, bytes sigG2) from the quorum co-sign over the
+   * step-1 messageHash. Admin wallet + bumped fees + await-receipt (throws on non-success so the
+   * caller logs and archives the evidence anyway). Returns the tx hash.
+   */
+  async queueSlashWithProof(
+    dvtValidatorAddress: string,
+    operator: string,
+    slashLevel: number,
+    epoch: bigint | number,
+    proof: string
+  ): Promise<string> {
+    if (!this.wallet) {
+      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+    }
+    const abi = [
+      "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof) external",
+    ];
+    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.queueSlashWithProof(
+      operator,
+      slashLevel,
+      epoch,
+      proof,
+      fees
+    );
+    this.logger.log(
+      `queueSlashWithProof(${operator}, ${slashLevel}, epoch ${epoch}) submitted: ${tx.hash}`
+    );
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(
+        `queueSlashWithProof tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+      );
+    }
+    this.logger.log(`queueSlashWithProof(${operator}) confirmed in block ${receipt.blockNumber}`);
+    return tx.hash;
+  }
+
+  /**
+   * Step 2 of the two-step slash (SP #329):
+   *   executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof)
+   * For a slash-only proposal repUsers/newScores are empty. `proof` is abi.encode(signerMask, sigG2)
+   * from the quorum co-sign over the step-2 messageHash. Admin wallet + bumped fees +
+   * await-receipt (throws on non-success). Returns the tx hash.
+   */
+  async executeSlashWithProof(
+    dvtValidatorAddress: string,
+    id: bigint | number,
+    repUsers: string[],
+    newScores: Array<bigint | number>,
+    epoch: bigint | number,
+    proof: string
+  ): Promise<string> {
+    if (!this.wallet) {
+      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+    }
+    const abi = [
+      "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof) external",
+    ];
+    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const fees = await bumpedFees(this.provider);
+    const tx: ethers.TransactionResponse = await contract.executeWithProof(
+      id,
+      repUsers,
+      newScores,
+      epoch,
+      proof,
+      fees
+    );
+    this.logger.log(`executeWithProof(id ${id}, epoch ${epoch}) submitted: ${tx.hash}`);
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(
+        `executeWithProof tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+      );
+    }
+    this.logger.log(`executeWithProof(id ${id}) confirmed in block ${receipt.blockNumber}`);
+    return tx.hash;
   }
 
   /** Current network base-fee in gwei (0 on chains without EIP-1559). */
