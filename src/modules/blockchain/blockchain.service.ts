@@ -469,9 +469,11 @@ export class BlockchainService {
         // This RPC/chain does not support the tag — fall through to the next.
       }
     }
-    // Fallback: latest minus a confirmation depth (chains without finalized/safe tags).
+    // Fallback: latest minus a confirmation depth (chains without finalized/safe tags). The
+    // confirmation depth is floored at 1 so the fallback NEVER resolves to the unconfirmed head
+    // (latest − 0): a finality-safe fallback must always sit at least one confirmation back.
     const latest = await this.provider.getBlockNumber();
-    const target = Math.max(0, latest - Math.max(0, confirmations));
+    const target = Math.max(0, latest - Math.max(1, confirmations));
     const b = await this.provider.getBlock(target);
     if (!b || typeof b.number !== "number" || !b.hash) {
       throw new Error(
@@ -492,14 +494,27 @@ export class BlockchainService {
    *
    * Unlike the private `_pendingSlash` (no getter → isSlashPending returns null), an emitted event
    * is a permanent on-chain fact, so this survives a node restart and is the authoritative guard
-   * against re-slashing a sustained violation. Best-effort: an absent event / RPC range error on a
-   * given filter is swallowed (treated as "no match"); returns false when nothing is found.
+   * against re-slashing a sustained violation.
+   *
+   * Returns `boolean | null`:
+   *   - `true`  — a matching slash event (operator + slashLevel) exists in the window.
+   *   - `false` — the window was scanned cleanly and NO matching event exists.
+   *   - `null`  — a provider/getLogs error made the scan INDETERMINATE. For a DUPLICATE-slash guard
+   *               on an IRREVERSIBLE action a provider error must NEVER be read as "not slashed"; the
+   *               caller treats `null` as "cannot determine" and fails CLOSED (do-not-slash).
+   *
+   * Match is narrowed to operator + slashLevel (NOT operator alone). `level` is a NON-indexed field
+   * in both events, so it is decoded from the log data and compared. This is INTENTIONALLY
+   * CONSERVATIVE: the audit rule is not itself on-chain, so a same-operator+level slash within the
+   * lookback window OVER-skips (never risks a double slash) rather than under-skips. A slash for a
+   * DIFFERENT level does not mark this rule as already-slashed.
    */
   async getRecentSlashExecuted(
     contractAddress: string,
     operator: string,
+    slashLevel: number,
     fromBlock: number
-  ): Promise<boolean> {
+  ): Promise<boolean | null> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
@@ -510,21 +525,36 @@ export class BlockchainService {
     const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
     const filters = [
       // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]).
-      { topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic] },
+      { name: "SlashExecutedWithProof", topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic] },
       // SlashExecuted: proposalId is 1st indexed (topics[1]), operator 2nd (topics[2]).
-      { topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic] },
+      { name: "SlashExecuted", topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic] },
     ];
     for (const f of filters) {
+      let logs;
       try {
-        const logs = await this.provider.getLogs({
+        logs = await this.provider.getLogs({
           address: contractAddress,
           fromBlock: Math.max(0, fromBlock),
           toBlock: "latest",
           topics: f.topics as (string | null)[],
         });
-        if (logs.length > 0) return true;
-      } catch {
-        // Event not defined on this contract, or RPC range/filter error — try the next.
+      } catch (error: any) {
+        // FAIL-CLOSED: a getLogs/provider error means the window could NOT be scanned. Return null
+        // ("indeterminate") rather than swallowing to a false "no match" — the caller must not read
+        // an unreadable chain as "safe to slash" for an irreversible action.
+        this.logger.warn(
+          `getRecentSlashExecuted getLogs failed on ${contractAddress} (${f.name}): ${error.message} — indeterminate`
+        );
+        return null;
+      }
+      for (const log of logs) {
+        try {
+          // level is NON-indexed in both events → decode it from the log data and compare.
+          const parsed = iface.parseLog({ topics: log.topics as string[], data: log.data });
+          if (parsed && Number(parsed.args.level) === slashLevel) return true;
+        } catch {
+          // A log the topic filter matched but we could not decode — ignore (not our event shape).
+        }
       }
     }
     return false;

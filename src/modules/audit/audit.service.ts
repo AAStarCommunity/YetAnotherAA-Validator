@@ -639,7 +639,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       proposalIdNote = "id-unresolved: proposal attempt suppressed by cooldown";
     } else if (
       this.executeSlash &&
-      (await this.isCoarseAlreadySlashed(coarseKey, v.operator, v.violationBlock))
+      (await this.isCoarseAlreadySlashed(coarseKey, v.operator, v.slashLevel, v.violationBlock))
     ) {
       // ARMED path OVER-SLASH GUARD (finding-4/5): a slash already executed (in-memory) or is
       // pending on-chain for this operator+rule → do NOT queue/execute the same ongoing condition
@@ -774,13 +774,20 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    *      local journal was lost. A hit is persisted to BOTH the durable journal and the memory guard.
    *   4. Best-effort on-chain PENDING flag (isSlashPending) — null ("unknown") on the current SP
    *      (private `_pendingSlash`), so it only helps a future deployment that exposes a getter.
+   *   5. CONSERVATIVE fail-closed backstop — if the on-chain event scan was INDETERMINATE (provider
+   *      error → null), there is no durable marker, AND the pending flag is ALSO indeterminate, we
+   *      cannot positively confirm "not slashed". For an IRREVERSIBLE slash we then treat it as
+   *      already-slashed and SKIP: better to miss a legitimate slash than risk a DOUBLE-slash when
+   *      the chain state can't be read.
    *
-   * `violationBlock` bounds the event scan window (`violationBlock - slashLookbackBlocks`). Every
-   * remote read is best-effort: an error is swallowed and treated as "no signal", never "not slashed".
+   * `violationBlock` bounds the event scan window (`violationBlock - slashLookbackBlocks`); the scan
+   * is narrowed to operator + `slashLevel`. A determinate remote read of "not slashed" lets the slash
+   * proceed; an indeterminate read (provider error) fails CLOSED per (5) — never "safe to slash".
    */
   private async isCoarseAlreadySlashed(
     coarseKey: string,
     operator: string,
+    slashLevel: number,
     violationBlock: number
   ): Promise<boolean> {
     if (this.slashedCoarseKeys.has(coarseKey)) return true;
@@ -795,29 +802,55 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // best-effort: journal read error → fall through to the on-chain scan.
     }
 
-    // (3) ON-CHAIN slash-executed events — the authoritative cross-restart guard.
+    // (3) ON-CHAIN slash-executed events — the authoritative cross-restart guard. A `null` from any
+    // target means that scan was INDETERMINATE (provider error), tracked so (5) can fail closed.
+    let scanIndeterminate = false;
     try {
       const fromBlock = Math.max(0, violationBlock - this.slashLookbackBlocks);
       const scanTargets = [this.blsAggregatorAddress, this.superPaymasterAddress].filter(Boolean);
       for (const target of scanTargets) {
-        if (await this.blockchainService.getRecentSlashExecuted(target, operator, fromBlock)) {
+        const hit = await this.blockchainService.getRecentSlashExecuted(
+          target,
+          operator,
+          slashLevel,
+          fromBlock
+        );
+        if (hit === true) {
           await this.recordCoarseSlashed(coarseKey); // persist durable + memory
           return true;
         }
+        if (hit === null) scanIndeterminate = true; // provider error on this target — unconfirmable
       }
     } catch {
-      // best-effort: RPC/range error → fall through to the pending flag.
+      // getRecentSlashExecuted threw (unexpected) → treat the whole scan as indeterminate.
+      scanIndeterminate = true;
     }
 
     // (4) Best-effort on-chain pending flag (null/unknown on the current SP).
+    let pendingIndeterminate = false;
     try {
       const pending = await this.blockchainService.isSlashPending(this.superPaymasterAddress, operator);
       if (pending === true) {
         this.markCoarseSlashed(coarseKey);
         return true;
       }
+      if (pending === null) pendingIndeterminate = true; // no getter on this deployment → unknown
     } catch {
-      // best-effort: getter absent / RPC error → unknown, rely on the guards above.
+      pendingIndeterminate = true; // getter absent / RPC error → unknown
+    }
+
+    // (5) CONSERVATIVE fail-closed backstop. Reaching here means NO guard positively confirmed an
+    // existing slash. If BOTH the on-chain event scan and the pending flag were indeterminate (and
+    // there is no durable marker — else we'd have returned above), we have zero authoritative signal
+    // that the operator is un-slashed. Fail CLOSED: skip the irreversible slash rather than risk a
+    // double-slash on unreadable chain state. A determinate on-chain "not slashed" leaves
+    // scanIndeterminate=false, so the normal armed path still slashes.
+    if (scanIndeterminate && pendingIndeterminate) {
+      this.logger.warn(
+        `Audit: ${operator} slash-state INDETERMINATE (on-chain scan + pending flag both ` +
+          `unavailable, no durable marker) — over-slash guard fails CLOSED, on-chain slash SKIPPED`
+      );
+      return true;
     }
     return false;
   }
@@ -978,11 +1011,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           this.logger.warn(
             `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
           );
-          // Durable immediately after the irreversible slash confirms (finding-4).
+          // Durable immediately after the irreversible slash confirms (finding-4). Set the SUBMITTED
+          // execute preimage as messageHash TOGETHER with executeTx in this same write, so every
+          // durable snapshot is internally consistent: a crash before the caller's final re-archive
+          // can no longer persist executeTx with messageHash="0x". `execMsgHash` is the exact 8-field
+          // preimage the quorum co-signed and executeWithProof carried (MEDIUM: executeTx+messageHash
+          // archived together). The caller's final pass recomputes the identical value (idempotent).
           if (proof) {
             proof.executeTx = executeTx;
             proof.signerMask = signerMask;
             proof.sigG2 = sigG2;
+            proof.messageHash = execMsgHash;
+            delete proof.messageHashNote;
+            delete proof.intendedExecuteMessageHash;
             await persistStep();
           }
         } catch (err: unknown) {

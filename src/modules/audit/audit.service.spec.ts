@@ -48,7 +48,12 @@ function makeBlockchain(
   overrides: Partial<{
     getBlockNumber: () => Promise<number>;
     getViolationBlock: (confirmations?: number) => Promise<{ number: number; hash: string }>;
-    getRecentSlashExecuted: (addr: string, op: string, fromBlock: number) => Promise<boolean>;
+    getRecentSlashExecuted: (
+      addr: string,
+      op: string,
+      slashLevel: number,
+      fromBlock: number
+    ) => Promise<boolean | null>;
     getCode: (addr: string) => Promise<string>;
     getCreditLimit: (addr: string, op: string, bt?: number) => Promise<bigint>;
     getAvailableCredit: (
@@ -1214,7 +1219,12 @@ describe("AuditService", () => {
     let scannedFrom: number | undefined;
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, {
-      getRecentSlashExecuted: async (_addr: string, _op: string, fromBlock: number) => {
+      getRecentSlashExecuted: async (
+        _addr: string,
+        _op: string,
+        _slashLevel: number,
+        fromBlock: number
+      ) => {
         scannedFrom = fromBlock;
         return false;
       },
@@ -1230,6 +1240,125 @@ describe("AuditService", () => {
     await svc.tick();
     // violationBlock 100000 - lookback 40000 = 60000.
     expect(scannedFrom).toBe(60_000);
+  });
+
+  // ── Codex round-2 HIGH: an INDETERMINATE on-chain scan fails CLOSED (no double-slash) ──
+  it("HIGH: getRecentSlashExecuted=null (provider error) → armed path SKIPS the slash (fail-closed)", async () => {
+    const order: string[] = [];
+    // Provider can't confirm slash state (null), and the pending flag is also unknown (null default).
+    const blockchain = recordingBlockchain(order, { getRecentSlashExecuted: async () => null });
+    const archive = makeArchive();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    // Indeterminate scan + indeterminate pending + no durable marker → over-slash guard fails CLOSED.
+    expect(order).toEqual([]); // NO queue / create / execute
+    expect(archive.records).toHaveLength(1); // evidence still archived (never lost)
+    expect(archive.records[0].proposalIdNote).toMatch(/over-slash guard/);
+  });
+
+  it("HIGH: getRecentSlashExecuted THROWS → armed path SKIPS the slash (fail-closed)", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, {
+      getRecentSlashExecuted: async () => {
+        throw new Error("provider down");
+      },
+    });
+    const archive = makeArchive();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    expect(order).toEqual([]); // NO on-chain writes when slash state is unconfirmable
+    expect(archive.records).toHaveLength(1);
+    expect(archive.records[0].proposalIdNote).toMatch(/over-slash guard/);
+  });
+
+  it("HIGH: an INDETERMINATE scan but a KNOWN pending flag (false) still lets the slash proceed", async () => {
+    // Only ONE of the two signals is indeterminate → we still have an authoritative signal, so the
+    // fail-closed backstop does NOT fire and the armed path slashes normally.
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, {
+      getRecentSlashExecuted: async () => null,
+      isSlashPending: async () => false,
+    });
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      makeArchive(),
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    expect(order).toEqual(["queue", "create", "execute"]);
+  });
+
+  // ── Codex round-2 MEDIUM: executeTx + submitted messageHash archived TOGETHER (consistent) ──
+  it("MEDIUM: the post-execute re-archive persists executeTx AND the 8-field messageHash together", async () => {
+    const snapshots: Array<{ executeTx?: string; messageHash: string; proofHash: string }> = [];
+    const records: SlashProof[] = [];
+    const snapArchive: IProofArchive & { slashed: Set<string> } = {
+      slashed: new Set<string>(),
+      async put(proof: SlashProof) {
+        snapshots.push({
+          executeTx: proof.executeTx,
+          messageHash: proof.messageHash,
+          proofHash: proof.proofHash,
+        });
+        const i = records.findIndex(r => r.proofHash === proof.proofHash);
+        if (i >= 0) records[i] = proof;
+        else records.push(proof);
+        return { proofHash: proof.proofHash, location: `mem://${proof.proofHash}` };
+      },
+      async has(proofHash: string) {
+        return records.some(r => r.proofHash === proofHash);
+      },
+      async count() {
+        return records.length;
+      },
+      async recordSlashed(k: string) {
+        this.slashed.add(k);
+      },
+      async hasSlashed(k: string) {
+        return this.slashed.has(k);
+      },
+      async removeSlashed(k: string) {
+        this.slashed.delete(k);
+      },
+    };
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order);
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      snapArchive,
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+
+    // EVERY durable snapshot that carries executeTx must ALSO carry a real (non-"0x") messageHash —
+    // no snapshot may persist executeTx alongside messageHash="0x" (the crash-window inconsistency).
+    const withExec = snapshots.filter(s => s.executeTx !== undefined);
+    expect(withExec.length).toBeGreaterThan(0);
+    for (const s of withExec) {
+      const expected = buildExecuteMessageHash(7n, OPERATOR, 1, BLOCK, 11155111, s.proofHash);
+      expect(s.messageHash).toBe(expected);
+      expect(s.messageHash).not.toBe("0x");
+    }
+    // Final durable state is likewise consistent.
+    expect(records[0].executeTx).toBe("0xEXECUTETX");
+    const finalExpected = buildExecuteMessageHash(7n, OPERATOR, 1, BLOCK, 11155111, records[0].proofHash);
+    expect(records[0].messageHash).toBe(finalExpected);
   });
 
   it("Finding 2: a durable slashed marker (archive) survives a RESTART → the sustained violation is NOT re-slashed", async () => {

@@ -222,7 +222,13 @@ export default () => {
       process.env.AUDIT_APNTS_TOKEN_ADDRESS || "0x696A73701b104c6cCBbAadDD2216788ea08EaB89",
     // Reorg-safety (finding-3): the audit reads all rule inputs at a FINALIZED (fallback: safe)
     // block. On chains that expose neither tag, fall back to latest MINUS this many confirmations.
-    auditFinalityConfirmations: parseInt(process.env.AUDIT_FINALITY_CONFIRMATIONS || "12", 10),
+    // FLOORED at 1 (never 0): a 0 (or non-numeric) value would make the fallback resolve to the
+    // UNCONFIRMED head (latest − 0), defeating the finality guard. A positive floor guarantees the
+    // fallback is always at least one confirmation behind the head. Default 12.
+    auditFinalityConfirmations: (() => {
+      const parsed = parseInt(process.env.AUDIT_FINALITY_CONFIRMATIONS || "12", 10);
+      return Math.max(1, Number.isFinite(parsed) ? parsed : 12);
+    })(),
     // Durable over-slash guard (finding-2): how far back to scan slash-executed events when
     // deciding whether an operator was already slashed (a restart-surviving, on-chain-truth guard).
     auditSlashLookbackBlocks: parseInt(process.env.AUDIT_SLASH_LOOKBACK_BLOCKS || "50000", 10),
