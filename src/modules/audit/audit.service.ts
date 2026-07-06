@@ -50,7 +50,6 @@ const SLASH_LEVEL_CREDIT_OVER_LIMIT = SlashLevel.MINOR;
 const RULE_CREDIT_OVER_LIMIT = "credit-over-limit";
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
-const ABI = new ethers.AbiCoder();
 
 export interface AuditDetection {
   operator: string;
@@ -62,6 +61,10 @@ export interface AuditDetection {
   detectedAt: number;
   /** Tx hash of the filed proposal, or null if the write failed / no wallet / cooldown-suppressed. */
   proposalTx: string | null;
+  /** Tx hash of the STEP-1 queueSlashWithProof (armed executeSlash path), or null. */
+  queueTx: string | null;
+  /** Tx hash of the STEP-2 executeWithProof — the on-chain slash (armed path), or null. */
+  executeTx: string | null;
 }
 
 @Injectable()
@@ -111,6 +114,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * Pruned once an entry ages past cooldownMs (the cooldown has expired → entry is dead).
    */
   private readonly lastProposalAt = new Map<string, number>();
+  /**
+   * DURABLE (within-process) over-slash guard for the ARMED execute path, keyed on the COARSE
+   * `chainId|operator|rule` (block-INDEPENDENT). Once a slash EXECUTES for an operator+rule, the
+   * coarse key is recorded here and the on-chain queue+execute is NOT re-run for the same ongoing
+   * condition — even after cooldownMs elapses and the violationBlock advances (which would mint a
+   * fresh stableKey/proofHash/epoch every tick). The key is cleared when the operator is next
+   * observed HEALTHY for that rule (condition resolved), so a genuinely NEW violation can slash
+   * again. Complements the best-effort on-chain isSlashPending() (the cross-restart guard) and the
+   * archive-before-execute ordering. The file-only proposal path is unaffected (keeps per-block dedup).
+   */
+  private readonly slashedCoarseKeys = new Set<string>();
   /** Hard ceiling on either dedup map's size — a defensive LRU-style cap against unbounded growth. */
   private static readonly MAX_DEDUP_ENTRIES = 10_000;
   /** Bounded ring of the most recent detections, newest first (for GET /audit/status). */
@@ -281,6 +295,30 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     }
   }
 
+  private coarseKey(operator: string, rule: string): string {
+    return `${this.chainId}|${operator}|${rule}`;
+  }
+
+  /**
+   * Record that an on-chain slash EXECUTED for this operator+rule so the armed execute path does
+   * not re-slash the same ongoing condition on later ticks. Bounded by a defensive LRU-style cap.
+   */
+  private markCoarseSlashed(coarseKey: string): void {
+    this.slashedCoarseKeys.add(coarseKey);
+    if (this.slashedCoarseKeys.size > AuditService.MAX_DEDUP_ENTRIES) {
+      const oldest = this.slashedCoarseKeys.values().next().value;
+      if (oldest !== undefined) this.slashedCoarseKeys.delete(oldest);
+    }
+  }
+
+  /**
+   * Clear the coarse over-slash guard once the operator is observed HEALTHY for a rule — the
+   * violation has resolved, so a genuinely new future violation is allowed to slash again.
+   */
+  private clearCoarseSlashed(operator: string, rule: string): void {
+    this.slashedCoarseKeys.delete(this.coarseKey(operator, rule));
+  }
+
   /**
    * Evict dedup/cooldown entries that have aged past cooldownMs (they can no longer suppress
    * anything, so keeping them only leaks memory in the long-lived daemon). Called once per tick.
@@ -375,6 +413,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.debug(
         `Audit: ${operator} creditLimit=0 (unconfigured/de-registered) — SKIP (fail-safe, not over-limit)`
       );
+      this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
       return;
     }
     // CROSS-CONTRACT AGREEMENT: both SuperPaymaster signals must agree before flagging. If
@@ -385,6 +424,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.debug(
         `Audit: ${operator} availableCredit=${availableCredit}>0 (within SP ceiling) — SKIP (no false over-limit)`
       );
+      this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
       return;
     }
 
@@ -399,12 +439,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.debug(
         `Audit: ${operator} not over limit (debt=${debt} ≤ limit=${creditLimit}, usage=${usageBps}bps)`
       );
+      this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
       return;
     }
     if (usageBps < this.creditThresholdBps) {
       this.logger.debug(
         `Audit: ${operator} over limit but under margin (usage=${usageBps}bps < ${this.creditThresholdBps}bps)`
       );
+      this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
       return;
     }
 
@@ -469,7 +511,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     sources: EvidenceSource[];
     observedAt: number;
   }): Promise<AuditDetection | null> {
-    const epoch = Math.floor(v.observedAt / 1000); // human field only — NOT hashed.
+    // DETERMINISTIC slash epoch = the violationBlock (an on-chain fact). Two DVT nodes observing
+    // the SAME violation derive the SAME epoch, so their queue/execute co-sign preimages match and
+    // the gossip BLS aggregate verifies. A wall-clock epoch (Math.floor(observedAt/1000)) would
+    // diverge across nodes → divergent messageHashes → the aggregate would never verify on-chain.
+    // observedAt stays a HUMAN-only field (already excluded from the content-address identity).
+    const epoch = v.violationBlock;
     const proposer = this.blockchainService.getWalletAddress() ?? ethers.ZeroAddress;
 
     // Content-address IDENTITY = ON-CHAIN facts only (no wall-clock). Two DVT nodes seeing
@@ -486,8 +533,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
 
     // ── DEDUP ─────────────────────────────────────────────────────────────────────
     const stableKey = `${this.chainId}|${v.operator}|${v.rule}|${v.violationBlock}`;
-    const coarseKey = `${this.chainId}|${v.operator}|${v.rule}`;
-    // (a) exact same violation@block already handled (this process, or on disk from a prior run).
+    const coarseKey = this.coarseKey(v.operator, v.rule);
+    // Exact same violation@block already handled (this process, or on disk from a prior run).
     if (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash))) {
       this.logger.debug(
         `Audit: ${v.operator} ${v.rule}@${v.violationBlock} already proposed (proof ${proofHash}) — skip`
@@ -495,91 +542,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       return null;
     }
 
-    // (b) COOLDOWN gates the on-chain ATTEMPT only (never the archival). An ongoing violation
-    //     whose block advances each tick must not re-send a tx every interval — otherwise a
-    //     persistently-reverting proposal (e.g. proposer not an active validator) would burn
-    //     admin-wallet gas and churn nonces forever. The cooldown is armed on ATTEMPT (below),
-    //     regardless of the tx result, keyed on the COARSE chainId|operator|rule.
-    const last = this.lastProposalAt.get(coarseKey);
-    const withinCooldown = last !== undefined && this.clock() - last < this.cooldownMs;
-
-    // File the slash proposal (proposal-INTENT), unless suppressed by the cooldown. Best-effort:
-    // on failure (no wallet / revert) the proof is still archived so the evidence survives.
-    let proposalTx: string | null = null;
-    let onchainProposalId: bigint | null = null;
-    if (withinCooldown) {
-      this.logger.debug(
-        `Audit: ${v.operator} ${v.rule} within cooldown (${this.clock() - (last as number)}ms < ` +
-          `${this.cooldownMs}ms) — attempt suppressed, archiving evidence only`
-      );
-    } else {
-      // Arm the cooldown on ATTEMPT (before the result) so a reverting tx still backs off for
-      // cooldownMs instead of retrying every advancing-block tick.
-      this.lastProposalAt.set(coarseKey, this.clock());
-      if (this.executeSlash) {
-        // INCREMENT 2 (execute-slash ARMED): the FULL two-step on-chain slash orchestration —
-        // queue (co-signed) → createProposal(evidenceHash=proofHash) → execute (co-signed). Each
-        // step is wrapped so a co-sign/tx failure is logged but the evidence is still archived
-        // below (evidence never lost) and the poll loop never crashes.
-        const res = await this.coordinateQuorumCoSign({
-          operator: v.operator,
-          slashLevel: v.slashLevel,
-          reason: v.reason,
-          epoch,
-          evidenceHash: proofHash,
-        });
-        proposalTx = res.proposalTx;
-        onchainProposalId = res.proposalId;
-      } else {
-        // DEFAULT (execute-slash OFF): only FILE the proposal (proposal-INTENT), binding the
-        // archived evidence via evidenceHash=proofHash. No queue/execute → nothing is slashed.
-        // Best-effort: on failure (no wallet / revert) the proof is still archived below.
-        try {
-          const res = await this.blockchainService.createProposalWithEvidence(
-            this.dvtValidatorAddress,
-            v.operator,
-            v.slashLevel,
-            v.reason,
-            proofHash
-          );
-          proposalTx = res.txHash;
-          onchainProposalId = res.proposalId;
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.logger.error(`Audit: ${v.operator} createProposal failed — ${msg}`);
-        }
-      }
-    }
-
-    // Use the REAL on-chain proposal id (decimal string). When unresolved — attempt suppressed
-    // by cooldown, write failed, or the ProposalCreated event was absent — store null + a clear
-    // note rather than fabricating an id (a fake id would never match the on-chain proposal and
-    // would break increment-2's quorum co-sign / verifyAndExecute).
-    const proposalId: string | null = onchainProposalId !== null ? onchainProposalId.toString() : null;
-    const proposalIdNote = withinCooldown
-      ? "id-unresolved: proposal attempt suppressed by cooldown"
-      : proposalTx === null
-        ? "id-unresolved: proposal write failed"
-        : onchainProposalId === null
-          ? "id-unresolved: ProposalCreated event not found in receipt"
-          : undefined;
-    // The message a DVT quorum would BLS-sign over the proposal (co-sign is increment 2). This
-    // MUST match BLSAggregator.verifyAndExecute's message-hash preimage (BLSAggregator.sol:406):
-    //   keccak256(abi.encode(proposalId, operator, slashLevel, repUsers[], newScores[], epoch, chainId))
-    // — 7 fields. For a slash-only proposal repUsers/newScores are empty ([]). Bound to the REAL id;
-    // when the id is unresolved the message is a placeholder ("0x") since there is no on-chain
-    // proposal to sign over yet.
-    // TODO(inc-2): epoch must match the value passed to verifyAndExecute at co-sign time.
-    const messageHash =
-      onchainProposalId !== null
-        ? ethers.keccak256(
-            ABI.encode(
-              ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256"],
-              [onchainProposalId, v.operator, v.slashLevel, [], [], epoch, this.chainId]
-            )
-          )
-        : "0x";
-
+    // Build the PRE-execution proof. The real proof.messageHash is the 8-field EXECUTE preimage,
+    // which needs the REAL proposalId (only known AFTER createProposal) — so it is "0x" + a note
+    // here and is filled in below once the proposal is filed. queueMessageHash (armed path) and
+    // the co-sign material are also set post-orchestration.
     const proof: SlashProof = {
       version: "dvt-slash-proof/1",
       chainId: this.chainId,
@@ -587,7 +553,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       slashLevel: v.slashLevel,
       reason: v.reason,
       epoch,
-      messageHash,
+      messageHash: "0x",
+      messageHashNote: "pre-execution: proposalId not yet resolved",
       evidence: {
         rule: v.rule,
         observed: v.debt.toString(),
@@ -596,8 +563,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         violationBlock: v.violationBlock,
         observedAt: v.observedAt,
       },
-      proposalId,
-      // Quorum co-sign fields are placeholders until increment 2.
+      proposalId: null,
       signerMask: "0x",
       sigG2: "0x",
       proofHash,
@@ -606,25 +572,111 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       penaltyAmount: "0",
       attestations: {},
       createdAt: this.clock(),
-      ...(proposalTx ? { proposalTx } : {}),
-      ...(proposalIdNote ? { proposalIdNote } : {}),
     };
 
-    // Archive the evidence FIRST, then mark the violation@block handled. If archive.put throws
-    // (disk full / IO error), recordStableKey is NOT reached, so a later tick re-attempts the
-    // archive rather than the in-memory stableKey silently suppressing it for cooldownMs — the
-    // "evidence never lost" invariant. (The on-chain tx is still cooldown-gated above, so a retry
-    // re-archives without re-sending a proposal.)
+    // ── ARCHIVE-BEFORE-EXECUTE (finding-5, evidence + intent durable first) ─────────
+    // Persist the durable evidence + slash INTENT BEFORE any irreversible on-chain queue/execute,
+    // so a crash mid-slash cannot lose the record. recordStableKey ONLY after a successful put so
+    // an archive IO failure does not silently suppress a retry (the evidence-never-lost invariant).
     const { location } = await this.archive.put(proof);
     this.recordStableKey(stableKey);
+
+    // ── COOLDOWN + OVER-SLASH GUARD gate the on-chain ATTEMPT (never the archival) ──
+    // COOLDOWN: an ongoing violation whose block advances each tick must not re-send a tx every
+    // interval (a persistently-reverting proposal would burn admin-wallet gas / churn nonces).
+    const last = this.lastProposalAt.get(coarseKey);
+    const withinCooldown = last !== undefined && this.clock() - last < this.cooldownMs;
+
+    let proposalTx: string | null = null;
+    let queueTx: string | null = null;
+    let executeTx: string | null = null;
+    let onchainProposalId: bigint | null = null;
+    let proposalIdNote: string | undefined;
+
+    if (withinCooldown) {
+      this.logger.debug(
+        `Audit: ${v.operator} ${v.rule} within cooldown (${this.clock() - (last as number)}ms < ` +
+          `${this.cooldownMs}ms) — attempt suppressed, archiving evidence only`
+      );
+      proposalIdNote = "id-unresolved: proposal attempt suppressed by cooldown";
+    } else if (this.executeSlash && (await this.isCoarseAlreadySlashed(coarseKey, v.operator))) {
+      // ARMED path OVER-SLASH GUARD (finding-4/5): a slash already executed (in-memory) or is
+      // pending on-chain for this operator+rule → do NOT queue/execute the same ongoing condition
+      // again, even after cooldownMs with an advancing block. Evidence is still archived (above).
+      this.logger.warn(
+        `Audit: ${v.operator} ${v.rule} already slashed/pending — over-slash guard, on-chain slash SKIPPED`
+      );
+      proposalIdNote =
+        "id-unresolved: operator already slashed/pending for this rule (over-slash guard)";
+    } else {
+      // Arm the cooldown on ATTEMPT (before the result) so a reverting tx still backs off.
+      this.lastProposalAt.set(coarseKey, this.clock());
+      // UNIFIED proposal filing (finding-6): both the armed (queue → create → execute) and the
+      // file-only (create only) paths go through coordinateQuorumCoSign — one createProposalWith-
+      // Evidence call site. Every step catches its own failure so the evidence stays archived and
+      // the poll loop never crashes.
+      const res = await this.coordinateQuorumCoSign({
+        operator: v.operator,
+        slashLevel: v.slashLevel,
+        reason: v.reason,
+        epoch,
+        evidenceHash: proofHash,
+      });
+      proposalTx = res.proposalTx;
+      onchainProposalId = res.proposalId;
+      queueTx = res.queueTx;
+      executeTx = res.executeTx;
+      if (res.queueMessageHash) proof.queueMessageHash = res.queueMessageHash;
+      if (executeTx !== null) {
+        // A slash actually executed → arm the over-slash guard + record the real co-sign material.
+        this.markCoarseSlashed(coarseKey);
+        proof.signerMask = res.signerMask;
+        proof.sigG2 = res.sigG2;
+      }
+      if (onchainProposalId === null) {
+        proposalIdNote =
+          proposalTx === null
+            ? "id-unresolved: proposal write failed"
+            : "id-unresolved: ProposalCreated event not found in receipt";
+      }
+    }
+
+    // ── FINAL proof.messageHash = the 8-field EXECUTE preimage actually signed + submitted ──────
+    // (finding-1) buildExecuteMessageHash(proposalId, operator, slashLevel, epoch, chainId,
+    // evidenceHash=proofHash) — the SAME message the quorum co-signs and executeWithProof carries.
+    // When the id is unresolved there is no on-chain proposal to sign over → "0x" + a clear note.
+    const proposalId: string | null = onchainProposalId !== null ? onchainProposalId.toString() : null;
+    if (onchainProposalId !== null) {
+      proof.messageHash = buildExecuteMessageHash(
+        onchainProposalId,
+        v.operator,
+        v.slashLevel,
+        epoch,
+        this.chainId,
+        proofHash
+      );
+      delete proof.messageHashNote;
+    } else {
+      proof.messageHash = "0x";
+      proof.messageHashNote = proposalIdNote ?? "id-unresolved: no on-chain proposal to sign over";
+    }
+    proof.proposalId = proposalId;
+    if (proposalIdNote) proof.proposalIdNote = proposalIdNote;
+    if (proposalTx) proof.proposalTx = proposalTx;
+    if (queueTx) proof.queueTx = queueTx;
+    if (executeTx) proof.executeTx = executeTx;
+
+    // Update the archived proof with the on-chain results (idempotent overwrite on proofHash), so
+    // the evidence now references the queue/execute txs of the slash it justified (finding-2).
+    await this.archive.put(proof);
     this.logger.warn(
       `Audit: ${v.operator} VIOLATION ${v.rule} — proof ${proofHash} archived at ${location}` +
-        (proposalTx ? ` (proposal ${proposalTx})` : " (proposal NOT filed)")
+        (executeTx
+          ? ` (SLASH executed ${executeTx})`
+          : proposalTx
+            ? ` (proposal ${proposalTx})`
+            : " (proposal NOT filed)")
     );
-
-    // NOTE: the on-chain two-step slash (queue → createProposal → execute) already ran ABOVE
-    // via coordinateQuorumCoSign when executeSlash is armed. It runs BEFORE this archival on
-    // purpose but catches all of its own failures, so the evidence is archived regardless.
 
     const detection: AuditDetection = {
       operator: v.operator,
@@ -634,6 +686,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       reason: v.reason,
       detectedAt: v.observedAt,
       proposalTx,
+      queueTx,
+      executeTx,
     };
     this.recentDetections.unshift(detection);
     if (this.recentDetections.length > AuditService.MAX_RECENT) {
@@ -643,21 +697,46 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * INCREMENT 2 — the two-step slash-consensus orchestration that turns a filed audit violation
-   * into a real on-chain slash (SP #329). Two INDEPENDENT quorum-co-signed steps bracket the
-   * proposal, run in this exact order:
+   * Is a slash already in effect for this operator+rule? Checks the in-memory coarse guard first
+   * (fast, within-process), then a best-effort on-chain pending-slash read (the durable, restart-
+   * surviving signal). On the current SP the getter is absent so isSlashPending returns null →
+   * unknown → falls back to the in-memory guard. A true on-chain flag is cached into the in-memory
+   * guard so subsequent ticks short-circuit without another RPC.
+   */
+  private async isCoarseAlreadySlashed(coarseKey: string, operator: string): Promise<boolean> {
+    if (this.slashedCoarseKeys.has(coarseKey)) return true;
+    try {
+      const pending = await this.blockchainService.isSlashPending(this.superPaymasterAddress, operator);
+      if (pending === true) {
+        this.markCoarseSlashed(coarseKey);
+        return true;
+      }
+    } catch {
+      // best-effort: getter absent / RPC error → unknown, rely on the in-memory guard only.
+    }
+    return false;
+  }
+
+  /**
+   * The slash-consensus orchestration — the SINGLE createProposalWithEvidence call site for BOTH
+   * the file-only and the armed (SP #329 two-step) paths. Runs in this exact order:
    *
-   *   1. QUEUE    — co-sign the 5-field queue preimage → queueSlashWithProof (slash intent).
+   *   1. QUEUE    — (ARMED only) co-sign the 5-field queue preimage → queueSlashWithProof.
    *   2. PROPOSAL — createProposalWithEvidence(evidenceHash=proofHash) → the REAL proposal id,
-   *                 binding the on-chain slash to the archived evidence.
-   *   3. EXECUTE  — co-sign the 8-field execute preimage (bound to that real id + evidenceHash)
-   *                 → executeWithProof (slash-only ⇒ repUsers/newScores empty). Skipped when the
-   *                 proposal id is unresolved (a fabricated id would revert on-chain).
+   *                 binding the on-chain slash to the archived evidence. ALWAYS runs.
+   *   3. EXECUTE  — (ARMED only) co-sign the 8-field execute preimage (bound to that real id +
+   *                 evidenceHash) → executeWithProof (slash-only ⇒ repUsers/newScores empty).
+   *                 Skipped when the proposal id is unresolved (a fabricated id would revert).
    *
-   * Each step is wrapped: a co-sign or tx failure is logged and swallowed so the caller still
-   * archives the evidence (evidence never lost) and the poll loop never crashes. With the default
-   * PendingSlotCoSigner every co-sign throws (SP validator slots pending the 24h timelock), so
-   * this reduces to: nothing queued, proposal filed, nothing executed.
+   * When executeSlash is OFF (default) only step 2 runs — the file-only path: proposal filed +
+   * evidence bound, nothing queued or slashed. Each step is wrapped: a co-sign or tx failure is
+   * logged and swallowed so the caller still archives the evidence (evidence never lost) and the
+   * poll loop never crashes. With the default PendingSlotCoSigner every co-sign throws (SP
+   * validator slots pending the 24h timelock), so the armed path reduces to just the proposal.
+   *
+   * Returns the queue/proposal/execute tx hashes, the real proposalId, the queueMessageHash (armed
+   * path, so the caller can archive the co-signed queue preimage), and the EXECUTE co-sign material
+   * (signerMask hex + sigG2) — "0x"/"0x" unless a slash actually executed.
    *
    * TODO(inc-2 live): the real multi-node gossip BLS aggregation behind coSigner — collect peer
    * signatures over the messageHash, build the signerMask bitmap by SP-assigned validator slot,
@@ -674,34 +753,43 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     proposalId: bigint | null;
     queueTx: string | null;
     executeTx: string | null;
+    queueMessageHash: string | null;
+    signerMask: string;
+    sigG2: string;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
+    const armed = this.executeSlash;
     let queueTx: string | null = null;
     let proposalTx: string | null = null;
     let proposalId: bigint | null = null;
     let executeTx: string | null = null;
+    let queueMessageHash: string | null = null;
+    let signerMask = "0x";
+    let sigG2 = "0x";
 
-    // ── Step 1: QUEUE (quorum co-signed) ──────────────────────────────────────────
-    try {
-      const queueMsgHash = buildQueueMessageHash(operator, slashLevel, epoch, this.chainId);
-      const { signerMask, sigG2 } = await this.coSigner.coSign(queueMsgHash);
-      const proof = encodeProof(signerMask, sigG2);
-      queueTx = await this.blockchainService.queueSlashWithProof(
-        this.dvtValidatorAddress,
-        operator,
-        slashLevel,
-        epoch,
-        proof
-      );
-      this.logger.warn(`Audit: ${operator} slash QUEUED (tx ${queueTx})`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.logger.error(
-        `Audit: ${operator} slash queue step failed — ${msg} (evidence archived; slash not queued)`
-      );
+    // ── Step 1: QUEUE (ARMED only, quorum co-signed) ──────────────────────────────
+    if (armed) {
+      try {
+        queueMessageHash = buildQueueMessageHash(operator, slashLevel, epoch, this.chainId);
+        const cosign = await this.coSigner.coSign(queueMessageHash);
+        const proof = encodeProof(cosign.signerMask, cosign.sigG2);
+        queueTx = await this.blockchainService.queueSlashWithProof(
+          this.dvtValidatorAddress,
+          operator,
+          slashLevel,
+          epoch,
+          proof
+        );
+        this.logger.warn(`Audit: ${operator} slash QUEUED (tx ${queueTx})`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.error(
+          `Audit: ${operator} slash queue step failed — ${msg} (evidence archived; slash not queued)`
+        );
+      }
     }
 
-    // ── Step 2: file the proposal (binds evidenceHash=proofHash) ───────────────────
+    // ── Step 2: file the proposal (ALWAYS — binds evidenceHash=proofHash) ──────────
     try {
       const res = await this.blockchainService.createProposalWithEvidence(
         this.dvtValidatorAddress,
@@ -717,43 +805,48 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.error(`Audit: ${operator} createProposal failed — ${msg}`);
     }
 
-    // ── Step 3: EXECUTE (quorum co-signed) — only with a REAL proposal id ───────────
-    if (proposalId === null) {
-      this.logger.error(
-        `Audit: ${operator} slash execute SKIPPED — no real proposalId ` +
-          `(createProposal failed or ProposalCreated absent); a fabricated id would revert`
-      );
-      return { proposalTx, proposalId, queueTx, executeTx };
+    // ── Step 3: EXECUTE (ARMED only, quorum co-signed) — only with a REAL proposal id ──
+    if (armed) {
+      if (proposalId === null) {
+        this.logger.error(
+          `Audit: ${operator} slash execute SKIPPED — no real proposalId ` +
+            `(createProposal failed or ProposalCreated absent); a fabricated id would revert`
+        );
+      } else {
+        try {
+          const execMsgHash = buildExecuteMessageHash(
+            proposalId,
+            operator,
+            slashLevel,
+            epoch,
+            this.chainId,
+            evidenceHash
+          );
+          const cosign = await this.coSigner.coSign(execMsgHash);
+          const proof = encodeProof(cosign.signerMask, cosign.sigG2);
+          executeTx = await this.blockchainService.executeSlashWithProof(
+            this.dvtValidatorAddress,
+            proposalId,
+            [], // slash-only ⇒ no reputation users
+            [], // slash-only ⇒ no reputation scores
+            epoch,
+            proof
+          );
+          // Record the EXECUTE co-sign material so the archived proof references the real slash.
+          signerMask = ethers.toBeHex(cosign.signerMask);
+          sigG2 = cosign.sigG2;
+          this.logger.warn(
+            `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
+          );
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.logger.error(
+            `Audit: ${operator} slash execute step failed — ${msg} (evidence archived; slash not executed)`
+          );
+        }
+      }
     }
-    try {
-      const execMsgHash = buildExecuteMessageHash(
-        proposalId,
-        operator,
-        slashLevel,
-        epoch,
-        this.chainId,
-        evidenceHash
-      );
-      const { signerMask, sigG2 } = await this.coSigner.coSign(execMsgHash);
-      const proof = encodeProof(signerMask, sigG2);
-      executeTx = await this.blockchainService.executeSlashWithProof(
-        this.dvtValidatorAddress,
-        proposalId,
-        [], // slash-only ⇒ no reputation users
-        [], // slash-only ⇒ no reputation scores
-        epoch,
-        proof
-      );
-      this.logger.warn(
-        `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
-      );
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.logger.error(
-        `Audit: ${operator} slash execute step failed — ${msg} (evidence archived; slash not executed)`
-      );
-    }
-    return { proposalTx, proposalId, queueTx, executeTx };
+    return { proposalTx, proposalId, queueTx, executeTx, queueMessageHash, signerMask, sigG2 };
   }
 
   /** Read-only status for GET /audit/status. No secrets. */

@@ -622,12 +622,53 @@ export class BlockchainService {
   }
 
   /**
+   * Best-effort read of an operator's on-chain pending-slash flag. This is the DURABLE
+   * cross-restart guard against double-slashing a sustained violation (finding-4/5): if a slash
+   * is already queued/pending, the audit must NOT queue+execute another.
+   *
+   * SP #329 keeps `_pendingSlash` PRIVATE with no public getter, so on the current deployment this
+   * call reverts and returns `null` ("unknown") — the caller then falls back to the in-memory
+   * coarse operator|rule guard. Should a future SuperPaymaster expose `pendingSlash(address)`
+   * (or `isSlashPending`), this begins returning the real flag and becomes the authoritative,
+   * restart-surviving guard with no caller change. `null` is treated as "unknown", never "false".
+   */
+  async isSlashPending(
+    superPaymasterAddress: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<boolean | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    // Try both plausible public getter names; either returning a bool answers the question.
+    const abi = [
+      "function pendingSlash(address operator) view returns (bool)",
+      "function isSlashPending(address operator) view returns (bool)",
+    ];
+    const contract = new ethers.Contract(superPaymasterAddress, abi, this.provider);
+    for (const fn of ["pendingSlash", "isSlashPending"] as const) {
+      try {
+        const pending: boolean = await contract[fn](operator, { blockTag });
+        return Boolean(pending);
+      } catch {
+        // getter absent on this deployment — try the next name.
+      }
+    }
+    return null;
+  }
+
+  /**
    * File a slash proposal binding the archived evidence (SP #329 4-arg createProposal):
    *   createProposal(address operator, uint8 level, string reason, bytes32 evidenceHash) returns (uint256 id)
-   * Same admin-wallet + bumped-fees + await-receipt contract as createSlashProposal; the extra
-   * `evidenceHash` (the content-addressed proofHash) binds the on-chain proposal to the archived
-   * proof. Returns the tx hash and the REAL on-chain id parsed from ProposalCreated (`null` when
-   * the event is absent, so the caller never fabricates an id).
+   *
+   * NOTE: the 4-arg `createProposal` selector is ONLY exposed by the #329 DVTValidator
+   * (Sepolia default 0x568b1486BFE036e603eA11f0D03Dc47fa62c9E0e, config-overridable via
+   * AUDIT_DVT_VALIDATOR_ADDRESS), which ships both the legacy 3-arg and this evidence-binding
+   * 4-arg overload. Pointing this at an older 3-arg-only validator would revert (no matching
+   * selector). Same admin-wallet + bumped-fees + await-receipt contract as createSlashProposal;
+   * the extra `evidenceHash` (the content-addressed proofHash) binds the on-chain proposal to the
+   * archived proof. Returns the tx hash and the REAL on-chain id parsed from ProposalCreated
+   * (`null` when the event is absent, so the caller never fabricates an id).
    */
   async createProposalWithEvidence(
     dvtValidatorAddress: string,

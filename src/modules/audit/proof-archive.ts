@@ -64,12 +64,31 @@ export interface SlashProof {
   operator: string;
   slashLevel: number;
   reason: string;
+  /**
+   * DETERMINISTIC slash epoch — the violationBlock (an on-chain fact), NOT a wall-clock value.
+   * Bound into BOTH co-sign preimages (queue + execute) and passed as the on-chain epoch arg, so
+   * two DVT nodes observing the SAME violation derive the SAME epoch → the SAME messageHash → the
+   * gossip BLS aggregate verifies. (observedAt stays the only wall-clock field, under `evidence`.)
+   */
   epoch: number;
-  /** BLS message the quorum signs over the proposal. */
+  /**
+   * The 8-field EXECUTE preimage the quorum co-signs before executeWithProof — the SAME message
+   * actually submitted on-chain: buildExecuteMessageHash(proposalId, operator, slashLevel, epoch,
+   * chainId, evidenceHash=proofHash). "0x" (with a `messageHashNote`) when the real proposalId is
+   * unresolved (proposal not filed / event absent) — never a stale or wrong preimage.
+   */
   messageHash: string;
-  /** Bitmask of co-signers — empty until increment 2. */
+  /** Present only when `messageHash` is "0x": why the execute preimage could not be computed. */
+  messageHashNote?: string;
+  /**
+   * The 5-field QUEUE preimage co-signed before queueSlashWithProof — buildQueueMessageHash(
+   * operator, slashLevel, epoch, chainId). Present only on the armed (executeSlash) path where the
+   * queue step actually runs; undefined on the file-only proposal path.
+   */
+  queueMessageHash?: string;
+  /** Bitmask of co-signers (hex) — "0x" until a real quorum execute co-sign lands. */
   signerMask: string;
-  /** Aggregated G2 signature — empty until increment 2. */
+  /** Aggregated G2 signature — "0x" until a real quorum execute co-sign lands. */
   sigG2: string;
   /** Content address of this record (keccak256 over the immutable evidence core). */
   proofHash: string;
@@ -85,10 +104,20 @@ export interface SlashProof {
   createdAt: number;
   /**
    * Tx hash of the createProposal SUBMISSION (proposal-intent), when filed. This is the
-   * proposal tx, NOT the slash execution — execution (BLSAggregator.verifyAndExecute) is
-   * the deferred increment-2 step. Undefined when no proposal was filed.
+   * proposal tx, NOT the slash execution. Undefined when no proposal was filed.
    */
   proposalTx?: string;
+  /**
+   * Tx hash of the STEP-1 queueSlashWithProof submission (armed executeSlash path only). The
+   * on-chain slash-intent pre-flag. Undefined when the queue step did not run / failed.
+   */
+  queueTx?: string;
+  /**
+   * Tx hash of the STEP-2 executeWithProof submission — the irreversible on-chain slash. Present
+   * only on the armed path after a successful quorum co-sign + execute. Undefined otherwise. This
+   * is what durably references the evidence to the executed slash (finding-2).
+   */
+  executeTx?: string;
 }
 
 /**
