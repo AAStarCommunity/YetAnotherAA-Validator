@@ -1503,4 +1503,51 @@ describe("AuditService", () => {
     expect(mk(0.5).computeJitterMs()).toBe(30_000);
     expect(mk(0.999999).computeJitterMs()).toBeLessThan(60_000);
   });
+
+  // ── PK perf findings ─────────────────────────────────────────────────────────
+  it("PK-F2: the finalized evidence block is resolved ONCE per tick, shared across operators", async () => {
+    let violationBlockCalls = 0;
+    const opB = "0x" + "ab".repeat(20);
+    const blockchain = makeBlockchain({
+      getViolationBlock: async function (this: any) {
+        violationBlockCalls++;
+        return { number: await this.getBlockNumber(), hash: BLOCK_HASH };
+      },
+    });
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditWatchlist: [OPERATOR, opB] }),
+      makeArchive()
+    );
+    await svc.tick();
+    // Two operators, but only ONE getViolationBlock RPC (shared snapshot), not one per operator.
+    expect(violationBlockCalls).toBe(1);
+  });
+
+  it("PK-F2: a getViolationBlock failure skips the whole tick without throwing", async () => {
+    const blockchain = makeBlockchain({
+      getViolationBlock: async () => {
+        throw new Error("RPC down");
+      },
+    });
+    const archive = makeArchive();
+    const svc = makeService(blockchain, makeConfig(), archive);
+    await expect(svc.tick()).resolves.toBeUndefined();
+    expect(archive.records).toHaveLength(0);
+  });
+
+  it("PK-F3: healthy operator on the default (executeSlash=false) path never calls removeSlashed", async () => {
+    const archive = makeArchive();
+    let removeCalls = 0;
+    const origRemove = archive.removeSlashed.bind(archive);
+    archive.removeSlashed = async (k: string) => {
+      removeCalls++;
+      return origRemove(k);
+    };
+    // Default makeBlockchain models a HEALTHY operator (debt 0 ≤ limit 1000) → clearCoarseSlashed
+    // runs, but executeSlash is off and there is no in-memory marker → durable syscall is skipped.
+    const svc = makeService(makeBlockchain(), makeConfig(), archive);
+    await svc.tick();
+    expect(removeCalls).toBe(0);
+  });
 });

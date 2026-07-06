@@ -231,6 +231,11 @@ export default () => {
     })(),
     // Durable over-slash guard (finding-2): how far back to scan slash-executed events when
     // deciding whether an operator was already slashed (a restart-surviving, on-chain-truth guard).
+    // NOTE (PK finding): on a range-limited RPC, a getLogs span wider than the provider's cap makes
+    // the scan error → the over-slash guard fails CLOSED (the slash is SKIPPED, logged as
+    // "indeterminate"), which is the safe direction but suppresses legitimate slashes. Size this to
+    // your RPC's getLogs block-range limit (e.g. many public endpoints cap ~10k) so the scan stays
+    // determinate. It is only consulted on the armed executeSlash path.
     auditSlashLookbackBlocks: parseInt(process.env.AUDIT_SLASH_LOOKBACK_BLOCKS || "50000", 10),
 
     // Gossip Network

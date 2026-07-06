@@ -343,7 +343,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    */
   private async clearCoarseSlashed(operator: string, rule: string): Promise<void> {
     const coarseKey = this.coarseKey(operator, rule);
-    this.slashedCoarseKeys.delete(coarseKey);
+    const hadInMemory = this.slashedCoarseKeys.delete(coarseKey);
+    // Durable slashed markers are ONLY ever written on the armed (executeSlash) execute path. On the
+    // default file-only path none can exist, so the removeSlashed syscall on every healthy tick is
+    // pure waste (PK finding). Skip it unless execution is armed or we actually had an in-memory
+    // marker to mirror durably — correctness is unchanged (a stale marker is re-checked on-chain).
+    if (!hadInMemory && !this.executeSlash) return;
     try {
       await this.archive.removeSlashed(coarseKey);
     } catch {
@@ -382,9 +387,22 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // have aged past cooldownMs (they can no longer suppress anything) before each sweep.
     this.pruneDedupState();
     try {
+      // Resolve the finalized evidence block ONCE per tick and share it across every operator in
+      // this sweep (PK perf finding): a healthy watchlist otherwise pays getViolationBlock's 1-4
+      // RPC per operator. One finalized snapshot is also MORE consistent (all operators evaluated
+      // against the same chain state) and cannot reorg. A failure here is a global RPC problem, not
+      // per-operator, so skip the whole tick rather than hammering each operator into the same error.
+      let pinnedBlock: { number: number; hash: string };
+      try {
+        pinnedBlock = await this.blockchainService.getViolationBlock(this.finalityConfirmations);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.error(`Audit: could not resolve finalized block — skipping tick (${msg})`);
+        return;
+      }
       for (const operator of this.watchlist) {
         try {
-          await this.auditOperator(operator);
+          await this.auditOperator(operator, pinnedBlock);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           this.logger.error(`Audit: ${operator} audit failed — ${msg}`);
@@ -399,13 +417,18 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * Audit a single operator: read its credit / reputation / stake state and evaluate the
    * credit-over-limit rule. On a confirmed violation, archive a proof and file a proposal.
    */
-  async auditOperator(operator: string): Promise<void> {
+  async auditOperator(
+    operator: string,
+    pinnedBlock?: { number: number; hash: string }
+  ): Promise<void> {
     // Pin EVERY rule input to ONE FINALIZED block (finding-3) so creditLimit, availableCredit and
     // debt can never be mixed across blocks (no phantom over-limit from a mid-read state change)
     // AND the block the irreversible slash is justified by cannot be undone by a reorg. The block
     // HASH is recorded in the evidence so the justification is pinned to a specific finalized block.
+    // tick() resolves this ONCE and shares it across the sweep; a direct caller (tests) may omit it.
     const { number: violationBlock, hash: violationBlockHash } =
-      await this.blockchainService.getViolationBlock(this.finalityConfirmations);
+      pinnedBlock ??
+      (await this.blockchainService.getViolationBlock(this.finalityConfirmations));
 
     // All per-operator reads are pinned to the SAME block; issue them concurrently (5-6 reads)
     // rather than serially. reputation + DVT stake lock are auxiliary evidence (not part of the
