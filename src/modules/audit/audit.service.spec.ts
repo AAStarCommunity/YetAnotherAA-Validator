@@ -1536,18 +1536,18 @@ describe("AuditService", () => {
     expect(archive.records).toHaveLength(0);
   });
 
-  it("PK-F3: healthy operator on the default (executeSlash=false) path never calls removeSlashed", async () => {
+  it("B-F3 regression: a healthy read clears a durable slashed marker even when DISARMED", async () => {
+    // Simulate an armed→disarmed restart: a durable marker left by an earlier armed run exists on
+    // disk, but the node now runs with executeSlash=false. A healthy read MUST still clear it — else
+    // hasSlashed short-circuits before the on-chain scan and suppresses a legitimate future slash
+    // indefinitely (Codex R3 B-F3). Default makeBlockchain models a HEALTHY operator (debt 0 ≤ 1000).
     const archive = makeArchive();
-    let removeCalls = 0;
-    const origRemove = archive.removeSlashed.bind(archive);
-    archive.removeSlashed = async (k: string) => {
-      removeCalls++;
-      return origRemove(k);
-    };
-    // Default makeBlockchain models a HEALTHY operator (debt 0 ≤ limit 1000) → clearCoarseSlashed
-    // runs, but executeSlash is off and there is no in-memory marker → durable syscall is skipped.
-    const svc = makeService(makeBlockchain(), makeConfig(), archive);
+    const coarseKey = `11155111|${ethers.getAddress(OPERATOR)}|credit-over-limit`;
+    await archive.recordSlashed(coarseKey);
+    expect(archive.slashed.has(coarseKey)).toBe(true);
+    const svc = makeService(makeBlockchain(), makeConfig({ auditExecuteSlash: false }), archive);
     await svc.tick();
-    expect(removeCalls).toBe(0);
+    // The stale durable marker is gone — a genuine future violation can slash again.
+    expect(archive.slashed.has(coarseKey)).toBe(false);
   });
 });

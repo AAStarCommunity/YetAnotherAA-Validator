@@ -343,12 +343,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    */
   private async clearCoarseSlashed(operator: string, rule: string): Promise<void> {
     const coarseKey = this.coarseKey(operator, rule);
-    const hadInMemory = this.slashedCoarseKeys.delete(coarseKey);
-    // Durable slashed markers are ONLY ever written on the armed (executeSlash) execute path. On the
-    // default file-only path none can exist, so the removeSlashed syscall on every healthy tick is
-    // pure waste (PK finding). Skip it unless execution is armed or we actually had an in-memory
-    // marker to mirror durably — correctness is unchanged (a stale marker is re-checked on-chain).
-    if (!hadInMemory && !this.executeSlash) return;
+    this.slashedCoarseKeys.delete(coarseKey);
+    // A healthy read ALWAYS attempts the durable removal, regardless of the current executeSlash
+    // setting. A durable marker written by an EARLIER armed run must be cleared even if the node is
+    // now running disarmed — otherwise it would survive an armed→disarmed→armed restart cycle and,
+    // since hasSlashed short-circuits before the on-chain scan, suppress a legitimate future slash
+    // indefinitely (Codex R3 B-F3). removeSlashed on an absent key is a cheap best-effort no-op.
     try {
       await this.archive.removeSlashed(coarseKey);
     } catch {
