@@ -321,6 +321,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
+   * Checksum-normalize a config address for the content-address identity so two DVT nodes with
+   * differently-cased AUDIT_* addresses still derive the SAME proofHash (LOW). Falls back to the raw
+   * string if it is not a valid address (bootstrap already gates existence, so this is defensive).
+   */
+  private normalizeAddress(addr: string): string {
+    try {
+      return ethers.getAddress(addr);
+    } catch {
+      return addr;
+    }
+  }
+
+  /**
    * Record (in-memory only) that an on-chain slash EXECUTED for this operator+rule so the armed
    * execute path does not re-slash the same ongoing condition on later ticks. Bounded by a
    * defensive LRU-style cap. Durability across restart is handled separately via the archive
@@ -565,6 +578,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       reason,
       rule: RULE_CREDIT_OVER_LIMIT,
       creditLimit,
+      availableCredit,
       debt,
       violationBlock,
       violationBlockHash,
@@ -649,15 +663,29 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
 
       if (!this.isCreditOverLimit(creditLimit, availableCredit, debt)) return NO;
 
+      // Re-read the pinned block's hash (part of the content-address, LOW). Fail closed if it
+      // cannot be read — this node then cannot reproduce the requester's proofHash, so it refuses.
+      const violationBlockHash = await this.blockchainService.getBlockHash(blockTag);
+      if (!violationBlockHash) return NO;
+
       // Re-derive the content-address from the SAME on-chain identity (wall-clock-free), so it
-      // equals the requester's proofHash for the identical violation.
+      // equals the requester's proofHash for the identical violation. Every slash-critical input —
+      // availableCredit, slashLevel, block hash, and the source contract/token addresses — is
+      // committed, so evidenceHash is a full content address of exactly what would be slashed.
       const identity: ProofIdentity = {
         chainId: this.chainId,
         operator,
         rule: RULE_CREDIT_OVER_LIMIT,
         creditLimit: creditLimit.toString(),
+        availableCredit: availableCredit.toString(),
         debt: (debt as bigint).toString(),
         violationBlock: blockTag,
+        violationBlockHash,
+        slashLevel: SLASH_LEVEL_CREDIT_OVER_LIMIT,
+        registry: this.normalizeAddress(this.registryAddress),
+        superPaymaster: this.normalizeAddress(this.superPaymasterAddress),
+        dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
+        apntsToken: this.normalizeAddress(this.apntsTokenAddress),
       };
       return { confirmed: true, proofHash: computeProofHash(identity) };
     } catch (err: unknown) {
@@ -678,6 +706,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     reason: string;
     rule: string;
     creditLimit: bigint;
+    availableCredit: bigint;
     debt: bigint;
     violationBlock: number;
     violationBlockHash: string;
@@ -699,8 +728,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       operator: v.operator,
       rule: v.rule,
       creditLimit: v.creditLimit.toString(),
+      availableCredit: v.availableCredit.toString(),
       debt: v.debt.toString(),
       violationBlock: v.violationBlock,
+      violationBlockHash: v.violationBlockHash,
+      slashLevel: v.slashLevel,
+      registry: this.normalizeAddress(this.registryAddress),
+      superPaymaster: this.normalizeAddress(this.superPaymasterAddress),
+      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
+      apntsToken: this.normalizeAddress(this.apntsTokenAddress),
     };
     const proofHash = computeProofHash(identity);
 

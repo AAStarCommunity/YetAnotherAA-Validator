@@ -229,3 +229,123 @@ describe("GossipService co-sign transport", () => {
     await new Promise(r => setTimeout(r, 10)); // let the timers clear
   });
 });
+
+/**
+ * MEDIUM 1 (Codex): the collector counts ONLY validated responses toward the threshold and dedups
+ * by an app-supplied key (the co-signer keys by on-chain slot) — so one connected peer cannot flood
+ * bogus responses with distinct signer ids, crowd out honest signers, and force a premature
+ * under-threshold resolution.
+ */
+describe("GossipService co-sign collector: validate + dedupKey", () => {
+  const flush = () => new Promise(r => setTimeout(r, 0));
+  const bySlot = (r: CoSignResponsePayload) => r.slot;
+  const validateOk = async (r: CoSignResponsePayload) => (r as any).ok === true;
+
+  function respMsg(nodeId: string, slot: number, ok: boolean, requestId = "req-V"): GossipMessage {
+    return {
+      type: "cosign-response",
+      from: nodeId,
+      data: {
+        requestId,
+        slot,
+        signerNodeId: nodeId,
+        signerPublicKey: "0xpk",
+        signatureCompact: "0xsig",
+        messageHash: "0xhash",
+        ok,
+      } as any,
+      timestamp: Date.now(),
+      ttl: 0,
+      messageId: `resp-${nodeId}-${slot}`,
+      version: 0,
+    };
+  }
+
+  it("bogus responses that fail validation do NOT count and cannot crowd out honest signers", async () => {
+    const svc = buildService();
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-V" }), {
+      threshold: 2,
+      timeoutMs: 1000,
+      validate: validateOk,
+      dedupKey: bySlot,
+    }) as Promise<CoSignResponsePayload[]>;
+    let settled = false;
+    void promise.then(() => (settled = true));
+
+    // One peer floods 3 bogus responses with DISTINCT signer ids + slots → none validate.
+    (svc as any).handleCoSignResponse(respMsg("bad-1", 5, false));
+    (svc as any).handleCoSignResponse(respMsg("bad-2", 6, false));
+    (svc as any).handleCoSignResponse(respMsg("bad-3", 7, false));
+    await flush();
+    expect(settled).toBe(false); // still waiting — bogus never counted
+
+    // Two honest, valid, distinct-slot responses → resolves with EXACTLY those.
+    (svc as any).handleCoSignResponse(respMsg("good-1", 1, true));
+    (svc as any).handleCoSignResponse(respMsg("good-2", 2, true));
+    const responses = await promise;
+    expect(responses).toHaveLength(2);
+    expect(responses.map(r => r.slot).sort((a, b) => a - b)).toEqual([1, 2]);
+  });
+
+  it("resolves EARLY once enough validated unique-slot responses arrive (before timeout)", async () => {
+    const svc = buildService();
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-V" }), {
+      threshold: 2,
+      timeoutMs: 5000, // long — must resolve on validated count, not timeout
+      validate: validateOk,
+      dedupKey: bySlot,
+    }) as Promise<CoSignResponsePayload[]>;
+    (svc as any).handleCoSignResponse(respMsg("a", 1, true));
+    (svc as any).handleCoSignResponse(respMsg("b", 2, true));
+    const responses = await promise;
+    expect(responses).toHaveLength(2);
+  });
+
+  it("resolves on TIMEOUT with the validated partial set", async () => {
+    const svc = buildService();
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-V" }), {
+      threshold: 3,
+      timeoutMs: 20,
+      validate: validateOk,
+      dedupKey: bySlot,
+    }) as Promise<CoSignResponsePayload[]>;
+    (svc as any).handleCoSignResponse(respMsg("a", 1, true));
+    (svc as any).handleCoSignResponse(respMsg("bad", 2, false)); // dropped
+    const responses = await promise;
+    // Threshold 3 never met (only 1 valid) → resolves on timeout with the single validated response.
+    expect(responses).toHaveLength(1);
+    expect(responses[0].slot).toBe(1);
+  });
+
+  it("the SAME slot from two distinct nodes counts ONCE (dedup by slot)", async () => {
+    const svc = buildService();
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-V" }), {
+      threshold: 2,
+      timeoutMs: 20,
+      validate: validateOk,
+      dedupKey: bySlot,
+    }) as Promise<CoSignResponsePayload[]>;
+    // Two DISTINCT nodes both claim slot 2 (valid sigs) → deduped to one → threshold 2 NOT met.
+    (svc as any).handleCoSignResponse(respMsg("node-2a", 2, true));
+    (svc as any).handleCoSignResponse(respMsg("node-2b", 2, true));
+    const responses = await promise; // resolves on timeout with the single unique slot
+    expect(responses).toHaveLength(1);
+    expect(responses[0].slot).toBe(2);
+  });
+
+  it("a validated response arriving AFTER resolution is safely ignored (no leak / no throw)", async () => {
+    const svc = buildService();
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-V" }), {
+      threshold: 1,
+      timeoutMs: 1000,
+      validate: validateOk,
+      dedupKey: bySlot,
+    }) as Promise<CoSignResponsePayload[]>;
+    (svc as any).handleCoSignResponse(respMsg("a", 1, true));
+    const responses = await promise;
+    expect(responses).toHaveLength(1);
+    // Pending entry cleaned up → a late response is a no-op (no throw, nothing counted).
+    expect((svc as any).pendingCoSign.has("req-V")).toBe(false);
+    expect(() => (svc as any).handleCoSignResponse(respMsg("late", 9, true))).not.toThrow();
+  });
+});

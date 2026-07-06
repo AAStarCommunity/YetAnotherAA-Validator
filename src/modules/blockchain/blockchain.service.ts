@@ -466,6 +466,38 @@ export class BlockchainService {
   }
 
   /**
+   * Contract factory seam. All wallet-signed write paths (createProposal, queue/execute slash) build
+   * their `ethers.Contract` through this one method so a test can override it to inject a mock —
+   * `ethers` is an ESM namespace (read-only) and cannot be spied on directly. Production behaviour is
+   * exactly `new ethers.Contract(...)`.
+   */
+  protected buildContract(
+    address: string,
+    abi: ethers.InterfaceAbi,
+    runner: ethers.ContractRunner
+  ): ethers.Contract {
+    return new ethers.Contract(address, abi, runner);
+  }
+
+  /**
+   * Block hash of a SPECIFIC historical block number, or `null` when it cannot be read. Used by the
+   * co-sign responder to re-derive the content-address of a violation pinned at `epoch`
+   * (violationBlockHash is part of ProofIdentity, LOW): a responder that cannot read the exact block
+   * hash fails closed (cannot reproduce the requester's proofHash → refuses to co-sign).
+   */
+  async getBlockHash(blockNumber: number): Promise<string | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    try {
+      const b = await this.provider.getBlock(blockNumber);
+      return b?.hash ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * The block an irreversible slash is justified against — a FINALIZED (fallback: safe) block,
    * returned as `{ number, hash }` (finding-3). Pinning the slash evidence to a finalized block,
    * and recording its HASH, makes the justification reorg-safe: a reorg that rewrites the chain
@@ -818,7 +850,7 @@ export class BlockchainService {
       "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
     ];
     const iface = new ethers.Interface(abi);
-    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.createProposal(
       operator,
@@ -840,13 +872,21 @@ export class BlockchainService {
     let proposalId: bigint | null = null;
     for (const log of receipt.logs) {
       try {
+        // MEDIUM 3 (Codex): only trust a ProposalCreated emitted BY the DVTValidator we called AND
+        // matching THIS proposal's operator + level. A decodable log from another contract, or one
+        // whose args disagree, must NEVER be mistaken for our proposal id (a wrong id would bind the
+        // evidence to someone else's proposal and later make executeWithProof slash the wrong thing).
+        if (ethers.getAddress(log.address) !== ethers.getAddress(dvtValidatorAddress)) continue;
         const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed && parsed.name === "ProposalCreated") {
-          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
-          break;
-        }
+        if (!parsed || parsed.name !== "ProposalCreated") continue;
+        const evOperator = parsed.args.operator ?? parsed.args[1];
+        const evLevel = parsed.args.level ?? parsed.args[2];
+        if (ethers.getAddress(evOperator) !== ethers.getAddress(operator)) continue;
+        if (Number(evLevel) !== level) continue;
+        proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+        break;
       } catch {
-        // Not a ProposalCreated log (or from another contract) — skip.
+        // Not a ProposalCreated log from this validator (or from another contract) — skip.
       }
     }
     if (proposalId === null) {
@@ -925,7 +965,7 @@ export class BlockchainService {
       "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
     ];
     const iface = new ethers.Interface(abi);
-    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.createProposal(
       operator,
@@ -946,13 +986,21 @@ export class BlockchainService {
     let proposalId: bigint | null = null;
     for (const log of receipt.logs) {
       try {
+        // MEDIUM 3 (Codex): only trust a ProposalCreated emitted BY the DVTValidator we called AND
+        // matching THIS proposal's operator + level. A decodable log from another contract, or one
+        // whose args disagree, must NEVER be mistaken for our proposal id (a wrong id would bind the
+        // evidence to someone else's proposal and later make executeWithProof slash the wrong thing).
+        if (ethers.getAddress(log.address) !== ethers.getAddress(dvtValidatorAddress)) continue;
         const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed && parsed.name === "ProposalCreated") {
-          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
-          break;
-        }
+        if (!parsed || parsed.name !== "ProposalCreated") continue;
+        const evOperator = parsed.args.operator ?? parsed.args[1];
+        const evLevel = parsed.args.level ?? parsed.args[2];
+        if (ethers.getAddress(evOperator) !== ethers.getAddress(operator)) continue;
+        if (Number(evLevel) !== level) continue;
+        proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+        break;
       } catch {
-        // Not a ProposalCreated log (or from another contract) — skip.
+        // Not a ProposalCreated log from this validator (or from another contract) — skip.
       }
     }
     if (proposalId === null) {
@@ -987,7 +1035,20 @@ export class BlockchainService {
     const abi = [
       "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof) external",
     ];
-    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+    // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT call first. Any deterministic
+    // mismatch (bad signerMask, sigG2 encoding, DST, on-chain threshold, stale slot mapping, wrong
+    // address, proposal state) reverts HERE — before spending a single wei of gas — so the audit's
+    // try/catch degrades to file+archive instead of eating a PAID on-chain revert. Only a passing
+    // simulation lets the real, irreversible tx broadcast.
+    try {
+      await contract.queueSlashWithProof.staticCall(operator, slashLevel, epoch, proof);
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `queueSlashWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`
+      );
+    }
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.queueSlashWithProof(
       operator,
@@ -1030,7 +1091,18 @@ export class BlockchainService {
     const abi = [
       "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof) external",
     ];
-    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+    // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT execute call first so any
+    // deterministic revert (signerMask/sigG2/threshold/proposal-state mismatch) surfaces BEFORE the
+    // irreversible slash tx spends gas. Only a passing simulation lets the real tx broadcast.
+    try {
+      await contract.executeWithProof.staticCall(id, repUsers, newScores, epoch, proof);
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `executeWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`
+      );
+    }
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.executeWithProof(
       id,

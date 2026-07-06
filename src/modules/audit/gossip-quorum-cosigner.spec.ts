@@ -450,7 +450,56 @@ describe("GossipQuorumCoSigner", () => {
     expect(await cs.verifyAndSign(payload(executeReq()))).toBeNull();
   });
 
-  it("responder confirms a QUEUE step (no evidenceHash binding required)", async () => {
+  it("responder signs a QUEUE step when evidenceHash matches the re-derived proofHash (MEDIUM 2)", async () => {
+    const queueEvidence = "0x" + "cc".repeat(32);
+    const queueReq: CoSignRequest = {
+      step: "queue",
+      operator: OPERATOR,
+      slashLevel: SlashLevel.MINOR,
+      epoch: EPOCH,
+      chainId: CHAIN_ID,
+      // The queue request now CARRIES evidenceHash (the on-chain 5-field preimage still excludes it;
+      // this only makes a queue quorum form when every signer agrees on the same evidence).
+      evidenceHash: queueEvidence,
+      messageHash: buildQueueMessageHash(OPERATOR, SlashLevel.MINOR, EPOCH, CHAIN_ID),
+    };
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[1], "node-2"),
+      makeBlockchain(),
+      makeConfig()
+    );
+    cs.arm(async () => ({ confirmed: true, proofHash: queueEvidence }));
+    const resp = await cs.verifyAndSign(payload(queueReq));
+    expect(resp).not.toBeNull();
+    expect(resp!.slot).toBe(2);
+  });
+
+  it("responder REFUSES a QUEUE step whose evidenceHash mismatches the re-derived proofHash (MEDIUM 2)", async () => {
+    const queueReq: CoSignRequest = {
+      step: "queue",
+      operator: OPERATOR,
+      slashLevel: SlashLevel.MINOR,
+      epoch: EPOCH,
+      chainId: CHAIN_ID,
+      evidenceHash: "0x" + "cc".repeat(32), // attacker-attached bogus evidence
+      messageHash: buildQueueMessageHash(OPERATOR, SlashLevel.MINOR, EPOCH, CHAIN_ID),
+    };
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[1], "node-2"),
+      makeBlockchain(),
+      makeConfig()
+    );
+    // Verifier confirms the real violation but re-derives a DIFFERENT proofHash than the bogus
+    // evidenceHash attached to the queue request → the responder refuses to co-sign.
+    cs.arm(async () => ({ confirmed: true, proofHash: "0x" + "dd".repeat(32) }));
+    expect(await cs.verifyAndSign(payload(queueReq))).toBeNull();
+  });
+
+  it("responder REFUSES a QUEUE step with NO evidenceHash at all (MEDIUM 2)", async () => {
     const queueReq: CoSignRequest = {
       step: "queue",
       operator: OPERATOR,
@@ -467,9 +516,7 @@ describe("GossipQuorumCoSigner", () => {
       makeConfig()
     );
     cs.arm(async () => ({ confirmed: true, proofHash: "0x" + "cc".repeat(32) }));
-    const resp = await cs.verifyAndSign(payload(queueReq));
-    expect(resp).not.toBeNull();
-    expect(resp!.slot).toBe(2);
+    expect(await cs.verifyAndSign(payload(queueReq))).toBeNull();
   });
 
   // ── sigG2 aggregate round-trip (256B, re-verifies) ──────────────────────────────

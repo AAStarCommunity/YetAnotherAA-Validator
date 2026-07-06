@@ -326,14 +326,21 @@ describe("AuditService", () => {
     expect(sourceNames).toContain(`IxPNTsToken(${APNTS_TOKEN}).getDebt`);
     expect(sourceNames).toContain("SuperPaymaster.getAvailableCredit");
 
-    // proofHash is a real content address over ON-CHAIN identity: recomputing matches.
+    // proofHash is a real content address over the FULL ON-CHAIN identity: recomputing matches.
     const recomputed = computeProofHash({
       chainId: proof.chainId,
       operator: proof.operator,
       rule: proof.evidence.rule,
       creditLimit: proof.evidence.threshold,
+      availableCredit: "0", // over-limit ⇒ SP-enforced availableCredit is 0
       debt: proof.evidence.observed,
       violationBlock: proof.evidence.violationBlock,
+      violationBlockHash: proof.evidence.violationBlockHash!,
+      slashLevel: proof.slashLevel,
+      registry: ethers.getAddress(REGISTRY),
+      superPaymaster: ethers.getAddress(SUPER_PAYMASTER),
+      dvtValidator: ethers.getAddress(DVT_VALIDATOR),
+      apntsToken: ethers.getAddress(APNTS_TOKEN),
     });
     expect(recomputed).toBe(proof.proofHash);
     expect(proof.proofHash).toMatch(/^0x[0-9a-f]{64}$/);
@@ -434,11 +441,18 @@ describe("AuditService", () => {
     const archive = makeArchive();
     const identityHash = computeProofHash({
       chainId: 11155111,
-      operator: OPERATOR,
+      operator: ethers.getAddress(OPERATOR),
       rule: "credit-over-limit",
       creditLimit: "1000",
+      availableCredit: "0",
       debt: "2000",
       violationBlock: BLOCK,
+      violationBlockHash: BLOCK_HASH,
+      slashLevel: 1,
+      registry: ethers.getAddress(REGISTRY),
+      superPaymaster: ethers.getAddress(SUPER_PAYMASTER),
+      dvtValidator: ethers.getAddress(DVT_VALIDATOR),
+      apntsToken: ethers.getAddress(APNTS_TOKEN),
     });
     (archive.records as SlashProof[]).push({ proofHash: identityHash } as SlashProof);
     const svc = makeService(blockchain, makeConfig(), archive);

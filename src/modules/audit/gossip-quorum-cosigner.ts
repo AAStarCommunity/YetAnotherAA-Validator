@@ -131,16 +131,18 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       // 4. independent violation confirmation (re-read on-chain at the epoch block).
       const { confirmed, proofHash } = await this.verifier(req);
       if (!confirmed || proofHash === null) return null;
-      if (req.step === "execute") {
-        // The linchpin "innocent-operator" defense: a substituted operator yields a different
-        // proofHash, so the execute co-sign only signs when our re-derived proofHash matches the
-        // evidenceHash bound into the preimage.
-        if (
-          typeof req.evidenceHash !== "string" ||
-          proofHash.toLowerCase() !== req.evidenceHash.toLowerCase()
-        ) {
-          return null;
-        }
+      // The linchpin "innocent-operator" / "bogus-evidence" defense (MEDIUM 2): bind evidenceHash
+      // for BOTH the queue AND the execute step. The request MUST carry an evidenceHash equal to the
+      // proofHash we independently re-derived. For execute this stops a substituted operator (the
+      // on-chain preimage already includes evidenceHash). For queue — whose 5-field on-chain preimage
+      // does NOT include evidenceHash — this still means a queue quorum only FORMS when every signer
+      // agrees on the same evidence, so a malicious requester cannot get a real queue quorum while
+      // attaching a bogus evidenceHash and submitting a spurious queue tx (gas / pending-state churn).
+      if (
+        typeof req.evidenceHash !== "string" ||
+        proofHash.toLowerCase() !== req.evidenceHash.toLowerCase()
+      ) {
+        return null;
       }
 
       // 5. resolve own on-chain validator slot (by our own BLS key).
@@ -216,9 +218,15 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
     const requestId = uuidv4();
     const payload: CoSignRequestPayload = { ...req, requestId, requesterNodeId: node.nodeId };
     const peerThreshold = Math.max(0, threshold - 1);
+    // MEDIUM 1: hand the collector the SAME per-response validation (crypto + on-chain slot binding)
+    // and a slot-based dedup key, so ONLY validated, unique-slot peer responses count toward the
+    // collector's early-resolve — a peer cannot flood bogus responses to crowd out honest signers.
+    // coSign still re-validates + re-dedups the returned set below (idempotent defense-in-depth).
     const peerResponses = await this.gossip.requestCoSignatures(payload, {
       threshold: peerThreshold,
       timeoutMs: this.timeoutMs,
+      validate: resp => this.validateResponse(req, resp),
+      dedupKey: resp => resp.slot,
     });
 
     // Validate EVERY response (own + peers) before counting its bit. Dedup by slot.

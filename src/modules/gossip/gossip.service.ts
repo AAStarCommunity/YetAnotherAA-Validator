@@ -57,12 +57,20 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     | ((payload: CoSignRequestPayload) => Promise<CoSignResponsePayload | null>)
     | null = null;
 
-  /** In-flight co-sign requests this node originated, keyed by requestId (correlation id). */
+  /**
+   * In-flight co-sign requests this node originated, keyed by requestId (correlation id). Only
+   * responses that pass the optional async `validate` are counted, and they are deduped by the
+   * optional `dedupKey` (the co-signer keys by on-chain slot) — so a single connected peer cannot
+   * crowd out honest signers with multiple bogus responses and force a premature under-threshold
+   * resolution (MEDIUM 1). `validated` holds the accepted, deduped responses.
+   */
   private pendingCoSign = new Map<
     string,
     {
-      responses: Map<string, CoSignResponsePayload>;
+      validated: Map<string | number, CoSignResponsePayload>;
       threshold: number;
+      validate?: (resp: CoSignResponsePayload) => Promise<boolean>;
+      dedupKey?: (resp: CoSignResponsePayload) => string | number;
       finish: () => void;
       timer: NodeJS.Timeout | null;
     }
@@ -555,28 +563,42 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Broadcast a co-sign request to all connected peers and collect their responses, keyed by
-   * `requestId`. Resolves early once `threshold` DISTINCT signer nodes have replied (dedup by
-   * signerNodeId), or on `timeoutMs` with whatever partial set arrived. Always clears the timer
-   * and the pending entry. `threshold <= 0` resolves immediately with an empty set (the caller
-   * needs no peer signatures beyond its own self-contribution).
+   * `requestId`. Resolves early once `threshold` VALIDATED, unique-`dedupKey` responses have
+   * arrived, or on `timeoutMs` with whatever validated partial set accrued. Always clears the timer
+   * and the pending entry (no leak). `threshold <= 0` resolves immediately with an empty set (the
+   * caller needs no peer signatures beyond its own self-contribution).
+   *
+   * MEDIUM 1 (Codex): the optional `validate` counts ONLY cryptographically/on-chain-valid
+   * responses toward the threshold, and `dedupKey` (the co-signer keys by on-chain slot) collapses
+   * duplicates — so one connected peer cannot flood many bogus responses with distinct signer ids,
+   * crowd out honest signers, and force a premature under-threshold resolution. Absent `validate`,
+   * every response counts (legacy transport behaviour); absent `dedupKey`, responses dedup by
+   * `signerNodeId`.
    */
   async requestCoSignatures(
     payload: CoSignRequestPayload,
-    opts: { threshold: number; timeoutMs: number }
+    opts: {
+      threshold: number;
+      timeoutMs: number;
+      validate?: (resp: CoSignResponsePayload) => Promise<boolean>;
+      dedupKey?: (resp: CoSignResponsePayload) => string | number;
+    }
   ): Promise<CoSignResponsePayload[]> {
     return new Promise<CoSignResponsePayload[]>(resolve => {
-      const responses = new Map<string, CoSignResponsePayload>();
+      const validated = new Map<string | number, CoSignResponsePayload>();
       let done = false;
       const finish = () => {
         if (done) return;
         done = true;
         if (entry.timer) clearTimeout(entry.timer);
         this.pendingCoSign.delete(payload.requestId);
-        resolve(Array.from(responses.values()));
+        resolve(Array.from(validated.values()));
       };
       const entry = {
-        responses,
+        validated,
         threshold: opts.threshold,
+        validate: opts.validate,
+        dedupKey: opts.dedupKey,
         finish,
         timer: null as NodeJS.Timeout | null,
       };
@@ -631,16 +653,47 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       });
   }
 
-  /** Route a co-sign response back to the originating requestCoSignatures collector. */
+  /**
+   * Route a co-sign response back to the originating requestCoSignatures collector. A late,
+   * duplicate, or cross-requestId response whose collector already resolved is ignored (the pending
+   * entry is gone). When a `validate` is configured the response is counted ONLY after it passes
+   * (async) — so a bogus response never contributes toward the threshold (MEDIUM 1).
+   */
   private handleCoSignResponse(message: GossipMessage): void {
     const payload = message.data as CoSignResponsePayload;
     if (!payload || typeof payload.requestId !== "string") return;
     if (typeof payload.signerNodeId !== "string") return;
     const pending = this.pendingCoSign.get(payload.requestId);
     if (!pending) return; // unknown / already-resolved request → ignore
-    // Dedup by signer node id: a peer replying twice does not double-count toward threshold.
-    pending.responses.set(payload.signerNodeId, payload);
-    if (pending.responses.size >= pending.threshold) {
+    if (pending.validate) {
+      // Validate asynchronously; count ONLY on success. Failures (invalid sig / bad on-chain
+      // binding) or validator errors are silently dropped and never reach the threshold.
+      void pending
+        .validate(payload)
+        .then(ok => {
+          if (ok) this.countValidatedResponse(payload.requestId, payload);
+        })
+        .catch(() => {
+          /* validator threw → treat as invalid, drop */
+        });
+    } else {
+      this.countValidatedResponse(payload.requestId, payload);
+    }
+  }
+
+  /**
+   * Record a VALIDATED co-sign response toward its collector's threshold, deduped by `dedupKey`
+   * (default: signerNodeId). Re-reads the pending entry so a response whose validation finished
+   * AFTER the collector already resolved (timeout / threshold reached) is safely ignored. Resolves
+   * the collector once enough unique-key validated responses have accrued.
+   */
+  private countValidatedResponse(requestId: string, payload: CoSignResponsePayload): void {
+    const pending = this.pendingCoSign.get(requestId);
+    if (!pending) return; // collector already finished/cleaned, or cross-requestId → ignore
+    const key = pending.dedupKey ? pending.dedupKey(payload) : payload.signerNodeId;
+    if (pending.validated.has(key)) return; // dedup: same slot/node counts once
+    pending.validated.set(key, payload);
+    if (pending.validated.size >= pending.threshold) {
       pending.finish();
     }
   }

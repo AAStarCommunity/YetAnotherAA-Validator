@@ -47,9 +47,9 @@ export interface Evidence {
    * Block HASH of `violationBlock` (finding-3). Pinning the irreversible slash to a
    * finalized block's hash — not just its number — makes the evidence reorg-safe: a
    * reorg that rewrites `violationBlock` would change this hash, so the justification
-   * cannot be silently invalidated. Deliberately EXCLUDED from the content-address
-   * identity (a finalized block's hash is a deterministic function of its number, and
-   * two nodes reading the same finalized number already agree on the hash).
+   * cannot be silently invalidated. Now ALSO part of the content-address identity (LOW):
+   * a finalized block's hash is a deterministic function of its number, so two nodes
+   * reading the same finalized number still derive the same proofHash.
    */
   violationBlockHash?: string;
   /**
@@ -154,10 +154,30 @@ export interface ProofIdentity {
   rule: string;
   /** On-chain credit limit at violationBlock (stringified). */
   creditLimit: string;
+  /** On-chain available credit at violationBlock (stringified) — the SP-enforced ceiling signal. */
+  availableCredit: string;
   /** On-chain debt at violationBlock (stringified). */
   debt: string;
   /** Block all rule inputs were pinned to. */
   violationBlock: number;
+  /**
+   * Block HASH of `violationBlock` (LOW): committing to the finalized block's hash — not just its
+   * number — makes the content-address reorg-evidence. A reorg that rewrites `violationBlock` would
+   * change this hash, so evidenceHash cannot silently point at re-written history. Two nodes reading
+   * the same finalized number still agree (a finalized block's hash is a deterministic function of
+   * its number), so this stays cross-node deterministic and wall-clock-free.
+   */
+  violationBlockHash: string;
+  /** SP #329 SlashLevel bound into the slash preimages — part of the slash-critical identity. */
+  slashLevel: number;
+  /** Registry the credit limit / reputation were read from (checksummed). */
+  registry: string;
+  /** SuperPaymaster the availableCredit was read from (checksummed). */
+  superPaymaster: string;
+  /** DVTValidator the slash proposal/queue/execute target (checksummed). */
+  dvtValidator: string;
+  /** xPNTs token the operator debt was read from (checksummed). */
+  apntsToken: string;
 }
 
 /** Deterministic JSON with recursively sorted keys — a stable content-address preimage. */

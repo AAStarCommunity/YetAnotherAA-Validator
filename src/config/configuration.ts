@@ -284,18 +284,37 @@ function parseAllowlist(allowlistString: string): string[] {
 }
 
 /**
+ * Per-severity SAFE MINIMUM quorum (the pinned live policy, N=3 BLSAggregator bootstrap). A
+ * configured override may only RAISE a threshold, never lower it below this floor — otherwise a
+ * value like `MINOR:1` would let a single local signature pass as quorum and defeat the 3-of-3
+ * invariant that gates a REAL, irreversible on-chain GToken slash. HIGH 1 (Codex): clamp UP.
+ */
+const SLASH_THRESHOLD_FLOOR = { WARNING: 2, MINOR: 3, MAJOR: 3 } as const;
+
+/**
  * Parse the optional AUDIT_SLASH_THRESHOLDS override ("WARNING:2,MINOR:3,MAJOR:3") into the
  * per-severity quorum table. Defaults to the on-chain BLSAggregator bootstrap (N=3): 2/3/3.
- * Malformed / non-positive entries are ignored (the default for that level is kept).
+ * Malformed / non-positive entries are ignored (the default for that level is kept). Any parsed
+ * value BELOW the safe floor is CLAMPED UP to the floor (with a warning) so a misconfiguration can
+ * never weaken the quorum below the pinned live policy; HIGHER values are preserved as configured.
  */
 function parseSlashThresholds(raw?: string): { WARNING: number; MINOR: number; MAJOR: number } {
-  const out = { WARNING: 2, MINOR: 3, MAJOR: 3 };
+  const out = { ...SLASH_THRESHOLD_FLOOR } as { WARNING: number; MINOR: number; MAJOR: number };
   if (!raw) return out;
   for (const pair of raw.split(",")) {
     const [k, v] = pair.split(":").map(s => s.trim());
     const n = parseInt(v, 10);
     if ((k === "WARNING" || k === "MINOR" || k === "MAJOR") && Number.isFinite(n) && n > 0) {
-      out[k] = n;
+      const floor = SLASH_THRESHOLD_FLOOR[k];
+      if (n < floor) {
+        console.warn(
+          `⚠️  AUDIT_SLASH_THRESHOLDS ${k}:${n} is below the safe minimum (${floor}) — ` +
+            `clamping UP to ${floor} (the 3-of-3 slash quorum invariant cannot be weakened)`
+        );
+        out[k] = floor;
+      } else {
+        out[k] = n;
+      }
     }
   }
   return out;

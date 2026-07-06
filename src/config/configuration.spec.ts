@@ -42,3 +42,60 @@ describe("configuration: auditFinalityConfirmations floor", () => {
     expect(configuration().auditFinalityConfirmations).toBe(20);
   });
 });
+
+/**
+ * HIGH 1 (Codex): AUDIT_SLASH_THRESHOLDS must be CLAMPED UP to the pinned live floor
+ * (WARNING ≥ 2, MINOR ≥ 3, MAJOR ≥ 3) so a misconfiguration like `MINOR:1` can never let a single
+ * local signature pass as quorum and defeat the 3-of-3 slash invariant. HIGHER values are kept.
+ */
+describe("configuration: auditSlashThresholds clamp (slash-quorum floor)", () => {
+  const saved = { ...process.env };
+
+  beforeEach(() => {
+    process.env.ETH_RPC_URL = "http://localhost:8545";
+    process.env.VALIDATOR_CONTRACT_ADDRESS = "0x" + "12".repeat(20);
+  });
+
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it("unset → the pinned live defaults 2/3/3", () => {
+    delete process.env.AUDIT_SLASH_THRESHOLDS;
+    expect(configuration().auditSlashThresholds).toEqual({ WARNING: 2, MINOR: 3, MAJOR: 3 });
+  });
+
+  it("MINOR:1 (below floor) → clamped UP to 3", () => {
+    process.env.AUDIT_SLASH_THRESHOLDS = "MINOR:1";
+    expect(configuration().auditSlashThresholds.MINOR).toBe(3);
+  });
+
+  it("WARNING:1 (below floor) → clamped UP to 2", () => {
+    process.env.AUDIT_SLASH_THRESHOLDS = "WARNING:1";
+    expect(configuration().auditSlashThresholds.WARNING).toBe(2);
+  });
+
+  it("MAJOR:1 (below floor) → clamped UP to 3", () => {
+    process.env.AUDIT_SLASH_THRESHOLDS = "MAJOR:1";
+    expect(configuration().auditSlashThresholds.MAJOR).toBe(3);
+  });
+
+  it("MINOR:4 (above floor) → preserved (higher thresholds still configurable)", () => {
+    process.env.AUDIT_SLASH_THRESHOLDS = "MINOR:4";
+    expect(configuration().auditSlashThresholds.MINOR).toBe(4);
+  });
+
+  it("mixed: MINOR:1,WARNING:5 → MINOR clamped to 3, WARNING preserved at 5", () => {
+    process.env.AUDIT_SLASH_THRESHOLDS = "MINOR:1,WARNING:5";
+    const t = configuration().auditSlashThresholds;
+    expect(t.MINOR).toBe(3);
+    expect(t.WARNING).toBe(5);
+  });
+
+  it("a malformed / non-positive entry keeps that level at its floor default", () => {
+    process.env.AUDIT_SLASH_THRESHOLDS = "MINOR:0,MAJOR:notanumber";
+    const t = configuration().auditSlashThresholds;
+    expect(t.MINOR).toBe(3);
+    expect(t.MAJOR).toBe(3);
+  });
+});
