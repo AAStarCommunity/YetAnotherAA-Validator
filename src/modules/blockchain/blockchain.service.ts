@@ -582,10 +582,11 @@ export class BlockchainService {
     const iface = new ethers.Interface([
       "event SlashExecutedWithProof(address indexed operator, uint8 level, uint256 penalty, bytes32 proofHash, uint256 timestamp)",
       "event SlashExecuted(uint256 indexed proposalId, address indexed operator, uint8 level)",
+      "event OperatorSlashed(address indexed operator, uint256 amount, uint8 level)",
     ]);
     const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
     const filters = [
-      // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]).
+      // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]). BLS/DVT execute path.
       {
         name: "SlashExecutedWithProof",
         topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic],
@@ -594,6 +595,13 @@ export class BlockchainService {
       {
         name: "SlashExecuted",
         topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic],
+      },
+      // OperatorSlashed: operator 1st indexed (topics[1]). Emitted by `_slash` on BOTH the BLS/DVT
+      // execute path AND owner-manual `slashOperator` — which does NOT emit SlashExecutedWithProof, so
+      // WITHOUT this an owner-slashed operator reads as "not slashed" and the audit double-slashes it.
+      {
+        name: "OperatorSlashed",
+        topics: [iface.getEvent("OperatorSlashed")!.topicHash, opTopic],
       },
     ];
     for (const f of filters) {

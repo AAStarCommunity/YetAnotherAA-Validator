@@ -773,17 +773,32 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // ── DEDUP ─────────────────────────────────────────────────────────────────────
     const stableKey = `${this.chainId}|${v.operator}|${v.rule}|${v.violationBlock}`;
     const coarseKey = this.coarseKey(v.operator, v.rule);
-    // Exact same violation@block already handled (this process, or on disk from a prior run) — UNLESS
-    // a prior attempt's ARMED co-sign aborted transiently (no peers yet): `coSignRetryKeys` bypasses
-    // the dedup so the co-sign is re-attempted even though the evidence is already archived.
-    if (
-      !this.coSignRetryKeys.has(stableKey) &&
-      (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash)))
-    ) {
-      this.logger.debug(
-        `Audit: ${v.operator} ${v.rule}@${v.violationBlock} already proposed (proof ${proofHash}) — skip`
-      );
-      return null;
+    // Exact same violation@block already handled (this process, or on disk from a prior run) — with
+    // TWO bypasses so an incomplete slash is not stranded:
+    //   (a) `coSignRetryKeys` (in-memory): a prior attempt's ARMED co-sign aborted transiently.
+    //   (b) archived INCOMPLETE slash (durable, Codex-Critical crash-restart fix): the archived proof
+    //       has `queueTx` set but no `executeTx` — the operator was queued (pending, withdraw-locked)
+    //       but never slashed. In-memory `coSignRetryKeys` is LOST on a crash, so without this the
+    //       durable `archive.has` short-circuit would permanently skip the block → stuck pending. We
+    //       carry the archived proof so its `proposalId` can be REUSED on the resume (no orphan).
+    // The archived proof (if any) for THIS violation — read once (armed only) so we can (a) detect an
+    // INCOMPLETE slash to resume and (b) REUSE its durably-persisted proposalId on the resume so no
+    // path files a fresh orphan proposal. `incomplete` = queued (queueTx set) but not executed.
+    const archived = this.executeSlash ? await this.archive.get(proofHash) : null;
+    const resumeArchived = archived && archived.queueTx && !archived.executeTx ? archived : null;
+    if (!this.coSignRetryKeys.has(stableKey)) {
+      if (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash))) {
+        if (!resumeArchived) {
+          this.logger.debug(
+            `Audit: ${v.operator} ${v.rule}@${v.violationBlock} already proposed (proof ${proofHash}) — skip`
+          );
+          return null;
+        }
+        this.logger.warn(
+          `Audit: ${v.operator} ${v.rule}@${v.violationBlock} archived INCOMPLETE slash ` +
+            `(queueTx ${resumeArchived.queueTx}, no executeTx) — re-assessing to RESUME across restart`
+        );
+      }
     }
 
     // Build the PRE-execution proof. The real proof.messageHash is the 8-field EXECUTE preimage,
@@ -882,6 +897,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // on-chain step (finding-4): a crash between a confirmed queue/execute tx and the final
       // archive below can no longer lose that tx record — durable state always reflects what was
       // actually submitted.
+      // On the resume path, REUSE the proposalId this node already filed for this evidence (durably
+      // recorded in the archived proof) instead of creating a fresh one — bounds resume to ZERO new
+      // proposals for a same-node retry (Codex High-2: orphan re-explosion). A peer resuming with no
+      // local proposal (null) files one, throttled by the cooldown that a post-queue failure keeps.
+      const resumeProposalId =
+        resume && resumeArchived?.proposalId ? BigInt(resumeArchived.proposalId) : null;
       const res = await this.coordinateQuorumCoSign(
         {
           operator: v.operator,
@@ -891,7 +912,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           evidenceHash: proofHash,
         },
         proof,
-        resume
+        resume,
+        resumeProposalId
       );
       proposalTx = res.proposalTx;
       onchainProposalId = res.proposalId;
@@ -899,15 +921,25 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       executeTx = res.executeTx;
       if (res.queueMessageHash) proof.queueMessageHash = res.queueMessageHash;
       if (res.coSignAborted) {
-        // ROBUSTNESS GAP FIX: the armed queue co-sign failed TRANSIENTLY (no gossip peers yet /
-        // quorum not reached / staticCall reverted) — nothing was slashed, no gas spent. Mark this
-        // block for co-sign RETRY (bypasses the archived-evidence dedup) + clear the coarse cooldown
-        // so the NEXT tick re-attempts, instead of permanently skipping the block (a node that detects
-        // a violation before its gossip mesh is up would otherwise lose that block's slash forever).
+        // An ARMED attempt did not fully execute → mark the block for co-sign RETRY (bypasses the
+        // archived-evidence dedup in-process). Whether to also CLEAR the cooldown depends on how far
+        // it got:
+        //   • queue NEVER landed (queueTx null && not resuming) → pure transient (no gas spent, e.g.
+        //     gossip mesh not up yet) → CLEAR cooldown so the next tick retries IMMEDIATELY.
+        //   • queue DID land (queueTx set) or we were RESUMING → a post-queue failure. KEEP the
+        //     cooldown so the execute retry is THROTTLED to once per cooldownMs — otherwise the resume
+        //     path re-attempts every tick × every node (Codex High-2 orphan/gas explosion).
         this.coSignRetryKeys.add(stableKey);
-        this.lastProposalAt.delete(coarseKey);
+        const queuePreflagLanded = res.queueTx !== null || resume;
+        if (!queuePreflagLanded) {
+          this.lastProposalAt.delete(coarseKey);
+        }
         this.logger.warn(
-          `Audit: ${v.operator} ${v.rule} co-sign aborted (transient) — will retry next tick`
+          `Audit: ${v.operator} ${v.rule} co-sign aborted (${
+            queuePreflagLanded
+              ? "post-queue, cooldown kept — throttled resume"
+              : "transient, cooldown cleared"
+          }) — will retry next tick`
         );
       } else {
         // Co-sign completed (queued / executed / dry-run) → stop retrying this block.
@@ -1101,16 +1133,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       pendingIndeterminate = true; // RPC error → unknown
     }
 
-    // (5) CONSERVATIVE fail-closed backstop. Reaching here means NO guard positively confirmed an
-    // existing slash OR pending. If BOTH the executed-event scan and the pending reconstruction were
-    // indeterminate (and there is no durable marker — else we'd have returned above), we have zero
-    // authoritative signal. Fail CLOSED: "blocked" → the caller skips the irreversible slash rather
-    // than risk a double-slash on unreadable chain state. A determinate "not slashed / not pending"
-    // returns "clear" → the normal armed path slashes.
-    if (scanIndeterminate && pendingIndeterminate) {
+    // (5) CONSERVATIVE fail-closed backstop. Reaching here means the operator is NOT already-executed
+    // by any positive signal (1-3) and NOT pending (4). Fail CLOSED whenever the EXECUTED-scan was
+    // indeterminate: a `pending === false` does NOT prove "never slashed" — a *completed* slash also
+    // clears `_pendingSlash`, so if we cannot read the executed events we cannot rule out a prior
+    // slash and must not fire an irreversible one. (Codex-Critical: the earlier `scanIndeterminate &&
+    // pendingIndeterminate` was too weak — a determinate pending=false wrongly unblocked.) A
+    // pendingIndeterminate alone (executed-scan determinate "not executed") is safe to slash. Only a
+    // fully determinate "not executed / not pending" returns "clear".
+    if (scanIndeterminate) {
       this.logger.warn(
-        `Audit: ${operator} slash-state INDETERMINATE (executed-scan + pending-reconstruction both ` +
-          `unavailable, no durable marker) — fails CLOSED, on-chain slash SKIPPED`
+        `Audit: ${operator} slash-state INDETERMINATE (executed-event scan unavailable; ` +
+          `pending=${pendingIndeterminate ? "unknown" : "false"} cannot prove un-slashed) — ` +
+          `fails CLOSED, on-chain slash SKIPPED`
       );
       return "blocked";
     }
@@ -1168,7 +1203,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
      * true, Step 1 (queue) is SKIPPED (a re-queue hits the BLSAggregator replay guard and reverts);
      * the flow goes straight to createProposal + execute to complete the slash. Defaults to false.
      */
-    resume = false
+    resume = false,
+    /**
+     * On the resume path, a proposalId this node ALREADY filed for this evidence (from the archived
+     * proof). When provided, Step 2 REUSES it instead of creating a fresh proposal — so a same-node
+     * resume adds ZERO new on-chain proposals (no orphan re-explosion). Null ⇒ Step 2 files one.
+     */
+    resumeProposalId: bigint | null = null
   ): Promise<{
     proposalTx: string | null;
     proposalId: bigint | null;
@@ -1276,7 +1317,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // an ORPHAN proposal that Step 3 then SKIPS — and with N nodes each retrying every tick, one
     // orphan per node per tick. Gating on the queue pre-flag makes only the node(s) that hold it file
     // a proposal they can actually execute.
-    if (!armed || queueTx !== null || resume) {
+    if (resumeProposalId !== null) {
+      // RESUME with a proposal this node already filed — reuse it, file NOTHING new (no orphan).
+      proposalId = resumeProposalId;
+      this.logger.warn(
+        `Audit: ${operator} createProposal REUSED existing proposal id ${resumeProposalId} ` +
+          `(resume) — no new on-chain proposal filed`
+      );
+    } else if (!armed || queueTx !== null || resume) {
       try {
         const res = await this.blockchainService.createProposalWithEvidence(
           this.dvtValidatorAddress,
@@ -1288,6 +1336,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         );
         proposalTx = res.txHash;
         proposalId = res.proposalId;
+        // ARMED only: persist the REAL proposalId durably NOW (before the execute step), so a crash
+        // between createProposal and executeWithProof lets a restarted process REUSE this id on the
+        // resume (no orphan) instead of filing a fresh proposal. File-only has no execute to resume,
+        // and the final archive records the id anyway. Skip the sentinel/no-op dry-run id.
+        if (proof && armed && proposalId !== null && proposalTx !== DRY_RUN_TX_SENTINEL) {
+          proof.proposalId = proposalId.toString();
+          await persistStep();
+        }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         this.logger.error(`Audit: ${operator} createProposal failed — ${msg}`);

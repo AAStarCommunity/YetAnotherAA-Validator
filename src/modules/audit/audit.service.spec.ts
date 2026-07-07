@@ -140,6 +140,9 @@ function makeArchive(): IProofArchive & { records: SlashProof[]; slashed: Set<st
     async has(proofHash: string) {
       return records.some(r => r.proofHash === proofHash);
     },
+    async get(proofHash: string) {
+      return records.find(r => r.proofHash === proofHash) ?? null;
+    },
     async count() {
       return records.length;
     },
@@ -698,6 +701,9 @@ describe("AuditService", () => {
       async has(proofHash: string) {
         return records.some(r => r.proofHash === proofHash);
       },
+      async get(proofHash: string) {
+        return records.find(r => r.proofHash === proofHash) ?? null;
+      },
       async count() {
         return records.length;
       },
@@ -1252,23 +1258,29 @@ describe("AuditService", () => {
       },
     });
     const archive = makeArchive();
+    // A mutable clock advanced past cooldownMs between ticks: the post-queue-failure THROTTLE keeps the
+    // cooldown, so tick 2 must be beyond it for the resume to fire (proves both throttle AND resume).
+    let now = 1_700_000_000_000;
     const svc = makeService(
       blockchain,
-      makeConfig({ auditExecuteSlash: true }),
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 20_000 }),
       archive,
-      undefined,
+      () => now,
       makeCoSigner()
     );
 
     // Tick 1: queue + create land, execute THROWS → executeTx null → NOT marked handled, retry armed.
     await svc.tick();
     expect(order).toEqual(["queue", "create", "execute"]);
+    now += 25_000; // advance past cooldownMs so the resume is not throttled
     expect((await svc.getStatus()).recentDetections[0].executeTx).toBeNull();
 
-    // Tick 2: operator now pending on-chain (queue landed) → RESUME: skip queue, create + execute (ok).
+    // Tick 2: operator now pending on-chain (queue landed) → RESUME. No re-queue (replay guard would
+    // revert) AND no new createProposal — the archived proposalId from tick 1 is REUSED (High-2: zero
+    // orphan on a same-node resume). Only the execute (previously failed) is retried, now succeeding.
     order.length = 0;
     await svc.tick();
-    expect(order).toEqual(["create", "execute"]); // NO re-queue — the BLSAggregator replay guard would revert it
+    expect(order).toEqual(["execute"]); // reused proposal id (no re-create), no re-queue
     expect(executeAttempts).toBe(2);
     expect((await svc.getStatus()).recentDetections[0].executeTx).toBe("0xEXECUTETX"); // slash completed
   });
@@ -1301,6 +1313,9 @@ describe("AuditService", () => {
       },
       async has(proofHash: string) {
         return records.some(r => r.proofHash === proofHash);
+      },
+      async get(proofHash: string) {
+        return records.find(r => r.proofHash === proofHash) ?? null;
       },
       async count() {
         return records.length;
@@ -1419,13 +1434,34 @@ describe("AuditService", () => {
     expect(archive.records[0].proposalIdNote).toMatch(/over-slash guard/);
   });
 
-  it("HIGH: an INDETERMINATE scan but a KNOWN pending flag (false) still lets the slash proceed", async () => {
-    // Only ONE of the two signals is indeterminate → we still have an authoritative signal, so the
-    // fail-closed backstop does NOT fire and the armed path slashes normally.
+  it("Codex-Critical: an INDETERMINATE executed-scan fails CLOSED even when pending=false (pending≠proof-of-un-slashed)", async () => {
+    // A `pending === false` does NOT prove "never slashed" — a COMPLETED slash also clears
+    // _pendingSlash. So if the executed-event scan is indeterminate (null), we cannot rule out a
+    // prior slash and must NOT fire another. "blocked" → skip. (The old code let pending=false unblock
+    // this and could double-slash.)
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, {
-      getRecentSlashExecuted: async () => null,
-      isSlashPending: async () => false,
+      getRecentSlashExecuted: async () => null, // executed scan INDETERMINATE
+      isSlashPending: async () => false, // determinate "not currently pending" — but that ≠ "not slashed"
+    });
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      makeArchive(),
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    expect(order).toEqual([]); // fail-closed: NO slash on an unreadable executed-scan
+  });
+
+  it("a DETERMINATE 'not executed' scan with pending unknown (null) still slashes (only pending was flaky)", async () => {
+    // The inverse: the executed scan is DETERMINATE (false = definitively not slashed) and only the
+    // pending reconstruction is indeterminate → we DO have proof it was not executed, so slash.
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, {
+      getRecentSlashExecuted: async () => false, // determinate: not executed
+      isSlashPending: async () => null, // pending reconstruction unavailable
     });
     const svc = makeService(
       blockchain,
@@ -1457,6 +1493,9 @@ describe("AuditService", () => {
       },
       async has(proofHash: string) {
         return records.some(r => r.proofHash === proofHash);
+      },
+      async get(proofHash: string) {
+        return records.find(r => r.proofHash === proofHash) ?? null;
       },
       async count() {
         return records.length;
@@ -1720,6 +1759,9 @@ describe("AuditService", () => {
       },
       async has(proofHash: string) {
         return records.some(r => r.proofHash === proofHash);
+      },
+      async get(proofHash: string) {
+        return records.find(r => r.proofHash === proofHash) ?? null;
       },
       async count() {
         return records.length;
