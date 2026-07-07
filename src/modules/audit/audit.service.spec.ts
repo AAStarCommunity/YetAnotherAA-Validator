@@ -1285,6 +1285,57 @@ describe("AuditService", () => {
     expect((await svc.getStatus()).recentDetections[0].executeTx).toBe("0xEXECUTETX"); // slash completed
   });
 
+  it("Codex-Critical: a RESTARTED process (empty in-memory retry state) resumes an archived incomplete slash via on-chain pending", async () => {
+    // The full crash-restart hole: process A queues (pending on-chain) then dies before execute. A
+    // FRESH process B — empty coSignRetryKeys / cooldown / proposedStableKeys — sharing only the
+    // durable archive must NOT be short-circuited by archive.has; it re-assesses on-chain pending and
+    // RESUMES. (The archive.has fast-skip only applies to a COMPLETED archived slash.)
+    const archive = makeArchive(); // durable, SHARED across the two process lifetimes
+    let pending = false;
+    let executeAttempts = 0;
+    const blockchain = overLimitBlockchain({
+      getRecentSlashExecuted: async () => false,
+      isSlashPending: async () => pending,
+      queueSlashWithProof: async () => {
+        pending = true; // queue pre-flag now set on-chain (survives the "crash")
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => ({ txHash: "0xP", proposalId: 9n }),
+      executeSlashWithProof: async () => {
+        executeAttempts++;
+        if (executeAttempts === 1) throw new Error("execute reverted, then the process crashed");
+        return "0xEXECUTETX";
+      },
+    });
+
+    // Process lifetime 1: queue + create land (proposalId durably persisted), execute fails → the
+    // archive holds an INCOMPLETE proof (queueTx set, executeTx unset).
+    const svcA = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svcA.tick();
+    expect(archive.records).toHaveLength(1);
+    expect(archive.records[0].queueTx).toBeDefined();
+    expect(archive.records[0].executeTx).toBeUndefined();
+
+    // Process lifetime 2 (RESTART): a brand-new service instance (fresh in-memory maps) on the same
+    // durable archive. It must resume to completion, NOT permanently skip on archive.has.
+    const svcB = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svcB.tick();
+    expect(executeAttempts).toBe(2); // svcB completed the slash the crashed svcA left pending
+    expect(archive.records[0].executeTx).toBe("0xEXECUTETX");
+  });
+
   // ── FINDING 5: archive-before-execute ordering (durable intent precedes the slash) ──
   it("Finding 5: the proof is archived (durable intent) BEFORE the irreversible on-chain execute, then updated after", async () => {
     const order: string[] = [];

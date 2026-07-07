@@ -786,19 +786,26 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // path files a fresh orphan proposal. `incomplete` = queued (queueTx set) but not executed.
     const archived = this.executeSlash ? await this.archive.get(proofHash) : null;
     const resumeArchived = archived && archived.queueTx && !archived.executeTx ? archived : null;
-    if (!this.coSignRetryKeys.has(stableKey)) {
+    // ARMED + the archived proof did NOT record a completed execute (executeTx unset — includes a
+    // crash BEFORE queueTx was even persisted) → do NOT short-circuit on `archive.has`: fall through
+    // to `assessSlashState`, which reads the AUTHORITATIVE on-chain pending state (durable; survives
+    // this tick's archive overwrite and any crash-before-persist window). Only a COMPLETED archived
+    // slash (executeTx set), or the file-only path, takes the fast dedup skip. (Codex-Critical: the
+    // archived queueTx alone is NOT a safe skip signal — the on-chain flag is.)
+    const armedUnfinished = this.executeSlash && (!archived || !archived.executeTx);
+    if (!this.coSignRetryKeys.has(stableKey) && !armedUnfinished) {
       if (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash))) {
-        if (!resumeArchived) {
-          this.logger.debug(
-            `Audit: ${v.operator} ${v.rule}@${v.violationBlock} already proposed (proof ${proofHash}) — skip`
-          );
-          return null;
-        }
-        this.logger.warn(
-          `Audit: ${v.operator} ${v.rule}@${v.violationBlock} archived INCOMPLETE slash ` +
-            `(queueTx ${resumeArchived.queueTx}, no executeTx) — re-assessing to RESUME across restart`
+        this.logger.debug(
+          `Audit: ${v.operator} ${v.rule}@${v.violationBlock} already proposed (proof ${proofHash}) — skip`
         );
+        return null;
       }
+    }
+    if (resumeArchived) {
+      this.logger.warn(
+        `Audit: ${v.operator} ${v.rule}@${v.violationBlock} archived INCOMPLETE slash ` +
+          `(queueTx ${resumeArchived.queueTx}, no executeTx) — will RESUME if on-chain pending`
+      );
     }
 
     // Build the PRE-execution proof. The real proof.messageHash is the 8-field EXECUTE preimage,
@@ -833,6 +840,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       attestations: {},
       createdAt: this.clock(),
     };
+
+    // Carry forward any durable on-chain PROGRESS from a prior incomplete attempt (queue/proposal
+    // landed but execute did not) so this fresh archive.put does NOT overwrite the durable incomplete
+    // marker with nulls — otherwise a crash right after this put would strand the resume (Codex-
+    // Critical overwrite window). Never clobber a real archived value with undefined/null.
+    if (archived) {
+      proof.queueTx = archived.queueTx ?? proof.queueTx;
+      proof.queueMessageHash = archived.queueMessageHash ?? proof.queueMessageHash;
+      proof.proposalTx = archived.proposalTx ?? proof.proposalTx;
+      proof.proposalId = archived.proposalId ?? proof.proposalId;
+    }
 
     // ── ARCHIVE-BEFORE-EXECUTE (finding-5, evidence + intent durable first) ─────────
     // Persist the durable evidence + slash INTENT BEFORE any irreversible on-chain queue/execute,
