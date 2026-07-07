@@ -8,6 +8,7 @@ import { BlsService } from "../bls/bls.service.js";
 import { NodeService } from "../node/node.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { bls, sigs } from "../../utils/bls.util.js";
+import { PROOF_SCHEMA_VERSION } from "./proof-archive.js";
 import {
   CoSignRequest,
   CoSignVerifier,
@@ -52,9 +53,10 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
   private verifier: CoSignVerifier | null = null;
 
   /**
-   * Memoized own on-chain slot (finding-1: resolveOwnSlot was a serial 1..maxSlots RPC scan on EVERY
-   * coSign/verifyAndSign). The slot is FIXED on-chain at registerBLSPublicKey, so a POSITIVE result
-   * is cached permanently. A null (node not yet registered at a slot) is NOT cached — it re-resolves
+   * Memoized own on-chain slot. resolveOwnSlot is now an O(1) getBLSPublicKey(operatorEoa) read
+   * (finding-3) — the on-chain BLSAggregator returns this validator's slot DIRECTLY, so there is no
+   * 1..maxSlots scan. The slot is FIXED on-chain at registerBLSPublicKey, so a POSITIVE result is
+   * cached permanently. A null (node not yet registered, or no wallet) is NOT cached — it re-resolves
    * next time so a later registration is picked up. `refreshOwnSlot()` forces re-resolution.
    */
   private ownSlot: number | null = null;
@@ -119,6 +121,18 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       if (!this.executeSlash) return null;
       if (!this.verifier) return null;
 
+      // 1b. proof-schema version must match (finding-1). A mixed-version fleet computes DIFFERENT
+      // proofHashes, so co-signing would silently fail to reach quorum with no clear reason. Refuse
+      // EXPLICITLY with a WARNING (fail-closed, safe) so the operator can diagnose + align versions.
+      if (req.proofSchemaVersion !== PROOF_SCHEMA_VERSION) {
+        this.logger.warn(
+          `verifyAndSign refused: proof schema version mismatch: req=${req.proofSchemaVersion} ` +
+            `local=${PROOF_SCHEMA_VERSION} — all DVT nodes must run the same inc-2-live version; ` +
+            `refusing to co-sign`
+        );
+        return null;
+      }
+
       // 2. operator must be watchlisted.
       let operator: string;
       try {
@@ -154,10 +168,9 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
         return null;
       }
 
-      // 5. resolve own on-chain validator slot (by our own BLS key).
+      // 5. resolve own on-chain validator slot (O(1) by our own operator EOA, finding-3).
       const node = this.nodeService.getNodeForSigning();
-      const ownCompressed = await this.blsService.getPublicKeyFromPrivateKey(node.privateKey);
-      const slot = await this.resolveOwnSlot(ownCompressed);
+      const slot = await this.resolveOwnSlot();
       if (slot === null) return null;
 
       // 6. sign the locally-recomputed hash.
@@ -199,8 +212,7 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       throw new Error("gossip co-sign: responder/verifier not wired");
     }
     const node = this.nodeService.getNodeForSigning();
-    const ownCompressed = await this.blsService.getPublicKeyFromPrivateKey(node.privateKey);
-    const ownSlot = await this.resolveOwnSlot(ownCompressed);
+    const ownSlot = await this.resolveOwnSlot();
     if (ownSlot === null) {
       throw new Error("gossip co-sign: local node has no on-chain validator slot — refusing");
     }
@@ -337,31 +349,29 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
   }
 
   /**
-   * Resolve THIS node's own slot by matching its BLS key (uncompressed EIP-2537) against the
-   * on-chain key registered at each slot. Ties the slot directly to the key we actually sign with,
-   * so the requester's on-chain binding of our response cannot mismatch. `null` when unregistered.
+   * Resolve THIS node's own slot with a SINGLE on-chain read (finding-3): getRegisteredSlot reads
+   * BLSAggregator.getBLSPublicKey(ownOperatorEoa), which returns this validator's slot directly — no
+   * 1..maxSlots scan. The operator EOA is the node's on-chain wallet (the same EOA that registered
+   * the BLS key and submits the slash txs). `null` when there is no wallet or the operator holds no
+   * active slot. The requester still independently binds our returned slot to its on-chain key
+   * (validateResponse), so a slot whose registered key differs from our signing key is rejected there
+   * — safety does not rely on this lookup matching the key.
    */
-  private async resolveOwnSlot(compressedPubKey: string): Promise<number | null> {
-    // Serve a previously-resolved POSITIVE slot from cache (finding-1): the on-chain slot is fixed at
-    // registration, so once found it never changes for this key.
+  private async resolveOwnSlot(): Promise<number | null> {
+    // Serve a previously-resolved POSITIVE slot from cache: the on-chain slot is fixed at
+    // registration, so once found it never changes for this operator.
     if (this.ownSlotResolved) return this.ownSlot;
-    let ownUncompressed: string;
-    try {
-      ownUncompressed = this.uncompressedFromCompressed(compressedPubKey).toLowerCase();
-    } catch {
+    const operatorEoa = this.blockchain.getWalletAddress();
+    if (!operatorEoa) return null; // no wallet → cannot resolve own slot (do NOT cache)
+    const slot = await this.blockchain.getRegisteredSlot(this.blsAggregatorAddress, operatorEoa);
+    if (slot === null) {
+      // Not yet registered at an active slot: do NOT cache the null — re-resolve next time so a
+      // later registration is picked up.
       return null;
     }
-    for (let slot = 1; slot <= this.maxSlots; slot++) {
-      const onchain = await this.blockchain.getBlsPublicKeyAtSlot(this.blsAggregatorAddress, slot);
-      if (onchain && onchain.toLowerCase() === ownUncompressed) {
-        this.ownSlot = slot;
-        this.ownSlotResolved = true;
-        return slot;
-      }
-    }
-    // Node not yet registered at any slot: do NOT cache the null — re-resolve next time so a later
-    // registration is picked up.
-    return null;
+    this.ownSlot = slot;
+    this.ownSlotResolved = true;
+    return slot;
   }
 
   /** Force re-resolution of the memoized own slot on the next resolveOwnSlot call. */

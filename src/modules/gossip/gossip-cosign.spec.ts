@@ -4,6 +4,7 @@ import type {
   CoSignResponsePayload,
   GossipMessage,
 } from "./gossip.interfaces.js";
+import { PROOF_SCHEMA_VERSION } from "../audit/proof-archive.js";
 
 /**
  * inc-2-live — gossip co-sign TRANSPORT tests. The gossip service is a dumb point-to-point
@@ -40,6 +41,7 @@ function buildService(nodeId = "self-node"): GossipService {
 
 function reqPayload(overrides: Partial<CoSignRequestPayload> = {}): CoSignRequestPayload {
   return {
+    proofSchemaVersion: PROOF_SCHEMA_VERSION,
     step: "queue",
     operator: "0x" + "12".repeat(20),
     slashLevel: 1,

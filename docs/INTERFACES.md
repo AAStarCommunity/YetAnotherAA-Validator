@@ -85,3 +85,26 @@ node scripts/sync-dvt-config.mjs --validator 0x…   # also check/set the valida
 `config:check` only touches DVT-owned fields — airaccount-owned fields
 (`e2e_account`, router) are never rewritten. Wire `npm run config:check` into CI
 to fail the build if the committed config drifts from the running nodes.
+
+## 3. Slash-consensus proof schema — all DVT nodes MUST match (inc-2-live)
+
+**What it is:** the inc-2-live gossip slash quorum content-addresses its
+evidence with a `proofHash` derived from `ProofIdentity` in
+`src/modules/audit/proof-archive.ts`, versioned by `PROOF_SCHEMA_VERSION`. Every
+co-sign request carries that version (`CoSignRequest.proofSchemaVersion`), and
+the responder (`gossip-quorum-cosigner.ts:verifyAndSign`) **refuses** to co-sign
+any request whose version differs from its own — an explicit, logged refusal,
+not a silent hash divergence.
+
+**Operational contract — deploy the fleet atomically.** Because widening
+`ProofIdentity` changes `proofHash`, a mixed-version fleet (some nodes old, some
+new) computes **different** `proofHash`es and cannot reach quorum. Slash
+consensus then silently loses liveness until every node matches.
+**Upgrade/deploy all DVT nodes together (atomic); never do a rolling partial
+upgrade** that leaves nodes on different `PROOF_SCHEMA_VERSION`. When you bump
+the identity shape, bump `PROOF_SCHEMA_VERSION` and roll all nodes in one
+coordinated deploy.
+
+**Auto-check:** `proof-archive.spec.ts` asserts the version is bound into
+`proofHash`; `gossip-quorum-cosigner.spec.ts` asserts a version-mismatched
+request is refused.

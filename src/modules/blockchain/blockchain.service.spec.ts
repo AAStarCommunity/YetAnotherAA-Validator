@@ -315,3 +315,67 @@ describe("BlockchainService.getSlotForValidator (finding-1 parallel scan)", () =
     expect(reads()).toBe(7); // all 7 slots issued (parallel), none skipped
   });
 });
+
+/**
+ * FINDING 3: getRegisteredSlot resolves a node's OWN slot in ONE getBLSPublicKey(operatorEoa) read
+ * (the on-chain call returns the validator's slot + isActive directly) — no 1..maxSlots scan.
+ * Returns the slot when ACTIVE and >= 1; null when inactive/unregistered, out of range, malformed,
+ * or the read reverts.
+ */
+describe("BlockchainService.getRegisteredSlot (finding-3 O(1) own-slot)", () => {
+  const BLS_AGG = ethers.getAddress("0x" + "aa".repeat(20));
+  const OP = ethers.getAddress("0x" + "12".repeat(20));
+  const CODER = ethers.AbiCoder.defaultAbiCoder();
+  const RET = ["tuple(bytes32,bytes32,bytes32,bytes32)", "uint8", "bool"];
+  const PK = [
+    "0x" + "11".repeat(32),
+    "0x" + "22".repeat(32),
+    "0x" + "33".repeat(32),
+    "0x" + "44".repeat(32),
+  ];
+
+  /** A service whose provider.call returns an ABI-encoded getBLSPublicKey tuple (or throws). */
+  function makeService(call: () => Promise<string>): BlockchainService {
+    const config = { get: (_k: string) => undefined } as any;
+    const svc = new BlockchainService(config);
+    (svc as any).provider = { call };
+    return svc;
+  }
+
+  it("returns the 1-indexed slot for an ACTIVE registered validator (one read)", async () => {
+    let calls = 0;
+    const svc = makeService(async () => {
+      calls++;
+      return CODER.encode(RET, [PK, 5, true]);
+    });
+    expect(await svc.getRegisteredSlot(BLS_AGG, OP)).toBe(5);
+    expect(calls).toBe(1); // O(1): a single getBLSPublicKey read, no slot scan
+  });
+
+  it("returns null when the validator is INACTIVE (revoked)", async () => {
+    const svc = makeService(async () => CODER.encode(RET, [PK, 5, false]));
+    expect(await svc.getRegisteredSlot(BLS_AGG, OP)).toBeNull();
+  });
+
+  it("returns null when the returned slot is 0 (unregistered / no slot)", async () => {
+    const svc = makeService(async () => CODER.encode(RET, [PK, 0, true]));
+    expect(await svc.getRegisteredSlot(BLS_AGG, OP)).toBeNull();
+  });
+
+  it("returns null when the on-chain read reverts (fail-closed)", async () => {
+    const svc = makeService(async () => {
+      throw new Error("execution reverted");
+    });
+    expect(await svc.getRegisteredSlot(BLS_AGG, OP)).toBeNull();
+  });
+
+  it("returns null for a malformed operator EOA WITHOUT any read", async () => {
+    let calls = 0;
+    const svc = makeService(async () => {
+      calls++;
+      return CODER.encode(RET, [PK, 5, true]);
+    });
+    expect(await svc.getRegisteredSlot(BLS_AGG, "not-an-address")).toBeNull();
+    expect(calls).toBe(0);
+  });
+});

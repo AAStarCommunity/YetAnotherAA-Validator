@@ -11,6 +11,7 @@ import {
   recomputeMessageHash,
   encodeProof,
 } from "./slash-consensus.js";
+import { PROOF_SCHEMA_VERSION } from "./proof-archive.js";
 
 const OPERATOR = ethers.getAddress("0x" + "12".repeat(20));
 const EVIDENCE_HASH = "0x" + "cd".repeat(32);
@@ -91,6 +92,7 @@ describe("slash-consensus primitives (SP #329)", () => {
   it("PendingSlotCoSigner fails closed: coSign(req) throws the disarmed error", async () => {
     const coSigner = new PendingSlotCoSigner();
     const req: CoSignRequest = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       step: "queue",
       operator: OPERATOR,
       slashLevel: SlashLevel.MINOR,
@@ -140,6 +142,7 @@ describe("slash-consensus primitives (SP #329)", () => {
   describe("recomputeMessageHash", () => {
     it("queue step === buildQueueMessageHash", () => {
       const req: CoSignRequest = {
+        proofSchemaVersion: PROOF_SCHEMA_VERSION,
         step: "queue",
         operator: OPERATOR,
         slashLevel: SlashLevel.MINOR,
@@ -155,6 +158,7 @@ describe("slash-consensus primitives (SP #329)", () => {
 
     it("execute step === buildExecuteMessageHash", () => {
       const req: CoSignRequest = {
+        proofSchemaVersion: PROOF_SCHEMA_VERSION,
         step: "execute",
         operator: OPERATOR,
         slashLevel: SlashLevel.MINOR,
@@ -171,6 +175,7 @@ describe("slash-consensus primitives (SP #329)", () => {
 
     it("execute step without proposalId → throws", () => {
       const req: CoSignRequest = {
+        proofSchemaVersion: PROOF_SCHEMA_VERSION,
         step: "execute",
         operator: OPERATOR,
         slashLevel: SlashLevel.MINOR,
@@ -184,6 +189,7 @@ describe("slash-consensus primitives (SP #329)", () => {
 
     it("execute step without evidenceHash → throws", () => {
       const req: CoSignRequest = {
+        proofSchemaVersion: PROOF_SCHEMA_VERSION,
         step: "execute",
         operator: OPERATOR,
         slashLevel: SlashLevel.MINOR,

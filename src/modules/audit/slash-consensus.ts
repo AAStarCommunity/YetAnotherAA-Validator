@@ -133,6 +133,13 @@ export function buildSignerMask(slots: number[]): bigint {
  * `messageHash`) and to independently re-confirm the underlying violation before signing.
  */
 export interface CoSignRequest {
+  /**
+   * Proof-schema version (finding-1) = proof-archive `PROOF_SCHEMA_VERSION`. The responder REFUSES
+   * to co-sign a request whose version differs from its own — an EXPLICIT, diagnosable refusal for a
+   * mixed-version fleet, instead of a silent proofHash divergence that quietly loses quorum. Does
+   * NOT affect the on-chain messageHash (recomputeMessageHash ignores it); it only gates co-sign.
+   */
+  proofSchemaVersion: number;
   /** Which slash step this request co-signs: the 5-field queue preimage or 8-field execute. */
   step: "queue" | "execute";
   /** Operator being slashed (checksummed address). */

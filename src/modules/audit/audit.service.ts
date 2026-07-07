@@ -11,7 +11,7 @@ import { ethers } from "ethers";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 import type { IProofArchive, SlashProof, EvidenceSource, ProofIdentity } from "./proof-archive.js";
-import { LocalProofArchive, computeProofHash } from "./proof-archive.js";
+import { LocalProofArchive, computeProofHash, PROOF_SCHEMA_VERSION } from "./proof-archive.js";
 import type { IQuorumCoSigner, CoSignRequest, CoSignVerifier } from "./slash-consensus.js";
 import {
   SlashLevel,
@@ -663,16 +663,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
 
       if (!this.isCreditOverLimit(creditLimit, availableCredit, debt)) return NO;
 
-      // Re-read the pinned block's hash (part of the content-address, LOW). Fail closed if it
-      // cannot be read — this node then cannot reproduce the requester's proofHash, so it refuses.
-      const violationBlockHash = await this.blockchainService.getBlockHash(blockTag);
-      if (!violationBlockHash) return NO;
-
       // Re-derive the content-address from the SAME on-chain identity (wall-clock-free), so it
       // equals the requester's proofHash for the identical violation. Every slash-critical input —
-      // availableCredit, slashLevel, block hash, and the source contract/token addresses — is
-      // committed, so evidenceHash is a full content address of exactly what would be slashed.
+      // availableCredit, slashLevel, and the source contract/token addresses — is committed at the
+      // FINALIZED block, so evidenceHash is a full content address of exactly what would be slashed.
+      // No block-HEADER read is needed (finding-2): reorg-safety comes from the finality-pinned
+      // `epoch`, so a non-archive node that cannot read an old header still reproduces this proofHash.
       const identity: ProofIdentity = {
+        proofSchemaVersion: PROOF_SCHEMA_VERSION,
         chainId: this.chainId,
         operator,
         rule: RULE_CREDIT_OVER_LIMIT,
@@ -680,7 +678,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         availableCredit: availableCredit.toString(),
         debt: (debt as bigint).toString(),
         violationBlock: blockTag,
-        violationBlockHash,
         slashLevel: SLASH_LEVEL_CREDIT_OVER_LIMIT,
         registry: this.normalizeAddress(this.registryAddress),
         superPaymaster: this.normalizeAddress(this.superPaymasterAddress),
@@ -724,6 +721,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // Content-address IDENTITY = ON-CHAIN facts only (no wall-clock). Two DVT nodes seeing
     // the same violation at the same block derive the same proofHash + proposalId.
     const identity: ProofIdentity = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       chainId: this.chainId,
       operator: v.operator,
       rule: v.rule,
@@ -731,7 +729,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       availableCredit: v.availableCredit.toString(),
       debt: v.debt.toString(),
       violationBlock: v.violationBlock,
-      violationBlockHash: v.violationBlockHash,
       slashLevel: v.slashLevel,
       registry: this.normalizeAddress(this.registryAddress),
       superPaymaster: this.normalizeAddress(this.superPaymasterAddress),
@@ -1108,6 +1105,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       try {
         queueMessageHash = buildQueueMessageHash(operator, slashLevel, epoch, this.chainId);
         const cosign = await this.coSigner.coSign({
+          proofSchemaVersion: PROOF_SCHEMA_VERSION,
           step: "queue",
           operator,
           slashLevel,
@@ -1180,6 +1178,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
             evidenceHash
           );
           const cosign = await this.coSigner.coSign({
+            proofSchemaVersion: PROOF_SCHEMA_VERSION,
             step: "execute",
             operator,
             slashLevel,

@@ -1,6 +1,11 @@
 import { ethers } from "ethers";
 import { AuditService } from "./audit.service.js";
-import { IProofArchive, SlashProof, computeProofHash } from "./proof-archive.js";
+import {
+  IProofArchive,
+  SlashProof,
+  computeProofHash,
+  PROOF_SCHEMA_VERSION,
+} from "./proof-archive.js";
 import {
   IQuorumCoSigner,
   CoSignRequest,
@@ -328,6 +333,7 @@ describe("AuditService", () => {
 
     // proofHash is a real content address over the FULL ON-CHAIN identity: recomputing matches.
     const recomputed = computeProofHash({
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       chainId: proof.chainId,
       operator: proof.operator,
       rule: proof.evidence.rule,
@@ -335,7 +341,6 @@ describe("AuditService", () => {
       availableCredit: "0", // over-limit ⇒ SP-enforced availableCredit is 0
       debt: proof.evidence.observed,
       violationBlock: proof.evidence.violationBlock,
-      violationBlockHash: proof.evidence.violationBlockHash!,
       slashLevel: proof.slashLevel,
       registry: ethers.getAddress(REGISTRY),
       superPaymaster: ethers.getAddress(SUPER_PAYMASTER),
@@ -440,6 +445,7 @@ describe("AuditService", () => {
     // Pre-seed the archive with the exact proof for this violation@block.
     const archive = makeArchive();
     const identityHash = computeProofHash({
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       chainId: 11155111,
       operator: ethers.getAddress(OPERATOR),
       rule: "credit-over-limit",
@@ -447,7 +453,6 @@ describe("AuditService", () => {
       availableCredit: "0",
       debt: "2000",
       violationBlock: BLOCK,
-      violationBlockHash: BLOCK_HASH,
       slashLevel: 1,
       registry: ethers.getAddress(REGISTRY),
       superPaymaster: ethers.getAddress(SUPER_PAYMASTER),

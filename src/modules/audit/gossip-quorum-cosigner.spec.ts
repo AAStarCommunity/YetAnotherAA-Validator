@@ -11,6 +11,7 @@ import {
   buildSignerMask,
 } from "./slash-consensus.js";
 import type { CoSignRequestPayload, CoSignResponsePayload } from "../gossip/gossip.interfaces.js";
+import { PROOF_SCHEMA_VERSION } from "./proof-archive.js";
 import { bls, sigs, BLS_DST } from "../../utils/bls.util.js";
 
 /**
@@ -56,16 +57,38 @@ async function signOver(privHex: string, messageHash: string): Promise<string> {
   return (await signPoint(privHex, messageHash)).toHex();
 }
 
-/** On-chain slot registry mock: slot i (1-indexed) → PRIVS[i-1]. */
-function makeBlockchain(slotCount = 3) {
+/** The validator EOA the mock binds to a 1-indexed slot (matches getValidatorAtSlot below). */
+function validatorAddr(slot: number): string {
+  return ethers.getAddress("0x" + String(slot).padStart(2, "0").repeat(20));
+}
+
+/**
+ * On-chain slot registry mock: slot i (1-indexed) → validatorAddr(i) with BLS key PRIVS[i-1].
+ * `ownSlot` sets what getWalletAddress reports as THIS node's operator EOA (finding-3: resolveOwnSlot
+ * now looks its slot up via getRegisteredSlot(operatorEoa), not a BLS-key scan). Omit `ownSlot` to
+ * simulate a node with no wallet / no registered slot.
+ */
+function makeBlockchain(slotCount = 3, ownSlot?: number) {
   return {
     async getValidatorAtSlot(_addr: string, slot: number): Promise<string | null> {
-      if (slot >= 1 && slot <= slotCount)
-        return ethers.getAddress("0x" + String(slot).padStart(2, "0").repeat(20));
+      if (slot >= 1 && slot <= slotCount) return validatorAddr(slot);
       return null;
     },
     async getBlsPublicKeyAtSlot(_addr: string, slot: number): Promise<string | null> {
       if (slot >= 1 && slot <= slotCount) return uncompressedPub(PRIVS[slot - 1]);
+      return null;
+    },
+    getWalletAddress(): string | null {
+      return ownSlot && ownSlot >= 1 ? validatorAddr(ownSlot) : null;
+    },
+    async getRegisteredSlot(_addr: string, operatorEoa: string): Promise<number | null> {
+      let eoa: string;
+      try {
+        eoa = ethers.getAddress(operatorEoa);
+      } catch {
+        return null;
+      }
+      for (let s = 1; s <= slotCount; s++) if (validatorAddr(s) === eoa) return s;
       return null;
     },
   } as any;
@@ -121,6 +144,7 @@ const ALWAYS_CONFIRM: CoSignVerifier = async req => ({
 function executeReq(overrides: Partial<CoSignRequest> = {}): CoSignRequest {
   const evidenceHash = (overrides.evidenceHash as string) ?? "0x" + "ee".repeat(32);
   const base: CoSignRequest = {
+    proofSchemaVersion: PROOF_SCHEMA_VERSION,
     step: "execute",
     operator: OPERATOR,
     slashLevel: SlashLevel.MINOR,
@@ -168,7 +192,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip(peers),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -196,7 +220,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip(peers),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -209,7 +233,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip([]),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -229,7 +253,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip([forged, good]),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -245,7 +269,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip([spoofed]),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -262,7 +286,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip([a, b]),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -290,7 +314,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip([], 0),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -316,7 +340,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip([]),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(async () => ({ confirmed: false, proofHash: null }));
@@ -340,7 +364,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip(peers),
       blsService,
       makeNode(PRIVS[0]),
-      makeBlockchain(),
+      makeBlockchain(3, 1),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -360,7 +384,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip([]),
       blsService,
       makeNode(PRIVS[1], "node-2"),
-      makeBlockchain(),
+      makeBlockchain(3, 2),
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
@@ -450,9 +474,40 @@ describe("GossipQuorumCoSigner", () => {
     expect(await cs.verifyAndSign(payload(executeReq()))).toBeNull();
   });
 
+  it("finding-1: responder REFUSES a proofSchemaVersion mismatch (explicit, diagnosable)", async () => {
+    // A peer on a DIFFERENT inc-2-live version → refuse EXPLICITLY (would otherwise be a silent
+    // proofHash divergence that quietly loses quorum). Node/wallet at slot 2, everything else valid.
+    const req = executeReq({ proofSchemaVersion: PROOF_SCHEMA_VERSION + 1 });
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[1], "node-2"),
+      makeBlockchain(3, 2),
+      makeConfig()
+    );
+    cs.arm(ALWAYS_CONFIRM);
+    expect(await cs.verifyAndSign(payload(req))).toBeNull();
+  });
+
+  it("finding-1: responder signs when proofSchemaVersion matches", async () => {
+    const req = executeReq({ proofSchemaVersion: PROOF_SCHEMA_VERSION });
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[1], "node-2"),
+      makeBlockchain(3, 2),
+      makeConfig()
+    );
+    cs.arm(ALWAYS_CONFIRM);
+    const resp = await cs.verifyAndSign(payload(req));
+    expect(resp).not.toBeNull();
+    expect(resp!.slot).toBe(2);
+  });
+
   it("responder signs a QUEUE step when evidenceHash matches the re-derived proofHash (MEDIUM 2)", async () => {
     const queueEvidence = "0x" + "cc".repeat(32);
     const queueReq: CoSignRequest = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       step: "queue",
       operator: OPERATOR,
       slashLevel: SlashLevel.MINOR,
@@ -467,7 +522,7 @@ describe("GossipQuorumCoSigner", () => {
       makeGossip([]),
       blsService,
       makeNode(PRIVS[1], "node-2"),
-      makeBlockchain(),
+      makeBlockchain(3, 2),
       makeConfig()
     );
     cs.arm(async () => ({ confirmed: true, proofHash: queueEvidence }));
@@ -478,6 +533,7 @@ describe("GossipQuorumCoSigner", () => {
 
   it("responder REFUSES a QUEUE step whose evidenceHash mismatches the re-derived proofHash (MEDIUM 2)", async () => {
     const queueReq: CoSignRequest = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       step: "queue",
       operator: OPERATOR,
       slashLevel: SlashLevel.MINOR,
@@ -501,6 +557,7 @@ describe("GossipQuorumCoSigner", () => {
 
   it("responder REFUSES a QUEUE step with NO evidenceHash at all (MEDIUM 2)", async () => {
     const queueReq: CoSignRequest = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       step: "queue",
       operator: OPERATOR,
       slashLevel: SlashLevel.MINOR,
@@ -541,72 +598,20 @@ describe("GossipQuorumCoSigner", () => {
     expect(await sigs.verify(agg, msgPoint, aggPub)).toBe(true);
   });
 
-  // ── FINDING 1: own-slot memoization ────────────────────────────────────────────
-  it("finding-1: resolveOwnSlot resolves once then serves from cache across verifyAndSign calls", async () => {
-    const bc = makeBlockchain();
-    let keyCalls = 0;
-    const orig = bc.getBlsPublicKeyAtSlot.bind(bc);
-    bc.getBlsPublicKeyAtSlot = async (addr: string, slot: number) => {
-      keyCalls++;
-      return orig(addr, slot);
+  // ── FINDING 3: own-slot O(1) lookup (getRegisteredSlot, no 13-slot scan) + memoization ──
+  it("finding-3: resolveOwnSlot resolves via ONE getRegisteredSlot read (no slot scan) then caches", async () => {
+    const bc = makeBlockchain(3, 2); // wallet EOA registered at slot 2
+    let registeredSlotCalls = 0;
+    let keyScanCalls = 0;
+    const origReg = bc.getRegisteredSlot.bind(bc);
+    bc.getRegisteredSlot = async (addr: string, eoa: string) => {
+      registeredSlotCalls++;
+      return origReg(addr, eoa);
     };
-    const cs = new GossipQuorumCoSigner(
-      makeGossip([]),
-      blsService,
-      makeNode(PRIVS[1], "node-2"), // own key registered at slot 2
-      bc,
-      makeConfig()
-    );
-    cs.arm(ALWAYS_CONFIRM);
-    const req = executeReq();
-
-    const r1 = await cs.verifyAndSign(payload(req));
-    expect(r1).not.toBeNull();
-    expect(r1!.slot).toBe(2);
-    const afterFirst = keyCalls;
-    expect(afterFirst).toBeGreaterThan(0); // first call actually scanned the slot registry
-
-    const r2 = await cs.verifyAndSign(payload(req));
-    expect(r2).not.toBeNull();
-    expect(r2!.slot).toBe(2);
-    expect(keyCalls).toBe(afterFirst); // second call served the slot from cache — ZERO extra reads
-  });
-
-  it("finding-1: a null (unregistered) resolution is NOT cached — retried on the next call", async () => {
-    let registered = false;
-    const targetKey = uncompressedPub(PRIVS[0]);
-    const bc = {
-      async getBlsPublicKeyAtSlot(_addr: string, slot: number): Promise<string | null> {
-        if (registered && slot === 1) return targetKey;
-        return null;
-      },
-      async getValidatorAtSlot(): Promise<string | null> {
-        return null;
-      },
-    } as any;
-    const cs = new GossipQuorumCoSigner(
-      makeGossip([]),
-      blsService,
-      makeNode(PRIVS[0]),
-      bc,
-      makeConfig()
-    );
-    cs.arm(ALWAYS_CONFIRM);
-
-    // Unregistered → null, and MUST NOT be cached.
-    expect(await (cs as any).resolveOwnSlot(compressedPub(PRIVS[0]))).toBeNull();
-    // A later on-chain registration is picked up on the next resolution (no stale null cache).
-    registered = true;
-    expect(await (cs as any).resolveOwnSlot(compressedPub(PRIVS[0]))).toBe(1);
-  });
-
-  it("finding-1: refreshOwnSlot forces re-resolution of a cached positive slot", async () => {
-    const bc = makeBlockchain();
-    let keyCalls = 0;
-    const orig = bc.getBlsPublicKeyAtSlot.bind(bc);
+    const origKey = bc.getBlsPublicKeyAtSlot.bind(bc);
     bc.getBlsPublicKeyAtSlot = async (addr: string, slot: number) => {
-      keyCalls++;
-      return orig(addr, slot);
+      keyScanCalls++;
+      return origKey(addr, slot);
     };
     const cs = new GossipQuorumCoSigner(
       makeGossip([]),
@@ -616,13 +621,86 @@ describe("GossipQuorumCoSigner", () => {
       makeConfig()
     );
     cs.arm(ALWAYS_CONFIRM);
-    expect(await (cs as any).resolveOwnSlot(compressedPub(PRIVS[1]))).toBe(2);
-    const afterFirst = keyCalls;
-    expect(await (cs as any).resolveOwnSlot(compressedPub(PRIVS[1]))).toBe(2);
-    expect(keyCalls).toBe(afterFirst); // cached
+    const req = executeReq();
+
+    const r1 = await cs.verifyAndSign(payload(req));
+    expect(r1).not.toBeNull();
+    expect(r1!.slot).toBe(2);
+    // ONE getRegisteredSlot read resolved the slot — NOT a 1..maxSlots getBlsPublicKeyAtSlot scan.
+    expect(registeredSlotCalls).toBe(1);
+    expect(keyScanCalls).toBe(0);
+
+    const r2 = await cs.verifyAndSign(payload(req));
+    expect(r2).not.toBeNull();
+    expect(r2!.slot).toBe(2);
+    expect(registeredSlotCalls).toBe(1); // cached — ZERO extra reads
+  });
+
+  it("finding-3: a null (unregistered) resolution is NOT cached — retried on the next call", async () => {
+    let registered = false;
+    const bc = makeBlockchain(3, 2);
+    const origReg = bc.getRegisteredSlot.bind(bc);
+    bc.getRegisteredSlot = async (addr: string, eoa: string) =>
+      registered ? origReg(addr, eoa) : null;
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[1], "node-2"),
+      bc,
+      makeConfig()
+    );
+    cs.arm(ALWAYS_CONFIRM);
+
+    // Unregistered → null, and MUST NOT be cached.
+    expect(await (cs as any).resolveOwnSlot()).toBeNull();
+    // A later on-chain registration is picked up on the next resolution (no stale null cache).
+    registered = true;
+    expect(await (cs as any).resolveOwnSlot()).toBe(2);
+  });
+
+  it("finding-3: no wallet (getWalletAddress null) → resolveOwnSlot null WITHOUT any RPC", async () => {
+    const bc = makeBlockchain(3); // no ownSlot → getWalletAddress returns null
+    let regCalls = 0;
+    const origReg = bc.getRegisteredSlot.bind(bc);
+    bc.getRegisteredSlot = async (addr: string, eoa: string) => {
+      regCalls++;
+      return origReg(addr, eoa);
+    };
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[1], "node-2"),
+      bc,
+      makeConfig()
+    );
+    cs.arm(ALWAYS_CONFIRM);
+    expect(await (cs as any).resolveOwnSlot()).toBeNull();
+    expect(regCalls).toBe(0); // short-circuits before any on-chain read when there is no wallet
+  });
+
+  it("finding-3: refreshOwnSlot forces re-resolution of a cached positive slot", async () => {
+    const bc = makeBlockchain(3, 2);
+    let regCalls = 0;
+    const origReg = bc.getRegisteredSlot.bind(bc);
+    bc.getRegisteredSlot = async (addr: string, eoa: string) => {
+      regCalls++;
+      return origReg(addr, eoa);
+    };
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[1], "node-2"),
+      bc,
+      makeConfig()
+    );
+    cs.arm(ALWAYS_CONFIRM);
+    expect(await (cs as any).resolveOwnSlot()).toBe(2);
+    expect(regCalls).toBe(1);
+    expect(await (cs as any).resolveOwnSlot()).toBe(2);
+    expect(regCalls).toBe(1); // cached
     cs.refreshOwnSlot();
-    expect(await (cs as any).resolveOwnSlot(compressedPub(PRIVS[1]))).toBe(2);
-    expect(keyCalls).toBeGreaterThan(afterFirst); // forced re-scan after refresh
+    expect(await (cs as any).resolveOwnSlot()).toBe(2);
+    expect(regCalls).toBe(2); // forced re-read after refresh
   });
 
   // ── FINDING 2: validateResponse single on-chain read + per-call cache ───────────

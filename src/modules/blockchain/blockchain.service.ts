@@ -480,24 +480,6 @@ export class BlockchainService {
   }
 
   /**
-   * Block hash of a SPECIFIC historical block number, or `null` when it cannot be read. Used by the
-   * co-sign responder to re-derive the content-address of a violation pinned at `epoch`
-   * (violationBlockHash is part of ProofIdentity, LOW): a responder that cannot read the exact block
-   * hash fails closed (cannot reproduce the requester's proofHash → refuses to co-sign).
-   */
-  async getBlockHash(blockNumber: number): Promise<string | null> {
-    if (!this.provider) {
-      throw new Error("Blockchain provider not configured");
-    }
-    try {
-      const b = await this.provider.getBlock(blockNumber);
-      return b?.hash ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
    * The block an irreversible slash is justified against — a FINALIZED (fallback: safe) block,
    * returned as `{ number, hash }` (finding-3). Pinning the slash evidence to a finalized block,
    * and recording its HASH, makes the justification reorg-safe: a reorg that rewrites the chain
@@ -684,6 +666,45 @@ export class BlockchainService {
     } catch (error: any) {
       this.logger.warn(
         `getBLSPublicKey(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
+      );
+      return null;
+    }
+  }
+
+  /**
+   * O(1) own-slot lookup (finding-3): BLSAggregator.getBLSPublicKey(validator) returns the
+   * validator's (publicKey, slot, isActive) in a SINGLE read, so a node resolves its OWN registered
+   * slot directly from its operator EOA — no 1..maxSlots scan. Returns the 1-indexed `slot` when the
+   * validator is ACTIVE and `slot >= 1`; `null` when unregistered/inactive, the slot is out of
+   * range, the EOA is malformed, or the read reverts (fail-closed).
+   */
+  async getRegisteredSlot(
+    blsAggregatorAddress: string,
+    operatorEoa: string
+  ): Promise<number | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    let validator: string;
+    try {
+      validator = ethers.getAddress(operatorEoa);
+    } catch {
+      return null;
+    }
+    const abi = [
+      "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
+    ];
+    const contract = new ethers.Contract(blsAggregatorAddress, abi, this.provider);
+    try {
+      const res = await contract.getBLSPublicKey(validator);
+      const isActive = res.isActive ?? res[2];
+      if (!isActive) return null;
+      const slot = Number(res.slot ?? res[1]);
+      if (!Number.isInteger(slot) || slot < 1) return null;
+      return slot;
+    } catch (error: any) {
+      this.logger.warn(
+        `getRegisteredSlot(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
       );
       return null;
     }
