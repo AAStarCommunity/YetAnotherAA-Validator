@@ -838,25 +838,40 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     let onchainProposalId: bigint | null = null;
     let proposalIdNote: string | undefined;
 
+    // Assess on-chain slash state ONCE (armed + not throttled): drives BOTH the over-slash guard
+    // ("executed"/"blocked" → skip) AND the RESUME path ("pending" → complete an incomplete on-chain
+    // slash without re-queuing). Skipped when within cooldown (throttled) or file-only (never queues).
+    const slashState: "executed" | "pending" | "clear" | "blocked" =
+      !withinCooldown && this.executeSlash
+        ? await this.assessSlashState(coarseKey, v.operator, v.slashLevel, v.violationBlock)
+        : "clear";
+
     if (withinCooldown) {
       this.logger.debug(
         `Audit: ${v.operator} ${v.rule} within cooldown (${this.clock() - (last as number)}ms < ` +
           `${this.cooldownMs}ms) — attempt suppressed, archiving evidence only`
       );
       proposalIdNote = "id-unresolved: proposal attempt suppressed by cooldown";
-    } else if (
-      this.executeSlash &&
-      (await this.isCoarseAlreadySlashed(coarseKey, v.operator, v.slashLevel, v.violationBlock))
-    ) {
-      // ARMED path OVER-SLASH GUARD (finding-4/5): a slash already executed (in-memory) or is
-      // pending on-chain for this operator+rule → do NOT queue/execute the same ongoing condition
-      // again, even after cooldownMs with an advancing block. Evidence is still archived (above).
+    } else if (slashState === "executed" || slashState === "blocked") {
+      // ARMED path OVER-SLASH GUARD (finding-4/5): a slash already EXECUTED for this operator+rule
+      // ("executed"), or the chain state is unreadable ("blocked" = fail-closed) → do NOT queue/
+      // execute again, even after cooldownMs with an advancing block. Evidence is still archived.
+      // NB: a "pending" (incomplete) slash is NOT handled here — it flows to the RESUME path below.
       this.logger.warn(
-        `Audit: ${v.operator} ${v.rule} already slashed/pending — over-slash guard, on-chain slash SKIPPED`
+        `Audit: ${v.operator} ${v.rule} ${
+          slashState === "executed" ? "already slashed" : "slash-state indeterminate"
+        } — over-slash guard, on-chain slash SKIPPED`
       );
       proposalIdNote =
-        "id-unresolved: operator already slashed/pending for this rule (over-slash guard)";
+        slashState === "executed"
+          ? "id-unresolved: operator already slashed for this rule (over-slash guard)"
+          : "id-unresolved: slash-state indeterminate (over-slash guard fail-closed)";
     } else {
+      // slashState === "clear" (normal full queue→create→execute) OR "pending" (RESUME: an on-chain
+      // queue pre-flag is already set — this node queued on a prior tick then failed pre-execute, or a
+      // peer queued it — so skip the replay-guarded re-queue and go straight to createProposal +
+      // execute to COMPLETE the slash).
+      const resume = slashState === "pending";
       // Arm the cooldown on ATTEMPT (before the result) so a reverting tx still backs off.
       this.lastProposalAt.set(coarseKey, this.clock());
       // UNIFIED proposal filing (finding-6): both the armed (queue → create → execute) and the
@@ -875,7 +890,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           epoch,
           evidenceHash: proofHash,
         },
-        proof
+        proof,
+        resume
       );
       proposalTx = res.proposalTx;
       onchainProposalId = res.proposalId;
@@ -1019,26 +1035,28 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * is narrowed to operator + `slashLevel`. A determinate remote read of "not slashed" lets the slash
    * proceed; an indeterminate read (provider error) fails CLOSED per (5) — never "safe to slash".
    */
-  private async isCoarseAlreadySlashed(
+  private async assessSlashState(
     coarseKey: string,
     operator: string,
     slashLevel: number,
     violationBlock: number
-  ): Promise<boolean> {
-    if (this.slashedCoarseKeys.has(coarseKey)) return true;
+  ): Promise<"executed" | "pending" | "clear" | "blocked"> {
+    // (1) In-memory executed marker.
+    if (this.slashedCoarseKeys.has(coarseKey)) return "executed";
 
-    // (2) DURABLE journal — survives a restart within the same process/disk.
+    // (2) DURABLE executed journal — survives a restart within the same process/disk.
     try {
       if (await this.archive.hasSlashed(coarseKey)) {
         this.markCoarseSlashed(coarseKey); // cache in-memory (do not re-write the marker)
-        return true;
+        return "executed";
       }
     } catch {
       // best-effort: journal read error → fall through to the on-chain scan.
     }
 
-    // (3) ON-CHAIN slash-executed events — the authoritative cross-restart guard. A `null` from any
-    // target means that scan was INDETERMINATE (provider error), tracked so (5) can fail closed.
+    // (3) ON-CHAIN slash-EXECUTED events — the authoritative cross-restart DOUBLE-slash guard. A
+    // `null` from any target means that scan was INDETERMINATE (provider error), tracked so (5) can
+    // fail closed.
     let scanIndeterminate = false;
     try {
       // Scan the most-recent `slashLookbackBlocks` at the chain HEAD (where slash events are emitted),
@@ -1054,7 +1072,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         );
         if (hit === true) {
           await this.recordCoarseSlashed(coarseKey); // persist durable + memory
-          return true;
+          return "executed";
         }
         if (hit === null) scanIndeterminate = true; // provider error on this target — unconfirmable
       }
@@ -1063,57 +1081,66 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       scanIndeterminate = true;
     }
 
-    // (4) Best-effort on-chain pending flag (null/unknown on the current SP).
+    // (4) ON-CHAIN pending flag, reconstructed from SP events (SlashQueued/SlashCancelled/
+    // OperatorSlashed — no getter; SP is EIP-170-capped). CRITICAL: a `pending` operator is NOT
+    // "already slashed" — it is an INCOMPLETE slash (queued on-chain but not yet executed, because
+    // the queuing node crashed/RPC-failed before executing, or a peer queued it). It must be RESUMED
+    // (skip the replay-guarded re-queue, complete createProposal + execute), never SKIPPED — skipping
+    // it was the stuck-pending liveness bug: the operator's withdraw stays locked forever yet the
+    // slash never lands.
     let pendingIndeterminate = false;
     try {
       const pending = await this.blockchainService.isSlashPending(
         this.superPaymasterAddress,
-        operator
+        operator,
+        this.slashLookbackBlocks
       );
-      if (pending === true) {
-        this.markCoarseSlashed(coarseKey);
-        return true;
-      }
-      if (pending === null) pendingIndeterminate = true; // no getter on this deployment → unknown
+      if (pending === true) return "pending";
+      if (pending === null) pendingIndeterminate = true; // scan unavailable → unknown
     } catch {
-      pendingIndeterminate = true; // getter absent / RPC error → unknown
+      pendingIndeterminate = true; // RPC error → unknown
     }
 
     // (5) CONSERVATIVE fail-closed backstop. Reaching here means NO guard positively confirmed an
-    // existing slash. If BOTH the on-chain event scan and the pending flag were indeterminate (and
-    // there is no durable marker — else we'd have returned above), we have zero authoritative signal
-    // that the operator is un-slashed. Fail CLOSED: skip the irreversible slash rather than risk a
-    // double-slash on unreadable chain state. A determinate on-chain "not slashed" leaves
-    // scanIndeterminate=false, so the normal armed path still slashes.
+    // existing slash OR pending. If BOTH the executed-event scan and the pending reconstruction were
+    // indeterminate (and there is no durable marker — else we'd have returned above), we have zero
+    // authoritative signal. Fail CLOSED: "blocked" → the caller skips the irreversible slash rather
+    // than risk a double-slash on unreadable chain state. A determinate "not slashed / not pending"
+    // returns "clear" → the normal armed path slashes.
     if (scanIndeterminate && pendingIndeterminate) {
       this.logger.warn(
-        `Audit: ${operator} slash-state INDETERMINATE (on-chain scan + pending flag both ` +
-          `unavailable, no durable marker) — over-slash guard fails CLOSED, on-chain slash SKIPPED`
+        `Audit: ${operator} slash-state INDETERMINATE (executed-scan + pending-reconstruction both ` +
+          `unavailable, no durable marker) — fails CLOSED, on-chain slash SKIPPED`
       );
-      return true;
+      return "blocked";
     }
-    return false;
+    return "clear";
   }
 
   /**
    * The slash-consensus orchestration — the SINGLE createProposalWithEvidence call site for BOTH
    * the file-only and the armed (SP #329 two-step) paths. Runs in this exact order:
    *
-   *   1. QUEUE    — (ARMED only) co-sign the 5-field queue preimage → queueSlashWithProof.
-   *   2. PROPOSAL — createProposalWithEvidence(evidenceHash=proofHash) → the REAL proposal id,
-   *                 binding the on-chain slash to the archived evidence. ALWAYS runs.
+   *   1. QUEUE    — (ARMED, and NOT `resume`) co-sign the 5-field queue preimage → queueSlashWithProof.
+   *                 SKIPPED on the `resume` path (the operator is already pending on-chain — re-queuing
+   *                 would hit the BLSAggregator replay guard and revert).
+   *   2. PROPOSAL — createProposalWithEvidence(evidenceHash=proofHash) → the REAL proposal id, binding
+   *                 the on-chain slash to the archived evidence. Runs when NOT armed (file-only: the
+   *                 proposal IS the deliverable) OR the on-chain queue pre-flag is set — queued this
+   *                 tick (queueTx !== null) OR `resume`. Gated so a transiently-aborted queue does NOT
+   *                 spawn an orphan proposal Step 3 can't execute.
    *   3. EXECUTE  — (ARMED only) co-sign the 8-field execute preimage (bound to that real id +
-   *                 evidenceHash) → executeWithProof (slash-only ⇒ repUsers/newScores empty).
-   *                 STRICTLY contingent on the TWO-STEP SAFETY (finding-1): it runs ONLY when the
-   *                 queue step CONFIRMED (queueTx !== null) AND the proposal id resolved. If the
-   *                 queue co-sign/tx failed, the whole slash aborts to file+archive only — a slash
-   *                 must never execute without its confirmed queue pre-flag.
+   *                 evidenceHash) → executeWithProof (slash-only ⇒ repUsers/newScores empty). STRICTLY
+   *                 contingent on the TWO-STEP SAFETY (finding-1): runs ONLY when the queue pre-flag is
+   *                 set (queueTx !== null OR `resume`) AND the proposal id resolved. If neither, the
+   *                 slash aborts to file+archive only — never execute without a confirmed queue.
    *
-   * When executeSlash is OFF (default) only step 2 runs — the file-only path: proposal filed +
-   * evidence bound, nothing queued or slashed. Each step is wrapped: a co-sign or tx failure is
-   * logged and swallowed so the caller still archives the evidence (evidence never lost) and the
-   * poll loop never crashes. With the default PendingSlotCoSigner every co-sign throws (SP
-   * validator slots pending the 24h timelock), so the armed path reduces to just the proposal.
+   * An ARMED attempt that did not reach a real execute (executeTx null) sets `coSignAborted` so the
+   * caller retries next tick and RESUMES (Codex-Critical: a queued-but-unexecuted operator would
+   * otherwise stay pending/withdraw-locked forever). When executeSlash is OFF (default) only step 2
+   * runs — the file-only path: proposal filed + evidence bound, nothing queued or slashed. Each step
+   * is wrapped: a co-sign or tx failure is logged and swallowed so the caller still archives the
+   * evidence (evidence never lost) and the poll loop never crashes.
    *
    * When `proof` is passed, it is RE-ARCHIVED after each CONFIRMED on-chain step (finding-4) so a
    * crash between a confirmed tx and the caller's final archive cannot lose that tx record.
@@ -1134,7 +1161,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       epoch: number;
       evidenceHash: string;
     },
-    proof?: SlashProof
+    proof?: SlashProof,
+    /**
+     * RESUME an incomplete on-chain slash: the operator is ALREADY pending-slash (the queue pre-flag
+     * is set — this node queued on a prior tick then failed pre-execute, or a peer queued it). When
+     * true, Step 1 (queue) is SKIPPED (a re-queue hits the BLSAggregator replay guard and reverts);
+     * the flow goes straight to createProposal + execute to complete the slash. Defaults to false.
+     */
+    resume = false
   ): Promise<{
     proposalTx: string | null;
     proposalId: bigint | null;
@@ -1180,8 +1214,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       }
     };
 
-    // ── Step 1: QUEUE (ARMED only, quorum co-signed) ──────────────────────────────
-    if (armed) {
+    // ── Step 1: QUEUE (ARMED only, quorum co-signed; SKIPPED when resuming) ────────
+    // On the RESUME path the operator's queue pre-flag is already set on-chain (a prior tick's / a
+    // peer's queueSlashWithProof landed); re-queuing would replay the same 5-field messageHash and
+    // revert on the BLSAggregator `usedSlashQueueHashes` guard. Skip straight to createProposal +
+    // execute to COMPLETE the slash.
+    if (armed && resume) {
+      this.logger.warn(
+        `Audit: ${operator} slash queue SKIPPED — operator already pending-slash on-chain ` +
+          `(resuming to createProposal + execute)`
+      );
+    } else if (armed) {
       try {
         queueMessageHash = buildQueueMessageHash(operator, slashLevel, epoch, this.chainId);
         const cosign = await this.coSigner.coSign({
@@ -1226,14 +1269,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
 
     // ── Step 2: file the proposal (binds evidenceHash=proofHash) ───────────────────
     // File-only (NOT armed): the proposal IS the deliverable — always create it.
-    // ARMED: create the proposal ONLY after the queue step CONFIRMED (queueTx !== null,
-    // where a dry-run's DRY_RUN_TX_SENTINEL also counts as confirmed). Creating it when
-    // the queue co-sign aborted (transient no-peers / under-threshold / a PEER node already
-    // queued this operator so our queueSlashWithProof reverts) would spawn an ORPHAN on-chain
-    // proposal that Step 3 then SKIPS (queueTx === null) — and with N nodes each retrying
-    // every tick, one orphan per node per tick. Gating on queueTx makes exactly ONE node —
-    // the one whose queue confirmed — file exactly ONE proposal, which it then executes.
-    if (!armed || queueTx !== null) {
+    // ARMED: create the proposal ONLY when the on-chain queue pre-flag is set — i.e. we queued it
+    // THIS tick (queueTx !== null; a dry-run's DRY_RUN_TX_SENTINEL counts) OR we are RESUMING an
+    // already-pending slash (`resume`). Creating it when the queue co-sign aborted transiently (no
+    // peers / under-threshold / a PEER already queued so our queueSlashWithProof reverts) would spawn
+    // an ORPHAN proposal that Step 3 then SKIPS — and with N nodes each retrying every tick, one
+    // orphan per node per tick. Gating on the queue pre-flag makes only the node(s) that hold it file
+    // a proposal they can actually execute.
+    if (!armed || queueTx !== null || resume) {
       try {
         const res = await this.blockchainService.createProposalWithEvidence(
           this.dvtValidatorAddress,
@@ -1256,14 +1299,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       );
     }
 
-    // ── Step 3: EXECUTE (ARMED only) — TWO-STEP SAFETY: confirmed queue + real id required ──
+    // ── Step 3: EXECUTE (ARMED only) — TWO-STEP SAFETY: queue pre-flag set + real id required ──
+    // The pre-flag is set when we queued this tick (queueTx !== null) OR we are RESUMING an operator
+    // already pending on-chain (`resume`). Either way `require(_pendingSlash)` in executeSlashWithBLS
+    // is satisfied; without it the execute would revert.
     if (armed) {
-      if (queueTx === null) {
+      if (queueTx === null && !resume) {
         // finding-1: never execute a slash whose queue pre-flag did not confirm. Abort to
         // file+archive only — the evidence + proposal remain, but no irreversible slash fires.
         this.logger.error(
-          `Audit: ${operator} slash execute SKIPPED — queue step did not confirm (queueTx null); ` +
-            `two-step safety requires a confirmed queueSlashWithProof before executeWithProof`
+          `Audit: ${operator} slash execute SKIPPED — queue step did not confirm (queueTx null, ` +
+            `not resuming); two-step safety requires the on-chain queue pre-flag before executeWithProof`
         );
       } else if (proposalId === null) {
         this.logger.error(
@@ -1333,6 +1379,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         }
       }
     }
+
+    // RESUME-RETRY signal (Codex-Critical fix): an ARMED attempt that did NOT reach a real execute
+    // (executeTx null — createProposal or the execute co-sign failed, or the queue confirmed but a
+    // later step threw) leaves the operator PENDING-slash on-chain yet not slashed. Signal the caller
+    // to retry next tick (bypassing the archived-evidence dedup + clearing cooldown) so `assessSlashState`
+    // sees the "pending" state and RESUMES to completion — instead of marking the block handled and
+    // stranding the operator withdraw-locked forever. Dry-run's sentinel executeTx is non-null, so a
+    // clean rehearsal does not trip this. The existing queue-catch also sets coSignAborted for the
+    // never-queued transient case; this widens it to every incomplete armed outcome.
+    if (armed && !dryRun && executeTx === null) {
+      coSignAborted = true;
+    }
+
     return {
       proposalTx,
       proposalId,

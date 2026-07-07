@@ -1198,7 +1198,12 @@ describe("AuditService", () => {
     expect(order.filter(o => o === "execute")).toHaveLength(2);
   });
 
-  it("Finding 4: an on-chain isSlashPending=true short-circuits queue/create/execute (durable cross-restart guard)", async () => {
+  it("Finding 4: on-chain pending (isSlashPending=true) RESUMES — skips the queue, completes createProposal + execute", async () => {
+    // Codex-Critical fix: a `pending` operator is an INCOMPLETE slash (queued on-chain but not yet
+    // executed — the queuing node crashed/RPC-failed, or a peer queued it), NOT an already-slashed
+    // one. It must be RESUMED, not skipped: re-queuing would replay-guard revert, so skip Step 1 and
+    // go straight to createProposal + execute. Skipping it (the old behavior) left the operator
+    // pending (withdraw-locked) yet never slashed — the stuck-pending liveness bug.
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, { isSlashPending: async () => true });
     const archive = makeArchive();
@@ -1210,10 +1215,62 @@ describe("AuditService", () => {
       makeCoSigner()
     );
     await svc.tick();
-    // Already pending on-chain → NO on-chain writes this tick; evidence still archived.
-    expect(order).toEqual([]);
+    // RESUME: no queue (replay-guard would revert), but createProposal + execute COMPLETE the slash.
+    expect(order).toEqual(["create", "execute"]);
     expect(archive.records).toHaveLength(1);
-    expect(archive.records[0].proposalIdNote).toMatch(/over-slash guard/);
+    expect(archive.records[0].executeTx).toBe("0xEXECUTETX");
+    // The co-signer ran ONCE — only over the execute preimage (no queue co-sign on the resume path).
+    const status = await svc.getStatus();
+    expect(status.recentDetections[0].queueTx).toBeNull();
+    expect(status.recentDetections[0].executeTx).toBe("0xEXECUTETX");
+  });
+
+  it("Codex-Critical: queue confirms but execute fails → retried next tick and RESUMED to completion (no stuck-pending, no re-queue)", async () => {
+    // The full liveness path: a slash whose queue landed but whose execute failed must NOT be marked
+    // handled — the operator is pending (withdraw-locked) but not slashed. Next tick it is detected as
+    // pending and RESUMED (skip re-queue → complete createProposal + execute).
+    const order: string[] = [];
+    let executeAttempts = 0;
+    let pending = false; // becomes true once the queue lands on-chain
+    const blockchain = overLimitBlockchain({
+      getRecentSlashExecuted: async () => false, // never EXECUTED in this mock (resume keys off pending)
+      isSlashPending: async () => pending,
+      queueSlashWithProof: async () => {
+        order.push("queue");
+        pending = true; // queue pre-flag now set on-chain
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => {
+        order.push("create");
+        return { txHash: "0xP", proposalId: 7n };
+      },
+      executeSlashWithProof: async () => {
+        executeAttempts++;
+        order.push("execute");
+        if (executeAttempts === 1) throw new Error("execute reverted (transient RPC)");
+        return "0xEXECUTETX";
+      },
+    });
+    const archive = makeArchive();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+
+    // Tick 1: queue + create land, execute THROWS → executeTx null → NOT marked handled, retry armed.
+    await svc.tick();
+    expect(order).toEqual(["queue", "create", "execute"]);
+    expect((await svc.getStatus()).recentDetections[0].executeTx).toBeNull();
+
+    // Tick 2: operator now pending on-chain (queue landed) → RESUME: skip queue, create + execute (ok).
+    order.length = 0;
+    await svc.tick();
+    expect(order).toEqual(["create", "execute"]); // NO re-queue — the BLSAggregator replay guard would revert it
+    expect(executeAttempts).toBe(2);
+    expect((await svc.getStatus()).recentDetections[0].executeTx).toBe("0xEXECUTETX"); // slash completed
   });
 
   // ── FINDING 5: archive-before-execute ordering (durable intent precedes the slash) ──
