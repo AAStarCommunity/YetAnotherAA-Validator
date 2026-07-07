@@ -8,7 +8,7 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
-import { BlockchainService } from "../blockchain/blockchain.service.js";
+import { BlockchainService, DRY_RUN_TX_SENTINEL } from "../blockchain/blockchain.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 import type { IProofArchive, SlashProof, EvidenceSource, ProofIdentity } from "./proof-archive.js";
 import { LocalProofArchive, computeProofHash, PROOF_SCHEMA_VERSION } from "./proof-archive.js";
@@ -92,6 +92,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * when both auditEnabled AND this are true — so nothing is auto-slashed until explicitly enabled.
    */
   private readonly executeSlash: boolean;
+  /**
+   * DRY-RUN drill (AUDIT_DRY_RUN). Only meaningful when ALSO armed (executeSlash). When true, the
+   * full gossip quorum co-sign AND the staticCall preflight against the REAL contracts still run, but
+   * the queue/execute broadcasts are SKIPPED (return the sentinel) and NO durable slashed marker is
+   * written — so the drill proves the whole path end-to-end with zero real slash and is repeatable.
+   */
+  private readonly dryRun: boolean;
   /** Confirmation depth for the finalized-block fallback (finding-3, reorg-safe evidence). */
   private readonly finalityConfirmations: number;
   /** How far back to scan on-chain slash-executed events for the durable guard (finding-2). */
@@ -179,6 +186,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.gtokenStakingAddress = config.get<string>("auditGtokenStakingAddress") ?? "";
     this.apntsTokenAddress = config.get<string>("auditApntsTokenAddress") ?? "";
     this.executeSlash = config.get<boolean>("auditExecuteSlash") === true;
+    this.dryRun = config.get<boolean>("auditDryRun") === true;
     this.finalityConfirmations = config.get<number>("auditFinalityConfirmations") ?? 12;
     this.slashLookbackBlocks = config.get<number>("auditSlashLookbackBlocks") ?? 50_000;
     this.clock = clock ?? (() => Date.now());
@@ -282,7 +290,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         `watchlist=[${this.watchlist.join(", ")}] creditThreshold=${this.creditThresholdBps}bps ` +
         `registry=${this.registryAddress} superPaymaster=${this.superPaymasterAddress} ` +
         `dvtValidator=${this.dvtValidatorAddress} blsAggregator=${this.blsAggregatorAddress} ` +
-        `executeSlash=${this.executeSlash} (${this.executeSlash ? "two-step on-chain slash ARMED" : "file+archive ONLY"})`
+        `executeSlash=${this.executeSlash} (${
+          this.executeSlash
+            ? this.dryRun
+              ? "DRY RUN — full co-sign + staticCall preflight, NO broadcast"
+              : "two-step on-chain slash ARMED"
+            : "file+archive ONLY"
+        })`
     );
   }
 
@@ -844,7 +858,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       queueTx = res.queueTx;
       executeTx = res.executeTx;
       if (res.queueMessageHash) proof.queueMessageHash = res.queueMessageHash;
-      if (executeTx !== null) {
+      if (executeTx === DRY_RUN_TX_SENTINEL) {
+        // DRY RUN: the quorum co-sign + staticCall preflight passed against the REAL contracts, but
+        // NOTHING was slashed (no broadcast). Record the real co-sign material + the sentinel tx so
+        // the archive shows the drill, but DO NOT write the durable over-slash marker — a durable
+        // marker would wrongly suppress a LATER real (or repeat dry) run for the same operator+rule.
+        // The drill must be repeatable.
+        this.logger.warn(
+          `Audit: ${v.operator} ${v.rule} DRY RUN — staticCall passed, slash NOT broadcast; ` +
+            `durable over-slash marker intentionally NOT written (repeatable drill)`
+        );
+        proof.signerMask = res.signerMask;
+        proof.sigG2 = res.sigG2;
+      } else if (executeTx !== null) {
         // A slash actually executed → arm the DURABLE over-slash guard (in-memory + archive journal,
         // finding-2) so a restart does not re-slash, and record the real co-sign material.
         await this.recordCoarseSlashed(coarseKey);
@@ -1079,6 +1105,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
     const armed = this.executeSlash;
+    // DRY-RUN drill (only meaningful when armed): the co-sign below STILL happens and the queue/execute
+    // staticCall preflight STILL runs against the REAL contracts, but the broadcast is skipped and the
+    // step returns DRY_RUN_TX_SENTINEL. queueTx/executeTx then carry the sentinel (recorded as-is).
+    const dryRun = this.dryRun;
     let queueTx: string | null = null;
     let proposalTx: string | null = null;
     let proposalId: bigint | null = null;
@@ -1120,9 +1150,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           operator,
           slashLevel,
           epoch,
-          encoded
+          encoded,
+          dryRun
         );
-        this.logger.warn(`Audit: ${operator} slash QUEUED (tx ${queueTx})`);
+        this.logger.warn(
+          `Audit: ${operator} slash ${dryRun ? "QUEUE DRY RUN (staticCall passed, NOT broadcast)" : "QUEUED"} (tx ${queueTx})`
+        );
         // Durable BEFORE execute: the confirmed queueTx is persisted now (finding-4).
         if (proof) {
           proof.queueTx = queueTx;
@@ -1195,13 +1228,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
             [], // slash-only ⇒ no reputation users
             [], // slash-only ⇒ no reputation scores
             epoch,
-            encoded
+            encoded,
+            dryRun
           );
           // Record the EXECUTE co-sign material so the archived proof references the real slash.
           signerMask = ethers.toBeHex(cosign.signerMask);
           sigG2 = cosign.sigG2;
           this.logger.warn(
-            `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
+            dryRun
+              ? `Audit: ${operator} DRY RUN: staticCall passed — would slash ${operator} ` +
+                  `(proposal ${proposalId}), NOT broadcasting`
+              : `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
           );
           // Durable immediately after the irreversible slash confirms (finding-4). Set the SUBMITTED
           // execute preimage as messageHash TOGETHER with executeTx in this same write, so every

@@ -215,6 +215,14 @@ export default () => {
     // fires ONLY when this is ALSO "true". Default FALSE so nothing is auto-slashed until an
     // operator explicitly opts in AND the SP validator slots (registerBLSPublicKey) are ready.
     auditExecuteSlash: process.env.AUDIT_EXECUTE_SLASH === "true",
+    // DRY-RUN drill (safe intermediate for the FIRST live slash of money-moving code). Only meaningful
+    // when the node is ALSO armed (AUDIT_EXECUTE_SLASH=true). When true, the audit runs the FULL gossip
+    // quorum co-sign AND the staticCall preflight against the REAL deployed contracts (proving the
+    // signerMask/sigG2 are accepted by verifyAndExecute) but does NOT broadcast the real queue/execute
+    // transaction — no operator is actually slashed, and NO durable over-slash marker is written (so the
+    // drill is repeatable). It logs the would-slash target and records a sentinel tx (0xDRYRUN) in the
+    // archived proof. Flip this OFF once the path is proven end-to-end to go live. Default false.
+    auditDryRun: process.env.AUDIT_DRY_RUN === "true",
     // The xPNTs token the credit-over-limit rule reads operator debt from. Debt lives on the
     // xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT on SuperPaymaster/Registry. Default is the
     // Sepolia aPNTs token. FAIL-CLOSED: required + must have on-chain code when AUDIT_ENABLED=true.
