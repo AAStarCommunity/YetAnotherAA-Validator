@@ -1362,6 +1362,59 @@ describe("AuditService", () => {
     expect(creates).toBe(1); // still 1 — no per-cooldown-window orphan proposal
   });
 
+  it("Codex-High: a healthy observation clears the coarse pending proposalId — a later pending re-offense files a FRESH proposal (no stale reuse)", async () => {
+    // Stale-id poisoning: node files proposal 3, execute fails (pending id = 3). The operator later
+    // goes HEALTHY (episode over) then RE-OFFENDS and is pending again on a NEW block. The pending id
+    // must have been cleared on the healthy reset, so the resume files a FRESH proposal instead of
+    // reusing the dead id 3 (which would only staticCall-revert and churn retries).
+    const archive = makeArchive();
+    let overLimit = true;
+    let pending = false;
+    let vblock = 1000;
+    let creates = 0;
+    const ids = [3n, 7n];
+    const blockchain = overLimitBlockchain({
+      getDebt: async () => (overLimit ? 400n : 0n),
+      getCreditLimit: async () => 300n,
+      getAvailableCredit: async () => (overLimit ? 0n : 300n),
+      getRecentSlashExecuted: async () => false,
+      isSlashPending: async () => pending,
+      queueSlashWithProof: async () => {
+        pending = true;
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => ({ txHash: "0xP", proposalId: ids[creates++] }),
+      executeSlashWithProof: async () => {
+        throw new Error("execute fails");
+      },
+    });
+    blockchain.getBlockNumber = async () => vblock;
+    let now = 1_700_000_000_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 20_000 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+
+    await svc.tick(); // over-limit: queue + create(3) + execute fails → pending id = 3
+    expect(creates).toBe(1);
+
+    overLimit = false; // HEALTHY → clearCoarseSlashed drops the pending id
+    pending = false;
+    vblock = 1001;
+    now += 25_000;
+    await svc.tick();
+
+    overLimit = true; // RE-OFFENSE on a NEW block, already pending on-chain (peer queued) → resume
+    pending = true;
+    vblock = 1002;
+    now += 25_000;
+    await svc.tick();
+    expect(creates).toBe(2); // FRESH proposal (7) filed — the stale id 3 was cleared, not reused
+  });
+
   it("Codex-Critical: a RESTARTED process (empty in-memory retry state) resumes an archived incomplete slash via on-chain pending", async () => {
     // The full crash-restart hole: process A queues (pending on-chain) then dies before execute. A
     // FRESH process B — empty coSignRetryKeys / cooldown / proposedStableKeys — sharing only the

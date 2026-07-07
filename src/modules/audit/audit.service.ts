@@ -380,6 +380,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    */
   private markCoarseSlashed(coarseKey: string): void {
     this.slashedCoarseKeys.add(coarseKey);
+    // The slash for this coarse condition is EXECUTED (locally, durably, or observed on-chain — incl.
+    // by a PEER). Drop any in-flight proposal id we were holding for reuse: it now points at an
+    // executed proposal, so reusing it on a future pending resume would only staticCall-revert and
+    // churn retries (Codex: stale-id poisoning). A future genuinely-new violation files a fresh one.
+    this.pendingProposalIds.delete(coarseKey);
     if (this.slashedCoarseKeys.size > AuditService.MAX_DEDUP_ENTRIES) {
       const oldest = this.slashedCoarseKeys.values().next().value;
       if (oldest !== undefined) this.slashedCoarseKeys.delete(oldest);
@@ -411,6 +416,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private async clearCoarseSlashed(operator: string, rule: string): Promise<void> {
     const coarseKey = this.coarseKey(operator, rule);
     this.slashedCoarseKeys.delete(coarseKey);
+    // The operator is HEALTHY again → any in-flight proposal id we held is stale (the episode it
+    // belonged to is over); drop it so a genuinely-new future violation files a fresh proposal rather
+    // than reusing a dead id (Codex: stale-id poisoning on the healthy→re-offend path).
+    this.pendingProposalIds.delete(coarseKey);
     // A healthy read ALWAYS attempts the durable removal, regardless of the current executeSlash
     // setting. A durable marker written by an EARLIER armed run must be cleared even if the node is
     // now running disarmed — otherwise it would survive an armed→disarmed→armed restart cycle and,
