@@ -8,15 +8,20 @@ BLS 签名基础设施：链下签名聚合服务 + 链上验证合约，作为�
 
 ### 🔑 BLS 密钥托管模式 / Key Custody(独立 vs KMS 合并）
 
-DVT 的 BLS 共签私钥有两种托管方式，**同一个二进制、`RUST_SIGNER_URL` 一个 env 切换**，不强绑定 KMS：
+DVT 的 BLS 共签私钥有两种托管方式，**同一个二进制、`RUST_SIGNER_URL`
+一个 env 切换**，不强绑定 KMS：
 
-| 模式 | BLS 私钥在哪 | 抗提取 | 自启 | 配置 |
-|---|---|---|---|---|
-| **独立(keystore)** | EIP-2335 keystore(盘上加密 + 手动密码) | 盘窃安全；攻破运行中 DVT 可从 RAM 挖 | ❌ 断电需重输密码 | `RUST_SIGNER_URL` 不设(默认) |
-| **KMS-TEE 合并** | AirAccount KMS 的 TEE(**永不出 TEE**) | **强(= KMS 级，攻破 DVT 也挖不到)** | ✅ 无需密码 | `RUST_SIGNER_URL=http://127.0.0.1:3100` |
+| 模式               | BLS 私钥在哪                           | 抗提取                               | 自启              | 配置                                    |
+| ------------------ | -------------------------------------- | ------------------------------------ | ----------------- | --------------------------------------- |
+| **独立(keystore)** | EIP-2335 keystore(盘上加密 + 手动密码) | 盘窃安全；攻破运行中 DVT 可从 RAM 挖 | ❌ 断电需重输密码 | `RUST_SIGNER_URL` 不设(默认)            |
+| **KMS-TEE 合并**   | AirAccount KMS 的 TEE(**永不出 TEE**)  | **强(= KMS 级，攻破 DVT 也挖不到)**  | ✅ 无需密码       | `RUST_SIGNER_URL=http://127.0.0.1:3100` |
 
 - **只跑 DVT、不跑 KMS 的社区** → **独立 keystore 模式**(默认，零 KMS 依赖)。
-- **同板跑 [AirAccount KMS](https://github.com/AAStarCommunity/AirAccount) + DVT 的社区** → **KMS-TEE 模式**：DVT 验完 owner-auth 后调 KMS 内部 signer(`127.0.0.1:3100`，仅本地、不经公网)只取签名，私钥全程不出 TEE、断电自启不用重输密码。签名与 keystore 模式**字节一致**(同 blst / @noble / DST)，链上 validator 无差别。接入见 AirAccount `kms/docs/dvt-tee-bls-custody-design.md`。
+- **同板跑 [AirAccount KMS](https://github.com/AAStarCommunity/AirAccount) +
+  DVT 的社区** →
+  **KMS-TEE 模式**：DVT 验完 owner-auth 后调 KMS 内部 signer(`127.0.0.1:3100`，仅本地、不经公网)只取签名，私钥全程不出 TEE、断电自启不用重输密码。签名与 keystore 模式**字节一致**(同 blst
+  / @noble / DST)，链上 validator 无差别。接入见 AirAccount
+  `kms/docs/dvt-tee-bls-custody-design.md`。
 
 ### 📘 aNode DVT 运维 & 快速上手
 
