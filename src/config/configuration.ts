@@ -61,6 +61,11 @@ export default () => {
     // falls back to Node signing unless RUST_SIGNER_REQUIRED=true (then it fails closed).
     rustSignerUrl: process.env.RUST_SIGNER_URL || undefined,
     rustSignerRequired: process.env.RUST_SIGNER_REQUIRED === "true",
+    // KMS-TEE custody mode: when the Rust signer is AirAccount KMS (127.0.0.1:3100)
+    // and KMS has KMS_BLS_SIGNER_TOKEN set, /sign requires this shared secret in the
+    // X-Signer-Token header so only this DVT process (not any co-located process) can
+    // invoke the TEE signer. Unset = no header sent (backward-compatible).
+    rustSignerToken: process.env.RUST_SIGNER_TOKEN || undefined,
 
     // Operator alerting → aastar-monitor Telegram bot (#100). Opt-in; fire-and-forget
     // (never blocks signing/relaying). Distinct from NOTIFY_* (which alerts end users).
