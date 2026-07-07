@@ -169,4 +169,44 @@ describe("NodeService — EIP-2335 keystore load (#5)", () => {
       }
     );
   });
+
+  it("KMS-TEE F3: registerOnChain derives EIP-2537 from publicKey (no privateKey.substring crash)", async () => {
+    // Real compressed G1 pubkey (dvt1) so bls.G1.Point.fromHex works; NO privateKey (key in TEE).
+    const PUB =
+      "0x8067dfd1f98fd1258c0eed3886d234f81eea9371b595a1a278a49c71f8f5eda74639fa043948f7fc0ee3e6b8ec9b8555";
+    const dir = mkdtempSync(join(tmpdir(), "ks-"));
+    const file = join(dir, "node_state.json");
+    writeFileSync(file, JSON.stringify({ nodeId: "0x1f5e", nodeName: "dvt1", publicKey: PUB }));
+    let registeredWith: string | null = null;
+    const blockchain = {
+      isConfigured: () => true,
+      checkNodeRegistration: async () => false,
+      registerNodeOnChain: async (_addr: string, _id: string, eip2537: string) => {
+        registeredWith = eip2537;
+        return "0xtx";
+      },
+    } as any;
+    const blsReal = { encodePublicKeyToEIP2537: (pt: any) => "0x" + "11".repeat(4) } as any;
+    const config = {
+      get: (k: string) =>
+        k === "rustSignerUrl"
+          ? "http://127.0.0.1:3100"
+          : k === "rustSignerRequired"
+            ? true
+            : k === "validatorContractAddress"
+              ? "0xval"
+              : undefined,
+    } as unknown as ConfigService;
+    const svc = new NodeService(blsReal, blockchain, config);
+    (svc as any).nodeStateFilePath = file;
+    (svc as any).contractAddress = "0xval";
+    try {
+      (svc as any).loadExistingNodeState(); // keyless boot OK
+      const res = await svc.registerOnChain(); // must NOT crash on undefined privateKey
+      expect(res.success).toBe(true);
+      expect(registeredWith).toBe("0x" + "11".repeat(4)); // derived from the provisioned pubkey
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

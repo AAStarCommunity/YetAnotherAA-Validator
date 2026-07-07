@@ -171,15 +171,25 @@ export class NodeService implements OnModuleInit {
       // Perform actual registration
       this.logger.log(`Registering node ${this.nodeState.nodeId} on-chain...`);
 
-      // Convert 48-byte public key to 128-byte EIP2537 format for contract registration
-      const privateKeyHex = this.nodeState.privateKey.substring(2);
-      const privateKeyBytes = new Uint8Array(privateKeyHex.length / 2);
-      for (let i = 0; i < privateKeyHex.length; i += 2) {
-        privateKeyBytes[i / 2] = parseInt(privateKeyHex.substr(i, 2), 16);
+      // Derive the 128-byte EIP-2537 public key for on-chain registration. In KMS-TEE (keyless)
+      // mode there is NO local privateKey (it's sealed in the TEE), so decompress the publicKey the
+      // TEE already provisioned into node_state.json instead of re-deriving from a private key
+      // (clestons/Codex F3 — privateKey.substring(2) would crash on undefined here).
+      const { bls, sigs } = await import("../../utils/bls.util.js");
+      let publicKeyPoint: unknown;
+      if (this.nodeState.privateKey) {
+        const privateKeyHex = this.nodeState.privateKey.substring(2);
+        const privateKeyBytes = new Uint8Array(privateKeyHex.length / 2);
+        for (let i = 0; i < privateKeyHex.length; i += 2) {
+          privateKeyBytes[i / 2] = parseInt(privateKeyHex.substr(i, 2), 16);
+        }
+        publicKeyPoint = sigs.getPublicKey(privateKeyBytes);
+      } else {
+        if (!this.nodeState.publicKey) {
+          throw new Error("Cannot register: node_state has neither a privateKey nor a publicKey");
+        }
+        publicKeyPoint = bls.G1.Point.fromHex(this.nodeState.publicKey.replace(/^0x/, ""));
       }
-
-      const { sigs } = await import("../../utils/bls.util.js");
-      const publicKeyPoint = sigs.getPublicKey(privateKeyBytes);
       const eip2537PublicKey = this.blsService.encodePublicKeyToEIP2537(publicKeyPoint);
 
       const txHash = await this.blockchainService.registerNodeOnChain(

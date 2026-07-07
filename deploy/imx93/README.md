@@ -140,9 +140,9 @@ same seam.
   KMS `BlsGenKey` seals the key + returns the pubkey → write `node_state.json`
   with that `publicKey` and `nodeId = keccak256(EIP-2537 pubkey)`, then register
   on-chain (`registerWithProof`).
-- **Anti-abuse stays on the DVT host** (owner-auth `isValidOwnerAuth` eth_call
+- **Anti-abuse stays on the DVT host** (owner-auth `isValidOwnerAuth` eth*call
   is a host job — the TA can't reach the chain). The TEE only raises single-node
-  key _extraction_ resistance to KMS level; the load-bearing security is the
+  key \_extraction* resistance to KMS level; the load-bearing security is the
   threshold (≥3 independent nodes) + on-chain owner-auth. Slot-resolution and
   the queue/execute tx sender still use the **operator EOA
   (`ETH_PRIVATE_KEY`)**, a separate k1 key — that stays on host.
