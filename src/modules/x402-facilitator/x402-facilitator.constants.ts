@@ -194,5 +194,4 @@ export type VerifyResult = { ok: true; payer: string } | { ok: false; reason: st
 
 /** Discriminated result of an on-chain settle attempt. */
 export type SettleResult =
-  | { ok: true; txHash: string; payer: string }
-  | { ok: false; reason: string };
+  { ok: true; txHash: string; payer: string } | { ok: false; reason: string };

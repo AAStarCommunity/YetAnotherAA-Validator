@@ -60,9 +60,7 @@ The standard x402 v2 envelope:
     "amount": "1000000",
     "payTo": "0x…", // final recipient
     "maxTimeoutSeconds": 3600,
-    "extra": {
-      /* see §2 */
-    },
+    "extra": {/* see §2 */},
   },
 }
 ```

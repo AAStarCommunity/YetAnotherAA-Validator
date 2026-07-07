@@ -1,8 +1,8 @@
 # aNode Roadmap — 全局版本路线图
 
 > 本文是 aNode(本仓库 =
-> DVT 签名节点参考实现)的**唯一全局路线图**。后续开发 follow 本文。配套:跨仓库整合
-> [#45] · 多语言/SDK 边界设计 [#63] · 前身营养归档 [#59/#60/#61/#62] ·
+> DVT 签名节点参考实现)的**唯一全局路线图**。后续开发 follow 本文。配套:跨仓库整合 [#45]
+> · 多语言/SDK 边界设计 [#63] · 前身营养归档 [#59/#60/#61/#62] ·
 > conformance 基线 `conformance/`。当前已发布:**v1.3.0**(node
 > hardening + 依赖治理 + /check-deps + license + real-node E2E `validate=0`)。
 
