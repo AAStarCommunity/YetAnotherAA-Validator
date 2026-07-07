@@ -51,6 +51,15 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
   /** Independent violation re-confirmation, wired by AuditService via `arm()`. */
   private verifier: CoSignVerifier | null = null;
 
+  /**
+   * Memoized own on-chain slot (finding-1: resolveOwnSlot was a serial 1..maxSlots RPC scan on EVERY
+   * coSign/verifyAndSign). The slot is FIXED on-chain at registerBLSPublicKey, so a POSITIVE result
+   * is cached permanently. A null (node not yet registered at a slot) is NOT cached — it re-resolves
+   * next time so a later registration is picked up. `refreshOwnSlot()` forces re-resolution.
+   */
+  private ownSlot: number | null = null;
+  private ownSlotResolved = false;
+
   constructor(
     private readonly gossip: GossipService,
     private readonly blsService: BlsService,
@@ -218,6 +227,10 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
     const requestId = uuidv4();
     const payload: CoSignRequestPayload = { ...req, requestId, requesterNodeId: node.nodeId };
     const peerThreshold = Math.max(0, threshold - 1);
+    // finding-2: one per-coSign-call cache (slot → on-chain uncompressed key) SHARED between the
+    // collector's validate callback and the post-collection defense-in-depth loop, so repeated
+    // same-slot validations within a single coSign hit getBlsPublicKeyAtSlot at most once per slot.
+    const keyCache = new Map<number, string | null>();
     // MEDIUM 1: hand the collector the SAME per-response validation (crypto + on-chain slot binding)
     // and a slot-based dedup key, so ONLY validated, unique-slot peer responses count toward the
     // collector's early-resolve — a peer cannot flood bogus responses to crowd out honest signers.
@@ -225,14 +238,14 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
     const peerResponses = await this.gossip.requestCoSignatures(payload, {
       threshold: peerThreshold,
       timeoutMs: this.timeoutMs,
-      validate: resp => this.validateResponse(req, resp),
+      validate: resp => this.validateResponse(req, resp, keyCache),
       dedupKey: resp => resp.slot,
     });
 
     // Validate EVERY response (own + peers) before counting its bit. Dedup by slot.
     const bySlot = new Map<number, { pubkey: string; sigCompact: string }>();
     for (const resp of [own, ...peerResponses]) {
-      if (!(await this.validateResponse(req, resp))) continue;
+      if (!(await this.validateResponse(req, resp, keyCache))) continue;
       if (!bySlot.has(resp.slot)) {
         bySlot.set(resp.slot, { pubkey: resp.signerPublicKey, sigCompact: resp.signatureCompact });
       }
@@ -266,13 +279,20 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
    *   - slot in range,
    *   - response messageHash === the locally recomputed hash,
    *   - signatureCompact verifies against signerPublicKey over hashToCurve(messageHash),
-   *   - signerPublicKey === the on-chain key registered at that slot (uncompressed EIP-2537),
-   *   - the slot resolves to a non-zero on-chain validator.
-   * Any failure / error → false (the signature is dropped, never counted).
+   *   - signerPublicKey === the on-chain key registered at that slot (uncompressed EIP-2537).
+   * A NON-NULL getBlsPublicKeyAtSlot ALREADY implies the slot resolves to a non-zero, ACTIVE
+   * validator (it reads validatorAtSlot internally, returns null on the zero address, and checks
+   * isActive), so the previously-separate getValidatorAtSlot call was redundant and is dropped
+   * (finding-2). Any failure / error → false (the signature is dropped, never counted).
+   *
+   * `keyCache` (slot → on-chain key) is an optional PER-coSign-call memo so repeated same-slot
+   * validations within one coSign don't re-hit RPC. `null` is cached too (a null-keyed slot stays
+   * rejected for the whole call).
    */
   private async validateResponse(
     req: CoSignRequest,
-    resp: CoSignResponsePayload
+    resp: CoSignResponsePayload,
+    keyCache?: Map<number, string | null>
   ): Promise<boolean> {
     try {
       if (!resp || typeof resp.slot !== "number") return false;
@@ -292,21 +312,23 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       const valid = await this.blsService.verifySignature(signature, msgPoint, publicKey);
       if (!valid) return false;
 
-      // On-chain binding: the returned key MUST be the one registered at the claimed slot, and
-      // the slot MUST resolve to a live validator. Closes the "valid sig from an unregistered key
-      // claiming a slot" hole.
-      const onchainKey = await this.blockchain.getBlsPublicKeyAtSlot(
-        this.blsAggregatorAddress,
-        resp.slot
-      );
+      // On-chain binding: the returned key MUST be the one registered at the claimed slot. A
+      // non-null getBlsPublicKeyAtSlot already guarantees the slot resolves to a non-zero, ACTIVE
+      // validator (it reads validatorAtSlot + isActive internally), so no separate getValidatorAtSlot
+      // is needed. Memoize per coSign call so two responses for the same slot read RPC only once.
+      let onchainKey: string | null;
+      if (keyCache && keyCache.has(resp.slot)) {
+        onchainKey = keyCache.get(resp.slot) ?? null;
+      } else {
+        onchainKey = await this.blockchain.getBlsPublicKeyAtSlot(
+          this.blsAggregatorAddress,
+          resp.slot
+        );
+        if (keyCache) keyCache.set(resp.slot, onchainKey);
+      }
       if (!onchainKey) return false;
       const respUncompressed = this.uncompressedFromCompressed(resp.signerPublicKey);
       if (onchainKey.toLowerCase() !== respUncompressed.toLowerCase()) return false;
-      const validator = await this.blockchain.getValidatorAtSlot(
-        this.blsAggregatorAddress,
-        resp.slot
-      );
-      if (!validator) return false;
 
       return true;
     } catch {
@@ -320,6 +342,9 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
    * so the requester's on-chain binding of our response cannot mismatch. `null` when unregistered.
    */
   private async resolveOwnSlot(compressedPubKey: string): Promise<number | null> {
+    // Serve a previously-resolved POSITIVE slot from cache (finding-1): the on-chain slot is fixed at
+    // registration, so once found it never changes for this key.
+    if (this.ownSlotResolved) return this.ownSlot;
     let ownUncompressed: string;
     try {
       ownUncompressed = this.uncompressedFromCompressed(compressedPubKey).toLowerCase();
@@ -328,9 +353,21 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
     }
     for (let slot = 1; slot <= this.maxSlots; slot++) {
       const onchain = await this.blockchain.getBlsPublicKeyAtSlot(this.blsAggregatorAddress, slot);
-      if (onchain && onchain.toLowerCase() === ownUncompressed) return slot;
+      if (onchain && onchain.toLowerCase() === ownUncompressed) {
+        this.ownSlot = slot;
+        this.ownSlotResolved = true;
+        return slot;
+      }
     }
+    // Node not yet registered at any slot: do NOT cache the null — re-resolve next time so a later
+    // registration is picked up.
     return null;
+  }
+
+  /** Force re-resolution of the memoized own slot on the next resolveOwnSlot call. */
+  refreshOwnSlot(): void {
+    this.ownSlot = null;
+    this.ownSlotResolved = false;
   }
 
   /** Compressed 48-byte G1 (0x-hex) → uncompressed EIP-2537 128-byte (0x-hex). */

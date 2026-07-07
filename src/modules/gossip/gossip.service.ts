@@ -81,6 +81,14 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       seenExact: Set<string>;
       validationsStarted: number;
       maxValidations: number;
+      // finding-3 (per-connection anti-DoS): a single compromised/known peer flooding distinct bogus
+      // responses (varying signerNodeId/slot/sig) could consume the whole global `maxValidations`
+      // budget before honest peers' responses arrive → honest signers dropped. signerNodeId/from is
+      // attacker-controlled, so we rate-limit by the CONNECTION (ws) — the real, un-forgeable
+      // identity. Each connection gets at most `perConnCap` validations; the global cap + exact-dedup
+      // remain as backstops. Responses injected with no ws (tests) skip only the per-connection check.
+      perConn: Map<WebSocket, number>;
+      perConnCap: number;
     }
   >();
 
@@ -362,7 +370,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
         break;
 
       case "cosign-response":
-        this.handleCoSignResponse(message);
+        this.handleCoSignResponse(message, ws);
         break;
 
       default:
@@ -592,6 +600,10 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       dedupKey?: (resp: CoSignResponsePayload) => string | number;
       /** Hard cap on validate() calls per request (flood backstop). Default 64. */
       maxValidations?: number;
+      /** Per-connection cap on validate() calls (finding-3). A legit peer holds ONE slot, so ~1
+       *  response; 4 leaves margin for retries while stopping one peer from exhausting the global
+       *  budget. Default 4. */
+      perConnCap?: number;
     }
   ): Promise<CoSignResponsePayload[]> {
     return new Promise<CoSignResponsePayload[]>(resolve => {
@@ -614,6 +626,8 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
         seenExact: new Set<string>(),
         validationsStarted: 0,
         maxValidations: Math.max(1, opts.maxValidations ?? 64),
+        perConn: new Map<WebSocket, number>(),
+        perConnCap: Math.max(1, opts.perConnCap ?? 4),
       };
       this.pendingCoSign.set(payload.requestId, entry);
 
@@ -671,8 +685,14 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * duplicate, or cross-requestId response whose collector already resolved is ignored (the pending
    * entry is gone). When a `validate` is configured the response is counted ONLY after it passes
    * (async) — so a bogus response never contributes toward the threshold (MEDIUM 1).
+   *
+   * `ws` is the SOURCE connection (finding-3). It is the un-forgeable per-peer identity used to
+   * rate-limit validations per connection so one flooding peer cannot exhaust the global budget and
+   * crowd out honest signers arriving on other connections. It is optional: tests inject responses
+   * directly with no ws, in which case only the per-connection check is skipped (global cap +
+   * exact-dedup still apply).
    */
-  private handleCoSignResponse(message: GossipMessage): void {
+  private handleCoSignResponse(message: GossipMessage, ws?: WebSocket): void {
     const payload = message.data as CoSignResponsePayload;
     if (!payload || typeof payload.requestId !== "string") return;
     if (typeof payload.signerNodeId !== "string") return;
@@ -687,7 +707,12 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       const exactKey = `${payload.signerNodeId}|${payload.slot}|${payload.signatureCompact}`;
       if (pending.seenExact.has(exactKey)) return;
       pending.seenExact.add(exactKey);
+      // finding-3: PER-CONNECTION cap. A single connection cannot start more than `perConnCap`
+      // validations, so a flooder on one ws can't consume the whole global budget before honest
+      // peers' responses (on OTHER connections) are validated. Skipped when ws is absent (tests).
+      if (ws && (pending.perConn.get(ws) ?? 0) >= pending.perConnCap) return;
       if (pending.validationsStarted >= pending.maxValidations) return;
+      if (ws) pending.perConn.set(ws, (pending.perConn.get(ws) ?? 0) + 1);
       pending.validationsStarted++;
       // Validate asynchronously; count ONLY on success. Failures (invalid sig / bad on-chain
       // binding) or validator errors are silently dropped and never reach the threshold.

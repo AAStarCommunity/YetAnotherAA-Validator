@@ -257,3 +257,61 @@ describe("BlockchainService.createProposalWithEvidence ProposalCreated verificat
     expect(res.proposalId).toBeNull();
   });
 });
+
+/**
+ * FINDING 1: getSlotForValidator scans slots 1..maxSlots for the one bound to an operator EOA. The
+ * scan is now parallelized (Promise.all over getValidatorAtSlot) and must still return the LOWEST
+ * matching slot, and null when the operator holds no slot or the address is malformed.
+ */
+describe("BlockchainService.getSlotForValidator (finding-1 parallel scan)", () => {
+  const BLS_AGG = ethers.getAddress("0x" + "aa".repeat(20));
+
+  /** A service whose getValidatorAtSlot resolves from a slot→address map (counting reads). */
+  function makeSlotService(slotMap: Record<number, string>): {
+    svc: BlockchainService;
+    reads: () => number;
+  } {
+    const config = { get: (_k: string) => undefined } as any;
+    const svc = new BlockchainService(config);
+    let reads = 0;
+    (svc as any).getValidatorAtSlot = async (
+      _addr: string,
+      slot: number
+    ): Promise<string | null> => {
+      reads++;
+      return slotMap[slot] ?? null;
+    };
+    return { svc, reads: () => reads };
+  }
+
+  it("returns the correct 1-indexed slot when the operator is registered", async () => {
+    const operator = ethers.getAddress("0x" + "12".repeat(20));
+    const { svc } = makeSlotService({ 3: operator });
+    expect(await svc.getSlotForValidator(BLS_AGG, operator, 13)).toBe(3);
+  });
+
+  it("returns null when the operator holds NO slot", async () => {
+    const operator = ethers.getAddress("0x" + "12".repeat(20));
+    const { svc } = makeSlotService({ 1: ethers.getAddress("0x" + "34".repeat(20)) });
+    expect(await svc.getSlotForValidator(BLS_AGG, operator, 13)).toBeNull();
+  });
+
+  it("returns null for a malformed operator address (never scans)", async () => {
+    const { svc, reads } = makeSlotService({ 1: ethers.getAddress("0x" + "12".repeat(20)) });
+    expect(await svc.getSlotForValidator(BLS_AGG, "not-an-address", 13)).toBeNull();
+    expect(reads()).toBe(0);
+  });
+
+  it("returns the LOWEST matching slot when the operator appears at multiple slots", async () => {
+    const operator = ethers.getAddress("0x" + "12".repeat(20));
+    const { svc } = makeSlotService({ 2: operator, 5: operator });
+    expect(await svc.getSlotForValidator(BLS_AGG, operator, 13)).toBe(2);
+  });
+
+  it("scans every slot exactly once (parallel Promise.all over 1..maxSlots)", async () => {
+    const operator = ethers.getAddress("0x" + "12".repeat(20));
+    const { svc, reads } = makeSlotService({ 4: operator });
+    expect(await svc.getSlotForValidator(BLS_AGG, operator, 7)).toBe(4);
+    expect(reads()).toBe(7); // all 7 slots issued (parallel), none skipped
+  });
+});

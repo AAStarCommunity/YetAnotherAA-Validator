@@ -400,3 +400,118 @@ describe("GossipService co-sign collector: validate + dedupKey", () => {
     expect(() => (svc as any).handleCoSignResponse(respMsg("late", 9, true))).not.toThrow();
   });
 });
+
+/**
+ * FINDING 3 (per-connection anti-DoS): the global `maxValidations` budget can be exhausted by ONE
+ * malicious peer flooding distinct bogus responses (varying signerNodeId/slot/sig) before honest
+ * peers' responses arrive → honest signers dropped (liveness). signerNodeId/from is
+ * attacker-controlled; the CONNECTION (ws) is the un-forgeable identity, so validations are capped
+ * per connection. The global cap + exact-dedup remain as backstops; a response with no ws (direct
+ * test injection) skips only the per-connection check.
+ */
+describe("GossipService co-sign collector: per-connection cap (finding-3)", () => {
+  const flush = () => new Promise(r => setTimeout(r, 0));
+  const bySlot = (r: CoSignResponsePayload) => r.slot;
+
+  function respMsg(nodeId: string, slot: number, ok: boolean, requestId: string): GossipMessage {
+    return {
+      type: "cosign-response",
+      from: nodeId,
+      data: {
+        requestId,
+        slot,
+        signerNodeId: nodeId,
+        signerPublicKey: "0xpk",
+        signatureCompact: "0xsig",
+        messageHash: "0xhash",
+        ok,
+      } as any,
+      timestamp: Date.now(),
+      ttl: 0,
+      messageId: `resp-${nodeId}-${slot}`,
+      version: 0,
+    };
+  }
+
+  it("one flooding connection is capped at perConnCap and CANNOT crowd out honest signers on OTHER connections", async () => {
+    const svc = buildService();
+    let floodValidations = 0;
+    const validate = async (r: CoSignResponsePayload) => {
+      if (String(r.signerNodeId).startsWith("bad-")) floodValidations++;
+      return (r as any).ok === true;
+    };
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-conn" }), {
+      threshold: 2,
+      timeoutMs: 1000,
+      validate,
+      dedupKey: bySlot,
+      perConnCap: 4,
+    }) as Promise<CoSignResponsePayload[]>;
+    let settled = false;
+    void promise.then(() => (settled = true));
+
+    const wsFlood = {} as any; // one attacker connection
+
+    // Flooder sends 10 DISTINCT bogus responses on ONE connection → only perConnCap (4) validate.
+    for (let i = 0; i < 10; i++) {
+      (svc as any).handleCoSignResponse(respMsg(`bad-${i}`, i + 1, false, "req-conn"), wsFlood);
+    }
+    await flush();
+    expect(floodValidations).toBe(4); // per-connection cap enforced — NOT all 10
+    expect(settled).toBe(false); // bogus never counted → still waiting for honest signers
+
+    // Honest peers on OTHER connections still validate + count to the threshold (not crowded out).
+    (svc as any).handleCoSignResponse(respMsg("good-1", 11, true, "req-conn"), {} as any);
+    (svc as any).handleCoSignResponse(respMsg("good-2", 12, true, "req-conn"), {} as any);
+    const responses = await promise;
+    expect(responses).toHaveLength(2);
+    expect(responses.map(r => r.slot).sort((a, b) => a - b)).toEqual([11, 12]);
+  });
+
+  it("exact-dedup still fires FIRST (identical resends on one ws validate at most once)", async () => {
+    const svc = buildService();
+    let validateCalls = 0;
+    const validate = async () => {
+      validateCalls++;
+      return false;
+    };
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-exact" }), {
+      threshold: 3,
+      timeoutMs: 20,
+      validate,
+      dedupKey: bySlot,
+      perConnCap: 4,
+    }) as Promise<CoSignResponsePayload[]>;
+    const ws = {} as any;
+    for (let i = 0; i < 10; i++) {
+      (svc as any).handleCoSignResponse(respMsg("flood", 5, false, "req-exact"), ws);
+    }
+    await flush();
+    expect(validateCalls).toBe(1); // exact-dedup collapsed the 10 identical resends
+    await promise;
+  });
+
+  it("a response with NO ws still respects the global maxValidations cap", async () => {
+    const svc = buildService();
+    let validateCalls = 0;
+    const validate = async () => {
+      validateCalls++;
+      return false;
+    };
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-nows" }), {
+      threshold: 3,
+      timeoutMs: 20,
+      validate,
+      dedupKey: bySlot,
+      maxValidations: 5,
+      perConnCap: 4,
+    }) as Promise<CoSignResponsePayload[]>;
+    // 20 distinct responses injected with NO ws → per-connection check skipped, global cap bounds.
+    for (let i = 0; i < 20; i++) {
+      (svc as any).handleCoSignResponse(respMsg(`n-${i}`, (i % 12) + 1, false, "req-nows"));
+    }
+    await flush();
+    expect(validateCalls).toBeLessThanOrEqual(5); // global cap still enforced without a ws
+    await promise;
+  });
+});

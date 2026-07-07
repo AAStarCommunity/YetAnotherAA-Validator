@@ -705,9 +705,15 @@ export class BlockchainService {
     } catch {
       return null;
     }
-    for (let slot = 1; slot <= maxSlots; slot++) {
-      const v = await this.getValidatorAtSlot(blsAggregatorAddress, slot);
-      if (v && v === target) return slot;
+    // Parallelize the slot scan (was a serial RPC per slot): issue all validatorAtSlot(1..maxSlots)
+    // reads at once, then pick the LOWEST-indexed slot that matches. Each getValidatorAtSlot already
+    // fails closed to null on revert/absence, so a bad address / empty slot never matches.
+    const slots = Array.from({ length: Math.max(0, maxSlots) }, (_, i) => i + 1);
+    const validators = await Promise.all(
+      slots.map(slot => this.getValidatorAtSlot(blsAggregatorAddress, slot))
+    );
+    for (let i = 0; i < validators.length; i++) {
+      if (validators[i] && validators[i] === target) return slots[i];
     }
     return null;
   }
