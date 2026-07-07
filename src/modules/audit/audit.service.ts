@@ -1224,21 +1224,36 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       }
     }
 
-    // ── Step 2: file the proposal (ALWAYS — binds evidenceHash=proofHash) ──────────
-    try {
-      const res = await this.blockchainService.createProposalWithEvidence(
-        this.dvtValidatorAddress,
-        operator,
-        slashLevel,
-        reason,
-        evidenceHash,
-        dryRun
+    // ── Step 2: file the proposal (binds evidenceHash=proofHash) ───────────────────
+    // File-only (NOT armed): the proposal IS the deliverable — always create it.
+    // ARMED: create the proposal ONLY after the queue step CONFIRMED (queueTx !== null,
+    // where a dry-run's DRY_RUN_TX_SENTINEL also counts as confirmed). Creating it when
+    // the queue co-sign aborted (transient no-peers / under-threshold / a PEER node already
+    // queued this operator so our queueSlashWithProof reverts) would spawn an ORPHAN on-chain
+    // proposal that Step 3 then SKIPS (queueTx === null) — and with N nodes each retrying
+    // every tick, one orphan per node per tick. Gating on queueTx makes exactly ONE node —
+    // the one whose queue confirmed — file exactly ONE proposal, which it then executes.
+    if (!armed || queueTx !== null) {
+      try {
+        const res = await this.blockchainService.createProposalWithEvidence(
+          this.dvtValidatorAddress,
+          operator,
+          slashLevel,
+          reason,
+          evidenceHash,
+          dryRun
+        );
+        proposalTx = res.txHash;
+        proposalId = res.proposalId;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.error(`Audit: ${operator} createProposal failed — ${msg}`);
+      }
+    } else {
+      this.logger.warn(
+        `Audit: ${operator} createProposal SKIPPED — armed queue step did not confirm ` +
+          `(queueTx null); not filing an orphan proposal, will retry next tick`
       );
-      proposalTx = res.txHash;
-      proposalId = res.proposalId;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.logger.error(`Audit: ${operator} createProposal failed — ${msg}`);
     }
 
     // ── Step 3: EXECUTE (ARMED only) — TWO-STEP SAFETY: confirmed queue + real id required ──

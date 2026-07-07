@@ -981,6 +981,42 @@ describe("AuditService", () => {
     expect(execArgs[5]).toBe(expectedProof);
   });
 
+  it("executeSlash=true + queue co-sign aborts: files NO orphan proposal (createProposal skipped), no execute", async () => {
+    // Regression for the Stage-3 live-drill orphan-proposal bug: armed mode used to call
+    // createProposalWithEvidence UNCONDITIONALLY, so a transient queue co-sign failure (no peers /
+    // under-threshold / a peer node already queued) spawned an on-chain proposal that Step 3 then
+    // skipped — one orphan per node per retry tick. The fix gates createProposal on a confirmed queue.
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order);
+    const archive = makeArchive();
+    // A co-signer that ABORTS the queue step (models transient no-peers / under-threshold).
+    const abortingCoSigner: IQuorumCoSigner & { calls: string[] } = {
+      calls: [],
+      async coSign(req: CoSignRequest) {
+        this.calls.push(req.step);
+        throw new Error("gossip co-sign: no gossip peers available to reach quorum");
+      },
+    };
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      clockAt(1_700_000_000_000),
+      abortingCoSigner
+    );
+    await svc.tick();
+
+    // NOTHING on-chain: queue co-sign threw before queueSlashWithProof, so no queue tx; and because
+    // the queue never confirmed, NO createProposal (no orphan) and NO execute.
+    expect(order).toEqual([]);
+    expect(abortingCoSigner.calls).toEqual(["queue"]); // only the queue co-sign was attempted
+    // Evidence is still archived (evidence-never-lost) and the violation is flagged for retry.
+    expect(archive.records).toHaveLength(1);
+    const status = await svc.getStatus();
+    expect(status.recentDetections[0].queueTx).toBeNull();
+    expect(status.recentDetections[0].executeTx).toBeNull();
+  });
+
   it("executeSlash=true + real proposalId: execute is bound to that exact id", async () => {
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, {
@@ -1032,11 +1068,11 @@ describe("AuditService", () => {
     const svc = makeService(blockchain, makeConfig({ auditExecuteSlash: true }), archive);
     // The tick must survive the stub's throw (loop never crashes).
     await expect(svc.tick()).resolves.toBeUndefined();
-    // queue co-sign threw (queue skipped) but the proposal was still filed; execute co-sign
-    // also threw (execute skipped) — yet the evidence is archived regardless.
-    expect(order).toEqual(["create"]);
+    // queue co-sign threw (queue skipped) → armed mode files NO proposal (orphan-proposal fix):
+    // no confirmed queue ⇒ no createProposal ⇒ no execute — yet the evidence is archived regardless.
+    expect(order).toEqual([]);
     expect(archive.records).toHaveLength(1);
-    expect(archive.records[0].proposalTx).toBe("0xPROPOSALTX");
+    expect(archive.records[0].proposalTx ?? null).toBeNull();
   });
 
   it("Finding 1 (CRITICAL): a queue tx failure ABORTS the slash — execute is NOT called (two-step safety)", async () => {
@@ -1063,16 +1099,19 @@ describe("AuditService", () => {
       makeCoSigner()
     );
     await expect(svc.tick()).resolves.toBeUndefined();
-    // finding-1: queue reverted (queueTx null) → execute must NOT run even though the proposal
-    // filed and resolved a real id. A slash never executes without a confirmed queue pre-flag.
-    expect(order).toEqual(["queue-fail", "create"]);
+    // finding-1 + orphan-proposal fix: queue reverted (queueTx null) → NO createProposal (no orphan)
+    // and NO execute. A slash never executes without a confirmed queue pre-flag, and armed mode never
+    // files a proposal it cannot execute.
+    expect(order).toEqual(["queue-fail"]);
     expect(executeCalls).toBe(0);
     expect(archive.records).toHaveLength(1);
     const proof = archive.records[0];
-    // No execute tx recorded, and the (resolvable) execute preimage is kept as INTENT only.
+    // No execute tx recorded. createProposal was skipped (queue never confirmed) → no proposalId,
+    // so there is no resolvable execute preimage to record even as INTENT — the whole flow retries.
     expect(proof.executeTx).toBeUndefined();
     expect(proof.messageHash).toBe("0x");
-    expect(proof.intendedExecuteMessageHash).toBeDefined();
+    expect(proof.intendedExecuteMessageHash ?? undefined).toBeUndefined();
+    expect(proof.proposalTx ?? null).toBeNull();
     // The over-slash guard was NOT armed durably (no slash executed).
     expect((archive as any).slashed.size).toBe(0);
     const status = await svc.getStatus();
