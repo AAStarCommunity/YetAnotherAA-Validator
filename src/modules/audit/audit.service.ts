@@ -8,7 +8,7 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
-import { BlockchainService } from "../blockchain/blockchain.service.js";
+import { BlockchainService, DRY_RUN_TX_SENTINEL } from "../blockchain/blockchain.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 import type { IProofArchive, SlashProof, EvidenceSource, ProofIdentity } from "./proof-archive.js";
 import { LocalProofArchive, computeProofHash, PROOF_SCHEMA_VERSION } from "./proof-archive.js";
@@ -92,6 +92,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * when both auditEnabled AND this are true — so nothing is auto-slashed until explicitly enabled.
    */
   private readonly executeSlash: boolean;
+  /**
+   * DRY-RUN drill (AUDIT_DRY_RUN). Only meaningful when ALSO armed (executeSlash). When true, the
+   * full gossip quorum co-sign AND the staticCall preflight against the REAL contracts still run, but
+   * the queue/execute broadcasts are SKIPPED (return the sentinel) and NO durable slashed marker is
+   * written — so the drill proves the whole path end-to-end with zero real slash and is repeatable.
+   */
+  private readonly dryRun: boolean;
   /** Confirmation depth for the finalized-block fallback (finding-3, reorg-safe evidence). */
   private readonly finalityConfirmations: number;
   /** How far back to scan on-chain slash-executed events for the durable guard (finding-2). */
@@ -131,6 +138,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * archive-before-execute ordering. The file-only proposal path is unaffected (keeps per-block dedup).
    */
   private readonly slashedCoarseKeys = new Set<string>();
+  /**
+   * Stable keys whose ARMED co-sign aborted TRANSIENTLY (no gossip peers yet / quorum not reached).
+   * The dedup gate bypasses these so the co-sign is re-attempted next tick even though the evidence
+   * is already archived — a node that detects a violation before its gossip mesh is up must not lose
+   * that block's slash forever. Cleared once the co-sign completes (queued / executed / dry-run).
+   */
+  private readonly coSignRetryKeys = new Set<string>();
   /** Hard ceiling on either dedup map's size — a defensive LRU-style cap against unbounded growth. */
   private static readonly MAX_DEDUP_ENTRIES = 10_000;
   /** Bounded ring of the most recent detections, newest first (for GET /audit/status). */
@@ -179,6 +193,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.gtokenStakingAddress = config.get<string>("auditGtokenStakingAddress") ?? "";
     this.apntsTokenAddress = config.get<string>("auditApntsTokenAddress") ?? "";
     this.executeSlash = config.get<boolean>("auditExecuteSlash") === true;
+    this.dryRun = config.get<boolean>("auditDryRun") === true;
     this.finalityConfirmations = config.get<number>("auditFinalityConfirmations") ?? 12;
     this.slashLookbackBlocks = config.get<number>("auditSlashLookbackBlocks") ?? 50_000;
     this.clock = clock ?? (() => Date.now());
@@ -277,12 +292,26 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         this.intervalMs
       );
     }, jitterMs);
+    if (this.dryRun && !this.executeSlash) {
+      // F2 (Codex #181): AUDIT_DRY_RUN only matters on the armed co-sign/slash path. When disarmed
+      // the flag is a silent no-op — warn so a mis-set drill config is visible, not silently ignored.
+      this.logger.warn(
+        "AUDIT_DRY_RUN=true but AUDIT_EXECUTE_SLASH is not armed — DRY_RUN has NO effect " +
+          "(the co-sign + staticCall path runs only when armed). Set AUDIT_EXECUTE_SLASH=true for the drill."
+      );
+    }
     this.logger.log(
       `DVT audit ENABLED — interval=${this.intervalMs}ms jitter=${jitterMs}ms ` +
         `watchlist=[${this.watchlist.join(", ")}] creditThreshold=${this.creditThresholdBps}bps ` +
         `registry=${this.registryAddress} superPaymaster=${this.superPaymasterAddress} ` +
         `dvtValidator=${this.dvtValidatorAddress} blsAggregator=${this.blsAggregatorAddress} ` +
-        `executeSlash=${this.executeSlash} (${this.executeSlash ? "two-step on-chain slash ARMED" : "file+archive ONLY"})`
+        `executeSlash=${this.executeSlash} (${
+          this.executeSlash
+            ? this.dryRun
+              ? "DRY RUN — full co-sign + staticCall preflight, NO broadcast"
+              : "two-step on-chain slash ARMED"
+            : "file+archive ONLY"
+        })`
     );
   }
 
@@ -396,6 +425,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     for (const [key, ts] of this.lastProposalAt) {
       if (now - ts > this.cooldownMs) this.lastProposalAt.delete(key);
     }
+    // coSignRetryKeys clears on co-sign success; a permanently-partitioned node could still leak one
+    // entry per finalized-block change. Coarse-cap it — the current block re-adds next tick if still
+    // aborting, so dropping stale entries never loses a live retry.
+    if (this.coSignRetryKeys.size > AuditService.MAX_DEDUP_ENTRIES) this.coSignRetryKeys.clear();
   }
 
   /**
@@ -740,8 +773,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // ── DEDUP ─────────────────────────────────────────────────────────────────────
     const stableKey = `${this.chainId}|${v.operator}|${v.rule}|${v.violationBlock}`;
     const coarseKey = this.coarseKey(v.operator, v.rule);
-    // Exact same violation@block already handled (this process, or on disk from a prior run).
-    if (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash))) {
+    // Exact same violation@block already handled (this process, or on disk from a prior run) — UNLESS
+    // a prior attempt's ARMED co-sign aborted transiently (no peers yet): `coSignRetryKeys` bypasses
+    // the dedup so the co-sign is re-attempted even though the evidence is already archived.
+    if (
+      !this.coSignRetryKeys.has(stableKey) &&
+      (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash)))
+    ) {
       this.logger.debug(
         `Audit: ${v.operator} ${v.rule}@${v.violationBlock} already proposed (proof ${proofHash}) — skip`
       );
@@ -844,7 +882,34 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       queueTx = res.queueTx;
       executeTx = res.executeTx;
       if (res.queueMessageHash) proof.queueMessageHash = res.queueMessageHash;
-      if (executeTx !== null) {
+      if (res.coSignAborted) {
+        // ROBUSTNESS GAP FIX: the armed queue co-sign failed TRANSIENTLY (no gossip peers yet /
+        // quorum not reached / staticCall reverted) — nothing was slashed, no gas spent. Mark this
+        // block for co-sign RETRY (bypasses the archived-evidence dedup) + clear the coarse cooldown
+        // so the NEXT tick re-attempts, instead of permanently skipping the block (a node that detects
+        // a violation before its gossip mesh is up would otherwise lose that block's slash forever).
+        this.coSignRetryKeys.add(stableKey);
+        this.lastProposalAt.delete(coarseKey);
+        this.logger.warn(
+          `Audit: ${v.operator} ${v.rule} co-sign aborted (transient) — will retry next tick`
+        );
+      } else {
+        // Co-sign completed (queued / executed / dry-run) → stop retrying this block.
+        this.coSignRetryKeys.delete(stableKey);
+      }
+      if (executeTx === DRY_RUN_TX_SENTINEL) {
+        // DRY RUN: the quorum co-sign + staticCall preflight passed against the REAL contracts, but
+        // NOTHING was slashed (no broadcast). Record the real co-sign material + the sentinel tx so
+        // the archive shows the drill, but DO NOT write the durable over-slash marker — a durable
+        // marker would wrongly suppress a LATER real (or repeat dry) run for the same operator+rule.
+        // The drill must be repeatable.
+        this.logger.warn(
+          `Audit: ${v.operator} ${v.rule} DRY RUN — staticCall passed, slash NOT broadcast; ` +
+            `durable over-slash marker intentionally NOT written (repeatable drill)`
+        );
+        proof.signerMask = res.signerMask;
+        proof.sigG2 = res.sigG2;
+      } else if (executeTx !== null) {
         // A slash actually executed → arm the DURABLE over-slash guard (in-memory + archive journal,
         // finding-2) so a restart does not re-slash, and record the real co-sign material.
         await this.recordCoarseSlashed(coarseKey);
@@ -976,14 +1041,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // target means that scan was INDETERMINATE (provider error), tracked so (5) can fail closed.
     let scanIndeterminate = false;
     try {
-      const fromBlock = Math.max(0, violationBlock - this.slashLookbackBlocks);
+      // Scan the most-recent `slashLookbackBlocks` at the chain HEAD (where slash events are emitted),
+      // NOT anchored at the ~60-blocks-behind finalized violationBlock — the range then equals the
+      // lookback (size it to the RPC's getLogs cap so the scan stays determinate).
       const scanTargets = [this.blsAggregatorAddress, this.superPaymasterAddress].filter(Boolean);
       for (const target of scanTargets) {
         const hit = await this.blockchainService.getRecentSlashExecuted(
           target,
           operator,
           slashLevel,
-          fromBlock
+          this.slashLookbackBlocks
         );
         if (hit === true) {
           await this.recordCoarseSlashed(coarseKey); // persist durable + memory
@@ -1076,9 +1143,22 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     queueMessageHash: string | null;
     signerMask: string;
     sigG2: string;
+    /**
+     * True when the ARMED queue co-sign could NOT complete for a TRANSIENT reason (no gossip peers
+     * yet / quorum not reached / staticCall preflight reverted) — nothing was slashed and no gas was
+     * spent. The caller then clears the per-block dedup + cooldown so the NEXT tick re-attempts,
+     * instead of losing this violation-block's co-sign forever (robustness gap: a node that detects
+     * before its gossip mesh is up must not permanently skip the block).
+     */
+    coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
     const armed = this.executeSlash;
+    let coSignAborted = false;
+    // DRY-RUN drill (only meaningful when armed): the co-sign below STILL happens and the queue/execute
+    // staticCall preflight STILL runs against the REAL contracts, but the broadcast is skipped and the
+    // step returns DRY_RUN_TX_SENTINEL. queueTx/executeTx then carry the sentinel (recorded as-is).
+    const dryRun = this.dryRun;
     let queueTx: string | null = null;
     let proposalTx: string | null = null;
     let proposalId: bigint | null = null;
@@ -1120,9 +1200,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           operator,
           slashLevel,
           epoch,
-          encoded
+          encoded,
+          dryRun
         );
-        this.logger.warn(`Audit: ${operator} slash QUEUED (tx ${queueTx})`);
+        this.logger.warn(
+          `Audit: ${operator} slash ${dryRun ? "QUEUE DRY RUN (staticCall passed, NOT broadcast)" : "QUEUED"} (tx ${queueTx})`
+        );
         // Durable BEFORE execute: the confirmed queueTx is persisted now (finding-4).
         if (proof) {
           proof.queueTx = queueTx;
@@ -1131,8 +1214,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
+        // TRANSIENT: the armed queue co-sign didn't complete (no peers / quorum not met / staticCall
+        // reverted). Nothing slashed, no gas spent. Signal the caller to RETRY next tick rather than
+        // marking this violation-block permanently handled.
+        coSignAborted = true;
         this.logger.error(
-          `Audit: ${operator} slash queue step failed — ${msg} (evidence archived; slash not queued)`
+          `Audit: ${operator} slash queue step failed — ${msg} (evidence archived; slash not queued; will retry)`
         );
       }
     }
@@ -1144,7 +1231,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         operator,
         slashLevel,
         reason,
-        evidenceHash
+        evidenceHash,
+        dryRun
       );
       proposalTx = res.txHash;
       proposalId = res.proposalId;
@@ -1195,13 +1283,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
             [], // slash-only ⇒ no reputation users
             [], // slash-only ⇒ no reputation scores
             epoch,
-            encoded
+            encoded,
+            dryRun
           );
           // Record the EXECUTE co-sign material so the archived proof references the real slash.
           signerMask = ethers.toBeHex(cosign.signerMask);
           sigG2 = cosign.sigG2;
           this.logger.warn(
-            `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
+            dryRun
+              ? `Audit: ${operator} DRY RUN: staticCall passed — would slash ${operator} ` +
+                  `(proposal ${proposalId}), NOT broadcasting`
+              : `Audit: ${operator} slash EXECUTED (proposal ${proposalId}, tx ${executeTx})`
           );
           // Durable immediately after the irreversible slash confirms (finding-4). Set the SUBMITTED
           // execute preimage as messageHash TOGETHER with executeTx in this same write, so every
@@ -1226,7 +1318,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         }
       }
     }
-    return { proposalTx, proposalId, queueTx, executeTx, queueMessageHash, signerMask, sigG2 };
+    return {
+      proposalTx,
+      proposalId,
+      queueTx,
+      executeTx,
+      queueMessageHash,
+      signerMask,
+      sigG2,
+      coSignAborted,
+    };
   }
 
   /** Read-only status for GET /audit/status. No secrets. */

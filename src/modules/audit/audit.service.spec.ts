@@ -1,5 +1,6 @@
 import { ethers } from "ethers";
 import { AuditService } from "./audit.service.js";
+import { DRY_RUN_TX_SENTINEL } from "../blockchain/blockchain.service.js";
 import {
   IProofArchive,
   SlashProof,
@@ -432,6 +433,29 @@ describe("AuditService", () => {
     await svc.tick();
     await svc.tick();
     expect(created).toHaveLength(1);
+  });
+
+  it("robustness: a TRANSIENT armed co-sign abort (no peers) is RE-ATTEMPTED next tick (not dedup-suppressed)", async () => {
+    let coSignCalls = 0;
+    const coSigner: IQuorumCoSigner = {
+      async coSign() {
+        coSignCalls++;
+        throw new Error("gossip co-sign: no gossip peers available to reach quorum");
+      },
+    };
+    const svc = makeService(
+      overLimitBlockchain(),
+      makeConfig({ auditExecuteSlash: true }),
+      makeArchive(),
+      clockAt(1_700_000_000_000),
+      coSigner
+    );
+    await svc.tick();
+    await svc.tick();
+    await svc.tick();
+    // Without the fix the archived-evidence dedup would suppress ticks 2-3 → coSignCalls===1 and the
+    // block's slash is lost forever. The transient-abort retry re-attempts every tick.
+    expect(coSignCalls).toBe(3);
   });
 
   it("dedup: an already-archived proof (prior process) → no new proposal", async () => {
@@ -1229,17 +1253,17 @@ describe("AuditService", () => {
     expect(archive.slashed.size).toBe(1);
   });
 
-  it("Finding 2: getRecentSlashExecuted scans within [violationBlock - lookback, latest]", async () => {
-    let scannedFrom: number | undefined;
+  it("Finding 2: getRecentSlashExecuted is passed the lookback WINDOW size (head-anchored scan)", async () => {
+    let scannedLookback: number | undefined;
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, {
       getRecentSlashExecuted: async (
         _addr: string,
         _op: string,
         _slashLevel: number,
-        fromBlock: number
+        lookbackBlocks: number
       ) => {
-        scannedFrom = fromBlock;
+        scannedLookback = lookbackBlocks;
         return false;
       },
     });
@@ -1252,8 +1276,10 @@ describe("AuditService", () => {
       makeCoSigner()
     );
     await svc.tick();
-    // violationBlock 100000 - lookback 40000 = 60000.
-    expect(scannedFrom).toBe(60_000);
+    // The window is now anchored at the chain HEAD: [latest - lookback, latest]. The caller passes
+    // the lookback size (40000) directly, not an absolute fromBlock — so the getLogs range == lookback
+    // and can be sized to the RPC's getLogs cap (real-env finding: Alchemy free = 10 blocks).
+    expect(scannedLookback).toBe(40_000);
   });
 
   // ── Codex round-2 HIGH: an INDETERMINATE on-chain scan fails CLOSED (no double-slash) ──
@@ -1420,6 +1446,127 @@ describe("AuditService", () => {
     expect(order2.filter(o => o === "execute")).toHaveLength(0);
     // Evidence for the new block is still archived (never lost).
     expect(archive.records.some(r => r.evidence.violationBlock === 4001)).toBe(true);
+  });
+
+  // ── AUDIT_DRY_RUN: armed drill that proves the full path but never really slashes ──
+
+  /**
+   * A recording blockchain whose queue/execute HONOR the `dryRun` last arg exactly like the real
+   * BlockchainService: when dryRun is passed true they return DRY_RUN_TX_SENTINEL (staticCall passed,
+   * no broadcast) instead of a real tx hash. Records the dryRun flag each call received.
+   */
+  function dryRunRecordingBlockchain(
+    order: string[],
+    dryRunFlags: { queue?: boolean; execute?: boolean }
+  ) {
+    return overLimitBlockchain({
+      queueSlashWithProof: async (...args: any[]) => {
+        order.push("queue");
+        dryRunFlags.queue = args[5] === true;
+        return args[5] === true ? DRY_RUN_TX_SENTINEL : "0xQUEUETX";
+      },
+      createProposalWithEvidence: async () => {
+        order.push("create");
+        return { txHash: "0xPROPOSALTX", proposalId: 7n };
+      },
+      executeSlashWithProof: async (...args: any[]) => {
+        order.push("execute");
+        dryRunFlags.execute = args[6] === true;
+        return args[6] === true ? DRY_RUN_TX_SENTINEL : "0xEXECUTETX";
+      },
+    });
+  }
+
+  it("DRY RUN (armed + auditDryRun): co-sign happens, queue/execute return the sentinel, NO durable slash marker", async () => {
+    const order: string[] = [];
+    const dryRunFlags: { queue?: boolean; execute?: boolean } = {};
+    const blockchain = dryRunRecordingBlockchain(order, dryRunFlags);
+    const archive = makeArchive();
+    const coSigner = makeCoSigner();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditDryRun: true }),
+      archive,
+      undefined,
+      coSigner
+    );
+    await svc.tick();
+
+    // The FULL path still runs: queue → create → execute (the whole point of the drill).
+    expect(order).toEqual(["queue", "create", "execute"]);
+    // The quorum co-sign genuinely happened — twice (queue + execute preimages).
+    expect(coSigner.calls).toHaveLength(2);
+    // The audit passed dryRun=true down to BOTH on-chain write calls.
+    expect(dryRunFlags.queue).toBe(true);
+    expect(dryRunFlags.execute).toBe(true);
+
+    // The archived proof records the SENTINEL txs verbatim, so it plainly shows this was a dry run.
+    expect(archive.records).toHaveLength(1);
+    const proof = archive.records[0];
+    expect(proof.queueTx).toBe(DRY_RUN_TX_SENTINEL);
+    expect(proof.executeTx).toBe(DRY_RUN_TX_SENTINEL);
+
+    // CRITICAL: NO durable over-slash marker written (nothing was really slashed) → drill is repeatable.
+    expect(archive.slashed.size).toBe(0);
+    expect((svc as any).slashedCoarseKeys.size).toBe(0);
+
+    // The detection surfaces the sentinel txs too.
+    const status = await svc.getStatus();
+    expect(status.recentDetections[0].queueTx).toBe(DRY_RUN_TX_SENTINEL);
+    expect(status.recentDetections[0].executeTx).toBe(DRY_RUN_TX_SENTINEL);
+  });
+
+  it("DRY RUN is REPEATABLE: a sustained violation across advancing blocks (past cooldown) dry-runs every time (never suppressed)", async () => {
+    const order: string[] = [];
+    const dryRunFlags: { queue?: boolean; execute?: boolean } = {};
+    let block = 4000;
+    let now = 1_700_000_000_000;
+    const blockchain = dryRunRecordingBlockchain(order, dryRunFlags);
+    blockchain.getBlockNumber = async () => block;
+    const archive = makeArchive();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditDryRun: true, auditCooldownMs: 1 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+    // Tick 1 dry-runs the execute.
+    await svc.tick();
+    // Later ticks at NEW blocks, past cooldown — with NO durable marker written, each must dry-run AGAIN
+    // (a real armed run would be blocked here by the over-slash guard). Repeatability is the invariant.
+    for (let i = 0; i < 3; i++) {
+      block += 1;
+      now += 10;
+      await svc.tick();
+    }
+    // Every tick reached the execute step (4 total) — none suppressed by a durable slashed marker.
+    expect(order.filter(o => o === "execute")).toHaveLength(4);
+    expect(archive.slashed.size).toBe(0);
+  });
+
+  it("armed + auditDryRun=false → REAL path unchanged (real tx hashes, durable marker written)", async () => {
+    const order: string[] = [];
+    const dryRunFlags: { queue?: boolean; execute?: boolean } = {};
+    const blockchain = dryRunRecordingBlockchain(order, dryRunFlags);
+    const archive = makeArchive();
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditDryRun: false }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    expect(order).toEqual(["queue", "create", "execute"]);
+    // dryRun=false passed through → real tx hashes recorded, NOT the sentinel.
+    expect(dryRunFlags.queue).toBe(false);
+    expect(dryRunFlags.execute).toBe(false);
+    const proof = archive.records[0];
+    expect(proof.queueTx).toBe("0xQUEUETX");
+    expect(proof.executeTx).toBe("0xEXECUTETX");
+    // A REAL slash executed → the durable over-slash marker IS written.
+    expect(archive.slashed.size).toBe(1);
   });
 
   // ── FINDING 3: evidence pinned to a FINALIZED block + its hash (reorg-safe) ──────

@@ -54,8 +54,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * this node is disarmed → every request is silently refused (fail-closed).
    */
   private coSignHandler:
-    | ((payload: CoSignRequestPayload) => Promise<CoSignResponsePayload | null>)
-    | null = null;
+    ((payload: CoSignRequestPayload) => Promise<CoSignResponsePayload | null>) | null = null;
 
   /**
    * In-flight co-sign requests this node originated, keyed by requestId (correlation id). Only

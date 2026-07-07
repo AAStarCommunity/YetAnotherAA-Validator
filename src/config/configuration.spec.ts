@@ -44,6 +44,39 @@ describe("configuration: auditFinalityConfirmations floor", () => {
 });
 
 /**
+ * AUDIT_DRY_RUN — the safe intermediate for the FIRST live slash drill. Off by default; only
+ * meaningful when the node is ALSO armed (AUDIT_EXECUTE_SLASH), but the config flag itself is
+ * independent (the audit gates dry-run on `armed && dryRun`).
+ */
+describe("configuration: auditDryRun", () => {
+  const saved = { ...process.env };
+
+  beforeEach(() => {
+    process.env.ETH_RPC_URL = "http://localhost:8545";
+    process.env.VALIDATOR_CONTRACT_ADDRESS = "0x" + "12".repeat(20);
+  });
+
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it("AUDIT_DRY_RUN=true → auditDryRun true", () => {
+    process.env.AUDIT_DRY_RUN = "true";
+    expect(configuration().auditDryRun).toBe(true);
+  });
+
+  it("unset → default false", () => {
+    delete process.env.AUDIT_DRY_RUN;
+    expect(configuration().auditDryRun).toBe(false);
+  });
+
+  it("any non-'true' value → false (strict, fail-safe off)", () => {
+    process.env.AUDIT_DRY_RUN = "1";
+    expect(configuration().auditDryRun).toBe(false);
+  });
+});
+
+/**
  * HIGH 1 (Codex): AUDIT_SLASH_THRESHOLDS must be CLAMPED UP to the pinned live floor
  * (WARNING ≥ 2, MINOR ≥ 3, MAJOR ≥ 3) so a misconfiguration like `MINOR:1` can never let a single
  * local signature pass as quorum and defeat the 3-of-3 slash invariant. HIGHER values are kept.

@@ -26,6 +26,16 @@ export const OWNER_AUTH_ABI = [
   "function isValidOwnerAuth(bytes32 userOpHash, bytes calldata ownerAuth) view returns (bytes4)",
 ];
 
+/**
+ * Sentinel "tx hash" returned by queueSlashWithProof / executeSlashWithProof when they run in
+ * DRY-RUN mode (AUDIT_DRY_RUN): the staticCall preflight ran against the REAL contracts and passed,
+ * but the real broadcast was intentionally SKIPPED (no operator was slashed). It is NOT a real tx
+ * hash — it is deliberately NOT 0x-hex-32 so it can never be mistaken for one. Shared with
+ * AuditService (which records it verbatim in the archived proof and skips the durable slashed
+ * marker) and the tests, so the "was this a dry run?" check has a single source of truth.
+ */
+export const DRY_RUN_TX_SENTINEL = "0xDRYRUN";
+
 /** ERC-4337 v0.7 PackedUserOperation (the exact tuple EntryPoint.getUserOpHash takes). */
 export interface PackedUserOp {
   sender: string;
@@ -548,11 +558,27 @@ export class BlockchainService {
     contractAddress: string,
     operator: string,
     slashLevel: number,
-    fromBlock: number
+    lookbackBlocks: number
   ): Promise<boolean | null> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
+    // Scan a BOUNDED window ending at the chain HEAD: [latest - lookbackBlocks, latest]. Slash
+    // events are emitted near `latest` (a slash fires AFTER the finalized violation is detected), so
+    // anchoring the window at the head — not at the ~60-blocks-behind finalized violationBlock — both
+    // catches the real events AND keeps the getLogs range == lookbackBlocks. Size lookbackBlocks to
+    // your RPC's getLogs cap (Alchemy free = 10) so the scan stays determinate; a range wider than the
+    // cap errors → indeterminate → the over-slash guard fails CLOSED (real-env finding).
+    let latest: number;
+    try {
+      latest = await this.provider.getBlockNumber();
+    } catch (error: any) {
+      this.logger.warn(
+        `getRecentSlashExecuted getBlockNumber failed: ${error.message} — indeterminate`
+      );
+      return null;
+    }
+    const fromBlock = Math.max(0, latest - Math.max(0, lookbackBlocks));
     const iface = new ethers.Interface([
       "event SlashExecutedWithProof(address indexed operator, uint8 level, uint256 penalty, bytes32 proofHash, uint256 timestamp)",
       "event SlashExecuted(uint256 indexed proposalId, address indexed operator, uint8 level)",
@@ -982,7 +1008,8 @@ export class BlockchainService {
     operator: string,
     level: number,
     reason: string,
-    evidenceHash: string
+    evidenceHash: string,
+    dryRun = false
   ): Promise<{ txHash: string; proposalId: bigint | null }> {
     if (!this.wallet) {
       throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
@@ -993,6 +1020,22 @@ export class BlockchainService {
     ];
     const iface = new ethers.Interface(abi);
     const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+    // DRY RUN (Codex #181 F1): createProposal is a REAL governance tx — broadcasting it in a drill
+    // would leave an orphaned on-chain proposal. staticCall instead: it validates the call AND returns
+    // the would-be proposalId (createProposal's return value) for the execute messageHash, with NO
+    // broadcast and no side effect.
+    if (dryRun) {
+      const wouldBeId: bigint = await contract.createProposal.staticCall(
+        operator,
+        level,
+        reason,
+        evidenceHash
+      );
+      this.logger.log(
+        `createProposal DRY RUN: staticCall passed (would-be id ${wouldBeId}) — NOT broadcasting`
+      );
+      return { txHash: DRY_RUN_TX_SENTINEL, proposalId: wouldBeId };
+    }
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.createProposal(
       operator,
@@ -1054,7 +1097,8 @@ export class BlockchainService {
     operator: string,
     slashLevel: number,
     epoch: bigint | number,
-    proof: string
+    proof: string,
+    dryRun = false
   ): Promise<string> {
     if (!this.wallet) {
       throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
@@ -1075,6 +1119,17 @@ export class BlockchainService {
       throw new Error(
         `queueSlashWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`
       );
+    }
+    // DRY-RUN (AUDIT_DRY_RUN): the preflight above ran against the REAL contract and passed, proving
+    // the signerMask/sigG2/threshold/slot mapping are accepted by verifyAndExecute. Stop HERE — do
+    // NOT broadcast the real queue tx and do NOT await a receipt (there is no tx). Return the sentinel
+    // so the caller records that this step was a dry run instead of a real slash queue.
+    if (dryRun) {
+      this.logger.warn(
+        `queueSlashWithProof DRY RUN: staticCall passed, NOT broadcasting — would queue slash of ` +
+          `${operator} (slashLevel ${slashLevel}, epoch ${epoch})`
+      );
+      return DRY_RUN_TX_SENTINEL;
     }
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.queueSlashWithProof(
@@ -1110,7 +1165,8 @@ export class BlockchainService {
     repUsers: string[],
     newScores: Array<bigint | number>,
     epoch: bigint | number,
-    proof: string
+    proof: string,
+    dryRun = false
   ): Promise<string> {
     if (!this.wallet) {
       throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
@@ -1129,6 +1185,17 @@ export class BlockchainService {
       throw new Error(
         `executeWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`
       );
+    }
+    // DRY-RUN (AUDIT_DRY_RUN): the preflight above simulated the EXACT irreversible slash against the
+    // REAL contract and passed — proving verifyAndExecute accepts the proof — but this is a drill, so
+    // stop HERE. Do NOT broadcast the real slash and do NOT await a receipt. Return the sentinel so the
+    // caller records that NO operator was actually slashed (and skips the durable over-slash marker).
+    if (dryRun) {
+      this.logger.warn(
+        `executeSlashWithProof DRY RUN: staticCall passed, NOT broadcasting — would slash proposal ` +
+          `id ${id} (epoch ${epoch})`
+      );
+      return DRY_RUN_TX_SENTINEL;
     }
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.executeWithProof(
