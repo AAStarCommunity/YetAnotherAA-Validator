@@ -76,7 +76,28 @@ export class NodeService implements OnModuleInit {
       state.privateKey = "0x" + Buffer.from(secret).toString("hex");
       this.logger.log("BLS key loaded from encrypted keystore (EIP-2335)");
     } else if (!state.privateKey) {
-      throw new Error("node_state.json has neither a keystore nor a plaintext privateKey");
+      // Merged (KMS-TEE) mode: the BLS private key lives in the KMS TEE and NEVER touches disk.
+      // A key-less node_state.json (nodeId + publicKey only) is valid ONLY when signing is BOTH
+      // delegated (RUST_SIGNER_URL set) AND required (RUST_SIGNER_REQUIRED=true → never a local
+      // fallback) — every signature is produced by the remote TEE signer, addressed by node_id.
+      // The publicKey must still be present so nodeId derivation / gossip announcements work.
+      const delegatedAndRequired =
+        !!this.configService.get<string>("rustSignerUrl") &&
+        this.configService.get<boolean>("rustSignerRequired") === true;
+      if (!delegatedAndRequired) {
+        throw new Error(
+          "node_state.json has neither a keystore nor a plaintext privateKey " +
+            "(a key-less node_state is only valid in KMS-TEE mode: RUST_SIGNER_URL + RUST_SIGNER_REQUIRED=true)"
+        );
+      }
+      if (!state.publicKey) {
+        throw new Error(
+          "node_state.json has no privateKey and no publicKey — KMS-TEE (delegated) mode still needs the publicKey"
+        );
+      }
+      this.logger.log(
+        "BLS private key delegated to the remote TEE signer (RUST_SIGNER_REQUIRED) — no local key on disk (KMS-TEE mode)"
+      );
     }
     return state;
   }

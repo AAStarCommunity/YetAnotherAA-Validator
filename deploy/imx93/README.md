@@ -118,12 +118,41 @@ ln -sfn /opt/aastar-dvt/releases/<old-version> /opt/aastar-dvt/current
 systemctl restart aastar-dvt@node1
 ```
 
+## KMS-TEE merged mode (BLS key sealed in the TEE, CC-22)
+
+When DVT runs **alongside KMS on the board**, the DVT's BLS key can live in the
+KMS OP-TEE TA and never touch disk (AirAccount `dvt-tee-bls-custody`, Variant
+B). This reuses the SAME `RUST_SIGNER_URL` seam below — the KMS host exposes an
+internal `/sign` endpoint (`127.0.0.1`, not public) that implements the signer
+contract
+`POST /sign {user_op_hash, node_id} → {signature, signature_compact, public_key}`
+(blst `min_pk`, DST `BLS_SIG_…_POP_`, EIP-2537 — byte-identical,
+golden-verified). DVT signs by **node_id only**, so no private key is needed on
+the DVT side — including the inc-2-live slash co-sign, which routes through the
+same seam.
+
+- **Node env**: `RUST_SIGNER_URL=http://127.0.0.1:<kms-port>` **and**
+  `RUST_SIGNER_REQUIRED=true` (fail-closed — never fall back to local signing;
+  there is no local key to fall back to).
+- **`node_state.json` is key-less**: `{ nodeId, publicKey }` only — NO
+  `privateKey`/`keystore`. The node boots on this ONLY when both env vars above
+  are set (otherwise it fails closed). Provision it from the TEE-generated key:
+  KMS `BlsGenKey` seals the key + returns the pubkey → write `node_state.json`
+  with that `publicKey` and `nodeId = keccak256(EIP-2537 pubkey)`, then register
+  on-chain (`registerWithProof`).
+- **Anti-abuse stays on the DVT host** (owner-auth `isValidOwnerAuth` eth_call
+  is a host job — the TA can't reach the chain). The TEE only raises single-node
+  key _extraction_ resistance to KMS level; the load-bearing security is the
+  threshold (≥3 independent nodes) + on-chain owner-auth. Slot-resolution and
+  the queue/execute tx sender still use the **operator EOA
+  (`ETH_PRIVATE_KEY`)**, a separate k1 key — that stays on host.
+
 ## Optional: hybrid Rust signer (faster BLS on ARM)
 
 Delegate BLS signing to a local Rust signer (byte-identical output —
 golden-vector verified — and faster on the A55). Fully optional: if the signer
-is down the DVT falls back to in-process Node signing. Best fit for this
-constrained board.
+is down the DVT falls back to in-process Node signing (UNLESS
+`RUST_SIGNER_REQUIRED=true`). Best fit for this constrained board.
 
 ```bash
 # (on your Mac) cross-build the arm64 signer — no Docker, uses cargo-zigbuild:

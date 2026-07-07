@@ -108,4 +108,65 @@ describe("NodeService — EIP-2335 keystore load (#5)", () => {
       }
     );
   });
+
+  // ── KMS-TEE (merged) mode: key-less node_state, BLS key sealed in the TEE ──────────
+  const withStateCfg = (
+    state: object,
+    cfg: Record<string, unknown>,
+    fn: (svc: NodeService) => void
+  ) => {
+    const dir = mkdtempSync(join(tmpdir(), "ks-"));
+    const file = join(dir, "node_state.json");
+    writeFileSync(file, JSON.stringify(state));
+    const config = { get: (k: string) => cfg[k] } as unknown as ConfigService;
+    const svc = new NodeService({} as any, {} as any, config);
+    (svc as any).nodeStateFilePath = file;
+    try {
+      fn(svc);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const keylessState = () => ({
+    nodeId: "0x1",
+    nodeName: "n",
+    publicKey: "0xabcd",
+    description: "d",
+  });
+
+  it("KMS-TEE: key-less node_state boots when RUST_SIGNER_URL + RUST_SIGNER_REQUIRED=true", () => {
+    withStateCfg(
+      keylessState(),
+      { rustSignerUrl: "http://127.0.0.1:3100", rustSignerRequired: true },
+      svc => {
+        expect(() => (svc as any).loadExistingNodeState()).not.toThrow();
+        expect((svc as any).nodeState.privateKey).toBeUndefined(); // key stays in the TEE
+        expect((svc as any).nodeState.publicKey).toBe("0xabcd");
+      }
+    );
+  });
+
+  it("KMS-TEE: key-less node_state FAILS CLOSED without RUST_SIGNER_REQUIRED (could not sign)", () => {
+    withStateCfg(keylessState(), { rustSignerUrl: "http://127.0.0.1:3100" }, svc => {
+      expect(() => (svc as any).loadExistingNodeState()).toThrow(
+        /neither a keystore nor a plaintext privateKey/
+      );
+    });
+    // and with neither url nor required set
+    withStateCfg(keylessState(), {}, svc => {
+      expect(() => (svc as any).loadExistingNodeState()).toThrow(
+        /neither a keystore nor a plaintext privateKey/
+      );
+    });
+  });
+
+  it("KMS-TEE: delegated but NO publicKey → throws (pubkey still needed for nodeId/announce)", () => {
+    withStateCfg(
+      { nodeId: "0x1", nodeName: "n", description: "d" },
+      { rustSignerUrl: "http://127.0.0.1:3100", rustSignerRequired: true },
+      svc => {
+        expect(() => (svc as any).loadExistingNodeState()).toThrow(/still needs the publicKey/);
+      }
+    );
+  });
 });
