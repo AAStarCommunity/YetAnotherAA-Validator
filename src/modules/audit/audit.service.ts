@@ -145,6 +145,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * that block's slash forever. Cleared once the co-sign completes (queued / executed / dry-run).
    */
   private readonly coSignRetryKeys = new Set<string>();
+  /**
+   * COARSE-key (operator|rule) → the on-chain proposalId of an in-flight (queued, not yet executed)
+   * slash. The proofHash carries `violationBlock`, so a SUSTAINED violation gets a NEW proofHash each
+   * time the finalized block advances — the archived-proof reuse (keyed by proofHash) then misses the
+   * prior proposal and a resume would file a fresh one every cooldown window. This coarse map lets a
+   * later-block resume REUSE the original proposalId (no per-cooldown orphan). Set when createProposal
+   * confirms, cleared when the slash executes. In-memory: a cross-restart cross-block resume falls back
+   * to one fresh (bounded, harmless) proposal; the same-proof archived-incomplete resume still reuses.
+   */
+  private readonly pendingProposalIds = new Map<string, string>();
   /** Hard ceiling on either dedup map's size — a defensive LRU-style cap against unbounded growth. */
   private static readonly MAX_DEDUP_ENTRIES = 10_000;
   /** Bounded ring of the most recent detections, newest first (for GET /audit/status). */
@@ -429,6 +439,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // entry per finalized-block change. Coarse-cap it — the current block re-adds next tick if still
     // aborting, so dropping stale entries never loses a live retry.
     if (this.coSignRetryKeys.size > AuditService.MAX_DEDUP_ENTRIES) this.coSignRetryKeys.clear();
+    // pendingProposalIds is keyed by coarse operator|rule (bounded by watchlist × rules) and clears on
+    // execute; coarse-cap it defensively against operator churn. Dropping an entry only costs one fresh
+    // proposal on the next resume (bounded, harmless) — never a lost slash.
+    if (this.pendingProposalIds.size > AuditService.MAX_DEDUP_ENTRIES)
+      this.pendingProposalIds.clear();
   }
 
   /**
@@ -925,8 +940,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // recorded in the archived proof) instead of creating a fresh one — bounds resume to ZERO new
       // proposals for a same-node retry (Codex High-2: orphan re-explosion). A peer resuming with no
       // local proposal (null) files one, throttled by the cooldown that a post-queue failure keeps.
-      const resumeProposalId =
-        resume && resumeArchived?.proposalId ? BigInt(resumeArchived.proposalId) : null;
+      // Reuse the in-flight proposalId: prefer the SAME-proof archived one, else the COARSE-key map
+      // (which survives a violationBlock advance → proofHash change, so a later-block resume does not
+      // file a fresh orphan proposal every cooldown window).
+      const carriedProposalId =
+        resumeArchived?.proposalId ?? this.pendingProposalIds.get(coarseKey) ?? null;
+      const resumeProposalId = resume && carriedProposalId ? BigInt(carriedProposalId) : null;
       const res = await this.coordinateQuorumCoSign(
         {
           operator: v.operator,
@@ -943,6 +962,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       onchainProposalId = res.proposalId;
       queueTx = res.queueTx;
       executeTx = res.executeTx;
+      // Track the in-flight proposal by COARSE key so a later-block resume (proofHash changed as the
+      // finalized violationBlock advanced) reuses this id instead of filing a fresh orphan. Set when a
+      // proposal exists but the slash did NOT execute this tick; clear once it really executes. Dry-run
+      // (executeTx = sentinel) touches neither — the drill is repeatable and writes no durable state.
+      if (onchainProposalId !== null && executeTx === null) {
+        this.pendingProposalIds.set(coarseKey, onchainProposalId.toString());
+      } else if (executeTx !== null && executeTx !== DRY_RUN_TX_SENTINEL) {
+        this.pendingProposalIds.delete(coarseKey);
+      }
       if (res.queueMessageHash) proof.queueMessageHash = res.queueMessageHash;
       if (res.coSignAborted) {
         // An ARMED attempt did not fully execute → mark the block for co-sign RETRY (bypasses the

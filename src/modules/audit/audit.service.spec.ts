@@ -1319,6 +1319,49 @@ describe("AuditService", () => {
     expect(archive.records[0].queueTx).toBeDefined(); // queue marker also preserved
   });
 
+  it("Codex-High: after the violationBlock advances, a resume REUSES the coarse pending proposalId (no per-cooldown orphan)", async () => {
+    // proofHash carries violationBlock, so a sustained violation gets a NEW proofHash each finalized-
+    // block advance. The archived-proof reuse (keyed by proofHash) then misses the prior proposal — but
+    // the COARSE (operator|rule) pending-proposal map still holds it, so a later-block resume reuses it
+    // instead of filing a fresh orphan proposal every cooldown window.
+    const archive = makeArchive();
+    let vblock = 1000;
+    let pending = false;
+    let creates = 0;
+    const blockchain = overLimitBlockchain({
+      isSlashPending: async () => pending,
+      queueSlashWithProof: async () => {
+        pending = true;
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => {
+        creates++;
+        return { txHash: "0xP", proposalId: 8n };
+      },
+      executeSlashWithProof: async () => {
+        throw new Error("execute keeps failing across cooldown windows");
+      },
+    });
+    blockchain.getBlockNumber = async () => vblock; // getViolationBlock delegates to this
+    let now = 1_700_000_000_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 20_000 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+
+    await svc.tick(); // block 1000: clear → queue + create (proposal 8) + execute fails
+    expect(creates).toBe(1);
+
+    vblock = 1005; // finalized violationBlock advanced → a NEW proofHash next tick
+    now += 25_000; // past cooldown
+    await svc.tick(); // pending → resume; archived proof for the NEW proofHash is absent, but the
+    // coarse map still holds proposal 8 → REUSED (skip createProposal), execute retried
+    expect(creates).toBe(1); // still 1 — no per-cooldown-window orphan proposal
+  });
+
   it("Codex-Critical: a RESTARTED process (empty in-memory retry state) resumes an archived incomplete slash via on-chain pending", async () => {
     // The full crash-restart hole: process A queues (pending on-chain) then dies before execute. A
     // FRESH process B — empty coSignRetryKeys / cooldown / proposedStableKeys — sharing only the
