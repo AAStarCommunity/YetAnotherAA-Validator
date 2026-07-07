@@ -303,8 +303,10 @@ function parseSlashThresholds(raw?: string): { WARNING: number; MINOR: number; M
   if (!raw) return out;
   for (const pair of raw.split(",")) {
     const [k, v] = pair.split(":").map(s => s.trim());
-    const n = parseInt(v, 10);
-    if ((k === "WARNING" || k === "MINOR" || k === "MAJOR") && Number.isFinite(n) && n > 0) {
+    // STRICT numeric parse (Codex R2 LOW): reject "4oops"/"" — parseInt would silently take 4.
+    // A malformed value is IGNORED so the safe floor is kept (never a weaker/garbage quorum).
+    const n = /^[0-9]+$/.test(v ?? "") ? Number(v) : NaN;
+    if ((k === "WARNING" || k === "MINOR" || k === "MAJOR") && Number.isSafeInteger(n) && n > 0) {
       const floor = SLASH_THRESHOLD_FLOOR[k];
       if (n < floor) {
         console.warn(

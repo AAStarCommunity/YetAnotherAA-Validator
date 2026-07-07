@@ -287,6 +287,57 @@ describe("GossipService co-sign collector: validate + dedupKey", () => {
     expect(responses.map(r => r.slot).sort((a, b) => a - b)).toEqual([1, 2]);
   });
 
+  it("MEDIUM 1: EXACT resends are dropped BEFORE validate + total validations are capped", async () => {
+    const svc = buildService();
+    let validateCalls = 0;
+    const countingValidate = async (r: CoSignResponsePayload) => {
+      validateCalls++;
+      return (r as any).ok === true;
+    };
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-cap" }), {
+      threshold: 3,
+      timeoutMs: 20,
+      validate: countingValidate,
+      dedupKey: bySlot,
+      maxValidations: 5,
+    }) as Promise<CoSignResponsePayload[]>;
+
+    // Same peer resends the IDENTICAL bogus response 10× → validate runs at most ONCE for it.
+    for (let i = 0; i < 10; i++) {
+      (svc as any).handleCoSignResponse(respMsg("flood", 5, false, "req-cap"));
+    }
+    await flush();
+    expect(validateCalls).toBe(1); // exact-dedup collapsed the 10 resends to a single validate
+
+    // Distinct bogus responses beyond the cap are dropped without validating.
+    for (let i = 0; i < 20; i++) {
+      (svc as any).handleCoSignResponse(respMsg(`d-${i}`, (i % 12) + 1, false, "req-cap"));
+    }
+    await flush();
+    expect(validateCalls).toBeLessThanOrEqual(5); // maxValidations cap enforced
+    await promise; // times out (never reached threshold) — bogus flood never formed a quorum
+  });
+
+  it("MEDIUM 1: a bogus early claim on a slot does NOT poison the honest signer's real response", async () => {
+    const svc = buildService();
+    const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-poison" }), {
+      threshold: 1,
+      timeoutMs: 1000,
+      validate: validateOk,
+      dedupKey: bySlot,
+    }) as Promise<CoSignResponsePayload[]>;
+
+    // Attacker claims slot 2 FIRST with a bogus (invalid) response → fails validate, not counted.
+    (svc as any).handleCoSignResponse(respMsg("attacker", 2, false, "req-poison"));
+    await flush();
+    // The HONEST dvt2 then sends its real slot-2 response → still validates + counts (no poisoning).
+    (svc as any).handleCoSignResponse(respMsg("dvt2", 2, true, "req-poison"));
+    const responses = await promise;
+    expect(responses).toHaveLength(1);
+    expect(responses[0].slot).toBe(2);
+    expect(responses[0].signerNodeId).toBe("dvt2");
+  });
+
   it("resolves EARLY once enough validated unique-slot responses arrive (before timeout)", async () => {
     const svc = buildService();
     const promise = (svc as any).requestCoSignatures(reqPayload({ requestId: "req-V" }), {

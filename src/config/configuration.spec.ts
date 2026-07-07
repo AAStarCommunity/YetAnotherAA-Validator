@@ -98,4 +98,15 @@ describe("configuration: auditSlashThresholds clamp (slash-quorum floor)", () =>
     expect(t.MINOR).toBe(3);
     expect(t.MAJOR).toBe(3);
   });
+
+  it("LOW (Codex R2): a numeric-prefix junk value ('4oops') is IGNORED, not read as 4", () => {
+    // parseInt would silently take 4; strict ^[0-9]+$ rejects it → the safe floor is kept.
+    process.env.AUDIT_SLASH_THRESHOLDS = "MINOR:4oops";
+    expect(configuration().auditSlashThresholds.MINOR).toBe(3);
+  });
+
+  it("LOW (Codex R2): an empty value ('MINOR:') keeps the floor", () => {
+    process.env.AUDIT_SLASH_THRESHOLDS = "MINOR:";
+    expect(configuration().auditSlashThresholds.MINOR).toBe(3);
+  });
 });

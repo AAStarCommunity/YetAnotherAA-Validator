@@ -73,6 +73,14 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       dedupKey?: (resp: CoSignResponsePayload) => string | number;
       finish: () => void;
       timer: NodeJS.Timeout | null;
+      // MEDIUM 1 (Codex R2) — bound validation work against a response flood without letting a
+      // peer poison a slot: skip EXACT resends before the async validate (identical response adds
+      // nothing), and cap the total number of validations started per request. Post-validate slot
+      // dedup (in `validated`) still decides the quorum, so an early bogus slot claim can never
+      // suppress the honest signer's real response for that slot.
+      seenExact: Set<string>;
+      validationsStarted: number;
+      maxValidations: number;
     }
   >();
 
@@ -582,6 +590,8 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       timeoutMs: number;
       validate?: (resp: CoSignResponsePayload) => Promise<boolean>;
       dedupKey?: (resp: CoSignResponsePayload) => string | number;
+      /** Hard cap on validate() calls per request (flood backstop). Default 64. */
+      maxValidations?: number;
     }
   ): Promise<CoSignResponsePayload[]> {
     return new Promise<CoSignResponsePayload[]>(resolve => {
@@ -601,6 +611,9 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
         dedupKey: opts.dedupKey,
         finish,
         timer: null as NodeJS.Timeout | null,
+        seenExact: new Set<string>(),
+        validationsStarted: 0,
+        maxValidations: Math.max(1, opts.maxValidations ?? 64),
       };
       this.pendingCoSign.set(payload.requestId, entry);
 
@@ -666,6 +679,16 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     const pending = this.pendingCoSign.get(payload.requestId);
     if (!pending) return; // unknown / already-resolved request → ignore
     if (pending.validate) {
+      // MEDIUM 1 (Codex R2): bound validation work BEFORE the expensive async validate.
+      // (a) Drop EXACT resends (same signer/slot/signature) — identical, adds nothing, and this
+      //     keys on the FULL response so it can never poison a slot the honest signer will claim.
+      // (b) Cap total validations per request as a flood backstop. Honest signers (≤ slot count)
+      //     fit far under the cap; a compromised peer spamming distinct bogus responses is bounded.
+      const exactKey = `${payload.signerNodeId}|${payload.slot}|${payload.signatureCompact}`;
+      if (pending.seenExact.has(exactKey)) return;
+      pending.seenExact.add(exactKey);
+      if (pending.validationsStarted >= pending.maxValidations) return;
+      pending.validationsStarted++;
       // Validate asynchronously; count ONLY on success. Failures (invalid sig / bad on-chain
       // binding) or validator errors are silently dropped and never reach the threshold.
       void pending
