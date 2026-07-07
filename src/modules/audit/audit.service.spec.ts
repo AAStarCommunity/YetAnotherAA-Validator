@@ -1415,6 +1415,56 @@ describe("AuditService", () => {
     expect(creates).toBe(2); // FRESH proposal (7) filed — the stale id 3 was cleared, not reused
   });
 
+  it("Codex-High: a peer completing the slash DURING cooldown is learned in-window → no double-slash after the event scrolls out", async () => {
+    // The cooldown must throttle the ATTEMPT, not LEARNING. This node attempts, backs off; a peer
+    // executes during the backoff. If assessSlashState were skipped throughout cooldown, the peer's
+    // SlashExecuted/OperatorSlashed would scroll out of the head-window before the next scan and this
+    // node would file a SECOND slash for the same sustained violation. Scanning during cooldown (while
+    // in-flight) records the durable marker while the event is still in-window → no double-slash.
+    const archive = makeArchive();
+    let curBlock = 1000;
+    let peerExecBlock: number | null = null;
+    let queues = 0;
+    const blockchain = overLimitBlockchain({
+      // Model the head-window: the peer's executed event is visible only within lookback (9) blocks.
+      getRecentSlashExecuted: async () => peerExecBlock !== null && curBlock - peerExecBlock <= 9,
+      isSlashPending: async () => false,
+      queueSlashWithProof: async () => {
+        queues++;
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => ({ txHash: "0xP", proposalId: 4n }),
+      executeSlashWithProof: async () => {
+        throw new Error("this node's execute fails");
+      },
+    });
+    blockchain.getBlockNumber = async () => curBlock;
+    let now = 1_700_000_000_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 20_000, auditSlashLookbackBlocks: 9 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+
+    await svc.tick(); // block 1000: this node queues (1) + create + execute fails → in-flight, cooldown set
+    expect(queues).toBe(1);
+
+    // A PEER executes at block 1002, still within this node's cooldown → the in-flight scan records the
+    // durable marker WHILE the event is in-window.
+    peerExecBlock = 1002;
+    curBlock = 1002;
+    now += 5_000; // within cooldown
+    await svc.tick();
+
+    // The event scrolls OUT of the window and cooldown expires. The durable marker prevents a fresh slash.
+    curBlock = 1020;
+    now += 25_000;
+    await svc.tick();
+    expect(queues).toBe(1); // still 1 — no double-slash even though the peer's event is now out-of-window
+  });
+
   it("Codex-Critical: a RESTARTED process (empty in-memory retry state) resumes an archived incomplete slash via on-chain pending", async () => {
     // The full crash-restart hole: process A queues (pending on-chain) then dies before execute. A
     // FRESH process B — empty coSignRetryKeys / cooldown / proposedStableKeys — sharing only the

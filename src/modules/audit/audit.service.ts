@@ -901,11 +901,18 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     let onchainProposalId: bigint | null = null;
     let proposalIdNote: string | undefined;
 
-    // Assess on-chain slash state ONCE (armed + not throttled): drives BOTH the over-slash guard
-    // ("executed"/"blocked" → skip) AND the RESUME path ("pending" → complete an incomplete on-chain
-    // slash without re-queuing). Skipped when within cooldown (throttled) or file-only (never queues).
+    // Assess on-chain slash state: drives the over-slash guard ("executed"/"blocked" → skip), the
+    // RESUME path ("pending"), and — critically — LEARNING that a PEER completed the slash. The
+    // cooldown throttles the ATTEMPT, but it must NOT throttle learning: a node with an IN-FLIGHT slash
+    // (pendingProposalIds / coSignRetryKeys) keeps scanning during its backoff so a peer's
+    // SlashExecuted/OperatorSlashed is recorded (recordCoarseSlashed) WHILE it is still inside the
+    // head-window — otherwise, if AUDIT_SLASH_LOOKBACK_BLOCKS is shorter than the cooldown's block
+    // horizon, the event scrolls out of the window and the post-cooldown scan reads "clear" → a DOUBLE
+    // slash of the same sustained violation (Codex). Only assess for armed nodes; file-only never
+    // queues. `assessSlashState`'s own step-1/2 in-memory/journal checks keep repeat calls cheap.
+    const inFlight = this.pendingProposalIds.has(coarseKey) || this.coSignRetryKeys.has(stableKey);
     const slashState: "executed" | "pending" | "clear" | "blocked" =
-      !withinCooldown && this.executeSlash
+      this.executeSlash && (!withinCooldown || inFlight)
         ? await this.assessSlashState(coarseKey, v.operator, v.slashLevel, v.violationBlock)
         : "clear";
 
