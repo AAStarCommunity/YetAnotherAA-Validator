@@ -138,6 +138,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * archive-before-execute ordering. The file-only proposal path is unaffected (keeps per-block dedup).
    */
   private readonly slashedCoarseKeys = new Set<string>();
+  /**
+   * Stable keys whose ARMED co-sign aborted TRANSIENTLY (no gossip peers yet / quorum not reached).
+   * The dedup gate bypasses these so the co-sign is re-attempted next tick even though the evidence
+   * is already archived — a node that detects a violation before its gossip mesh is up must not lose
+   * that block's slash forever. Cleared once the co-sign completes (queued / executed / dry-run).
+   */
+  private readonly coSignRetryKeys = new Set<string>();
   /** Hard ceiling on either dedup map's size — a defensive LRU-style cap against unbounded growth. */
   private static readonly MAX_DEDUP_ENTRIES = 10_000;
   /** Bounded ring of the most recent detections, newest first (for GET /audit/status). */
@@ -410,6 +417,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     for (const [key, ts] of this.lastProposalAt) {
       if (now - ts > this.cooldownMs) this.lastProposalAt.delete(key);
     }
+    // coSignRetryKeys clears on co-sign success; a permanently-partitioned node could still leak one
+    // entry per finalized-block change. Coarse-cap it — the current block re-adds next tick if still
+    // aborting, so dropping stale entries never loses a live retry.
+    if (this.coSignRetryKeys.size > AuditService.MAX_DEDUP_ENTRIES) this.coSignRetryKeys.clear();
   }
 
   /**
@@ -754,8 +765,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // ── DEDUP ─────────────────────────────────────────────────────────────────────
     const stableKey = `${this.chainId}|${v.operator}|${v.rule}|${v.violationBlock}`;
     const coarseKey = this.coarseKey(v.operator, v.rule);
-    // Exact same violation@block already handled (this process, or on disk from a prior run).
-    if (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash))) {
+    // Exact same violation@block already handled (this process, or on disk from a prior run) — UNLESS
+    // a prior attempt's ARMED co-sign aborted transiently (no peers yet): `coSignRetryKeys` bypasses
+    // the dedup so the co-sign is re-attempted even though the evidence is already archived.
+    if (
+      !this.coSignRetryKeys.has(stableKey) &&
+      (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash)))
+    ) {
       this.logger.debug(
         `Audit: ${v.operator} ${v.rule}@${v.violationBlock} already proposed (proof ${proofHash}) — skip`
       );
@@ -858,6 +874,21 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       queueTx = res.queueTx;
       executeTx = res.executeTx;
       if (res.queueMessageHash) proof.queueMessageHash = res.queueMessageHash;
+      if (res.coSignAborted) {
+        // ROBUSTNESS GAP FIX: the armed queue co-sign failed TRANSIENTLY (no gossip peers yet /
+        // quorum not reached / staticCall reverted) — nothing was slashed, no gas spent. Mark this
+        // block for co-sign RETRY (bypasses the archived-evidence dedup) + clear the coarse cooldown
+        // so the NEXT tick re-attempts, instead of permanently skipping the block (a node that detects
+        // a violation before its gossip mesh is up would otherwise lose that block's slash forever).
+        this.coSignRetryKeys.add(stableKey);
+        this.lastProposalAt.delete(coarseKey);
+        this.logger.warn(
+          `Audit: ${v.operator} ${v.rule} co-sign aborted (transient) — will retry next tick`
+        );
+      } else {
+        // Co-sign completed (queued / executed / dry-run) → stop retrying this block.
+        this.coSignRetryKeys.delete(stableKey);
+      }
       if (executeTx === DRY_RUN_TX_SENTINEL) {
         // DRY RUN: the quorum co-sign + staticCall preflight passed against the REAL contracts, but
         // NOTHING was slashed (no broadcast). Record the real co-sign material + the sentinel tx so
@@ -1102,9 +1133,18 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     queueMessageHash: string | null;
     signerMask: string;
     sigG2: string;
+    /**
+     * True when the ARMED queue co-sign could NOT complete for a TRANSIENT reason (no gossip peers
+     * yet / quorum not reached / staticCall preflight reverted) — nothing was slashed and no gas was
+     * spent. The caller then clears the per-block dedup + cooldown so the NEXT tick re-attempts,
+     * instead of losing this violation-block's co-sign forever (robustness gap: a node that detects
+     * before its gossip mesh is up must not permanently skip the block).
+     */
+    coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
     const armed = this.executeSlash;
+    let coSignAborted = false;
     // DRY-RUN drill (only meaningful when armed): the co-sign below STILL happens and the queue/execute
     // staticCall preflight STILL runs against the REAL contracts, but the broadcast is skipped and the
     // step returns DRY_RUN_TX_SENTINEL. queueTx/executeTx then carry the sentinel (recorded as-is).
@@ -1164,8 +1204,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
+        // TRANSIENT: the armed queue co-sign didn't complete (no peers / quorum not met / staticCall
+        // reverted). Nothing slashed, no gas spent. Signal the caller to RETRY next tick rather than
+        // marking this violation-block permanently handled.
+        coSignAborted = true;
         this.logger.error(
-          `Audit: ${operator} slash queue step failed — ${msg} (evidence archived; slash not queued)`
+          `Audit: ${operator} slash queue step failed — ${msg} (evidence archived; slash not queued; will retry)`
         );
       }
     }
@@ -1263,7 +1307,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         }
       }
     }
-    return { proposalTx, proposalId, queueTx, executeTx, queueMessageHash, signerMask, sigG2 };
+    return {
+      proposalTx,
+      proposalId,
+      queueTx,
+      executeTx,
+      queueMessageHash,
+      signerMask,
+      sigG2,
+      coSignAborted,
+    };
   }
 
   /** Read-only status for GET /audit/status. No secrets. */

@@ -435,6 +435,29 @@ describe("AuditService", () => {
     expect(created).toHaveLength(1);
   });
 
+  it("robustness: a TRANSIENT armed co-sign abort (no peers) is RE-ATTEMPTED next tick (not dedup-suppressed)", async () => {
+    let coSignCalls = 0;
+    const coSigner: IQuorumCoSigner = {
+      async coSign() {
+        coSignCalls++;
+        throw new Error("gossip co-sign: no gossip peers available to reach quorum");
+      },
+    };
+    const svc = makeService(
+      overLimitBlockchain(),
+      makeConfig({ auditExecuteSlash: true }),
+      makeArchive(),
+      clockAt(1_700_000_000_000),
+      coSigner
+    );
+    await svc.tick();
+    await svc.tick();
+    await svc.tick();
+    // Without the fix the archived-evidence dedup would suppress ticks 2-3 → coSignCalls===1 and the
+    // block's slash is lost forever. The transient-abort retry re-attempts every tick.
+    expect(coSignCalls).toBe(3);
+  });
+
   it("dedup: an already-archived proof (prior process) → no new proposal", async () => {
     const created: any[] = [];
     const blockchain = overLimitBlockchain({
