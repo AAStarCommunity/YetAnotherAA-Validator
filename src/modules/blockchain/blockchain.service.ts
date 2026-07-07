@@ -1117,7 +1117,8 @@ export class BlockchainService {
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
       throw new Error(
-        `queueSlashWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`
+        `queueSlashWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`,
+        { cause: err }
       );
     }
     // DRY-RUN (AUDIT_DRY_RUN): the preflight above ran against the REAL contract and passed, proving
@@ -1183,7 +1184,8 @@ export class BlockchainService {
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
       throw new Error(
-        `executeWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`
+        `executeWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`,
+        { cause: err }
       );
     }
     // DRY-RUN (AUDIT_DRY_RUN): the preflight above simulated the EXACT irreversible slash against the

@@ -251,7 +251,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       toCheck.push(["AUDIT_GTOKEN_STAKING_ADDRESS", this.gtokenStakingAddress]);
     }
     for (const [name, addr] of toCheck) {
-      let code = "0x";
+      let code: string;
       try {
         code = await this.blockchainService.getCode(addr);
       } catch (err: unknown) {
@@ -1339,7 +1339,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     recentDetections: AuditDetection[];
     archivedProofCount: number;
   }> {
-    let archivedProofCount = 0;
+    let archivedProofCount: number;
     try {
       archivedProofCount = await this.archive.count();
     } catch {

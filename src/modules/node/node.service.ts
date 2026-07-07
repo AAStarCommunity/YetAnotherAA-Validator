@@ -53,7 +53,7 @@ export class NodeService implements OnModuleInit {
     try {
       state = JSON.parse(readFileSync(this.nodeStateFilePath, "utf8"));
     } catch (error: any) {
-      throw new Error(`Failed to load node state: ${error.message}`);
+      throw new Error(`Failed to load node state: ${error.message}`, { cause: error });
     }
     this.nodeState = this.resolvePrivateKey(state);
   }
@@ -114,7 +114,7 @@ export class NodeService implements OnModuleInit {
       }
       writeFileSync(this.nodeStateFilePath, JSON.stringify(toWrite, null, 2), "utf8");
     } catch (error: any) {
-      throw new Error(`Failed to save node state: ${error.message}`);
+      throw new Error(`Failed to save node state: ${error.message}`, { cause: error });
     }
   }
 

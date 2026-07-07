@@ -41,7 +41,7 @@ export class GossipWhitelistValidator {
     try {
       url = new URL(endpoint);
     } catch (error) {
-      throw new Error(`Invalid URL format: ${endpoint}`);
+      throw new Error(`Invalid URL format: ${endpoint}`, { cause: error });
     }
 
     // Validate protocol
