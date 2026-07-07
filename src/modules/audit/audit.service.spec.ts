@@ -1285,6 +1285,40 @@ describe("AuditService", () => {
     expect((await svc.getStatus()).recentDetections[0].executeTx).toBe("0xEXECUTETX"); // slash completed
   });
 
+  it("Codex-High: a cooldown-suppressed tick does NOT clobber the carried-forward proposalId (reuse survives)", async () => {
+    // tick 1 queues + creates proposal 5 (durably persisted) then execute fails → cooldown KEPT
+    // (post-queue throttle). tick 2 falls WITHIN cooldown so the orchestrator is not called; the
+    // finalization must NOT overwrite the carried-forward proposalId with null — else a later crash
+    // loses it and the resume files a fresh orphan proposal.
+    const archive = makeArchive();
+    const blockchain = overLimitBlockchain({
+      getRecentSlashExecuted: async () => false,
+      isSlashPending: async () => false, // tick 1 is a normal (non-resume) queue
+      queueSlashWithProof: async () => "0xQUEUE",
+      createProposalWithEvidence: async () => ({ txHash: "0xP", proposalId: 5n }),
+      executeSlashWithProof: async () => {
+        throw new Error("execute reverted");
+      },
+    });
+    // Fixed clock → tick 2 is WITHIN the default cooldown.
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      clockAt(1_700_000_000_000),
+      makeCoSigner()
+    );
+
+    await svc.tick(); // queue + create (proposalId 5 persisted) + execute fails
+    expect(archive.records[0].proposalId).toBe("5");
+    expect(archive.records[0].queueTx).toBeDefined();
+    expect(archive.records[0].executeTx).toBeUndefined();
+
+    await svc.tick(); // within cooldown → suppressed; the carried proposalId MUST survive
+    expect(archive.records[0].proposalId).toBe("5"); // not clobbered to null
+    expect(archive.records[0].queueTx).toBeDefined(); // queue marker also preserved
+  });
+
   it("Codex-Critical: a RESTARTED process (empty in-memory retry state) resumes an archived incomplete slash via on-chain pending", async () => {
     // The full crash-restart hole: process A queues (pending on-chain) then dies before execute. A
     // FRESH process B — empty coSignRetryKeys / cooldown / proposedStableKeys — sharing only the

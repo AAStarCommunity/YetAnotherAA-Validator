@@ -792,7 +792,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // this tick's archive overwrite and any crash-before-persist window). Only a COMPLETED archived
     // slash (executeTx set), or the file-only path, takes the fast dedup skip. (Codex-Critical: the
     // archived queueTx alone is NOT a safe skip signal — the on-chain flag is.)
-    const armedUnfinished = this.executeSlash && (!archived || !archived.executeTx);
+    // …unless we ALREADY know (in-memory, this process) the coarse operator+rule was slashed — then
+    // the fast skip is safe (no resume needed) and avoids re-processing/re-archiving every tick when a
+    // slash landed on-chain but its executeTx was never persisted locally (Codex Low: churn).
+    const armedUnfinished =
+      this.executeSlash &&
+      !this.slashedCoarseKeys.has(coarseKey) &&
+      (!archived || !archived.executeTx);
     if (!this.coSignRetryKeys.has(stableKey) && !armedUnfinished) {
       if (this.proposedStableKeys.has(stableKey) || (await this.archive.has(proofHash))) {
         this.logger.debug(
@@ -1026,7 +1032,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       proof.messageHash = "0x";
       proof.messageHashNote = proposalIdNote ?? "id-unresolved: no on-chain proposal to sign over";
     }
-    proof.proposalId = proposalId;
+    // Only OVERWRITE proposalId when THIS tick resolved a real on-chain id (a fresh createProposal or
+    // a reused resume id). When it did NOT (a cooldown-SUPPRESSED tick never called the orchestrator,
+    // so onchainProposalId is null), KEEP the value already on `proof` — carried forward from the
+    // archived incomplete attempt — so a durable proposalId survives for reuse and a later crash does
+    // not lose it (Codex: null-clobber reopened orphan reuse). Never clobber a real id with null.
+    if (onchainProposalId !== null) {
+      proof.proposalId = proposalId;
+    }
     if (proposalIdNote) proof.proposalIdNote = proposalIdNote;
     if (proposalTx) proof.proposalTx = proposalTx;
     if (queueTx) proof.queueTx = queueTx;
