@@ -163,9 +163,16 @@ export class BlsService {
     node: NodeKeyPair
   ): Promise<SignatureResult> {
     const url = `${base.replace(/\/+$/, "")}/sign`;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    // KMS-TEE mode: attach the shared secret when configured so a KMS signer with
+    // KMS_BLS_SIGNER_TOKEN set accepts this request (and rejects other local processes).
+    const signerToken = this.configService?.get<string>("rustSignerToken");
+    if (signerToken) {
+      headers["X-Signer-Token"] = signerToken;
+    }
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ user_op_hash: userOpHash, node_id: node.nodeId }),
     });
     if (!response.ok) {
