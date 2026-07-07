@@ -323,6 +323,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
             : "file+archive ONLY"
         })`
     );
+    // Armed, real-broadcast operators: surface the two double-slash residuals the DVT over-slash
+    // guard can only PARTIALLY cover (they need operational sizing / an SP contract change — see
+    // docs/RELEASE_TEST_CHECKLIST.md "double-slash residuals").
+    if (this.executeSlash && !this.dryRun) {
+      this.logger.warn(
+        `DVT audit ARMED (real slash): the cross-node over-slash guard scans the last ` +
+          `${this.slashLookbackBlocks} blocks (AUDIT_SLASH_LOOKBACK_BLOCKS). Size it to cover the ` +
+          `worst-case node restart/offline horizon for a SUSTAINED violation — a peer slash that ages ` +
+          `out of this window before a fresh node scans can be double-slashed. AUTHORITATIVE ` +
+          `same-episode double-slash prevention requires the SuperPaymaster BLS execute path to carry ` +
+          `the slash cooldown its owner path already has (executeSlashWithBLS lacks _slashCd) — tracked with @repo:sp.`
+      );
+    }
   }
 
   onApplicationShutdown(): void {
