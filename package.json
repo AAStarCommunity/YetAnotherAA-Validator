@@ -84,6 +84,7 @@
     "picomatch": "4.0.4"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@jest/globals": "^30.4.1",
     "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",
