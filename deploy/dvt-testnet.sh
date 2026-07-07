@@ -52,16 +52,24 @@ start() {
       pub_url="${!pub_var:-}"
       if [ -n "$pub_url" ]; then
         export PUBLIC_URL="$pub_url"
-        export GOSSIP_PUBLIC_URL="${pub_url/https:/wss:}/ws"
-        # Seed the mesh from all three nodes' gossip endpoints (the node drops its own
-        # self-reference); unset GOSSIP_BOOTSTRAP_PEERS in .env.testnet keeps it default.
-        if [ -z "${GOSSIP_BOOTSTRAP_PEERS:-}" ]; then
-          seeds=""
-          for j in 1 2 3; do
-            jv="NODE${j}_PUBLIC_URL"; ju="${!jv:-}"
-            [ -n "$ju" ] && seeds="${seeds:+$seeds,}${ju/https:/wss:}/ws"
-          done
-          export GOSSIP_BOOTSTRAP_PEERS="$seeds"
+        if [ "${DRILL_LOCAL_GOSSIP:-}" = "1" ]; then
+          # Co-located drill: the 3 nodes are on THIS machine — gossip over localhost,
+          # bypassing the cloudflare tunnel (whose wss://dvtN.aastar.io/ws returns 502 on
+          # the WebSocket upgrade). PUBLIC_URL (app announce) stays cloudflare.
+          export GOSSIP_PUBLIC_URL="ws://localhost:${port}/ws"
+          export GOSSIP_BOOTSTRAP_PEERS="ws://localhost:4001/ws,ws://localhost:4002/ws,ws://localhost:4003/ws"
+        else
+          export GOSSIP_PUBLIC_URL="${pub_url/https:/wss:}/ws"
+          # Seed the mesh from all three nodes' gossip endpoints (the node drops its own
+          # self-reference); unset GOSSIP_BOOTSTRAP_PEERS in .env.testnet keeps it default.
+          if [ -z "${GOSSIP_BOOTSTRAP_PEERS:-}" ]; then
+            seeds=""
+            for j in 1 2 3; do
+              jv="NODE${j}_PUBLIC_URL"; ju="${!jv:-}"
+              [ -n "$ju" ] && seeds="${seeds:+$seeds,}${ju/https:/wss:}/ws"
+            done
+            export GOSSIP_BOOTSTRAP_PEERS="$seeds"
+          fi
         fi
       fi
       nohup node "$DIST" >"$RUN/node$i.log" 2>&1 &

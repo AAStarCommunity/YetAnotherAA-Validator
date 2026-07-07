@@ -558,11 +558,27 @@ export class BlockchainService {
     contractAddress: string,
     operator: string,
     slashLevel: number,
-    fromBlock: number
+    lookbackBlocks: number
   ): Promise<boolean | null> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
+    // Scan a BOUNDED window ending at the chain HEAD: [latest - lookbackBlocks, latest]. Slash
+    // events are emitted near `latest` (a slash fires AFTER the finalized violation is detected), so
+    // anchoring the window at the head — not at the ~60-blocks-behind finalized violationBlock — both
+    // catches the real events AND keeps the getLogs range == lookbackBlocks. Size lookbackBlocks to
+    // your RPC's getLogs cap (Alchemy free = 10) so the scan stays determinate; a range wider than the
+    // cap errors → indeterminate → the over-slash guard fails CLOSED (real-env finding).
+    let latest: number;
+    try {
+      latest = await this.provider.getBlockNumber();
+    } catch (error: any) {
+      this.logger.warn(
+        `getRecentSlashExecuted getBlockNumber failed: ${error.message} — indeterminate`
+      );
+      return null;
+    }
+    const fromBlock = Math.max(0, latest - Math.max(0, lookbackBlocks));
     const iface = new ethers.Interface([
       "event SlashExecutedWithProof(address indexed operator, uint8 level, uint256 penalty, bytes32 proofHash, uint256 timestamp)",
       "event SlashExecuted(uint256 indexed proposalId, address indexed operator, uint8 level)",
@@ -992,7 +1008,8 @@ export class BlockchainService {
     operator: string,
     level: number,
     reason: string,
-    evidenceHash: string
+    evidenceHash: string,
+    dryRun = false
   ): Promise<{ txHash: string; proposalId: bigint | null }> {
     if (!this.wallet) {
       throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
@@ -1003,6 +1020,22 @@ export class BlockchainService {
     ];
     const iface = new ethers.Interface(abi);
     const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+    // DRY RUN (Codex #181 F1): createProposal is a REAL governance tx — broadcasting it in a drill
+    // would leave an orphaned on-chain proposal. staticCall instead: it validates the call AND returns
+    // the would-be proposalId (createProposal's return value) for the execute messageHash, with NO
+    // broadcast and no side effect.
+    if (dryRun) {
+      const wouldBeId: bigint = await contract.createProposal.staticCall(
+        operator,
+        level,
+        reason,
+        evidenceHash
+      );
+      this.logger.log(
+        `createProposal DRY RUN: staticCall passed (would-be id ${wouldBeId}) — NOT broadcasting`
+      );
+      return { txHash: DRY_RUN_TX_SENTINEL, proposalId: wouldBeId };
+    }
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.createProposal(
       operator,

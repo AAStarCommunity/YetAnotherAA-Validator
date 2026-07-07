@@ -29,11 +29,15 @@ function makeSlashExecutedLog(proposalId: bigint, operator: string, level: numbe
   return { topics: encoded.topics, data: encoded.data };
 }
 
-/** A BlockchainService whose `provider.getLogs` is the supplied stub. */
-function makeService(getLogs: (filter: any) => Promise<any[]>): BlockchainService {
+/** A BlockchainService whose `provider.getLogs` is the supplied stub. getRecentSlashExecuted now
+ *  anchors the scan window at the chain HEAD, so the provider also exposes getBlockNumber. */
+function makeService(
+  getLogs: (filter: any) => Promise<any[]>,
+  getBlockNumber: () => Promise<number> = async () => 1000
+): BlockchainService {
   const config = { get: (_k: string) => undefined } as any;
   const svc = new BlockchainService(config);
-  (svc as any).provider = { getLogs };
+  (svc as any).provider = { getLogs, getBlockNumber };
   return svc;
 }
 
@@ -204,6 +208,30 @@ describe("BlockchainService dry-run (AUDIT_DRY_RUN) — queue/execute skip broad
       svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, PROOF, true)
     ).rejects.toThrow(/preflight \(staticCall\) reverted/);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("F1 (Codex #181): createProposal dryRun=true → staticCall for the would-be id, NO broadcast", async () => {
+    const svc = makeWriterService();
+    // createProposal is a REAL governance tx — dry-run must NOT file an orphaned proposal. staticCall
+    // returns the would-be proposalId (for the execute messageHash); the real send never fires.
+    const send = jest.fn(async () => ({
+      hash: "0xTXHASH",
+      wait: async () => ({ status: 1, logs: [] }),
+    }));
+    (send as any).staticCall = jest.fn(async () => 42n);
+    (svc as any).buildContract = () => ({ createProposal: send }) as any;
+    const res = await svc.createProposalWithEvidence(
+      DVT_VALIDATOR,
+      OPERATOR,
+      1,
+      "credit-over-limit",
+      "0x" + "cd".repeat(32),
+      true
+    );
+    expect(res.txHash).toBe(DRY_RUN_TX_SENTINEL);
+    expect(res.proposalId).toBe(42n); // the would-be id from staticCall
+    expect((send as any).staticCall).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled(); // no real proposal filed
   });
 
   it("queue dryRun=false → unchanged: send IS called, returns the real tx hash", async () => {

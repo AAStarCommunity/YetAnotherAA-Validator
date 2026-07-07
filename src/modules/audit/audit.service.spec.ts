@@ -1253,17 +1253,17 @@ describe("AuditService", () => {
     expect(archive.slashed.size).toBe(1);
   });
 
-  it("Finding 2: getRecentSlashExecuted scans within [violationBlock - lookback, latest]", async () => {
-    let scannedFrom: number | undefined;
+  it("Finding 2: getRecentSlashExecuted is passed the lookback WINDOW size (head-anchored scan)", async () => {
+    let scannedLookback: number | undefined;
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, {
       getRecentSlashExecuted: async (
         _addr: string,
         _op: string,
         _slashLevel: number,
-        fromBlock: number
+        lookbackBlocks: number
       ) => {
-        scannedFrom = fromBlock;
+        scannedLookback = lookbackBlocks;
         return false;
       },
     });
@@ -1276,8 +1276,10 @@ describe("AuditService", () => {
       makeCoSigner()
     );
     await svc.tick();
-    // violationBlock 100000 - lookback 40000 = 60000.
-    expect(scannedFrom).toBe(60_000);
+    // The window is now anchored at the chain HEAD: [latest - lookback, latest]. The caller passes
+    // the lookback size (40000) directly, not an absolute fromBlock — so the getLogs range == lookback
+    // and can be sized to the RPC's getLogs cap (real-env finding: Alchemy free = 10 blocks).
+    expect(scannedLookback).toBe(40_000);
   });
 
   // ── Codex round-2 HIGH: an INDETERMINATE on-chain scan fails CLOSED (no double-slash) ──

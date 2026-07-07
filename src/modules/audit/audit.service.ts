@@ -292,6 +292,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         this.intervalMs
       );
     }, jitterMs);
+    if (this.dryRun && !this.executeSlash) {
+      // F2 (Codex #181): AUDIT_DRY_RUN only matters on the armed co-sign/slash path. When disarmed
+      // the flag is a silent no-op — warn so a mis-set drill config is visible, not silently ignored.
+      this.logger.warn(
+        "AUDIT_DRY_RUN=true but AUDIT_EXECUTE_SLASH is not armed — DRY_RUN has NO effect " +
+          "(the co-sign + staticCall path runs only when armed). Set AUDIT_EXECUTE_SLASH=true for the drill."
+      );
+    }
     this.logger.log(
       `DVT audit ENABLED — interval=${this.intervalMs}ms jitter=${jitterMs}ms ` +
         `watchlist=[${this.watchlist.join(", ")}] creditThreshold=${this.creditThresholdBps}bps ` +
@@ -1033,14 +1041,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // target means that scan was INDETERMINATE (provider error), tracked so (5) can fail closed.
     let scanIndeterminate = false;
     try {
-      const fromBlock = Math.max(0, violationBlock - this.slashLookbackBlocks);
+      // Scan the most-recent `slashLookbackBlocks` at the chain HEAD (where slash events are emitted),
+      // NOT anchored at the ~60-blocks-behind finalized violationBlock — the range then equals the
+      // lookback (size it to the RPC's getLogs cap so the scan stays determinate).
       const scanTargets = [this.blsAggregatorAddress, this.superPaymasterAddress].filter(Boolean);
       for (const target of scanTargets) {
         const hit = await this.blockchainService.getRecentSlashExecuted(
           target,
           operator,
           slashLevel,
-          fromBlock
+          this.slashLookbackBlocks
         );
         if (hit === true) {
           await this.recordCoarseSlashed(coarseKey); // persist durable + memory
@@ -1221,7 +1231,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         operator,
         slashLevel,
         reason,
-        evidenceHash
+        evidenceHash,
+        dryRun
       );
       proposalTx = res.txHash;
       proposalId = res.proposalId;
