@@ -1,4 +1,5 @@
 import {
+  Inject,
   Injectable,
   Logger,
   Optional,
@@ -10,11 +11,12 @@ import { ethers } from "ethers";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 import type { IProofArchive, SlashProof, EvidenceSource, ProofIdentity } from "./proof-archive.js";
-import { LocalProofArchive, computeProofHash } from "./proof-archive.js";
-import type { IQuorumCoSigner } from "./slash-consensus.js";
+import { LocalProofArchive, computeProofHash, PROOF_SCHEMA_VERSION } from "./proof-archive.js";
+import type { IQuorumCoSigner, CoSignRequest, CoSignVerifier } from "./slash-consensus.js";
 import {
   SlashLevel,
   PendingSlotCoSigner,
+  QUORUM_COSIGNER,
   buildQueueMessageHash,
   buildExecuteMessageHash,
   encodeProof,
@@ -146,7 +148,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     /** Test seam: injectable archive; defaults to a LocalProofArchive at auditProofDir. */
     @Optional() archive?: IProofArchive,
     /** Injected quorum co-signer; defaults to the deferred PendingSlotCoSigner (fails closed). */
-    @Optional() coSigner?: IQuorumCoSigner
+    @Optional() @Inject(QUORUM_COSIGNER) coSigner?: IQuorumCoSigner
   ) {
     this.enabled = config.get<boolean>("auditEnabled") === true;
     this.intervalMs = config.get<number>("auditIntervalMs") ?? 60_000;
@@ -253,6 +255,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         return;
       }
     }
+    // Wire the gossip quorum co-sign responder (inc-2 live). When the injected co-signer is the
+    // live GossipQuorumCoSigner (armed node), hand it the independent violation verifier and let
+    // it register its responder handler on GossipService, so this armed node re-verifies + co-signs
+    // peer slash requests from first principles even if it never itself requests. A no-op on the
+    // disarmed PendingSlotCoSigner default (no `arm` method).
+    const armable = this.coSigner as Partial<{ arm: (v: CoSignVerifier) => void }>;
+    if (typeof armable.arm === "function") {
+      armable.arm(req => this.verifyViolationForCoSign(req));
+      this.logger.log("DVT audit: gossip quorum co-sign responder ARMED");
+    }
+
     // Phase-jitter the first tick across [0, intervalMs) so redundant auditors that boot
     // together don't all file the same proposal in the same window.
     const jitterMs = this.computeJitterMs();
@@ -305,6 +318,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
 
   private coarseKey(operator: string, rule: string): string {
     return `${this.chainId}|${operator}|${rule}`;
+  }
+
+  /**
+   * Checksum-normalize a config address for the content-address identity so two DVT nodes with
+   * differently-cased AUDIT_* addresses still derive the SAME proofHash (LOW). Falls back to the raw
+   * string if it is not a valid address (bootstrap already gates existence, so this is defensive).
+   */
+  private normalizeAddress(addr: string): string {
+    try {
+      return ethers.getAddress(addr);
+    } catch {
+      return addr;
+    }
   }
 
   /**
@@ -552,6 +578,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       reason,
       rule: RULE_CREDIT_OVER_LIMIT,
       creditLimit,
+      availableCredit,
       debt,
       violationBlock,
       violationBlockHash,
@@ -571,6 +598,101 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
+   * Pure credit-over-limit predicate — the SINGLE rule decision shared by the audit tick's
+   * detection (auditOperator) and the co-sign responder's independent re-confirmation
+   * (verifyViolationForCoSign), so a peer confirms EXACTLY the condition the requester detected
+   * (no rule drift). Mirrors the inline checks in auditOperator: null debt / creditLimit==0 /
+   * availableCredit>0 / debt<=limit / under-margin all resolve to `false` (not a violation).
+   */
+  private isCreditOverLimit(
+    creditLimit: bigint,
+    availableCredit: bigint,
+    debt: bigint | null
+  ): boolean {
+    if (debt === null) return false;
+    if (creditLimit === 0n) return false;
+    if (availableCredit > 0n) return false;
+    if (!(debt > creditLimit)) return false;
+    const usageBps = (debt * 10_000n) / creditLimit;
+    if (usageBps < this.creditThresholdBps) return false;
+    return true;
+  }
+
+  /**
+   * The RESPONDER-side independent violation re-confirmation (inc-2 live). Given a peer's co-sign
+   * request, re-read the operator's on-chain state PINNED at `epoch` (= the violationBlock) and
+   * re-apply this node's OWN credit-over-limit rule, then re-derive the content-address. Returns
+   * `{ confirmed, proofHash }`; the responder compares the proofHash against the request's
+   * evidenceHash for the execute step (the innocent-operator defense). Fail-closed: an
+   * un-watchlisted operator, a chain/level mismatch, an unreadable debt, or any RPC error resolves
+   * to `{ confirmed: false, proofHash: null }` — this node then refuses to co-sign.
+   */
+  async verifyViolationForCoSign(
+    req: CoSignRequest
+  ): Promise<{ confirmed: boolean; proofHash: string | null }> {
+    const NO = { confirmed: false, proofHash: null };
+    try {
+      // Bind to THIS node's chain + rule: a request for another chain or a slashLevel this node's
+      // rule never assigns cannot be confirmed (the messageHash recompute already catches chain,
+      // this is defense-in-depth + the queue-step level check).
+      if (req.chainId !== this.chainId) return NO;
+      if (req.slashLevel !== SLASH_LEVEL_CREDIT_OVER_LIMIT) return NO;
+
+      let operator: string;
+      try {
+        operator = ethers.getAddress(req.operator);
+      } catch {
+        return NO;
+      }
+      if (!this.watchlist.includes(operator)) return NO;
+
+      const blockTag = req.epoch;
+      if (!Number.isInteger(blockTag) || blockTag < 0) return NO;
+
+      // Re-read the SAME rule inputs the tick reads, pinned at the epoch block.
+      const [creditLimit, availableCredit, debt] = await Promise.all([
+        this.blockchainService.getCreditLimit(this.registryAddress, operator, blockTag),
+        this.blockchainService.getAvailableCredit(
+          this.superPaymasterAddress,
+          operator,
+          this.apntsTokenAddress,
+          blockTag
+        ),
+        this.readOperatorDebt(operator, blockTag),
+      ]);
+
+      if (!this.isCreditOverLimit(creditLimit, availableCredit, debt)) return NO;
+
+      // Re-derive the content-address from the SAME on-chain identity (wall-clock-free), so it
+      // equals the requester's proofHash for the identical violation. Every slash-critical input —
+      // availableCredit, slashLevel, and the source contract/token addresses — is committed at the
+      // FINALIZED block, so evidenceHash is a full content address of exactly what would be slashed.
+      // No block-HEADER read is needed (finding-2): reorg-safety comes from the finality-pinned
+      // `epoch`, so a non-archive node that cannot read an old header still reproduces this proofHash.
+      const identity: ProofIdentity = {
+        proofSchemaVersion: PROOF_SCHEMA_VERSION,
+        chainId: this.chainId,
+        operator,
+        rule: RULE_CREDIT_OVER_LIMIT,
+        creditLimit: creditLimit.toString(),
+        availableCredit: availableCredit.toString(),
+        debt: (debt as bigint).toString(),
+        violationBlock: blockTag,
+        slashLevel: SLASH_LEVEL_CREDIT_OVER_LIMIT,
+        registry: this.normalizeAddress(this.registryAddress),
+        superPaymaster: this.normalizeAddress(this.superPaymasterAddress),
+        dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
+        apntsToken: this.normalizeAddress(this.apntsTokenAddress),
+      };
+      return { confirmed: true, proofHash: computeProofHash(identity) };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`verifyViolationForCoSign refused (indeterminate): ${msg}`);
+      return NO;
+    }
+  }
+
+  /**
    * On a confirmed violation: build the evidence proof, content-address it, file the slash
    * proposal on the DVTValidator (proposal-intent), and archive the proof. The proof is
    * archived even if the on-chain write fails, so the evidence is never lost.
@@ -581,6 +703,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     reason: string;
     rule: string;
     creditLimit: bigint;
+    availableCredit: bigint;
     debt: bigint;
     violationBlock: number;
     violationBlockHash: string;
@@ -598,12 +721,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // Content-address IDENTITY = ON-CHAIN facts only (no wall-clock). Two DVT nodes seeing
     // the same violation at the same block derive the same proofHash + proposalId.
     const identity: ProofIdentity = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       chainId: this.chainId,
       operator: v.operator,
       rule: v.rule,
       creditLimit: v.creditLimit.toString(),
+      availableCredit: v.availableCredit.toString(),
       debt: v.debt.toString(),
       violationBlock: v.violationBlock,
+      slashLevel: v.slashLevel,
+      registry: this.normalizeAddress(this.registryAddress),
+      superPaymaster: this.normalizeAddress(this.superPaymasterAddress),
+      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
+      apntsToken: this.normalizeAddress(this.apntsTokenAddress),
     };
     const proofHash = computeProofHash(identity);
 
@@ -974,7 +1104,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     if (armed) {
       try {
         queueMessageHash = buildQueueMessageHash(operator, slashLevel, epoch, this.chainId);
-        const cosign = await this.coSigner.coSign(queueMessageHash);
+        const cosign = await this.coSigner.coSign({
+          proofSchemaVersion: PROOF_SCHEMA_VERSION,
+          step: "queue",
+          operator,
+          slashLevel,
+          epoch,
+          chainId: this.chainId,
+          evidenceHash,
+          messageHash: queueMessageHash,
+        });
         const encoded = encodeProof(cosign.signerMask, cosign.sigG2);
         queueTx = await this.blockchainService.queueSlashWithProof(
           this.dvtValidatorAddress,
@@ -1038,7 +1177,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
             this.chainId,
             evidenceHash
           );
-          const cosign = await this.coSigner.coSign(execMsgHash);
+          const cosign = await this.coSigner.coSign({
+            proofSchemaVersion: PROOF_SCHEMA_VERSION,
+            step: "execute",
+            operator,
+            slashLevel,
+            epoch,
+            chainId: this.chainId,
+            proposalId: proposalId.toString(),
+            evidenceHash,
+            messageHash: execMsgHash,
+          });
           const encoded = encodeProof(cosign.signerMask, cosign.sigG2);
           executeTx = await this.blockchainService.executeSlashWithProof(
             this.dvtValidatorAddress,

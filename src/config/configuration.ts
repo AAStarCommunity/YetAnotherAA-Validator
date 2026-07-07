@@ -238,6 +238,21 @@ export default () => {
     // slashes. Size this to your RPC's getLogs block-range limit (many public endpoints cap ~10k) so
     // the scan stays determinate. It is only consulted on the armed executeSlash path.
     auditSlashLookbackBlocks: parseInt(process.env.AUDIT_SLASH_LOOKBACK_BLOCKS || "50000", 10),
+    // Live gossip quorum co-sign (inc-2). Only consulted on the armed executeSlash path.
+    // AUDIT_COSIGN_TIMEOUT_MS: how long the requester waits for peer signatures before resolving
+    //   with whatever partial set arrived (then it enforces the threshold; under → no submit).
+    // AUDIT_SLASH_THRESHOLDS: optional per-severity quorum override "WARNING:2,MINOR:3,MAJOR:3"
+    //   (the on-chain BLSAggregator bootstrap for N=3). Must match / not exceed the on-chain table.
+    // AUDIT_MAX_SLOTS: how many 1-indexed BLSAggregator slots to scan (= on-chain MAX_VALIDATORS).
+    // AUDIT_SLOT_MAP: optional boot-time cross-check only (never the runtime slot source — the
+    //   on-chain BLSAggregator is authoritative); format "0xoperator:slot,..." for diagnostics.
+    auditCoSignTimeoutMs: parseInt(process.env.AUDIT_COSIGN_TIMEOUT_MS || "15000", 10),
+    auditSlashThresholds: parseSlashThresholds(process.env.AUDIT_SLASH_THRESHOLDS),
+    auditMaxSlots: (() => {
+      const parsed = parseInt(process.env.AUDIT_MAX_SLOTS || "13", 10);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 13;
+    })(),
+    auditSlotMap: process.env.AUDIT_SLOT_MAP || undefined,
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
@@ -266,4 +281,43 @@ function parseAllowlist(allowlistString: string): string[] {
     .split(",")
     .map(a => a.trim())
     .filter(a => a.length > 0);
+}
+
+/**
+ * Per-severity SAFE MINIMUM quorum (the pinned live policy, N=3 BLSAggregator bootstrap). A
+ * configured override may only RAISE a threshold, never lower it below this floor — otherwise a
+ * value like `MINOR:1` would let a single local signature pass as quorum and defeat the 3-of-3
+ * invariant that gates a REAL, irreversible on-chain GToken slash. HIGH 1 (Codex): clamp UP.
+ */
+const SLASH_THRESHOLD_FLOOR = { WARNING: 2, MINOR: 3, MAJOR: 3 } as const;
+
+/**
+ * Parse the optional AUDIT_SLASH_THRESHOLDS override ("WARNING:2,MINOR:3,MAJOR:3") into the
+ * per-severity quorum table. Defaults to the on-chain BLSAggregator bootstrap (N=3): 2/3/3.
+ * Malformed / non-positive entries are ignored (the default for that level is kept). Any parsed
+ * value BELOW the safe floor is CLAMPED UP to the floor (with a warning) so a misconfiguration can
+ * never weaken the quorum below the pinned live policy; HIGHER values are preserved as configured.
+ */
+function parseSlashThresholds(raw?: string): { WARNING: number; MINOR: number; MAJOR: number } {
+  const out = { ...SLASH_THRESHOLD_FLOOR } as { WARNING: number; MINOR: number; MAJOR: number };
+  if (!raw) return out;
+  for (const pair of raw.split(",")) {
+    const [k, v] = pair.split(":").map(s => s.trim());
+    // STRICT numeric parse (Codex R2 LOW): reject "4oops"/"" — parseInt would silently take 4.
+    // A malformed value is IGNORED so the safe floor is kept (never a weaker/garbage quorum).
+    const n = /^[0-9]+$/.test(v ?? "") ? Number(v) : NaN;
+    if ((k === "WARNING" || k === "MINOR" || k === "MAJOR") && Number.isSafeInteger(n) && n > 0) {
+      const floor = SLASH_THRESHOLD_FLOOR[k];
+      if (n < floor) {
+        console.warn(
+          `⚠️  AUDIT_SLASH_THRESHOLDS ${k}:${n} is below the safe minimum (${floor}) — ` +
+            `clamping UP to ${floor} (the 3-of-3 slash quorum invariant cannot be weakened)`
+        );
+        out[k] = floor;
+      } else {
+        out[k] = n;
+      }
+    }
+  }
+  return out;
 }

@@ -15,6 +15,17 @@ import { ethers } from "ethers";
  * populated in increment 2 when the multi-node co-sign lands (see AuditService).
  */
 
+/**
+ * Proof-schema version bound into every proofHash (finding-1). BUMP this whenever the
+ * `ProofIdentity` shape (the content-address preimage) changes, so a mixed-version fleet produces
+ * DIFFERENT proofHashes and the co-sign responder can refuse with an EXPLICIT, diagnosable version
+ * mismatch instead of a silent hash divergence that quietly loses quorum. Version 2 widened the
+ * identity (availableCredit / slashLevel / source contract addresses) and — in this increment —
+ * DROPPED `violationBlockHash` from the hash (finding-2). All DVT nodes MUST run the same version:
+ * deploy/upgrade the fleet atomically, never a rolling partial upgrade.
+ */
+export const PROOF_SCHEMA_VERSION = 2;
+
 export interface EvidenceSource {
   /** Where the observation came from: an on-chain `view` read or a decoded `event`. */
   type: "view" | "event";
@@ -44,12 +55,12 @@ export interface Evidence {
    */
   violationBlock: number;
   /**
-   * Block HASH of `violationBlock` (finding-3). Pinning the irreversible slash to a
-   * finalized block's hash — not just its number — makes the evidence reorg-safe: a
-   * reorg that rewrites `violationBlock` would change this hash, so the justification
-   * cannot be silently invalidated. Deliberately EXCLUDED from the content-address
-   * identity (a finalized block's hash is a deterministic function of its number, and
-   * two nodes reading the same finalized number already agree on the hash).
+   * Block HASH of `violationBlock`, kept for HUMAN forensics ONLY. Deliberately NOT part of the
+   * content-address identity (finding-2): reorg-safety already comes from pinning `violationBlock`
+   * to a FINALIZED block (it won't reorg), so hashing the header in was redundant and only added a
+   * liveness risk — a non-archive node cannot read an old block's header and would then be unable to
+   * reproduce the proofHash. Recording it here (not in ProofIdentity) keeps the forensic trail
+   * without gating co-sign on a historical-header read.
    */
   violationBlockHash?: string;
   /**
@@ -148,16 +159,39 @@ export interface SlashProof {
  * proofHash. This is what makes the archive content-addressed and cross-node de-duplicating.
  */
 export interface ProofIdentity {
+  /**
+   * Proof-schema version (finding-1) — the FIRST field of the identity, bound into proofHash so a
+   * version bump changes the content-address. Lets the co-sign responder diagnose a mixed-version
+   * fleet (explicit refusal) instead of silently computing a divergent hash.
+   */
+  proofSchemaVersion: number;
   chainId: number;
   operator: string;
   /** Rule id, e.g. "credit-over-limit". */
   rule: string;
   /** On-chain credit limit at violationBlock (stringified). */
   creditLimit: string;
+  /** On-chain available credit at violationBlock (stringified) — the SP-enforced ceiling signal. */
+  availableCredit: string;
   /** On-chain debt at violationBlock (stringified). */
   debt: string;
-  /** Block all rule inputs were pinned to. */
+  /**
+   * Block all rule inputs were pinned to. Reorg-safety comes SOLELY from this being a FINALIZED
+   * block (finding-2): a finalized block won't reorg, so the economic reads pinned to it are stable
+   * and fully content-address the evidence WITHOUT hashing the block header — which a non-archive
+   * node cannot read, so hashing it in only risked liveness.
+   */
   violationBlock: number;
+  /** SP #329 SlashLevel bound into the slash preimages — part of the slash-critical identity. */
+  slashLevel: number;
+  /** Registry the credit limit / reputation were read from (checksummed). */
+  registry: string;
+  /** SuperPaymaster the availableCredit was read from (checksummed). */
+  superPaymaster: string;
+  /** DVTValidator the slash proposal/queue/execute target (checksummed). */
+  dvtValidator: string;
+  /** xPNTs token the operator debt was read from (checksummed). */
+  apntsToken: string;
 }
 
 /** Deterministic JSON with recursively sorted keys — a stable content-address preimage. */
@@ -177,7 +211,9 @@ function stableStringify(value: unknown): string {
  * Content-address a detection: keccak256 over the canonical (sorted-key) serialization
  * of its ON-CHAIN identity. Deterministic and wall-clock-free — the same on-chain
  * violation always yields the same hash, which is what makes the archive tamper-evident,
- * de-duplicating, and stable across nodes/ticks.
+ * de-duplicating, and stable across nodes/ticks. Reorg-safety comes from the finality-pinned
+ * `violationBlock` (a finalized block won't reorg), NOT from hashing the block header — so a
+ * non-archive node that cannot read an old header can still reproduce this hash (finding-2).
  */
 export function computeProofHash(identity: ProofIdentity): string {
   return ethers.keccak256(ethers.toUtf8Bytes(stableStringify(identity)));

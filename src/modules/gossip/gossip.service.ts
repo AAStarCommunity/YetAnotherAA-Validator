@@ -14,6 +14,8 @@ import {
   GossipConfig,
   GossipStats,
   MessageHistory,
+  CoSignRequestPayload,
+  CoSignResponsePayload,
 } from "./gossip.interfaces.js";
 import { GossipWhitelistValidator } from "./gossip-whitelist-validator.js";
 
@@ -45,6 +47,50 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     gossipRounds: 0,
     lastGossipTime: null,
   };
+
+  /**
+   * DVT slash quorum co-sign (inc-2 live). A single registered handler re-verifies + signs an
+   * incoming request; the gossip service stays ignorant of AuditService (one-way DI). Null when
+   * this node is disarmed → every request is silently refused (fail-closed).
+   */
+  private coSignHandler:
+    | ((payload: CoSignRequestPayload) => Promise<CoSignResponsePayload | null>)
+    | null = null;
+
+  /**
+   * In-flight co-sign requests this node originated, keyed by requestId (correlation id). Only
+   * responses that pass the optional async `validate` are counted, and they are deduped by the
+   * optional `dedupKey` (the co-signer keys by on-chain slot) — so a single connected peer cannot
+   * crowd out honest signers with multiple bogus responses and force a premature under-threshold
+   * resolution (MEDIUM 1). `validated` holds the accepted, deduped responses.
+   */
+  private pendingCoSign = new Map<
+    string,
+    {
+      validated: Map<string | number, CoSignResponsePayload>;
+      threshold: number;
+      validate?: (resp: CoSignResponsePayload) => Promise<boolean>;
+      dedupKey?: (resp: CoSignResponsePayload) => string | number;
+      finish: () => void;
+      timer: NodeJS.Timeout | null;
+      // MEDIUM 1 (Codex R2) — bound validation work against a response flood without letting a
+      // peer poison a slot: skip EXACT resends before the async validate (identical response adds
+      // nothing), and cap the total number of validations started per request. Post-validate slot
+      // dedup (in `validated`) still decides the quorum, so an early bogus slot claim can never
+      // suppress the honest signer's real response for that slot.
+      seenExact: Set<string>;
+      validationsStarted: number;
+      maxValidations: number;
+      // finding-3 (per-connection anti-DoS): a single compromised/known peer flooding distinct bogus
+      // responses (varying signerNodeId/slot/sig) could consume the whole global `maxValidations`
+      // budget before honest peers' responses arrive → honest signers dropped. signerNodeId/from is
+      // attacker-controlled, so we rate-limit by the CONNECTION (ws) — the real, un-forgeable
+      // identity. Each connection gets at most `perConnCap` validations; the global cap + exact-dedup
+      // remain as backstops. Responses injected with no ws (tests) skip only the per-connection check.
+      perConn: Map<WebSocket, number>;
+      perConnCap: number;
+    }
+  >();
 
   constructor(
     private configService: ConfigService,
@@ -319,6 +365,14 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
         this.handleHeartbeatMessage(message);
         break;
 
+      case "cosign-request":
+        this.handleCoSignRequest(ws, message);
+        break;
+
+      case "cosign-response":
+        this.handleCoSignResponse(message, ws);
+        break;
+
       default:
         console.log(`Unknown gossip message type: ${message.type}`);
     }
@@ -502,6 +556,193 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       peer.lastSeen = new Date();
       peer.status = "active";
       peer.heartbeatCount++;
+    }
+  }
+
+  // ── DVT slash quorum co-sign transport (inc-2 live) ─────────────────────────────
+  //
+  // POINT-TO-POINT only: co-sign messages are sent with ttl=0 so handleGossipMessage NEVER
+  // flood-propagates them, and each carries a FRESH messageId (correlation is the separate
+  // requestId) so the history-dedup can't drop a legitimate retry. The gossip service runs
+  // ZERO slash logic — it invokes the registered handler and relays the reply, nothing more.
+
+  /**
+   * Register the single co-sign handler (GossipQuorumCoSigner.verifyAndSign). Keeps the gossip
+   * service decoupled from AuditService: it only knows "call this to get a signed response or a
+   * null refusal". A disarmed node never registers one → all requests are silently refused.
+   */
+  registerCoSignHandler(
+    fn: (payload: CoSignRequestPayload) => Promise<CoSignResponsePayload | null>
+  ): void {
+    this.coSignHandler = fn;
+  }
+
+  /**
+   * Broadcast a co-sign request to all connected peers and collect their responses, keyed by
+   * `requestId`. Resolves early once `threshold` VALIDATED, unique-`dedupKey` responses have
+   * arrived, or on `timeoutMs` with whatever validated partial set accrued. Always clears the timer
+   * and the pending entry (no leak). `threshold <= 0` resolves immediately with an empty set (the
+   * caller needs no peer signatures beyond its own self-contribution).
+   *
+   * MEDIUM 1 (Codex): the optional `validate` counts ONLY cryptographically/on-chain-valid
+   * responses toward the threshold, and `dedupKey` (the co-signer keys by on-chain slot) collapses
+   * duplicates — so one connected peer cannot flood many bogus responses with distinct signer ids,
+   * crowd out honest signers, and force a premature under-threshold resolution. Absent `validate`,
+   * every response counts (legacy transport behaviour); absent `dedupKey`, responses dedup by
+   * `signerNodeId`.
+   */
+  async requestCoSignatures(
+    payload: CoSignRequestPayload,
+    opts: {
+      threshold: number;
+      timeoutMs: number;
+      validate?: (resp: CoSignResponsePayload) => Promise<boolean>;
+      dedupKey?: (resp: CoSignResponsePayload) => string | number;
+      /** Hard cap on validate() calls per request (flood backstop). Default 64. */
+      maxValidations?: number;
+      /** Per-connection cap on validate() calls (finding-3). A legit peer holds ONE slot, so ~1
+       *  response; 4 leaves margin for retries while stopping one peer from exhausting the global
+       *  budget. Default 4. */
+      perConnCap?: number;
+    }
+  ): Promise<CoSignResponsePayload[]> {
+    return new Promise<CoSignResponsePayload[]>(resolve => {
+      const validated = new Map<string | number, CoSignResponsePayload>();
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (entry.timer) clearTimeout(entry.timer);
+        this.pendingCoSign.delete(payload.requestId);
+        resolve(Array.from(validated.values()));
+      };
+      const entry = {
+        validated,
+        threshold: opts.threshold,
+        validate: opts.validate,
+        dedupKey: opts.dedupKey,
+        finish,
+        timer: null as NodeJS.Timeout | null,
+        seenExact: new Set<string>(),
+        validationsStarted: 0,
+        maxValidations: Math.max(1, opts.maxValidations ?? 64),
+        perConn: new Map<WebSocket, number>(),
+        perConnCap: Math.max(1, opts.perConnCap ?? 4),
+      };
+      this.pendingCoSign.set(payload.requestId, entry);
+
+      if (opts.threshold <= 0) {
+        finish();
+        return;
+      }
+      entry.timer = setTimeout(finish, opts.timeoutMs);
+
+      const message: GossipMessage = {
+        type: "cosign-request",
+        from: this.getNodeId(),
+        data: payload,
+        timestamp: Date.now(),
+        ttl: 0, // point-to-point — never flood-propagated
+        messageId: uuidv4(), // fresh per send so history-dedup never drops a retry
+        version: this.nodeState.version,
+      };
+      this.broadcastMessage(message);
+    });
+  }
+
+  /**
+   * Handle an incoming co-sign request: hand it to the registered handler and, if the handler
+   * returns a signed response (non-null), reply on the SAME socket. A null return (refusal) is a
+   * silent, fail-closed no-op. No propagation — this is a directed request/response.
+   */
+  private handleCoSignRequest(ws: WebSocket, message: GossipMessage): void {
+    const handler = this.coSignHandler;
+    if (!handler) return; // disarmed / no handler → silent fail-closed refusal
+    const payload = message.data as CoSignRequestPayload;
+    void handler(payload)
+      .then(resp => {
+        if (resp === null) return; // handler refused → silent
+        const reply: GossipMessage = {
+          type: "cosign-response",
+          from: this.getNodeId(),
+          to: message.from,
+          data: resp,
+          timestamp: Date.now(),
+          ttl: 0, // directed reply — never propagated
+          messageId: uuidv4(),
+          version: this.nodeState.version,
+        };
+        this.sendMessage(ws, reply);
+        this.stats.messagesSent++;
+      })
+      .catch(error => {
+        console.error("Co-sign request handler error:", error);
+      });
+  }
+
+  /**
+   * Route a co-sign response back to the originating requestCoSignatures collector. A late,
+   * duplicate, or cross-requestId response whose collector already resolved is ignored (the pending
+   * entry is gone). When a `validate` is configured the response is counted ONLY after it passes
+   * (async) — so a bogus response never contributes toward the threshold (MEDIUM 1).
+   *
+   * `ws` is the SOURCE connection (finding-3). It is the un-forgeable per-peer identity used to
+   * rate-limit validations per connection so one flooding peer cannot exhaust the global budget and
+   * crowd out honest signers arriving on other connections. It is optional: tests inject responses
+   * directly with no ws, in which case only the per-connection check is skipped (global cap +
+   * exact-dedup still apply).
+   */
+  private handleCoSignResponse(message: GossipMessage, ws?: WebSocket): void {
+    const payload = message.data as CoSignResponsePayload;
+    if (!payload || typeof payload.requestId !== "string") return;
+    if (typeof payload.signerNodeId !== "string") return;
+    const pending = this.pendingCoSign.get(payload.requestId);
+    if (!pending) return; // unknown / already-resolved request → ignore
+    if (pending.validate) {
+      // MEDIUM 1 (Codex R2): bound validation work BEFORE the expensive async validate.
+      // (a) Drop EXACT resends (same signer/slot/signature) — identical, adds nothing, and this
+      //     keys on the FULL response so it can never poison a slot the honest signer will claim.
+      // (b) Cap total validations per request as a flood backstop. Honest signers (≤ slot count)
+      //     fit far under the cap; a compromised peer spamming distinct bogus responses is bounded.
+      const exactKey = `${payload.signerNodeId}|${payload.slot}|${payload.signatureCompact}`;
+      if (pending.seenExact.has(exactKey)) return;
+      pending.seenExact.add(exactKey);
+      // finding-3: PER-CONNECTION cap. A single connection cannot start more than `perConnCap`
+      // validations, so a flooder on one ws can't consume the whole global budget before honest
+      // peers' responses (on OTHER connections) are validated. Skipped when ws is absent (tests).
+      if (ws && (pending.perConn.get(ws) ?? 0) >= pending.perConnCap) return;
+      if (pending.validationsStarted >= pending.maxValidations) return;
+      if (ws) pending.perConn.set(ws, (pending.perConn.get(ws) ?? 0) + 1);
+      pending.validationsStarted++;
+      // Validate asynchronously; count ONLY on success. Failures (invalid sig / bad on-chain
+      // binding) or validator errors are silently dropped and never reach the threshold.
+      void pending
+        .validate(payload)
+        .then(ok => {
+          if (ok) this.countValidatedResponse(payload.requestId, payload);
+        })
+        .catch(() => {
+          /* validator threw → treat as invalid, drop */
+        });
+    } else {
+      this.countValidatedResponse(payload.requestId, payload);
+    }
+  }
+
+  /**
+   * Record a VALIDATED co-sign response toward its collector's threshold, deduped by `dedupKey`
+   * (default: signerNodeId). Re-reads the pending entry so a response whose validation finished
+   * AFTER the collector already resolved (timeout / threshold reached) is safely ignored. Resolves
+   * the collector once enough unique-key validated responses have accrued.
+   */
+  private countValidatedResponse(requestId: string, payload: CoSignResponsePayload): void {
+    const pending = this.pendingCoSign.get(requestId);
+    if (!pending) return; // collector already finished/cleaned, or cross-requestId → ignore
+    const key = pending.dedupKey ? pending.dedupKey(payload) : payload.signerNodeId;
+    if (pending.validated.has(key)) return; // dedup: same slot/node counts once
+    pending.validated.set(key, payload);
+    if (pending.validated.size >= pending.threshold) {
+      pending.finish();
     }
   }
 

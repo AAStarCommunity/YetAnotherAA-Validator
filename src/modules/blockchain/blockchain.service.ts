@@ -466,6 +466,20 @@ export class BlockchainService {
   }
 
   /**
+   * Contract factory seam. All wallet-signed write paths (createProposal, queue/execute slash) build
+   * their `ethers.Contract` through this one method so a test can override it to inject a mock —
+   * `ethers` is an ESM namespace (read-only) and cannot be spied on directly. Production behaviour is
+   * exactly `new ethers.Contract(...)`.
+   */
+  protected buildContract(
+    address: string,
+    abi: ethers.InterfaceAbi,
+    runner: ethers.ContractRunner
+  ): ethers.Contract {
+    return new ethers.Contract(address, abi, runner);
+  }
+
+  /**
    * The block an irreversible slash is justified against — a FINALIZED (fallback: safe) block,
    * returned as `{ number, hash }` (finding-3). Pinning the slash evidence to a finalized block,
    * and recording its HASH, makes the justification reorg-safe: a reorg that rewrites the chain
@@ -585,6 +599,144 @@ export class BlockchainService {
       }
     }
     return false;
+  }
+
+  // ── BLSAggregator slot registry (inc-2 live gossip co-sign) ────────────────────
+  //
+  // The authoritative slot→validator→BLS-key mapping the quorum co-sign binds against. Slot is
+  // 1-indexed in [1, MAX_VALIDATORS]; signerMask bit `s-1` ⇔ slot `s` (see BLSAggregator.sol
+  // `_reconstructPkAgg`). All reads are best-effort → `null` on revert/absence (fail-closed at
+  // the caller: an unresolvable slot/key means "cannot bind" → refuse to count that signature).
+
+  /**
+   * BLSAggregator.validatorAtSlot(slot) — the validator address bound to a 1-indexed slot.
+   * Returns the checksummed address, or `null` when the slot is empty (zero address) or the read
+   * reverts.
+   */
+  async getValidatorAtSlot(blsAggregatorAddress: string, slot: number): Promise<string | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function validatorAtSlot(uint8 slot) view returns (address)"];
+    const contract = new ethers.Contract(blsAggregatorAddress, abi, this.provider);
+    try {
+      const addr: string = await contract.validatorAtSlot(slot);
+      if (!addr || addr === ethers.ZeroAddress) return null;
+      return ethers.getAddress(addr);
+    } catch (error: any) {
+      this.logger.warn(
+        `validatorAtSlot(${slot}) failed on ${blsAggregatorAddress}: ${error.message}`
+      );
+      return null;
+    }
+  }
+
+  /**
+   * The active BLS G1 public key registered at a slot, as its uncompressed EIP-2537 128-byte
+   * encoding (0x-hex, lowercase) — the concatenation of the on-chain BLS.G1Point words
+   * `x_a || x_b || y_a || y_b`, byte-identical to `BlsService.encodePublicKeyToEIP2537`. Resolves
+   * the slot's validator (validatorAtSlot) then reads BLSAggregator.getBLSPublicKey(validator).
+   * Returns `null` when the slot is empty, the key is inactive (revoked), or the read reverts.
+   * The requester uses this to bind a peer's returned slot to the exact on-chain key.
+   */
+  async getBlsPublicKeyAtSlot(blsAggregatorAddress: string, slot: number): Promise<string | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const validator = await this.getValidatorAtSlot(blsAggregatorAddress, slot);
+    if (!validator) return null;
+    const abi = [
+      "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
+    ];
+    const contract = new ethers.Contract(blsAggregatorAddress, abi, this.provider);
+    try {
+      const res = await contract.getBLSPublicKey(validator);
+      const pk = res.publicKey ?? res[0];
+      const isActive = res.isActive ?? res[2];
+      if (!isActive) return null;
+      const words = [
+        pk.x_a ?? pk[0],
+        pk.x_b ?? pk[1],
+        pk.y_a ?? pk[2],
+        pk.y_b ?? pk[3],
+      ] as string[];
+      if (words.some(w => typeof w !== "string")) return null;
+      const hex = "0x" + words.map(w => w.slice(2)).join("");
+      return hex.toLowerCase();
+    } catch (error: any) {
+      this.logger.warn(
+        `getBLSPublicKey(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
+      );
+      return null;
+    }
+  }
+
+  /**
+   * O(1) own-slot lookup (finding-3): BLSAggregator.getBLSPublicKey(validator) returns the
+   * validator's (publicKey, slot, isActive) in a SINGLE read, so a node resolves its OWN registered
+   * slot directly from its operator EOA — no 1..maxSlots scan. Returns the 1-indexed `slot` when the
+   * validator is ACTIVE and `slot >= 1`; `null` when unregistered/inactive, the slot is out of
+   * range, the EOA is malformed, or the read reverts (fail-closed).
+   */
+  async getRegisteredSlot(
+    blsAggregatorAddress: string,
+    operatorEoa: string
+  ): Promise<number | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    let validator: string;
+    try {
+      validator = ethers.getAddress(operatorEoa);
+    } catch {
+      return null;
+    }
+    const abi = [
+      "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
+    ];
+    const contract = new ethers.Contract(blsAggregatorAddress, abi, this.provider);
+    try {
+      const res = await contract.getBLSPublicKey(validator);
+      const isActive = res.isActive ?? res[2];
+      if (!isActive) return null;
+      const slot = Number(res.slot ?? res[1]);
+      if (!Number.isInteger(slot) || slot < 1) return null;
+      return slot;
+    } catch (error: any) {
+      this.logger.warn(
+        `getRegisteredSlot(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Scan slots `1..maxSlots` for the one bound to `operatorEoa` (checksum-compared), returning its
+   * 1-indexed slot or `null` when the operator holds no slot. A node whose operator is at no slot
+   * MUST refuse to participate in the quorum co-sign (fail-closed).
+   */
+  async getSlotForValidator(
+    blsAggregatorAddress: string,
+    operatorEoa: string,
+    maxSlots: number
+  ): Promise<number | null> {
+    let target: string;
+    try {
+      target = ethers.getAddress(operatorEoa);
+    } catch {
+      return null;
+    }
+    // Parallelize the slot scan (was a serial RPC per slot): issue all validatorAtSlot(1..maxSlots)
+    // reads at once, then pick the LOWEST-indexed slot that matches. Each getValidatorAtSlot already
+    // fails closed to null on revert/absence, so a bad address / empty slot never matches.
+    const slots = Array.from({ length: Math.max(0, maxSlots) }, (_, i) => i + 1);
+    const validators = await Promise.all(
+      slots.map(slot => this.getValidatorAtSlot(blsAggregatorAddress, slot))
+    );
+    for (let i = 0; i < validators.length; i++) {
+      if (validators[i] && validators[i] === target) return slots[i];
+    }
+    return null;
   }
 
   /** Runtime bytecode at `address` ("0x" when there's no contract). Used for a fail-closed
@@ -725,7 +877,7 @@ export class BlockchainService {
       "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
     ];
     const iface = new ethers.Interface(abi);
-    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.createProposal(
       operator,
@@ -747,13 +899,21 @@ export class BlockchainService {
     let proposalId: bigint | null = null;
     for (const log of receipt.logs) {
       try {
+        // MEDIUM 3 (Codex): only trust a ProposalCreated emitted BY the DVTValidator we called AND
+        // matching THIS proposal's operator + level. A decodable log from another contract, or one
+        // whose args disagree, must NEVER be mistaken for our proposal id (a wrong id would bind the
+        // evidence to someone else's proposal and later make executeWithProof slash the wrong thing).
+        if (ethers.getAddress(log.address) !== ethers.getAddress(dvtValidatorAddress)) continue;
         const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed && parsed.name === "ProposalCreated") {
-          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
-          break;
-        }
+        if (!parsed || parsed.name !== "ProposalCreated") continue;
+        const evOperator = parsed.args.operator ?? parsed.args[1];
+        const evLevel = parsed.args.level ?? parsed.args[2];
+        if (ethers.getAddress(evOperator) !== ethers.getAddress(operator)) continue;
+        if (Number(evLevel) !== level) continue;
+        proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+        break;
       } catch {
-        // Not a ProposalCreated log (or from another contract) — skip.
+        // Not a ProposalCreated log from this validator (or from another contract) — skip.
       }
     }
     if (proposalId === null) {
@@ -832,7 +992,7 @@ export class BlockchainService {
       "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
     ];
     const iface = new ethers.Interface(abi);
-    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.createProposal(
       operator,
@@ -853,13 +1013,21 @@ export class BlockchainService {
     let proposalId: bigint | null = null;
     for (const log of receipt.logs) {
       try {
+        // MEDIUM 3 (Codex): only trust a ProposalCreated emitted BY the DVTValidator we called AND
+        // matching THIS proposal's operator + level. A decodable log from another contract, or one
+        // whose args disagree, must NEVER be mistaken for our proposal id (a wrong id would bind the
+        // evidence to someone else's proposal and later make executeWithProof slash the wrong thing).
+        if (ethers.getAddress(log.address) !== ethers.getAddress(dvtValidatorAddress)) continue;
         const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed && parsed.name === "ProposalCreated") {
-          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
-          break;
-        }
+        if (!parsed || parsed.name !== "ProposalCreated") continue;
+        const evOperator = parsed.args.operator ?? parsed.args[1];
+        const evLevel = parsed.args.level ?? parsed.args[2];
+        if (ethers.getAddress(evOperator) !== ethers.getAddress(operator)) continue;
+        if (Number(evLevel) !== level) continue;
+        proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+        break;
       } catch {
-        // Not a ProposalCreated log (or from another contract) — skip.
+        // Not a ProposalCreated log from this validator (or from another contract) — skip.
       }
     }
     if (proposalId === null) {
@@ -894,7 +1062,20 @@ export class BlockchainService {
     const abi = [
       "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof) external",
     ];
-    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+    // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT call first. Any deterministic
+    // mismatch (bad signerMask, sigG2 encoding, DST, on-chain threshold, stale slot mapping, wrong
+    // address, proposal state) reverts HERE — before spending a single wei of gas — so the audit's
+    // try/catch degrades to file+archive instead of eating a PAID on-chain revert. Only a passing
+    // simulation lets the real, irreversible tx broadcast.
+    try {
+      await contract.queueSlashWithProof.staticCall(operator, slashLevel, epoch, proof);
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `queueSlashWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`
+      );
+    }
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.queueSlashWithProof(
       operator,
@@ -937,7 +1118,18 @@ export class BlockchainService {
     const abi = [
       "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof) external",
     ];
-    const contract = new ethers.Contract(dvtValidatorAddress, abi, this.wallet);
+    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+    // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT execute call first so any
+    // deterministic revert (signerMask/sigG2/threshold/proposal-state mismatch) surfaces BEFORE the
+    // irreversible slash tx spends gas. Only a passing simulation lets the real tx broadcast.
+    try {
+      await contract.executeWithProof.staticCall(id, repUsers, newScores, epoch, proof);
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `executeWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`
+      );
+    }
     const fees = await bumpedFees(this.provider);
     const tx: ethers.TransactionResponse = await contract.executeWithProof(
       id,

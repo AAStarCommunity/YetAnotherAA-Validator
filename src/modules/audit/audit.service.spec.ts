@@ -1,8 +1,14 @@
 import { ethers } from "ethers";
 import { AuditService } from "./audit.service.js";
-import { IProofArchive, SlashProof, computeProofHash } from "./proof-archive.js";
+import {
+  IProofArchive,
+  SlashProof,
+  computeProofHash,
+  PROOF_SCHEMA_VERSION,
+} from "./proof-archive.js";
 import {
   IQuorumCoSigner,
+  CoSignRequest,
   buildQueueMessageHash,
   buildExecuteMessageHash,
   encodeProof,
@@ -97,16 +103,20 @@ function makeBlockchain(
   };
 }
 
-/** A deterministic mock quorum co-signer that always succeeds (fixed mask + sig). */
+/** A deterministic mock quorum co-signer that always succeeds (fixed mask + sig). It records the
+ *  messageHash of each structured CoSignRequest so existing assertions on `calls[i]` still hold. */
 function makeCoSigner(
   signerMask = 0b111n,
   sigG2 = "0x" + "ab".repeat(64)
-): IQuorumCoSigner & { calls: string[] } {
+): IQuorumCoSigner & { calls: string[]; requests: CoSignRequest[] } {
   const calls: string[] = [];
+  const requests: CoSignRequest[] = [];
   return {
     calls,
-    async coSign(messageHash: string) {
-      calls.push(messageHash);
+    requests,
+    async coSign(req: CoSignRequest) {
+      calls.push(req.messageHash);
+      requests.push(req);
       return { signerMask, sigG2 };
     },
   };
@@ -321,14 +331,21 @@ describe("AuditService", () => {
     expect(sourceNames).toContain(`IxPNTsToken(${APNTS_TOKEN}).getDebt`);
     expect(sourceNames).toContain("SuperPaymaster.getAvailableCredit");
 
-    // proofHash is a real content address over ON-CHAIN identity: recomputing matches.
+    // proofHash is a real content address over the FULL ON-CHAIN identity: recomputing matches.
     const recomputed = computeProofHash({
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       chainId: proof.chainId,
       operator: proof.operator,
       rule: proof.evidence.rule,
       creditLimit: proof.evidence.threshold,
+      availableCredit: "0", // over-limit ⇒ SP-enforced availableCredit is 0
       debt: proof.evidence.observed,
       violationBlock: proof.evidence.violationBlock,
+      slashLevel: proof.slashLevel,
+      registry: ethers.getAddress(REGISTRY),
+      superPaymaster: ethers.getAddress(SUPER_PAYMASTER),
+      dvtValidator: ethers.getAddress(DVT_VALIDATOR),
+      apntsToken: ethers.getAddress(APNTS_TOKEN),
     });
     expect(recomputed).toBe(proof.proofHash);
     expect(proof.proofHash).toMatch(/^0x[0-9a-f]{64}$/);
@@ -428,12 +445,19 @@ describe("AuditService", () => {
     // Pre-seed the archive with the exact proof for this violation@block.
     const archive = makeArchive();
     const identityHash = computeProofHash({
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
       chainId: 11155111,
-      operator: OPERATOR,
+      operator: ethers.getAddress(OPERATOR),
       rule: "credit-over-limit",
       creditLimit: "1000",
+      availableCredit: "0",
       debt: "2000",
       violationBlock: BLOCK,
+      slashLevel: 1,
+      registry: ethers.getAddress(REGISTRY),
+      superPaymaster: ethers.getAddress(SUPER_PAYMASTER),
+      dvtValidator: ethers.getAddress(DVT_VALIDATOR),
+      apntsToken: ethers.getAddress(APNTS_TOKEN),
     });
     (archive.records as SlashProof[]).push({ proofHash: identityHash } as SlashProof);
     const svc = makeService(blockchain, makeConfig(), archive);
