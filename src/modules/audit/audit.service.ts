@@ -664,23 +664,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * A1#6 (Codex High-1/High-2) — an operator may be SLASHED only if it is EXPLICITLY static-listed
-   * (AUDIT_WATCHLIST — an operator affirmatively chosen) OR present in a FRESH on-chain-derived set.
-   * A derived-only operator backed by a stale/never-confirmed membership snapshot is NOT slashed —
-   * else a member who exited between the last derivation and now could be wrongly slashed (the
-   * on-chain _requireActiveValidator is the last backstop; this is the first). Both the requester
-   * (coordinateQuorumCoSign) and the responder (verifyViolationForCoSign) apply this identically so a
-   * derived-only slash is authorized consistently across the quorum.
-   */
-  private isSlashableOperator(operator: string): boolean {
-    // Not even watched (neither static nor derived) → never slashable. Hardens the helper's contract
-    // so it is safe standalone, not only because callers pre-filter via effectiveWatchlist (Codex Low).
-    if (!this.effectiveWatchlist().includes(operator)) return false;
-    if (this.watchlist.includes(operator)) return true; // explicitly configured → always slashable
-    return this.derivedSetIsFresh(); // derived-only → requires a FRESH membership snapshot
-  }
-
-  /**
    * A1#6 (Codex round-3) — AUTHORITATIVE per-operator slash gate, pinned to the evidence block. The
    * cached derived set is a snapshot from an EARLIER finalized block (throttled refresh), so before an
    * IRREVERSIBLE slash we confirm the specific operator STILL holds an audited role AT the evidence
@@ -1012,6 +995,23 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
 
       const blockTag = req.epoch;
       if (!Number.isInteger(blockTag) || blockTag < 0) return NO;
+
+      // A1#6 (Codex round-4, Low) — INDEPENDENTLY require the requester-supplied epoch to be FINALIZED
+      // by THIS responder's own view. Every rule input + hasRole membership is pinned to req.epoch, so
+      // a malicious requester who supplies an UNFINALIZED (reorg-able) block where the victim is
+      // transiently over-limit / a member must not be able to harvest a co-signature. Reject any epoch
+      // newer than our finalized head; a responder briefly behind simply refuses and the requester
+      // retries (fail-closed). A read failure here is also fail-closed (caught by the outer try → NO).
+      const finalizedHead = await this.blockchainService.getViolationBlock(
+        this.finalityConfirmations
+      );
+      if (blockTag > finalizedHead.number) {
+        this.logger.warn(
+          `co-sign refused: epoch ${blockTag} is not finalized by this node (finalized head ` +
+            `${finalizedHead.number}) — refusing to co-sign on reorg-able state`
+        );
+        return NO;
+      }
 
       // A1#6 (Codex round-3) — a derived-only operator's membership is CONFIRMED at req.epoch (the
       // SAME block the evidence is verified at) via hasRole, not just the cached set's wall-clock

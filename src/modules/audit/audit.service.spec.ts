@@ -2388,6 +2388,23 @@ describe("AuditService", () => {
       expect(res.confirmed).toBe(false); // cached-fresh but exited-at-epoch → refuse
     });
 
+    it("responder REFUSES an epoch newer than its own finalized head (no co-sign on reorg-able state)", async () => {
+      const derivedOp = ethers.getAddress(opB);
+      const blockchain = overLimitBlockchain({
+        getRegisteredOperators: async () => [derivedOp],
+        getViolationBlock: async () => ({ number: BLOCK, hash: BLOCK_HASH }), // finalized head = BLOCK
+      });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      const res = await (svc as any).verifyViolationForCoSign({
+        chainId: 11155111,
+        operator: derivedOp,
+        slashLevel: 1,
+        epoch: BLOCK + 100, // beyond finalized head → unfinalized, reorg-able
+      });
+      expect(res.confirmed).toBe(false);
+    });
+
     it("hasRole read error → fail-closed (does not co-sign a derived-only op)", async () => {
       const derivedOp = ethers.getAddress(opB);
       const blockchain = overLimitBlockchain({
