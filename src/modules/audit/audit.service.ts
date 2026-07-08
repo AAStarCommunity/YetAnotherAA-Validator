@@ -159,6 +159,36 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private static readonly MAX_DEDUP_ENTRIES = 10_000;
   /** Bounded ring of the most recent detections, newest first (for GET /audit/status). */
   private readonly recentDetections: AuditDetection[] = [];
+  /**
+   * Cumulative monitoring counters (in-memory, since process start) — exposed via GET /audit/status
+   * and mirrored to a structured `[AUDIT-EVENT] kind=…` log line at each outcome so ops can alert
+   * either by scraping the log or polling the endpoint. NOT reset except on restart.
+   */
+  private readonly metrics = {
+    detections: 0,
+    slashesExecuted: 0,
+    dryRunPassed: 0,
+    coSignAborts: 0,
+    overSlashSkips: 0,
+    errors: 0,
+  };
+
+  /** Emit a structured, greppable monitoring event + bump the matching counter (best-effort). */
+  private emitAuditEvent(
+    kind: "SLASH_EXECUTED" | "DRY_RUN_PASSED" | "COSIGN_ABORTED" | "OVER_SLASH_SKIP" | "ERROR",
+    fields: Record<string, string | number | null | undefined>
+  ): void {
+    if (kind === "SLASH_EXECUTED") this.metrics.slashesExecuted++;
+    else if (kind === "DRY_RUN_PASSED") this.metrics.dryRunPassed++;
+    else if (kind === "COSIGN_ABORTED") this.metrics.coSignAborts++;
+    else if (kind === "OVER_SLASH_SKIP") this.metrics.overSlashSkips++;
+    else if (kind === "ERROR") this.metrics.errors++;
+    const kv = Object.entries(fields)
+      .filter(([, v]) => v !== undefined && v !== null)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(" ");
+    this.logger.warn(`[AUDIT-EVENT] kind=${kind} ${kv}`);
+  }
   private static readonly MAX_RECENT = 20;
 
   constructor(
@@ -504,6 +534,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           this.logger.error(`Audit: ${operator} audit failed — ${msg}`);
+          this.emitAuditEvent("ERROR", { operator, error: msg });
         }
       }
     } finally {
@@ -945,6 +976,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           slashState === "executed" ? "already slashed" : "slash-state indeterminate"
         } — over-slash guard, on-chain slash SKIPPED`
       );
+      this.emitAuditEvent("OVER_SLASH_SKIP", {
+        operator: v.operator,
+        rule: v.rule,
+        reason: slashState,
+      });
       proposalIdNote =
         slashState === "executed"
           ? "id-unresolved: operator already slashed for this rule (over-slash guard)"
@@ -1022,6 +1058,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
               : "transient, cooldown cleared"
           }) — will retry next tick`
         );
+        this.emitAuditEvent("COSIGN_ABORTED", {
+          operator: v.operator,
+          rule: v.rule,
+          phase: queuePreflagLanded ? "post-queue" : "transient",
+          queueTx: res.queueTx,
+        });
       } else {
         // Co-sign completed (queued / executed / dry-run) → stop retrying this block.
         this.coSignRetryKeys.delete(stableKey);
@@ -1036,6 +1078,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           `Audit: ${v.operator} ${v.rule} DRY RUN — staticCall passed, slash NOT broadcast; ` +
             `durable over-slash marker intentionally NOT written (repeatable drill)`
         );
+        this.emitAuditEvent("DRY_RUN_PASSED", {
+          operator: v.operator,
+          rule: v.rule,
+          proposalId: onchainProposalId?.toString(),
+        });
         proof.signerMask = res.signerMask;
         proof.sigG2 = res.sigG2;
       } else if (executeTx !== null) {
@@ -1044,6 +1091,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         await this.recordCoarseSlashed(coarseKey);
         proof.signerMask = res.signerMask;
         proof.sigG2 = res.sigG2;
+        this.emitAuditEvent("SLASH_EXECUTED", {
+          operator: v.operator,
+          rule: v.rule,
+          slashLevel: v.slashLevel,
+          proposalId: onchainProposalId?.toString(),
+          queueTx,
+          executeTx,
+        });
       }
       if (onchainProposalId === null) {
         proposalIdNote =
@@ -1126,6 +1181,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       executeTx,
     };
     this.recentDetections.unshift(detection);
+    this.metrics.detections++;
     if (this.recentDetections.length > AuditService.MAX_RECENT) {
       this.recentDetections.length = AuditService.MAX_RECENT;
     }
@@ -1556,6 +1612,14 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     lastTickAt: number | null;
     recentDetections: AuditDetection[];
     archivedProofCount: number;
+    metrics: {
+      detections: number;
+      slashesExecuted: number;
+      dryRunPassed: number;
+      coSignAborts: number;
+      overSlashSkips: number;
+      errors: number;
+    };
   }> {
     let archivedProofCount: number;
     try {
@@ -1570,6 +1634,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       lastTickAt: this.lastTickAt,
       recentDetections: this.recentDetections,
       archivedProofCount,
+      // Cumulative monitoring counters (since process start) — poll these OR alert on the
+      // `[AUDIT-EVENT] kind=…` log lines. slashesExecuted/dryRunPassed = successes; coSignAborts/
+      // overSlashSkips/errors = things to watch.
+      metrics: { ...this.metrics },
     };
   }
 }

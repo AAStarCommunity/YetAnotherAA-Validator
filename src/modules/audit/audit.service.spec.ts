@@ -924,6 +924,24 @@ describe("AuditService", () => {
     expect(createArgs[4]).toBe(archive.records[0].proofHash);
   });
 
+  it("monitoring: a real slash increments metrics.slashesExecuted + detections, exposed via getStatus", async () => {
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order);
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      makeArchive(),
+      clockAt(1_700_000_000_000),
+      makeCoSigner()
+    );
+    await svc.tick();
+    const status = await svc.getStatus();
+    expect(status.metrics.detections).toBe(1);
+    expect(status.metrics.slashesExecuted).toBe(1); // queue+create+execute all landed
+    expect(status.metrics.dryRunPassed).toBe(0);
+    expect(status.metrics.overSlashSkips).toBe(0);
+  });
+
   it("executeSlash=true: calls queue → createProposalWithEvidence → execute in that order", async () => {
     const order: string[] = [];
     const blockchain = recordingBlockchain(order);
