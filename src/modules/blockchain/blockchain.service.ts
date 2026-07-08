@@ -1007,6 +1007,27 @@ export class BlockchainService {
     }
   }
 
+  /**
+   * Registry.hasRole(roleId, account) — does `operator` CURRENTLY hold the role, read at `blockTag`
+   * (A1#6). A cheap O(1) eth_call used to CONFIRM a derived operator is still a role member at the
+   * SAME finalized block the slash evidence is pinned to — closing the "cached membership block ≠
+   * evidence block" gap without re-scanning events. THROWS on a provider error so the caller can
+   * fail-closed (an unconfirmable membership must not authorize an irreversible slash).
+   */
+  async hasRole(
+    registryAddress: string,
+    roleId: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<boolean> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function hasRole(bytes32 role, address account) view returns (bool)"];
+    const contract = new ethers.Contract(registryAddress, abi, this.provider);
+    return await contract.hasRole(roleId, operator, { blockTag });
+  }
+
   /** Hard cap on role events accumulated in one derivation — bounds memory against a huge history
    *  or a malicious register/exit flood (Codex Medium-2). Exceeding it THROWS so the caller keeps its
    *  previous set rather than OOMing. ~100k events ≫ any realistic staked-role churn. */

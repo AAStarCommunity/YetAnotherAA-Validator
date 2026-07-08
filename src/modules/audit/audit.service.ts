@@ -681,6 +681,39 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
+   * A1#6 (Codex round-3) — AUTHORITATIVE per-operator slash gate, pinned to the evidence block. The
+   * cached derived set is a snapshot from an EARLIER finalized block (throttled refresh), so before an
+   * IRREVERSIBLE slash we confirm the specific operator STILL holds an audited role AT the evidence
+   * block via a cheap `Registry.hasRole` eth_call — closing the "membership block ≠ evidence block"
+   * gap without re-scanning events every tick/request.
+   *   • static-listed operator → always slashable (explicitly chosen; may not hold any role).
+   *   • derived-only operator  → the SET must be fresh (derivedSetIsFresh) AND the operator must hold
+   *     one of the audited roles at `blockTag` (hasRole). A member who exited between the cached
+   *     derivation and the evidence block reads hasRole=false there → NOT slashed.
+   * Any read error → fail-closed (unconfirmable membership must not authorize a slash).
+   */
+  private async confirmSlashableAtBlock(operator: string, blockTag: number): Promise<boolean> {
+    if (this.watchlist.includes(operator)) return true;
+    if (!this.derivedSetIsFresh()) return false;
+    for (const roleId of this.roleIds) {
+      try {
+        if (
+          await this.blockchainService.hasRole(this.registryAddress, roleId, operator, blockTag)
+        ) {
+          return true;
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.warn(
+          `Audit: hasRole(${roleId}) check failed for ${operator} @${blockTag} — fail-closed (${msg})`
+        );
+        return false;
+      }
+    }
+    return false; // not a member of any audited role at the evidence block
+  }
+
+  /**
    * A1#6 — refresh the on-chain-derived operator set, throttled to roleRefreshMs. Enumerates the
    * CURRENT members of every configured role from the Registry (getRoleMembers getter-first, role-
    * event reconstruction fallback) and caches them checksummed. On ANY derivation error the PREVIOUS
@@ -698,17 +731,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private async refreshDerivedOperators(force = false, pinnedToBlock?: number): Promise<void> {
     if (!this.roleDerive || this.roleIds.length === 0) return;
     const now = this.clock();
+    // Single-flight FIRST (Codex round-3): a caller must never proceed on a half-updated set while a
+    // derivation is actively running — await it, then use its fresh result. Checked BEFORE the
+    // throttle so a throttled caller still waits out an in-flight refresh rather than racing ahead.
+    if (this.refreshInFlight) {
+      await this.refreshInFlight;
+      return;
+    }
     // Throttle by ATTEMPT time (success or failure) so failures/floods can't hammer getLogs.
     if (
       !force &&
       this.lastRoleAttemptAt !== null &&
       now - this.lastRoleAttemptAt < this.roleRefreshMs
     ) {
-      return;
-    }
-    // Single-flight: a concurrent caller awaits the in-flight derivation instead of starting a second.
-    if (this.refreshInFlight) {
-      await this.refreshInFlight;
       return;
     }
     this.lastRoleAttemptAt = now;
@@ -971,19 +1006,22 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // A1#6 (Codex High-1) — authorize against the EFFECTIVE set (static ∪ on-chain-derived), not
       // just the static list, or a derived-only operator could be audited by the requester yet never
       // co-signed by peers → never reaches quorum. Refresh (throttled) first so the responder's
-      // derived set is current. A derived-ONLY operator additionally requires a FRESH membership
-      // snapshot (isSlashableOperator) — a peer must not co-sign a slash of a possibly-exited operator.
+      // derived set is current.
       await this.refreshDerivedOperators();
       if (!this.effectiveWatchlist().includes(operator)) return NO;
-      if (!this.isSlashableOperator(operator)) {
-        this.logger.warn(
-          `co-sign refused: derived-only operator ${operator} but on-chain membership is stale`
-        );
-        return NO;
-      }
 
       const blockTag = req.epoch;
       if (!Number.isInteger(blockTag) || blockTag < 0) return NO;
+
+      // A1#6 (Codex round-3) — a derived-only operator's membership is CONFIRMED at req.epoch (the
+      // SAME block the evidence is verified at) via hasRole, not just the cached set's wall-clock
+      // freshness — a peer must not co-sign a slash of an operator who had exited by the epoch block.
+      if (!(await this.confirmSlashableAtBlock(operator, blockTag))) {
+        this.logger.warn(
+          `co-sign refused: ${operator} not a confirmed audited-role member at epoch ${blockTag}`
+        );
+        return NO;
+      }
 
       // Re-read the SAME rule inputs the tick reads, pinned at the epoch block.
       const [creditLimit, availableCredit, debt] = await Promise.all([
@@ -1607,14 +1645,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
-    // A1#6 (Codex High-2) — a derived-ONLY operator is armed for the irreversible on-chain slash only
-    // when its on-chain membership is FRESH; stale/never-confirmed membership degrades to file-only
-    // (proposal + archive, no queue/execute). Static-listed operators are always armed when enabled.
-    const armed = this.executeSlash && this.isSlashableOperator(operator);
+    // A1#6 (Codex High-2 + round-3) — a derived-ONLY operator is armed for the irreversible on-chain
+    // slash only when its membership is CONFIRMED at the evidence block (epoch) via hasRole — not just
+    // the cached set's wall-clock freshness. Stale/never-confirmed/exited-by-epoch membership degrades
+    // to file-only (proposal + archive, no queue/execute). Static-listed operators are always armed.
+    const armed = this.executeSlash && (await this.confirmSlashableAtBlock(operator, epoch));
     if (this.executeSlash && !armed) {
       this.logger.warn(
-        `Audit: ${operator} armed slash WITHHELD — derived-only operator with stale on-chain ` +
-          `membership; filing proposal only until membership is freshly confirmed`
+        `Audit: ${operator} armed slash WITHHELD — derived-only operator not confirmed as an ` +
+          `audited-role member at evidence block ${epoch}; filing proposal only`
       );
     }
     let coSignAborted = false;

@@ -82,6 +82,12 @@ function makeBlockchain(
       chunk: number,
       useGetter?: boolean
     ) => Promise<string[]>;
+    hasRole: (
+      registry: string,
+      roleId: string,
+      operator: string,
+      blockTag?: number
+    ) => Promise<boolean>;
   }> = {}
 ): any {
   return {
@@ -112,6 +118,9 @@ function makeBlockchain(
     // A1#6 — on-chain role enumeration. Default empty (roleDerive is off in BASE_CONFIG, so this is
     // never called unless a test opts in with auditRoleDerive: true).
     getRegisteredOperators: overrides.getRegisteredOperators ?? (async () => []),
+    // A1#6 (round-3) — per-operator membership at the evidence block. Default TRUE (a derived operator
+    // is still a role member); a test overrides to model an operator that exited by the epoch block.
+    hasRole: overrides.hasRole ?? (async () => true),
   };
 }
 
@@ -2359,6 +2368,67 @@ describe("AuditService", () => {
       release();
       await Promise.all([p1, p2]);
       expect(calls).toBe(2); // bootstrap + ONE shared derivation, not 3
+    });
+
+    // ── Codex round-3: membership CONFIRMED at the evidence block (hasRole), not just wall-clock ──
+    it("responder REFUSES a derived-only op that EXITED by the epoch block (hasRole=false), even when the set is fresh", async () => {
+      const derivedOp = ethers.getAddress(opB);
+      const blockchain = overLimitBlockchain({
+        getRegisteredOperators: async () => [derivedOp], // still in the cached set
+        hasRole: async () => false, // but NOT a member at the evidence block (exited)
+      });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      const res = await (svc as any).verifyViolationForCoSign({
+        chainId: 11155111,
+        operator: derivedOp,
+        slashLevel: 1,
+        epoch: BLOCK,
+      });
+      expect(res.confirmed).toBe(false); // cached-fresh but exited-at-epoch → refuse
+    });
+
+    it("hasRole read error → fail-closed (does not co-sign a derived-only op)", async () => {
+      const derivedOp = ethers.getAddress(opB);
+      const blockchain = overLimitBlockchain({
+        getRegisteredOperators: async () => [derivedOp],
+        hasRole: async () => {
+          throw new Error("rpc down");
+        },
+      });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      const res = await (svc as any).verifyViolationForCoSign({
+        chainId: 11155111,
+        operator: derivedOp,
+        slashLevel: 1,
+        epoch: BLOCK,
+      });
+      expect(res.confirmed).toBe(false);
+    });
+
+    it("a STATIC-listed operator is co-signed WITHOUT a hasRole check (may hold no role)", async () => {
+      let hasRoleCalled = false;
+      const blockchain = overLimitBlockchain({
+        hasRole: async () => {
+          hasRoleCalled = true;
+          return false;
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        roleDeriveConfig({ auditWatchlist: [OPERATOR] }),
+        makeArchive()
+      );
+      await svc.onApplicationBootstrap();
+      const res = await (svc as any).verifyViolationForCoSign({
+        chainId: 11155111,
+        operator: ethers.getAddress(OPERATOR),
+        slashLevel: 1,
+        epoch: BLOCK,
+      });
+      expect(res.confirmed).toBe(true);
+      expect(hasRoleCalled).toBe(false); // static operator bypasses the membership check
     });
 
     it("a STATIC-listed operator is still co-signed even when the derived set is stale", async () => {
