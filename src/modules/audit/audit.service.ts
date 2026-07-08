@@ -58,6 +58,14 @@ const RULE_CREDIT_OVER_LIMIT = "credit-over-limit";
  */
 const SLASH_LEVEL_OFFLINE = SlashLevel.WARNING;
 const RULE_OFFLINE = "offline";
+/**
+ * Continuous-offline threshold — a VERSION-BOUND CONSTANT, NOT env (Codex/PK review M-2). It enters
+ * the offline proofHash, so every DVT node MUST use the identical value or the content-address (and
+ * thus the BLS quorum) diverges. A code constant tied to PROOF_SCHEMA_VERSION guarantees all
+ * same-version nodes agree; tuning it is a deliberate versioned release, not a per-node env knob.
+ * 10 minutes. (The effective window is this + the finality lag of the evidence block.)
+ */
+const OFFLINE_THRESHOLD_MS = 600_000;
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
 
@@ -127,8 +135,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly roleMaxStaleMs: number;
   /** Rule ② offline detection — opt-in; audits gossip liveness of the watched operators. */
   private readonly offlineEnabled: boolean;
-  /** Continuous-offline threshold (ms): OFFLINE = lastSeen older than block.ts − this. */
-  private readonly offlineThresholdMs: number;
   /** Liveness source (GossipService.getLastSeen); null when gossip isn't wired → offline self-disables. */
   private readonly gossip: GossipService | null;
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
@@ -295,7 +301,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.roleUseGetter = config.get<boolean>("auditRoleUseGetter") === true;
     this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
     this.offlineEnabled = config.get<boolean>("auditOfflineEnabled") === true;
-    this.offlineThresholdMs = config.get<number>("auditOfflineThresholdMs") ?? 600_000;
     this.gossip = gossip ?? null;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
@@ -1014,7 +1019,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       );
       return;
     }
-    const deadlineMs = blockTsSec * 1000 - this.offlineThresholdMs;
+    const deadlineMs = blockTsSec * 1000 - OFFLINE_THRESHOLD_MS;
 
     if (lastSeen >= deadlineMs) {
       // ONLINE (or within the threshold) — the operator is live; clear any prior offline marker so a
@@ -1033,13 +1038,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       slashLevel: SLASH_LEVEL_OFFLINE,
       registry: this.normalizeAddress(this.registryAddress),
       dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
-      offlineThresholdMs: this.offlineThresholdMs,
+      offlineThresholdMs: OFFLINE_THRESHOLD_MS,
       blsAggregator: this.normalizeAddress(this.blsAggregatorAddress),
     };
     const offlineForMs = blockTsSec * 1000 - lastSeen;
     const reason =
       `${RULE_OFFLINE}: nodeId ${nodeId} last heartbeat ${offlineForMs}ms before finalized block ` +
-      `${pinnedBlock.number} (> threshold ${this.offlineThresholdMs}ms)`;
+      `${pinnedBlock.number} (> threshold ${OFFLINE_THRESHOLD_MS}ms)`;
     this.logger.warn(reason);
     // observedAt / lastSeen are HUMAN-only forensics in `sources` (excluded from the content-address).
     const sources: EvidenceSource[] = [
@@ -1067,7 +1072,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       observedAt: this.clock(),
       identity,
       observed: `offline ${offlineForMs}ms`,
-      threshold: `${this.offlineThresholdMs}ms`,
+      threshold: `${OFFLINE_THRESHOLD_MS}ms`,
     });
   }
 

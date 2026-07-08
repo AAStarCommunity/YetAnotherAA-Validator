@@ -33,6 +33,8 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
   /** Hard cap on the liveness ledger — bounds a spoofed-heartbeat flood (Codex High-1). ≫ any real
    *  DVT fleet; a NEW nodeId past this is rejected (existing entries are never evicted). */
   private static readonly MAX_LIVENESS_LEDGER = 4096;
+  /** Rate-limit (epoch ms) for the ledger-full warning so the log line itself can't be flooded (L-1). */
+  private lastLedgerFullWarnAt = 0;
   private connections = new Map<string, WebSocket>();
   private nodeState: NodeState;
   private messageHistory = new Map<string, MessageHistory>();
@@ -589,7 +591,20 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       !this.lastSeenLedger.has(nodeId) &&
       this.lastSeenLedger.size >= GossipService.MAX_LIVENESS_LEDGER
     ) {
-      return; // ledger full + a NEW nodeId → reject (never evict existing offline evidence)
+      // ledger full + a NEW nodeId → reject (never evict existing offline evidence). NOT silent
+      // (L-1): a full ledger means a NEW registered operator would escape offline auditing — surface
+      // it so ops can react (and it signals a possible spoofed-heartbeat flood). Rate-limited to once
+      // per minute so the log itself can't be flooded.
+      const now = Date.now();
+      if (now - this.lastLedgerFullWarnAt > 60_000) {
+        this.lastLedgerFullWarnAt = now;
+        console.warn(
+          `⚠️  liveness ledger FULL (${GossipService.MAX_LIVENESS_LEDGER}) — rejecting new nodeId ` +
+            `${nodeId.slice(0, 10)}…; a genuinely new operator would escape offline audit. Possible ` +
+            `spoofed-heartbeat flood (heartbeat auth = inc-2 M-1 fix).`
+        );
+      }
+      return;
     }
     this.lastSeenLedger.set(nodeId, Date.now());
   }
