@@ -75,7 +75,11 @@ async function signedHeartbeat(
 }
 
 function buildService(): GossipService {
-  return new GossipService(makeConfig(), makeNodeService(), blsService);
+  const svc = new GossipService(makeConfig(), makeNodeService(), blsService);
+  // The ledger records ONLY nodeIds the auditor marks relevant (default record-nothing). Mark both
+  // test identities relevant so the happy-path tests record; the registration test overrides this.
+  svc.setRelevantNodeIds([nodeIdFor(PRIV_A), nodeIdFor(PRIV_B)]);
+  return svc;
 }
 
 describe("GossipService heartbeat authentication (offline-audit rule ② inc-2)", () => {
@@ -163,6 +167,40 @@ describe("GossipService heartbeat authentication (offline-audit rule ② inc-2)"
     expect((svc as any).lastSeenLedger.size).toBe(1);
     expect(svc.getLastSeen(nid)).toBe(NOW);
     expect(svc.getLastSeen(nid.toUpperCase().replace("0X", "0x"))).toBe(NOW); // case-insensitive read
+  });
+
+  it("default is RECORD-NOTHING — a valid heartbeat with NO relevant set is dropped (no startup Sybil window)", async () => {
+    // Fresh service WITHOUT any setRelevantNodeIds → the ledger records nothing (closes the pre-first-
+    // tick Sybil window).
+    const svc = new GossipService(makeConfig(), makeNodeService(), blsService);
+    const nid = nodeIdFor(PRIV_A);
+    await (svc as any).handleHeartbeatMessage(await signedHeartbeat(PRIV_A, NOW));
+    expect(svc.getLastSeen(nid)).toBeNull();
+    expect((svc as any).lastSeenLedger.size).toBe(0);
+  });
+
+  it("setRelevantNodeIds PRUNES ledger entries no longer relevant (evicts a poisoned/exited entry)", async () => {
+    const svc = buildService(); // A + B relevant
+    const nidA = nodeIdFor(PRIV_A);
+    const nidB = nodeIdFor(PRIV_B);
+    await (svc as any).handleHeartbeatMessage(await signedHeartbeat(PRIV_A, NOW));
+    await (svc as any).handleHeartbeatMessage(await signedHeartbeat(PRIV_B, NOW));
+    expect((svc as any).lastSeenLedger.size).toBe(2);
+    // Narrow the audited set to A only → B is pruned from the ledger.
+    svc.setRelevantNodeIds([nidA]);
+    expect(svc.getLastSeen(nidB)).toBeNull();
+    expect(svc.getLastSeen(nidA)).toBe(NOW);
+    expect((svc as any).lastSeenLedger.size).toBe(1);
+  });
+
+  it("a same-authTs replay does NOT advance liveness (monotonic on authTs, closes the future-date replay)", async () => {
+    const svc = buildService();
+    const nid = nodeIdFor(PRIV_A);
+    await (svc as any).handleHeartbeatMessage(await signedHeartbeat(PRIV_A, NOW));
+    const seen1 = svc.getLastSeen(nid);
+    // Replay the exact same signed heartbeat (same authTs) → rejected by the authTs-monotonic guard.
+    await (svc as any).handleHeartbeatMessage(await signedHeartbeat(PRIV_A, NOW));
+    expect(svc.getLastSeen(nid)).toBe(seen1);
   });
 
   it("registration gate: with a relevant set, an UNREGISTERED (Sybil) valid heartbeat is NOT recorded (Codex High)", async () => {

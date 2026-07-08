@@ -32,7 +32,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * REMOVED from `peers`, which would erase the very lastSeen the offline proof needs). Bounded by the
    * number of distinct nodes ever seen (the small DVT fleet). Read via getLastSeen(nodeId).
    */
-  private lastSeenLedger = new Map<string, number>();
+  private lastSeenLedger = new Map<string, { authTs: number; seen: number }>();
   /** Hard cap on the liveness ledger — bounds a spoofed-heartbeat flood (Codex High-1). ≫ any real
    *  DVT fleet; a NEW nodeId past this is rejected (existing entries are never evicted). */
   private static readonly MAX_LIVENESS_LEDGER = 4096;
@@ -47,6 +47,11 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    *  (a legit peer sends 1 heartbeat/interval; this is generous). */
   private static readonly HEARTBEAT_VERIFY_PER_CONN = 5;
   private static readonly HEARTBEAT_VERIFY_WINDOW_MS = 10_000;
+  /** GLOBAL verify budget per window — a backstop the per-connection budget cannot bypass via
+   *  reconnect churn (each new ws would otherwise get a fresh per-conn budget). Bounds TOTAL BLS
+   *  heartbeat verifies/window across all connections. ≫ a real fleet's N heartbeats/window. */
+  private static readonly HEARTBEAT_VERIFY_GLOBAL = 128;
+  private globalVerifyBudget = { count: 0, windowStart: 0 };
   /** Rate-limit (epoch ms) for the ledger-full warning so the log line itself can't be flooded (L-1). */
   private lastLedgerFullWarnAt = 0;
   /** Per-ws BLS-verify throttle for inbound heartbeats (CPU-DoS guard). */
@@ -342,6 +347,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       ws.on("close", () => {
         console.log(`❌ Disconnected from gossip peer: ${endpoint}`);
         this.connections.delete(endpoint);
+        this.heartbeatVerifyBudget.delete(ws);
       });
 
       ws.on("error", (error: Error) => {
@@ -615,43 +621,60 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     // (Codex High) nor miss the audit's keccak256 (lowercase) lookup.
     const nodeId = typeof peerId === "string" ? peerId.toLowerCase() : "";
     if (!/^0x[0-9a-f]{64}$/.test(nodeId)) return;
+    // REGISTRATION gate FIRST (Codex High): record ONLY nodeIds the auditor asked for. An EMPTY set
+    // records NOTHING (default) — so before the first AuditService push, a Sybil flood cannot fill the
+    // ledger. A node not running the auditor simply never populates the set (its ledger stays empty,
+    // and nothing reads it). This gate applies to NEW and EXISTING entries alike.
+    if (!this.relevantNodeIds.has(nodeId)) return;
     const now = Date.now();
     if (auth.authTs > now + GossipService.MAX_HEARTBEAT_SKEW_MS) return; // future-dated → drop
-    // clamp the recorded time to receive time so a within-skew future timestamp buys NO offline grace;
-    // authTs is used only for the signature. recordLiveness re-clamps + enforces monotonicity.
-    const recordTs = Math.min(auth.authTs, now);
-    // MONOTONIC/stale precheck BEFORE verifying — a replay or stale heartbeat can't advance liveness,
-    // so there is no reason to pay a BLS verify for it (defeats the replay-flood CPU DoS).
+    // MONOTONIC/stale precheck on the SIGNED authTs (not the receive-clamped value) BEFORE verifying:
+    // a replay or stale heartbeat carries authTs <= the last accepted authTs, so it can neither advance
+    // liveness nor be worth a BLS verify. Comparing authTs (unique per genuine heartbeat) — not the
+    // receive-clamped recordTs — also closes the within-skew future-date REPLAY (Codex Medium).
     const existing = this.lastSeenLedger.get(nodeId);
-    if (existing !== undefined && recordTs <= existing) return;
-    // registration gate + capacity: a NEW nodeId that isn't audited, or that overflows the cap, is
-    // dropped before verifying (Codex High: unregistered Sybil must not consume verify budget or cap).
-    if (existing === undefined) {
-      if (this.relevantNodeIds.size > 0 && !this.relevantNodeIds.has(nodeId)) return;
-      if (this.lastSeenLedger.size >= GossipService.MAX_LIVENESS_LEDGER) {
-        this.warnLedgerFull(nodeId);
-        return;
-      }
+    if (existing !== undefined && auth.authTs <= existing.authTs) return;
+    if (existing === undefined && this.lastSeenLedger.size >= GossipService.MAX_LIVENESS_LEDGER) {
+      this.warnLedgerFull(nodeId);
+      return;
     }
-    // per-connection verify budget — bounds a flood of fresh-authTs valid-shaped heartbeats.
+    // verify budget (per-connection AND global) — bounds a flood of fresh-authTs valid-shaped
+    // heartbeats, including one spread across many short-lived reconnections.
     if (!this.allowHeartbeatVerify(ws, now)) return;
-    // EXPENSIVE: BLS verify (last).
+    // EXPENSIVE: BLS verify (last). Record the RECEIVE-clamped time so a within-skew future timestamp
+    // buys no offline grace; keep authTs for the monotonic/replay guard.
     if (await this.verifyHeartbeatAuth(nodeId, auth)) {
-      this.recordLiveness(nodeId, recordTs);
+      this.recordLiveness(nodeId, auth.authTs, Math.min(auth.authTs, now));
     }
   }
 
-  /** Per-ws sliding-window budget for heartbeat BLS verifications (CPU-DoS guard). No ws (tests /
-   *  self-injected) → always allowed. */
+  /**
+   * Sliding-window budget for heartbeat BLS verifications (CPU-DoS guard). BOTH a GLOBAL cap (bounds
+   * total verifies/window, so reconnect churn can't multiply the budget) AND a per-connection cap
+   * (fairness). No ws (tests / self-injected) skips only the per-connection check.
+   */
   private allowHeartbeatVerify(ws: WebSocket | undefined, now: number): boolean {
-    if (!ws) return true;
-    const b = this.heartbeatVerifyBudget.get(ws);
-    if (!b || now - b.windowStart >= GossipService.HEARTBEAT_VERIFY_WINDOW_MS) {
-      this.heartbeatVerifyBudget.set(ws, { count: 1, windowStart: now });
-      return true;
+    const W = GossipService.HEARTBEAT_VERIFY_WINDOW_MS;
+    // global window
+    if (
+      this.globalVerifyBudget.windowStart === 0 ||
+      now - this.globalVerifyBudget.windowStart >= W
+    ) {
+      this.globalVerifyBudget = { count: 0, windowStart: now };
     }
-    if (b.count >= GossipService.HEARTBEAT_VERIFY_PER_CONN) return false;
-    b.count++;
+    if (this.globalVerifyBudget.count >= GossipService.HEARTBEAT_VERIFY_GLOBAL) return false;
+    // per-connection window
+    if (ws) {
+      const b = this.heartbeatVerifyBudget.get(ws);
+      if (!b || now - b.windowStart >= W) {
+        this.heartbeatVerifyBudget.set(ws, { count: 1, windowStart: now });
+      } else if (b.count >= GossipService.HEARTBEAT_VERIFY_PER_CONN) {
+        return false;
+      } else {
+        b.count++;
+      }
+    }
+    this.globalVerifyBudget.count++;
     return true;
   }
 
@@ -675,6 +698,12 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     const next = new Set<string>();
     for (const n of nodeIds) if (typeof n === "string") next.add(n.toLowerCase());
     this.relevantNodeIds = next;
+    // PRUNE ledger entries no longer relevant (Codex High) — evicts any Sybil recorded during an
+    // earlier empty-set window and any operator that has exited the audited set, so the cap always
+    // reflects the CURRENT audited set and can't be permanently poisoned.
+    for (const key of this.lastSeenLedger.keys()) {
+      if (!next.has(key)) this.lastSeenLedger.delete(key);
+    }
   }
 
   /**
@@ -717,11 +746,13 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * every gate (shape, monotonic, registration, cap) was applied by the caller; the monotonic guard is
    * re-checked here because the BLS verify is async and another heartbeat could have landed meanwhile.
    */
-  private recordLiveness(nodeId: string, seenAtMs: number): void {
+  private recordLiveness(nodeId: string, authTs: number, seen: number): void {
     if (!/^0x[0-9a-f]{64}$/.test(nodeId)) return;
+    if (!this.relevantNodeIds.has(nodeId)) return; // re-check relevance (async verify race)
     const existing = this.lastSeenLedger.get(nodeId);
     if (existing !== undefined) {
-      if (seenAtMs > existing) this.lastSeenLedger.set(nodeId, seenAtMs); // monotonic anti-replay
+      // monotonic on the SIGNED authTs — a replayed heartbeat (same authTs) can't advance liveness.
+      if (authTs > existing.authTs) this.lastSeenLedger.set(nodeId, { authTs, seen });
       return;
     }
     // A new nodeId slipped past the caller's cap check only if it raced another verify — re-guard.
@@ -729,7 +760,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       this.warnLedgerFull(nodeId);
       return;
     }
-    this.lastSeenLedger.set(nodeId, seenAtMs);
+    this.lastSeenLedger.set(nodeId, { authTs, seen });
   }
 
   /**
@@ -741,7 +772,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * `nodeId` is lowercased to match the canonical ledger keys (keccak256 output is lowercase).
    */
   getLastSeen(nodeId: string): number | null {
-    return this.lastSeenLedger.get(nodeId.toLowerCase()) ?? null;
+    return this.lastSeenLedger.get(nodeId.toLowerCase())?.seen ?? null;
   }
 
   // ── DVT slash quorum co-sign transport (inc-2 live) ─────────────────────────────
@@ -1425,6 +1456,9 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
         this.connections.delete(endpoint);
       }
     });
+    // Drop the per-connection heartbeat-verify budget so short-lived/reconnecting connections don't
+    // leak Map entries (Codex High — memory leak + reconnect-bypass are the same root).
+    this.heartbeatVerifyBudget.delete(ws);
   }
 
   /**
