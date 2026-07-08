@@ -650,7 +650,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // liveness ledger so it records ONLY audited operators' heartbeats (Codex: a Sybil can't exhaust
       // the cap). The cache is authoritative-per-operator: a transient getOperatorNodeId FAILURE keeps
       // the previously-resolved nodeId (Codex Medium: never prune a still-relevant operator on an RPC
-      // blip); an entry is dropped ONLY when its operator leaves the watchlist. Runs on the empty-
+      // blip), while an AUTHORITATIVE null (inactive / key rotated) drops it, and leaving the
+      // watchlist drops it. Runs on the empty-
       // watchlist path too, so a drained set correctly clears the relevant set (Codex Low).
       if (this.offlineEnabled && this.gossip && this.blsAggregatorAddress) {
         const current = new Set(operators);
