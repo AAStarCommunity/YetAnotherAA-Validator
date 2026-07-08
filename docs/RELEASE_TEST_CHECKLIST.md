@@ -110,36 +110,39 @@ RPC every tick. The node's RPC MUST provide:
 
 ---
 
-## Double-slash residuals (armed real-slash — read before flipping `AUDIT_DRY_RUN=false` in prod)
+## Double-slash residuals — ✅ CONTRACT-CLOSED by SuperPaymaster 5.4.2
 
-The DVT over-slash guard (`getRecentSlashExecuted` incl. `OperatorSlashed`, +
-event-reconstructed `isSlashPending`, + the during-cooldown "learning" scan for
-in-flight keys) prevents same-node and the common cross-node double-slash. Two
-residuals it can only PARTIALLY cover (surfaced by an 8-round adversarial
-review):
+Both residuals below (surfaced by an 8-round adversarial review) are now
+**authoritatively closed on-chain** by SuperPaymaster **5.4.2** (deployed
+Sepolia 2026-07-08, UUPS in-place — address unchanged): the BLS slash path now
+enforces a **1h cooldown gate inside `SP.queueSlash`** (`_blsSlashCd`, decoupled
+from the owner-path `_slashCd`). Within the window, a `BLS_AGGREGATOR`
+`queueSlash` reverts `SlashCooldown()`, so a racing second slash of the same
+operator **cannot even queue** — the DVT `queueSlashWithProof` staticCall
+preflight catches it and degrades to file+archive (no gas, no parked pending).
+The gate is at `queueSlash` (not `executeSlashWithBLS`) precisely so a stale
+`_pendingSlash` is never parked.
 
-1. **Fresh-node / long-offline window** — a node with no in-memory state and no
-   local durable slashed marker, started after a peer's `SlashExecuted` /
-   `OperatorSlashed` has aged out of `AUDIT_SLASH_LOOKBACK_BLOCKS`, can read
-   "clear" for a still-sustained violation and slash again. **Mitigation
-   (operational):** size `AUDIT_SLASH_LOOKBACK_BLOCKS` to cover the worst-case
-   node restart/offline horizon (bounded by the RPC's `eth_getLogs` cap — use a
-   provider whose cap exceeds that horizon), or seed/share the durable slashed
-   journal across the fleet.
+The DVT over-slash guard (`getRecentSlashExecuted` incl. `OperatorSlashed`,
+`isSlashPending` — now the O(1) typed getter with the event reconstruction as a
+pre-5.4.2 fallback, + the during-cooldown "learning" scan) is retained as
+gas-saving defence-in-depth; the contract is the authority.
 
-2. **Different-epoch concurrent slash — needs an SP contract change
-   (@repo:sp).** `epoch = violationBlock`, and the BLSAggregator queue replay
-   guard keys on `operator + slashLevel + epoch + chainid`. Two nodes that
-   observe the same sustained violation at DIFFERENT finalized blocks produce
-   DIFFERENT queue hashes, so both can queue; if one lands after the other
-   executed and cleared `_pendingSlash`, it re-sets pending and executes a
-   SECOND slash. The DVT over-slash guard mitigates but cannot authoritatively
-   close a cross-node contract race. **Authoritative fix (SuperPaymaster):**
-   `executeSlashWithBLS` must carry the same slash cooldown its owner path
-   already has — `slashOperator` enforces `_slashCd[operator]` (24h) but
-   `executeSlashWithBLS` does NOT — or make the queue/replay guard coarse
-   (`operator + slashLevel`, dropping `epoch`). Tracked with @repo:sp on the
-   Cooperation-Center board.
+1. **Fresh-node / long-offline window** — a fresh node could read "clear" for a
+   sustained violation whose peer slash aged out of
+   `AUDIT_SLASH_LOOKBACK_BLOCKS` → ✅ now the contract reverts its `queueSlash`
+   within the 1h cooldown. Still size `AUDIT_SLASH_LOOKBACK_BLOCKS` sensibly to
+   avoid needless preflight churn.
+
+2. **Different-epoch concurrent slash** → ✅ closed: two nodes at different
+   `epoch`s could both queue, but the 1h `_blsSlashCd` gate in `SP.queueSlash`
+   reverts the second regardless of epoch.
+
+⚠️ **Cold-start floor:** the 5.4.2 upgrade atomically primed a 1h blanket BLS
+cooldown (`primeBlsSlashCooldown`), so for ~1h AFTER the upgrade EVERY BLS
+`queueSlash` (even a never-slashed operator) reverts `SlashCooldown`. **Schedule
+the first real slash E2E ≥ 1h after the upgrade** (≥ ~2026-07-08 09:24 UTC), or
+the queue reverts. The owner path is unaffected.
 
 ---
 
