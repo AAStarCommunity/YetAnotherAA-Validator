@@ -137,6 +137,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly offlineEnabled: boolean;
   /** Liveness source (GossipService.getLastSeen); null when gossip isn't wired → offline self-disables. */
   private readonly gossip: GossipService | null;
+  /** Stable operator→nodeId cache (offline rule ②). A transient resolve failure keeps the cached
+   *  nodeId so a still-relevant operator is never pruned from the gossip ledger on an RPC blip. */
+  private readonly offlineNodeIdCache = new Map<string, string>();
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
   private derivedOperators: string[] = [];
   /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
@@ -643,28 +646,35 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         });
       }
       const operators = this.effectiveWatchlist();
-      if (operators.length === 0) {
-        this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
-        return;
-      }
-      // Rule ② offline — resolve every audited operator to its gossip nodeId ONCE, and push the set to
-      // the gossip liveness ledger so it records ONLY these operators' heartbeats (Codex High: an
-      // authenticated-but-unregistered Sybil can't exhaust the capped ledger ahead of a real operator).
-      const offlineNodeIds = new Map<string, string>();
+      // Rule ② offline — maintain a STABLE operator→nodeId cache and push its nodeIds to the gossip
+      // liveness ledger so it records ONLY audited operators' heartbeats (Codex: a Sybil can't exhaust
+      // the cap). The cache is authoritative-per-operator: a transient getOperatorNodeId FAILURE keeps
+      // the previously-resolved nodeId (Codex Medium: never prune a still-relevant operator on an RPC
+      // blip); an entry is dropped ONLY when its operator leaves the watchlist. Runs on the empty-
+      // watchlist path too, so a drained set correctly clears the relevant set (Codex Low).
       if (this.offlineEnabled && this.gossip && this.blsAggregatorAddress) {
+        const current = new Set(operators);
+        for (const op of [...this.offlineNodeIdCache.keys()]) {
+          if (!current.has(op)) this.offlineNodeIdCache.delete(op); // operator exited the watchlist
+        }
         for (const operator of operators) {
           try {
             const nid = await this.blockchainService.getOperatorNodeId(
               this.blsAggregatorAddress,
               operator
             );
-            if (nid) offlineNodeIds.set(operator, nid);
+            if (nid) this.offlineNodeIdCache.set(operator, nid);
+            // resolve failure (null) → KEEP any cached nodeId (do not drop a relevant operator)
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             this.logger.debug(`Audit: offline nodeId resolve failed for ${operator} — ${msg}`);
           }
         }
-        this.gossip.setRelevantNodeIds(offlineNodeIds.values());
+        this.gossip.setRelevantNodeIds(this.offlineNodeIdCache.values());
+      }
+      if (operators.length === 0) {
+        this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
+        return;
       }
       for (const operator of operators) {
         try {
@@ -677,7 +687,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         // Rule ② offline — independent of the credit rule: one rule's failure must not skip the other.
         if (this.offlineEnabled) {
           try {
-            await this.auditOfflineForOperator(operator, pinnedBlock, offlineNodeIds.get(operator));
+            await this.auditOfflineForOperator(
+              operator,
+              pinnedBlock,
+              this.offlineNodeIdCache.get(operator)
+            );
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             this.logger.error(`Audit: ${operator} offline audit failed — ${msg}`);

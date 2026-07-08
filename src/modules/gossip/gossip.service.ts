@@ -47,10 +47,11 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    *  (a legit peer sends 1 heartbeat/interval; this is generous). */
   private static readonly HEARTBEAT_VERIFY_PER_CONN = 5;
   private static readonly HEARTBEAT_VERIFY_WINDOW_MS = 10_000;
-  /** GLOBAL verify budget per window — a backstop the per-connection budget cannot bypass via
-   *  reconnect churn (each new ws would otherwise get a fresh per-conn budget). Bounds TOTAL BLS
-   *  heartbeat verifies/window across all connections. ≫ a real fleet's N heartbeats/window. */
-  private static readonly HEARTBEAT_VERIFY_GLOBAL = 128;
+  /** GLOBAL verify-budget FLOOR + per-relevant-node headroom. The effective cap SCALES with the
+   *  audited fleet (relevantNodeIds.size), since only relevant nodeIds are ever verified — so a large
+   *  fleet can't self-DoS (Codex Medium), while a flood is still bounded to floor + 8×fleet per window. */
+  private static readonly HEARTBEAT_VERIFY_GLOBAL_FLOOR = 128;
+  private static readonly HEARTBEAT_VERIFY_PER_RELEVANT = 8;
   private globalVerifyBudget = { count: 0, windowStart: 0 };
   /** Rate-limit (epoch ms) for the ledger-full warning so the log line itself can't be flooded (L-1). */
   private lastLedgerFullWarnAt = 0;
@@ -60,8 +61,9 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * The nodeIds whose liveness this node actually AUDITS (offline rule ②) — pushed by AuditService
    * (the registered/watched operators, resolved to nodeIds). When non-empty, ONLY these nodeIds are
    * recorded, so an authenticated but UNREGISTERED Sybil identity cannot exhaust the capped ledger
-   * ahead of a real operator (Codex High). Empty = record any authenticated nodeId (a node not
-   * running the auditor). All entries are lowercase-canonical.
+   * ahead of a real operator (Codex High). EMPTY = record NOTHING (the default) — so before the
+   * auditor's first push, or on a node not running the auditor, a Sybil flood can't fill the ledger.
+   * All entries are lowercase-canonical; setRelevantNodeIds also prunes now-irrelevant ledger entries.
    */
   private relevantNodeIds = new Set<string>();
   private connections = new Map<string, WebSocket>();
@@ -662,7 +664,12 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     ) {
       this.globalVerifyBudget = { count: 0, windowStart: now };
     }
-    if (this.globalVerifyBudget.count >= GossipService.HEARTBEAT_VERIFY_GLOBAL) return false;
+    // Scale the global cap with the audited fleet (only relevant nodeIds are verified) so a large
+    // fleet never starves itself, while a flood stays bounded.
+    const globalCap =
+      GossipService.HEARTBEAT_VERIFY_GLOBAL_FLOOR +
+      this.relevantNodeIds.size * GossipService.HEARTBEAT_VERIFY_PER_RELEVANT;
+    if (this.globalVerifyBudget.count >= globalCap) return false;
     // per-connection window
     if (ws) {
       const b = this.heartbeatVerifyBudget.get(ws);
