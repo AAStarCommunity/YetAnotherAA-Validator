@@ -74,6 +74,14 @@ function makeBlockchain(
     executeSlashWithProof: (...args: any[]) => Promise<string>;
     isSlashPending: (...args: any[]) => Promise<boolean | null>;
     getWalletAddress: () => string | null;
+    getRegisteredOperators: (
+      registry: string,
+      roleIds: string[],
+      fromBlock: number,
+      toBlock: number,
+      chunk: number,
+      useGetter?: boolean
+    ) => Promise<string[]>;
   }> = {}
 ): any {
   return {
@@ -101,6 +109,9 @@ function makeBlockchain(
     // Current SP keeps _pendingSlash private → no getter → null ("unknown") by default.
     isSlashPending: overrides.isSlashPending ?? (async () => null),
     getWalletAddress: overrides.getWalletAddress ?? (() => "0x" + "99".repeat(20)),
+    // A1#6 — on-chain role enumeration. Default empty (roleDerive is off in BASE_CONFIG, so this is
+    // never called unless a test opts in with auditRoleDerive: true).
+    getRegisteredOperators: overrides.getRegisteredOperators ?? (async () => []),
   };
 }
 
@@ -2104,5 +2115,245 @@ describe("AuditService", () => {
     await svc.tick();
     // The stale durable marker is gone — a genuine future violation can slash again.
     expect(archive.slashed.has(coarseKey)).toBe(false);
+  });
+
+  // ── A1#6: watchlist derived from on-chain Registry role membership ─────────────
+  describe("A1#6 on-chain role-derived watchlist", () => {
+    const opB = "0x" + "cd".repeat(20);
+    const roleDeriveConfig = (overrides: Record<string, unknown> = {}) =>
+      makeConfig({
+        auditRoleDerive: true,
+        auditRoleIds: ["DVT", "ANODE"],
+        auditRoleFromBlock: 100,
+        auditRoleLogChunk: 5000,
+        auditRoleRefreshMs: 300_000,
+        ...overrides,
+      });
+
+    it("hashes role NAMES to keccak256 roleIds and passes them to getRegisteredOperators", async () => {
+      let seen: string[] = [];
+      const blockchain = makeBlockchain({
+        getRegisteredOperators: async (_r, roleIds) => {
+          seen = roleIds;
+          return [];
+        },
+      });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      expect(seen).toEqual([ethers.id("DVT"), ethers.id("ANODE")]);
+    });
+
+    it("audits on-chain-derived operators even when the static watchlist is empty", async () => {
+      const audited: string[] = [];
+      const blockchain = overLimitBlockchain({
+        getRegisteredOperators: async () => [opB],
+        createProposalWithEvidence: async (_addr: string, operator: string) => {
+          audited.push(operator);
+          return { txHash: "0xTX", proposalId: 7n };
+        },
+      });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      await svc.tick();
+      expect(audited).toEqual([ethers.getAddress(opB)]);
+    });
+
+    it("UNIONs the static watchlist with the derived set (static never subtracts)", async () => {
+      const blockchain = makeBlockchain({ getRegisteredOperators: async () => [opB] });
+      const svc = makeService(
+        blockchain,
+        roleDeriveConfig({ auditWatchlist: [OPERATOR] }),
+        makeArchive()
+      );
+      await svc.onApplicationBootstrap();
+      const status = await svc.getStatus();
+      expect(status.watchlist.sort()).toEqual(
+        [ethers.getAddress(OPERATOR), ethers.getAddress(opB)].sort()
+      );
+      expect(status.roleDerive).toBe(true);
+      expect(status.derivedOperatorCount).toBe(1);
+    });
+
+    it("canonicalizes derived addresses to checksummed form", async () => {
+      const lower = "0x" + "ef".repeat(20);
+      const blockchain = makeBlockchain({ getRegisteredOperators: async () => [lower] });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      expect((await svc.getStatus()).watchlist).toEqual([ethers.getAddress(lower)]);
+    });
+
+    it("KEEPS the previous derived set when a refresh fails (never shrinks to empty)", async () => {
+      let call = 0;
+      const blockchain = makeBlockchain({
+        getRegisteredOperators: async () => {
+          call++;
+          if (call === 1) return [opB]; // eager bootstrap derive succeeds
+          throw new Error("getLogs range too wide"); // subsequent refresh fails
+        },
+      });
+      // refreshMs=0 so the next tick attempts a fresh (failing) derivation.
+      const svc = makeService(
+        blockchain,
+        roleDeriveConfig({ auditWatchlist: [], auditRoleRefreshMs: 0 }),
+        makeArchive()
+      );
+      await svc.onApplicationBootstrap();
+      expect((await svc.getStatus()).derivedOperatorCount).toBe(1);
+      await svc.tick(); // refresh throws → previous set kept
+      expect((await svc.getStatus()).derivedOperatorCount).toBe(1);
+      expect((await svc.getStatus()).watchlist).toEqual([ethers.getAddress(opB)]);
+    });
+
+    it("is a no-op when roleDerive is OFF (getRegisteredOperators never called)", async () => {
+      let called = false;
+      const blockchain = makeBlockchain({
+        getRegisteredOperators: async () => {
+          called = true;
+          return [opB];
+        },
+      });
+      // BASE_CONFIG has auditRoleDerive unset (falsy) and a non-empty static watchlist.
+      const svc = makeService(blockchain, makeConfig(), makeArchive());
+      await svc.onApplicationBootstrap();
+      await svc.tick();
+      expect(called).toBe(false);
+      expect((await svc.getStatus()).watchlist).toEqual([ethers.getAddress(OPERATOR)]);
+    });
+
+    it("boots with an empty static watchlist when roleDerive is ON (no 'nothing to watch' bail)", async () => {
+      const blockchain = makeBlockchain({ getRegisteredOperators: async () => [opB] });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      // enabled stays true (did not early-return on the empty static list) and the derived op is live.
+      expect((await svc.getStatus()).enabled).toBe(true);
+      expect((await svc.getStatus()).watchlist).toEqual([ethers.getAddress(opB)]);
+    });
+
+    // ── Codex Medium-1: membership derived to the SAME finalized block as the evidence ──
+    it("derives membership at the finalized block (not raw latest)", async () => {
+      let seenToBlock = -1;
+      const blockchain = makeBlockchain({
+        getViolationBlock: async () => ({ number: 999, hash: BLOCK_HASH }),
+        getRegisteredOperators: async (_r, _ids, _from, toBlock) => {
+          seenToBlock = toBlock;
+          return [];
+        },
+      });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      expect(seenToBlock).toBe(999);
+    });
+
+    // ── Codex Medium-2: fail-closed when the event-scan has no explicit lower bound ──
+    it("DISABLES fail-closed when roleDerive is on, no getter, and AUDIT_ROLE_FROM_BLOCK is 0", async () => {
+      let called = false;
+      const blockchain = makeBlockchain({
+        getRegisteredOperators: async () => {
+          called = true;
+          return [opB];
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        roleDeriveConfig({ auditWatchlist: [], auditRoleFromBlock: 0, auditRoleUseGetter: false }),
+        makeArchive()
+      );
+      await svc.onApplicationBootstrap();
+      expect((await svc.getStatus()).enabled).toBe(false);
+      expect(called).toBe(false); // never scanned from genesis
+    });
+
+    it("allows fromBlock 0 when the getter is enabled (no scan window needed)", async () => {
+      let usedGetter: boolean | undefined;
+      const blockchain = makeBlockchain({
+        getRegisteredOperators: async (_r, _ids, _from, _to, _chunk, useGetter) => {
+          usedGetter = useGetter;
+          return [opB];
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        roleDeriveConfig({ auditWatchlist: [], auditRoleFromBlock: 0, auditRoleUseGetter: true }),
+        makeArchive()
+      );
+      await svc.onApplicationBootstrap();
+      expect((await svc.getStatus()).enabled).toBe(true);
+      expect(usedGetter).toBe(true);
+    });
+
+    // ── Codex High-1: the co-sign RESPONDER authorizes the effective (derived) set ──
+    it("responder co-signs a DERIVED-only operator (not just static-listed)", async () => {
+      const derivedOp = ethers.getAddress(opB);
+      const blockchain = overLimitBlockchain({ getRegisteredOperators: async () => [derivedOp] });
+      const svc = makeService(blockchain, roleDeriveConfig({ auditWatchlist: [] }), makeArchive());
+      await svc.onApplicationBootstrap();
+      const res = await (svc as any).verifyViolationForCoSign({
+        chainId: 11155111,
+        operator: derivedOp,
+        slashLevel: 1,
+        epoch: BLOCK,
+      });
+      expect(res.confirmed).toBe(true); // was `false` before the fix (static-only auth)
+      expect(res.proofHash).toMatch(/^0x[0-9a-f]{64}$/);
+    });
+
+    // ── Codex High-2: a STALE derived membership must not drive a slash of a derived-only op ──
+    it("responder REFUSES to co-sign a derived-only op when membership is stale", async () => {
+      const derivedOp = ethers.getAddress(opB);
+      let t = 1_700_000_000_000;
+      const blockchain = overLimitBlockchain({ getRegisteredOperators: async () => [derivedOp] });
+      // refreshMs 0 so each call re-derives; maxStale small so time advance makes it stale.
+      const svc = makeService(
+        blockchain,
+        roleDeriveConfig({
+          auditWatchlist: [],
+          auditRoleRefreshMs: 0,
+          auditRoleMaxStaleMs: 1000,
+        }),
+        makeArchive(),
+        () => t
+      );
+      await svc.onApplicationBootstrap();
+      // Make the NEXT derive fail so lastRoleRefreshAt freezes, then advance time past maxStale.
+      blockchain.getRegisteredOperators = async () => {
+        throw new Error("rpc down");
+      };
+      t += 5000; // now stale (5s > 1s maxStale)
+      const res = await (svc as any).verifyViolationForCoSign({
+        chainId: 11155111,
+        operator: derivedOp,
+        slashLevel: 1,
+        epoch: BLOCK,
+      });
+      expect(res.confirmed).toBe(false); // stale derived membership → refuse to co-sign a slash
+    });
+
+    it("a STATIC-listed operator is still co-signed even when the derived set is stale", async () => {
+      let t = 1_700_000_000_000;
+      // OPERATOR is static-listed; derived set will go stale but must not gate a static operator.
+      const blockchain = overLimitBlockchain({
+        getRegisteredOperators: async () => {
+          throw new Error("rpc down"); // never a successful derive → derived set never fresh
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        roleDeriveConfig({
+          auditWatchlist: [OPERATOR],
+          auditRoleMaxStaleMs: 1000,
+        }),
+        makeArchive(),
+        () => t
+      );
+      await svc.onApplicationBootstrap();
+      t += 5000;
+      const res = await (svc as any).verifyViolationForCoSign({
+        chainId: 11155111,
+        operator: ethers.getAddress(OPERATOR),
+        slashLevel: 1,
+        epoch: BLOCK,
+      });
+      expect(res.confirmed).toBe(true); // static operator unaffected by derived-set staleness
+    });
   });
 });

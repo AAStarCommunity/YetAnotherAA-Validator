@@ -266,6 +266,41 @@ export default () => {
       return Number.isFinite(parsed) && parsed > 0 ? parsed : 13;
     })(),
     auditSlotMap: process.env.AUDIT_SLOT_MAP || undefined,
+    // A1#6 — derive the watchlist from the on-chain Registry role set instead of a hand-curated
+    // AUDIT_WATCHLIST. When AUDIT_ROLE_DERIVE=true, the audit enumerates the CURRENT members of
+    // AUDIT_ROLE_IDS (default "DVT,ANODE") from Registry.roleMembers (getRoleMembers getter-first,
+    // role-event reconstruction fallback) each refresh, and UNIONs them with the static
+    // AUDIT_WATCHLIST (which stays as an optional manual override / addition — never subtracts).
+    // Default OFF → today's static-list behavior is unchanged.
+    // AUDIT_ROLE_IDS: comma-separated role NAMES (hashed via keccak256) — e.g. "DVT,ANODE".
+    // AUDIT_ROLE_FROM_BLOCK: the Registry deploy block (event-scan lower bound; 0 = genesis, slow).
+    // AUDIT_ROLE_LOG_CHUNK: getLogs block-range per request for the event-scan fallback (RPC cap).
+    // AUDIT_ROLE_REFRESH_MS: how often to re-derive the set (not every tick — getLogs is heavy).
+    auditRoleDerive: process.env.AUDIT_ROLE_DERIVE === "true",
+    auditRoleIds: parseRoleIds(process.env.AUDIT_ROLE_IDS || "DVT,ANODE"),
+    auditRoleFromBlock: (() => {
+      const parsed = parseInt(process.env.AUDIT_ROLE_FROM_BLOCK || "0", 10);
+      return Math.max(0, Number.isFinite(parsed) ? parsed : 0);
+    })(),
+    auditRoleLogChunk: (() => {
+      const parsed = parseInt(process.env.AUDIT_ROLE_LOG_CHUNK || "10000", 10);
+      return Math.max(1, Number.isFinite(parsed) && parsed > 0 ? parsed : 10000);
+    })(),
+    auditRoleRefreshMs: (() => {
+      const parsed = parseInt(process.env.AUDIT_ROLE_REFRESH_MS || "300000", 10);
+      return Math.max(1, Number.isFinite(parsed) && parsed > 0 ? parsed : 300000);
+    })(),
+    // AUDIT_ROLE_USE_GETTER: trust a Registry.getRoleMembers(bytes32) getter (O(1)) instead of the
+    // event scan. Default OFF — the deployed Registry has no such getter and a 4-byte selector
+    // collision could return a valid-looking wrong set (Codex Medium-3). Turn on ONLY against a
+    // Registry known to implement it. AUDIT_ROLE_MAX_STALE_MS: a DERIVED-only operator is NOT
+    // slashed once the last successful derivation is older than this (stale membership must not drive
+    // an irreversible slash of a possibly-exited operator; Codex High-2). Default 15min.
+    auditRoleUseGetter: process.env.AUDIT_ROLE_USE_GETTER === "true",
+    auditRoleMaxStaleMs: (() => {
+      const parsed = parseInt(process.env.AUDIT_ROLE_MAX_STALE_MS || "900000", 10);
+      return Math.max(1, Number.isFinite(parsed) && parsed > 0 ? parsed : 900000);
+    })(),
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
@@ -294,6 +329,19 @@ function parseAllowlist(allowlistString: string): string[] {
     .split(",")
     .map(a => a.trim())
     .filter(a => a.length > 0);
+}
+
+/**
+ * Parse AUDIT_ROLE_IDS ("DVT,ANODE") into a de-duplicated list of role NAME strings. The names
+ * are hashed to their bytes32 roleId (keccak256) downstream in the audit service (which owns the
+ * ethers dependency) — keeping this config module free of ethers. Empty entries are dropped.
+ */
+function parseRoleIds(raw: string): string[] {
+  const seen = new Set<string>();
+  for (const name of raw.split(",").map(r => r.trim())) {
+    if (name.length > 0) seen.add(name);
+  }
+  return [...seen];
 }
 
 /**

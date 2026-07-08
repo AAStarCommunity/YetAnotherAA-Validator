@@ -58,3 +58,6 @@ dist-bundle/
 deploy/.dvt-test-registration.env
 deploy/node*/data/
 audit-proofs/
+
+# Drill proof-archive backups (Stage-3 dry-run artifacts) — never commit
+deploy/.drill-archive-backup/
