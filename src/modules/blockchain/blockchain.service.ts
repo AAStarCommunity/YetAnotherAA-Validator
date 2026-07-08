@@ -586,22 +586,25 @@ export class BlockchainService {
     ]);
     const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
     const filters = [
-      // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]). BLS/DVT execute path.
+      // SlashExecutedWithProof (BLS/DVT execute) + OperatorSlashed (emitted by `_slash` on BOTH the
+      // BLS path AND owner-manual `slashOperator`, which does NOT emit SlashExecutedWithProof — WITHOUT
+      // it an owner-slashed operator reads "not slashed" and the audit double-slashes). Operator is
+      // topics[1] in BOTH → fetch them in ONE getLogs with an OR of the two topic0 hashes.
       {
-        name: "SlashExecutedWithProof",
-        topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic],
+        name: "SlashExecutedWithProof|OperatorSlashed",
+        topics: [
+          [
+            iface.getEvent("SlashExecutedWithProof")!.topicHash,
+            iface.getEvent("OperatorSlashed")!.topicHash,
+          ],
+          opTopic,
+        ],
       },
-      // SlashExecuted: proposalId is 1st indexed (topics[1]), operator 2nd (topics[2]).
+      // SlashExecuted: proposalId is 1st indexed (topics[1]), operator 2nd (topics[2]) — different
+      // position, so it needs its own filter.
       {
         name: "SlashExecuted",
         topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic],
-      },
-      // OperatorSlashed: operator 1st indexed (topics[1]). Emitted by `_slash` on BOTH the BLS/DVT
-      // execute path AND owner-manual `slashOperator` — which does NOT emit SlashExecutedWithProof, so
-      // WITHOUT this an owner-slashed operator reads as "not slashed" and the audit double-slashes it.
-      {
-        name: "OperatorSlashed",
-        topics: [iface.getEvent("OperatorSlashed")!.topicHash, opTopic],
       },
     ];
     for (const f of filters) {
@@ -611,7 +614,7 @@ export class BlockchainService {
           address: contractAddress,
           fromBlock: Math.max(0, fromBlock),
           toBlock: "latest",
-          topics: f.topics as (string | null)[],
+          topics: f.topics as (string | string[] | null)[],
         });
       } catch (error: any) {
         // FAIL-CLOSED: a getLogs/provider error means the window could NOT be scanned. Return null
@@ -679,36 +682,37 @@ export class BlockchainService {
       "event SlashCancelled(address indexed operator)",
       "event OperatorSlashed(address indexed operator, uint256 amount, uint8 level)",
     ]);
-    // `operator` is the 1st indexed field (topics[1]) in ALL three events.
+    // `operator` is the 1st indexed field (topics[1]) in ALL three events, so ONE getLogs with an
+    // OR of the three topic0 hashes fetches them together (was 3 round-trips → 1). pending == the
+    // LATEST match (by block, then logIndex) is SlashQueued.
     const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
-    const kinds = [
-      { name: "SlashQueued", pending: true },
-      { name: "SlashCancelled", pending: false },
-      { name: "OperatorSlashed", pending: false },
-    ] as const;
+    const setTopic = iface.getEvent("SlashQueued")!.topicHash; // the only "pending = true" event
+    const topic0s = [
+      setTopic,
+      iface.getEvent("SlashCancelled")!.topicHash,
+      iface.getEvent("OperatorSlashed")!.topicHash,
+    ];
+    let logs;
+    try {
+      logs = await this.provider.getLogs({
+        address: superPaymasterAddress,
+        fromBlock,
+        toBlock: "latest",
+        topics: [topic0s, opTopic], // topics[0] = OR(SlashQueued|SlashCancelled|OperatorSlashed)
+      });
+    } catch (error: any) {
+      // FAIL-CLOSED: an unscannable window is INDETERMINATE, never a silent "not pending".
+      this.logger.warn(
+        `isSlashPending getLogs failed on ${superPaymasterAddress}: ${error.message} — indeterminate`
+      );
+      return null;
+    }
     let best: { block: number; index: number; pending: boolean } | null = null;
-    for (const k of kinds) {
-      let logs;
-      try {
-        logs = await this.provider.getLogs({
-          address: superPaymasterAddress,
-          fromBlock,
-          toBlock: "latest",
-          topics: [iface.getEvent(k.name)!.topicHash, opTopic],
-        });
-      } catch (error: any) {
-        // FAIL-CLOSED: an unscannable window is INDETERMINATE, never a silent "not pending".
-        this.logger.warn(
-          `isSlashPending getLogs failed on ${superPaymasterAddress} (${k.name}): ${error.message} — indeterminate`
-        );
-        return null;
-      }
-      for (const log of logs) {
-        const block = log.blockNumber;
-        const index = log.index; // ethers v6: logIndex within the block
-        if (best === null || block > best.block || (block === best.block && index > best.index)) {
-          best = { block, index, pending: k.pending };
-        }
+    for (const log of logs) {
+      const block = log.blockNumber;
+      const index = log.index; // ethers v6: logIndex within the block
+      if (best === null || block > best.block || (block === best.block && index > best.index)) {
+        best = { block, index, pending: log.topics[0] === setTopic };
       }
     }
     return best === null ? false : best.pending;

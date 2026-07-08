@@ -108,7 +108,14 @@ describe("BlockchainService.isSlashPending (event reconstruction)", () => {
     getBlockNumber: () => Promise<number> = async () => 1000
   ) {
     return makeService(
-      async (filter: any) => pool.filter(l => l.topics[0] === filter.topics[0]),
+      // isSlashPending now fetches all three events in ONE getLogs with an OR of topic0 hashes, so
+      // topics[0] is an ARRAY — match a log whose topic0 is any of them.
+      async (filter: any) =>
+        pool.filter(l =>
+          Array.isArray(filter.topics[0])
+            ? filter.topics[0].includes(l.topics[0])
+            : l.topics[0] === filter.topics[0]
+        ),
       getBlockNumber
     );
   }
