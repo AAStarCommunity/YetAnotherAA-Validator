@@ -683,9 +683,17 @@ export class BlockchainService {
         this.provider
       );
       const pending: boolean = await contract.isSlashPending(operator);
-      return Boolean(pending);
-    } catch {
-      // getter absent (older SP) / decode failure → fall back to the durable event reconstruction.
+      return pending;
+    } catch (err: unknown) {
+      // The getter call did not return a bool. Two reasons collapse here — a pre-5.4.2 SP with no
+      // isSlashPending function (call reverts), or a TRANSIENT RPC error — and we cannot always tell
+      // them apart, so we log at debug (not warn: on a healthy 5.4.2 SP this branch never runs) and
+      // fall back to the durable event reconstruction (which has its own fail-closed null on error).
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.debug(
+        `isSlashPending getter unavailable on ${superPaymasterAddress} (${msg}) — ` +
+          `falling back to event reconstruction`
+      );
       return this.isSlashPendingFromEvents(superPaymasterAddress, operator, lookbackBlocks);
     }
   }
