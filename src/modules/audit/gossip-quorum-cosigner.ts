@@ -46,10 +46,15 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
   private readonly timeoutMs: number;
   private readonly slashThresholds: { WARNING: number; MINOR: number; MAJOR: number };
   private readonly executeSlash: boolean;
-  /** Canonicalized watchlist — the responder refuses to co-sign for any operator not on it. */
-  private readonly watchlist: string[];
 
-  /** Independent violation re-confirmation, wired by AuditService via `arm()`. */
+  /**
+   * Independent violation re-confirmation + operator AUTHORIZATION, wired by AuditService via
+   * `arm()`. AuditService.verifyViolationForCoSign is the SINGLE authority on which operators may be
+   * co-signed: it checks the EFFECTIVE watchlist (static AUDIT_WATCHLIST ∪ the FRESH on-chain-derived
+   * role set) and re-confirms the violation at the epoch block. The responder does NOT keep its own
+   * static watchlist — a duplicate static-only check here would pre-reject derived-only operators
+   * before this verifier ever runs, so they could never reach quorum (Codex A1#6 High-1).
+   */
   private verifier: CoSignVerifier | null = null;
 
   /**
@@ -80,17 +85,6 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       "auditSlashThresholds"
     ) ?? { WARNING: 2, MINOR: 3, MAJOR: 3 };
     this.executeSlash = config.get<boolean>("auditExecuteSlash") === true;
-    this.watchlist = (config.get<string[]>("auditWatchlist") ?? [])
-      .map(a => a.trim())
-      .filter(Boolean)
-      .map(a => {
-        try {
-          return ethers.getAddress(a);
-        } catch {
-          return null;
-        }
-      })
-      .filter((a): a is string => a !== null);
   }
 
   /**
@@ -109,9 +103,10 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
    * The peer gate. Returns a signed CoSignResponsePayload ONLY when every check passes; ANY
    * failure or uncertainty returns `null` (silent, fail-closed refusal). Order:
    *   1. local node armed (AUDIT_EXECUTE_SLASH)               — else refuse.
-   *   2. operator on the local watchlist                      — else refuse.
+   *   2. operator address parses (authorization deferred to 4) — else refuse.
    *   3. recompute messageHash locally, assert == request     — NEVER trust the requester's hash.
-   *   4. independent violation confirmation at `epoch` block  — proofHash === evidenceHash (execute).
+   *   4. verifier: authorize (effective watchlist + freshness) AND confirm violation at `epoch`
+   *      block — proofHash === evidenceHash (execute). The verifier owns operator authorization.
    *   5. resolve own on-chain validator slot                  — else refuse.
    *   6. BLS-sign the LOCALLY-recomputed hash.
    */
@@ -133,14 +128,15 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
         return null;
       }
 
-      // 2. operator must be watchlisted.
-      let operator: string;
+      // 2. operator address must parse. AUTHORIZATION (is this operator watched + slashable?) is NOT
+      // done here — it is delegated to the verifier at step 4, the single authority that checks the
+      // EFFECTIVE (static ∪ fresh-derived) watchlist. A static-only check here would pre-reject
+      // derived-only operators before the verifier runs (Codex A1#6 High-1).
       try {
-        operator = ethers.getAddress(req.operator);
+        ethers.getAddress(req.operator);
       } catch {
         return null;
       }
-      if (!this.watchlist.includes(operator)) return null;
 
       // 3. recompute the messageHash from first principles; NEVER trust req.messageHash.
       let localHash: string;

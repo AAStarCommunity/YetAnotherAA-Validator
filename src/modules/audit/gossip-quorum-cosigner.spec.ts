@@ -411,15 +411,35 @@ describe("GossipQuorumCoSigner", () => {
     expect(await cs.verifyAndSign(payload(executeReq()))).toBeNull();
   });
 
-  it("responder REFUSES an un-watchlisted operator", async () => {
+  it("responder AUTHORIZATION is delegated to the verifier — signs an operator NOT in static auditWatchlist when the verifier confirms (A1#6 High-1)", async () => {
+    // The responder no longer keeps its own static watchlist: a derived-only operator (absent from
+    // AUDIT_WATCHLIST) must reach quorum when AuditService.verifyViolationForCoSign authorizes it.
+    // Before the fix this returned null (static-only pre-reject); now it signs.
     const cs = new GossipQuorumCoSigner(
       makeGossip([]),
       blsService,
       makeNode(PRIVS[1], "node-2"),
-      makeBlockchain(),
-      makeConfig({ auditWatchlist: [] })
+      makeBlockchain(3, 2), // resolvable own slot 2
+      makeConfig({ auditWatchlist: [] }) // empty static list — authorization is the verifier's job
     );
     cs.arm(ALWAYS_CONFIRM);
+    const resp = await cs.verifyAndSign(payload(executeReq()));
+    expect(resp).not.toBeNull();
+    expect(resp!.slot).toBe(2);
+  });
+
+  it("responder REFUSES when the verifier does NOT authorize (un-watchlisted → verifier returns not-confirmed)", async () => {
+    // The verifier is the single authority: a not-confirmed result (e.g. operator not in the
+    // effective watchlist, or stale derived membership) → the responder refuses.
+    const NEVER: CoSignVerifier = async () => ({ confirmed: false, proofHash: null });
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[1], "node-2"),
+      makeBlockchain(3, 2),
+      makeConfig({ auditWatchlist: [] })
+    );
+    cs.arm(NEVER);
     expect(await cs.verifyAndSign(payload(executeReq()))).toBeNull();
   });
 

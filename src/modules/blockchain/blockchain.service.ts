@@ -1008,6 +1008,198 @@ export class BlockchainService {
   }
 
   /**
+   * Registry.hasRole(roleId, account) — does `operator` CURRENTLY hold the role, read at `blockTag`
+   * (A1#6). A cheap O(1) eth_call used to CONFIRM a derived operator is still a role member at the
+   * SAME finalized block the slash evidence is pinned to — closing the "cached membership block ≠
+   * evidence block" gap without re-scanning events. THROWS on a provider error so the caller can
+   * fail-closed (an unconfirmable membership must not authorize an irreversible slash).
+   */
+  async hasRole(
+    registryAddress: string,
+    roleId: string,
+    operator: string,
+    blockTag?: number
+  ): Promise<boolean> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function hasRole(bytes32 role, address account) view returns (bool)"];
+    const contract = new ethers.Contract(registryAddress, abi, this.provider);
+    return await contract.hasRole(roleId, operator, { blockTag });
+  }
+
+  /** Hard cap on role events accumulated in one derivation — bounds memory against a huge history
+   *  or a malicious register/exit flood (Codex Medium-2). Exceeding it THROWS so the caller keeps its
+   *  previous set rather than OOMing. ~100k events ≫ any realistic staked-role churn. */
+  private static readonly MAX_ROLE_EVENTS = 100_000;
+
+  /**
+   * Enumerate the CURRENT members of one or more Registry roles — the on-chain
+   * source of truth for "who is a registered operator" (A1#6). This replaces the
+   * hand-curated AUDIT_WATCHLIST env with the permissionless registration set.
+   *
+   * Membership is derived up to `toBlock` — the caller passes the SAME FINALIZED block it evaluates
+   * violations at, so a head-only (unfinalized) RoleExited/Registered can neither add nor drop an
+   * operator relative to the evidence, and a reorg cannot flip the set after it was used (Codex
+   * Medium-1). Never derive to a raw `latest`.
+   *
+   * `useGetter`-gated getter-FIRST, event-scan FALLBACK:
+   *   1. Only when `useGetter` — call `getRoleMembers(bytes32) view returns (address[])` at
+   *      `{ blockTag: toBlock }`. Default OFF: the deployed 5.4.2 Registry has no such getter
+   *      (roleMembers is `internal`), and blindly trusting ANY ABI-decodable return from that 4-byte
+   *      selector risks a selector-collision returning a valid-looking wrong set (Codex Medium-3).
+   *      Enable only against a Registry known to implement it.
+   *   2. FALLBACK (default): reconstruct the live set from role events over [fromBlock, toBlock]:
+   *      ADD on RoleRegistered|RoleGranted, REMOVE on RoleExited|RoleRevoked, replayed in
+   *      (block, logIndex) order so a re-join after an exit resurfaces the member.
+   *
+   * `roleId` is topics[1] (indexed) in ALL FOUR events; `user`/`account` is topics[2].
+   * Returns CHECKSUMMED addresses, de-duplicated across the given roleIds.
+   *
+   * THROWS on a provider/getLogs error (fail-loud): the caller must treat an unscannable window as
+   * "could not derive" and keep its previous set, NOT silently audit an empty list.
+   */
+  async getRegisteredOperators(
+    registryAddress: string,
+    roleIds: string[],
+    fromBlock: number,
+    toBlock: number,
+    chunkSize: number,
+    useGetter = false
+  ): Promise<string[]> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const out = new Set<string>();
+    for (const roleId of roleIds) {
+      if (useGetter) {
+        // getter-first — one static read of the maintained roleMembers array, pinned to toBlock.
+        // Still best-effort: a revert/decode error falls through to the event scan.
+        try {
+          const getterAbi = ["function getRoleMembers(bytes32 roleId) view returns (address[])"];
+          const c = new ethers.Contract(registryAddress, getterAbi, this.provider);
+          const members: string[] = await c.getRoleMembers(roleId, { blockTag: toBlock });
+          for (const m of members) out.add(ethers.getAddress(m));
+          continue; // getter succeeded for this role — skip the event scan
+        } catch (error: any) {
+          this.logger.debug(
+            `getRoleMembers(${roleId}) failed on ${registryAddress} (${error.message}) — event scan`
+          );
+        }
+      }
+      // fallback (default) — reconstruct from events, replayed in chain order. REFUSE a from-genesis
+      // scan (Codex Medium-2): with the getter enabled but fromBlock=0, a getter revert would
+      // otherwise silently drop into a genesis-wide getLogs DoS. Throwing keeps the caller's previous
+      // set instead. (roleDerive without the getter is already fail-closed at bootstrap.)
+      if (fromBlock <= 0) {
+        throw new Error(
+          `getRegisteredOperators: refusing a from-genesis event scan for role ${roleId} ` +
+            `(fromBlock=0) — set AUDIT_ROLE_FROM_BLOCK to the Registry deploy block`
+        );
+      }
+      const derived = await this.deriveRoleMembersFromEvents(
+        registryAddress,
+        roleId,
+        fromBlock,
+        toBlock,
+        chunkSize
+      );
+      for (const m of derived) out.add(m);
+    }
+    return [...out];
+  }
+
+  /**
+   * Reconstruct one role's live member set from Registry events over [fromBlock, toBlock], chunked
+   * to `chunkSize`. ADD on RoleRegistered|RoleGranted, REMOVE on RoleExited|RoleRevoked. On a getLogs
+   * error the range is ADAPTIVELY HALVED down to a single block before giving up (handles a provider's
+   * "too many results" on a dense window without failing the whole derivation), and only a
+   * single-block failure THROWS — so a partial scan can never masquerade as a smaller member set.
+   */
+  private async deriveRoleMembersFromEvents(
+    registryAddress: string,
+    roleId: string,
+    fromBlock: number,
+    toBlock: number,
+    chunkSize: number
+  ): Promise<string[]> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const iface = new ethers.Interface([
+      "event RoleRegistered(bytes32 indexed roleId, address indexed user, uint256 burnAmount, uint256 timestamp)",
+      "event RoleExited(bytes32 indexed roleId, address indexed user, uint256 exitFee, uint256 timestamp)",
+      "event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)",
+      "event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender)",
+    ]);
+    const addTopics = [
+      iface.getEvent("RoleRegistered")!.topicHash,
+      iface.getEvent("RoleGranted")!.topicHash,
+    ];
+    const removeTopics = [
+      iface.getEvent("RoleExited")!.topicHash,
+      iface.getEvent("RoleRevoked")!.topicHash,
+    ];
+    const roleTopic = ethers.zeroPadValue(roleId, 32); // roleId is topics[1] in all four
+    const topicFilter = [[...addTopics, ...removeTopics], roleTopic];
+    const events: { block: number; index: number; user: string; add: boolean }[] = [];
+
+    // Scan [lo, hi]; on a getLogs error, halve until a single block fails (then throw). This absorbs
+    // a provider's result-count cap on a dense range instead of aborting the whole derivation.
+    const scanRange = async (lo: number, hi: number): Promise<void> => {
+      let logs;
+      try {
+        logs = await this.provider!.getLogs({
+          address: registryAddress,
+          fromBlock: lo,
+          toBlock: hi,
+          topics: topicFilter,
+        });
+      } catch (error: any) {
+        if (hi > lo) {
+          const mid = Math.floor((lo + hi) / 2);
+          await scanRange(lo, mid);
+          await scanRange(mid + 1, hi);
+          return;
+        }
+        // single block still fails — genuinely unscannable → fail-loud (caller keeps previous set).
+        throw new Error(
+          `deriveRoleMembers getLogs failed on ${registryAddress} block ${lo}: ${error.message}`,
+          { cause: error }
+        );
+      }
+      for (const log of logs) {
+        if (events.length >= BlockchainService.MAX_ROLE_EVENTS) {
+          throw new Error(
+            `deriveRoleMembers exceeded ${BlockchainService.MAX_ROLE_EVENTS} events on ${registryAddress} ` +
+              `role ${roleId} — refusing to derive (possible event flood / misconfigured fromBlock)`
+          );
+        }
+        const user = ethers.getAddress(ethers.dataSlice(log.topics[2], 12)); // topics[2] = user (20B, left-padded)
+        events.push({
+          block: log.blockNumber,
+          index: log.index,
+          user,
+          add: addTopics.includes(log.topics[0]),
+        });
+      }
+    };
+
+    const step = Math.max(1, chunkSize);
+    for (let start = Math.max(0, fromBlock); start <= toBlock; start += step) {
+      await scanRange(start, Math.min(start + step - 1, toBlock));
+    }
+    // Replay in (block, logIndex) order so the LAST event per user wins (re-join after exit).
+    events.sort((a, b) => (a.block !== b.block ? a.block - b.block : a.index - b.index));
+    const live = new Set<string>();
+    for (const e of events) {
+      if (e.add) live.add(e.user);
+      else live.delete(e.user);
+    }
+    return [...live];
+  }
+
+  /**
    * File a slash proposal on the DVTValidator:
    *   createProposal(address operator, uint8 level, string reason) returns (uint256 id)
    * Uses the admin wallet (ETH_PRIVATE_KEY). This is the proposal-INTENT only — the

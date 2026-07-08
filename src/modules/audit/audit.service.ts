@@ -103,6 +103,32 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly finalityConfirmations: number;
   /** How far back to scan on-chain slash-executed events for the durable guard (finding-2). */
   private readonly slashLookbackBlocks: number;
+  /** A1#6 — derive the effective watchlist from on-chain Registry role membership (opt-in). */
+  private readonly roleDerive: boolean;
+  /** bytes32 roleIds (keccak256 of the role NAMES from AUDIT_ROLE_IDS) to enumerate. */
+  private readonly roleIds: string[];
+  /** Event-scan lower bound (Registry deploy block) for the getRoleMembers fallback. */
+  private readonly roleFromBlock: number;
+  /** getLogs block-range per request for the role-event scan fallback. */
+  private readonly roleLogChunk: number;
+  /** How often to re-derive the on-chain role set (throttled — getLogs is heavy). */
+  private readonly roleRefreshMs: number;
+  /** Trust a Registry.getRoleMembers getter instead of the event scan (default off; Codex Medium-3). */
+  private readonly roleUseGetter: boolean;
+  /** A derived-ONLY operator is not slashed once the last success is older than this (Codex High-2). */
+  private readonly roleMaxStaleMs: number;
+  /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
+  private derivedOperators: string[] = [];
+  /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
+  private lastRoleRefreshAt: number | null = null;
+  /** Wall-clock of the last derivation ATTEMPT (success OR failure) — throttles getLogs frequency
+   *  even under a request flood or persistent RPC failure (Codex Medium/Low). */
+  private lastRoleAttemptAt: number | null = null;
+  /** Single-flight guard: concurrent refresh callers await this one in-flight derivation. */
+  private refreshInFlight: Promise<void> | null = null;
+  /** True once role derivation has SUCCEEDED at least once — distinguishes "never derived" (fail to
+   *  an empty set) from "derived, genuinely empty" so the former is never silently unaudited. */
+  private roleDeriveSucceeded = false;
   private readonly archive: IProofArchive;
   /** Quorum co-sign seam — default PendingSlotCoSigner (fails closed until SP assigns BLS slots). */
   private readonly coSigner: IQuorumCoSigner;
@@ -175,7 +201,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
 
   /** Emit a structured, greppable monitoring event + bump the matching counter (best-effort). */
   private emitAuditEvent(
-    kind: "SLASH_EXECUTED" | "DRY_RUN_PASSED" | "COSIGN_ABORTED" | "OVER_SLASH_SKIP" | "ERROR",
+    kind:
+      | "SLASH_EXECUTED"
+      | "DRY_RUN_PASSED"
+      | "COSIGN_ABORTED"
+      | "OVER_SLASH_SKIP"
+      | "ROLE_DERIVE_UNHEALTHY"
+      | "ERROR",
     fields: Record<string, string | number | null | undefined>
   ): void {
     if (kind === "SLASH_EXECUTED") this.metrics.slashesExecuted++;
@@ -236,6 +268,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.dryRun = config.get<boolean>("auditDryRun") === true;
     this.finalityConfirmations = config.get<number>("auditFinalityConfirmations") ?? 12;
     this.slashLookbackBlocks = config.get<number>("auditSlashLookbackBlocks") ?? 50_000;
+    this.roleDerive = config.get<boolean>("auditRoleDerive") === true;
+    // Hash each role NAME ("DVT") to its bytes32 roleId (keccak256) — the config module keeps the
+    // raw names to stay ethers-free; the hashing lives here where ethers is already a dependency.
+    this.roleIds = (config.get<string[]>("auditRoleIds") ?? []).map(name => ethers.id(name));
+    this.roleFromBlock = config.get<number>("auditRoleFromBlock") ?? 0;
+    this.roleLogChunk = config.get<number>("auditRoleLogChunk") ?? 10_000;
+    this.roleRefreshMs = config.get<number>("auditRoleRefreshMs") ?? 300_000;
+    this.roleUseGetter = config.get<boolean>("auditRoleUseGetter") === true;
+    this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
     this.archive =
@@ -256,8 +297,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.log("DVT audit DISABLED (AUDIT_ENABLED!=true) — no operators watched");
       return;
     }
-    if (this.watchlist.length === 0) {
-      this.logger.warn("Audit: AUDIT_ENABLED=true but AUDIT_WATCHLIST is empty — nothing to watch");
+    if (this.watchlist.length === 0 && !this.roleDerive) {
+      this.logger.warn(
+        "Audit: AUDIT_ENABLED=true but AUDIT_WATCHLIST is empty and AUDIT_ROLE_DERIVE!=true — nothing to watch"
+      );
       return;
     }
     // FAIL-CLOSED config validation. Every required contract address must be set explicitly
@@ -310,6 +353,30 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         return;
       }
     }
+    // A1#6 — eager first derivation so the startup log + first tick already see the on-chain set
+    // (registry code was just confirmed above). Non-fatal: a failure keeps the empty set and the
+    // first tick retries. When roleDerive is on but AUDIT_ROLE_IDS parsed to nothing, that's a
+    // misconfig (nothing to enumerate) — warn.
+    if (this.roleDerive && this.roleIds.length === 0) {
+      this.logger.warn(
+        "Audit: AUDIT_ROLE_DERIVE=true but AUDIT_ROLE_IDS is empty — no roles to enumerate"
+      );
+    } else if (this.roleDerive) {
+      // FAIL-CLOSED: the event-scan fallback from block 0 is a genesis-wide getLogs DoS footgun
+      // (Codex Medium-2). Require an explicit AUDIT_ROLE_FROM_BLOCK (the Registry deploy block) unless
+      // the O(1) getter is enabled (which needs no scan window).
+      if (!this.roleUseGetter && this.roleFromBlock === 0) {
+        this.enabled = false;
+        this.logger.error(
+          "Audit: AUDIT_ROLE_DERIVE=true requires AUDIT_ROLE_FROM_BLOCK (the Registry deploy block) " +
+            "for the event-scan — a from-genesis scan is a DoS footgun. Set it (or enable " +
+            "AUDIT_ROLE_USE_GETTER against a Registry with getRoleMembers). DISABLED (fail-closed)."
+        );
+        return;
+      }
+      await this.refreshDerivedOperators(true);
+    }
+
     // Wire the gossip quorum co-sign responder (inc-2 live). When the injected co-signer is the
     // live GossipQuorumCoSigner (armed node), hand it the independent violation verifier and let
     // it register its responder handler on GossipService, so this armed node re-verifies + co-signs
@@ -342,7 +409,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     }
     this.logger.log(
       `DVT audit ENABLED — interval=${this.intervalMs}ms jitter=${jitterMs}ms ` +
-        `watchlist=[${this.watchlist.join(", ")}] creditThreshold=${this.creditThresholdBps}bps ` +
+        `watchlist=[${this.effectiveWatchlist().join(", ")}] ` +
+        `(static=${this.watchlist.length}, roleDerive=${this.roleDerive ? `on:${this.derivedOperators.length}` : "off"}) ` +
+        `creditThreshold=${this.creditThresholdBps}bps ` +
         `registry=${this.registryAddress} superPaymaster=${this.superPaymasterAddress} ` +
         `dvtValidator=${this.dvtValidatorAddress} blsAggregator=${this.blsAggregatorAddress} ` +
         `executeSlash=${this.executeSlash} (${
@@ -520,6 +589,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // RPC per operator. One finalized snapshot is also MORE consistent (all operators evaluated
       // against the same chain state) and cannot reorg. A failure here is a global RPC problem, not
       // per-operator, so skip the whole tick rather than hammering each operator into the same error.
+      // Resolved BEFORE the role refresh so membership is derived to the SAME block (Codex Medium-1).
       let pinnedBlock: { number: number; hash: string };
       try {
         pinnedBlock = await this.blockchainService.getViolationBlock(this.finalityConfirmations);
@@ -528,7 +598,31 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         this.logger.error(`Audit: could not resolve finalized block — skipping tick (${msg})`);
         return;
       }
-      for (const operator of this.watchlist) {
+      // A1#6 — refresh the on-chain-derived operator set (throttled; no-op when roleDerive is off),
+      // pinned to the SAME finalized block as the evidence. A derivation failure KEEPS the previous
+      // set, so a transient RPC blip never silently empties the watchlist mid-sweep.
+      await this.refreshDerivedOperators(false, pinnedBlock.number);
+      // HEALTH (Codex High-2) — never let a role-derive deployment go SILENTLY unaudited. Surface a
+      // loud, alertable event when the derived set has never been confirmed or has gone stale, so an
+      // empty/stale watchlist reads as a monitored failure, not "all clear".
+      if (this.roleDerive && !this.derivedSetIsFresh()) {
+        const reason = !this.roleDeriveSucceeded ? "never-succeeded" : "stale";
+        this.logger.warn(
+          `Audit: on-chain role membership ${reason} — derived-only operators will NOT be slashed ` +
+            `until it is freshly confirmed (static-listed operators unaffected)`
+        );
+        this.emitAuditEvent("ROLE_DERIVE_UNHEALTHY", {
+          reason,
+          derivedCount: this.derivedOperators.length,
+          lastRoleRefreshAt: this.lastRoleRefreshAt,
+        });
+      }
+      const operators = this.effectiveWatchlist();
+      if (operators.length === 0) {
+        this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
+        return;
+      }
+      for (const operator of operators) {
         try {
           await this.auditOperator(operator, pinnedBlock);
         } catch (err: unknown) {
@@ -539,6 +633,153 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       }
     } finally {
       this.tickInFlight = false;
+    }
+  }
+
+  /**
+   * A1#6 — the operators actually audited this tick: the static AUDIT_WATCHLIST UNIONed with the
+   * on-chain-derived role set (both checksummed at ingest). The static list is an additive manual
+   * override — it never SUBTRACTS from the derived set. Deduped so an operator that is both listed
+   * and on-chain-registered is audited once.
+   */
+  private effectiveWatchlist(): string[] {
+    if (this.derivedOperators.length === 0) return this.watchlist;
+    if (this.watchlist.length === 0) return this.derivedOperators;
+    return [...new Set([...this.watchlist, ...this.derivedOperators])];
+  }
+
+  /**
+   * A1#6 (Codex High-2) — the derived set is FRESH when derivation has SUCCEEDED at least once AND
+   * the last success is within roleMaxStaleMs. When roleDerive is off there are no derived operators,
+   * so freshness is N/A → true. A stale set means the on-chain membership we hold may no longer match
+   * reality (a member could have exited since), so it must not drive an irreversible slash.
+   */
+  private derivedSetIsFresh(): boolean {
+    if (!this.roleDerive) return true;
+    return (
+      this.roleDeriveSucceeded &&
+      this.lastRoleRefreshAt !== null &&
+      this.clock() - this.lastRoleRefreshAt <= this.roleMaxStaleMs
+    );
+  }
+
+  /**
+   * A1#6 (Codex round-3) — AUTHORITATIVE per-operator slash gate, pinned to the evidence block. The
+   * cached derived set is a snapshot from an EARLIER finalized block (throttled refresh), so before an
+   * IRREVERSIBLE slash we confirm the specific operator STILL holds an audited role AT the evidence
+   * block via a cheap `Registry.hasRole` eth_call — closing the "membership block ≠ evidence block"
+   * gap without re-scanning events every tick/request.
+   *   • static-listed operator → always slashable (explicitly chosen; may not hold any role).
+   *   • derived-only operator  → the SET must be fresh (derivedSetIsFresh) AND the operator must hold
+   *     one of the audited roles at `blockTag` (hasRole). A member who exited between the cached
+   *     derivation and the evidence block reads hasRole=false there → NOT slashed.
+   * Any read error → fail-closed (unconfirmable membership must not authorize a slash).
+   */
+  private async confirmSlashableAtBlock(operator: string, blockTag: number): Promise<boolean> {
+    if (this.watchlist.includes(operator)) return true;
+    if (!this.derivedSetIsFresh()) return false;
+    for (const roleId of this.roleIds) {
+      try {
+        if (
+          await this.blockchainService.hasRole(this.registryAddress, roleId, operator, blockTag)
+        ) {
+          return true;
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.warn(
+          `Audit: hasRole(${roleId}) check failed for ${operator} @${blockTag} — fail-closed (${msg})`
+        );
+        return false;
+      }
+    }
+    return false; // not a member of any audited role at the evidence block
+  }
+
+  /**
+   * A1#6 — refresh the on-chain-derived operator set, throttled to roleRefreshMs. Enumerates the
+   * CURRENT members of every configured role from the Registry (getRoleMembers getter-first, role-
+   * event reconstruction fallback) and caches them checksummed. On ANY derivation error the PREVIOUS
+   * set is KEPT (never shrunk to empty on a transient RPC blip).
+   *
+   * Throttled by lastRoleAttemptAt — updated on BOTH success AND failure (Codex Medium/Low) — so a
+   * peer flooding co-sign requests (each of which calls this) or a persistent RPC failure cannot
+   * drive getLogs faster than roleRefreshMs. A SINGLE-FLIGHT guard (refreshInFlight) collapses truly
+   * concurrent calls onto one derivation, so a later-block result can't be overwritten by an
+   * in-flight earlier one. Freshness (derivedSetIsFresh) is driven by lastRoleRefreshAt (success
+   * only). No-op when roleDerive is off or no roles are configured. `force` bypasses the throttle
+   * (eager bootstrap). `pinnedToBlock` (the tick's finalized evidence block) aligns the membership
+   * snapshot with the evidence (Codex Medium-1); omitted callers resolve their own finalized block.
+   */
+  private async refreshDerivedOperators(force = false, pinnedToBlock?: number): Promise<void> {
+    if (!this.roleDerive || this.roleIds.length === 0) return;
+    const now = this.clock();
+    // Single-flight FIRST (Codex round-3): a caller must never proceed on a half-updated set while a
+    // derivation is actively running — await it, then use its fresh result. Checked BEFORE the
+    // throttle so a throttled caller still waits out an in-flight refresh rather than racing ahead.
+    if (this.refreshInFlight) {
+      await this.refreshInFlight;
+      return;
+    }
+    // Throttle by ATTEMPT time (success or failure) so failures/floods can't hammer getLogs.
+    if (
+      !force &&
+      this.lastRoleAttemptAt !== null &&
+      now - this.lastRoleAttemptAt < this.roleRefreshMs
+    ) {
+      return;
+    }
+    this.lastRoleAttemptAt = now;
+    this.refreshInFlight = this.doRefreshDerivedOperators(now, pinnedToBlock);
+    try {
+      await this.refreshInFlight;
+    } finally {
+      this.refreshInFlight = null;
+    }
+  }
+
+  /** The actual derivation (guarded by refreshDerivedOperators' throttle + single-flight). */
+  private async doRefreshDerivedOperators(now: number, pinnedToBlock?: number): Promise<void> {
+    try {
+      // Derive membership up to the SAME FINALIZED block violations are evaluated at (Codex Medium-1):
+      // an unfinalized head RoleExited/Registered must not add/drop an operator relative to the
+      // evidence, and a reorg must not flip the set after use. Reuse the tick's pinned block when
+      // given (also saves an RPC); otherwise resolve our own finalized block.
+      const toBlock =
+        pinnedToBlock ??
+        (await this.blockchainService.getViolationBlock(this.finalityConfirmations)).number;
+      const members = await this.blockchainService.getRegisteredOperators(
+        this.registryAddress,
+        this.roleIds,
+        this.roleFromBlock,
+        toBlock,
+        this.roleLogChunk,
+        this.roleUseGetter
+      );
+      const canonical: string[] = [];
+      for (const m of members) {
+        try {
+          canonical.push(ethers.getAddress(m));
+        } catch {
+          this.logger.warn(`Audit: dropping invalid on-chain operator "${m}" (not an address)`);
+        }
+      }
+      this.derivedOperators = canonical;
+      this.lastRoleRefreshAt = now;
+      this.roleDeriveSucceeded = true;
+      this.logger.log(
+        `Audit: derived ${canonical.length} operator(s) from ${this.roleIds.length} on-chain role(s) ` +
+          `@finalized block ${toBlock}`
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // KEEP the previous derivedOperators — a transient getLogs failure must NOT empty the watchlist.
+      // lastRoleRefreshAt is left unchanged (freshness decays → derived-only slashing withheld once
+      // stale), but lastRoleAttemptAt WAS updated so failures don't spin getLogs.
+      this.logger.warn(
+        `Audit: on-chain role derivation failed (${msg}) — keeping previous derived set ` +
+          `(${this.derivedOperators.length} operator(s))`
+      );
     }
   }
 
@@ -745,10 +986,42 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       } catch {
         return NO;
       }
-      if (!this.watchlist.includes(operator)) return NO;
+      // A1#6 (Codex High-1) — authorize against the EFFECTIVE set (static ∪ on-chain-derived), not
+      // just the static list, or a derived-only operator could be audited by the requester yet never
+      // co-signed by peers → never reaches quorum. Refresh (throttled) first so the responder's
+      // derived set is current.
+      await this.refreshDerivedOperators();
+      if (!this.effectiveWatchlist().includes(operator)) return NO;
 
       const blockTag = req.epoch;
       if (!Number.isInteger(blockTag) || blockTag < 0) return NO;
+
+      // A1#6 (Codex round-4, Low) — INDEPENDENTLY require the requester-supplied epoch to be FINALIZED
+      // by THIS responder's own view. Every rule input + hasRole membership is pinned to req.epoch, so
+      // a malicious requester who supplies an UNFINALIZED (reorg-able) block where the victim is
+      // transiently over-limit / a member must not be able to harvest a co-signature. Reject any epoch
+      // newer than our finalized head; a responder briefly behind simply refuses and the requester
+      // retries (fail-closed). A read failure here is also fail-closed (caught by the outer try → NO).
+      const finalizedHead = await this.blockchainService.getViolationBlock(
+        this.finalityConfirmations
+      );
+      if (blockTag > finalizedHead.number) {
+        this.logger.warn(
+          `co-sign refused: epoch ${blockTag} is not finalized by this node (finalized head ` +
+            `${finalizedHead.number}) — refusing to co-sign on reorg-able state`
+        );
+        return NO;
+      }
+
+      // A1#6 (Codex round-3) — a derived-only operator's membership is CONFIRMED at req.epoch (the
+      // SAME block the evidence is verified at) via hasRole, not just the cached set's wall-clock
+      // freshness — a peer must not co-sign a slash of an operator who had exited by the epoch block.
+      if (!(await this.confirmSlashableAtBlock(operator, blockTag))) {
+        this.logger.warn(
+          `co-sign refused: ${operator} not a confirmed audited-role member at epoch ${blockTag}`
+        );
+        return NO;
+      }
 
       // Re-read the SAME rule inputs the tick reads, pinned at the epoch block.
       const [creditLimit, availableCredit, debt] = await Promise.all([
@@ -1372,7 +1645,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
-    const armed = this.executeSlash;
+    // A1#6 (Codex High-2 + round-3) — a derived-ONLY operator is armed for the irreversible on-chain
+    // slash only when its membership is CONFIRMED at the evidence block (epoch) via hasRole — not just
+    // the cached set's wall-clock freshness. Stale/never-confirmed/exited-by-epoch membership degrades
+    // to file-only (proposal + archive, no queue/execute). Static-listed operators are always armed.
+    const armed = this.executeSlash && (await this.confirmSlashableAtBlock(operator, epoch));
+    if (this.executeSlash && !armed) {
+      this.logger.warn(
+        `Audit: ${operator} armed slash WITHHELD — derived-only operator not confirmed as an ` +
+          `audited-role member at evidence block ${epoch}; filing proposal only`
+      );
+    }
     let coSignAborted = false;
     // DRY-RUN drill (only meaningful when armed): the co-sign below STILL happens and the queue/execute
     // staticCall preflight STILL runs against the REAL contracts, but the broadcast is skipped and the
@@ -1609,6 +1892,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     enabled: boolean;
     intervalMs: number;
     watchlist: string[];
+    roleDerive: boolean;
+    derivedOperatorCount: number;
+    derivedSetFresh: boolean;
+    lastRoleRefreshAt: number | null;
     lastTickAt: number | null;
     recentDetections: AuditDetection[];
     archivedProofCount: number;
@@ -1630,7 +1917,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     return {
       enabled: this.enabled,
       intervalMs: this.intervalMs,
-      watchlist: this.watchlist,
+      watchlist: this.effectiveWatchlist(),
+      roleDerive: this.roleDerive,
+      derivedOperatorCount: this.derivedOperators.length,
+      derivedSetFresh: this.derivedSetIsFresh(),
+      lastRoleRefreshAt: this.lastRoleRefreshAt,
       lastTickAt: this.lastTickAt,
       recentDetections: this.recentDetections,
       archivedProofCount,
