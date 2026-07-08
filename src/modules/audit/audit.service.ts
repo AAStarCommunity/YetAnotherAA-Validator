@@ -663,9 +663,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
               this.blsAggregatorAddress,
               operator
             );
-            if (nid) this.offlineNodeIdCache.set(operator, nid);
-            // resolve failure (null) → KEEP any cached nodeId (do not drop a relevant operator)
+            if (nid) {
+              this.offlineNodeIdCache.set(operator, nid); // active → update (self-heals a key rotation)
+            } else {
+              // AUTHORITATIVE null (inactive / no active slot / key rotated away) → DROP the stale
+              // nodeId so we never audit under an old key nor reject the new node's heartbeats.
+              this.offlineNodeIdCache.delete(operator);
+            }
           } catch (err: unknown) {
+            // TRANSIENT RPC failure (getOperatorNodeId throws) → KEEP the last-known nodeId.
             const msg = err instanceof Error ? err.message : String(err);
             this.logger.debug(`Audit: offline nodeId resolve failed for ${operator} — ${msg}`);
           }

@@ -2687,6 +2687,30 @@ describe("AuditService", () => {
       expect(gossip.lastRelevant).toEqual([NODE_ID]);
     });
 
+    it("DROPS the cached nodeId on an AUTHORITATIVE null (inactive/key-rotated), not on a throw (Codex M-final)", async () => {
+      let call = 0;
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => {
+          call++;
+          if (call === 1) return NODE_ID; // tick 1: active
+          return null; // tick 2: authoritative "no active slot" (rotated / exited)
+        },
+      });
+      const gossip = makeGossip(ONLINE_LAST_SEEN);
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        gossip
+      );
+      await svc.tick();
+      expect(gossip.lastRelevant).toEqual([NODE_ID]);
+      await svc.tick(); // authoritative null → cache dropped → relevant set cleared
+      expect(gossip.lastRelevant).toEqual([]);
+    });
+
     it("is FILE-ONLY even when armed (executeSlash) — no queue/execute for offline in inc-1", async () => {
       let queued = false;
       const blockchain = makeBlockchain({

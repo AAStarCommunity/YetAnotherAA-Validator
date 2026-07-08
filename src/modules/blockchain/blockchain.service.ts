@@ -923,10 +923,16 @@ export class BlockchainService {
       ]);
       return ethers.keccak256(encoding);
     } catch (error: any) {
+      // THROW on a transient RPC/contract error — the caller (offline nodeId cache) must NOT conflate
+      // this with an AUTHORITATIVE `null` (inactive/no-slot). null = "definitely not an active
+      // validator" (drop the cache); throw = "unknown, keep the last-known nodeId" (Codex Medium).
       this.logger.warn(
         `getOperatorNodeId(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
       );
-      return null;
+      throw new Error(
+        `getOperatorNodeId(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`,
+        { cause: error }
+      );
     }
   }
 
