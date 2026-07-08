@@ -23,6 +23,13 @@ import { GossipWhitelistValidator } from "./gossip-whitelist-validator.js";
 export class GossipService implements OnModuleInit, OnModuleDestroy {
   private server: WebSocketServer;
   private peers = new Map<string, PeerInfo>();
+  /**
+   * Liveness ledger (offline-audit rule ②) — the LAST time each nodeId was heard from, as an epoch
+   * millisecond. UNLIKE `peers`, this is NEVER cleaned up (a peer offline past cleanupTimeout is
+   * REMOVED from `peers`, which would erase the very lastSeen the offline proof needs). Bounded by the
+   * number of distinct nodes ever seen (the small DVT fleet). Read via getLastSeen(nodeId).
+   */
+  private lastSeenLedger = new Map<string, number>();
   private connections = new Map<string, WebSocket>();
   private nodeState: NodeState;
   private messageHistory = new Map<string, MessageHistory>();
@@ -549,6 +556,9 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    */
   private handleHeartbeatMessage(message: GossipMessage): void {
     const peerId = message.from;
+    // Record liveness in the never-cleaned ledger for the offline-audit rule, even for a peer not
+    // (yet) in the connection map — a heartbeat IS proof of life regardless of connection state.
+    if (peerId) this.lastSeenLedger.set(peerId, Date.now());
     const peer = this.peers.get(peerId);
 
     if (peer) {
@@ -556,6 +566,17 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       peer.status = "active";
       peer.heartbeatCount++;
     }
+  }
+
+  /**
+   * Offline-audit rule ② — the last epoch-ms this nodeId was heard from (heartbeat), or null if it
+   * was NEVER observed by this node. Survives SWIM cleanup (see lastSeenLedger). The audit compares
+   * this against a finalized block's on-chain timestamp minus the offline threshold, so the decision
+   * is anchored to a globally-consistent clock, not this node's wall-clock. A null (never-seen node)
+   * yields NO offline proof — the audit fails safe (won't slash a node it has no liveness data for).
+   */
+  getLastSeen(nodeId: string): number | null {
+    return this.lastSeenLedger.get(nodeId) ?? null;
   }
 
   // ── DVT slash quorum co-sign transport (inc-2 live) ─────────────────────────────

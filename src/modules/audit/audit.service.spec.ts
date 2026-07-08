@@ -88,6 +88,8 @@ function makeBlockchain(
       operator: string,
       blockTag?: number
     ) => Promise<boolean>;
+    getOperatorNodeId: (blsAgg: string, operator: string) => Promise<string | null>;
+    getBlockTimestamp: (blockNumber: number) => Promise<number>;
   }> = {}
 ): any {
   return {
@@ -121,6 +123,10 @@ function makeBlockchain(
     // A1#6 (round-3) — per-operator membership at the evidence block. Default TRUE (a derived operator
     // is still a role member); a test overrides to model an operator that exited by the epoch block.
     hasRole: overrides.hasRole ?? (async () => true),
+    // Rule ② offline — operator → nodeId resolution + block timestamp. Defaults model an operator with
+    // an active slot (nodeId) and a fixed block time; offline tests override these.
+    getOperatorNodeId: overrides.getOperatorNodeId ?? (async () => "0x" + "ab".repeat(32)),
+    getBlockTimestamp: overrides.getBlockTimestamp ?? (async () => 1_700_000_000),
   };
 }
 
@@ -187,14 +193,29 @@ function clockAt(nowMs: number) {
   return () => nowMs;
 }
 
+/** Liveness mock for the offline rule (rule ②). getLastSeen returns a fixed epoch-ms (or null). */
+function makeGossip(lastSeenMs: number | null): any {
+  return { getLastSeen: (_nodeId: string) => lastSeenMs };
+}
+
 function makeService(
   blockchain: any,
   config: any,
   archive: IProofArchive,
   clock: () => number = clockAt(1_700_000_000_000),
-  coSigner?: IQuorumCoSigner
+  coSigner?: IQuorumCoSigner,
+  gossip?: any
 ) {
-  return new AuditService(blockchain, config, makeRegistry(), clock, () => 0, archive, coSigner);
+  return new AuditService(
+    blockchain,
+    config,
+    makeRegistry(),
+    clock,
+    () => 0,
+    archive,
+    coSigner,
+    gossip
+  );
 }
 
 /** A blockchain whose operator is genuinely OVER limit: debt (2000) > creditLimit (1000). */
@@ -2474,6 +2495,164 @@ describe("AuditService", () => {
         epoch: BLOCK,
       });
       expect(res.confirmed).toBe(true); // static operator unaffected by derived-set staleness
+    });
+  });
+
+  // ── Rule ② offline detection (inc-1) ──────────────────────────────────────────
+  describe("rule ② offline detection", () => {
+    const BLS_AGG = "0x" + "bb".repeat(20);
+    const NODE_ID = "0x" + "ab".repeat(32);
+    // clock/blockTs: block.timestamp 1_700_000_000s → 1_700_000_000_000ms; threshold 600_000ms →
+    // deadline 1_699_999_400_000ms. lastSeen below deadline = OFFLINE, at/above = ONLINE.
+    const OFFLINE_LAST_SEEN = 1_699_990_000_000; // 10_000_000ms (≈2.7h) before the block → offline
+    const ONLINE_LAST_SEEN = 1_700_000_000_000; // == block time → online
+
+    const offlineConfig = (overrides: Record<string, unknown> = {}) =>
+      makeConfig({
+        auditOfflineEnabled: true,
+        auditOfflineThresholdMs: 600_000,
+        auditBlsAggregatorAddress: BLS_AGG,
+        ...overrides,
+      });
+
+    it("files an OFFLINE proposal when the operator's last heartbeat is older than the deadline", async () => {
+      const created: string[] = [];
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => NODE_ID,
+        createProposalWithEvidence: async (_a: string, operator: string) => {
+          created.push(operator);
+          return { txHash: "0xTX", proposalId: 9n };
+        },
+      });
+      const archive = makeArchive();
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        archive,
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(OFFLINE_LAST_SEEN)
+      );
+      await svc.tick();
+      // an offline proof was archived (rule=offline, WARNING=0) and a proposal filed for the operator.
+      const offlineProof = archive.records.find(r => r.evidence.rule === "offline");
+      expect(offlineProof).toBeDefined();
+      expect(offlineProof!.slashLevel).toBe(0); // SlashLevel.WARNING
+      expect(created).toEqual([ethers.getAddress(OPERATOR)]);
+    });
+
+    it("does NOT flag an operator seen within the threshold (online)", async () => {
+      const blockchain = makeBlockchain({ getOperatorNodeId: async () => NODE_ID });
+      const archive = makeArchive();
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        archive,
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(ONLINE_LAST_SEEN)
+      );
+      await svc.tick();
+      expect(archive.records.find(r => r.evidence.rule === "offline")).toBeUndefined();
+    });
+
+    it("SKIPS a never-seen node (getLastSeen null) — cannot prove offline-since-T", async () => {
+      const blockchain = makeBlockchain({ getOperatorNodeId: async () => NODE_ID });
+      const archive = makeArchive();
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        archive,
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(null)
+      );
+      await svc.tick();
+      expect(archive.records.find(r => r.evidence.rule === "offline")).toBeUndefined();
+    });
+
+    it("SKIPS an operator with no active BLS slot (getOperatorNodeId null)", async () => {
+      let gossipCalled = false;
+      const blockchain = makeBlockchain({ getOperatorNodeId: async () => null });
+      const archive = makeArchive();
+      const gossip = {
+        getLastSeen: () => {
+          gossipCalled = true;
+          return OFFLINE_LAST_SEEN;
+        },
+      };
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        archive,
+        clockAt(1_700_000_000_000),
+        undefined,
+        gossip
+      );
+      await svc.tick();
+      expect(archive.records.find(r => r.evidence.rule === "offline")).toBeUndefined();
+      expect(gossipCalled).toBe(false); // bailed before touching gossip
+    });
+
+    it("is a no-op when AUDIT_OFFLINE_ENABLED is not set (getOperatorNodeId never called)", async () => {
+      let called = false;
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => {
+          called = true;
+          return NODE_ID;
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        makeConfig(),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(OFFLINE_LAST_SEEN)
+      );
+      await svc.tick();
+      expect(called).toBe(false);
+    });
+
+    it("offline proofHash is DETERMINISTIC across nodes with DIFFERENT lastSeen (no per-node data)", async () => {
+      const build = async (lastSeen: number) => {
+        const archive = makeArchive();
+        const svc = makeService(
+          makeBlockchain({ getOperatorNodeId: async () => NODE_ID }),
+          offlineConfig(),
+          archive,
+          clockAt(1_700_000_000_000),
+          undefined,
+          makeGossip(lastSeen)
+        );
+        await svc.tick();
+        return archive.records.find(r => r.evidence.rule === "offline")!.proofHash;
+      };
+      // Two nodes observed the operator offline at DIFFERENT times — same block, same threshold.
+      const hashA = await build(1_699_990_000_000);
+      const hashB = await build(1_699_985_123_456);
+      expect(hashA).toBe(hashB); // content-address excludes lastSeen → identical
+    });
+
+    it("is FILE-ONLY even when armed (executeSlash) — no queue/execute for offline in inc-1", async () => {
+      let queued = false;
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => NODE_ID,
+        queueSlashWithProof: async () => {
+          queued = true;
+          return "0xQUEUE";
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        offlineConfig({ auditExecuteSlash: true }),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(OFFLINE_LAST_SEEN)
+      );
+      await svc.tick();
+      expect(queued).toBe(false); // offline never queues an on-chain slash in inc-1
     });
   });
 });

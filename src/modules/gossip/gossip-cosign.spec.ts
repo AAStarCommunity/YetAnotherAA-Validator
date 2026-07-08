@@ -517,3 +517,33 @@ describe("GossipService co-sign collector: per-connection cap (finding-3)", () =
     await promise;
   });
 });
+
+describe("GossipService liveness ledger (offline-audit rule ②)", () => {
+  it("records lastSeen on heartbeat and returns null for a never-seen node", () => {
+    const svc = buildService();
+    expect(svc.getLastSeen("peer-x")).toBeNull();
+    const before = Date.now();
+    (svc as any).handleHeartbeatMessage({ from: "peer-x" } as GossipMessage);
+    const seen = svc.getLastSeen("peer-x");
+    expect(seen).not.toBeNull();
+    expect(seen!).toBeGreaterThanOrEqual(before);
+    expect(svc.getLastSeen("other")).toBeNull();
+  });
+
+  it("advances lastSeen on a later heartbeat", () => {
+    const svc = buildService();
+    (svc as any).handleHeartbeatMessage({ from: "peer-y" } as GossipMessage);
+    const first = svc.getLastSeen("peer-y")!;
+    (svc as any).handleHeartbeatMessage({ from: "peer-y" } as GossipMessage);
+    expect(svc.getLastSeen("peer-y")!).toBeGreaterThanOrEqual(first);
+  });
+
+  it("ledger survives peer cleanup (records lastSeen even with no peer in the connection map)", () => {
+    const svc = buildService();
+    // A heartbeat from a peer NOT in the `peers` map still records liveness — the offline proof needs
+    // the lastSeen even after SWIM cleanup removes the peer entry.
+    (svc as any).handleHeartbeatMessage({ from: "ghost" } as GossipMessage);
+    expect((svc as any).peers.has("ghost")).toBe(false);
+    expect(svc.getLastSeen("ghost")).not.toBeNull();
+  });
+});

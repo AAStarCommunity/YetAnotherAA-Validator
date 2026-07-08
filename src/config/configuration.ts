@@ -301,6 +301,17 @@ export default () => {
       const parsed = parseInt(process.env.AUDIT_ROLE_MAX_STALE_MS || "900000", 10);
       return Math.max(1, Number.isFinite(parsed) && parsed > 0 ? parsed : 900000);
     })(),
+    // Rule ② offline detection (inc-1). Opt-in; audits liveness of the SAME operators the credit rule
+    // watches. An operator is OFFLINE when this node last heard its gossip heartbeat more than
+    // AUDIT_OFFLINE_THRESHOLD_MS before the finalized evidence block's on-chain timestamp (a globally-
+    // consistent deadline, not local wall-clock). Slash level WARNING. Reuses AUDIT_BLS_AGGREGATOR_
+    // ADDRESS to resolve operator → registered BLS key → nodeId. inc-1 files a proposal + archives the
+    // proof; the armed BLS co-sign for offline is inc-2.
+    auditOfflineEnabled: process.env.AUDIT_OFFLINE_ENABLED === "true",
+    auditOfflineThresholdMs: (() => {
+      const parsed = parseInt(process.env.AUDIT_OFFLINE_THRESHOLD_MS || "600000", 10);
+      return Math.max(1, Number.isFinite(parsed) && parsed > 0 ? parsed : 600000);
+    })(),
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,

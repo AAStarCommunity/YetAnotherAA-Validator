@@ -869,6 +869,68 @@ export class BlockchainService {
   }
 
   /**
+   * Offline-audit rule ② — the UNIX timestamp (seconds) of a block. The offline proof anchors its
+   * "offline since" deadline to a FINALIZED block's on-chain timestamp (a globally-consistent clock)
+   * so every DVT node computes the SAME deadline from the SAME block, independent of local wall-clock.
+   * THROWS if the block can't be read (caller fails closed — no deterministic deadline → no slash).
+   */
+  async getBlockTimestamp(blockNumber: number): Promise<number> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const block = await this.provider.getBlock(blockNumber);
+    if (!block) {
+      throw new Error(`getBlockTimestamp: block ${blockNumber} not found`);
+    }
+    return Number(block.timestamp);
+  }
+
+  /**
+   * Offline-audit rule ② — resolve an on-chain operator to its gossip `nodeId`, the bridge between
+   * the on-chain slash target (operator EOA) and the off-chain liveness key (gossip peer id). Reads
+   * BLSAggregator.getBLSPublicKey(operator) → the registered EIP-2537 G1 key tuple (x_a,x_b,y_a,y_b =
+   * the 128-byte encoding), then nodeId = keccak256(encoding) — IDENTICAL to gen-node-state.mjs /
+   * registerWithProof. Returns null when the operator holds no ACTIVE slot (nothing to bind / slash).
+   */
+  async getOperatorNodeId(
+    blsAggregatorAddress: string,
+    operatorEoa: string
+  ): Promise<string | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    let validator: string;
+    try {
+      validator = ethers.getAddress(operatorEoa);
+    } catch {
+      return null;
+    }
+    const abi = [
+      "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
+    ];
+    const contract = new ethers.Contract(blsAggregatorAddress, abi, this.provider);
+    try {
+      const res = await contract.getBLSPublicKey(validator);
+      const isActive = res.isActive ?? res[2];
+      if (!isActive) return null;
+      const pk = res.publicKey ?? res[0];
+      // Concatenate x_a ++ x_b ++ y_a ++ y_b = the 128-byte EIP-2537 G1 encoding, then keccak256.
+      const encoding = ethers.concat([
+        pk.x_a ?? pk[0],
+        pk.x_b ?? pk[1],
+        pk.y_a ?? pk[2],
+        pk.y_b ?? pk[3],
+      ]);
+      return ethers.keccak256(encoding);
+    } catch (error: any) {
+      this.logger.warn(
+        `getOperatorNodeId(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
+      );
+      return null;
+    }
+  }
+
+  /**
    * Scan slots `1..maxSlots` for the one bound to `operatorEoa` (checksum-compared), returning its
    * 1-indexed slot or `null` when the operator holds no slot. A node whose operator is at no slot
    * MUST refuse to participate in the quorum co-sign (fail-closed).
