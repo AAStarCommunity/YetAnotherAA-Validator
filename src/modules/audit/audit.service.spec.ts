@@ -2328,6 +2328,39 @@ describe("AuditService", () => {
       expect(res.confirmed).toBe(false); // stale derived membership → refuse to co-sign a slash
     });
 
+    // ── Codex round-2: single-flight collapses concurrent refreshes onto ONE derivation ──
+    it("concurrent refreshes share one in-flight derivation (single-flight, no double getLogs)", async () => {
+      let calls = 0;
+      let release!: () => void;
+      const gate = new Promise<void>(res => {
+        release = res;
+      });
+      let firstDone = false;
+      const blockchain = makeBlockchain({
+        getRegisteredOperators: async () => {
+          calls++;
+          if (!firstDone) {
+            firstDone = true; // bootstrap eager derive resolves immediately
+            return [opB];
+          }
+          await gate; // subsequent derive suspends so two callers overlap
+          return [opB];
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        roleDeriveConfig({ auditWatchlist: [], auditRoleRefreshMs: 0 }),
+        makeArchive()
+      );
+      await svc.onApplicationBootstrap(); // calls = 1 (bootstrap)
+      // Fire two concurrent refreshes; the second must await the first's in-flight promise.
+      const p1 = (svc as any).refreshDerivedOperators(false);
+      const p2 = (svc as any).refreshDerivedOperators(false);
+      release();
+      await Promise.all([p1, p2]);
+      expect(calls).toBe(2); // bootstrap + ONE shared derivation, not 3
+    });
+
     it("a STATIC-listed operator is still co-signed even when the derived set is stale", async () => {
       let t = 1_700_000_000_000;
       // OPERATOR is static-listed; derived set will go stale but must not gate a static operator.

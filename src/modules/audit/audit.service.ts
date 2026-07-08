@@ -119,8 +119,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly roleMaxStaleMs: number;
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
   private derivedOperators: string[] = [];
-  /** Wall-clock of the last SUCCESSFUL role derivation (null = never); throttles the refresh. */
+  /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
   private lastRoleRefreshAt: number | null = null;
+  /** Wall-clock of the last derivation ATTEMPT (success OR failure) — throttles getLogs frequency
+   *  even under a request flood or persistent RPC failure (Codex Medium/Low). */
+  private lastRoleAttemptAt: number | null = null;
+  /** Single-flight guard: concurrent refresh callers await this one in-flight derivation. */
+  private refreshInFlight: Promise<void> | null = null;
   /** True once role derivation has SUCCEEDED at least once — distinguishes "never derived" (fail to
    *  an empty set) from "derived, genuinely empty" so the former is never silently unaudited. */
   private roleDeriveSucceeded = false;
@@ -579,10 +584,24 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // have aged past cooldownMs (they can no longer suppress anything) before each sweep.
     this.pruneDedupState();
     try {
-      // A1#6 — refresh the on-chain-derived operator set (throttled to roleRefreshMs; no-op when
-      // roleDerive is off). A derivation failure KEEPS the previous set, so a transient RPC blip
-      // never silently empties the watchlist mid-sweep.
-      await this.refreshDerivedOperators();
+      // Resolve the finalized evidence block ONCE per tick and share it across every operator in
+      // this sweep (PK perf finding): a healthy watchlist otherwise pays getViolationBlock's 1-4
+      // RPC per operator. One finalized snapshot is also MORE consistent (all operators evaluated
+      // against the same chain state) and cannot reorg. A failure here is a global RPC problem, not
+      // per-operator, so skip the whole tick rather than hammering each operator into the same error.
+      // Resolved BEFORE the role refresh so membership is derived to the SAME block (Codex Medium-1).
+      let pinnedBlock: { number: number; hash: string };
+      try {
+        pinnedBlock = await this.blockchainService.getViolationBlock(this.finalityConfirmations);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.logger.error(`Audit: could not resolve finalized block — skipping tick (${msg})`);
+        return;
+      }
+      // A1#6 — refresh the on-chain-derived operator set (throttled; no-op when roleDerive is off),
+      // pinned to the SAME finalized block as the evidence. A derivation failure KEEPS the previous
+      // set, so a transient RPC blip never silently empties the watchlist mid-sweep.
+      await this.refreshDerivedOperators(false, pinnedBlock.number);
       // HEALTH (Codex High-2) — never let a role-derive deployment go SILENTLY unaudited. Surface a
       // loud, alertable event when the derived set has never been confirmed or has gone stale, so an
       // empty/stale watchlist reads as a monitored failure, not "all clear".
@@ -601,19 +620,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       const operators = this.effectiveWatchlist();
       if (operators.length === 0) {
         this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
-        return;
-      }
-      // Resolve the finalized evidence block ONCE per tick and share it across every operator in
-      // this sweep (PK perf finding): a healthy watchlist otherwise pays getViolationBlock's 1-4
-      // RPC per operator. One finalized snapshot is also MORE consistent (all operators evaluated
-      // against the same chain state) and cannot reorg. A failure here is a global RPC problem, not
-      // per-operator, so skip the whole tick rather than hammering each operator into the same error.
-      let pinnedBlock: { number: number; hash: string };
-      try {
-        pinnedBlock = await this.blockchainService.getViolationBlock(this.finalityConfirmations);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.logger.error(`Audit: could not resolve finalized block — skipping tick (${msg})`);
         return;
       }
       for (const operator of operators) {
@@ -667,39 +673,68 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * derived-only slash is authorized consistently across the quorum.
    */
   private isSlashableOperator(operator: string): boolean {
-    if (this.watchlist.includes(operator)) return true;
-    return this.derivedSetIsFresh();
+    // Not even watched (neither static nor derived) → never slashable. Hardens the helper's contract
+    // so it is safe standalone, not only because callers pre-filter via effectiveWatchlist (Codex Low).
+    if (!this.effectiveWatchlist().includes(operator)) return false;
+    if (this.watchlist.includes(operator)) return true; // explicitly configured → always slashable
+    return this.derivedSetIsFresh(); // derived-only → requires a FRESH membership snapshot
   }
 
   /**
    * A1#6 — refresh the on-chain-derived operator set, throttled to roleRefreshMs. Enumerates the
    * CURRENT members of every configured role from the Registry (getRoleMembers getter-first, role-
    * event reconstruction fallback) and caches them checksummed. On ANY derivation error the PREVIOUS
-   * set is KEPT (never shrunk to empty on a transient RPC blip) and lastRoleRefreshAt is left
-   * unchanged so the NEXT tick retries immediately rather than waiting a full refresh interval.
-   * No-op when roleDerive is off or no roles are configured. `force` bypasses the throttle (eager
-   * bootstrap derivation).
+   * set is KEPT (never shrunk to empty on a transient RPC blip).
+   *
+   * Throttled by lastRoleAttemptAt — updated on BOTH success AND failure (Codex Medium/Low) — so a
+   * peer flooding co-sign requests (each of which calls this) or a persistent RPC failure cannot
+   * drive getLogs faster than roleRefreshMs. A SINGLE-FLIGHT guard (refreshInFlight) collapses truly
+   * concurrent calls onto one derivation, so a later-block result can't be overwritten by an
+   * in-flight earlier one. Freshness (derivedSetIsFresh) is driven by lastRoleRefreshAt (success
+   * only). No-op when roleDerive is off or no roles are configured. `force` bypasses the throttle
+   * (eager bootstrap). `pinnedToBlock` (the tick's finalized evidence block) aligns the membership
+   * snapshot with the evidence (Codex Medium-1); omitted callers resolve their own finalized block.
    */
-  private async refreshDerivedOperators(force = false): Promise<void> {
+  private async refreshDerivedOperators(force = false, pinnedToBlock?: number): Promise<void> {
     if (!this.roleDerive || this.roleIds.length === 0) return;
     const now = this.clock();
+    // Throttle by ATTEMPT time (success or failure) so failures/floods can't hammer getLogs.
     if (
       !force &&
-      this.lastRoleRefreshAt !== null &&
-      now - this.lastRoleRefreshAt < this.roleRefreshMs
+      this.lastRoleAttemptAt !== null &&
+      now - this.lastRoleAttemptAt < this.roleRefreshMs
     ) {
       return;
     }
+    // Single-flight: a concurrent caller awaits the in-flight derivation instead of starting a second.
+    if (this.refreshInFlight) {
+      await this.refreshInFlight;
+      return;
+    }
+    this.lastRoleAttemptAt = now;
+    this.refreshInFlight = this.doRefreshDerivedOperators(now, pinnedToBlock);
+    try {
+      await this.refreshInFlight;
+    } finally {
+      this.refreshInFlight = null;
+    }
+  }
+
+  /** The actual derivation (guarded by refreshDerivedOperators' throttle + single-flight). */
+  private async doRefreshDerivedOperators(now: number, pinnedToBlock?: number): Promise<void> {
     try {
       // Derive membership up to the SAME FINALIZED block violations are evaluated at (Codex Medium-1):
       // an unfinalized head RoleExited/Registered must not add/drop an operator relative to the
-      // evidence, and a reorg must not flip the set after use.
-      const finalized = await this.blockchainService.getViolationBlock(this.finalityConfirmations);
+      // evidence, and a reorg must not flip the set after use. Reuse the tick's pinned block when
+      // given (also saves an RPC); otherwise resolve our own finalized block.
+      const toBlock =
+        pinnedToBlock ??
+        (await this.blockchainService.getViolationBlock(this.finalityConfirmations)).number;
       const members = await this.blockchainService.getRegisteredOperators(
         this.registryAddress,
         this.roleIds,
         this.roleFromBlock,
-        finalized.number,
+        toBlock,
         this.roleLogChunk,
         this.roleUseGetter
       );
@@ -716,11 +751,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.roleDeriveSucceeded = true;
       this.logger.log(
         `Audit: derived ${canonical.length} operator(s) from ${this.roleIds.length} on-chain role(s) ` +
-          `@finalized block ${finalized.number}`
+          `@finalized block ${toBlock}`
       );
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       // KEEP the previous derivedOperators — a transient getLogs failure must NOT empty the watchlist.
+      // lastRoleRefreshAt is left unchanged (freshness decays → derived-only slashing withheld once
+      // stale), but lastRoleAttemptAt WAS updated so failures don't spin getLogs.
       this.logger.warn(
         `Audit: on-chain role derivation failed (${msg}) — keeping previous derived set ` +
           `(${this.derivedOperators.length} operator(s))`

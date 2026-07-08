@@ -1066,7 +1066,16 @@ export class BlockchainService {
           );
         }
       }
-      // fallback (default) — reconstruct from events, replayed in chain order.
+      // fallback (default) — reconstruct from events, replayed in chain order. REFUSE a from-genesis
+      // scan (Codex Medium-2): with the getter enabled but fromBlock=0, a getter revert would
+      // otherwise silently drop into a genesis-wide getLogs DoS. Throwing keeps the caller's previous
+      // set instead. (roleDerive without the getter is already fail-closed at bootstrap.)
+      if (fromBlock <= 0) {
+        throw new Error(
+          `getRegisteredOperators: refusing a from-genesis event scan for role ${roleId} ` +
+            `(fromBlock=0) — set AUDIT_ROLE_FROM_BLOCK to the Registry deploy block`
+        );
+      }
       const derived = await this.deriveRoleMembersFromEvents(
         registryAddress,
         roleId,
