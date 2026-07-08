@@ -669,6 +669,39 @@ export class BlockchainService {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
+    // PREFER the O(1) authoritative typed getter added in SuperPaymaster 5.4.2
+    // (ISuperPaymaster.isSlashPending → reads _pendingSlash directly): no getLogs window, no reorg
+    // edge, no owner-path OperatorSlashed miss — and it closes the fresh-node "peer slash aged out of
+    // the window" residual. FALL BACK to the event reconstruction only when the getter is absent
+    // (pre-5.4.2 SP → the call reverts) so the same DVT binary works against both. A getter that
+    // returns a real bool is authoritative; a getter revert is treated as "not present", NOT as a
+    // definite state.
+    try {
+      const contract = new ethers.Contract(
+        superPaymasterAddress,
+        ["function isSlashPending(address operator) view returns (bool)"],
+        this.provider
+      );
+      const pending: boolean = await contract.isSlashPending(operator);
+      return Boolean(pending);
+    } catch {
+      // getter absent (older SP) / decode failure → fall back to the durable event reconstruction.
+      return this.isSlashPendingFromEvents(superPaymasterAddress, operator, lookbackBlocks);
+    }
+  }
+
+  /**
+   * Fallback pending reconstruction from SP events (used only against a pre-5.4.2 SP with no
+   * isSlashPending getter). See the getter above for the authoritative path.
+   */
+  private async isSlashPendingFromEvents(
+    superPaymasterAddress: string,
+    operator: string,
+    lookbackBlocks: number
+  ): Promise<boolean | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
     let latest: number;
     try {
       latest = await this.provider.getBlockNumber();

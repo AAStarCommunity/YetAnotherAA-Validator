@@ -120,6 +120,22 @@ describe("BlockchainService.isSlashPending (event reconstruction)", () => {
     );
   }
 
+  it("PREFERS the typed getter (SP 5.4.2): returns its bool WITHOUT any event scan", async () => {
+    const config = { get: (_k: string) => undefined } as any;
+    const svc = new BlockchainService(config);
+    (svc as any).provider = {
+      // isSlashPending(address)→bool ABI-encoded true; getLogs must NOT be reached on the getter path.
+      call: async () => ethers.AbiCoder.defaultAbiCoder().encode(["bool"], [true]),
+      getLogs: async () => {
+        throw new Error("event fallback must NOT run when the getter answers");
+      },
+      getBlockNumber: async () => 1000,
+    };
+    expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBe(true);
+  });
+
+  // NB: every test BELOW uses a provider with NO `.call`, so the getter throws → the code FALLS BACK
+  // to the event reconstruction — i.e. these now also assert the pre-5.4.2 fallback path works.
   it("only SlashQueued in window → pending (true)", async () => {
     const svc = pendingService([pLog("SlashQueued", OPERATOR, 100, 0)]);
     expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBe(true);
