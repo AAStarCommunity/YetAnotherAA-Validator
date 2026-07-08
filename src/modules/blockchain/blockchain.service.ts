@@ -582,10 +582,11 @@ export class BlockchainService {
     const iface = new ethers.Interface([
       "event SlashExecutedWithProof(address indexed operator, uint8 level, uint256 penalty, bytes32 proofHash, uint256 timestamp)",
       "event SlashExecuted(uint256 indexed proposalId, address indexed operator, uint8 level)",
+      "event OperatorSlashed(address indexed operator, uint256 amount, uint8 level)",
     ]);
     const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
     const filters = [
-      // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]).
+      // SlashExecutedWithProof: operator is the 1st indexed field (topics[1]). BLS/DVT execute path.
       {
         name: "SlashExecutedWithProof",
         topics: [iface.getEvent("SlashExecutedWithProof")!.topicHash, opTopic],
@@ -594,6 +595,13 @@ export class BlockchainService {
       {
         name: "SlashExecuted",
         topics: [iface.getEvent("SlashExecuted")!.topicHash, null, opTopic],
+      },
+      // OperatorSlashed: operator 1st indexed (topics[1]). Emitted by `_slash` on BOTH the BLS/DVT
+      // execute path AND owner-manual `slashOperator` — which does NOT emit SlashExecutedWithProof, so
+      // WITHOUT this an owner-slashed operator reads as "not slashed" and the audit double-slashes it.
+      {
+        name: "OperatorSlashed",
+        topics: [iface.getEvent("OperatorSlashed")!.topicHash, opTopic],
       },
     ];
     for (const f of filters) {
@@ -625,6 +633,85 @@ export class BlockchainService {
       }
     }
     return false;
+  }
+
+  /**
+   * Reconstruct whether `operator` is currently pending-slash on the SuperPaymaster WITHOUT an
+   * on-chain getter. SP is at the EIP-170 size limit (39 bytes free) so it deliberately exposes NO
+   * `isSlashPending` view; the state is instead rebuilt from the events SP emits at every
+   * `_pendingSlash` flip. Rule (authoritative, from repo:sp): over a head-anchored window, take the
+   * LATEST (by blockNumber, then logIndex) event for `operator` among —
+   *   SET   → `SlashQueued(operator)`
+   *   CLEAR → `SlashCancelled(operator)`         (owner `cancelSlash`)
+   *   CLEAR → `OperatorSlashed(operator, ...)`   (emitted by BOTH the BLS execute path AND owner
+   *                                               manual `slashOperator`; the latter does NOT emit
+   *                                               `SlashExecutedWithProof`, so keying off that alone
+   *                                               would forever mis-read a manually-slashed operator
+   *                                               as still pending — hence `OperatorSlashed` is the
+   *                                               authoritative CLEAR signal).
+   * pending == (the latest such event is `SlashQueued`).
+   *
+   * Returns `null` (INDETERMINATE, fail-closed) on any getBlockNumber/getLogs error — the caller must
+   * not read an unreadable chain as a definite pending/not-pending. Returns `false` when the window
+   * holds no such event: size `lookbackBlocks` to the queue→execute latency / your RPC's getLogs cap
+   * (Alchemy free = 10). A `SlashQueued` OLDER than the window reads as not-pending → the caller then
+   * re-queues → the BLSAggregator `usedSlashQueueHashes` replay guard reverts the duplicate → the
+   * queue step aborts transiently → retry next tick. Never a wrong slash, just a bounded retry.
+   */
+  async isSlashPending(
+    superPaymasterAddress: string,
+    operator: string,
+    lookbackBlocks: number
+  ): Promise<boolean | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    let latest: number;
+    try {
+      latest = await this.provider.getBlockNumber();
+    } catch (error: any) {
+      this.logger.warn(`isSlashPending getBlockNumber failed: ${error.message} — indeterminate`);
+      return null;
+    }
+    const fromBlock = Math.max(0, latest - Math.max(0, lookbackBlocks));
+    const iface = new ethers.Interface([
+      "event SlashQueued(address indexed operator)",
+      "event SlashCancelled(address indexed operator)",
+      "event OperatorSlashed(address indexed operator, uint256 amount, uint8 level)",
+    ]);
+    // `operator` is the 1st indexed field (topics[1]) in ALL three events.
+    const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
+    const kinds = [
+      { name: "SlashQueued", pending: true },
+      { name: "SlashCancelled", pending: false },
+      { name: "OperatorSlashed", pending: false },
+    ] as const;
+    let best: { block: number; index: number; pending: boolean } | null = null;
+    for (const k of kinds) {
+      let logs;
+      try {
+        logs = await this.provider.getLogs({
+          address: superPaymasterAddress,
+          fromBlock,
+          toBlock: "latest",
+          topics: [iface.getEvent(k.name)!.topicHash, opTopic],
+        });
+      } catch (error: any) {
+        // FAIL-CLOSED: an unscannable window is INDETERMINATE, never a silent "not pending".
+        this.logger.warn(
+          `isSlashPending getLogs failed on ${superPaymasterAddress} (${k.name}): ${error.message} — indeterminate`
+        );
+        return null;
+      }
+      for (const log of logs) {
+        const block = log.blockNumber;
+        const index = log.index; // ethers v6: logIndex within the block
+        if (best === null || block > best.block || (block === best.block && index > best.index)) {
+          best = { block, index, pending: k.pending };
+        }
+      }
+    }
+    return best === null ? false : best.pending;
   }
 
   // ── BLSAggregator slot registry (inc-2 live gossip co-sign) ────────────────────
@@ -952,42 +1039,6 @@ export class BlockchainService {
         (proposalId !== null ? ` (proposalId ${proposalId})` : "")
     );
     return { txHash: tx.hash, proposalId };
-  }
-
-  /**
-   * Best-effort read of an operator's on-chain pending-slash flag. This is the DURABLE
-   * cross-restart guard against double-slashing a sustained violation (finding-4/5): if a slash
-   * is already queued/pending, the audit must NOT queue+execute another.
-   *
-   * SP #329 keeps `_pendingSlash` PRIVATE with no public getter, so on the current deployment this
-   * call reverts and returns `null` ("unknown") — the caller then falls back to the in-memory
-   * coarse operator|rule guard. Should a future SuperPaymaster expose `pendingSlash(address)`
-   * (or `isSlashPending`), this begins returning the real flag and becomes the authoritative,
-   * restart-surviving guard with no caller change. `null` is treated as "unknown", never "false".
-   */
-  async isSlashPending(
-    superPaymasterAddress: string,
-    operator: string,
-    blockTag?: number
-  ): Promise<boolean | null> {
-    if (!this.provider) {
-      throw new Error("Blockchain provider not configured");
-    }
-    // Try both plausible public getter names; either returning a bool answers the question.
-    const abi = [
-      "function pendingSlash(address operator) view returns (bool)",
-      "function isSlashPending(address operator) view returns (bool)",
-    ];
-    const contract = new ethers.Contract(superPaymasterAddress, abi, this.provider);
-    for (const fn of ["pendingSlash", "isSlashPending"] as const) {
-      try {
-        const pending: boolean = await contract[fn](operator, { blockTag });
-        return Boolean(pending);
-      } catch {
-        // getter absent on this deployment — try the next name.
-      }
-    }
-    return null;
   }
 
   /**

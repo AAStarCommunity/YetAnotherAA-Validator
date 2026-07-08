@@ -140,6 +140,9 @@ function makeArchive(): IProofArchive & { records: SlashProof[]; slashed: Set<st
     async has(proofHash: string) {
       return records.some(r => r.proofHash === proofHash);
     },
+    async get(proofHash: string) {
+      return records.find(r => r.proofHash === proofHash) ?? null;
+    },
     async count() {
       return records.length;
     },
@@ -698,6 +701,9 @@ describe("AuditService", () => {
       async has(proofHash: string) {
         return records.some(r => r.proofHash === proofHash);
       },
+      async get(proofHash: string) {
+        return records.find(r => r.proofHash === proofHash) ?? null;
+      },
       async count() {
         return records.length;
       },
@@ -981,6 +987,42 @@ describe("AuditService", () => {
     expect(execArgs[5]).toBe(expectedProof);
   });
 
+  it("executeSlash=true + queue co-sign aborts: files NO orphan proposal (createProposal skipped), no execute", async () => {
+    // Regression for the Stage-3 live-drill orphan-proposal bug: armed mode used to call
+    // createProposalWithEvidence UNCONDITIONALLY, so a transient queue co-sign failure (no peers /
+    // under-threshold / a peer node already queued) spawned an on-chain proposal that Step 3 then
+    // skipped — one orphan per node per retry tick. The fix gates createProposal on a confirmed queue.
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order);
+    const archive = makeArchive();
+    // A co-signer that ABORTS the queue step (models transient no-peers / under-threshold).
+    const abortingCoSigner: IQuorumCoSigner & { calls: string[] } = {
+      calls: [],
+      async coSign(req: CoSignRequest) {
+        this.calls.push(req.step);
+        throw new Error("gossip co-sign: no gossip peers available to reach quorum");
+      },
+    };
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      clockAt(1_700_000_000_000),
+      abortingCoSigner
+    );
+    await svc.tick();
+
+    // NOTHING on-chain: queue co-sign threw before queueSlashWithProof, so no queue tx; and because
+    // the queue never confirmed, NO createProposal (no orphan) and NO execute.
+    expect(order).toEqual([]);
+    expect(abortingCoSigner.calls).toEqual(["queue"]); // only the queue co-sign was attempted
+    // Evidence is still archived (evidence-never-lost) and the violation is flagged for retry.
+    expect(archive.records).toHaveLength(1);
+    const status = await svc.getStatus();
+    expect(status.recentDetections[0].queueTx).toBeNull();
+    expect(status.recentDetections[0].executeTx).toBeNull();
+  });
+
   it("executeSlash=true + real proposalId: execute is bound to that exact id", async () => {
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, {
@@ -1032,11 +1074,11 @@ describe("AuditService", () => {
     const svc = makeService(blockchain, makeConfig({ auditExecuteSlash: true }), archive);
     // The tick must survive the stub's throw (loop never crashes).
     await expect(svc.tick()).resolves.toBeUndefined();
-    // queue co-sign threw (queue skipped) but the proposal was still filed; execute co-sign
-    // also threw (execute skipped) — yet the evidence is archived regardless.
-    expect(order).toEqual(["create"]);
+    // queue co-sign threw (queue skipped) → armed mode files NO proposal (orphan-proposal fix):
+    // no confirmed queue ⇒ no createProposal ⇒ no execute — yet the evidence is archived regardless.
+    expect(order).toEqual([]);
     expect(archive.records).toHaveLength(1);
-    expect(archive.records[0].proposalTx).toBe("0xPROPOSALTX");
+    expect(archive.records[0].proposalTx ?? null).toBeNull();
   });
 
   it("Finding 1 (CRITICAL): a queue tx failure ABORTS the slash — execute is NOT called (two-step safety)", async () => {
@@ -1063,16 +1105,19 @@ describe("AuditService", () => {
       makeCoSigner()
     );
     await expect(svc.tick()).resolves.toBeUndefined();
-    // finding-1: queue reverted (queueTx null) → execute must NOT run even though the proposal
-    // filed and resolved a real id. A slash never executes without a confirmed queue pre-flag.
-    expect(order).toEqual(["queue-fail", "create"]);
+    // finding-1 + orphan-proposal fix: queue reverted (queueTx null) → NO createProposal (no orphan)
+    // and NO execute. A slash never executes without a confirmed queue pre-flag, and armed mode never
+    // files a proposal it cannot execute.
+    expect(order).toEqual(["queue-fail"]);
     expect(executeCalls).toBe(0);
     expect(archive.records).toHaveLength(1);
     const proof = archive.records[0];
-    // No execute tx recorded, and the (resolvable) execute preimage is kept as INTENT only.
+    // No execute tx recorded. createProposal was skipped (queue never confirmed) → no proposalId,
+    // so there is no resolvable execute preimage to record even as INTENT — the whole flow retries.
     expect(proof.executeTx).toBeUndefined();
     expect(proof.messageHash).toBe("0x");
-    expect(proof.intendedExecuteMessageHash).toBeDefined();
+    expect(proof.intendedExecuteMessageHash ?? undefined).toBeUndefined();
+    expect(proof.proposalTx ?? null).toBeNull();
     // The over-slash guard was NOT armed durably (no slash executed).
     expect((archive as any).slashed.size).toBe(0);
     const status = await svc.getStatus();
@@ -1159,7 +1204,12 @@ describe("AuditService", () => {
     expect(order.filter(o => o === "execute")).toHaveLength(2);
   });
 
-  it("Finding 4: an on-chain isSlashPending=true short-circuits queue/create/execute (durable cross-restart guard)", async () => {
+  it("Finding 4: on-chain pending (isSlashPending=true) RESUMES — skips the queue, completes createProposal + execute", async () => {
+    // Codex-Critical fix: a `pending` operator is an INCOMPLETE slash (queued on-chain but not yet
+    // executed — the queuing node crashed/RPC-failed, or a peer queued it), NOT an already-slashed
+    // one. It must be RESUMED, not skipped: re-queuing would replay-guard revert, so skip Step 1 and
+    // go straight to createProposal + execute. Skipping it (the old behavior) left the operator
+    // pending (withdraw-locked) yet never slashed — the stuck-pending liveness bug.
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, { isSlashPending: async () => true });
     const archive = makeArchive();
@@ -1171,10 +1221,299 @@ describe("AuditService", () => {
       makeCoSigner()
     );
     await svc.tick();
-    // Already pending on-chain → NO on-chain writes this tick; evidence still archived.
-    expect(order).toEqual([]);
+    // RESUME: no queue (replay-guard would revert), but createProposal + execute COMPLETE the slash.
+    expect(order).toEqual(["create", "execute"]);
     expect(archive.records).toHaveLength(1);
-    expect(archive.records[0].proposalIdNote).toMatch(/over-slash guard/);
+    expect(archive.records[0].executeTx).toBe("0xEXECUTETX");
+    // The co-signer ran ONCE — only over the execute preimage (no queue co-sign on the resume path).
+    const status = await svc.getStatus();
+    expect(status.recentDetections[0].queueTx).toBeNull();
+    expect(status.recentDetections[0].executeTx).toBe("0xEXECUTETX");
+  });
+
+  it("Codex-Critical: queue confirms but execute fails → retried next tick and RESUMED to completion (no stuck-pending, no re-queue)", async () => {
+    // The full liveness path: a slash whose queue landed but whose execute failed must NOT be marked
+    // handled — the operator is pending (withdraw-locked) but not slashed. Next tick it is detected as
+    // pending and RESUMED (skip re-queue → complete createProposal + execute).
+    const order: string[] = [];
+    let executeAttempts = 0;
+    let pending = false; // becomes true once the queue lands on-chain
+    const blockchain = overLimitBlockchain({
+      getRecentSlashExecuted: async () => false, // never EXECUTED in this mock (resume keys off pending)
+      isSlashPending: async () => pending,
+      queueSlashWithProof: async () => {
+        order.push("queue");
+        pending = true; // queue pre-flag now set on-chain
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => {
+        order.push("create");
+        return { txHash: "0xP", proposalId: 7n };
+      },
+      executeSlashWithProof: async () => {
+        executeAttempts++;
+        order.push("execute");
+        if (executeAttempts === 1) throw new Error("execute reverted (transient RPC)");
+        return "0xEXECUTETX";
+      },
+    });
+    const archive = makeArchive();
+    // A mutable clock advanced past cooldownMs between ticks: the post-queue-failure THROTTLE keeps the
+    // cooldown, so tick 2 must be beyond it for the resume to fire (proves both throttle AND resume).
+    let now = 1_700_000_000_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 20_000 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+
+    // Tick 1: queue + create land, execute THROWS → executeTx null → NOT marked handled, retry armed.
+    await svc.tick();
+    expect(order).toEqual(["queue", "create", "execute"]);
+    now += 25_000; // advance past cooldownMs so the resume is not throttled
+    expect((await svc.getStatus()).recentDetections[0].executeTx).toBeNull();
+
+    // Tick 2: operator now pending on-chain (queue landed) → RESUME. No re-queue (replay guard would
+    // revert) AND no new createProposal — the archived proposalId from tick 1 is REUSED (High-2: zero
+    // orphan on a same-node resume). Only the execute (previously failed) is retried, now succeeding.
+    order.length = 0;
+    await svc.tick();
+    expect(order).toEqual(["execute"]); // reused proposal id (no re-create), no re-queue
+    expect(executeAttempts).toBe(2);
+    expect((await svc.getStatus()).recentDetections[0].executeTx).toBe("0xEXECUTETX"); // slash completed
+  });
+
+  it("Codex-High: a cooldown-suppressed tick does NOT clobber the carried-forward proposalId (reuse survives)", async () => {
+    // tick 1 queues + creates proposal 5 (durably persisted) then execute fails → cooldown KEPT
+    // (post-queue throttle). tick 2 falls WITHIN cooldown so the orchestrator is not called; the
+    // finalization must NOT overwrite the carried-forward proposalId with null — else a later crash
+    // loses it and the resume files a fresh orphan proposal.
+    const archive = makeArchive();
+    const blockchain = overLimitBlockchain({
+      getRecentSlashExecuted: async () => false,
+      isSlashPending: async () => false, // tick 1 is a normal (non-resume) queue
+      queueSlashWithProof: async () => "0xQUEUE",
+      createProposalWithEvidence: async () => ({ txHash: "0xP", proposalId: 5n }),
+      executeSlashWithProof: async () => {
+        throw new Error("execute reverted");
+      },
+    });
+    // Fixed clock → tick 2 is WITHIN the default cooldown.
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      clockAt(1_700_000_000_000),
+      makeCoSigner()
+    );
+
+    await svc.tick(); // queue + create (proposalId 5 persisted) + execute fails
+    expect(archive.records[0].proposalId).toBe("5");
+    expect(archive.records[0].queueTx).toBeDefined();
+    expect(archive.records[0].executeTx).toBeUndefined();
+
+    await svc.tick(); // within cooldown → suppressed; the carried proposalId MUST survive
+    expect(archive.records[0].proposalId).toBe("5"); // not clobbered to null
+    expect(archive.records[0].queueTx).toBeDefined(); // queue marker also preserved
+  });
+
+  it("Codex-High: after the violationBlock advances, a resume REUSES the coarse pending proposalId (no per-cooldown orphan)", async () => {
+    // proofHash carries violationBlock, so a sustained violation gets a NEW proofHash each finalized-
+    // block advance. The archived-proof reuse (keyed by proofHash) then misses the prior proposal — but
+    // the COARSE (operator|rule) pending-proposal map still holds it, so a later-block resume reuses it
+    // instead of filing a fresh orphan proposal every cooldown window.
+    const archive = makeArchive();
+    let vblock = 1000;
+    let pending = false;
+    let creates = 0;
+    const blockchain = overLimitBlockchain({
+      isSlashPending: async () => pending,
+      queueSlashWithProof: async () => {
+        pending = true;
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => {
+        creates++;
+        return { txHash: "0xP", proposalId: 8n };
+      },
+      executeSlashWithProof: async () => {
+        throw new Error("execute keeps failing across cooldown windows");
+      },
+    });
+    blockchain.getBlockNumber = async () => vblock; // getViolationBlock delegates to this
+    let now = 1_700_000_000_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 20_000 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+
+    await svc.tick(); // block 1000: clear → queue + create (proposal 8) + execute fails
+    expect(creates).toBe(1);
+
+    vblock = 1005; // finalized violationBlock advanced → a NEW proofHash next tick
+    now += 25_000; // past cooldown
+    await svc.tick(); // pending → resume; archived proof for the NEW proofHash is absent, but the
+    // coarse map still holds proposal 8 → REUSED (skip createProposal), execute retried
+    expect(creates).toBe(1); // still 1 — no per-cooldown-window orphan proposal
+  });
+
+  it("Codex-High: a healthy observation clears the coarse pending proposalId — a later pending re-offense files a FRESH proposal (no stale reuse)", async () => {
+    // Stale-id poisoning: node files proposal 3, execute fails (pending id = 3). The operator later
+    // goes HEALTHY (episode over) then RE-OFFENDS and is pending again on a NEW block. The pending id
+    // must have been cleared on the healthy reset, so the resume files a FRESH proposal instead of
+    // reusing the dead id 3 (which would only staticCall-revert and churn retries).
+    const archive = makeArchive();
+    let overLimit = true;
+    let pending = false;
+    let vblock = 1000;
+    let creates = 0;
+    const ids = [3n, 7n];
+    const blockchain = overLimitBlockchain({
+      getDebt: async () => (overLimit ? 400n : 0n),
+      getCreditLimit: async () => 300n,
+      getAvailableCredit: async () => (overLimit ? 0n : 300n),
+      getRecentSlashExecuted: async () => false,
+      isSlashPending: async () => pending,
+      queueSlashWithProof: async () => {
+        pending = true;
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => ({ txHash: "0xP", proposalId: ids[creates++] }),
+      executeSlashWithProof: async () => {
+        throw new Error("execute fails");
+      },
+    });
+    blockchain.getBlockNumber = async () => vblock;
+    let now = 1_700_000_000_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 20_000 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+
+    await svc.tick(); // over-limit: queue + create(3) + execute fails → pending id = 3
+    expect(creates).toBe(1);
+
+    overLimit = false; // HEALTHY → clearCoarseSlashed drops the pending id
+    pending = false;
+    vblock = 1001;
+    now += 25_000;
+    await svc.tick();
+
+    overLimit = true; // RE-OFFENSE on a NEW block, already pending on-chain (peer queued) → resume
+    pending = true;
+    vblock = 1002;
+    now += 25_000;
+    await svc.tick();
+    expect(creates).toBe(2); // FRESH proposal (7) filed — the stale id 3 was cleared, not reused
+  });
+
+  it("Codex-High: a peer completing the slash DURING cooldown is learned in-window → no double-slash after the event scrolls out", async () => {
+    // The cooldown must throttle the ATTEMPT, not LEARNING. This node attempts, backs off; a peer
+    // executes during the backoff. If assessSlashState were skipped throughout cooldown, the peer's
+    // SlashExecuted/OperatorSlashed would scroll out of the head-window before the next scan and this
+    // node would file a SECOND slash for the same sustained violation. Scanning during cooldown (while
+    // in-flight) records the durable marker while the event is still in-window → no double-slash.
+    const archive = makeArchive();
+    let curBlock = 1000;
+    let peerExecBlock: number | null = null;
+    let queues = 0;
+    const blockchain = overLimitBlockchain({
+      // Model the head-window: the peer's executed event is visible only within lookback (9) blocks.
+      getRecentSlashExecuted: async () => peerExecBlock !== null && curBlock - peerExecBlock <= 9,
+      isSlashPending: async () => false,
+      queueSlashWithProof: async () => {
+        queues++;
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => ({ txHash: "0xP", proposalId: 4n }),
+      executeSlashWithProof: async () => {
+        throw new Error("this node's execute fails");
+      },
+    });
+    blockchain.getBlockNumber = async () => curBlock;
+    let now = 1_700_000_000_000;
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true, auditCooldownMs: 20_000, auditSlashLookbackBlocks: 9 }),
+      archive,
+      () => now,
+      makeCoSigner()
+    );
+
+    await svc.tick(); // block 1000: this node queues (1) + create + execute fails → in-flight, cooldown set
+    expect(queues).toBe(1);
+
+    // A PEER executes at block 1002, still within this node's cooldown → the in-flight scan records the
+    // durable marker WHILE the event is in-window.
+    peerExecBlock = 1002;
+    curBlock = 1002;
+    now += 5_000; // within cooldown
+    await svc.tick();
+
+    // The event scrolls OUT of the window and cooldown expires. The durable marker prevents a fresh slash.
+    curBlock = 1020;
+    now += 25_000;
+    await svc.tick();
+    expect(queues).toBe(1); // still 1 — no double-slash even though the peer's event is now out-of-window
+  });
+
+  it("Codex-Critical: a RESTARTED process (empty in-memory retry state) resumes an archived incomplete slash via on-chain pending", async () => {
+    // The full crash-restart hole: process A queues (pending on-chain) then dies before execute. A
+    // FRESH process B — empty coSignRetryKeys / cooldown / proposedStableKeys — sharing only the
+    // durable archive must NOT be short-circuited by archive.has; it re-assesses on-chain pending and
+    // RESUMES. (The archive.has fast-skip only applies to a COMPLETED archived slash.)
+    const archive = makeArchive(); // durable, SHARED across the two process lifetimes
+    let pending = false;
+    let executeAttempts = 0;
+    const blockchain = overLimitBlockchain({
+      getRecentSlashExecuted: async () => false,
+      isSlashPending: async () => pending,
+      queueSlashWithProof: async () => {
+        pending = true; // queue pre-flag now set on-chain (survives the "crash")
+        return "0xQUEUE";
+      },
+      createProposalWithEvidence: async () => ({ txHash: "0xP", proposalId: 9n }),
+      executeSlashWithProof: async () => {
+        executeAttempts++;
+        if (executeAttempts === 1) throw new Error("execute reverted, then the process crashed");
+        return "0xEXECUTETX";
+      },
+    });
+
+    // Process lifetime 1: queue + create land (proposalId durably persisted), execute fails → the
+    // archive holds an INCOMPLETE proof (queueTx set, executeTx unset).
+    const svcA = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svcA.tick();
+    expect(archive.records).toHaveLength(1);
+    expect(archive.records[0].queueTx).toBeDefined();
+    expect(archive.records[0].executeTx).toBeUndefined();
+
+    // Process lifetime 2 (RESTART): a brand-new service instance (fresh in-memory maps) on the same
+    // durable archive. It must resume to completion, NOT permanently skip on archive.has.
+    const svcB = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      archive,
+      undefined,
+      makeCoSigner()
+    );
+    await svcB.tick();
+    expect(executeAttempts).toBe(2); // svcB completed the slash the crashed svcA left pending
+    expect(archive.records[0].executeTx).toBe("0xEXECUTETX");
   });
 
   // ── FINDING 5: archive-before-execute ordering (durable intent precedes the slash) ──
@@ -1205,6 +1544,9 @@ describe("AuditService", () => {
       },
       async has(proofHash: string) {
         return records.some(r => r.proofHash === proofHash);
+      },
+      async get(proofHash: string) {
+        return records.find(r => r.proofHash === proofHash) ?? null;
       },
       async count() {
         return records.length;
@@ -1323,13 +1665,34 @@ describe("AuditService", () => {
     expect(archive.records[0].proposalIdNote).toMatch(/over-slash guard/);
   });
 
-  it("HIGH: an INDETERMINATE scan but a KNOWN pending flag (false) still lets the slash proceed", async () => {
-    // Only ONE of the two signals is indeterminate → we still have an authoritative signal, so the
-    // fail-closed backstop does NOT fire and the armed path slashes normally.
+  it("Codex-Critical: an INDETERMINATE executed-scan fails CLOSED even when pending=false (pending≠proof-of-un-slashed)", async () => {
+    // A `pending === false` does NOT prove "never slashed" — a COMPLETED slash also clears
+    // _pendingSlash. So if the executed-event scan is indeterminate (null), we cannot rule out a
+    // prior slash and must NOT fire another. "blocked" → skip. (The old code let pending=false unblock
+    // this and could double-slash.)
     const order: string[] = [];
     const blockchain = recordingBlockchain(order, {
-      getRecentSlashExecuted: async () => null,
-      isSlashPending: async () => false,
+      getRecentSlashExecuted: async () => null, // executed scan INDETERMINATE
+      isSlashPending: async () => false, // determinate "not currently pending" — but that ≠ "not slashed"
+    });
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditExecuteSlash: true }),
+      makeArchive(),
+      undefined,
+      makeCoSigner()
+    );
+    await svc.tick();
+    expect(order).toEqual([]); // fail-closed: NO slash on an unreadable executed-scan
+  });
+
+  it("a DETERMINATE 'not executed' scan with pending unknown (null) still slashes (only pending was flaky)", async () => {
+    // The inverse: the executed scan is DETERMINATE (false = definitively not slashed) and only the
+    // pending reconstruction is indeterminate → we DO have proof it was not executed, so slash.
+    const order: string[] = [];
+    const blockchain = recordingBlockchain(order, {
+      getRecentSlashExecuted: async () => false, // determinate: not executed
+      isSlashPending: async () => null, // pending reconstruction unavailable
     });
     const svc = makeService(
       blockchain,
@@ -1361,6 +1724,9 @@ describe("AuditService", () => {
       },
       async has(proofHash: string) {
         return records.some(r => r.proofHash === proofHash);
+      },
+      async get(proofHash: string) {
+        return records.find(r => r.proofHash === proofHash) ?? null;
       },
       async count() {
         return records.length;
@@ -1624,6 +1990,9 @@ describe("AuditService", () => {
       },
       async has(proofHash: string) {
         return records.some(r => r.proofHash === proofHash);
+      },
+      async get(proofHash: string) {
+        return records.find(r => r.proofHash === proofHash) ?? null;
       },
       async count() {
         return records.length;

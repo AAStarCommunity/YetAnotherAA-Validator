@@ -83,6 +83,89 @@ describe("BlockchainService.getRecentSlashExecuted", () => {
 });
 
 /**
+ * isSlashPending reconstructs the operator's pending-slash flag from SP events (SlashQueued sets,
+ * SlashCancelled/OperatorSlashed clear) — SP exposes no getter (EIP-170). pending == the LATEST such
+ * event (by blockNumber, then logIndex) is SlashQueued. Verifies the ordering + fail-closed nulls.
+ */
+describe("BlockchainService.isSlashPending (event reconstruction)", () => {
+  const PENDING_IFACE = new ethers.Interface([
+    "event SlashQueued(address indexed operator)",
+    "event SlashCancelled(address indexed operator)",
+    "event OperatorSlashed(address indexed operator, uint256 amount, uint8 level)",
+  ]);
+  const TOPIC: Record<string, string> = {
+    SlashQueued: PENDING_IFACE.getEvent("SlashQueued")!.topicHash,
+    SlashCancelled: PENDING_IFACE.getEvent("SlashCancelled")!.topicHash,
+    OperatorSlashed: PENDING_IFACE.getEvent("OperatorSlashed")!.topicHash,
+  };
+  function pLog(name: string, operator: string, blockNumber: number, index: number) {
+    const opTopic = ethers.zeroPadValue(ethers.getAddress(operator), 32);
+    return { topics: [TOPIC[name], opTopic], data: "0x", blockNumber, index };
+  }
+  /** getLogs dispatches on the requested topics[0] (isSlashPending queries each event type once). */
+  function pendingService(
+    pool: ReturnType<typeof pLog>[],
+    getBlockNumber: () => Promise<number> = async () => 1000
+  ) {
+    return makeService(
+      async (filter: any) => pool.filter(l => l.topics[0] === filter.topics[0]),
+      getBlockNumber
+    );
+  }
+
+  it("only SlashQueued in window → pending (true)", async () => {
+    const svc = pendingService([pLog("SlashQueued", OPERATOR, 100, 0)]);
+    expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBe(true);
+  });
+
+  it("SlashQueued then a LATER OperatorSlashed (BLS or owner-manual clear) → not pending (false)", async () => {
+    const svc = pendingService([
+      pLog("SlashQueued", OPERATOR, 100, 0),
+      pLog("OperatorSlashed", OPERATOR, 102, 0),
+    ]);
+    expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBe(false);
+  });
+
+  it("SlashQueued then a LATER SlashCancelled → not pending (false)", async () => {
+    const svc = pendingService([
+      pLog("SlashQueued", OPERATOR, 100, 0),
+      pLog("SlashCancelled", OPERATOR, 101, 3),
+    ]);
+    expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBe(false);
+  });
+
+  it("re-queued after a clear (SlashQueued is latest by logIndex in the SAME block) → pending (true)", async () => {
+    const svc = pendingService([
+      pLog("SlashCancelled", OPERATOR, 200, 1),
+      pLog("SlashQueued", OPERATOR, 200, 4), // same block, higher logIndex → latest
+    ]);
+    expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBe(true);
+  });
+
+  it("no events in window → not pending (false), determinate", async () => {
+    const svc = pendingService([]);
+    expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBe(false);
+  });
+
+  it("fail-closed: a getLogs error returns null (INDETERMINATE), never false", async () => {
+    const svc = makeService(async () => {
+      throw new Error("RPC range too wide");
+    });
+    expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBeNull();
+  });
+
+  it("fail-closed: a getBlockNumber error returns null (INDETERMINATE)", async () => {
+    const svc = makeService(
+      async () => [],
+      async () => {
+        throw new Error("head unavailable");
+      }
+    );
+    expect(await svc.isSlashPending(CONTRACT, OPERATOR, 500)).toBeNull();
+  });
+});
+
+/**
  * Cross-repo interface lock for the owner-auth gate (airaccount-contract AAStarAirAccountV7).
  * The magic value the DVT gate checks MUST equal the function selector of the delegated view —
  * if airaccount ever changes this interface, updating OWNER_AUTH_FN/OWNER_AUTH_MAGIC/OWNER_AUTH_ABI
