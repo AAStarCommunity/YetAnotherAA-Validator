@@ -1000,6 +1000,20 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       );
       return;
     }
+    // CLOCK-SANITY gate (Codex High-2) — lastSeen is stamped with THIS node's wall clock (Date.now at
+    // heartbeat), but the deadline is chain time. A local clock running BEHIND the (already-past,
+    // finalized) evidence block is broken and would age every heartbeat too far into the past → FALSE
+    // offline. If our clock is earlier than a block that has already finalized, refuse to trust local
+    // timestamps this tick (fail-safe skip). (A clock running AHEAD only SUPPRESSES offline — safe.)
+    // NB: because the block is FINALIZED (~finality lag behind head), the EFFECTIVE offline window is
+    // (finality lag + offlineThresholdMs) — deliberately conservative, which also absorbs sub-lag skew.
+    if (this.clock() < blockTsSec * 1000) {
+      this.logger.warn(
+        `Audit: offline SKIP for ${operator} — local clock (${this.clock()}) is behind the finalized ` +
+          `evidence block time (${blockTsSec * 1000}); refusing to trust local liveness timestamps`
+      );
+      return;
+    }
     const deadlineMs = blockTsSec * 1000 - this.offlineThresholdMs;
 
     if (lastSeen >= deadlineMs) {
@@ -1797,12 +1811,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     const armed =
       this.executeSlash && !fileOnlyRule && (await this.confirmSlashableAtBlock(operator, epoch));
     if (this.executeSlash && !armed && !fileOnlyRule) {
-      this.logger.warn(
-        `Audit: ${operator} armed slash WITHHELD — derived-only operator not confirmed as an ` +
-          `audited-role member at evidence block ${epoch}; filing proposal only`
-      );
-    }
-    if (this.executeSlash && !armed) {
       this.logger.warn(
         `Audit: ${operator} armed slash WITHHELD — derived-only operator not confirmed as an ` +
           `audited-role member at evidence block ${epoch}; filing proposal only`

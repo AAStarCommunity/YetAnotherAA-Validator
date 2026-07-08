@@ -30,6 +30,9 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * number of distinct nodes ever seen (the small DVT fleet). Read via getLastSeen(nodeId).
    */
   private lastSeenLedger = new Map<string, number>();
+  /** Hard cap on the liveness ledger — bounds a spoofed-heartbeat flood (Codex High-1). ≫ any real
+   *  DVT fleet; a NEW nodeId past this is rejected (existing entries are never evicted). */
+  private static readonly MAX_LIVENESS_LEDGER = 4096;
   private connections = new Map<string, WebSocket>();
   private nodeState: NodeState;
   private messageHistory = new Map<string, MessageHistory>();
@@ -558,7 +561,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     const peerId = message.from;
     // Record liveness in the never-cleaned ledger for the offline-audit rule, even for a peer not
     // (yet) in the connection map — a heartbeat IS proof of life regardless of connection state.
-    if (peerId) this.lastSeenLedger.set(peerId, Date.now());
+    this.recordLiveness(peerId);
     const peer = this.peers.get(peerId);
 
     if (peer) {
@@ -566,6 +569,29 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
       peer.status = "active";
       peer.heartbeatCount++;
     }
+  }
+
+  /**
+   * Record a nodeId's liveness (offline-audit rule ②), HARDENED against a hostile peer (Codex High-1):
+   *   • SHAPE gate — only a well-formed nodeId (0x + 64 hex = keccak256 = 32 bytes, the gen-node-state
+   *     / registerWithProof format) is accepted, so non-conforming garbage is dropped cheaply.
+   *   • SIZE cap — a NEW nodeId is rejected once the ledger is full, so a flood of distinct spoofed
+   *     `from` values cannot grow the map without bound (OOM). Existing entries (incl. the offline
+   *     evidence we care about) are NEVER evicted — updates to a known nodeId always apply.
+   * NOTE (inc-1 is FILE-ONLY, no real slash): `from` is NOT yet cryptographically authenticated, so a
+   * peer can still spoof a KNOWN victim nodeId's heartbeat to keep it looking "online" (SUPPRESS an
+   * offline detection — it cannot FORGE an offline one). Before the offline rule can gate a REAL slash
+   * (inc-2), heartbeats MUST be signed by the BLS key whose pubkey hashes to nodeId.
+   */
+  private recordLiveness(nodeId: string): void {
+    if (!nodeId || !/^0x[0-9a-fA-F]{64}$/.test(nodeId)) return;
+    if (
+      !this.lastSeenLedger.has(nodeId) &&
+      this.lastSeenLedger.size >= GossipService.MAX_LIVENESS_LEDGER
+    ) {
+      return; // ledger full + a NEW nodeId → reject (never evict existing offline evidence)
+    }
+    this.lastSeenLedger.set(nodeId, Date.now());
   }
 
   /**

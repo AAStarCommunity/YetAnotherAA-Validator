@@ -217,7 +217,12 @@ function stableStringify(value: unknown): string {
     return "[" + value.map(stableStringify).join(",") + "]";
   }
   const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
+  // Drop undefined-valued keys so a future OPTIONAL identity field that is present-but-undefined can
+  // never serialize as the literal string "undefined" (which would silently change a content-address).
+  // An absent key and a `key: undefined` therefore hash IDENTICALLY (Codex Low-1).
+  const keys = Object.keys(obj)
+    .filter(k => obj[k] !== undefined)
+    .sort();
   return "{" + keys.map(k => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",") + "}";
 }
 

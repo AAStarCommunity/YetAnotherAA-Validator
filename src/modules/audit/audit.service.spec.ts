@@ -2634,6 +2634,26 @@ describe("AuditService", () => {
       expect(hashA).toBe(hashB); // content-address excludes lastSeen → identical
     });
 
+    it("SKIPS offline when the local clock is behind the finalized block (slow-clock guard, Codex High-2)", async () => {
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => NODE_ID,
+        getBlockTimestamp: async () => 1_700_000_000, // block time = 1_700_000_000_000ms
+      });
+      const archive = makeArchive();
+      // Local clock EARLIER than the finalized block time → broken/slow clock → refuse to trust
+      // local liveness timestamps, even though lastSeen is "offline"-old.
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        archive,
+        clockAt(1_699_999_999_000), // 1s before the finalized block
+        undefined,
+        makeGossip(OFFLINE_LAST_SEEN)
+      );
+      await svc.tick();
+      expect(archive.records.find(r => r.evidence.rule === "offline")).toBeUndefined();
+    });
+
     it("is FILE-ONLY even when armed (executeSlash) — no queue/execute for offline in inc-1", async () => {
       let queued = false;
       const blockchain = makeBlockchain({
