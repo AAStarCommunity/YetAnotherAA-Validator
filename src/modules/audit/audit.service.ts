@@ -9,6 +9,7 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { BlockchainService, DRY_RUN_TX_SENTINEL } from "../blockchain/blockchain.service.js";
+import { GossipService } from "../gossip/gossip.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 import type { IProofArchive, SlashProof, EvidenceSource, ProofIdentity } from "./proof-archive.js";
 import { LocalProofArchive, computeProofHash, PROOF_SCHEMA_VERSION } from "./proof-archive.js";
@@ -50,6 +51,13 @@ import {
  */
 const SLASH_LEVEL_CREDIT_OVER_LIMIT = SlashLevel.MINOR;
 const RULE_CREDIT_OVER_LIMIT = "credit-over-limit";
+/**
+ * Rule ② offline detection. WARNING (=0) — the lowest severity (2-of-3 quorum in the N=3 bootstrap):
+ * a node being offline is a recoverable operational fault, not malice, so it carries the lightest
+ * penalty. Cleared when the operator is next seen online.
+ */
+const SLASH_LEVEL_OFFLINE = SlashLevel.WARNING;
+const RULE_OFFLINE = "offline";
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
 
@@ -117,6 +125,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly roleUseGetter: boolean;
   /** A derived-ONLY operator is not slashed once the last success is older than this (Codex High-2). */
   private readonly roleMaxStaleMs: number;
+  /** Rule ② offline detection — opt-in; audits gossip liveness of the watched operators. */
+  private readonly offlineEnabled: boolean;
+  /** Continuous-offline threshold (ms): OFFLINE = lastSeen older than block.ts − this. */
+  private readonly offlineThresholdMs: number;
+  /** Liveness source (GossipService.getLastSeen); null when gossip isn't wired → offline self-disables. */
+  private readonly gossip: GossipService | null;
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
   private derivedOperators: string[] = [];
   /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
@@ -234,7 +248,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     /** Test seam: injectable archive; defaults to a LocalProofArchive at auditProofDir. */
     @Optional() archive?: IProofArchive,
     /** Injected quorum co-signer; defaults to the deferred PendingSlotCoSigner (fails closed). */
-    @Optional() @Inject(QUORUM_COSIGNER) coSigner?: IQuorumCoSigner
+    @Optional() @Inject(QUORUM_COSIGNER) coSigner?: IQuorumCoSigner,
+    /** Liveness source for the offline rule (getLastSeen). Wired to GossipService; optional so a
+     *  deployment/test without gossip simply can't run the offline rule (it self-disables). */
+    @Optional() gossip?: GossipService
   ) {
     this.enabled = config.get<boolean>("auditEnabled") === true;
     this.intervalMs = config.get<number>("auditIntervalMs") ?? 60_000;
@@ -277,6 +294,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.roleRefreshMs = config.get<number>("auditRoleRefreshMs") ?? 300_000;
     this.roleUseGetter = config.get<boolean>("auditRoleUseGetter") === true;
     this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
+    this.offlineEnabled = config.get<boolean>("auditOfflineEnabled") === true;
+    this.offlineThresholdMs = config.get<number>("auditOfflineThresholdMs") ?? 600_000;
+    this.gossip = gossip ?? null;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
     this.archive =
@@ -630,6 +650,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           this.logger.error(`Audit: ${operator} audit failed — ${msg}`);
           this.emitAuditEvent("ERROR", { operator, error: msg });
         }
+        // Rule ② offline — independent of the credit rule: one rule's failure must not skip the other.
+        if (this.offlineEnabled) {
+          try {
+            await this.auditOfflineForOperator(operator, pinnedBlock);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.logger.error(`Audit: ${operator} offline audit failed — ${msg}`);
+            this.emitAuditEvent("ERROR", { operator, error: msg });
+          }
+        }
       }
     } finally {
       this.tickInFlight = false;
@@ -930,6 +960,118 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
+   * Rule ② offline detection (inc-1) for ONE operator, pinned to the same finalized block as the
+   * credit sweep. Bridges the on-chain slash target (operator) to off-chain liveness:
+   *   operator → BLSAggregator.getBLSPublicKey → nodeId=keccak256(EIP-2537 key) → gossip getLastSeen.
+   * OFFLINE ⇔ this node last heard the nodeId's heartbeat MORE than offlineThresholdMs before the
+   * finalized block's ON-CHAIN timestamp (a globally-consistent deadline — every DVT node computes the
+   * SAME deadline from the SAME block, so the content-address is deterministic). The proof carries NO
+   * per-node data (no lastSeen), only (operator, block, threshold), so all nodes reproduce the same
+   * proofHash. inc-1 files a proposal + archives the proof; the armed BLS co-sign is inc-2.
+   *
+   * Fail-SAFE at every uncertainty: offline disabled, no gossip/aggregator, operator holds no active
+   * slot, NEVER-seen node (no lastSeen → can't prove offline-since-T), or an unreadable block → SKIP
+   * (never fabricate an offline violation). A healthy (online) read CLEARS any coarse slashed marker.
+   */
+  private async auditOfflineForOperator(
+    operator: string,
+    pinnedBlock: { number: number; hash: string }
+  ): Promise<void> {
+    if (!this.offlineEnabled || !this.gossip || !this.blsAggregatorAddress) return;
+
+    const nodeId = await this.blockchainService.getOperatorNodeId(
+      this.blsAggregatorAddress,
+      operator
+    );
+    if (!nodeId) return; // operator holds no ACTIVE BLS slot → nothing to bind/slash
+
+    const lastSeen = this.gossip.getLastSeen(nodeId);
+    if (lastSeen === null) return; // never observed → cannot prove "offline since T" (fail-safe)
+
+    // Deadline anchored to the finalized block's ON-CHAIN timestamp (seconds → ms), NOT wall-clock,
+    // so every node computes the same threshold. A read failure fails safe (skip this operator).
+    let blockTsSec: number;
+    try {
+      blockTsSec = await this.blockchainService.getBlockTimestamp(pinnedBlock.number);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(
+        `Audit: offline block-timestamp read failed for block ${pinnedBlock.number} (${msg})`
+      );
+      return;
+    }
+    // CLOCK-SANITY gate (Codex High-2) — lastSeen is stamped with THIS node's wall clock (Date.now at
+    // heartbeat), but the deadline is chain time. A local clock running BEHIND the (already-past,
+    // finalized) evidence block is broken and would age every heartbeat too far into the past → FALSE
+    // offline. If our clock is earlier than a block that has already finalized, refuse to trust local
+    // timestamps this tick (fail-safe skip). (A clock running AHEAD only SUPPRESSES offline — safe.)
+    // NB: because the block is FINALIZED (~finality lag behind head), the EFFECTIVE offline window is
+    // (finality lag + offlineThresholdMs) — deliberately conservative, which also absorbs sub-lag skew.
+    if (this.clock() < blockTsSec * 1000) {
+      this.logger.warn(
+        `Audit: offline SKIP for ${operator} — local clock (${this.clock()}) is behind the finalized ` +
+          `evidence block time (${blockTsSec * 1000}); refusing to trust local liveness timestamps`
+      );
+      return;
+    }
+    const deadlineMs = blockTsSec * 1000 - this.offlineThresholdMs;
+
+    if (lastSeen >= deadlineMs) {
+      // ONLINE (or within the threshold) — the operator is live; clear any prior offline marker so a
+      // future genuine offline can slash again, and stop.
+      await this.clearCoarseSlashed(operator, RULE_OFFLINE);
+      return;
+    }
+
+    // OFFLINE violation. DETERMINISTIC identity — no lastSeen (would diverge across observers).
+    const identity: ProofIdentity = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
+      chainId: this.chainId,
+      operator,
+      rule: RULE_OFFLINE,
+      violationBlock: pinnedBlock.number,
+      slashLevel: SLASH_LEVEL_OFFLINE,
+      registry: this.normalizeAddress(this.registryAddress),
+      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
+      offlineThresholdMs: this.offlineThresholdMs,
+      blsAggregator: this.normalizeAddress(this.blsAggregatorAddress),
+    };
+    const offlineForMs = blockTsSec * 1000 - lastSeen;
+    const reason =
+      `${RULE_OFFLINE}: nodeId ${nodeId} last heartbeat ${offlineForMs}ms before finalized block ` +
+      `${pinnedBlock.number} (> threshold ${this.offlineThresholdMs}ms)`;
+    this.logger.warn(reason);
+    // observedAt / lastSeen are HUMAN-only forensics in `sources` (excluded from the content-address).
+    const sources: EvidenceSource[] = [
+      {
+        type: "view",
+        name: "gossip.getLastSeen(nodeId)",
+        value: `${lastSeen} (nodeId ${nodeId})`,
+        block: pinnedBlock.number,
+      },
+      {
+        type: "view",
+        name: "block.timestamp",
+        value: `${blockTsSec}s`,
+        block: pinnedBlock.number,
+      },
+    ];
+    await this.handleViolation({
+      operator,
+      slashLevel: SLASH_LEVEL_OFFLINE,
+      reason,
+      rule: RULE_OFFLINE,
+      violationBlock: pinnedBlock.number,
+      violationBlockHash: pinnedBlock.hash,
+      sources,
+      observedAt: this.clock(),
+      identity,
+      observed: `offline ${offlineForMs}ms`,
+      threshold: `${this.offlineThresholdMs}ms`,
+    });
+  }
+
+  /**
    * Best-effort operator debt read (block-pinned). Per the verified SP ABI, debt lives on the
    * xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT SuperPaymaster/Registry — so this reads the
    * aPNTs token directly. Returns null when the token's getDebt reverts / is absent — the caller
@@ -1076,13 +1218,22 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     slashLevel: number;
     reason: string;
     rule: string;
-    creditLimit: bigint;
-    availableCredit: bigint;
-    debt: bigint;
+    // credit-over-limit rule inputs — present on the credit path (used to build its identity inline).
+    creditLimit?: bigint;
+    availableCredit?: bigint;
+    debt?: bigint;
     violationBlock: number;
     violationBlockHash: string;
     sources: EvidenceSource[];
     observedAt: number;
+    // A pre-built content-address identity (rule ② offline). When provided it is used VERBATIM; when
+    // absent the credit-over-limit identity is built inline from creditLimit/availableCredit/debt so
+    // the credit path's proofHash is unchanged.
+    identity?: ProofIdentity;
+    // Human-readable evidence strings for the archived SlashProof (rule-generic). When absent the
+    // credit path's debt/creditLimit are used, so its archived evidence is unchanged.
+    observed?: string;
+    threshold?: string;
   }): Promise<AuditDetection | null> {
     // DETERMINISTIC slash epoch = the violationBlock (an on-chain fact). Two DVT nodes observing
     // the SAME violation derive the SAME epoch, so their queue/execute co-sign preimages match and
@@ -1093,15 +1244,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     const proposer = this.blockchainService.getWalletAddress() ?? ethers.ZeroAddress;
 
     // Content-address IDENTITY = ON-CHAIN facts only (no wall-clock). Two DVT nodes seeing
-    // the same violation at the same block derive the same proofHash + proposalId.
-    const identity: ProofIdentity = {
+    // the same violation at the same block derive the same proofHash + proposalId. The offline rule
+    // passes a pre-built identity; the credit rule builds its (unchanged) identity inline.
+    const identity: ProofIdentity = v.identity ?? {
       proofSchemaVersion: PROOF_SCHEMA_VERSION,
       chainId: this.chainId,
       operator: v.operator,
       rule: v.rule,
-      creditLimit: v.creditLimit.toString(),
-      availableCredit: v.availableCredit.toString(),
-      debt: v.debt.toString(),
+      creditLimit: v.creditLimit!.toString(),
+      availableCredit: v.availableCredit!.toString(),
+      debt: v.debt!.toString(),
       violationBlock: v.violationBlock,
       slashLevel: v.slashLevel,
       registry: this.normalizeAddress(this.registryAddress),
@@ -1170,8 +1322,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       messageHashNote: "pre-execution: proposalId not yet resolved",
       evidence: {
         rule: v.rule,
-        observed: v.debt.toString(),
-        threshold: v.creditLimit.toString(),
+        observed: v.observed ?? v.debt?.toString() ?? "",
+        threshold: v.threshold ?? v.creditLimit?.toString() ?? "",
         sources: v.sources,
         violationBlock: v.violationBlock,
         violationBlockHash: v.violationBlockHash,
@@ -1291,6 +1443,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           reason: v.reason,
           epoch,
           evidenceHash: proofHash,
+          rule: v.rule,
         },
         proof,
         resume,
@@ -1612,6 +1765,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       reason: string;
       epoch: number;
       evidenceHash: string;
+      /** Rule id — the offline rule (inc-1) is FILE-ONLY: no armed queue/execute yet (inc-2). */
+      rule?: string;
     },
     proof?: SlashProof,
     /**
@@ -1645,12 +1800,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
+    // Rule ② offline (inc-1) is FILE-ONLY: the armed BLS co-sign for offline (the responder re-checking
+    // its OWN gossip liveness) is inc-2, so the offline path never queues/executes — it only files a
+    // proposal + archives the proof. The credit rule is unaffected.
+    const fileOnlyRule = args.rule === RULE_OFFLINE;
     // A1#6 (Codex High-2 + round-3) — a derived-ONLY operator is armed for the irreversible on-chain
     // slash only when its membership is CONFIRMED at the evidence block (epoch) via hasRole — not just
     // the cached set's wall-clock freshness. Stale/never-confirmed/exited-by-epoch membership degrades
     // to file-only (proposal + archive, no queue/execute). Static-listed operators are always armed.
-    const armed = this.executeSlash && (await this.confirmSlashableAtBlock(operator, epoch));
-    if (this.executeSlash && !armed) {
+    const armed =
+      this.executeSlash && !fileOnlyRule && (await this.confirmSlashableAtBlock(operator, epoch));
+    if (this.executeSlash && !armed && !fileOnlyRule) {
       this.logger.warn(
         `Audit: ${operator} armed slash WITHHELD — derived-only operator not confirmed as an ` +
           `audited-role member at evidence block ${epoch}; filing proposal only`

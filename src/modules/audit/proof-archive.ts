@@ -167,14 +167,8 @@ export interface ProofIdentity {
   proofSchemaVersion: number;
   chainId: number;
   operator: string;
-  /** Rule id, e.g. "credit-over-limit". */
+  /** Rule id, e.g. "credit-over-limit" or "offline". */
   rule: string;
-  /** On-chain credit limit at violationBlock (stringified). */
-  creditLimit: string;
-  /** On-chain available credit at violationBlock (stringified) — the SP-enforced ceiling signal. */
-  availableCredit: string;
-  /** On-chain debt at violationBlock (stringified). */
-  debt: string;
   /**
    * Block all rule inputs were pinned to. Reorg-safety comes SOLELY from this being a FINALIZED
    * block (finding-2): a finalized block won't reorg, so the economic reads pinned to it are stable
@@ -184,14 +178,34 @@ export interface ProofIdentity {
   violationBlock: number;
   /** SP #329 SlashLevel bound into the slash preimages — part of the slash-critical identity. */
   slashLevel: number;
-  /** Registry the credit limit / reputation were read from (checksummed). */
+  /** Registry the role/limit/reputation were read from (checksummed). */
   registry: string;
-  /** SuperPaymaster the availableCredit was read from (checksummed). */
-  superPaymaster: string;
   /** DVTValidator the slash proposal/queue/execute target (checksummed). */
   dvtValidator: string;
+
+  // ── credit-over-limit rule fields (rule ①). OPTIONAL at the type level so the offline rule can
+  //    OMIT them; the credit path ALWAYS sets all five, so its serialized key set — and therefore its
+  //    proofHash — is byte-IDENTICAL to before this generalization (stableStringify skips absent keys,
+  //    so NO schema-version bump is needed and existing credit proofs still content-address the same).
+  /** On-chain credit limit at violationBlock (stringified). */
+  creditLimit?: string;
+  /** On-chain available credit at violationBlock (stringified) — the SP-enforced ceiling signal. */
+  availableCredit?: string;
+  /** On-chain debt at violationBlock (stringified). */
+  debt?: string;
+  /** SuperPaymaster the availableCredit was read from (checksummed). */
+  superPaymaster?: string;
   /** xPNTs token the operator debt was read from (checksummed). */
-  apntsToken: string;
+  apntsToken?: string;
+
+  // ── offline rule fields (rule ②). Present ONLY on offline proofs. NO per-node data (e.g. lastSeen)
+  //    is included — it would diverge across observers and break the content-address. The deadline is
+  //    fully derivable from violationBlock's on-chain timestamp minus offlineThresholdMs, so every
+  //    node reproduces the SAME proofHash for the SAME offline claim.
+  /** Continuous-offline threshold (ms) the deadline was computed with. */
+  offlineThresholdMs?: number;
+  /** BLSAggregator used to resolve operator → registered BLS key → gossip nodeId (checksummed). */
+  blsAggregator?: string;
 }
 
 /** Deterministic JSON with recursively sorted keys — a stable content-address preimage. */
@@ -203,7 +217,12 @@ function stableStringify(value: unknown): string {
     return "[" + value.map(stableStringify).join(",") + "]";
   }
   const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
+  // Drop undefined-valued keys so a future OPTIONAL identity field that is present-but-undefined can
+  // never serialize as the literal string "undefined" (which would silently change a content-address).
+  // An absent key and a `key: undefined` therefore hash IDENTICALLY (Codex Low-1).
+  const keys = Object.keys(obj)
+    .filter(k => obj[k] !== undefined)
+    .sort();
   return "{" + keys.map(k => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",") + "}";
 }
 
