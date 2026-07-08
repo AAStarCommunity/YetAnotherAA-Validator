@@ -44,16 +44,21 @@ function nodeIdFor(privHex: string): string {
 async function signedHeartbeat(
   privHex: string,
   authTs: number,
-  overrides: { from?: string; authSig?: string; publicKey?: string } = {}
+  overrides: { from?: string; messageFrom?: string; authSig?: string; publicKey?: string } = {}
 ): Promise<GossipMessage> {
   const pk = sigs.getPublicKey(privBytes(privHex));
+  // `from` = the nodeId the digest is SIGNED over; `messageFrom` = the (possibly differently-cased /
+  // spoofed) value placed in message.from. Default: both are the real nodeId.
   const from = overrides.from ?? nodeIdFor(privHex);
-  const digest = ethers.solidityPackedKeccak256(["bytes32", "uint256"], [from, authTs]);
+  const digest = ethers.solidityPackedKeccak256(
+    ["string", "bytes32", "uint256"],
+    ["YAA_HEARTBEAT_AUTH_V1", from, authTs]
+  );
   const msgPoint = await bls.G2.hashToCurve(ethers.getBytes(digest), { DST: BLS_DST });
   const sig = sigs.sign(msgPoint, privBytes(privHex));
   return {
     type: "heartbeat",
-    from: overrides.from ?? nodeIdFor(privHex),
+    from: overrides.messageFrom ?? overrides.from ?? nodeIdFor(privHex),
     data: {
       status: "active",
       auth: {
@@ -145,5 +150,31 @@ describe("GossipService heartbeat authentication (offline-audit rule ② inc-2)"
     await (svc as any).handleHeartbeatMessage(await signedHeartbeat(PRIV_A, NOW));
     expect((svc as any).peers.has(nid)).toBe(false);
     expect(svc.getLastSeen(nid)).toBe(NOW);
+  });
+
+  it("CANONICALIZES nodeId casing — an upper-cased message.from records ONE lowercase entry (Codex High)", async () => {
+    const svc = buildService();
+    const nid = nodeIdFor(PRIV_A); // lowercase keccak
+    // Same valid heartbeat but message.from is upper-cased — must collapse to the one canonical key,
+    // not create a second ledger entry (the casing-inflation attack).
+    await (svc as any).handleHeartbeatMessage(
+      await signedHeartbeat(PRIV_A, NOW, { messageFrom: nid.toUpperCase().replace("0X", "0x") })
+    );
+    expect((svc as any).lastSeenLedger.size).toBe(1);
+    expect(svc.getLastSeen(nid)).toBe(NOW);
+    expect(svc.getLastSeen(nid.toUpperCase().replace("0X", "0x"))).toBe(NOW); // case-insensitive read
+  });
+
+  it("registration gate: with a relevant set, an UNREGISTERED (Sybil) valid heartbeat is NOT recorded (Codex High)", async () => {
+    const svc = buildService();
+    const nidA = nodeIdFor(PRIV_A);
+    const nidB = nodeIdFor(PRIV_B);
+    svc.setRelevantNodeIds([nidA]); // only A is audited
+    // B is a genuine key-owner (valid sig) but NOT in the audited set → dropped before recording.
+    await (svc as any).handleHeartbeatMessage(await signedHeartbeat(PRIV_B, NOW));
+    expect(svc.getLastSeen(nidB)).toBeNull();
+    // A (in the set) IS recorded.
+    await (svc as any).handleHeartbeatMessage(await signedHeartbeat(PRIV_A, NOW));
+    expect(svc.getLastSeen(nidA)).toBe(NOW);
   });
 });

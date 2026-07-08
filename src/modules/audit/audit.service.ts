@@ -647,6 +647,25 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
         return;
       }
+      // Rule ② offline — resolve every audited operator to its gossip nodeId ONCE, and push the set to
+      // the gossip liveness ledger so it records ONLY these operators' heartbeats (Codex High: an
+      // authenticated-but-unregistered Sybil can't exhaust the capped ledger ahead of a real operator).
+      const offlineNodeIds = new Map<string, string>();
+      if (this.offlineEnabled && this.gossip && this.blsAggregatorAddress) {
+        for (const operator of operators) {
+          try {
+            const nid = await this.blockchainService.getOperatorNodeId(
+              this.blsAggregatorAddress,
+              operator
+            );
+            if (nid) offlineNodeIds.set(operator, nid);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.logger.debug(`Audit: offline nodeId resolve failed for ${operator} — ${msg}`);
+          }
+        }
+        this.gossip.setRelevantNodeIds(offlineNodeIds.values());
+      }
       for (const operator of operators) {
         try {
           await this.auditOperator(operator, pinnedBlock);
@@ -658,7 +677,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         // Rule ② offline — independent of the credit rule: one rule's failure must not skip the other.
         if (this.offlineEnabled) {
           try {
-            await this.auditOfflineForOperator(operator, pinnedBlock);
+            await this.auditOfflineForOperator(operator, pinnedBlock, offlineNodeIds.get(operator));
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             this.logger.error(`Audit: ${operator} offline audit failed — ${msg}`);
@@ -980,14 +999,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    */
   private async auditOfflineForOperator(
     operator: string,
-    pinnedBlock: { number: number; hash: string }
+    pinnedBlock: { number: number; hash: string },
+    preResolvedNodeId?: string
   ): Promise<void> {
     if (!this.offlineEnabled || !this.gossip || !this.blsAggregatorAddress) return;
 
-    const nodeId = await this.blockchainService.getOperatorNodeId(
-      this.blsAggregatorAddress,
-      operator
-    );
+    // Reuse the nodeId the tick already resolved (for the gossip relevant-set push) to avoid a second
+    // on-chain read; fall back to resolving here for a direct caller (tests).
+    const nodeId =
+      preResolvedNodeId ??
+      (await this.blockchainService.getOperatorNodeId(this.blsAggregatorAddress, operator));
     if (!nodeId) return; // operator holds no ACTIVE BLS slot → nothing to bind/slash
 
     const lastSeen = this.gossip.getLastSeen(nodeId);

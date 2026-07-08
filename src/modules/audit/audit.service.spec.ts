@@ -193,9 +193,10 @@ function clockAt(nowMs: number) {
   return () => nowMs;
 }
 
-/** Liveness mock for the offline rule (rule ②). getLastSeen returns a fixed epoch-ms (or null). */
+/** Liveness mock for the offline rule (rule ②). getLastSeen returns a fixed epoch-ms (or null);
+ *  setRelevantNodeIds is a no-op the tick calls to push the audited nodeId set. */
 function makeGossip(lastSeenMs: number | null): any {
-  return { getLastSeen: (_nodeId: string) => lastSeenMs };
+  return { getLastSeen: (_nodeId: string) => lastSeenMs, setRelevantNodeIds: (_ids: any) => {} };
 }
 
 function makeService(
@@ -2580,6 +2581,7 @@ describe("AuditService", () => {
           gossipCalled = true;
           return OFFLINE_LAST_SEEN;
         },
+        setRelevantNodeIds: (_ids: any) => {},
       };
       const svc = makeService(
         blockchain,

@@ -307,7 +307,15 @@ export default () => {
     // the fleet; see audit.service) before the finalized evidence block's on-chain timestamp (a
     // globally-consistent deadline, not local wall-clock). Slash level WARNING. Reuses
     // AUDIT_BLS_AGGREGATOR_ADDRESS to resolve operator → registered BLS key → nodeId.
-    auditOfflineEnabled: process.env.AUDIT_OFFLINE_ENABLED === "true",
+    auditOfflineEnabled: (() => {
+      if (process.env.AUDIT_OFFLINE_THRESHOLD_MS !== undefined) {
+        console.warn(
+          "⚠️  AUDIT_OFFLINE_THRESHOLD_MS is IGNORED — the offline threshold is now a version-bound " +
+            "constant (it enters the proofHash and must be identical fleet-wide). Remove the env var."
+        );
+      }
+      return process.env.AUDIT_OFFLINE_ENABLED === "true";
+    })(),
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,

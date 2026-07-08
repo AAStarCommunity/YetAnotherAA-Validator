@@ -37,10 +37,28 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    *  DVT fleet; a NEW nodeId past this is rejected (existing entries are never evicted). */
   private static readonly MAX_LIVENESS_LEDGER = 4096;
   /** Max clock skew (ms) a heartbeat's signed timestamp may lead this node's wall clock before it is
-   *  rejected as future-dated — bounds how far a node can post-date its own liveness. */
-  private static readonly MAX_HEARTBEAT_SKEW_MS = 120_000;
+   *  rejected as future-dated. Kept SMALL so a node can't buy meaningful extra offline grace by
+   *  post-dating; the recorded liveness is ALSO clamped to receive time (min(authTs, now)). */
+  private static readonly MAX_HEARTBEAT_SKEW_MS = 5_000;
+  /** Domain-separation tag folded into the heartbeat digest so a heartbeat signature can never be
+   *  replayed as any other protocol message (and vice-versa). Bump on any digest-layout change. */
+  private static readonly HEARTBEAT_AUTH_TAG = "YAA_HEARTBEAT_AUTH_V1";
+  /** Per-connection budget of BLS heartbeat verifications per window — bounds a verify-flood CPU DoS
+   *  (a legit peer sends 1 heartbeat/interval; this is generous). */
+  private static readonly HEARTBEAT_VERIFY_PER_CONN = 5;
+  private static readonly HEARTBEAT_VERIFY_WINDOW_MS = 10_000;
   /** Rate-limit (epoch ms) for the ledger-full warning so the log line itself can't be flooded (L-1). */
   private lastLedgerFullWarnAt = 0;
+  /** Per-ws BLS-verify throttle for inbound heartbeats (CPU-DoS guard). */
+  private heartbeatVerifyBudget = new Map<WebSocket, { count: number; windowStart: number }>();
+  /**
+   * The nodeIds whose liveness this node actually AUDITS (offline rule ②) — pushed by AuditService
+   * (the registered/watched operators, resolved to nodeIds). When non-empty, ONLY these nodeIds are
+   * recorded, so an authenticated but UNREGISTERED Sybil identity cannot exhaust the capped ledger
+   * ahead of a real operator (Codex High). Empty = record any authenticated nodeId (a node not
+   * running the auditor). All entries are lowercase-canonical.
+   */
+  private relevantNodeIds = new Set<string>();
   private connections = new Map<string, WebSocket>();
   private nodeState: NodeState;
   private messageHistory = new Map<string, MessageHistory>();
@@ -383,7 +401,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
         break;
 
       case "heartbeat":
-        void this.handleHeartbeatMessage(message).catch(e =>
+        void this.handleHeartbeatMessage(message, ws).catch(e =>
           console.warn(`heartbeat handling error: ${e instanceof Error ? e.message : String(e)}`)
         );
         break;
@@ -573,54 +591,119 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * auth verifies (inc-2 M-1) — a spoofed `from` can neither record nor suppress liveness. The SWIM
    * peer bookkeeping (mesh health) is unchanged and stays independent of the audit ledger.
    */
-  private async handleHeartbeatMessage(message: GossipMessage): Promise<void> {
+  private async handleHeartbeatMessage(message: GossipMessage, ws?: WebSocket): Promise<void> {
     const peerId = message.from;
     const auth = message.data?.auth;
-    if (auth && (await this.verifyHeartbeatAuth(peerId, auth))) {
-      // record the SIGNED timestamp (not Date.now()) — it is the value the signer committed to and
-      // the anti-replay monotonic key.
-      this.recordLiveness(peerId, auth.authTs);
-    }
+    // Update the SWIM peer bookkeeping (mesh health) regardless — it is a SEPARATE ledger from the
+    // slash-critical offline-audit ledger and stays best-effort/unauthenticated as before.
     const peer = this.peers.get(peerId);
     if (peer) {
       peer.lastSeen = new Date();
       peer.status = "active";
       peer.heartbeatCount++;
     }
-  }
-
-  /**
-   * Verify a heartbeat's BLS authentication (offline-audit rule ② inc-2). ALL of:
-   *   • the auth payload is well-formed and NOT future-dated beyond MAX_HEARTBEAT_SKEW_MS,
-   *   • the claimed pubkey HASHES to `from` — `keccak256(EIP-2537(pubkey)) === nodeId` — so a peer
-   *     cannot claim a nodeId it has no key for,
-   *   • the BLS signature verifies over `keccak256(nodeId | authTs)` under that pubkey.
-   * Returns false on any failure / when the BLS stack is absent (fail-safe: no record without proof).
-   * This makes a spoofed `from` useless: an attacker lacks the victim's key, so it can neither forge
-   * a fresh heartbeat nor (via the monotonic authTs in recordLiveness) replay an old one.
-   */
-  private async verifyHeartbeatAuth(
-    from: string,
-    auth: { publicKey?: unknown; authTs?: unknown; authSig?: unknown }
-  ): Promise<boolean> {
-    if (!this.blsService) return false;
+    // ── offline-audit ledger: ALL cheap gates run BEFORE the expensive BLS verify (CPU-DoS guard) ──
     if (
-      typeof auth?.publicKey !== "string" ||
-      typeof auth?.authSig !== "string" ||
-      typeof auth?.authTs !== "number" ||
+      !auth ||
+      typeof auth.authTs !== "number" ||
       !Number.isFinite(auth.authTs) ||
       auth.authTs <= 0
     ) {
-      return false;
+      return;
     }
-    if (auth.authTs > Date.now() + GossipService.MAX_HEARTBEAT_SKEW_MS) return false; // future-dated
-    if (!/^0x[0-9a-fA-F]{64}$/.test(from)) return false;
+    // canonical nodeId — lowercase so hex-casing variants can't create duplicate ledger identities
+    // (Codex High) nor miss the audit's keccak256 (lowercase) lookup.
+    const nodeId = typeof peerId === "string" ? peerId.toLowerCase() : "";
+    if (!/^0x[0-9a-f]{64}$/.test(nodeId)) return;
+    const now = Date.now();
+    if (auth.authTs > now + GossipService.MAX_HEARTBEAT_SKEW_MS) return; // future-dated → drop
+    // clamp the recorded time to receive time so a within-skew future timestamp buys NO offline grace;
+    // authTs is used only for the signature. recordLiveness re-clamps + enforces monotonicity.
+    const recordTs = Math.min(auth.authTs, now);
+    // MONOTONIC/stale precheck BEFORE verifying — a replay or stale heartbeat can't advance liveness,
+    // so there is no reason to pay a BLS verify for it (defeats the replay-flood CPU DoS).
+    const existing = this.lastSeenLedger.get(nodeId);
+    if (existing !== undefined && recordTs <= existing) return;
+    // registration gate + capacity: a NEW nodeId that isn't audited, or that overflows the cap, is
+    // dropped before verifying (Codex High: unregistered Sybil must not consume verify budget or cap).
+    if (existing === undefined) {
+      if (this.relevantNodeIds.size > 0 && !this.relevantNodeIds.has(nodeId)) return;
+      if (this.lastSeenLedger.size >= GossipService.MAX_LIVENESS_LEDGER) {
+        this.warnLedgerFull(nodeId);
+        return;
+      }
+    }
+    // per-connection verify budget — bounds a flood of fresh-authTs valid-shaped heartbeats.
+    if (!this.allowHeartbeatVerify(ws, now)) return;
+    // EXPENSIVE: BLS verify (last).
+    if (await this.verifyHeartbeatAuth(nodeId, auth)) {
+      this.recordLiveness(nodeId, recordTs);
+    }
+  }
+
+  /** Per-ws sliding-window budget for heartbeat BLS verifications (CPU-DoS guard). No ws (tests /
+   *  self-injected) → always allowed. */
+  private allowHeartbeatVerify(ws: WebSocket | undefined, now: number): boolean {
+    if (!ws) return true;
+    const b = this.heartbeatVerifyBudget.get(ws);
+    if (!b || now - b.windowStart >= GossipService.HEARTBEAT_VERIFY_WINDOW_MS) {
+      this.heartbeatVerifyBudget.set(ws, { count: 1, windowStart: now });
+      return true;
+    }
+    if (b.count >= GossipService.HEARTBEAT_VERIFY_PER_CONN) return false;
+    b.count++;
+    return true;
+  }
+
+  private warnLedgerFull(nodeId: string): void {
+    const now = Date.now();
+    if (now - this.lastLedgerFullWarnAt > 60_000) {
+      this.lastLedgerFullWarnAt = now;
+      console.warn(
+        `⚠️  liveness ledger FULL (${GossipService.MAX_LIVENESS_LEDGER}) — rejecting new nodeId ` +
+          `${nodeId.slice(0, 10)}…; a genuinely new operator would escape offline audit.`
+      );
+    }
+  }
+
+  /**
+   * Offline-audit rule ② — AuditService pushes the set of nodeIds it actually audits (its watched/
+   * registered operators, resolved to nodeIds) so the ledger only ever records THOSE, keeping an
+   * authenticated-but-unregistered Sybil from exhausting the cap (Codex High). Canonicalized lowercase.
+   */
+  setRelevantNodeIds(nodeIds: Iterable<string>): void {
+    const next = new Set<string>();
+    for (const n of nodeIds) if (typeof n === "string") next.add(n.toLowerCase());
+    this.relevantNodeIds = next;
+  }
+
+  /**
+   * Verify a heartbeat's BLS authentication (offline-audit rule ② inc-2). The caller has ALREADY run
+   * every cheap gate (shape, future-date, monotonic, registration, cap, per-conn budget); this does
+   * ONLY the expensive crypto:
+   *   • the claimed pubkey HASHES to the canonical `nodeId` — `keccak256(EIP-2537(pubkey)) === nodeId`
+   *     — so a peer cannot claim a nodeId it has no key for,
+   *   • the BLS signature verifies over the DOMAIN-SEPARATED digest keccak256(TAG | nodeId | authTs)
+   *     under that pubkey (the tag prevents any cross-protocol signature reuse).
+   * Returns false on any failure / when the BLS stack is absent (fail-safe: no record without proof).
+   */
+  private async verifyHeartbeatAuth(
+    nodeId: string,
+    auth: { publicKey?: unknown; authTs?: unknown; authSig?: unknown }
+  ): Promise<boolean> {
+    if (!this.blsService) return false;
+    if (typeof auth?.publicKey !== "string" || typeof auth?.authSig !== "string") return false;
+    const authTs = auth.authTs as number; // caller validated it is a finite positive number
     try {
       const pk = bls.G1.Point.fromHex(auth.publicKey.replace(/^0x/, ""));
-      // Bind the key to the claimed nodeId: nodeId = keccak256(EIP-2537 G1 pubkey).
+      // Bind the key to the claimed nodeId: nodeId = keccak256(EIP-2537 G1 pubkey). Compared against
+      // the already-lowercased nodeId (keccak256 output is lowercase).
       const derivedNodeId = ethers.keccak256(this.blsService.encodePublicKeyToEIP2537(pk));
-      if (derivedNodeId.toLowerCase() !== from.toLowerCase()) return false;
-      const digest = ethers.solidityPackedKeccak256(["bytes32", "uint256"], [from, auth.authTs]);
+      if (derivedNodeId.toLowerCase() !== nodeId) return false;
+      const digest = ethers.solidityPackedKeccak256(
+        ["string", "bytes32", "uint256"],
+        [GossipService.HEARTBEAT_AUTH_TAG, nodeId, authTs]
+      );
       const sig = sigs.Signature.fromHex(auth.authSig.replace(/^0x/, ""));
       const msgPoint = await this.blsService.hashMessageToCurve(digest);
       return await this.blsService.verifySignature(sig, msgPoint, pk);
@@ -630,31 +713,20 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Record a nodeId's AUTHENTICATED liveness at `seenAtMs` (the signed heartbeat timestamp), offline-
-   * audit rule ②. Callers pass only verified heartbeats (see verifyHeartbeatAuth). Hardened:
-   *   • SHAPE gate — only a well-formed nodeId (0x + 64 hex) is accepted.
-   *   • MONOTONIC — an existing entry only advances (seenAtMs > stored), so a replayed older signed
-   *     heartbeat cannot roll liveness backward (anti-replay); the value survives node restarts because
-   *     it is a wall-clock timestamp, not a resettable sequence.
-   *   • SIZE cap — a NEW nodeId is rejected once the ledger is full (NEVER evicts existing offline
-   *     evidence); the rejection is warned (L-1), rate-limited so the log can't be flooded.
+   * Store a verified heartbeat's liveness at `seenAtMs`. `nodeId` is already lowercase-canonical and
+   * every gate (shape, monotonic, registration, cap) was applied by the caller; the monotonic guard is
+   * re-checked here because the BLS verify is async and another heartbeat could have landed meanwhile.
    */
   private recordLiveness(nodeId: string, seenAtMs: number): void {
-    if (!nodeId || !/^0x[0-9a-fA-F]{64}$/.test(nodeId)) return;
+    if (!/^0x[0-9a-f]{64}$/.test(nodeId)) return;
     const existing = this.lastSeenLedger.get(nodeId);
     if (existing !== undefined) {
       if (seenAtMs > existing) this.lastSeenLedger.set(nodeId, seenAtMs); // monotonic anti-replay
       return;
     }
+    // A new nodeId slipped past the caller's cap check only if it raced another verify — re-guard.
     if (this.lastSeenLedger.size >= GossipService.MAX_LIVENESS_LEDGER) {
-      const now = Date.now();
-      if (now - this.lastLedgerFullWarnAt > 60_000) {
-        this.lastLedgerFullWarnAt = now;
-        console.warn(
-          `⚠️  liveness ledger FULL (${GossipService.MAX_LIVENESS_LEDGER}) — rejecting new nodeId ` +
-            `${nodeId.slice(0, 10)}…; a genuinely new operator would escape offline audit.`
-        );
-      }
+      this.warnLedgerFull(nodeId);
       return;
     }
     this.lastSeenLedger.set(nodeId, seenAtMs);
@@ -666,9 +738,10 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
    * this against a finalized block's on-chain timestamp minus the offline threshold, so the decision
    * is anchored to a globally-consistent clock, not this node's wall-clock. A null (never-seen node)
    * yields NO offline proof — the audit fails safe (won't slash a node it has no liveness data for).
+   * `nodeId` is lowercased to match the canonical ledger keys (keccak256 output is lowercase).
    */
   getLastSeen(nodeId: string): number | null {
-    return this.lastSeenLedger.get(nodeId) ?? null;
+    return this.lastSeenLedger.get(nodeId.toLowerCase()) ?? null;
   }
 
   // ── DVT slash quorum co-sign transport (inc-2 live) ─────────────────────────────
@@ -978,8 +1051,11 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     if (this.blsService) {
       try {
         const node = this.nodeService.getNodeForSigning();
-        const nodeId = this.getNodeId();
-        const digest = ethers.solidityPackedKeccak256(["bytes32", "uint256"], [nodeId, authTs]);
+        const nodeId = this.getNodeId().toLowerCase();
+        const digest = ethers.solidityPackedKeccak256(
+          ["string", "bytes32", "uint256"],
+          [GossipService.HEARTBEAT_AUTH_TAG, nodeId, authTs]
+        );
         const sig = await this.blsService.signDerivedHash(digest, node);
         if (typeof sig.signatureCompact === "string" && node.publicKey) {
           auth = {
