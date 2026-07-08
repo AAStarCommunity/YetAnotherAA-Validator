@@ -227,6 +227,12 @@ export function computeProofHash(identity: ProofIdentity): string {
 export interface IProofArchive {
   put(proof: SlashProof): Promise<{ proofHash: string; location: string }>;
   has(proofHash: string): Promise<boolean>;
+  /**
+   * Read back a previously archived proof (or `null` if absent/unreadable). Used by the armed dedup
+   * to distinguish a COMPLETED slash (skip) from an INCOMPLETE one — a proof with `queueTx` set but
+   * no `executeTx` — which must be RESUMED across a process restart (in-memory retry state is gone).
+   */
+  get(proofHash: string): Promise<SlashProof | null>;
   count(): Promise<number>;
   /**
    * DURABLE executed-slash journal (finding-2). `recordSlashed` persists a coarse
@@ -267,6 +273,16 @@ export class LocalProofArchive implements IProofArchive {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  async get(proofHash: string): Promise<SlashProof | null> {
+    try {
+      const raw = await fs.readFile(path.join(this.dir, `${proofHash}.json`), "utf8");
+      return JSON.parse(raw) as SlashProof;
+    } catch {
+      // Absent or unreadable/corrupt → treat as "no archived proof" (the dedup then falls through).
+      return null;
     }
   }
 
@@ -315,6 +331,10 @@ export class IpfsProofArchive implements IProofArchive {
   }
 
   async has(): Promise<boolean> {
+    throw new Error("IpfsProofArchive not implemented — increment 3");
+  }
+
+  async get(): Promise<SlashProof | null> {
     throw new Error("IpfsProofArchive not implemented — increment 3");
   }
 

@@ -110,6 +110,39 @@ RPC every tick. The node's RPC MUST provide:
 
 ---
 
+## Double-slash residuals (armed real-slash — read before flipping `AUDIT_DRY_RUN=false` in prod)
+
+The DVT over-slash guard (`getRecentSlashExecuted` incl. `OperatorSlashed`, +
+event-reconstructed `isSlashPending`, + the during-cooldown "learning" scan for
+in-flight keys) prevents same-node and the common cross-node double-slash. Two
+residuals it can only PARTIALLY cover (surfaced by an 8-round adversarial
+review):
+
+1. **Fresh-node / long-offline window** — a node with no in-memory state and no
+   local durable slashed marker, started after a peer's `SlashExecuted` /
+   `OperatorSlashed` has aged out of `AUDIT_SLASH_LOOKBACK_BLOCKS`, can read
+   "clear" for a still-sustained violation and slash again. **Mitigation
+   (operational):** size `AUDIT_SLASH_LOOKBACK_BLOCKS` to cover the worst-case
+   node restart/offline horizon (bounded by the RPC's `eth_getLogs` cap — use a
+   provider whose cap exceeds that horizon), or seed/share the durable slashed
+   journal across the fleet.
+
+2. **Different-epoch concurrent slash — needs an SP contract change
+   (@repo:sp).** `epoch = violationBlock`, and the BLSAggregator queue replay
+   guard keys on `operator + slashLevel + epoch + chainid`. Two nodes that
+   observe the same sustained violation at DIFFERENT finalized blocks produce
+   DIFFERENT queue hashes, so both can queue; if one lands after the other
+   executed and cleared `_pendingSlash`, it re-sets pending and executes a
+   SECOND slash. The DVT over-slash guard mitigates but cannot authoritatively
+   close a cross-node contract race. **Authoritative fix (SuperPaymaster):**
+   `executeSlashWithBLS` must carry the same slash cooldown its owner path
+   already has — `slashOperator` enforces `_slashCd[operator]` (24h) but
+   `executeSlashWithBLS` does NOT — or make the queue/replay guard coarse
+   (`operator + slashLevel`, dropping `epoch`). Tracked with @repo:sp on the
+   Cooperation-Center board.
+
+---
+
 ## Regression table — the 5 real-env failures the drill caught (unit tests could not)
 
 | #   | Failure                                                                                                                                                   | Fix                                                                                                     | Now covered by                                                 |
