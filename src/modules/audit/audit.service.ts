@@ -13,7 +13,7 @@ import { GossipService } from "../gossip/gossip.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 import type { IProofArchive, SlashProof, EvidenceSource, ProofIdentity } from "./proof-archive.js";
 import { LocalProofArchive, computeProofHash, PROOF_SCHEMA_VERSION } from "./proof-archive.js";
-import type { IQuorumCoSigner, CoSignRequest, CoSignVerifier } from "./slash-consensus.js";
+import type { IQuorumCoSigner } from "./slash-consensus.js";
 import {
   SlashLevel,
   PendingSlotCoSigner,
@@ -37,20 +37,16 @@ import {
  * [0, intervalMs) so redundant auditors that boot together don't file the same proposal in
  * the same window.
  *
- * INCREMENT-1 SCOPE: only the credit-over-limit rule + LocalProofArchive + proposal-intent.
+ * ACTIVE RULES: rule ② offline (gossip-heartbeat liveness) — file-only proposal + LocalProofArchive.
+ * The credit-over-limit (rule ①) and over-issue (rule ③) SLASH rules were retired by design review
+ * (credit is handled by the proactive sign-gate; over-issue is served by an on-chain view). The
+ * slash-consensus pipeline (queue → create → execute co-sign, proof archive, quorum co-signer) is
+ * KEPT intact as DORMANT scaffolding for future rules — no active rule currently arms it.
  * DEFERRED (see coordinateQuorumCoSign / IpfsProofArchive):
- *   - increment 2: multi-node BLS quorum co-sign via gossip + BLSAggregator.verifyAndExecute;
- *     the offline (gossip-heartbeat) / deposit-insufficient / token-over-issue rules.
+ *   - increment 2: multi-node BLS quorum co-sign via gossip + BLSAggregator.verifyAndExecute.
  *   - increment 3: IPFS pinning of proofs.
  */
 
-/**
- * Slash severity for the credit-over-limit rule. Maps to the SP #329 SlashLevel enum: MINOR (=1),
- * which is 3-of-3 quorum in the N=3 bootstrap. This uint8 is the `level` passed to createProposal
- * AND the slashLevel bound into both the queue and execute co-sign preimages — they must agree.
- */
-const SLASH_LEVEL_CREDIT_OVER_LIMIT = SlashLevel.MINOR;
-const RULE_CREDIT_OVER_LIMIT = "credit-over-limit";
 /**
  * Rule ② offline detection. WARNING (=0) — the lowest severity (2-of-3 quorum in the N=3 bootstrap):
  * a node being offline is a recoverable operational fault, not malice, so it carries the lightest
@@ -66,14 +62,6 @@ const RULE_OFFLINE = "offline";
  * 10 minutes. (The effective window is this + the finality lag of the evidence block.)
  */
 const OFFLINE_THRESHOLD_MS = 600_000;
-/**
- * Rule ③ over-issue (CC-28). MINOR (3-of-3 quorum) — a community minting xPNTs beyond its governance
- * cap is a serious economic abuse, and the evidence is OBJECTIVE (on-chain isOverIssued() bool), so
- * the strict quorum is warranted. Slash SUBJECT = the token's communityOwner. Cleared when the token
- * is next seen within cap.
- */
-const SLASH_LEVEL_OVER_ISSUE = SlashLevel.MINOR;
-const RULE_OVER_ISSUE = "over-issue";
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
 
@@ -101,15 +89,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly intervalMs: number;
   private readonly cooldownMs: number;
   private readonly watchlist: string[];
-  private readonly creditThresholdBps: bigint;
   private readonly chainId: number;
   private readonly registryAddress: string;
   private readonly superPaymasterAddress: string;
   private readonly dvtValidatorAddress: string;
   private readonly blsAggregatorAddress: string;
   private readonly gtokenStakingAddress: string;
-  /** xPNTs token the credit-over-limit rule reads operator debt from (getDebt lives on the token). */
-  private readonly apntsTokenAddress: string;
   /**
    * SECOND safety gate (increment 2). When false (default) a violation only FILES + ARCHIVES a
    * slash proposal; the two-step on-chain slash (queue → execute, quorum co-signed) fires only
@@ -148,12 +133,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   /** Stable operator→nodeId cache (offline rule ②). A transient resolve failure keeps the cached
    *  nodeId so a still-relevant operator is never pruned from the gossip ledger on an RPC blip. */
   private readonly offlineNodeIdCache = new Map<string, string>();
-  /** Rule ③ over-issue — opt-in; audits each community xPNTs token's on-chain isOverIssued() flag.
-   *  May be disabled at bootstrap (oversized list / all tokens invalid). */
-  private overIssueEnabled: boolean;
-  /** Community xPNTs token addresses to check for over-issuance (checksummed at ingest; bytecode-
-   *  validated + pruned at bootstrap). */
-  private xpntsTokens: string[];
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
   private derivedOperators: string[] = [];
   /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
@@ -259,9 +238,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.logger.warn(`[AUDIT-EVENT] kind=${kind} ${kv}`);
   }
   private static readonly MAX_RECENT = 20;
-  /** Bound on AUDIT_XPNTS_TOKENS — the over-issue rule polls tokens serially per tick (2 reads each),
-   *  so a huge list could elongate a tick and starve the single-flight guard (Codex Low). */
-  private static readonly MAX_XPNTS_TOKENS = 256;
 
   constructor(
     private readonly blockchainService: BlockchainService,
@@ -299,14 +275,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         }
       })
       .filter((a): a is string => a !== null);
-    this.creditThresholdBps = BigInt(config.get<number>("auditCreditThresholdBps") ?? 10_000);
     this.chainId = config.get<number>("auditChainId") ?? 11155111;
     this.registryAddress = config.get<string>("auditRegistryAddress") ?? "";
     this.superPaymasterAddress = config.get<string>("auditSuperPaymasterAddress") ?? "";
     this.dvtValidatorAddress = config.get<string>("auditDvtValidatorAddress") ?? "";
     this.blsAggregatorAddress = config.get<string>("auditBlsAggregatorAddress") ?? "";
     this.gtokenStakingAddress = config.get<string>("auditGtokenStakingAddress") ?? "";
-    this.apntsTokenAddress = config.get<string>("auditApntsTokenAddress") ?? "";
     this.executeSlash = config.get<boolean>("auditExecuteSlash") === true;
     this.dryRun = config.get<boolean>("auditDryRun") === true;
     this.finalityConfirmations = config.get<number>("auditFinalityConfirmations") ?? 12;
@@ -321,36 +295,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.roleUseGetter = config.get<boolean>("auditRoleUseGetter") === true;
     this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
     this.offlineEnabled = config.get<boolean>("auditOfflineEnabled") === true;
-    // Checksum, drop invalid, DEDUP.
-    const canonicalTokens = (config.get<string[]>("auditXpntsTokens") ?? [])
-      .map(a => a.trim())
-      .filter(Boolean)
-      .map(a => {
-        try {
-          return ethers.getAddress(a);
-        } catch {
-          this.logger.warn(`Audit: dropping invalid AUDIT_XPNTS_TOKENS entry "${a}"`);
-          return null;
-        }
-      })
-      .filter((a): a is string => a !== null);
-    const deduped = [...new Set(canonicalTokens)];
-    const rawOverIssue = config.get<boolean>("auditOverIssueEnabled") === true;
-    // FAIL-CLOSED on an oversized list (Codex High): silently truncating to a cap would drop configured
-    // audit targets — a security allowlist must NEVER silently reduce coverage. Over the bound → DISABLE
-    // over-issue with a loud error so the operator shards/reduces rather than getting partial coverage.
-    if (rawOverIssue && deduped.length > AuditService.MAX_XPNTS_TOKENS) {
-      this.logger.error(
-        `Audit: AUDIT_XPNTS_TOKENS has ${deduped.length} > ${AuditService.MAX_XPNTS_TOKENS} tokens — ` +
-          `over-issue DISABLED (fail-closed). Reduce the list or shard it across nodes; silent ` +
-          `truncation would leave tokens unaudited.`
-      );
-      this.overIssueEnabled = false;
-      this.xpntsTokens = [];
-    } else {
-      this.overIssueEnabled = rawOverIssue;
-      this.xpntsTokens = deduped;
-    }
     this.gossip = gossip ?? null;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
@@ -372,15 +316,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.log("DVT audit DISABLED (AUDIT_ENABLED!=true) — no operators watched");
       return;
     }
-    // A node may audit OPERATORS (static watchlist / on-chain-derived) and/or TOKENS (rule ③ over-
-    // issue) — over-issue is operator-independent, so a token-ONLY deployment must still schedule the
-    // tick (Codex: bootstrap starvation). Only bail when there is nothing of EITHER kind to watch.
+    // The audit watches OPERATORS (static watchlist / on-chain-derived) — bail when there is nothing
+    // of either kind to watch.
     const hasOperators = this.watchlist.length > 0 || this.roleDerive;
-    const hasOverIssueTokens = this.overIssueEnabled && this.xpntsTokens.length > 0;
-    if (!hasOperators && !hasOverIssueTokens) {
+    if (!hasOperators) {
       this.logger.warn(
-        "Audit: AUDIT_ENABLED=true but nothing to watch — AUDIT_WATCHLIST empty, AUDIT_ROLE_DERIVE!=true, " +
-          "and no AUDIT_XPNTS_TOKENS (over-issue)"
+        "Audit: AUDIT_ENABLED=true but nothing to watch — AUDIT_WATCHLIST empty, AUDIT_ROLE_DERIVE!=true"
       );
       return;
     }
@@ -391,7 +332,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     if (!this.registryAddress) missing.push("AUDIT_REGISTRY_ADDRESS");
     if (!this.superPaymasterAddress) missing.push("AUDIT_SUPER_PAYMASTER_ADDRESS");
     if (!this.dvtValidatorAddress) missing.push("AUDIT_DVT_VALIDATOR_ADDRESS");
-    if (!this.apntsTokenAddress) missing.push("AUDIT_APNTS_TOKEN_ADDRESS");
     if (missing.length > 0) {
       this.enabled = false;
       this.logger.error(
@@ -409,7 +349,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       ["AUDIT_REGISTRY_ADDRESS", this.registryAddress],
       ["AUDIT_SUPER_PAYMASTER_ADDRESS", this.superPaymasterAddress],
       ["AUDIT_DVT_VALIDATOR_ADDRESS", this.dvtValidatorAddress],
-      ["AUDIT_APNTS_TOKEN_ADDRESS", this.apntsTokenAddress],
     ];
     if (this.gtokenStakingAddress) {
       toCheck.push(["AUDIT_GTOKEN_STAKING_ADDRESS", this.gtokenStakingAddress]);
@@ -432,41 +371,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           `Audit: ${name}=${addr} has no on-chain code on chainId ${this.chainId} — DISABLED (fail-closed)`
         );
         return;
-      }
-    }
-    // Rule ③ — bytecode-validate each configured xPNTs token (Codex Medium: a missing/EOA/wrong-chain
-    // token address would otherwise be caught-and-swallowed per read, silently unaudited forever). A
-    // bad token is DROPPED with a loud error (not the whole audit — credit/offline may still be valid).
-    if (this.overIssueEnabled && this.xpntsTokens.length > 0) {
-      const valid: string[] = [];
-      for (const token of this.xpntsTokens) {
-        let code: string;
-        try {
-          code = await this.blockchainService.getCode(token);
-        } catch (err: unknown) {
-          // TRANSIENT RPC error — do NOT permanently drop a possibly-valid token on a one-time startup
-          // hiccup (Codex Medium). KEEP it; the per-tick getIsOverIssued read retries once RPC recovers
-          // (and its own per-token catch skips a genuinely-broken read without a false violation).
-          const msg = err instanceof Error ? err.message : String(err);
-          this.logger.warn(
-            `Audit: getCode(AUDIT_XPNTS_TOKENS ${token}) failed (${msg}) — KEEPING (transient; read retries)`
-          );
-          valid.push(token);
-          continue;
-        }
-        if (!code || code === "0x") {
-          // AUTHORITATIVE: no code = EOA / wrong chain / destroyed → drop (loud, not silent).
-          this.logger.error(
-            `Audit: AUDIT_XPNTS_TOKENS ${token} has no on-chain code on chainId ${this.chainId} — DROPPED`
-          );
-          continue;
-        }
-        valid.push(token);
-      }
-      this.xpntsTokens = valid;
-      if (valid.length === 0) {
-        this.overIssueEnabled = false;
-        this.logger.error("Audit: no valid AUDIT_XPNTS_TOKENS remain — over-issue DISABLED");
       }
     }
     // A1#6 — eager first derivation so the startup log + first tick already see the on-chain set
@@ -493,16 +397,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       await this.refreshDerivedOperators(true);
     }
 
-    // Wire the gossip quorum co-sign responder (inc-2 live). When the injected co-signer is the
-    // live GossipQuorumCoSigner (armed node), hand it the independent violation verifier and let
-    // it register its responder handler on GossipService, so this armed node re-verifies + co-signs
-    // peer slash requests from first principles even if it never itself requests. A no-op on the
-    // disarmed PendingSlotCoSigner default (no `arm` method).
-    const armable = this.coSigner as Partial<{ arm: (v: CoSignVerifier) => void }>;
-    if (typeof armable.arm === "function") {
-      armable.arm(req => this.verifyViolationForCoSign(req));
-      this.logger.log("DVT audit: gossip quorum co-sign responder ARMED");
-    }
+    // The gossip quorum co-sign responder stays UNARMED: the only rule that armed it (credit-over-
+    // limit) was retired, so no active rule supplies a violation verifier. The GossipQuorumCoSigner /
+    // PendingSlotCoSigner scaffolding is kept intact but dormant for future rules.
 
     // Phase-jitter the first tick across [0, intervalMs) so redundant auditors that boot
     // together don't all file the same proposal in the same window.
@@ -527,7 +424,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       `DVT audit ENABLED — interval=${this.intervalMs}ms jitter=${jitterMs}ms ` +
         `watchlist=[${this.effectiveWatchlist().join(", ")}] ` +
         `(static=${this.watchlist.length}, roleDerive=${this.roleDerive ? `on:${this.derivedOperators.length}` : "off"}) ` +
-        `creditThreshold=${this.creditThresholdBps}bps ` +
         `registry=${this.registryAddress} superPaymaster=${this.superPaymasterAddress} ` +
         `dvtValidator=${this.dvtValidatorAddress} blsAggregator=${this.blsAggregatorAddress} ` +
         `executeSlash=${this.executeSlash} (${
@@ -772,32 +668,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         }
         this.gossip.setRelevantNodeIds(this.offlineNodeIdCache.values());
       }
-      // Rule ③ over-issue — audits TOKENS (per community), INDEPENDENT of the operator set, so it runs
-      // even when the operator watchlist is empty. One token's failure never skips another.
-      if (this.overIssueEnabled) {
-        for (const token of this.xpntsTokens) {
-          try {
-            await this.auditOverIssueForToken(token, pinnedBlock);
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.logger.error(`Audit: over-issue audit failed for token ${token} — ${msg}`);
-            this.emitAuditEvent("ERROR", { operator: token, error: msg });
-          }
-        }
-      }
       if (operators.length === 0) {
         this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
         return;
       }
       for (const operator of operators) {
-        try {
-          await this.auditOperator(operator, pinnedBlock);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.logger.error(`Audit: ${operator} audit failed — ${msg}`);
-          this.emitAuditEvent("ERROR", { operator, error: msg });
-        }
-        // Rule ② offline — independent of the credit rule: one rule's failure must not skip the other.
+        // Rule ② offline — the sole active rule. A per-operator failure is logged and never aborts
+        // the sweep of the remaining operators.
         if (this.offlineEnabled) {
           try {
             await this.auditOfflineForOperator(
@@ -965,152 +842,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * Audit a single operator: read its credit / reputation / stake state and evaluate the
-   * credit-over-limit rule. On a confirmed violation, archive a proof and file a proposal.
-   */
-  async auditOperator(
-    operator: string,
-    pinnedBlock?: { number: number; hash: string }
-  ): Promise<void> {
-    // Pin EVERY rule input to ONE FINALIZED block (finding-3) so creditLimit, availableCredit and
-    // debt can never be mixed across blocks (no phantom over-limit from a mid-read state change)
-    // AND the block the irreversible slash is justified by cannot be undone by a reorg. The block
-    // HASH is recorded in the evidence so the justification is pinned to a specific finalized block.
-    // tick() resolves this ONCE and shares it across the sweep; a direct caller (tests) may omit it.
-    const { number: violationBlock, hash: violationBlockHash } =
-      pinnedBlock ?? (await this.blockchainService.getViolationBlock(this.finalityConfirmations));
-
-    // All per-operator reads are pinned to the SAME block; issue them concurrently (5-6 reads)
-    // rather than serially. reputation + DVT stake lock are auxiliary evidence (not part of the
-    // rule) → best-effort with a fallback so they never fail the audit.
-    const [creditLimit, availableCredit, debt, reputation, dvtStake] = await Promise.all([
-      this.blockchainService.getCreditLimit(this.registryAddress, operator, violationBlock),
-      this.blockchainService.getAvailableCredit(
-        this.superPaymasterAddress,
-        operator,
-        this.apntsTokenAddress,
-        violationBlock
-      ),
-      // GENUINE over-limit needs the operator's ACTUAL debt, read directly (block-pinned).
-      // getDebt is best-effort: null = getter absent / reverted → we CANNOT prove over-limit,
-      // so we SKIP (fail-safe, no proposal) rather than inferring it from availableCredit==0.
-      this.readOperatorDebt(operator, violationBlock),
-      this.blockchainService
-        .getGlobalReputation(this.registryAddress, operator, violationBlock)
-        .catch(() => -1n),
-      this.gtokenStakingAddress
-        ? this.blockchainService.getRoleLockAmount(
-            this.gtokenStakingAddress,
-            operator,
-            ROLE_DVT,
-            violationBlock
-          )
-        : Promise.resolve(0n),
-    ]);
-
-    if (debt === null) {
-      this.logger.debug(
-        `Audit: ${operator} debt unreadable (getDebt reverted/absent) — SKIP (fail-safe)`
-      );
-      return;
-    }
-
-    // FAIL-SAFE: creditLimit == 0 means UNCONFIGURED / de-registered, NOT "over limit". Flagging
-    // debt>0 against a zero limit would be an unconditional false positive → SKIP (never slash).
-    if (creditLimit === 0n) {
-      this.logger.debug(
-        `Audit: ${operator} creditLimit=0 (unconfigured/de-registered) — SKIP (fail-safe, not over-limit)`
-      );
-      await this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
-      return;
-    }
-    // CROSS-CONTRACT AGREEMENT: both SuperPaymaster signals must agree before flagging. If
-    // availableCredit > 0 the operator is still within SP's ENFORCED ceiling, so a lower/stale
-    // Registry creditLimit must NOT produce a false over-limit → SKIP. Only when SP itself reports
-    // the credit exhausted (availableCredit == 0) do we trust the debt>limit comparison.
-    if (availableCredit > 0n) {
-      this.logger.debug(
-        `Audit: ${operator} availableCredit=${availableCredit}>0 (within SP ceiling) — SKIP (no false over-limit)`
-      );
-      await this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
-      return;
-    }
-
-    // STRICT credit-over-limit rule: flag ONLY a genuine breach where debt EXCEEDS the limit
-    // (debt == creditLimit is AT the limit, not over → NOT a violation). creditThresholdBps is
-    // an OPTIONAL additional margin on top: debt*10000/limit must also reach it (default 10000).
-    // creditLimit > 0 is guaranteed above, so the ratio is always well-defined.
-    const overLimit = debt > creditLimit;
-    const usageBps = (debt * 10_000n) / creditLimit;
-
-    if (!overLimit) {
-      this.logger.debug(
-        `Audit: ${operator} not over limit (debt=${debt} ≤ limit=${creditLimit}, usage=${usageBps}bps)`
-      );
-      await this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
-      return;
-    }
-    if (usageBps < this.creditThresholdBps) {
-      this.logger.debug(
-        `Audit: ${operator} over limit but under margin (usage=${usageBps}bps < ${this.creditThresholdBps}bps)`
-      );
-      await this.clearCoarseSlashed(operator, RULE_CREDIT_OVER_LIMIT);
-      return;
-    }
-
-    const observedAt = this.clock();
-    const reason =
-      `${RULE_CREDIT_OVER_LIMIT}: debt ${debt} EXCEEDS limit ${creditLimit} ` +
-      `(usage ${usageBps}bps ≥ ${this.creditThresholdBps}bps, availableCredit ${availableCredit}, block ${violationBlock})`;
-    const sources: EvidenceSource[] = [
-      {
-        type: "view",
-        name: "Registry.getCreditLimit",
-        value: creditLimit.toString(),
-        block: violationBlock,
-      },
-      {
-        type: "view",
-        name: `IxPNTsToken(${this.apntsTokenAddress}).getDebt`,
-        value: debt.toString(),
-        block: violationBlock,
-      },
-      {
-        type: "view",
-        name: "SuperPaymaster.getAvailableCredit",
-        value: availableCredit.toString(),
-        block: violationBlock,
-      },
-      {
-        type: "view",
-        name: "Registry.globalReputation",
-        value: reputation.toString(),
-        block: violationBlock,
-      },
-      {
-        type: "view",
-        name: "GTokenStaking.roleLocks(DVT)",
-        value: dvtStake.toString(),
-        block: violationBlock,
-      },
-    ];
-
-    await this.handleViolation({
-      operator,
-      slashLevel: SLASH_LEVEL_CREDIT_OVER_LIMIT,
-      reason,
-      rule: RULE_CREDIT_OVER_LIMIT,
-      creditLimit,
-      availableCredit,
-      debt,
-      violationBlock,
-      violationBlockHash,
-      sources,
-      observedAt,
-    });
-  }
-
-  /**
    * Rule ② offline detection (inc-1) for ONE operator, pinned to the same finalized block as the
    * credit sweep. Bridges the on-chain slash target (operator) to off-chain liveness:
    *   operator → BLSAggregator.getBLSPublicKey → nodeId=keccak256(EIP-2537 key) → gossip getLastSeen.
@@ -1225,224 +956,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
-   * Rule ③ over-issue (CC-28) for ONE community xPNTs token, pinned to the finalized block. Reads the
-   * token's OBJECTIVE on-chain isOverIssued() flag (issued value > governance effectiveCap). On true,
-   * the SLASH SUBJECT is the token's communityOwner (the community that minted beyond its cap). The
-   * evidence is a deterministic on-chain bool → every DVT node agrees → SAFELY quorum-slashable
-   * (unlike gossip-offline). Fail-SAFE: over-issue disabled, an isOverIssued/communityOwner read
-   * error, or a null owner → SKIP (never fabricate). A within-cap read CLEARS any coarse marker.
-   */
-  private async auditOverIssueForToken(
-    token: string,
-    pinnedBlock: { number: number; hash: string }
-  ): Promise<void> {
-    if (!this.overIssueEnabled) return;
-
-    let over: boolean;
-    try {
-      over = await this.blockchainService.getIsOverIssued(token, pinnedBlock.number);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`Audit: over-issue isOverIssued read failed for token ${token} — ${msg}`);
-      return;
-    }
-
-    if (!over) {
-      // Cure: within cap → clear the TOKEN-scoped marker so a later re-breach of THIS token can file
-      // again (episode semantics: one open episode per token). Checked BEFORE reading communityOwner
-      // (Codex Low): a within-cap token needs no owner read, and a transient owner-null must not block
-      // the marker clear.
-      await this.clearCoarseSlashed(token, RULE_OVER_ISSUE);
-      return;
-    }
-
-    // Over-issued → the communityOwner is the slash subject; read it at the SAME block (pinned). Only
-    // fetched on a real violation (not on every within-cap token).
-    const owner = await this.blockchainService.getCommunityOwner(token, pinnedBlock.number);
-    if (!owner) return; // can't identify the subject → skip (fail-safe)
-
-    // OVER-ISSUE violation. DETERMINISTIC identity — on-chain bool, no per-node data.
-    const identity: ProofIdentity = {
-      proofSchemaVersion: PROOF_SCHEMA_VERSION,
-      chainId: this.chainId,
-      operator: owner,
-      rule: RULE_OVER_ISSUE,
-      violationBlock: pinnedBlock.number,
-      slashLevel: SLASH_LEVEL_OVER_ISSUE,
-      registry: this.normalizeAddress(this.registryAddress),
-      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
-      overIssueToken: this.normalizeAddress(token),
-    };
-    const reason = `${RULE_OVER_ISSUE}: community ${owner} over-issued xPNTs token ${token} (isOverIssued=true @block ${pinnedBlock.number})`;
-    this.logger.warn(reason);
-    const sources: EvidenceSource[] = [
-      {
-        type: "view",
-        name: "xPNTs.isOverIssued()",
-        value: "true",
-        block: pinnedBlock.number,
-      },
-      {
-        type: "view",
-        name: "xPNTs.communityOwner()",
-        value: owner,
-        block: pinnedBlock.number,
-      },
-    ];
-    await this.handleViolation({
-      operator: owner,
-      slashLevel: SLASH_LEVEL_OVER_ISSUE,
-      reason,
-      rule: RULE_OVER_ISSUE,
-      violationBlock: pinnedBlock.number,
-      violationBlockHash: pinnedBlock.hash,
-      sources,
-      observedAt: this.clock(),
-      identity,
-      observed: `over-issued (token ${token})`,
-      threshold: "isOverIssued=false",
-      dedupSubject: token, // TOKEN-scoped dedup (one owner may over-issue multiple tokens)
-    });
-  }
-
-  /**
-   * Best-effort operator debt read (block-pinned). Per the verified SP ABI, debt lives on the
-   * xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT SuperPaymaster/Registry — so this reads the
-   * aPNTs token directly. Returns null when the token's getDebt reverts / is absent — the caller
-   * treats null as "unknown" and skips (never guesses an over-limit from missing data).
-   */
-  private async readOperatorDebt(operator: string, blockTag: number): Promise<bigint | null> {
-    return this.blockchainService.getDebt(this.apntsTokenAddress, operator, blockTag);
-  }
-
-  /**
-   * Pure credit-over-limit predicate — the SINGLE rule decision shared by the audit tick's
-   * detection (auditOperator) and the co-sign responder's independent re-confirmation
-   * (verifyViolationForCoSign), so a peer confirms EXACTLY the condition the requester detected
-   * (no rule drift). Mirrors the inline checks in auditOperator: null debt / creditLimit==0 /
-   * availableCredit>0 / debt<=limit / under-margin all resolve to `false` (not a violation).
-   */
-  private isCreditOverLimit(
-    creditLimit: bigint,
-    availableCredit: bigint,
-    debt: bigint | null
-  ): boolean {
-    if (debt === null) return false;
-    if (creditLimit === 0n) return false;
-    if (availableCredit > 0n) return false;
-    if (!(debt > creditLimit)) return false;
-    const usageBps = (debt * 10_000n) / creditLimit;
-    if (usageBps < this.creditThresholdBps) return false;
-    return true;
-  }
-
-  /**
-   * The RESPONDER-side independent violation re-confirmation (inc-2 live). Given a peer's co-sign
-   * request, re-read the operator's on-chain state PINNED at `epoch` (= the violationBlock) and
-   * re-apply this node's OWN credit-over-limit rule, then re-derive the content-address. Returns
-   * `{ confirmed, proofHash }`; the responder compares the proofHash against the request's
-   * evidenceHash for the execute step (the innocent-operator defense). Fail-closed: an
-   * un-watchlisted operator, a chain/level mismatch, an unreadable debt, or any RPC error resolves
-   * to `{ confirmed: false, proofHash: null }` — this node then refuses to co-sign.
-   */
-  async verifyViolationForCoSign(
-    req: CoSignRequest
-  ): Promise<{ confirmed: boolean; proofHash: string | null }> {
-    const NO = { confirmed: false, proofHash: null };
-    try {
-      // Bind to THIS node's chain + rule: a request for another chain or a slashLevel this node's
-      // rule never assigns cannot be confirmed (the messageHash recompute already catches chain,
-      // this is defense-in-depth + the queue-step level check).
-      if (req.chainId !== this.chainId) return NO;
-      if (req.slashLevel !== SLASH_LEVEL_CREDIT_OVER_LIMIT) return NO;
-
-      let operator: string;
-      try {
-        operator = ethers.getAddress(req.operator);
-      } catch {
-        return NO;
-      }
-      // A1#6 (Codex High-1) — authorize against the EFFECTIVE set (static ∪ on-chain-derived), not
-      // just the static list, or a derived-only operator could be audited by the requester yet never
-      // co-signed by peers → never reaches quorum. Refresh (throttled) first so the responder's
-      // derived set is current.
-      await this.refreshDerivedOperators();
-      if (!this.effectiveWatchlist().includes(operator)) return NO;
-
-      const blockTag = req.epoch;
-      if (!Number.isInteger(blockTag) || blockTag < 0) return NO;
-
-      // A1#6 (Codex round-4, Low) — INDEPENDENTLY require the requester-supplied epoch to be FINALIZED
-      // by THIS responder's own view. Every rule input + hasRole membership is pinned to req.epoch, so
-      // a malicious requester who supplies an UNFINALIZED (reorg-able) block where the victim is
-      // transiently over-limit / a member must not be able to harvest a co-signature. Reject any epoch
-      // newer than our finalized head; a responder briefly behind simply refuses and the requester
-      // retries (fail-closed). A read failure here is also fail-closed (caught by the outer try → NO).
-      const finalizedHead = await this.blockchainService.getViolationBlock(
-        this.finalityConfirmations
-      );
-      if (blockTag > finalizedHead.number) {
-        this.logger.warn(
-          `co-sign refused: epoch ${blockTag} is not finalized by this node (finalized head ` +
-            `${finalizedHead.number}) — refusing to co-sign on reorg-able state`
-        );
-        return NO;
-      }
-
-      // A1#6 (Codex round-3) — a derived-only operator's membership is CONFIRMED at req.epoch (the
-      // SAME block the evidence is verified at) via hasRole, not just the cached set's wall-clock
-      // freshness — a peer must not co-sign a slash of an operator who had exited by the epoch block.
-      if (!(await this.confirmSlashableAtBlock(operator, blockTag))) {
-        this.logger.warn(
-          `co-sign refused: ${operator} not a confirmed audited-role member at epoch ${blockTag}`
-        );
-        return NO;
-      }
-
-      // Re-read the SAME rule inputs the tick reads, pinned at the epoch block.
-      const [creditLimit, availableCredit, debt] = await Promise.all([
-        this.blockchainService.getCreditLimit(this.registryAddress, operator, blockTag),
-        this.blockchainService.getAvailableCredit(
-          this.superPaymasterAddress,
-          operator,
-          this.apntsTokenAddress,
-          blockTag
-        ),
-        this.readOperatorDebt(operator, blockTag),
-      ]);
-
-      if (!this.isCreditOverLimit(creditLimit, availableCredit, debt)) return NO;
-
-      // Re-derive the content-address from the SAME on-chain identity (wall-clock-free), so it
-      // equals the requester's proofHash for the identical violation. Every slash-critical input —
-      // availableCredit, slashLevel, and the source contract/token addresses — is committed at the
-      // FINALIZED block, so evidenceHash is a full content address of exactly what would be slashed.
-      // No block-HEADER read is needed (finding-2): reorg-safety comes from the finality-pinned
-      // `epoch`, so a non-archive node that cannot read an old header still reproduces this proofHash.
-      const identity: ProofIdentity = {
-        proofSchemaVersion: PROOF_SCHEMA_VERSION,
-        chainId: this.chainId,
-        operator,
-        rule: RULE_CREDIT_OVER_LIMIT,
-        creditLimit: creditLimit.toString(),
-        availableCredit: availableCredit.toString(),
-        debt: (debt as bigint).toString(),
-        violationBlock: blockTag,
-        slashLevel: SLASH_LEVEL_CREDIT_OVER_LIMIT,
-        registry: this.normalizeAddress(this.registryAddress),
-        superPaymaster: this.normalizeAddress(this.superPaymasterAddress),
-        dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
-        apntsToken: this.normalizeAddress(this.apntsTokenAddress),
-      };
-      return { confirmed: true, proofHash: computeProofHash(identity) };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`verifyViolationForCoSign refused (indeterminate): ${msg}`);
-      return NO;
-    }
-  }
-
-  /**
    * On a confirmed violation: build the evidence proof, content-address it, file the slash
    * proposal on the DVTValidator (proposal-intent), and archive the proof. The proof is
    * archived even if the on-chain write fails, so the evidence is never lost.
@@ -1452,24 +965,18 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     slashLevel: number;
     reason: string;
     rule: string;
-    // credit-over-limit rule inputs — present on the credit path (used to build its identity inline).
-    creditLimit?: bigint;
-    availableCredit?: bigint;
-    debt?: bigint;
     violationBlock: number;
     violationBlockHash: string;
     sources: EvidenceSource[];
     observedAt: number;
-    // A pre-built content-address identity (rule ② offline). When provided it is used VERBATIM; when
-    // absent the credit-over-limit identity is built inline from creditLimit/availableCredit/debt so
-    // the credit path's proofHash is unchanged.
-    identity?: ProofIdentity;
-    // Human-readable evidence strings for the archived SlashProof (rule-generic). When absent the
-    // credit path's debt/creditLimit are used, so its archived evidence is unchanged.
-    observed?: string;
-    threshold?: string;
-    /** Dedup/cooldown key subject — defaults to `operator`. Rule ③ over-issue passes the TOKEN so
-     *  multiple over-issued tokens under one communityOwner are tracked independently (not collapsed). */
+    // The pre-built, wall-clock-free content-address identity for this rule's violation. Every active
+    // rule (and any future rule) supplies it verbatim so the proofHash is fully rule-owned.
+    identity: ProofIdentity;
+    // Human-readable evidence strings for the archived SlashProof (rule-generic).
+    observed: string;
+    threshold: string;
+    /** Dedup/cooldown key subject — defaults to `operator`. A rule whose violation stream is keyed by
+     *  something OTHER than the slash subject may override it (kept generic for future rules). */
     dedupSubject?: string;
   }): Promise<AuditDetection | null> {
     // DETERMINISTIC slash epoch = the violationBlock (an on-chain fact). Two DVT nodes observing
@@ -1480,24 +987,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     const epoch = v.violationBlock;
     const proposer = this.blockchainService.getWalletAddress() ?? ethers.ZeroAddress;
 
-    // Content-address IDENTITY = ON-CHAIN facts only (no wall-clock). Two DVT nodes seeing
-    // the same violation at the same block derive the same proofHash + proposalId. The offline rule
-    // passes a pre-built identity; the credit rule builds its (unchanged) identity inline.
-    const identity: ProofIdentity = v.identity ?? {
-      proofSchemaVersion: PROOF_SCHEMA_VERSION,
-      chainId: this.chainId,
-      operator: v.operator,
-      rule: v.rule,
-      creditLimit: v.creditLimit!.toString(),
-      availableCredit: v.availableCredit!.toString(),
-      debt: v.debt!.toString(),
-      violationBlock: v.violationBlock,
-      slashLevel: v.slashLevel,
-      registry: this.normalizeAddress(this.registryAddress),
-      superPaymaster: this.normalizeAddress(this.superPaymasterAddress),
-      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
-      apntsToken: this.normalizeAddress(this.apntsTokenAddress),
-    };
+    // Content-address IDENTITY = ON-CHAIN facts only (no wall-clock), supplied verbatim by the rule.
+    // Two DVT nodes seeing the same violation at the same block derive the same proofHash + proposalId.
+    const identity = v.identity;
     const proofHash = computeProofHash(identity);
 
     // ── DEDUP ─────────────────────────────────────────────────────────────────────
@@ -1564,8 +1056,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       messageHashNote: "pre-execution: proposalId not yet resolved",
       evidence: {
         rule: v.rule,
-        observed: v.observed ?? v.debt?.toString() ?? "",
-        threshold: v.threshold ?? v.creditLimit?.toString() ?? "",
+        observed: v.observed,
+        threshold: v.threshold,
         sources: v.sources,
         violationBlock: v.violationBlock,
         violationBlockHash: v.violationBlockHash,
@@ -2042,17 +1534,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
-    // FILE-ONLY rules (inc-1): file a proposal + archive the proof, but never queue/execute an on-chain
-    // slash yet. Offline's armed co-sign is deferred (its evidence is gossip-local; see #202). Over-
-    // issue's evidence IS objective (on-chain isOverIssued) so it is armable in principle, but its slash
-    // SUBJECT is a communityOwner (not a BLS-slotted DVT operator) — arming waits until the SP contract
-    // community-slash path is confirmed. The credit rule is unaffected (stays armed).
-    // INC-2 BLOCKER for over-issue (Codex High): the dedup coarseKey is TOKEN-scoped but the slash
-    // subject + assessSlashState + execute are OWNER-scoped. Two tokens of one owner would keep
-    // independent token-scoped armed state (slashedCoarseKeys/pendingProposalIds) yet slash the SAME
-    // owner — enabling a double-slash / orphaned-proposal. Over-issue MUST stay file-only until the
-    // proposal-dedup (token) is SEPARATED from the pending/executed-slash guard (owner).
-    const fileOnlyRule = args.rule === RULE_OFFLINE || args.rule === RULE_OVER_ISSUE;
+    // FILE-ONLY rules: file a proposal + archive the proof, but never queue/execute an on-chain slash.
+    // Offline's armed co-sign is deferred (its evidence is gossip-local; see #202). The armed queue →
+    // create → execute pipeline below is DORMANT scaffolding for a future rule (no active rule arms it).
+    const fileOnlyRule = args.rule === RULE_OFFLINE;
     // A1#6 (Codex High-2 + round-3) — a derived-ONLY operator is armed for the irreversible on-chain
     // slash only when its membership is CONFIRMED at the evidence block (epoch) via hasRole — not just
     // the cached set's wall-clock freshness. Stale/never-confirmed/exited-by-epoch membership degrades
@@ -2305,8 +1790,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     derivedOperatorCount: number;
     derivedSetFresh: boolean;
     lastRoleRefreshAt: number | null;
-    overIssueEnabled: boolean;
-    overIssueTokenCount: number;
     lastTickAt: number | null;
     recentDetections: AuditDetection[];
     archivedProofCount: number;
@@ -2332,8 +1815,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       roleDerive: this.roleDerive,
       derivedOperatorCount: this.derivedOperators.length,
       derivedSetFresh: this.derivedSetIsFresh(),
-      overIssueEnabled: this.overIssueEnabled,
-      overIssueTokenCount: this.xpntsTokens.length,
       lastRoleRefreshAt: this.lastRoleRefreshAt,
       lastTickAt: this.lastTickAt,
       recentDetections: this.recentDetections,
