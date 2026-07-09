@@ -444,13 +444,18 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         try {
           code = await this.blockchainService.getCode(token);
         } catch (err: unknown) {
+          // TRANSIENT RPC error — do NOT permanently drop a possibly-valid token on a one-time startup
+          // hiccup (Codex Medium). KEEP it; the per-tick getIsOverIssued read retries once RPC recovers
+          // (and its own per-token catch skips a genuinely-broken read without a false violation).
           const msg = err instanceof Error ? err.message : String(err);
-          this.logger.error(
-            `Audit: getCode(AUDIT_XPNTS_TOKENS ${token}) failed (${msg}) — DROPPED`
+          this.logger.warn(
+            `Audit: getCode(AUDIT_XPNTS_TOKENS ${token}) failed (${msg}) — KEEPING (transient; read retries)`
           );
+          valid.push(token);
           continue;
         }
         if (!code || code === "0x") {
+          // AUTHORITATIVE: no code = EOA / wrong chain / destroyed → drop (loud, not silent).
           this.logger.error(
             `Audit: AUDIT_XPNTS_TOKENS ${token} has no on-chain code on chainId ${this.chainId} — DROPPED`
           );
@@ -2297,6 +2302,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     derivedOperatorCount: number;
     derivedSetFresh: boolean;
     lastRoleRefreshAt: number | null;
+    overIssueEnabled: boolean;
+    overIssueTokenCount: number;
     lastTickAt: number | null;
     recentDetections: AuditDetection[];
     archivedProofCount: number;
@@ -2322,6 +2329,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       roleDerive: this.roleDerive,
       derivedOperatorCount: this.derivedOperators.length,
       derivedSetFresh: this.derivedSetIsFresh(),
+      overIssueEnabled: this.overIssueEnabled,
+      overIssueTokenCount: this.xpntsTokens.length,
       lastRoleRefreshAt: this.lastRoleRefreshAt,
       lastTickAt: this.lastTickAt,
       recentDetections: this.recentDetections,
