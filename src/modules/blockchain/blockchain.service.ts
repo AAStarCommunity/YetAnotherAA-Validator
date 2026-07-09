@@ -61,29 +61,48 @@ export class BlockchainService {
   private keeperWallet?: ethers.Wallet;
 
   /**
-   * FIFO serialization for the liveness ATTEST keeper (inc-2), which fires on a timer and shares
-   * the operator EOA with the slash writes. Design choice: slash writes are the PRIORITY and stay
-   * UNWRAPPED (they proceed immediately, never wait) — the attest instead YIELDS. This lock only
-   * serializes concurrent attests (one in-flight at a time); the attest's retry loop additionally
-   * detects a nonce grabbed by a slash and refetches, so a slash never fails because of an attest.
-   * An attest is idempotent + retriable, so losing a rare dead-heat costs only a retry/next tick.
+   * Single FIFO serialization for ALL operator-EOA (`this.wallet`) writes — the liveness attest
+   * keeper (inc-2, fires on a timer) AND every slash/proposal write share the same EOA, so without
+   * one lock two of them can read the same pending nonce and collide (a time-sensitive slash could
+   * fail as an underpriced same-nonce replacement, or an attest could displace a pending slash).
+   * Every write goes through `enqueueWalletWrite`, so exactly one holds the nonce at a time.
+   *
+   * Slash PRIORITY: `slashPending` counts slash writes that are queued-or-running. A slash bumps it
+   * synchronously BEFORE it waits for the lock, so a currently-running attest sees it (`hasPendingSlashWrite`)
+   * and BAILS between send attempts — releasing the lock so the slash runs next instead of waiting out
+   * the attest's retry budget. An attest is idempotent + retriable (re-anchors next tick), so yielding
+   * costs nothing; a slash never waits more than one in-flight attest SEND (seconds), never a full loop.
    */
-  private walletLock: Promise<unknown> = Promise.resolve();
+  private walletChain: Promise<unknown> = Promise.resolve();
+  private slashPending = 0;
 
   constructor(private configService: ConfigService) {
     this.initializeProvider();
   }
 
-  /** Run `fn` with at most one attest in-flight (see `walletLock`). */
-  protected async runWithWallet<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.walletLock.then(fn, fn);
+  /** True while any slash write is queued or running — the attest polls this to yield priority. */
+  protected hasPendingSlashWrite(): boolean {
+    return this.slashPending > 0;
+  }
+
+  /** Enqueue an operator-wallet write on the single FIFO chain (serializes nonce use). */
+  protected enqueueWalletWrite<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.walletChain.then(fn, fn);
     // Keep the chain alive regardless of fn's outcome; swallow here so one failure
     // doesn't reject every future waiter (each caller still gets its own result/throw).
-    this.walletLock = run.then(
+    this.walletChain = run.then(
       () => undefined,
       () => undefined
     );
     return run;
+  }
+
+  /** Enqueue a PRIORITY slash write: bump `slashPending` synchronously (so a running attest yields). */
+  protected enqueueSlashWrite<T>(fn: () => Promise<T>): Promise<T> {
+    this.slashPending++;
+    return this.enqueueWalletWrite(fn).finally(() => {
+      this.slashPending--;
+    });
   }
 
   private initializeProvider(): void {
@@ -621,8 +640,11 @@ export class BlockchainService {
    */
   async getAttestAnchor(depth: number): Promise<{ number: number; hash: string }> {
     if (!this.provider) throw new Error("Blockchain provider not configured");
+    // Coerce to a protocol-valid depth: a finite integer in [1, 255]. An out-of-range/NaN depth
+    // would otherwise select genesis, a stale block, or `getBlock(NaN)` (permanent tick failure).
+    const safeDepth = Number.isFinite(depth) ? Math.min(255, Math.max(1, Math.floor(depth))) : 16;
     const latest = await this.provider.getBlockNumber();
-    const target = Math.max(0, latest - Math.max(1, Math.floor(depth)));
+    const target = Math.max(0, latest - safeDepth);
     const b = await this.provider.getBlock(target);
     if (!b || typeof b.number !== "number" || !b.hash) {
       throw new Error(
@@ -633,17 +655,38 @@ export class BlockchainService {
   }
 
   /**
+   * Next fee bundle for an attest (re)send. For a same-nonce REPLACEMENT (`prev` set) it must
+   * STRICTLY exceed the previous tx on BOTH fields (geth requires ≥10%; we use +12.5%), else the
+   * node rejects it as `REPLACEMENT_UNDERPRICED` and the stuck tx never clears. It also floors at
+   * the fresh network estimate, so a rising base fee is followed rather than undercut.
+   */
+  private async nextAttestFees(
+    prev: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | null
+  ): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }> {
+    const fresh = await bumpedFees(this.provider);
+    if (!prev) return fresh;
+    const bump = (x: bigint): bigint => (x * 1125n) / 1000n; // +12.5% > geth's 10% replacement floor
+    const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
+    return {
+      maxFeePerGas: max(fresh.maxFeePerGas, bump(prev.maxFeePerGas)),
+      maxPriorityFeePerGas: max(fresh.maxPriorityFeePerGas, bump(prev.maxPriorityFeePerGas)),
+    };
+  }
+
+  /**
    * LivenessRegistry.attestLiveness(anchorBlock, anchorHash) — the operator (this node) self-proves
    * liveness on-chain so SP's auto-jail excludes it only when it is genuinely silent (inc-2 C1).
    *
    * msg.sender MUST be the registered operator EOA (`this.wallet`) — NOT the keeper key — because
-   * the registry attests the SENDER. Runs under `runWithWallet` (one attest in-flight) and YIELDS
-   * to slash writes on a nonce dead-heat (refetch + retry), so a slash — the priority — never fails
-   * because of an attest. Hardening (Codex inc-2 review): staticCall preflight (fail fast on a
-   * stale/bad anchor without burning a nonce), a bounded deadline loop with same-nonce fee-bumped
-   * REPLACEMENT (a fresh-nonce resend cannot clear a stuck lower nonce — and a tx stuck > 256
-   * blocks would freeze `lastLive` into a false-offline), and a final receipt reconciliation across
-   * every hash we broadcast (the original may mine while we wait on a replacement).
+   * the registry attests the SENDER. Runs on the single operator-wallet FIFO (`enqueueWalletWrite`)
+   * shared with the slash writes, so no attest/slash nonce race is possible; and it YIELDS to a
+   * pending slash (bails between attempts — `hasPendingSlashWrite`) so a slash never waits out the
+   * attest's retry budget. Hardening (Codex inc-2 review): staticCall preflight (fail before burning
+   * a nonce on a stale/bad anchor); a bounded deadline loop with same-nonce STRICTLY-increasing fee
+   * REPLACEMENT (`nextAttestFees` — a tx stuck > 256 blocks would freeze `lastLive` into a false-
+   * offline); a nonce-consumed error triggers a reconcile-then-refetch (our own tx may have mined →
+   * don't double-attest; otherwise a slash took the nonce → refetch + retry, guaranteeing a resend);
+   * and a final receipt reconciliation across every broadcast hash.
    */
   async attestLiveness(
     registryAddress: string,
@@ -654,17 +697,30 @@ export class BlockchainService {
     if (!this.wallet) {
       throw new Error("attestLiveness: no operator wallet (ETH_PRIVATE_KEY unset)");
     }
-    // Tight deadline on purpose: attest shares the operator-EOA FIFO lock with slash writes, so a
-    // slash waits at most one attest cycle. ≤ ~40s worst case (2 × 20s) bounds that wait. True
-    // slash-PREEMPTION of an in-flight attest is deferred (bootstrap N=3: slashes are rare +
-    // manual-review-gated, and the audit pipeline re-tries the slash on its next tick).
     const perAttemptMs = opts.perAttemptMs ?? 20_000;
-    const maxAttempts = Math.max(1, opts.maxAttempts ?? 2);
-    return this.runWithWallet(async () => {
+    const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
+    return this.enqueueWalletWrite(async () => {
       const op = this.wallet.address;
       const abi = ["function attestLiveness(uint256 anchorBlock, bytes32 anchorHash) external"];
       const contract = this.buildContract(registryAddress, abi, this.wallet);
+      const sent: string[] = [];
+      // Best-effort: return the first broadcast hash that already confirmed status 1.
+      const reconcile = async (): Promise<string | null> => {
+        for (const h of sent) {
+          try {
+            const r = await this.provider.getTransactionReceipt(h);
+            if (r?.status === 1) return h;
+          } catch {
+            // ignore — best-effort
+          }
+        }
+        return null;
+      };
 
+      // Yield to a waiting slash BEFORE taking a nonce (slash is the priority).
+      if (this.hasPendingSlashWrite()) {
+        throw new Error("attestLiveness yielded to a pending slash write");
+      }
       // Preflight: a stale/bad anchor reverts (StaleAnchor/BadAnchorHash). Fail here BEFORE
       // consuming a nonce so the keeper re-anchors on the next tick instead of burning gas.
       try {
@@ -676,53 +732,59 @@ export class BlockchainService {
         );
       }
 
-      // Pin a nonce so a resend is a same-nonce REPLACEMENT (not a new tx). If a slash grabs this
-      // nonce (dead-heat), the send throws a nonce-too-low error → we REFETCH a fresh nonce and
-      // retry (yielding priority to the slash). A stuck/underpriced tx instead keeps the nonce and
-      // escalates fees so the replacement displaces it before the anchor goes stale.
       let nonce = await this.provider.getTransactionCount(op, "pending");
-      const sent: string[] = [];
-      let bumpPct = 20;
+      let prevFees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | null = null;
       let lastErr: any;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        // Yield mid-loop the moment a slash is waiting — release the lock for it (re-anchor next tick).
+        if (this.hasPendingSlashWrite()) {
+          lastErr = new Error("yielded to a pending slash write");
+          break;
+        }
+        // 1) Broadcast (same nonce = replacement; strictly-increasing fees so it isn't underpriced).
+        let tx: ethers.TransactionResponse;
         try {
-          const fees = await bumpedFees(this.provider, bumpPct);
-          const tx: ethers.TransactionResponse = await contract.attestLiveness(
-            anchorBlock,
-            anchorHash,
-            {
-              nonce,
-              ...fees,
-            }
-          );
+          const fees = await this.nextAttestFees(prevFees);
+          prevFees = fees;
+          tx = await contract.attestLiveness(anchorBlock, anchorHash, { nonce, ...fees });
           sent.push(tx.hash);
-          const receipt = await tx.wait(1, perAttemptMs);
-          if (receipt?.status === 1) return tx.hash;
-          // Mined but reverted → nonce consumed; a same-nonce replacement can't help. Re-anchor next tick.
-          throw new Error(`attest tx ${tx.hash} reverted (status ${receipt?.status ?? "unknown"})`);
         } catch (e: any) {
           lastErr = e;
+          const code = e?.code;
           const msg = String(e?.shortMessage ?? e?.message ?? e);
-          // A reverted receipt is terminal for this anchor — stop and reconcile.
-          if (msg.includes("reverted")) break;
-          // A slash took our nonce (dead-heat) → yield: refetch the fresh pending nonce and retry.
-          if (/nonce too low|nonce has already been used|NONCE_EXPIRED/i.test(msg)) {
+          // Nonce consumed: our OWN earlier tx may have mined (reconcile → don't double-attest);
+          // otherwise a slash took the nonce → refetch a fresh nonce and retry (guaranteed resend).
+          if (code === "NONCE_EXPIRED" || /nonce too low|nonce has already been used/i.test(msg)) {
+            const hit = await reconcile();
+            if (hit) return hit;
             nonce = await this.provider.getTransactionCount(op, "pending");
             continue;
           }
-          // Timeout / underpriced replacement → keep the same nonce, escalate fees, resend.
-          bumpPct += 30;
+          // Replacement underpriced → next iteration bumps from prevFees; just retry.
+          if (
+            code === "REPLACEMENT_UNDERPRICED" ||
+            /replacement transaction underpriced/i.test(msg)
+          ) {
+            continue;
+          }
+          break; // unknown send error — reconcile + throw
         }
-      }
-      // Reconcile: the original may have mined while we waited on a replacement (or vice versa).
-      for (const h of sent) {
+        // 2) Await inclusion with a per-attempt deadline.
         try {
-          const r = await this.provider.getTransactionReceipt(h);
-          if (r?.status === 1) return h;
-        } catch {
-          // ignore — best-effort reconciliation
+          const receipt = await tx.wait(1, perAttemptMs);
+          if (receipt?.status === 1) return tx.hash;
+          // Mined but reverted → terminal for this anchor (re-anchor next tick).
+          lastErr = new Error(
+            `attest tx ${tx.hash} reverted (status ${receipt?.status ?? "unknown"})`
+          );
+          break;
+        } catch (e: any) {
+          lastErr = e;
+          // Timeout / not yet mined → keep the SAME nonce, escalate fees next iteration (replacement).
         }
       }
+      const hit = await reconcile();
+      if (hit) return hit;
       throw new Error(
         `attestLiveness not confirmed after ${maxAttempts} attempt(s): ${lastErr?.message ?? lastErr}`
       );
@@ -1523,64 +1585,68 @@ export class BlockchainService {
     level: number,
     reason: string
   ): Promise<{ txHash: string; proposalId: bigint | null }> {
-    if (!this.wallet) {
-      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
-    }
-    // Minimal fragment set: the write function plus the event we parse the real id from.
-    const abi = [
-      "function createProposal(address operator, uint8 level, string reason) returns (uint256)",
-      "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
-    ];
-    const iface = new ethers.Interface(abi);
-    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
-    const fees = await bumpedFees(this.provider);
-    const tx: ethers.TransactionResponse = await contract.createProposal(
-      operator,
-      level,
-      reason,
-      fees
-    );
-    this.logger.log(`createProposal(${operator}, ${level}) submitted: ${tx.hash}`);
-    // Await the receipt: a dropped/reverted proposal must NOT be recorded as success.
-    // Throw on failure so the caller archives the evidence but records proposalTx=null.
-    const receipt = await tx.wait();
-    if (!receipt || receipt.status !== 1) {
-      throw new Error(
-        `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
-      );
-    }
-    // Parse the REAL on-chain proposal id from the emitted ProposalCreated event. Best-effort:
-    // decode by topic, ignore unrelated logs, and fall back to null (never fabricate an id).
-    let proposalId: bigint | null = null;
-    for (const log of receipt.logs) {
-      try {
-        // MEDIUM 3 (Codex): only trust a ProposalCreated emitted BY the DVTValidator we called AND
-        // matching THIS proposal's operator + level. A decodable log from another contract, or one
-        // whose args disagree, must NEVER be mistaken for our proposal id (a wrong id would bind the
-        // evidence to someone else's proposal and later make executeWithProof slash the wrong thing).
-        if (ethers.getAddress(log.address) !== ethers.getAddress(dvtValidatorAddress)) continue;
-        const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
-        if (!parsed || parsed.name !== "ProposalCreated") continue;
-        const evOperator = parsed.args.operator ?? parsed.args[1];
-        const evLevel = parsed.args.level ?? parsed.args[2];
-        if (ethers.getAddress(evOperator) !== ethers.getAddress(operator)) continue;
-        if (Number(evLevel) !== level) continue;
-        proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
-        break;
-      } catch {
-        // Not a ProposalCreated log from this validator (or from another contract) — skip.
+    // Priority slash write on the shared operator-wallet FIFO (bumps slashPending so a running
+    // attest yields; serializes the nonce). See `enqueueSlashWrite` / `enqueueWalletWrite`.
+    return this.enqueueSlashWrite(async () => {
+      if (!this.wallet) {
+        throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
       }
-    }
-    if (proposalId === null) {
-      this.logger.warn(
-        `createProposal ${tx.hash} confirmed but no ProposalCreated event found — id unresolved`
+      // Minimal fragment set: the write function plus the event we parse the real id from.
+      const abi = [
+        "function createProposal(address operator, uint8 level, string reason) returns (uint256)",
+        "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
+      ];
+      const iface = new ethers.Interface(abi);
+      const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+      const fees = await bumpedFees(this.provider);
+      const tx: ethers.TransactionResponse = await contract.createProposal(
+        operator,
+        level,
+        reason,
+        fees
       );
-    }
-    this.logger.log(
-      `createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}` +
-        (proposalId !== null ? ` (proposalId ${proposalId})` : "")
-    );
-    return { txHash: tx.hash, proposalId };
+      this.logger.log(`createProposal(${operator}, ${level}) submitted: ${tx.hash}`);
+      // Await the receipt: a dropped/reverted proposal must NOT be recorded as success.
+      // Throw on failure so the caller archives the evidence but records proposalTx=null.
+      const receipt = await tx.wait();
+      if (!receipt || receipt.status !== 1) {
+        throw new Error(
+          `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+        );
+      }
+      // Parse the REAL on-chain proposal id from the emitted ProposalCreated event. Best-effort:
+      // decode by topic, ignore unrelated logs, and fall back to null (never fabricate an id).
+      let proposalId: bigint | null = null;
+      for (const log of receipt.logs) {
+        try {
+          // MEDIUM 3 (Codex): only trust a ProposalCreated emitted BY the DVTValidator we called AND
+          // matching THIS proposal's operator + level. A decodable log from another contract, or one
+          // whose args disagree, must NEVER be mistaken for our proposal id (a wrong id would bind the
+          // evidence to someone else's proposal and later make executeWithProof slash the wrong thing).
+          if (ethers.getAddress(log.address) !== ethers.getAddress(dvtValidatorAddress)) continue;
+          const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+          if (!parsed || parsed.name !== "ProposalCreated") continue;
+          const evOperator = parsed.args.operator ?? parsed.args[1];
+          const evLevel = parsed.args.level ?? parsed.args[2];
+          if (ethers.getAddress(evOperator) !== ethers.getAddress(operator)) continue;
+          if (Number(evLevel) !== level) continue;
+          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+          break;
+        } catch {
+          // Not a ProposalCreated log from this validator (or from another contract) — skip.
+        }
+      }
+      if (proposalId === null) {
+        this.logger.warn(
+          `createProposal ${tx.hash} confirmed but no ProposalCreated event found — id unresolved`
+        );
+      }
+      this.logger.log(
+        `createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}` +
+          (proposalId !== null ? ` (proposalId ${proposalId})` : "")
+      );
+      return { txHash: tx.hash, proposalId };
+    });
   }
 
   /**
@@ -1604,78 +1670,80 @@ export class BlockchainService {
     evidenceHash: string,
     dryRun = false
   ): Promise<{ txHash: string; proposalId: bigint | null }> {
-    if (!this.wallet) {
-      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
-    }
-    const abi = [
-      "function createProposal(address operator, uint8 level, string reason, bytes32 evidenceHash) returns (uint256)",
-      "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
-    ];
-    const iface = new ethers.Interface(abi);
-    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
-    // DRY RUN (Codex #181 F1): createProposal is a REAL governance tx — broadcasting it in a drill
-    // would leave an orphaned on-chain proposal. staticCall instead: it validates the call AND returns
-    // the would-be proposalId (createProposal's return value) for the execute messageHash, with NO
-    // broadcast and no side effect.
-    if (dryRun) {
-      const wouldBeId: bigint = await contract.createProposal.staticCall(
+    return this.enqueueSlashWrite(async () => {
+      if (!this.wallet) {
+        throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+      }
+      const abi = [
+        "function createProposal(address operator, uint8 level, string reason, bytes32 evidenceHash) returns (uint256)",
+        "event ProposalCreated(uint256 indexed id, address indexed operator, uint8 level)",
+      ];
+      const iface = new ethers.Interface(abi);
+      const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+      // DRY RUN (Codex #181 F1): createProposal is a REAL governance tx — broadcasting it in a drill
+      // would leave an orphaned on-chain proposal. staticCall instead: it validates the call AND returns
+      // the would-be proposalId (createProposal's return value) for the execute messageHash, with NO
+      // broadcast and no side effect.
+      if (dryRun) {
+        const wouldBeId: bigint = await contract.createProposal.staticCall(
+          operator,
+          level,
+          reason,
+          evidenceHash
+        );
+        this.logger.log(
+          `createProposal DRY RUN: staticCall passed (would-be id ${wouldBeId}) — NOT broadcasting`
+        );
+        return { txHash: DRY_RUN_TX_SENTINEL, proposalId: wouldBeId };
+      }
+      const fees = await bumpedFees(this.provider);
+      const tx: ethers.TransactionResponse = await contract.createProposal(
         operator,
         level,
         reason,
-        evidenceHash
+        evidenceHash,
+        fees
       );
       this.logger.log(
-        `createProposal DRY RUN: staticCall passed (would-be id ${wouldBeId}) — NOT broadcasting`
+        `createProposal(${operator}, ${level}, evidence ${evidenceHash}) submitted: ${tx.hash}`
       );
-      return { txHash: DRY_RUN_TX_SENTINEL, proposalId: wouldBeId };
-    }
-    const fees = await bumpedFees(this.provider);
-    const tx: ethers.TransactionResponse = await contract.createProposal(
-      operator,
-      level,
-      reason,
-      evidenceHash,
-      fees
-    );
-    this.logger.log(
-      `createProposal(${operator}, ${level}, evidence ${evidenceHash}) submitted: ${tx.hash}`
-    );
-    const receipt = await tx.wait();
-    if (!receipt || receipt.status !== 1) {
-      throw new Error(
-        `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
-      );
-    }
-    let proposalId: bigint | null = null;
-    for (const log of receipt.logs) {
-      try {
-        // MEDIUM 3 (Codex): only trust a ProposalCreated emitted BY the DVTValidator we called AND
-        // matching THIS proposal's operator + level. A decodable log from another contract, or one
-        // whose args disagree, must NEVER be mistaken for our proposal id (a wrong id would bind the
-        // evidence to someone else's proposal and later make executeWithProof slash the wrong thing).
-        if (ethers.getAddress(log.address) !== ethers.getAddress(dvtValidatorAddress)) continue;
-        const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
-        if (!parsed || parsed.name !== "ProposalCreated") continue;
-        const evOperator = parsed.args.operator ?? parsed.args[1];
-        const evLevel = parsed.args.level ?? parsed.args[2];
-        if (ethers.getAddress(evOperator) !== ethers.getAddress(operator)) continue;
-        if (Number(evLevel) !== level) continue;
-        proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
-        break;
-      } catch {
-        // Not a ProposalCreated log from this validator (or from another contract) — skip.
+      const receipt = await tx.wait();
+      if (!receipt || receipt.status !== 1) {
+        throw new Error(
+          `createProposal tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+        );
       }
-    }
-    if (proposalId === null) {
-      this.logger.warn(
-        `createProposal ${tx.hash} confirmed but no ProposalCreated event found — id unresolved`
+      let proposalId: bigint | null = null;
+      for (const log of receipt.logs) {
+        try {
+          // MEDIUM 3 (Codex): only trust a ProposalCreated emitted BY the DVTValidator we called AND
+          // matching THIS proposal's operator + level. A decodable log from another contract, or one
+          // whose args disagree, must NEVER be mistaken for our proposal id (a wrong id would bind the
+          // evidence to someone else's proposal and later make executeWithProof slash the wrong thing).
+          if (ethers.getAddress(log.address) !== ethers.getAddress(dvtValidatorAddress)) continue;
+          const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+          if (!parsed || parsed.name !== "ProposalCreated") continue;
+          const evOperator = parsed.args.operator ?? parsed.args[1];
+          const evLevel = parsed.args.level ?? parsed.args[2];
+          if (ethers.getAddress(evOperator) !== ethers.getAddress(operator)) continue;
+          if (Number(evLevel) !== level) continue;
+          proposalId = BigInt(parsed.args.id ?? parsed.args[0]);
+          break;
+        } catch {
+          // Not a ProposalCreated log from this validator (or from another contract) — skip.
+        }
+      }
+      if (proposalId === null) {
+        this.logger.warn(
+          `createProposal ${tx.hash} confirmed but no ProposalCreated event found — id unresolved`
+        );
+      }
+      this.logger.log(
+        `createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}` +
+          (proposalId !== null ? ` (proposalId ${proposalId})` : "")
       );
-    }
-    this.logger.log(
-      `createProposal(${operator}, ${level}) confirmed in block ${receipt.blockNumber}` +
-        (proposalId !== null ? ` (proposalId ${proposalId})` : "")
-    );
-    return { txHash: tx.hash, proposalId };
+      return { txHash: tx.hash, proposalId };
+    });
   }
 
   /**
@@ -1693,57 +1761,59 @@ export class BlockchainService {
     proof: string,
     dryRun = false
   ): Promise<string> {
-    if (!this.wallet) {
-      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
-    }
-    const abi = [
-      "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof) external",
-    ];
-    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
-    // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT call first. Any deterministic
-    // mismatch (bad signerMask, sigG2 encoding, DST, on-chain threshold, stale slot mapping, wrong
-    // address, proposal state) reverts HERE — before spending a single wei of gas — so the audit's
-    // try/catch degrades to file+archive instead of eating a PAID on-chain revert. Only a passing
-    // simulation lets the real, irreversible tx broadcast.
-    try {
-      await contract.queueSlashWithProof.staticCall(operator, slashLevel, epoch, proof);
-    } catch (err: unknown) {
-      const reason = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `queueSlashWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`,
-        { cause: err }
+    return this.enqueueSlashWrite(async () => {
+      if (!this.wallet) {
+        throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+      }
+      const abi = [
+        "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof) external",
+      ];
+      const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+      // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT call first. Any deterministic
+      // mismatch (bad signerMask, sigG2 encoding, DST, on-chain threshold, stale slot mapping, wrong
+      // address, proposal state) reverts HERE — before spending a single wei of gas — so the audit's
+      // try/catch degrades to file+archive instead of eating a PAID on-chain revert. Only a passing
+      // simulation lets the real, irreversible tx broadcast.
+      try {
+        await contract.queueSlashWithProof.staticCall(operator, slashLevel, epoch, proof);
+      } catch (err: unknown) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `queueSlashWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`,
+          { cause: err }
+        );
+      }
+      // DRY-RUN (AUDIT_DRY_RUN): the preflight above ran against the REAL contract and passed, proving
+      // the signerMask/sigG2/threshold/slot mapping are accepted by verifyAndExecute. Stop HERE — do
+      // NOT broadcast the real queue tx and do NOT await a receipt (there is no tx). Return the sentinel
+      // so the caller records that this step was a dry run instead of a real slash queue.
+      if (dryRun) {
+        this.logger.warn(
+          `queueSlashWithProof DRY RUN: staticCall passed, NOT broadcasting — would queue slash of ` +
+            `${operator} (slashLevel ${slashLevel}, epoch ${epoch})`
+        );
+        return DRY_RUN_TX_SENTINEL;
+      }
+      const fees = await bumpedFees(this.provider);
+      const tx: ethers.TransactionResponse = await contract.queueSlashWithProof(
+        operator,
+        slashLevel,
+        epoch,
+        proof,
+        fees
       );
-    }
-    // DRY-RUN (AUDIT_DRY_RUN): the preflight above ran against the REAL contract and passed, proving
-    // the signerMask/sigG2/threshold/slot mapping are accepted by verifyAndExecute. Stop HERE — do
-    // NOT broadcast the real queue tx and do NOT await a receipt (there is no tx). Return the sentinel
-    // so the caller records that this step was a dry run instead of a real slash queue.
-    if (dryRun) {
-      this.logger.warn(
-        `queueSlashWithProof DRY RUN: staticCall passed, NOT broadcasting — would queue slash of ` +
-          `${operator} (slashLevel ${slashLevel}, epoch ${epoch})`
+      this.logger.log(
+        `queueSlashWithProof(${operator}, ${slashLevel}, epoch ${epoch}) submitted: ${tx.hash}`
       );
-      return DRY_RUN_TX_SENTINEL;
-    }
-    const fees = await bumpedFees(this.provider);
-    const tx: ethers.TransactionResponse = await contract.queueSlashWithProof(
-      operator,
-      slashLevel,
-      epoch,
-      proof,
-      fees
-    );
-    this.logger.log(
-      `queueSlashWithProof(${operator}, ${slashLevel}, epoch ${epoch}) submitted: ${tx.hash}`
-    );
-    const receipt = await tx.wait();
-    if (!receipt || receipt.status !== 1) {
-      throw new Error(
-        `queueSlashWithProof tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
-      );
-    }
-    this.logger.log(`queueSlashWithProof(${operator}) confirmed in block ${receipt.blockNumber}`);
-    return tx.hash;
+      const receipt = await tx.wait();
+      if (!receipt || receipt.status !== 1) {
+        throw new Error(
+          `queueSlashWithProof tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+        );
+      }
+      this.logger.log(`queueSlashWithProof(${operator}) confirmed in block ${receipt.blockNumber}`);
+      return tx.hash;
+    });
   }
 
   /**
@@ -1762,54 +1832,56 @@ export class BlockchainService {
     proof: string,
     dryRun = false
   ): Promise<string> {
-    if (!this.wallet) {
-      throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
-    }
-    const abi = [
-      "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof) external",
-    ];
-    const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
-    // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT execute call first so any
-    // deterministic revert (signerMask/sigG2/threshold/proposal-state mismatch) surfaces BEFORE the
-    // irreversible slash tx spends gas. Only a passing simulation lets the real tx broadcast.
-    try {
-      await contract.executeWithProof.staticCall(id, repUsers, newScores, epoch, proof);
-    } catch (err: unknown) {
-      const reason = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `executeWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`,
-        { cause: err }
+    return this.enqueueSlashWrite(async () => {
+      if (!this.wallet) {
+        throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
+      }
+      const abi = [
+        "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof) external",
+      ];
+      const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
+      // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT execute call first so any
+      // deterministic revert (signerMask/sigG2/threshold/proposal-state mismatch) surfaces BEFORE the
+      // irreversible slash tx spends gas. Only a passing simulation lets the real tx broadcast.
+      try {
+        await contract.executeWithProof.staticCall(id, repUsers, newScores, epoch, proof);
+      } catch (err: unknown) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `executeWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`,
+          { cause: err }
+        );
+      }
+      // DRY-RUN (AUDIT_DRY_RUN): the preflight above simulated the EXACT irreversible slash against the
+      // REAL contract and passed — proving verifyAndExecute accepts the proof — but this is a drill, so
+      // stop HERE. Do NOT broadcast the real slash and do NOT await a receipt. Return the sentinel so the
+      // caller records that NO operator was actually slashed (and skips the durable over-slash marker).
+      if (dryRun) {
+        this.logger.warn(
+          `executeSlashWithProof DRY RUN: staticCall passed, NOT broadcasting — would slash proposal ` +
+            `id ${id} (epoch ${epoch})`
+        );
+        return DRY_RUN_TX_SENTINEL;
+      }
+      const fees = await bumpedFees(this.provider);
+      const tx: ethers.TransactionResponse = await contract.executeWithProof(
+        id,
+        repUsers,
+        newScores,
+        epoch,
+        proof,
+        fees
       );
-    }
-    // DRY-RUN (AUDIT_DRY_RUN): the preflight above simulated the EXACT irreversible slash against the
-    // REAL contract and passed — proving verifyAndExecute accepts the proof — but this is a drill, so
-    // stop HERE. Do NOT broadcast the real slash and do NOT await a receipt. Return the sentinel so the
-    // caller records that NO operator was actually slashed (and skips the durable over-slash marker).
-    if (dryRun) {
-      this.logger.warn(
-        `executeSlashWithProof DRY RUN: staticCall passed, NOT broadcasting — would slash proposal ` +
-          `id ${id} (epoch ${epoch})`
-      );
-      return DRY_RUN_TX_SENTINEL;
-    }
-    const fees = await bumpedFees(this.provider);
-    const tx: ethers.TransactionResponse = await contract.executeWithProof(
-      id,
-      repUsers,
-      newScores,
-      epoch,
-      proof,
-      fees
-    );
-    this.logger.log(`executeWithProof(id ${id}, epoch ${epoch}) submitted: ${tx.hash}`);
-    const receipt = await tx.wait();
-    if (!receipt || receipt.status !== 1) {
-      throw new Error(
-        `executeWithProof tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
-      );
-    }
-    this.logger.log(`executeWithProof(id ${id}) confirmed in block ${receipt.blockNumber}`);
-    return tx.hash;
+      this.logger.log(`executeWithProof(id ${id}, epoch ${epoch}) submitted: ${tx.hash}`);
+      const receipt = await tx.wait();
+      if (!receipt || receipt.status !== 1) {
+        throw new Error(
+          `executeWithProof tx ${tx.hash} failed (status ${receipt?.status ?? "unknown"})`
+        );
+      }
+      this.logger.log(`executeWithProof(id ${id}) confirmed in block ${receipt.blockNumber}`);
+      return tx.hash;
+    });
   }
 
   /** Current network base-fee in gwei (0 on chains without EIP-1559). */

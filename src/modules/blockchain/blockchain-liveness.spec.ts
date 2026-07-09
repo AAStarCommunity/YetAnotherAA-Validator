@@ -113,6 +113,106 @@ describe("BlockchainService.attestLiveness", () => {
       /no operator wallet/
     );
   });
+
+  it("YIELDS immediately (before taking a nonce) when a slash write is pending", async () => {
+    const svc = svcWithWallet();
+    const getTransactionCount = jest.fn(async () => 5);
+    const staticCall = jest.fn(async () => undefined);
+    (svc as any).provider = { getFeeData: async () => feeData, getTransactionCount };
+    const attestLiveness: any = () => tx("0xnever", async () => ({ status: 1 }));
+    attestLiveness.staticCall = staticCall;
+    (svc as any).buildContract = () => ({ attestLiveness });
+    (svc as any).slashPending = 1; // a slash is queued/running → attest must yield
+    await expect(svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH)).rejects.toThrow(/yielded/);
+    expect(staticCall).not.toHaveBeenCalled(); // bailed before preflight + before any nonce read
+    expect(getTransactionCount).not.toHaveBeenCalled();
+  });
+
+  it("replacement on timeout uses STRICTLY-increasing fees on both fields", async () => {
+    const svc = svcWithWallet();
+    // Rising base fee would still be undercut without the +12.5% prev-fee floor; keep it flat so the
+    // strict-increase must come from the replacement logic, not the fresh estimate.
+    (svc as any).provider = {
+      getFeeData: async () => ({ maxFeePerGas: 100n, maxPriorityFeePerGas: 10n }),
+      getTransactionCount: async () => 5,
+      getTransactionReceipt: async () => null,
+    };
+    const feeArgs: Array<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }> = [];
+    const attestLiveness: any = (_a: number, _h: string, opts: any) => {
+      feeArgs.push({
+        maxFeePerGas: opts.maxFeePerGas,
+        maxPriorityFeePerGas: opts.maxPriorityFeePerGas,
+      });
+      return tx("0x" + feeArgs.length, async () => {
+        throw new Error("timeout waiting for tx");
+      });
+    };
+    attestLiveness.staticCall = async () => undefined;
+    (svc as any).buildContract = () => ({ attestLiveness });
+    await expect(svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH)).rejects.toThrow(/not confirmed/);
+    expect(feeArgs.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < feeArgs.length; i++) {
+      expect(feeArgs[i].maxFeePerGas > feeArgs[i - 1].maxFeePerGas).toBe(true);
+      expect(feeArgs[i].maxPriorityFeePerGas > feeArgs[i - 1].maxPriorityFeePerGas).toBe(true);
+    }
+  });
+
+  it("REPLACEMENT_UNDERPRICED on send → retries (does not abort the loop)", async () => {
+    const svc = svcWithWallet();
+    (svc as any).provider = {
+      getFeeData: async () => feeData,
+      getTransactionCount: async () => 5,
+      getTransactionReceipt: async () => null,
+    };
+    let call = 0;
+    const attestLiveness: any = () => {
+      call++;
+      if (call === 1) {
+        const e: any = new Error("replacement transaction underpriced");
+        e.code = "REPLACEMENT_UNDERPRICED";
+        throw e;
+      }
+      return tx("0xafterbump", async () => ({ status: 1 }));
+    };
+    attestLiveness.staticCall = async () => undefined;
+    (svc as any).buildContract = () => ({ attestLiveness });
+    await expect(svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH)).resolves.toBe("0xafterbump");
+  });
+});
+
+describe("BlockchainService operator-wallet slash priority", () => {
+  it("BAILS mid-loop when a slash arrives while the attest is waiting (releases the lock for it)", async () => {
+    const svc = svcWithWallet();
+    (svc as any).provider = {
+      getFeeData: async () => feeData,
+      getTransactionCount: async () => 5,
+      getTransactionReceipt: async () => null,
+    };
+    // First send lands but the wait times out; DURING that wait a slash arrives (slashPending=1),
+    // so the next loop iteration must bail instead of burning the rest of the retry budget.
+    const attestLiveness: any = () =>
+      tx("0xt", async () => {
+        (svc as any).slashPending = 1;
+        throw new Error("timeout waiting for tx");
+      });
+    attestLiveness.staticCall = async () => undefined;
+    (svc as any).buildContract = () => ({ attestLiveness });
+    // The final error embeds the bail reason ("yielded to a pending slash write").
+    await expect(svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH)).rejects.toThrow(/yielded/);
+  });
+
+  it("enqueueSlashWrite bumps slashPending during the write and clears it after (even on throw)", async () => {
+    const svc = svcWithWallet();
+    let seenDuring = -1;
+    await (svc as any)
+      .enqueueSlashWrite(async () => {
+        seenDuring = (svc as any).slashPending;
+        throw new Error("boom");
+      })
+      .catch(() => undefined);
+    expect(seenDuring).toBe(1); // pending while running
+    expect((svc as any).slashPending).toBe(0); // cleared in finally even though it threw
+  });
 });
 
 describe("BlockchainService liveness reads", () => {

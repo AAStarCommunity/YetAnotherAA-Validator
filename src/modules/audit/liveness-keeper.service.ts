@@ -35,6 +35,10 @@ import { OpsAlertService } from "../ops-alert/ops-alert.service.js";
  */
 @Injectable()
 export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicationShutdown {
+  /** Operationally-safe cadence bounds (fail-closed outside these). */
+  private static readonly MIN_INTERVAL_MS = 30_000; // 30s — below this floods RPC/gas
+  private static readonly MAX_INTERVAL_MS = 21_600_000; // 6h — above risks tripping the offline window
+
   private readonly logger = new Logger(LivenessKeeperService.name);
   private readonly enabled: boolean;
   private readonly registryAddress: string;
@@ -43,6 +47,8 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Guards against overlapping ticks if one attest runs longer than the interval. */
   private inFlight = false;
+  /** Set on shutdown so a fired timer / in-flight boot-attest starts no NEW work. */
+  private stopping = false;
 
   constructor(
     private readonly blockchain: BlockchainService,
@@ -69,10 +75,17 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
       );
       return;
     }
-    // Defensive: a non-finite / non-positive interval must never reach setInterval.
-    if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
+    // Bound the interval to an operationally-safe range [30s, 6h]. Too small floods RPC/gas; too
+    // large (or NaN/Infinity from bad env) can wrap Node's timer range to a near-immediate fire.
+    // Fail-CLOSED (disable) rather than fail-open on a misconfigured cadence.
+    if (
+      !Number.isFinite(this.intervalMs) ||
+      this.intervalMs < LivenessKeeperService.MIN_INTERVAL_MS ||
+      this.intervalMs > LivenessKeeperService.MAX_INTERVAL_MS
+    ) {
       this.logger.warn(
-        `invalid AUDIT_ATTEST_INTERVAL_MS (${this.intervalMs}) — attest keeper DISABLED`
+        `AUDIT_ATTEST_INTERVAL_MS (${this.intervalMs}) out of [${LivenessKeeperService.MIN_INTERVAL_MS}, ` +
+          `${LivenessKeeperService.MAX_INTERVAL_MS}] — attest keeper DISABLED`
       );
       return;
     }
@@ -88,6 +101,7 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
   }
 
   onApplicationShutdown(): void {
+    this.stopping = true;
     if (this.timer !== null) {
       clearInterval(this.timer);
       this.timer = null;
@@ -96,6 +110,7 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
 
   /** One attest cycle: read a fresh anchor, send attestLiveness. Never throws. */
   async tick(): Promise<void> {
+    if (this.stopping) return; // no new work during shutdown
     if (this.inFlight) {
       this.logger.debug("attest tick skipped — previous still in-flight");
       return;
