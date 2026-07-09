@@ -72,21 +72,86 @@ is retained, unarmed:
 - ① was the **only armed rule** (its `verifyViolationForCoSign` was
   credit-specific); removing it leaves the co-sign responder unarmed/dormant.
 
-### Waking a future slash
+## 5. How to add a new DVT audit rule (playbook)
 
-1. Re-code a DVT **rule predicate** (detect the violation at a pinned finalized
-   block, deterministic).
-2. **Arm** a co-sign verifier (re-confirm the violation from first principles)
-   so peers cross-verify.
-3. **File** a proposal → BLS-quorum co-sign → queue/execute → slash stake.
+The audit pipeline is **rule-agnostic**. A rule plugs into this fixed flow:
 
-The on-chain execution machinery (`DVTValidator` / `BLSAggregator` /
-`slashThresholds`) is already deployed.
+```
+enumerate targets → pin ONE finalized block → RULE predicate (deterministic)
+  → content-address the proof (keccak of on-chain-only identity)
+  → archive proof → file proposal (createProposal)
+  → [if armed] BLS-quorum co-sign (each peer re-verifies from first principles)
+  → queue → execute → slash stake
+```
 
-- A rule whose evidence is a **pure on-chain view** (like `isOverIssued`) →
-  **DVT-only** re-code.
-- A rule needing **new on-chain state** → also needs SP contract work. Example:
-  **offline-duration tiered slash** (1d → 10%, 3d → 30% +
-  permanent-offline-until-stake-topup) needs accumulated-downtime tracking
-  - penalty tiers, which `LivenessRegistry` does **not** have today (only
-    instantaneous `isOffline`).
+### Step 0 — decide the penalty (§2)
+
+- Objective + attributable + globally-verifiable economic fraud → **SLASH**
+  (this playbook).
+- Liveness / availability → **JAIL** (SP LivenessRegistry, not this pipeline).
+- Informational → **REPUTATION** (on-chain view; DVT doesn't act).
+
+Only build a slash rule for the first case.
+
+### Step 1 — the on-chain cooperation matrix (do this FIRST)
+
+| The rule's evidence is…                                              | DVT work                                   | On-chain (SP) work                                     |
+| -------------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------ |
+| a **pure on-chain view** (e.g. `isOverIssued`, a debt/limit compare) | predicate reads the view at a pinned block | **none** — machinery already deployed                  |
+| **derived from existing on-chain state** but not a single view       | predicate composes reads deterministically | none, unless a helper view is cleaner                  |
+| **new on-chain state that doesn't exist yet**                        | predicate reads the new view               | **SP must add the state + a `blockTag`-readable view** |
+
+The execution machinery (`DVTValidator.createProposal` →
+`BLSAggregator.verifyAndExecute` → `slashThresholds`) is **already deployed** —
+waking a slash never needs new execution contracts, only (sometimes) a new
+**evidence source**.
+
+### Step 2 — DVT code changes (in this repo)
+
+1. `blockchain.service.ts`: add a **read helper** for the rule's on-chain
+   inputs, `blockTag`-capable (so every co-signer reproduces the same value at
+   the epoch block). Model it on `getIsOverIssued`.
+2. `audit.service.ts`: add a **predicate** method (`auditXxxForTarget`) — pin to
+   the finalized block, read inputs, decide, and on a violation call the shared
+   `handleViolation({ …, identity, … })`. Add its call in `tick()`. Add a
+   `RULE_XXX` string + `SLASH_LEVEL_XXX` (`SlashLevel` enum).
+3. `proof-archive.ts`: add the rule's **identity fields** to `ProofIdentity`
+   (optional; `stableStringify` drops undefined). Do **NOT** change
+   `PROOF_SCHEMA_VERSION` unless you break an existing rule's hash.
+4. **Arm the responder** — add a `verifyViolationForCoSign`-style verifier that
+   re-reads the SAME inputs pinned at `req.epoch` and re-derives the proofHash,
+   and wire it via `armable.arm(...)` in `onApplicationBootstrap`. This is what
+   makes the slash a **quorum** (peers independently confirm) — the
+   innocent-operator defense. Without it the rule is file-only (proposal, never
+   executes).
+5. `configuration.ts`: add any `AUDIT_*` addresses/params + a fail-closed
+   required-check.
+6. Tests: predicate true/false branches, determinism (same proofHash across
+   nodes at the epoch), dedup (one proposal per violation), evidence-never-lost
+   (archive before propose), and the armed co-sign path.
+
+### Step 3 — arming & rollout
+
+- Keep it **file-only** first (`AUDIT_EXECUTE_SLASH` off) to observe proposals
+  without slashing.
+- Arm (`AUDIT_EXECUTE_SLASH=true`) only after the evidence is proven objective
+  on the target chain.
+- Every rejected/indeterminate read must **fail-safe** (no proposal), never
+  fail-open.
+
+### Worked example — offline-duration tiered slash (a FUTURE rule)
+
+Goal: 1 day offline → 10% slash; 3 days → 30% + permanent-offline until stake
+top-up.
+
+- **On-chain (SP) work (required first):** `LivenessRegistry` today exposes only
+  the _instantaneous_ `isOffline` / `lastLive`. This rule needs
+  **accumulated-downtime** tracking + **penalty tiers** — new on-chain state + a
+  `blockTag`-readable view (e.g. `offlineSinceBlock(op)` / `downtimeTier(op)`).
+- **DVT work:** a read helper for the new view; a predicate that maps the tier →
+  `SlashLevel` and a slash percentage; an armed verifier; config. The execution
+  pipeline is unchanged.
+
+Contrast: a rule like over-issue would have been **DVT-only** (its evidence
+`isOverIssued()` is already an on-chain view) — but we chose to make over-issue
+a **reputation** signal, not a slash (§3).
