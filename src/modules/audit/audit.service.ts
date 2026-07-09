@@ -66,6 +66,14 @@ const RULE_OFFLINE = "offline";
  * 10 minutes. (The effective window is this + the finality lag of the evidence block.)
  */
 const OFFLINE_THRESHOLD_MS = 600_000;
+/**
+ * Rule ③ over-issue (CC-28). MINOR (3-of-3 quorum) — a community minting xPNTs beyond its governance
+ * cap is a serious economic abuse, and the evidence is OBJECTIVE (on-chain isOverIssued() bool), so
+ * the strict quorum is warranted. Slash SUBJECT = the token's communityOwner. Cleared when the token
+ * is next seen within cap.
+ */
+const SLASH_LEVEL_OVER_ISSUE = SlashLevel.MINOR;
+const RULE_OVER_ISSUE = "over-issue";
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
 
@@ -140,6 +148,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   /** Stable operator→nodeId cache (offline rule ②). A transient resolve failure keeps the cached
    *  nodeId so a still-relevant operator is never pruned from the gossip ledger on an RPC blip. */
   private readonly offlineNodeIdCache = new Map<string, string>();
+  /** Rule ③ over-issue — opt-in; audits each community xPNTs token's on-chain isOverIssued() flag.
+   *  May be disabled at bootstrap (oversized list / all tokens invalid). */
+  private overIssueEnabled: boolean;
+  /** Community xPNTs token addresses to check for over-issuance (checksummed at ingest; bytecode-
+   *  validated + pruned at bootstrap). */
+  private xpntsTokens: string[];
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
   private derivedOperators: string[] = [];
   /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
@@ -245,6 +259,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.logger.warn(`[AUDIT-EVENT] kind=${kind} ${kv}`);
   }
   private static readonly MAX_RECENT = 20;
+  /** Bound on AUDIT_XPNTS_TOKENS — the over-issue rule polls tokens serially per tick (2 reads each),
+   *  so a huge list could elongate a tick and starve the single-flight guard (Codex Low). */
+  private static readonly MAX_XPNTS_TOKENS = 256;
 
   constructor(
     private readonly blockchainService: BlockchainService,
@@ -304,6 +321,36 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.roleUseGetter = config.get<boolean>("auditRoleUseGetter") === true;
     this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
     this.offlineEnabled = config.get<boolean>("auditOfflineEnabled") === true;
+    // Checksum, drop invalid, DEDUP.
+    const canonicalTokens = (config.get<string[]>("auditXpntsTokens") ?? [])
+      .map(a => a.trim())
+      .filter(Boolean)
+      .map(a => {
+        try {
+          return ethers.getAddress(a);
+        } catch {
+          this.logger.warn(`Audit: dropping invalid AUDIT_XPNTS_TOKENS entry "${a}"`);
+          return null;
+        }
+      })
+      .filter((a): a is string => a !== null);
+    const deduped = [...new Set(canonicalTokens)];
+    const rawOverIssue = config.get<boolean>("auditOverIssueEnabled") === true;
+    // FAIL-CLOSED on an oversized list (Codex High): silently truncating to a cap would drop configured
+    // audit targets — a security allowlist must NEVER silently reduce coverage. Over the bound → DISABLE
+    // over-issue with a loud error so the operator shards/reduces rather than getting partial coverage.
+    if (rawOverIssue && deduped.length > AuditService.MAX_XPNTS_TOKENS) {
+      this.logger.error(
+        `Audit: AUDIT_XPNTS_TOKENS has ${deduped.length} > ${AuditService.MAX_XPNTS_TOKENS} tokens — ` +
+          `over-issue DISABLED (fail-closed). Reduce the list or shard it across nodes; silent ` +
+          `truncation would leave tokens unaudited.`
+      );
+      this.overIssueEnabled = false;
+      this.xpntsTokens = [];
+    } else {
+      this.overIssueEnabled = rawOverIssue;
+      this.xpntsTokens = deduped;
+    }
     this.gossip = gossip ?? null;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
@@ -325,9 +372,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.log("DVT audit DISABLED (AUDIT_ENABLED!=true) — no operators watched");
       return;
     }
-    if (this.watchlist.length === 0 && !this.roleDerive) {
+    // A node may audit OPERATORS (static watchlist / on-chain-derived) and/or TOKENS (rule ③ over-
+    // issue) — over-issue is operator-independent, so a token-ONLY deployment must still schedule the
+    // tick (Codex: bootstrap starvation). Only bail when there is nothing of EITHER kind to watch.
+    const hasOperators = this.watchlist.length > 0 || this.roleDerive;
+    const hasOverIssueTokens = this.overIssueEnabled && this.xpntsTokens.length > 0;
+    if (!hasOperators && !hasOverIssueTokens) {
       this.logger.warn(
-        "Audit: AUDIT_ENABLED=true but AUDIT_WATCHLIST is empty and AUDIT_ROLE_DERIVE!=true — nothing to watch"
+        "Audit: AUDIT_ENABLED=true but nothing to watch — AUDIT_WATCHLIST empty, AUDIT_ROLE_DERIVE!=true, " +
+          "and no AUDIT_XPNTS_TOKENS (over-issue)"
       );
       return;
     }
@@ -379,6 +432,41 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           `Audit: ${name}=${addr} has no on-chain code on chainId ${this.chainId} — DISABLED (fail-closed)`
         );
         return;
+      }
+    }
+    // Rule ③ — bytecode-validate each configured xPNTs token (Codex Medium: a missing/EOA/wrong-chain
+    // token address would otherwise be caught-and-swallowed per read, silently unaudited forever). A
+    // bad token is DROPPED with a loud error (not the whole audit — credit/offline may still be valid).
+    if (this.overIssueEnabled && this.xpntsTokens.length > 0) {
+      const valid: string[] = [];
+      for (const token of this.xpntsTokens) {
+        let code: string;
+        try {
+          code = await this.blockchainService.getCode(token);
+        } catch (err: unknown) {
+          // TRANSIENT RPC error — do NOT permanently drop a possibly-valid token on a one-time startup
+          // hiccup (Codex Medium). KEEP it; the per-tick getIsOverIssued read retries once RPC recovers
+          // (and its own per-token catch skips a genuinely-broken read without a false violation).
+          const msg = err instanceof Error ? err.message : String(err);
+          this.logger.warn(
+            `Audit: getCode(AUDIT_XPNTS_TOKENS ${token}) failed (${msg}) — KEEPING (transient; read retries)`
+          );
+          valid.push(token);
+          continue;
+        }
+        if (!code || code === "0x") {
+          // AUTHORITATIVE: no code = EOA / wrong chain / destroyed → drop (loud, not silent).
+          this.logger.error(
+            `Audit: AUDIT_XPNTS_TOKENS ${token} has no on-chain code on chainId ${this.chainId} — DROPPED`
+          );
+          continue;
+        }
+        valid.push(token);
+      }
+      this.xpntsTokens = valid;
+      if (valid.length === 0) {
+        this.overIssueEnabled = false;
+        this.logger.error("Audit: no valid AUDIT_XPNTS_TOKENS remain — over-issue DISABLED");
       }
     }
     // A1#6 — eager first derivation so the startup log + first tick already see the on-chain set
@@ -560,6 +648,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // belonged to is over); drop it so a genuinely-new future violation files a fresh proposal rather
     // than reusing a dead id (Codex: stale-id poisoning on the healthy→re-offend path).
     this.pendingProposalIds.delete(coarseKey);
+    // NOTE: the proposal COOLDOWN (lastProposalAt) is deliberately NOT cleared here — it is a pure
+    // RATE LIMIT (≤1 proposal per subject per cooldownMs). Clearing it on every healthy read would let
+    // a FLAPPING condition (cross the boundary each block) spam a fresh proposal every tick. Episode
+    // semantics: a cure→re-breach re-files once the cooldown expires (or immediately if the gap already
+    // exceeds it), never faster. This keeps credit/offline (both live) spam-safe.
     // A healthy read ALWAYS attempts the durable removal, regardless of the current executeSlash
     // setting. A durable marker written by an EARLIER armed run must be cleared even if the node is
     // now running disarmed — otherwise it would survive an armed→disarmed→armed restart cycle and,
@@ -678,6 +771,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           }
         }
         this.gossip.setRelevantNodeIds(this.offlineNodeIdCache.values());
+      }
+      // Rule ③ over-issue — audits TOKENS (per community), INDEPENDENT of the operator set, so it runs
+      // even when the operator watchlist is empty. One token's failure never skips another.
+      if (this.overIssueEnabled) {
+        for (const token of this.xpntsTokens) {
+          try {
+            await this.auditOverIssueForToken(token, pinnedBlock);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.logger.error(`Audit: over-issue audit failed for token ${token} — ${msg}`);
+            this.emitAuditEvent("ERROR", { operator: token, error: msg });
+          }
+        }
       }
       if (operators.length === 0) {
         this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
@@ -1119,6 +1225,87 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   }
 
   /**
+   * Rule ③ over-issue (CC-28) for ONE community xPNTs token, pinned to the finalized block. Reads the
+   * token's OBJECTIVE on-chain isOverIssued() flag (issued value > governance effectiveCap). On true,
+   * the SLASH SUBJECT is the token's communityOwner (the community that minted beyond its cap). The
+   * evidence is a deterministic on-chain bool → every DVT node agrees → SAFELY quorum-slashable
+   * (unlike gossip-offline). Fail-SAFE: over-issue disabled, an isOverIssued/communityOwner read
+   * error, or a null owner → SKIP (never fabricate). A within-cap read CLEARS any coarse marker.
+   */
+  private async auditOverIssueForToken(
+    token: string,
+    pinnedBlock: { number: number; hash: string }
+  ): Promise<void> {
+    if (!this.overIssueEnabled) return;
+
+    let over: boolean;
+    try {
+      over = await this.blockchainService.getIsOverIssued(token, pinnedBlock.number);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Audit: over-issue isOverIssued read failed for token ${token} — ${msg}`);
+      return;
+    }
+
+    if (!over) {
+      // Cure: within cap → clear the TOKEN-scoped marker so a later re-breach of THIS token can file
+      // again (episode semantics: one open episode per token). Checked BEFORE reading communityOwner
+      // (Codex Low): a within-cap token needs no owner read, and a transient owner-null must not block
+      // the marker clear.
+      await this.clearCoarseSlashed(token, RULE_OVER_ISSUE);
+      return;
+    }
+
+    // Over-issued → the communityOwner is the slash subject; read it at the SAME block (pinned). Only
+    // fetched on a real violation (not on every within-cap token).
+    const owner = await this.blockchainService.getCommunityOwner(token, pinnedBlock.number);
+    if (!owner) return; // can't identify the subject → skip (fail-safe)
+
+    // OVER-ISSUE violation. DETERMINISTIC identity — on-chain bool, no per-node data.
+    const identity: ProofIdentity = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
+      chainId: this.chainId,
+      operator: owner,
+      rule: RULE_OVER_ISSUE,
+      violationBlock: pinnedBlock.number,
+      slashLevel: SLASH_LEVEL_OVER_ISSUE,
+      registry: this.normalizeAddress(this.registryAddress),
+      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
+      overIssueToken: this.normalizeAddress(token),
+    };
+    const reason = `${RULE_OVER_ISSUE}: community ${owner} over-issued xPNTs token ${token} (isOverIssued=true @block ${pinnedBlock.number})`;
+    this.logger.warn(reason);
+    const sources: EvidenceSource[] = [
+      {
+        type: "view",
+        name: "xPNTs.isOverIssued()",
+        value: "true",
+        block: pinnedBlock.number,
+      },
+      {
+        type: "view",
+        name: "xPNTs.communityOwner()",
+        value: owner,
+        block: pinnedBlock.number,
+      },
+    ];
+    await this.handleViolation({
+      operator: owner,
+      slashLevel: SLASH_LEVEL_OVER_ISSUE,
+      reason,
+      rule: RULE_OVER_ISSUE,
+      violationBlock: pinnedBlock.number,
+      violationBlockHash: pinnedBlock.hash,
+      sources,
+      observedAt: this.clock(),
+      identity,
+      observed: `over-issued (token ${token})`,
+      threshold: "isOverIssued=false",
+      dedupSubject: token, // TOKEN-scoped dedup (one owner may over-issue multiple tokens)
+    });
+  }
+
+  /**
    * Best-effort operator debt read (block-pinned). Per the verified SP ABI, debt lives on the
    * xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT SuperPaymaster/Registry — so this reads the
    * aPNTs token directly. Returns null when the token's getDebt reverts / is absent — the caller
@@ -1281,6 +1468,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // credit path's debt/creditLimit are used, so its archived evidence is unchanged.
     observed?: string;
     threshold?: string;
+    /** Dedup/cooldown key subject — defaults to `operator`. Rule ③ over-issue passes the TOKEN so
+     *  multiple over-issued tokens under one communityOwner are tracked independently (not collapsed). */
+    dedupSubject?: string;
   }): Promise<AuditDetection | null> {
     // DETERMINISTIC slash epoch = the violationBlock (an on-chain fact). Two DVT nodes observing
     // the SAME violation derive the SAME epoch, so their queue/execute co-sign preimages match and
@@ -1311,8 +1501,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     const proofHash = computeProofHash(identity);
 
     // ── DEDUP ─────────────────────────────────────────────────────────────────────
-    const stableKey = `${this.chainId}|${v.operator}|${v.rule}|${v.violationBlock}`;
-    const coarseKey = this.coarseKey(v.operator, v.rule);
+    // The dedup/cooldown SUBJECT defaults to the operator, but a rule whose violation stream is keyed
+    // by something OTHER than the slash subject overrides it (rule ③ over-issue: one community owner
+    // can have MULTIPLE over-issued tokens — keying by the owner would collapse them into one proposal,
+    // so it keys by the TOKEN while the slash subject stays the owner).
+    const dedupSubject = v.dedupSubject ?? v.operator;
+    const stableKey = `${this.chainId}|${dedupSubject}|${v.rule}|${v.violationBlock}`;
+    const coarseKey = this.coarseKey(dedupSubject, v.rule);
     // Exact same violation@block already handled (this process, or on disk from a prior run) — with
     // TWO bypasses so an incomplete slash is not stranded:
     //   (a) `coSignRetryKeys` (in-memory): a prior attempt's ARMED co-sign aborted transiently.
@@ -1847,10 +2042,17 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
-    // Rule ② offline (inc-1) is FILE-ONLY: the armed BLS co-sign for offline (the responder re-checking
-    // its OWN gossip liveness) is inc-2, so the offline path never queues/executes — it only files a
-    // proposal + archives the proof. The credit rule is unaffected.
-    const fileOnlyRule = args.rule === RULE_OFFLINE;
+    // FILE-ONLY rules (inc-1): file a proposal + archive the proof, but never queue/execute an on-chain
+    // slash yet. Offline's armed co-sign is deferred (its evidence is gossip-local; see #202). Over-
+    // issue's evidence IS objective (on-chain isOverIssued) so it is armable in principle, but its slash
+    // SUBJECT is a communityOwner (not a BLS-slotted DVT operator) — arming waits until the SP contract
+    // community-slash path is confirmed. The credit rule is unaffected (stays armed).
+    // INC-2 BLOCKER for over-issue (Codex High): the dedup coarseKey is TOKEN-scoped but the slash
+    // subject + assessSlashState + execute are OWNER-scoped. Two tokens of one owner would keep
+    // independent token-scoped armed state (slashedCoarseKeys/pendingProposalIds) yet slash the SAME
+    // owner — enabling a double-slash / orphaned-proposal. Over-issue MUST stay file-only until the
+    // proposal-dedup (token) is SEPARATED from the pending/executed-slash guard (owner).
+    const fileOnlyRule = args.rule === RULE_OFFLINE || args.rule === RULE_OVER_ISSUE;
     // A1#6 (Codex High-2 + round-3) — a derived-ONLY operator is armed for the irreversible on-chain
     // slash only when its membership is CONFIRMED at the evidence block (epoch) via hasRole — not just
     // the cached set's wall-clock freshness. Stale/never-confirmed/exited-by-epoch membership degrades
@@ -2103,6 +2305,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     derivedOperatorCount: number;
     derivedSetFresh: boolean;
     lastRoleRefreshAt: number | null;
+    overIssueEnabled: boolean;
+    overIssueTokenCount: number;
     lastTickAt: number | null;
     recentDetections: AuditDetection[];
     archivedProofCount: number;
@@ -2128,6 +2332,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       roleDerive: this.roleDerive,
       derivedOperatorCount: this.derivedOperators.length,
       derivedSetFresh: this.derivedSetIsFresh(),
+      overIssueEnabled: this.overIssueEnabled,
+      overIssueTokenCount: this.xpntsTokens.length,
       lastRoleRefreshAt: this.lastRoleRefreshAt,
       lastTickAt: this.lastTickAt,
       recentDetections: this.recentDetections,
