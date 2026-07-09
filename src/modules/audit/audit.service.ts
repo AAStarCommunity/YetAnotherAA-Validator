@@ -257,6 +257,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.logger.warn(`[AUDIT-EVENT] kind=${kind} ${kv}`);
   }
   private static readonly MAX_RECENT = 20;
+  /** Bound on AUDIT_XPNTS_TOKENS — the over-issue rule polls tokens serially per tick (2 reads each),
+   *  so a huge list could elongate a tick and starve the single-flight guard (Codex Low). */
+  private static readonly MAX_XPNTS_TOKENS = 256;
 
   constructor(
     private readonly blockchainService: BlockchainService,
@@ -317,7 +320,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
     this.offlineEnabled = config.get<boolean>("auditOfflineEnabled") === true;
     this.overIssueEnabled = config.get<boolean>("auditOverIssueEnabled") === true;
-    this.xpntsTokens = (config.get<string[]>("auditXpntsTokens") ?? [])
+    // Checksum, drop invalid, DEDUP, and cap (bounded serial polling per tick — Codex Low).
+    const canonicalTokens = (config.get<string[]>("auditXpntsTokens") ?? [])
       .map(a => a.trim())
       .filter(Boolean)
       .map(a => {
@@ -329,6 +333,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         }
       })
       .filter((a): a is string => a !== null);
+    const deduped = [...new Set(canonicalTokens)];
+    if (deduped.length > AuditService.MAX_XPNTS_TOKENS) {
+      this.logger.warn(
+        `Audit: AUDIT_XPNTS_TOKENS has ${deduped.length} entries — capping to ${AuditService.MAX_XPNTS_TOKENS}`
+      );
+    }
+    this.xpntsTokens = deduped.slice(0, AuditService.MAX_XPNTS_TOKENS);
     this.gossip = gossip ?? null;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
@@ -350,9 +361,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.log("DVT audit DISABLED (AUDIT_ENABLED!=true) — no operators watched");
       return;
     }
-    if (this.watchlist.length === 0 && !this.roleDerive) {
+    // A node may audit OPERATORS (static watchlist / on-chain-derived) and/or TOKENS (rule ③ over-
+    // issue) — over-issue is operator-independent, so a token-ONLY deployment must still schedule the
+    // tick (Codex: bootstrap starvation). Only bail when there is nothing of EITHER kind to watch.
+    const hasOperators = this.watchlist.length > 0 || this.roleDerive;
+    const hasOverIssueTokens = this.overIssueEnabled && this.xpntsTokens.length > 0;
+    if (!hasOperators && !hasOverIssueTokens) {
       this.logger.warn(
-        "Audit: AUDIT_ENABLED=true but AUDIT_WATCHLIST is empty and AUDIT_ROLE_DERIVE!=true — nothing to watch"
+        "Audit: AUDIT_ENABLED=true but nothing to watch — AUDIT_WATCHLIST empty, AUDIT_ROLE_DERIVE!=true, " +
+          "and no AUDIT_XPNTS_TOKENS (over-issue)"
       );
       return;
     }
@@ -585,6 +602,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // belonged to is over); drop it so a genuinely-new future violation files a fresh proposal rather
     // than reusing a dead id (Codex: stale-id poisoning on the healthy→re-offend path).
     this.pendingProposalIds.delete(coarseKey);
+    // End the episode: drop the proposal COOLDOWN too, so a genuinely-NEW violation after a cure is
+    // not suppressed by the resolved episode's cooldown window (Codex episode semantics — a
+    // cure→re-breach must be able to re-file promptly, not wait out the prior episode's cooldown).
+    this.lastProposalAt.delete(coarseKey);
     // A healthy read ALWAYS attempts the durable removal, regardless of the current executeSlash
     // setting. A durable marker written by an EARLIER armed run must be cleared even if the node is
     // now running disarmed — otherwise it would survive an armed→disarmed→armed restart cycle and,
@@ -1184,7 +1205,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     if (!owner) return; // can't identify the subject → skip (fail-safe)
 
     if (!over) {
-      await this.clearCoarseSlashed(owner, RULE_OVER_ISSUE);
+      // Cure: within cap → clear the TOKEN-scoped marker so a later re-breach of THIS token can file
+      // again (episode semantics: one open episode per token, cleared on cure).
+      await this.clearCoarseSlashed(token, RULE_OVER_ISSUE);
       return;
     }
 
@@ -1228,6 +1251,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       identity,
       observed: `over-issued (token ${token})`,
       threshold: "isOverIssued=false",
+      dedupSubject: token, // TOKEN-scoped dedup (one owner may over-issue multiple tokens)
     });
   }
 
@@ -1394,6 +1418,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // credit path's debt/creditLimit are used, so its archived evidence is unchanged.
     observed?: string;
     threshold?: string;
+    /** Dedup/cooldown key subject — defaults to `operator`. Rule ③ over-issue passes the TOKEN so
+     *  multiple over-issued tokens under one communityOwner are tracked independently (not collapsed). */
+    dedupSubject?: string;
   }): Promise<AuditDetection | null> {
     // DETERMINISTIC slash epoch = the violationBlock (an on-chain fact). Two DVT nodes observing
     // the SAME violation derive the SAME epoch, so their queue/execute co-sign preimages match and
@@ -1424,8 +1451,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     const proofHash = computeProofHash(identity);
 
     // ── DEDUP ─────────────────────────────────────────────────────────────────────
-    const stableKey = `${this.chainId}|${v.operator}|${v.rule}|${v.violationBlock}`;
-    const coarseKey = this.coarseKey(v.operator, v.rule);
+    // The dedup/cooldown SUBJECT defaults to the operator, but a rule whose violation stream is keyed
+    // by something OTHER than the slash subject overrides it (rule ③ over-issue: one community owner
+    // can have MULTIPLE over-issued tokens — keying by the owner would collapse them into one proposal,
+    // so it keys by the TOKEN while the slash subject stays the owner).
+    const dedupSubject = v.dedupSubject ?? v.operator;
+    const stableKey = `${this.chainId}|${dedupSubject}|${v.rule}|${v.violationBlock}`;
+    const coarseKey = this.coarseKey(dedupSubject, v.rule);
     // Exact same violation@block already handled (this process, or on disk from a prior run) — with
     // TWO bypasses so an incomplete slash is not stranded:
     //   (a) `coSignRetryKeys` (in-memory): a prior attempt's ARMED co-sign aborted transiently.

@@ -2837,5 +2837,91 @@ describe("AuditService", () => {
       await svc.tick();
       expect(queued).toBe(false);
     });
+
+    it("TWO over-issued tokens under ONE owner file TWO proposals (token-scoped dedup, Codex High)", async () => {
+      const TOKEN2 = "0x" + "18".repeat(20);
+      const created: string[] = [];
+      const blockchain = makeBlockchain({
+        getIsOverIssued: async () => true,
+        getCommunityOwner: async () => OWNER, // SAME owner for both tokens
+        createProposalWithEvidence: async (_a: string, operator: string) => {
+          created.push(operator);
+          return { txHash: "0xTX", proposalId: 11n };
+        },
+      });
+      const archive = makeArchive();
+      const svc = makeService(
+        blockchain,
+        overIssueConfig({ auditXpntsTokens: [TOKEN, TOKEN2] }),
+        archive
+      );
+      await svc.tick();
+      // BOTH tokens produce a distinct over-issue proof (not collapsed by the shared owner).
+      expect(archive.records.filter(r => r.evidence.rule === "over-issue")).toHaveLength(2);
+      expect(created).toHaveLength(2);
+    });
+
+    it("sustained breach does NOT re-file within cooldown; a cure→re-breach DOES re-file", async () => {
+      let over = true;
+      let blk = BLOCK; // blocks ADVANCE each tick (a finalized block's state can't flip)
+      const created: string[] = [];
+      const blockchain = makeBlockchain({
+        getViolationBlock: async () => ({ number: blk++, hash: BLOCK_HASH }),
+        getIsOverIssued: async () => over,
+        getCommunityOwner: async () => OWNER,
+        createProposalWithEvidence: async (_a: string, operator: string) => {
+          created.push(operator);
+          return { txHash: "0xTX", proposalId: 11n };
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        overIssueConfig(),
+        makeArchive(),
+        clockAt(1_700_000_000_000)
+      );
+      await svc.tick(); // breach → 1 proposal
+      await svc.tick(); // still breached, within cooldown → NOT re-filed
+      expect(created).toHaveLength(1);
+      over = false;
+      await svc.tick(); // cure → clears the token marker
+      over = true;
+      await svc.tick(); // re-breach after cure → files again
+      expect(created).toHaveLength(2);
+    });
+
+    it("a thrown isOverIssued SKIPS that token but still audits the others", async () => {
+      const BAD = "0x" + "19".repeat(20);
+      const created: string[] = [];
+      const blockchain = makeBlockchain({
+        getIsOverIssued: async (token: string) => {
+          if (token === BAD) throw new Error("no archive at block");
+          return true;
+        },
+        getCommunityOwner: async () => OWNER,
+        createProposalWithEvidence: async (_a: string, operator: string) => {
+          created.push(operator);
+          return { txHash: "0xTX", proposalId: 11n };
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        overIssueConfig({ auditXpntsTokens: [BAD, TOKEN] }),
+        makeArchive()
+      );
+      await svc.tick();
+      expect(created).toHaveLength(1); // BAD skipped, TOKEN still flagged
+    });
+
+    it("a TOKEN-ONLY node (empty watchlist) still schedules — over-issue runs (bootstrap starvation fix)", async () => {
+      const blockchain = makeBlockchain({ getIsOverIssued: async () => false });
+      const svc = makeService(
+        blockchain,
+        overIssueConfig({ auditWatchlist: [] }), // no operators, only tokens
+        makeArchive()
+      );
+      await svc.onApplicationBootstrap();
+      expect((await svc.getStatus()).enabled).toBe(true); // did NOT bail on empty watchlist
+    });
   });
 });
