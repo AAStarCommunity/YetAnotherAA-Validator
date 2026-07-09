@@ -324,6 +324,18 @@ export default () => {
     auditOverIssueEnabled: process.env.AUDIT_OVER_ISSUE_ENABLED === "true",
     auditXpntsTokens: parseAllowlist(process.env.AUDIT_XPNTS_TOKENS || ""),
 
+    // inc-2 liveness attest keeper (SP LivenessRegistry, CC-29). Opt-in. Each DVT node self-proves
+    // liveness on-chain so SP's auto-jail only excludes genuinely-silent operators. Reads NOTHING
+    // for slash-threshold math (BLSAggregator owns the fixed on-chain threshold) — this only writes
+    // attestLiveness(anchorBlock, anchorHash) from the operator EOA. Interval is wall-clock; set it
+    // to ~livenessWindow/3 worth of time for the target chain (keeper logs the on-chain window at boot).
+    auditAttestEnabled: process.env.AUDIT_ATTEST_ENABLED === "true",
+    auditLivenessRegistryAddress: process.env.AUDIT_LIVENESS_REGISTRY_ADDRESS || "",
+    auditAttestIntervalMs: parseInt(process.env.AUDIT_ATTEST_INTERVAL_MS || "600000", 10),
+    // Anchor depth for attestLiveness: head−depth. Must sit ABOVE typical reorg depth (stable hash →
+    // no BadAnchorHash) yet well BELOW SP's 256-block staleness bound. Default 16.
+    auditAttestAnchorDepth: parseInt(process.env.AUDIT_ATTEST_ANCHOR_DEPTH || "16", 10),
+
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,
     gossipBootstrapPeers: parseBootstrapPeers(process.env.GOSSIP_BOOTSTRAP_PEERS || ""),

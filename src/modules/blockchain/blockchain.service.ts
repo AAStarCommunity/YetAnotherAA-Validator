@@ -60,8 +60,30 @@ export class BlockchainService {
    *  to `wallet` (ETH_PRIVATE_KEY) only when KEEPER_PRIVATE_KEY is unset. */
   private keeperWallet?: ethers.Wallet;
 
+  /**
+   * FIFO serialization for the liveness ATTEST keeper (inc-2), which fires on a timer and shares
+   * the operator EOA with the slash writes. Design choice: slash writes are the PRIORITY and stay
+   * UNWRAPPED (they proceed immediately, never wait) — the attest instead YIELDS. This lock only
+   * serializes concurrent attests (one in-flight at a time); the attest's retry loop additionally
+   * detects a nonce grabbed by a slash and refetches, so a slash never fails because of an attest.
+   * An attest is idempotent + retriable, so losing a rare dead-heat costs only a retry/next tick.
+   */
+  private walletLock: Promise<unknown> = Promise.resolve();
+
   constructor(private configService: ConfigService) {
     this.initializeProvider();
+  }
+
+  /** Run `fn` with at most one attest in-flight (see `walletLock`). */
+  protected async runWithWallet<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.walletLock.then(fn, fn);
+    // Keep the chain alive regardless of fn's outcome; swallow here so one failure
+    // doesn't reject every future waiter (each caller still gets its own result/throw).
+    this.walletLock = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   }
 
   private initializeProvider(): void {
@@ -526,6 +548,185 @@ export class BlockchainService {
       );
     }
     return { number: b.number, hash: b.hash };
+  }
+
+  // ── SP LivenessRegistry (CC-29) reads — objective on-chain liveness. inc-2 uses these for
+  //    OBSERVABILITY (alerting/forensics) + a soft co-sign request-set optimization, NOT for
+  //    threshold math (BLSAggregator owns the fixed on-chain threshold; see INC2_DESIGN.md). All
+  //    reads are `blockTag`-capable so a co-signer can reproduce the live-set at a slash epoch.
+  //    Stable read ABI locked by SP PR #346 (Codex-APPROVED).
+
+  private static readonly LIVENESS_READ_ABI = [
+    "function isOffline(address op) view returns (bool)",
+    "function areOffline(address[] ops) view returns (bool[])",
+    "function lastLive(address op) view returns (uint256)",
+    "function livenessWindow() view returns (uint256)",
+  ];
+
+  /** LivenessRegistry.livenessWindow() — fleet-global governance value (blocks). */
+  async getLivenessWindow(registryAddress: string, blockTag?: number): Promise<bigint> {
+    if (!this.provider) throw new Error("Blockchain provider not configured");
+    const c = this.buildContract(
+      registryAddress,
+      BlockchainService.LIVENESS_READ_ABI,
+      this.provider
+    );
+    return BigInt(await c.livenessWindow({ blockTag }));
+  }
+
+  /** LivenessRegistry.lastLive(op) — last block the operator attested (0 = never). Forensics/audit. */
+  async getLastLive(registryAddress: string, op: string, blockTag?: number): Promise<bigint> {
+    if (!this.provider) throw new Error("Blockchain provider not configured");
+    const c = this.buildContract(
+      registryAddress,
+      BlockchainService.LIVENESS_READ_ABI,
+      this.provider
+    );
+    return BigInt(await c.lastLive(op, { blockTag }));
+  }
+
+  /** LivenessRegistry.isOffline(op) — objective `block.number > lastLive + window`; never-attested ⇒ true. */
+  async getIsOffline(registryAddress: string, op: string, blockTag?: number): Promise<boolean> {
+    if (!this.provider) throw new Error("Blockchain provider not configured");
+    const c = this.buildContract(
+      registryAddress,
+      BlockchainService.LIVENESS_READ_ABI,
+      this.provider
+    );
+    return await c.isOffline(op, { blockTag });
+  }
+
+  /** LivenessRegistry.areOffline(ops) — batch; build the epoch live-set in one call (pin blockTag=epoch). */
+  async getAreOffline(
+    registryAddress: string,
+    ops: string[],
+    blockTag?: number
+  ): Promise<boolean[]> {
+    if (!this.provider) throw new Error("Blockchain provider not configured");
+    if (ops.length === 0) return [];
+    const c = this.buildContract(
+      registryAddress,
+      BlockchainService.LIVENESS_READ_ABI,
+      this.provider
+    );
+    const res: boolean[] = await c.areOffline(ops, { blockTag });
+    return res.map(Boolean);
+  }
+
+  /**
+   * A recent anchor block `{ number, hash }` for `attestLiveness`, at `head − depth`. SP's M-01
+   * fix requires anchorBlock ∈ [head−256, head−1] AND anchorHash == blockhash(anchorBlock). Pick
+   * `depth` well ABOVE typical reorg depth (so the hash is stable → no BadAnchorHash) yet well
+   * BELOW 256 (so the tx has ample inclusion margin before StaleAnchor). Depth is floored at 1.
+   */
+  async getAttestAnchor(depth: number): Promise<{ number: number; hash: string }> {
+    if (!this.provider) throw new Error("Blockchain provider not configured");
+    const latest = await this.provider.getBlockNumber();
+    const target = Math.max(0, latest - Math.max(1, Math.floor(depth)));
+    const b = await this.provider.getBlock(target);
+    if (!b || typeof b.number !== "number" || !b.hash) {
+      throw new Error(
+        `getAttestAnchor: could not resolve anchor block (latest ${latest}, target ${target})`
+      );
+    }
+    return { number: b.number, hash: b.hash };
+  }
+
+  /**
+   * LivenessRegistry.attestLiveness(anchorBlock, anchorHash) — the operator (this node) self-proves
+   * liveness on-chain so SP's auto-jail excludes it only when it is genuinely silent (inc-2 C1).
+   *
+   * msg.sender MUST be the registered operator EOA (`this.wallet`) — NOT the keeper key — because
+   * the registry attests the SENDER. Runs under `runWithWallet` (one attest in-flight) and YIELDS
+   * to slash writes on a nonce dead-heat (refetch + retry), so a slash — the priority — never fails
+   * because of an attest. Hardening (Codex inc-2 review): staticCall preflight (fail fast on a
+   * stale/bad anchor without burning a nonce), a bounded deadline loop with same-nonce fee-bumped
+   * REPLACEMENT (a fresh-nonce resend cannot clear a stuck lower nonce — and a tx stuck > 256
+   * blocks would freeze `lastLive` into a false-offline), and a final receipt reconciliation across
+   * every hash we broadcast (the original may mine while we wait on a replacement).
+   */
+  async attestLiveness(
+    registryAddress: string,
+    anchorBlock: number,
+    anchorHash: string,
+    opts: { perAttemptMs?: number; maxAttempts?: number } = {}
+  ): Promise<string> {
+    if (!this.wallet) {
+      throw new Error("attestLiveness: no operator wallet (ETH_PRIVATE_KEY unset)");
+    }
+    // Tight deadline on purpose: attest shares the operator-EOA FIFO lock with slash writes, so a
+    // slash waits at most one attest cycle. ≤ ~40s worst case (2 × 20s) bounds that wait. True
+    // slash-PREEMPTION of an in-flight attest is deferred (bootstrap N=3: slashes are rare +
+    // manual-review-gated, and the audit pipeline re-tries the slash on its next tick).
+    const perAttemptMs = opts.perAttemptMs ?? 20_000;
+    const maxAttempts = Math.max(1, opts.maxAttempts ?? 2);
+    return this.runWithWallet(async () => {
+      const op = this.wallet.address;
+      const abi = ["function attestLiveness(uint256 anchorBlock, bytes32 anchorHash) external"];
+      const contract = this.buildContract(registryAddress, abi, this.wallet);
+
+      // Preflight: a stale/bad anchor reverts (StaleAnchor/BadAnchorHash). Fail here BEFORE
+      // consuming a nonce so the keeper re-anchors on the next tick instead of burning gas.
+      try {
+        await contract.attestLiveness.staticCall(anchorBlock, anchorHash);
+      } catch (e: any) {
+        throw new Error(
+          `attestLiveness preflight reverted (stale/bad anchor?): ${e?.shortMessage ?? e?.message ?? e}`,
+          { cause: e }
+        );
+      }
+
+      // Pin a nonce so a resend is a same-nonce REPLACEMENT (not a new tx). If a slash grabs this
+      // nonce (dead-heat), the send throws a nonce-too-low error → we REFETCH a fresh nonce and
+      // retry (yielding priority to the slash). A stuck/underpriced tx instead keeps the nonce and
+      // escalates fees so the replacement displaces it before the anchor goes stale.
+      let nonce = await this.provider.getTransactionCount(op, "pending");
+      const sent: string[] = [];
+      let bumpPct = 20;
+      let lastErr: any;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          const fees = await bumpedFees(this.provider, bumpPct);
+          const tx: ethers.TransactionResponse = await contract.attestLiveness(
+            anchorBlock,
+            anchorHash,
+            {
+              nonce,
+              ...fees,
+            }
+          );
+          sent.push(tx.hash);
+          const receipt = await tx.wait(1, perAttemptMs);
+          if (receipt?.status === 1) return tx.hash;
+          // Mined but reverted → nonce consumed; a same-nonce replacement can't help. Re-anchor next tick.
+          throw new Error(`attest tx ${tx.hash} reverted (status ${receipt?.status ?? "unknown"})`);
+        } catch (e: any) {
+          lastErr = e;
+          const msg = String(e?.shortMessage ?? e?.message ?? e);
+          // A reverted receipt is terminal for this anchor — stop and reconcile.
+          if (msg.includes("reverted")) break;
+          // A slash took our nonce (dead-heat) → yield: refetch the fresh pending nonce and retry.
+          if (/nonce too low|nonce has already been used|NONCE_EXPIRED/i.test(msg)) {
+            nonce = await this.provider.getTransactionCount(op, "pending");
+            continue;
+          }
+          // Timeout / underpriced replacement → keep the same nonce, escalate fees, resend.
+          bumpPct += 30;
+        }
+      }
+      // Reconcile: the original may have mined while we waited on a replacement (or vice versa).
+      for (const h of sent) {
+        try {
+          const r = await this.provider.getTransactionReceipt(h);
+          if (r?.status === 1) return h;
+        } catch {
+          // ignore — best-effort reconciliation
+        }
+      }
+      throw new Error(
+        `attestLiveness not confirmed after ${maxAttempts} attempt(s): ${lastErr?.message ?? lastErr}`
+      );
+    });
   }
 
   /**
