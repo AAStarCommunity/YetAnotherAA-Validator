@@ -2711,9 +2711,12 @@ describe("AuditService", () => {
       expect(gossip.lastRelevant).toEqual([]);
     });
 
-    it("is FILE-ONLY even when armed (executeSlash) — no queue/execute for offline in inc-1", async () => {
+    it("is ARMED (inc-2b) — an offline violation QUEUES an on-chain slash when the quorum co-signs", async () => {
       let queued = false;
-      const blockchain = makeBlockchain({
+      const blockchain = overLimitBlockchain({
+        getDebt: async () => 0n, // healthy credit so ONLY the offline rule fires
+        getCreditLimit: async () => 1000n,
+        getAvailableCredit: async () => 1000n,
         getOperatorNodeId: async () => NODE_ID,
         queueSlashWithProof: async () => {
           queued = true;
@@ -2725,11 +2728,88 @@ describe("AuditService", () => {
         offlineConfig({ auditExecuteSlash: true }),
         makeArchive(),
         clockAt(1_700_000_000_000),
-        undefined,
+        makeCoSigner(), // a succeeding quorum co-signer
         makeGossip(OFFLINE_LAST_SEEN)
       );
       await svc.tick();
-      expect(queued).toBe(false); // offline never queues an on-chain slash in inc-1
+      expect(queued).toBe(true); // inc-2b: offline now drives the real two-step slash
+    });
+
+    // ── inc-2b: the co-sign RESPONDER re-confirms offline from its OWN gossip liveness ──
+    const OFFLINE_LEVEL = 0; // SlashLevel.WARNING
+    const responderReq = (over: Record<string, unknown> = {}) => ({
+      chainId: 11155111,
+      operator: ethers.getAddress(OPERATOR),
+      slashLevel: OFFLINE_LEVEL,
+      epoch: BLOCK,
+      ...over,
+    });
+
+    it("responder CONFIRMS an offline violation (WARNING) from its own lastSeen", async () => {
+      const blockchain = makeBlockchain({ getOperatorNodeId: async () => NODE_ID });
+      const svc = makeService(
+        blockchain,
+        offlineConfig({ auditWatchlist: [OPERATOR] }),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(OFFLINE_LAST_SEEN)
+      );
+      const res = await (svc as any).verifyViolationForCoSign(responderReq());
+      expect(res.confirmed).toBe(true);
+      expect(res.proofHash).toMatch(/^0x[0-9a-f]{64}$/);
+    });
+
+    it("responder REFUSES offline co-sign when its OWN lastSeen shows the operator ONLINE", async () => {
+      const blockchain = makeBlockchain({ getOperatorNodeId: async () => NODE_ID });
+      const svc = makeService(
+        blockchain,
+        offlineConfig({ auditWatchlist: [OPERATOR] }),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(ONLINE_LAST_SEEN)
+      );
+      expect((await (svc as any).verifyViolationForCoSign(responderReq())).confirmed).toBe(false);
+    });
+
+    it("responder REFUSES offline co-sign when it has NEVER seen the nodeId", async () => {
+      const blockchain = makeBlockchain({ getOperatorNodeId: async () => NODE_ID });
+      const svc = makeService(
+        blockchain,
+        offlineConfig({ auditWatchlist: [OPERATOR] }),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(null)
+      );
+      expect((await (svc as any).verifyViolationForCoSign(responderReq())).confirmed).toBe(false);
+    });
+
+    it("responder's offline proofHash EQUALS the requester's (deterministic, no drift)", async () => {
+      // Requester: detect offline → archive a proof with proofHash P.
+      const reqArchive = makeArchive();
+      const reqSvc = makeService(
+        overLimitBlockchain({ getDebt: async () => 0n, getOperatorNodeId: async () => NODE_ID }),
+        offlineConfig({ auditWatchlist: [OPERATOR] }),
+        reqArchive,
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(OFFLINE_LAST_SEEN)
+      );
+      await reqSvc.tick();
+      const P = reqArchive.records.find(r => r.evidence.rule === "offline")!.proofHash;
+      // Responder: independently re-confirm → same proofHash.
+      const respSvc = makeService(
+        makeBlockchain({ getOperatorNodeId: async () => NODE_ID }),
+        offlineConfig({ auditWatchlist: [OPERATOR] }),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(1_699_985_000_000) // DIFFERENT lastSeen, still offline
+      );
+      const res = await (respSvc as any).verifyViolationForCoSign(responderReq());
+      expect(res.proofHash).toBe(P);
     });
   });
 });

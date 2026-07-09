@@ -1070,19 +1070,9 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       return;
     }
 
-    // OFFLINE violation. DETERMINISTIC identity — no lastSeen (would diverge across observers).
-    const identity: ProofIdentity = {
-      proofSchemaVersion: PROOF_SCHEMA_VERSION,
-      chainId: this.chainId,
-      operator,
-      rule: RULE_OFFLINE,
-      violationBlock: pinnedBlock.number,
-      slashLevel: SLASH_LEVEL_OFFLINE,
-      registry: this.normalizeAddress(this.registryAddress),
-      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
-      offlineThresholdMs: OFFLINE_THRESHOLD_MS,
-      blsAggregator: this.normalizeAddress(this.blsAggregatorAddress),
-    };
+    // OFFLINE violation. DETERMINISTIC identity — no lastSeen (would diverge across observers). Built
+    // by the SHARED helper so the co-sign responder reproduces the identical proofHash (no drift).
+    const identity = this.buildOfflineIdentity(operator, pinnedBlock.number);
     const offlineForMs = blockTsSec * 1000 - lastSeen;
     const reason =
       `${RULE_OFFLINE}: nodeId ${nodeId} last heartbeat ${offlineForMs}ms before finalized block ` +
@@ -1116,6 +1106,58 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       observed: `offline ${offlineForMs}ms`,
       threshold: `${OFFLINE_THRESHOLD_MS}ms`,
     });
+  }
+
+  /**
+   * DETERMINISTIC offline proof identity — the SINGLE source of the offline content-address, shared
+   * by the requester's detection (auditOfflineForOperator) and the responder's re-confirmation
+   * (confirmOfflineForCoSign) so both derive the IDENTICAL proofHash. Carries NO per-node data (no
+   * lastSeen) — only block-anchored, globally-agreed facts.
+   */
+  private buildOfflineIdentity(operator: string, violationBlock: number): ProofIdentity {
+    return {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
+      chainId: this.chainId,
+      operator,
+      rule: RULE_OFFLINE,
+      violationBlock,
+      slashLevel: SLASH_LEVEL_OFFLINE,
+      registry: this.normalizeAddress(this.registryAddress),
+      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
+      offlineThresholdMs: OFFLINE_THRESHOLD_MS,
+      blsAggregator: this.normalizeAddress(this.blsAggregatorAddress),
+    };
+  }
+
+  /**
+   * Responder-side offline re-confirmation (inc-2b armed co-sign): re-run THIS node's OWN offline
+   * predicate at the epoch block — the SAME logic as auditOfflineForOperator (resolve nodeId → this
+   * node's gossip lastSeen vs the epoch block's on-chain-timestamp deadline) — and return the matching
+   * proofHash. FAIL-CLOSED on every uncertainty (offline disabled, no gossip/aggregator, no active
+   * slot, never-seen nodeId, local clock behind the finalized block, or the operator was ONLINE at the
+   * epoch). A peer thus co-signs an offline slash ONLY when its OWN authenticated liveness data agrees.
+   */
+  private async confirmOfflineForCoSign(
+    operator: string,
+    blockTag: number
+  ): Promise<{ confirmed: boolean; proofHash: string | null }> {
+    const NO = { confirmed: false, proofHash: null };
+    if (!this.offlineEnabled || !this.gossip || !this.blsAggregatorAddress) return NO;
+    const nodeId = await this.blockchainService.getOperatorNodeId(
+      this.blsAggregatorAddress,
+      operator
+    );
+    if (!nodeId) return NO;
+    const lastSeen = this.gossip.getLastSeen(nodeId);
+    if (lastSeen === null) return NO; // never observed → can't confirm offline
+    const blockTsSec = await this.blockchainService.getBlockTimestamp(blockTag);
+    if (this.clock() < blockTsSec * 1000) return NO; // clock behind finalized block → don't trust
+    const deadlineMs = blockTsSec * 1000 - OFFLINE_THRESHOLD_MS;
+    if (lastSeen >= deadlineMs) return NO; // online at the epoch → not a violation
+    return {
+      confirmed: true,
+      proofHash: computeProofHash(this.buildOfflineIdentity(operator, blockTag)),
+    };
   }
 
   /**
@@ -1167,7 +1209,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       // rule never assigns cannot be confirmed (the messageHash recompute already catches chain,
       // this is defense-in-depth + the queue-step level check).
       if (req.chainId !== this.chainId) return NO;
-      if (req.slashLevel !== SLASH_LEVEL_CREDIT_OVER_LIMIT) return NO;
+      // Accept the two rules this node assigns: credit-over-limit (MINOR) and offline (WARNING). Any
+      // other level is a rule this node never fires → refuse (defense-in-depth; the evidenceHash
+      // binding downstream is the real guard).
+      const isCredit = req.slashLevel === SLASH_LEVEL_CREDIT_OVER_LIMIT;
+      const isOffline = req.slashLevel === SLASH_LEVEL_OFFLINE;
+      if (!isCredit && !isOffline) return NO;
 
       let operator: string;
       try {
@@ -1211,6 +1258,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         );
         return NO;
       }
+
+      // Rule ② offline (inc-2b) — re-confirm from THIS node's OWN authenticated gossip liveness at the
+      // epoch; the identity is content-addressed identically to the requester's (buildOfflineIdentity).
+      if (isOffline) return await this.confirmOfflineForCoSign(operator, blockTag);
 
       // Re-read the SAME rule inputs the tick reads, pinned at the epoch block.
       const [creditLimit, availableCredit, debt] = await Promise.all([
@@ -1812,7 +1863,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       reason: string;
       epoch: number;
       evidenceHash: string;
-      /** Rule id — the offline rule (inc-1) is FILE-ONLY: no armed queue/execute yet (inc-2). */
+      /** Rule id (informational — armed gating is now uniform across credit + offline). */
       rule?: string;
     },
     proof?: SlashProof,
@@ -1847,17 +1898,15 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
-    // Rule ② offline (inc-1) is FILE-ONLY: the armed BLS co-sign for offline (the responder re-checking
-    // its OWN gossip liveness) is inc-2, so the offline path never queues/executes — it only files a
-    // proposal + archives the proof. The credit rule is unaffected.
-    const fileOnlyRule = args.rule === RULE_OFFLINE;
+    // Rule ② offline is ARMED as of inc-2b: the responder re-checks its OWN authenticated gossip
+    // liveness (verifyViolationForCoSign → confirmOfflineForCoSign) before co-signing, so offline now
+    // drives the real two-step slash through the SAME path as credit. (WARNING level → 2-of-3 quorum.)
     // A1#6 (Codex High-2 + round-3) — a derived-ONLY operator is armed for the irreversible on-chain
     // slash only when its membership is CONFIRMED at the evidence block (epoch) via hasRole — not just
     // the cached set's wall-clock freshness. Stale/never-confirmed/exited-by-epoch membership degrades
     // to file-only (proposal + archive, no queue/execute). Static-listed operators are always armed.
-    const armed =
-      this.executeSlash && !fileOnlyRule && (await this.confirmSlashableAtBlock(operator, epoch));
-    if (this.executeSlash && !armed && !fileOnlyRule) {
+    const armed = this.executeSlash && (await this.confirmSlashableAtBlock(operator, epoch));
+    if (this.executeSlash && !armed) {
       this.logger.warn(
         `Audit: ${operator} armed slash WITHHELD — derived-only operator not confirmed as an ` +
           `audited-role member at evidence block ${epoch}; filing proposal only`
