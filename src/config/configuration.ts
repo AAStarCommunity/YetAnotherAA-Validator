@@ -181,16 +181,14 @@ export default () => {
     x402AuthSecret: process.env.X402_AUTH_SECRET || undefined,
     x402AuthTtlMs: parseInt(process.env.X402_AUTH_TTL_MS || "300000", 10),
 
-    // DVT Phase 2 (目标2) — autonomous audit of SuperPaymaster operators (#—, increment 1).
-    // Opt-in; default off → behavior unchanged. When enabled, a background poll reads each
-    // watchlisted operator's on-chain credit / reputation / stake state from the SuperPaymaster
-    // stack and, on a confirmed credit-over-limit violation, archives a content-addressed slash
-    // proof and files a slash proposal on the DVTValidator. The multi-node BLS quorum co-sign +
-    // verifyAndExecute is DEFERRED to increment 2 (needs gossip aggregation across DVT nodes).
+    // DVT Phase 2 (目标2) — autonomous audit of SuperPaymaster operators.
+    // Opt-in; default off → behavior unchanged. When enabled, a background poll audits each
+    // watchlisted operator's gossip liveness (rule ② offline) and, on a confirmed violation, archives
+    // a content-addressed slash proof and files a slash proposal on the DVTValidator. The credit-over-
+    // limit (rule ①) and over-issue (rule ③) SLASH rules were retired by design review; the slash-
+    // consensus pipeline is kept as dormant scaffolding for future rules.
     //
     // AUDIT_WATCHLIST: comma-separated operator addresses to monitor.
-    // AUDIT_CREDIT_THRESHOLD_BPS: additional margin ON TOP of strict over-limit — flag only
-    //   when debt STRICTLY exceeds the limit AND debt*10000/limit ≥ this (10000 bps = 100%).
     // FAIL-CLOSED: when AUDIT_ENABLED=true, ALL of AUDIT_REGISTRY_ADDRESS /
     //   AUDIT_SUPER_PAYMASTER_ADDRESS / AUDIT_DVT_VALIDATOR_ADDRESS must be set explicitly
     //   (no silent default), and each must have on-chain code (getCode != "0x") at bootstrap
@@ -201,7 +199,6 @@ export default () => {
     auditIntervalMs: parseInt(process.env.AUDIT_INTERVAL_MS || "60000", 10),
     auditCooldownMs: parseInt(process.env.AUDIT_COOLDOWN_MS || "3600000", 10),
     auditWatchlist: parseAllowlist(process.env.AUDIT_WATCHLIST || ""),
-    auditCreditThresholdBps: parseInt(process.env.AUDIT_CREDIT_THRESHOLD_BPS || "10000", 10),
     auditProofDir: process.env.AUDIT_PROOF_DIR || "./audit-proofs",
     auditChainId: parseInt(process.env.AUDIT_CHAIN_ID || "11155111", 10),
     auditRegistryAddress: process.env.AUDIT_REGISTRY_ADDRESS || undefined,
@@ -228,11 +225,6 @@ export default () => {
     // drill is repeatable). It logs the would-slash target and records a sentinel tx (0xDRYRUN) in the
     // archived proof. Flip this OFF once the path is proven end-to-end to go live. Default false.
     auditDryRun: process.env.AUDIT_DRY_RUN === "true",
-    // The xPNTs token the credit-over-limit rule reads operator debt from. Debt lives on the
-    // xPNTs TOKEN (IxPNTsToken.getDebt(address)), NOT on SuperPaymaster/Registry. Default is the
-    // Sepolia aPNTs token. FAIL-CLOSED: required + must have on-chain code when AUDIT_ENABLED=true.
-    auditApntsTokenAddress:
-      process.env.AUDIT_APNTS_TOKEN_ADDRESS || "0x696A73701b104c6cCBbAadDD2216788ea08EaB89",
     // Reorg-safety (finding-3): the audit reads all rule inputs at a FINALIZED (fallback: safe)
     // block. On chains that expose neither tag, fall back to latest MINUS this many confirmations.
     // FLOORED at 1 (never 0): a 0 (or non-numeric) value would make the fallback resolve to the
@@ -316,13 +308,6 @@ export default () => {
       }
       return process.env.AUDIT_OFFLINE_ENABLED === "true";
     })(),
-    // Rule ③ over-issue detection (CC-28). Opt-in; audits each configured community xPNTs TOKEN's
-    // OBJECTIVE on-chain isOverIssued() flag (issued value > governance cap). The slash SUBJECT is the
-    // token's communityOwner. Unlike offline, this is objectively slashable (deterministic on-chain
-    // bool). AUDIT_XPNTS_TOKENS: comma-separated community xPNTs token addresses to check (later:
-    // derive from the xPNTs factory, like the rule ① watchlist).
-    auditOverIssueEnabled: process.env.AUDIT_OVER_ISSUE_ENABLED === "true",
-    auditXpntsTokens: parseAllowlist(process.env.AUDIT_XPNTS_TOKENS || ""),
 
     // inc-2 liveness attest keeper (SP LivenessRegistry, CC-29). Opt-in. Each DVT node self-proves
     // liveness on-chain so SP's auto-jail only excludes genuinely-silent operators. Reads NOTHING
