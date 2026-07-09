@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit, OnModuleDestroy, Optional } from "@nestjs/common";
+import { Injectable, OnModuleInit, OnModuleDestroy, Optional, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import WebSocket, { WebSocketServer } from "ws";
@@ -24,6 +24,9 @@ import { GossipWhitelistValidator } from "./gossip-whitelist-validator.js";
 
 @Injectable()
 export class GossipService implements OnModuleInit, OnModuleDestroy {
+  /** NestJS logger for the offline-audit heartbeat paths (Codex Low: don't bypass it with console.*).
+   *  The rest of this file still uses console.* — converting it wholesale is out of scope here. */
+  private readonly logger = new Logger(GossipService.name);
   private server: WebSocketServer;
   private peers = new Map<string, PeerInfo>();
   /**
@@ -410,7 +413,9 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
 
       case "heartbeat":
         void this.handleHeartbeatMessage(message, ws).catch(e =>
-          console.warn(`heartbeat handling error: ${e instanceof Error ? e.message : String(e)}`)
+          this.logger.warn(
+            `heartbeat handling error: ${e instanceof Error ? e.message : String(e)}`
+          )
         );
         break;
 
@@ -689,7 +694,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
     const now = Date.now();
     if (now - this.lastLedgerFullWarnAt > 60_000) {
       this.lastLedgerFullWarnAt = now;
-      console.warn(
+      this.logger.warn(
         `⚠️  liveness ledger FULL (${GossipService.MAX_LIVENESS_LEDGER}) — rejecting new nodeId ` +
           `${nodeId.slice(0, 10)}…; a genuinely new operator would escape offline audit.`
       );
@@ -1070,7 +1075,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
   private startHeartbeat(): void {
     this.heartbeatInterval = setInterval(() => {
       void this.sendHeartbeat().catch(e =>
-        console.warn(`sendHeartbeat error: ${e instanceof Error ? e.message : String(e)}`)
+        this.logger.warn(`sendHeartbeat error: ${e instanceof Error ? e.message : String(e)}`)
       );
       this.checkPeerHealth();
     }, this.config.heartbeatInterval);
@@ -1103,7 +1108,7 @@ export class GossipService implements OnModuleInit, OnModuleDestroy {
           };
         }
       } catch (e) {
-        console.warn(
+        this.logger.warn(
           `heartbeat auth signing failed (sending unsigned): ${e instanceof Error ? e.message : String(e)}`
         );
       }
