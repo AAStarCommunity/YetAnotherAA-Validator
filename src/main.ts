@@ -25,6 +25,10 @@ async function bootstrap() {
 
   app.enableCors();
 
+  // Enable signal-driven lifecycle hooks so OnApplicationShutdown fires on SIGINT/SIGTERM —
+  // the liveness attest keeper (and other timers) clear their intervals on shutdown.
+  app.enableShutdownHooks();
+
   // Swagger configuration
   const config = new DocumentBuilder()
     .setTitle("BLS Signer Service API")
