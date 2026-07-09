@@ -2861,9 +2861,10 @@ describe("AuditService", () => {
       expect(created).toHaveLength(2);
     });
 
-    it("sustained breach does NOT re-file within cooldown; a cure→re-breach DOES re-file", async () => {
+    it("sustained/flapping breach is RATE-LIMITED by cooldown; re-files only after cooldown expires", async () => {
       let over = true;
       let blk = BLOCK; // blocks ADVANCE each tick (a finalized block's state can't flip)
+      let t = 1_700_000_000_000; // mutable clock
       const created: string[] = [];
       const blockchain = makeBlockchain({
         getViolationBlock: async () => ({ number: blk++, hash: BLOCK_HASH }),
@@ -2874,19 +2875,16 @@ describe("AuditService", () => {
           return { txHash: "0xTX", proposalId: 11n };
         },
       });
-      const svc = makeService(
-        blockchain,
-        overIssueConfig(),
-        makeArchive(),
-        clockAt(1_700_000_000_000)
-      );
+      const svc = makeService(blockchain, overIssueConfig(), makeArchive(), () => t);
       await svc.tick(); // breach → 1 proposal
-      await svc.tick(); // still breached, within cooldown → NOT re-filed
-      expect(created).toHaveLength(1);
+      await svc.tick(); // still breached, within cooldown → rate-limited, NOT re-filed
       over = false;
-      await svc.tick(); // cure → clears the token marker
+      await svc.tick(); // cure (within cooldown)
       over = true;
-      await svc.tick(); // re-breach after cure → files again
+      await svc.tick(); // re-breach still within cooldown → NOT re-filed (flap is rate-limited, no spam)
+      expect(created).toHaveLength(1);
+      t += 3_600_001; // advance past the 1h cooldown
+      await svc.tick(); // re-breach after cooldown → re-files
       expect(created).toHaveLength(2);
     });
 
@@ -2922,6 +2920,42 @@ describe("AuditService", () => {
       );
       await svc.onApplicationBootstrap();
       expect((await svc.getStatus()).enabled).toBe(true); // did NOT bail on empty watchlist
+    });
+
+    it("FAIL-CLOSED on an oversized token list (>256) — over-issue disabled, not silently truncated (Codex High)", async () => {
+      const many = Array.from({ length: 257 }, (_, i) => "0x" + i.toString(16).padStart(40, "0"));
+      let called = false;
+      const blockchain = makeBlockchain({
+        getIsOverIssued: async () => {
+          called = true;
+          return true;
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        overIssueConfig({ auditXpntsTokens: many }),
+        makeArchive()
+      );
+      expect((svc as any).overIssueEnabled).toBe(false); // disabled in the constructor
+      expect((svc as any).xpntsTokens).toHaveLength(0);
+      await svc.tick();
+      expect(called).toBe(false); // nothing audited (fail-closed, not partial coverage)
+    });
+
+    it("bootstrap DROPS a token with no on-chain code (loud error, keeps the good ones — Codex Medium)", async () => {
+      const BAD = "0x" + "19".repeat(20);
+      const blockchain = makeBlockchain({
+        getIsOverIssued: async () => false,
+        getCode: async (addr: string) => (addr === BAD ? "0x" : "0x60006000fd"),
+      });
+      const svc = makeService(
+        blockchain,
+        overIssueConfig({ auditXpntsTokens: [TOKEN, BAD] }),
+        makeArchive()
+      );
+      await svc.onApplicationBootstrap();
+      expect((svc as any).xpntsTokens).toEqual([TOKEN]); // BAD dropped, TOKEN kept
+      expect((svc as any).overIssueEnabled).toBe(true);
     });
   });
 });

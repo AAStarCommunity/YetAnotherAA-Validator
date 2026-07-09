@@ -148,10 +148,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   /** Stable operator→nodeId cache (offline rule ②). A transient resolve failure keeps the cached
    *  nodeId so a still-relevant operator is never pruned from the gossip ledger on an RPC blip. */
   private readonly offlineNodeIdCache = new Map<string, string>();
-  /** Rule ③ over-issue — opt-in; audits each community xPNTs token's on-chain isOverIssued() flag. */
-  private readonly overIssueEnabled: boolean;
-  /** Community xPNTs token addresses to check for over-issuance (checksummed at ingest). */
-  private readonly xpntsTokens: string[];
+  /** Rule ③ over-issue — opt-in; audits each community xPNTs token's on-chain isOverIssued() flag.
+   *  May be disabled at bootstrap (oversized list / all tokens invalid). */
+  private overIssueEnabled: boolean;
+  /** Community xPNTs token addresses to check for over-issuance (checksummed at ingest; bytecode-
+   *  validated + pruned at bootstrap). */
+  private xpntsTokens: string[];
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
   private derivedOperators: string[] = [];
   /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
@@ -319,8 +321,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.roleUseGetter = config.get<boolean>("auditRoleUseGetter") === true;
     this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
     this.offlineEnabled = config.get<boolean>("auditOfflineEnabled") === true;
-    this.overIssueEnabled = config.get<boolean>("auditOverIssueEnabled") === true;
-    // Checksum, drop invalid, DEDUP, and cap (bounded serial polling per tick — Codex Low).
+    // Checksum, drop invalid, DEDUP.
     const canonicalTokens = (config.get<string[]>("auditXpntsTokens") ?? [])
       .map(a => a.trim())
       .filter(Boolean)
@@ -334,12 +335,22 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       })
       .filter((a): a is string => a !== null);
     const deduped = [...new Set(canonicalTokens)];
-    if (deduped.length > AuditService.MAX_XPNTS_TOKENS) {
-      this.logger.warn(
-        `Audit: AUDIT_XPNTS_TOKENS has ${deduped.length} entries — capping to ${AuditService.MAX_XPNTS_TOKENS}`
+    const rawOverIssue = config.get<boolean>("auditOverIssueEnabled") === true;
+    // FAIL-CLOSED on an oversized list (Codex High): silently truncating to a cap would drop configured
+    // audit targets — a security allowlist must NEVER silently reduce coverage. Over the bound → DISABLE
+    // over-issue with a loud error so the operator shards/reduces rather than getting partial coverage.
+    if (rawOverIssue && deduped.length > AuditService.MAX_XPNTS_TOKENS) {
+      this.logger.error(
+        `Audit: AUDIT_XPNTS_TOKENS has ${deduped.length} > ${AuditService.MAX_XPNTS_TOKENS} tokens — ` +
+          `over-issue DISABLED (fail-closed). Reduce the list or shard it across nodes; silent ` +
+          `truncation would leave tokens unaudited.`
       );
+      this.overIssueEnabled = false;
+      this.xpntsTokens = [];
+    } else {
+      this.overIssueEnabled = rawOverIssue;
+      this.xpntsTokens = deduped;
     }
-    this.xpntsTokens = deduped.slice(0, AuditService.MAX_XPNTS_TOKENS);
     this.gossip = gossip ?? null;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
@@ -421,6 +432,36 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           `Audit: ${name}=${addr} has no on-chain code on chainId ${this.chainId} — DISABLED (fail-closed)`
         );
         return;
+      }
+    }
+    // Rule ③ — bytecode-validate each configured xPNTs token (Codex Medium: a missing/EOA/wrong-chain
+    // token address would otherwise be caught-and-swallowed per read, silently unaudited forever). A
+    // bad token is DROPPED with a loud error (not the whole audit — credit/offline may still be valid).
+    if (this.overIssueEnabled && this.xpntsTokens.length > 0) {
+      const valid: string[] = [];
+      for (const token of this.xpntsTokens) {
+        let code: string;
+        try {
+          code = await this.blockchainService.getCode(token);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.logger.error(
+            `Audit: getCode(AUDIT_XPNTS_TOKENS ${token}) failed (${msg}) — DROPPED`
+          );
+          continue;
+        }
+        if (!code || code === "0x") {
+          this.logger.error(
+            `Audit: AUDIT_XPNTS_TOKENS ${token} has no on-chain code on chainId ${this.chainId} — DROPPED`
+          );
+          continue;
+        }
+        valid.push(token);
+      }
+      this.xpntsTokens = valid;
+      if (valid.length === 0) {
+        this.overIssueEnabled = false;
+        this.logger.error("Audit: no valid AUDIT_XPNTS_TOKENS remain — over-issue DISABLED");
       }
     }
     // A1#6 — eager first derivation so the startup log + first tick already see the on-chain set
@@ -602,10 +643,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // belonged to is over); drop it so a genuinely-new future violation files a fresh proposal rather
     // than reusing a dead id (Codex: stale-id poisoning on the healthy→re-offend path).
     this.pendingProposalIds.delete(coarseKey);
-    // End the episode: drop the proposal COOLDOWN too, so a genuinely-NEW violation after a cure is
-    // not suppressed by the resolved episode's cooldown window (Codex episode semantics — a
-    // cure→re-breach must be able to re-file promptly, not wait out the prior episode's cooldown).
-    this.lastProposalAt.delete(coarseKey);
+    // NOTE: the proposal COOLDOWN (lastProposalAt) is deliberately NOT cleared here — it is a pure
+    // RATE LIMIT (≤1 proposal per subject per cooldownMs). Clearing it on every healthy read would let
+    // a FLAPPING condition (cross the boundary each block) spam a fresh proposal every tick. Episode
+    // semantics: a cure→re-breach re-files once the cooldown expires (or immediately if the gap already
+    // exceeds it), never faster. This keeps credit/offline (both live) spam-safe.
     // A healthy read ALWAYS attempts the durable removal, regardless of the current executeSlash
     // setting. A durable marker written by an EARLIER armed run must be cleared even if the node is
     // now running disarmed — otherwise it would survive an armed→disarmed→armed restart cycle and,
@@ -1997,6 +2039,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     // issue's evidence IS objective (on-chain isOverIssued) so it is armable in principle, but its slash
     // SUBJECT is a communityOwner (not a BLS-slotted DVT operator) — arming waits until the SP contract
     // community-slash path is confirmed. The credit rule is unaffected (stays armed).
+    // INC-2 BLOCKER for over-issue (Codex High): the dedup coarseKey is TOKEN-scoped but the slash
+    // subject + assessSlashState + execute are OWNER-scoped. Two tokens of one owner would keep
+    // independent token-scoped armed state (slashedCoarseKeys/pendingProposalIds) yet slash the SAME
+    // owner — enabling a double-slash / orphaned-proposal. Over-issue MUST stay file-only until the
+    // proposal-dedup (token) is SEPARATED from the pending/executed-slash guard (owner).
     const fileOnlyRule = args.rule === RULE_OFFLINE || args.rule === RULE_OVER_ISSUE;
     // A1#6 (Codex High-2 + round-3) — a derived-ONLY operator is armed for the irreversible on-chain
     // slash only when its membership is CONFIRMED at the evidence block (epoch) via hasRole — not just
