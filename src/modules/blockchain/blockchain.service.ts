@@ -169,7 +169,8 @@ export class BlockchainService {
       this.logger.log(`Registering node ${nodeId} on contract ${contractAddress}`);
 
       // Call registerPublicKey function
-      const tx = await contract.registerPublicKey(nodeId, publicKey);
+      // Broadcast on the shared operator-EOA FIFO so a concurrent attest/keeper can't race the nonce.
+      const tx = await this.enqueueWalletWrite(() => contract.registerPublicKey(nodeId, publicKey));
       this.logger.log(`Transaction submitted: ${tx.hash}`);
 
       // Wait for transaction confirmation
@@ -250,7 +251,7 @@ export class BlockchainService {
       this.logger.log(`Revoking node ${nodeId} on contract ${contractAddress}`);
 
       // Call revokePublicKey function
-      const tx = await contract.revokePublicKey(nodeId);
+      const tx = await this.enqueueWalletWrite(() => contract.revokePublicKey(nodeId));
       this.logger.log(`Transaction submitted: ${tx.hash}`);
 
       // Wait for transaction confirmation
@@ -286,7 +287,9 @@ export class BlockchainService {
     try {
       this.logger.log(`Batch registering ${nodeIds.length} nodes on contract ${contractAddress}`);
 
-      const tx = await contract.batchRegisterPublicKeys(nodeIds, publicKeys);
+      const tx = await this.enqueueWalletWrite(() =>
+        contract.batchRegisterPublicKeys(nodeIds, publicKeys)
+      );
       this.logger.log(`Batch registration transaction submitted: ${tx.hash}`);
 
       const receipt = await tx.wait();
@@ -665,7 +668,12 @@ export class BlockchainService {
   ): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }> {
     const fresh = await bumpedFees(this.provider);
     if (!prev) return fresh;
-    const bump = (x: bigint): bigint => (x * 1125n) / 1000n; // +12.5% > geth's 10% replacement floor
+    // +12.5% (ceil, and at least prev+1) so a REPLACEMENT strictly exceeds prev on BOTH fields even
+    // at tiny wei values where integer *1125/1000 would round back down to prev (geth wants ≥10%).
+    const bump = (x: bigint): bigint => {
+      const b = (x * 1125n + 999n) / 1000n;
+      return b > x ? b : x + 1n;
+    };
     const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
     return {
       maxFeePerGas: max(fresh.maxFeePerGas, bump(prev.maxFeePerGas)),
@@ -677,16 +685,21 @@ export class BlockchainService {
    * LivenessRegistry.attestLiveness(anchorBlock, anchorHash) — the operator (this node) self-proves
    * liveness on-chain so SP's auto-jail excludes it only when it is genuinely silent (inc-2 C1).
    *
-   * msg.sender MUST be the registered operator EOA (`this.wallet`) — NOT the keeper key — because
-   * the registry attests the SENDER. Runs on the single operator-wallet FIFO (`enqueueWalletWrite`)
-   * shared with the slash writes, so no attest/slash nonce race is possible; and it YIELDS to a
-   * pending slash (bails between attempts — `hasPendingSlashWrite`) so a slash never waits out the
-   * attest's retry budget. Hardening (Codex inc-2 review): staticCall preflight (fail before burning
-   * a nonce on a stale/bad anchor); a bounded deadline loop with same-nonce STRICTLY-increasing fee
-   * REPLACEMENT (`nextAttestFees` — a tx stuck > 256 blocks would freeze `lastLive` into a false-
-   * offline); a nonce-consumed error triggers a reconcile-then-refetch (our own tx may have mined →
-   * don't double-attest; otherwise a slash took the nonce → refetch + retry, guaranteeing a resend);
-   * and a final receipt reconciliation across every broadcast hash.
+   * msg.sender MUST be the registered operator EOA (`this.wallet`) — the registry attests the SENDER.
+   *
+   * Concurrency (Codex inc-2 rounds): the BROADCAST (nonce allocation + send) runs inside the shared
+   * operator-EOA FIFO (`enqueueWalletWrite`) — that window is exclusive so no attest/slash nonce race
+   * is possible — but the receipt WAIT runs OUTSIDE the lock, so a slash arriving during the wait
+   * grabs the lock (and the next nonce) immediately instead of blocking behind our timeout.
+   * Slash priority: we yield (bail) to a pending slash ONLY before our first broadcast (a slash then
+   * takes the lower nonce). Once we've broadcast at nonce N, a slash is at N+1 and DEPENDS on N
+   * mining, so we do NOT abandon N — we drive it to inclusion via same-nonce STRICTLY-increasing fee
+   * replacement (`nextAttestFees`; a tx stuck > 256 blocks would freeze `lastLive` into false-offline),
+   * which also unblocks the slash. A `maxSends` budget bounds real broadcasts; nonce-consumed /
+   * underpriced recoveries don't consume it (bounded separately) so a refetch always gets a resend.
+   * NOTE: this bounds a slash's wait to attest INCLUSION time, not zero — true tx-level preemption is
+   * out of scope and unnecessary: DVT slashes are finalized-evidence-driven + two-step/multi-block,
+   * not sub-block-time-sensitive.
    */
   async attestLiveness(
     registryAddress: string,
@@ -697,98 +710,116 @@ export class BlockchainService {
     if (!this.wallet) {
       throw new Error("attestLiveness: no operator wallet (ETH_PRIVATE_KEY unset)");
     }
-    const perAttemptMs = opts.perAttemptMs ?? 20_000;
-    const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
-    return this.enqueueWalletWrite(async () => {
-      const op = this.wallet.address;
-      const abi = ["function attestLiveness(uint256 anchorBlock, bytes32 anchorHash) external"];
-      const contract = this.buildContract(registryAddress, abi, this.wallet);
-      const sent: string[] = [];
-      // Best-effort: return the first broadcast hash that already confirmed status 1.
-      const reconcile = async (): Promise<string | null> => {
-        for (const h of sent) {
-          try {
-            const r = await this.provider.getTransactionReceipt(h);
-            if (r?.status === 1) return h;
-          } catch {
-            // ignore — best-effort
-          }
-        }
-        return null;
-      };
-
-      // Yield to a waiting slash BEFORE taking a nonce (slash is the priority).
-      if (this.hasPendingSlashWrite()) {
-        throw new Error("attestLiveness yielded to a pending slash write");
-      }
-      // Preflight: a stale/bad anchor reverts (StaleAnchor/BadAnchorHash). Fail here BEFORE
-      // consuming a nonce so the keeper re-anchors on the next tick instead of burning gas.
-      try {
-        await contract.attestLiveness.staticCall(anchorBlock, anchorHash);
-      } catch (e: any) {
-        throw new Error(
-          `attestLiveness preflight reverted (stale/bad anchor?): ${e?.shortMessage ?? e?.message ?? e}`,
-          { cause: e }
-        );
-      }
-
-      let nonce = await this.provider.getTransactionCount(op, "pending");
-      let prevFees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | null = null;
-      let lastErr: any;
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        // Yield mid-loop the moment a slash is waiting — release the lock for it (re-anchor next tick).
-        if (this.hasPendingSlashWrite()) {
-          lastErr = new Error("yielded to a pending slash write");
-          break;
-        }
-        // 1) Broadcast (same nonce = replacement; strictly-increasing fees so it isn't underpriced).
-        let tx: ethers.TransactionResponse;
+    const perAttemptMs =
+      Number.isFinite(opts.perAttemptMs) && (opts.perAttemptMs as number) > 0
+        ? (opts.perAttemptMs as number)
+        : 20_000;
+    // Finite integer send budget, capped — an adversarial Infinity/NaN/fractional must not spin.
+    const maxSends =
+      Number.isInteger(opts.maxAttempts) && (opts.maxAttempts as number) > 0
+        ? Math.min(opts.maxAttempts as number, 10)
+        : 3;
+    const op = this.wallet.address;
+    const abi = ["function attestLiveness(uint256 anchorBlock, bytes32 anchorHash) external"];
+    const contract = this.buildContract(registryAddress, abi, this.wallet);
+    const sent: string[] = [];
+    // Best-effort: return the first broadcast hash that already confirmed status 1.
+    const reconcile = async (): Promise<string | null> => {
+      for (const h of sent) {
         try {
+          const r = await this.provider.getTransactionReceipt(h);
+          if (r?.status === 1) return h;
+        } catch {
+          // ignore — best-effort
+        }
+      }
+      return null;
+    };
+
+    // Early yield: a slash already pending → bail before ANY work (no preflight, no nonce).
+    if (this.hasPendingSlashWrite()) {
+      throw new Error("attestLiveness yielded to a pending slash write");
+    }
+    // Preflight is a READ (staticCall) — no nonce, no lock. A stale/bad anchor reverts here BEFORE
+    // consuming a nonce, so the keeper re-anchors next tick instead of burning gas.
+    try {
+      await contract.attestLiveness.staticCall(anchorBlock, anchorHash);
+    } catch (e: any) {
+      throw new Error(
+        `attestLiveness preflight reverted (stale/bad anchor?): ${e?.shortMessage ?? e?.message ?? e}`,
+        { cause: e }
+      );
+    }
+
+    let nonce: number | null = null;
+    let prevFees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | null = null;
+    let lastErr: any;
+    let sends = 0;
+    const maxIterations = maxSends * 3; // bound recovery (refetch / underpriced) — never spin
+    for (let iter = 0; sends < maxSends && iter < maxIterations; iter++) {
+      // 1) BROADCAST under the lock (only nonce-alloc + send are exclusive; the wait below is not).
+      let tx: ethers.TransactionResponse;
+      try {
+        tx = await this.enqueueWalletWrite(async () => {
+          // Yield to a pending slash ONLY before our first broadcast — once we hold nonce N a slash
+          // is at N+1 and needs N to mine, so we must finish N rather than abandon it.
+          if (sent.length === 0 && this.hasPendingSlashWrite()) {
+            throw new Error("attestLiveness yielded to a pending slash write");
+          }
+          if (nonce === null) nonce = await this.provider.getTransactionCount(op, "pending");
           const fees = await this.nextAttestFees(prevFees);
           prevFees = fees;
-          tx = await contract.attestLiveness(anchorBlock, anchorHash, { nonce, ...fees });
-          sent.push(tx.hash);
-        } catch (e: any) {
-          lastErr = e;
-          const code = e?.code;
-          const msg = String(e?.shortMessage ?? e?.message ?? e);
-          // Nonce consumed: our OWN earlier tx may have mined (reconcile → don't double-attest);
-          // otherwise a slash took the nonce → refetch a fresh nonce and retry (guaranteed resend).
-          if (code === "NONCE_EXPIRED" || /nonce too low|nonce has already been used/i.test(msg)) {
-            const hit = await reconcile();
-            if (hit) return hit;
-            nonce = await this.provider.getTransactionCount(op, "pending");
-            continue;
-          }
-          // Replacement underpriced → next iteration bumps from prevFees; just retry.
-          if (
-            code === "REPLACEMENT_UNDERPRICED" ||
-            /replacement transaction underpriced/i.test(msg)
-          ) {
-            continue;
-          }
-          break; // unknown send error — reconcile + throw
-        }
-        // 2) Await inclusion with a per-attempt deadline.
-        try {
-          const receipt = await tx.wait(1, perAttemptMs);
-          if (receipt?.status === 1) return tx.hash;
-          // Mined but reverted → terminal for this anchor (re-anchor next tick).
-          lastErr = new Error(
-            `attest tx ${tx.hash} reverted (status ${receipt?.status ?? "unknown"})`
+          const t: ethers.TransactionResponse = await contract.attestLiveness(
+            anchorBlock,
+            anchorHash,
+            { nonce, ...fees }
           );
-          break;
-        } catch (e: any) {
-          lastErr = e;
-          // Timeout / not yet mined → keep the SAME nonce, escalate fees next iteration (replacement).
+          sent.push(t.hash);
+          return t;
+        });
+        sends++;
+      } catch (e: any) {
+        lastErr = e;
+        const code = e?.code;
+        const msg = String(e?.shortMessage ?? e?.message ?? e);
+        if (msg.includes("yielded")) break; // slash priority — re-anchor next tick
+        // Nonce consumed: our OWN earlier tx may have mined (reconcile → don't double-attest);
+        // otherwise a slash took the nonce → refetch a fresh nonce (new tx → fresh fee baseline) and
+        // retry. This recovery does NOT consume the send budget, so a resend is guaranteed.
+        if (code === "NONCE_EXPIRED" || /nonce too low|nonce has already been used/i.test(msg)) {
+          const hit = await reconcile();
+          if (hit) return hit;
+          nonce = null;
+          prevFees = null;
+          continue;
         }
+        // Replacement underpriced → prevFees already bumped; retry same nonce (not a send).
+        if (
+          code === "REPLACEMENT_UNDERPRICED" ||
+          /replacement transaction underpriced/i.test(msg)
+        ) {
+          continue;
+        }
+        break; // unknown send error — reconcile + throw
       }
-      const hit = await reconcile();
-      if (hit) return hit;
-      throw new Error(
-        `attestLiveness not confirmed after ${maxAttempts} attempt(s): ${lastErr?.message ?? lastErr}`
-      );
-    });
+      // 2) WAIT outside the lock — a slash can grab the lock + nonce N+1 during this window.
+      try {
+        const receipt = await tx.wait(1, perAttemptMs);
+        if (receipt?.status === 1) return tx.hash;
+        lastErr = new Error(
+          `attest tx ${tx.hash} reverted (status ${receipt?.status ?? "unknown"})`
+        );
+        break; // mined but reverted → terminal for this anchor
+      } catch (e: any) {
+        lastErr = e;
+        // Timeout / not yet mined → keep the SAME nonce, escalate fees next iteration (replacement).
+      }
+    }
+    const hit = await reconcile();
+    if (hit) return hit;
+    throw new Error(
+      `attestLiveness not confirmed after ${sends} send(s): ${lastErr?.message ?? lastErr}`
+    );
   }
 
   /**
@@ -1955,7 +1986,12 @@ export class BlockchainService {
     const abi = ["function updatePrice() external"];
     const contract = new ethers.Contract(paymasterAddress, abi, signer);
     const fees = await bumpedFees(this.provider);
-    const tx: ethers.TransactionResponse = await contract.updatePrice(fees);
+    // When no dedicated KEEPER_PRIVATE_KEY is set, `signer` IS the operator EOA — serialize this
+    // periodic broadcast on the shared FIFO so it can't race the attest/slash nonce. A dedicated
+    // keeper key is a SEPARATE EOA (its own nonce space) and needs no serialization.
+    const broadcast = (): Promise<ethers.TransactionResponse> => contract.updatePrice(fees);
+    const tx: ethers.TransactionResponse =
+      signer === this.wallet ? await this.enqueueWalletWrite(broadcast) : await broadcast();
     return tx.hash;
   }
 }

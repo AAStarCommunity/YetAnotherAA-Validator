@@ -58,7 +58,17 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
     this.enabled = this.config?.get<boolean>("auditAttestEnabled") === true;
     this.registryAddress = this.config?.get<string>("auditLivenessRegistryAddress") ?? "";
     this.intervalMs = this.config?.get<number>("auditAttestIntervalMs") ?? 600_000;
-    this.anchorDepth = this.config?.get<number>("auditAttestAnchorDepth") ?? 16;
+    // Clamp anchor depth to the protocol-valid [1,255] up front, so the ENABLED log reports the depth
+    // actually used (getAttestAnchor clamps too; keeping them in sync avoids a misleading log).
+    const rawDepth = this.config?.get<number>("auditAttestAnchorDepth") ?? 16;
+    this.anchorDepth = Number.isFinite(rawDepth)
+      ? Math.min(255, Math.max(1, Math.floor(rawDepth)))
+      : 16;
+    if (this.anchorDepth !== rawDepth) {
+      this.logger.warn(
+        `AUDIT_ATTEST_ANCHOR_DEPTH ${rawDepth} out of [1,255] — clamped to ${this.anchorDepth}`
+      );
+    }
   }
 
   onApplicationBootstrap(): void {
@@ -118,6 +128,7 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
     this.inFlight = true;
     try {
       const anchor = await this.blockchain.getAttestAnchor(this.anchorDepth);
+      if (this.stopping) return; // shutdown began during the anchor read — do not start a write
       const txHash = await this.blockchain.attestLiveness(
         this.registryAddress,
         anchor.number,

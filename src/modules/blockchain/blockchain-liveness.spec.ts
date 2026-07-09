@@ -181,24 +181,79 @@ describe("BlockchainService.attestLiveness", () => {
 });
 
 describe("BlockchainService operator-wallet slash priority", () => {
-  it("BAILS mid-loop when a slash arrives while the attest is waiting (releases the lock for it)", async () => {
+  it("after broadcasting nonce N, does NOT abandon it when a slash arrives (drives N to inclusion)", async () => {
     const svc = svcWithWallet();
     (svc as any).provider = {
       getFeeData: async () => feeData,
       getTransactionCount: async () => 5,
       getTransactionReceipt: async () => null,
     };
-    // First send lands but the wait times out; DURING that wait a slash arrives (slashPending=1),
-    // so the next loop iteration must bail instead of burning the rest of the retry budget.
+    // A slash arrives DURING the first wait — but since N is already broadcast and the slash sits at
+    // N+1 depending on N, the attest must drive N to inclusion (replacement), NOT yield/abandon it.
+    let call = 0;
+    const attestLiveness: any = () => {
+      call++;
+      if (call === 1)
+        return tx("0xt", async () => {
+          (svc as any).slashPending = 1;
+          throw new Error("timeout waiting for tx");
+        });
+      return tx("0xt", async () => ({ status: 1 })); // replacement confirms → drove N
+    };
+    attestLiveness.staticCall = async () => undefined;
+    (svc as any).buildContract = () => ({ attestLiveness });
+    await expect(svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH, { maxAttempts: 3 })).resolves.toBe(
+      "0xt"
+    );
+  });
+
+  it("runs the receipt WAIT outside the lock (a concurrent wallet write proceeds during the wait)", async () => {
+    const svc = svcWithWallet();
+    (svc as any).provider = { getFeeData: async () => feeData, getTransactionCount: async () => 5 };
+    let ran = false;
+    let release!: () => void;
+    const gate = new Promise<void>(r => (release = r));
     const attestLiveness: any = () =>
-      tx("0xt", async () => {
-        (svc as any).slashPending = 1;
-        throw new Error("timeout waiting for tx");
+      tx("0xa", async () => {
+        await gate;
+        return { status: 1 };
       });
     attestLiveness.staticCall = async () => undefined;
     (svc as any).buildContract = () => ({ attestLiveness });
-    // The final error embeds the bail reason ("yielded to a pending slash write").
-    await expect(svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH)).rejects.toThrow(/yielded/);
+    const p = svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH);
+    await Promise.resolve();
+    await Promise.resolve(); // let the attest broadcast (under lock) then enter its wait
+    // If the wait held the lock this would deadlock; it must run while the attest waits.
+    await (svc as any).enqueueWalletWrite(async () => {
+      ran = true;
+    });
+    expect(ran).toBe(true);
+    release();
+    await p;
+  });
+
+  it("a nonce refetch does NOT consume the send budget — resend guaranteed even at maxAttempts:1 (High #3)", async () => {
+    const svc = svcWithWallet();
+    const getTransactionCount = jest
+      .fn<() => Promise<number>>()
+      .mockResolvedValueOnce(5)
+      .mockResolvedValueOnce(6);
+    (svc as any).provider = {
+      getFeeData: async () => feeData,
+      getTransactionCount,
+      getTransactionReceipt: async () => null,
+    };
+    let call = 0;
+    const attestLiveness: any = () => {
+      call++;
+      if (call === 1) throw new Error("nonce too low");
+      return tx("0xresent", async () => ({ status: 1 }));
+    };
+    attestLiveness.staticCall = async () => undefined;
+    (svc as any).buildContract = () => ({ attestLiveness });
+    await expect(svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH, { maxAttempts: 1 })).resolves.toBe(
+      "0xresent"
+    );
   });
 
   it("enqueueSlashWrite bumps slashPending during the write and clears it after (even on throw)", async () => {
