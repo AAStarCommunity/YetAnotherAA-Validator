@@ -193,9 +193,17 @@ function clockAt(nowMs: number) {
   return () => nowMs;
 }
 
-/** Liveness mock for the offline rule (rule ②). getLastSeen returns a fixed epoch-ms (or null). */
+/** Liveness mock for the offline rule (rule ②). getLastSeen returns a fixed epoch-ms (or null);
+ *  setRelevantNodeIds records the last pushed set so tests can assert the relevant-set contents. */
 function makeGossip(lastSeenMs: number | null): any {
-  return { getLastSeen: (_nodeId: string) => lastSeenMs };
+  const g: any = {
+    lastRelevant: null as string[] | null,
+    getLastSeen: (_nodeId: string) => lastSeenMs,
+    setRelevantNodeIds: (ids: Iterable<string>) => {
+      g.lastRelevant = [...ids];
+    },
+  };
+  return g;
 }
 
 function makeService(
@@ -2580,6 +2588,7 @@ describe("AuditService", () => {
           gossipCalled = true;
           return OFFLINE_LAST_SEEN;
         },
+        setRelevantNodeIds: (_ids: any) => {},
       };
       const svc = makeService(
         blockchain,
@@ -2652,6 +2661,54 @@ describe("AuditService", () => {
       );
       await svc.tick();
       expect(archive.records.find(r => r.evidence.rule === "offline")).toBeUndefined();
+    });
+
+    it("keeps a relevant operator's nodeId across a TRANSIENT resolve failure (no prune on RPC blip, Codex M1)", async () => {
+      let call = 0;
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => {
+          call++;
+          if (call === 1) return NODE_ID; // tick 1 resolves
+          throw new Error("rpc blip"); // tick 2 fails
+        },
+      });
+      const gossip = makeGossip(ONLINE_LAST_SEEN);
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        gossip
+      );
+      await svc.tick(); // resolves → cache + relevant set has NODE_ID
+      expect(gossip.lastRelevant).toEqual([NODE_ID]);
+      await svc.tick(); // resolve throws → cached nodeId retained, NOT pruned
+      expect(gossip.lastRelevant).toEqual([NODE_ID]);
+    });
+
+    it("DROPS the cached nodeId on an AUTHORITATIVE null (inactive/key-rotated), not on a throw (Codex M-final)", async () => {
+      let call = 0;
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => {
+          call++;
+          if (call === 1) return NODE_ID; // tick 1: active
+          return null; // tick 2: authoritative "no active slot" (rotated / exited)
+        },
+      });
+      const gossip = makeGossip(ONLINE_LAST_SEEN);
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        gossip
+      );
+      await svc.tick();
+      expect(gossip.lastRelevant).toEqual([NODE_ID]);
+      await svc.tick(); // authoritative null → cache dropped → relevant set cleared
+      expect(gossip.lastRelevant).toEqual([]);
     });
 
     it("is FILE-ONLY even when armed (executeSlash) — no queue/execute for offline in inc-1", async () => {

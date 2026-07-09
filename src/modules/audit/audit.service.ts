@@ -58,6 +58,14 @@ const RULE_CREDIT_OVER_LIMIT = "credit-over-limit";
  */
 const SLASH_LEVEL_OFFLINE = SlashLevel.WARNING;
 const RULE_OFFLINE = "offline";
+/**
+ * Continuous-offline threshold — a VERSION-BOUND CONSTANT, NOT env (Codex/PK review M-2). It enters
+ * the offline proofHash, so every DVT node MUST use the identical value or the content-address (and
+ * thus the BLS quorum) diverges. A code constant tied to PROOF_SCHEMA_VERSION guarantees all
+ * same-version nodes agree; tuning it is a deliberate versioned release, not a per-node env knob.
+ * 10 minutes. (The effective window is this + the finality lag of the evidence block.)
+ */
+const OFFLINE_THRESHOLD_MS = 600_000;
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
 
@@ -127,10 +135,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly roleMaxStaleMs: number;
   /** Rule ② offline detection — opt-in; audits gossip liveness of the watched operators. */
   private readonly offlineEnabled: boolean;
-  /** Continuous-offline threshold (ms): OFFLINE = lastSeen older than block.ts − this. */
-  private readonly offlineThresholdMs: number;
   /** Liveness source (GossipService.getLastSeen); null when gossip isn't wired → offline self-disables. */
   private readonly gossip: GossipService | null;
+  /** Stable operator→nodeId cache (offline rule ②). A transient resolve failure keeps the cached
+   *  nodeId so a still-relevant operator is never pruned from the gossip ledger on an RPC blip. */
+  private readonly offlineNodeIdCache = new Map<string, string>();
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
   private derivedOperators: string[] = [];
   /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
@@ -295,7 +304,6 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.roleUseGetter = config.get<boolean>("auditRoleUseGetter") === true;
     this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
     this.offlineEnabled = config.get<boolean>("auditOfflineEnabled") === true;
-    this.offlineThresholdMs = config.get<number>("auditOfflineThresholdMs") ?? 600_000;
     this.gossip = gossip ?? null;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
@@ -638,6 +646,39 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         });
       }
       const operators = this.effectiveWatchlist();
+      // Rule ② offline — maintain a STABLE operator→nodeId cache and push its nodeIds to the gossip
+      // liveness ledger so it records ONLY audited operators' heartbeats (Codex: a Sybil can't exhaust
+      // the cap). The cache is authoritative-per-operator: a transient getOperatorNodeId FAILURE keeps
+      // the previously-resolved nodeId (Codex Medium: never prune a still-relevant operator on an RPC
+      // blip), while an AUTHORITATIVE null (inactive / key rotated) drops it, and leaving the
+      // watchlist drops it. Runs on the empty-
+      // watchlist path too, so a drained set correctly clears the relevant set (Codex Low).
+      if (this.offlineEnabled && this.gossip && this.blsAggregatorAddress) {
+        const current = new Set(operators);
+        for (const op of [...this.offlineNodeIdCache.keys()]) {
+          if (!current.has(op)) this.offlineNodeIdCache.delete(op); // operator exited the watchlist
+        }
+        for (const operator of operators) {
+          try {
+            const nid = await this.blockchainService.getOperatorNodeId(
+              this.blsAggregatorAddress,
+              operator
+            );
+            if (nid) {
+              this.offlineNodeIdCache.set(operator, nid); // active → update (self-heals a key rotation)
+            } else {
+              // AUTHORITATIVE null (inactive / no active slot / key rotated away) → DROP the stale
+              // nodeId so we never audit under an old key nor reject the new node's heartbeats.
+              this.offlineNodeIdCache.delete(operator);
+            }
+          } catch (err: unknown) {
+            // TRANSIENT RPC failure (getOperatorNodeId throws) → KEEP the last-known nodeId.
+            const msg = err instanceof Error ? err.message : String(err);
+            this.logger.debug(`Audit: offline nodeId resolve failed for ${operator} — ${msg}`);
+          }
+        }
+        this.gossip.setRelevantNodeIds(this.offlineNodeIdCache.values());
+      }
       if (operators.length === 0) {
         this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
         return;
@@ -653,7 +694,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         // Rule ② offline — independent of the credit rule: one rule's failure must not skip the other.
         if (this.offlineEnabled) {
           try {
-            await this.auditOfflineForOperator(operator, pinnedBlock);
+            await this.auditOfflineForOperator(
+              operator,
+              pinnedBlock,
+              this.offlineNodeIdCache.get(operator)
+            );
           } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             this.logger.error(`Audit: ${operator} offline audit failed — ${msg}`);
@@ -975,14 +1020,16 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    */
   private async auditOfflineForOperator(
     operator: string,
-    pinnedBlock: { number: number; hash: string }
+    pinnedBlock: { number: number; hash: string },
+    preResolvedNodeId?: string
   ): Promise<void> {
     if (!this.offlineEnabled || !this.gossip || !this.blsAggregatorAddress) return;
 
-    const nodeId = await this.blockchainService.getOperatorNodeId(
-      this.blsAggregatorAddress,
-      operator
-    );
+    // Reuse the nodeId the tick already resolved (for the gossip relevant-set push) to avoid a second
+    // on-chain read; fall back to resolving here for a direct caller (tests).
+    const nodeId =
+      preResolvedNodeId ??
+      (await this.blockchainService.getOperatorNodeId(this.blsAggregatorAddress, operator));
     if (!nodeId) return; // operator holds no ACTIVE BLS slot → nothing to bind/slash
 
     const lastSeen = this.gossip.getLastSeen(nodeId);
@@ -1014,7 +1061,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       );
       return;
     }
-    const deadlineMs = blockTsSec * 1000 - this.offlineThresholdMs;
+    const deadlineMs = blockTsSec * 1000 - OFFLINE_THRESHOLD_MS;
 
     if (lastSeen >= deadlineMs) {
       // ONLINE (or within the threshold) — the operator is live; clear any prior offline marker so a
@@ -1033,13 +1080,13 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       slashLevel: SLASH_LEVEL_OFFLINE,
       registry: this.normalizeAddress(this.registryAddress),
       dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
-      offlineThresholdMs: this.offlineThresholdMs,
+      offlineThresholdMs: OFFLINE_THRESHOLD_MS,
       blsAggregator: this.normalizeAddress(this.blsAggregatorAddress),
     };
     const offlineForMs = blockTsSec * 1000 - lastSeen;
     const reason =
       `${RULE_OFFLINE}: nodeId ${nodeId} last heartbeat ${offlineForMs}ms before finalized block ` +
-      `${pinnedBlock.number} (> threshold ${this.offlineThresholdMs}ms)`;
+      `${pinnedBlock.number} (> threshold ${OFFLINE_THRESHOLD_MS}ms)`;
     this.logger.warn(reason);
     // observedAt / lastSeen are HUMAN-only forensics in `sources` (excluded from the content-address).
     const sources: EvidenceSource[] = [
@@ -1067,7 +1114,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       observedAt: this.clock(),
       identity,
       observed: `offline ${offlineForMs}ms`,
-      threshold: `${this.offlineThresholdMs}ms`,
+      threshold: `${OFFLINE_THRESHOLD_MS}ms`,
     });
   }
 
