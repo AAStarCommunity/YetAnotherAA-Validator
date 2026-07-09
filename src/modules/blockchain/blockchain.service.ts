@@ -111,9 +111,14 @@ export class BlockchainService {
    */
   protected runWithSlashPriority<T>(fn: () => Promise<T>): Promise<T> {
     this.slashPending++;
-    return fn().finally(() => {
-      this.slashPending--;
-    });
+    // `Promise.resolve().then(fn)` so a SYNCHRONOUS throw in fn (before it returns a promise) still
+    // routes through `.finally` and decrements — otherwise slashPending would leak and every future
+    // attest would yield forever (Codex r4 Low). The ++ stays synchronous, so priority is immediate.
+    return Promise.resolve()
+      .then(fn)
+      .finally(() => {
+        this.slashPending--;
+      });
   }
 
   private initializeProvider(): void {
@@ -796,6 +801,11 @@ export class BlockchainService {
           if (nonce === null) nonce = await this.provider.getTransactionCount(op, "pending");
           const fees = await this.nextAttestFees(prevFees);
           prevFees = fees;
+          // Recheck AFTER the nonce/fee awaits — a slash that arrived during them must still win the
+          // lower nonce (Codex r4 Medium). Narrows the priority race to the send itself (unavoidable).
+          if (sent.length === 0 && this.hasPendingSlashWrite()) {
+            throw new Error("attestLiveness yielded to a pending slash write");
+          }
           const t: ethers.TransactionResponse = await contract.attestLiveness(
             anchorBlock,
             anchorHash,

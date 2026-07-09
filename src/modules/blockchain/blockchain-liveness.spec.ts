@@ -293,6 +293,37 @@ describe("BlockchainService operator-wallet slash priority", () => {
     await slash;
     expect((svc as any).slashPending).toBe(0);
   });
+
+  it("runWithSlashPriority clears slashPending even when fn throws SYNCHRONOUSLY (Codex r4 Low)", async () => {
+    const svc = svcWithWallet();
+    await (svc as any)
+      .runWithSlashPriority(() => {
+        throw new Error("sync boom"); // NOT async → returns no promise; must still decrement
+      })
+      .catch(() => undefined);
+    expect((svc as any).slashPending).toBe(0);
+  });
+
+  it("attest rechecks slash-priority AFTER the nonce/fee awaits — a slash arriving mid-broadcast wins", async () => {
+    const svc = svcWithWallet();
+    let sent = false;
+    const attestLiveness: any = () => {
+      sent = true;
+      return tx("0xshouldnotsend", async () => ({ status: 1 }));
+    };
+    attestLiveness.staticCall = async () => undefined;
+    (svc as any).provider = {
+      getFeeData: async () => feeData,
+      // A slash arrives DURING the nonce read (after the top-of-broadcast check passed).
+      getTransactionCount: async () => {
+        (svc as any).slashPending = 1;
+        return 5;
+      },
+    };
+    (svc as any).buildContract = () => ({ attestLiveness });
+    await expect(svc.attestLiveness(REGISTRY, 984, ANCHOR_HASH)).rejects.toThrow(/yielded/);
+    expect(sent).toBe(false); // yielded before the actual send → slash keeps the lower nonce
+  });
 });
 
 describe("BlockchainService liveness reads", () => {
