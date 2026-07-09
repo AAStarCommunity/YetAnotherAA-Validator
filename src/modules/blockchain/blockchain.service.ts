@@ -61,17 +61,19 @@ export class BlockchainService {
   private keeperWallet?: ethers.Wallet;
 
   /**
-   * Single FIFO serialization for ALL operator-EOA (`this.wallet`) writes — the liveness attest
-   * keeper (inc-2, fires on a timer) AND every slash/proposal write share the same EOA, so without
-   * one lock two of them can read the same pending nonce and collide (a time-sensitive slash could
-   * fail as an underpriced same-nonce replacement, or an attest could displace a pending slash).
-   * Every write goes through `enqueueWalletWrite`, so exactly one holds the nonce at a time.
+   * Nonce-race protection for the shared operator EOA (`this.wallet`): the attest keeper (inc-2)
+   * and every slash/proposal/registration/updatePrice write share the same EOA. The rule is
+   * BROADCAST-under-lock, WAIT-outside-lock: `enqueueWalletWrite` serializes only the nonce
+   * allocation + send of each tx, NOT its receipt wait. That is what makes it deadlock-free — if a
+   * write held the FIFO through its (possibly 20s) wait, a stuck lower-nonce attest could never be
+   * replaced while a higher-nonce slash sat waiting on it (nonce head-of-line deadlock, Codex r3).
+   * With waits outside the lock, the attest can always reacquire the FIFO to fee-bump a stuck nonce.
    *
-   * Slash PRIORITY: `slashPending` counts slash writes that are queued-or-running. A slash bumps it
-   * synchronously BEFORE it waits for the lock, so a currently-running attest sees it (`hasPendingSlashWrite`)
-   * and BAILS between send attempts — releasing the lock so the slash runs next instead of waiting out
-   * the attest's retry budget. An attest is idempotent + retriable (re-anchors next tick), so yielding
-   * costs nothing; a slash never waits more than one in-flight attest SEND (seconds), never a full loop.
+   * Slash PRIORITY is a SEPARATE signal from the lock: `runWithSlashPriority` bumps `slashPending`
+   * for a slash's whole lifetime (broadcast + wait), so a running attest sees it via
+   * `hasPendingSlashWrite` and yields BEFORE taking a nonce (letting the slash take the lower nonce).
+   * Once the attest has broadcast nonce N, a slash is at N+1 and DEPENDS on N mining, so the attest
+   * then drives N to inclusion rather than yielding. slashPending does NOT hold the FIFO.
    */
   private walletChain: Promise<unknown> = Promise.resolve();
   private slashPending = 0;
@@ -85,7 +87,11 @@ export class BlockchainService {
     return this.slashPending > 0;
   }
 
-  /** Enqueue an operator-wallet write on the single FIFO chain (serializes nonce use). */
+  /**
+   * Serialize a single operator-wallet BROADCAST (nonce alloc + send) on the FIFO chain. Callers
+   * MUST await the returned tx's receipt OUTSIDE this call (do not `await tx.wait()` inside `fn`),
+   * or a slow inclusion would hold the lock and reintroduce the nonce head-of-line deadlock.
+   */
   protected enqueueWalletWrite<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.walletChain.then(fn, fn);
     // Keep the chain alive regardless of fn's outcome; swallow here so one failure
@@ -97,10 +103,15 @@ export class BlockchainService {
     return run;
   }
 
-  /** Enqueue a PRIORITY slash write: bump `slashPending` synchronously (so a running attest yields). */
-  protected enqueueSlashWrite<T>(fn: () => Promise<T>): Promise<T> {
+  /**
+   * Run a PRIORITY slash operation: bump `slashPending` for its WHOLE lifetime (so a running attest
+   * yields before taking a nonce) — but do NOT hold the FIFO here. The slash method wraps only its
+   * BROADCAST in `enqueueWalletWrite` and awaits the receipt outside it, so its wait never blocks the
+   * attest from replacing a stuck nonce (the r3 deadlock).
+   */
+  protected runWithSlashPriority<T>(fn: () => Promise<T>): Promise<T> {
     this.slashPending++;
-    return this.enqueueWalletWrite(fn).finally(() => {
+    return fn().finally(() => {
       this.slashPending--;
     });
   }
@@ -129,8 +140,20 @@ export class BlockchainService {
     const keeperKey = this.configService.get<string>("keeperPrivateKey");
     if (keeperKey && /^0x[0-9a-fA-F]{64}$/.test(keeperKey)) {
       try {
-        this.keeperWallet = new ethers.Wallet(keeperKey, this.provider);
-        this.logger.log(`Keeper signer (dedicated): ${this.keeperWallet.address}`);
+        const kw = new ethers.Wallet(keeperKey, this.provider);
+        // If KEEPER_PRIVATE_KEY resolves to the SAME EOA as ETH_PRIVATE_KEY (two Wallet objects, one
+        // address), do NOT treat it as dedicated — else `keeperSigner` would be a distinct object and
+        // `signer === this.wallet` in updatePrice would be false, leaving that periodic broadcast
+        // OUTSIDE the shared nonce FIFO (Codex r3 High). Keep keeperWallet only for a DIFFERENT EOA.
+        if (this.wallet && kw.address.toLowerCase() === this.wallet.address.toLowerCase()) {
+          this.logger.warn(
+            "KEEPER_PRIVATE_KEY is the SAME EOA as ETH_PRIVATE_KEY — treating as the operator wallet " +
+              "(keeper writes serialize on the shared nonce FIFO)"
+          );
+        } else {
+          this.keeperWallet = kw;
+          this.logger.log(`Keeper signer (dedicated): ${this.keeperWallet.address}`);
+        }
       } catch (error: any) {
         this.logger.error(`Invalid KEEPER_PRIVATE_KEY: ${error.message}`);
       }
@@ -755,8 +778,12 @@ export class BlockchainService {
     let prevFees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | null = null;
     let lastErr: any;
     let sends = 0;
-    const maxIterations = maxSends * 3; // bound recovery (refetch / underpriced) — never spin
-    for (let iter = 0; sends < maxSends && iter < maxIterations; iter++) {
+    // A recovery (nonce refetch / underpriced retry) does NOT consume the SEND budget — it only
+    // consumes a separate recovery budget — so `maxSends` real broadcasts are guaranteed even when a
+    // recovery lands on what would have been the last iteration (Codex r3 High #3 / Medium).
+    let recoveries = 0;
+    const maxRecoveries = maxSends * 2 + 2;
+    while (sends < maxSends) {
       // 1) BROADCAST under the lock (only nonce-alloc + send are exclusive; the wait below is not).
       let tx: ethers.TransactionResponse;
       try {
@@ -783,9 +810,10 @@ export class BlockchainService {
         const code = e?.code;
         const msg = String(e?.shortMessage ?? e?.message ?? e);
         if (msg.includes("yielded")) break; // slash priority — re-anchor next tick
+        if (++recoveries > maxRecoveries) break; // too many recoveries — give up (reconcile + throw)
         // Nonce consumed: our OWN earlier tx may have mined (reconcile → don't double-attest);
         // otherwise a slash took the nonce → refetch a fresh nonce (new tx → fresh fee baseline) and
-        // retry. This recovery does NOT consume the send budget, so a resend is guaranteed.
+        // retry. Recovery does NOT increment `sends`, so a real resend still follows.
         if (code === "NONCE_EXPIRED" || /nonce too low|nonce has already been used/i.test(msg)) {
           const hit = await reconcile();
           if (hit) return hit;
@@ -1617,8 +1645,8 @@ export class BlockchainService {
     reason: string
   ): Promise<{ txHash: string; proposalId: bigint | null }> {
     // Priority slash write on the shared operator-wallet FIFO (bumps slashPending so a running
-    // attest yields; serializes the nonce). See `enqueueSlashWrite` / `enqueueWalletWrite`.
-    return this.enqueueSlashWrite(async () => {
+    // attest yields). Broadcast is wrapped in `enqueueWalletWrite`; the wait stays OUTSIDE it.
+    return this.runWithSlashPriority(async () => {
       if (!this.wallet) {
         throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
       }
@@ -1630,11 +1658,8 @@ export class BlockchainService {
       const iface = new ethers.Interface(abi);
       const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
       const fees = await bumpedFees(this.provider);
-      const tx: ethers.TransactionResponse = await contract.createProposal(
-        operator,
-        level,
-        reason,
-        fees
+      const tx: ethers.TransactionResponse = await this.enqueueWalletWrite(() =>
+        contract.createProposal(operator, level, reason, fees)
       );
       this.logger.log(`createProposal(${operator}, ${level}) submitted: ${tx.hash}`);
       // Await the receipt: a dropped/reverted proposal must NOT be recorded as success.
@@ -1701,7 +1726,7 @@ export class BlockchainService {
     evidenceHash: string,
     dryRun = false
   ): Promise<{ txHash: string; proposalId: bigint | null }> {
-    return this.enqueueSlashWrite(async () => {
+    return this.runWithSlashPriority(async () => {
       if (!this.wallet) {
         throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
       }
@@ -1728,12 +1753,8 @@ export class BlockchainService {
         return { txHash: DRY_RUN_TX_SENTINEL, proposalId: wouldBeId };
       }
       const fees = await bumpedFees(this.provider);
-      const tx: ethers.TransactionResponse = await contract.createProposal(
-        operator,
-        level,
-        reason,
-        evidenceHash,
-        fees
+      const tx: ethers.TransactionResponse = await this.enqueueWalletWrite(() =>
+        contract.createProposal(operator, level, reason, evidenceHash, fees)
       );
       this.logger.log(
         `createProposal(${operator}, ${level}, evidence ${evidenceHash}) submitted: ${tx.hash}`
@@ -1792,7 +1813,7 @@ export class BlockchainService {
     proof: string,
     dryRun = false
   ): Promise<string> {
-    return this.enqueueSlashWrite(async () => {
+    return this.runWithSlashPriority(async () => {
       if (!this.wallet) {
         throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
       }
@@ -1826,12 +1847,8 @@ export class BlockchainService {
         return DRY_RUN_TX_SENTINEL;
       }
       const fees = await bumpedFees(this.provider);
-      const tx: ethers.TransactionResponse = await contract.queueSlashWithProof(
-        operator,
-        slashLevel,
-        epoch,
-        proof,
-        fees
+      const tx: ethers.TransactionResponse = await this.enqueueWalletWrite(() =>
+        contract.queueSlashWithProof(operator, slashLevel, epoch, proof, fees)
       );
       this.logger.log(
         `queueSlashWithProof(${operator}, ${slashLevel}, epoch ${epoch}) submitted: ${tx.hash}`
@@ -1863,7 +1880,7 @@ export class BlockchainService {
     proof: string,
     dryRun = false
   ): Promise<string> {
-    return this.enqueueSlashWrite(async () => {
+    return this.runWithSlashPriority(async () => {
       if (!this.wallet) {
         throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
       }
@@ -1895,13 +1912,8 @@ export class BlockchainService {
         return DRY_RUN_TX_SENTINEL;
       }
       const fees = await bumpedFees(this.provider);
-      const tx: ethers.TransactionResponse = await contract.executeWithProof(
-        id,
-        repUsers,
-        newScores,
-        epoch,
-        proof,
-        fees
+      const tx: ethers.TransactionResponse = await this.enqueueWalletWrite(() =>
+        contract.executeWithProof(id, repUsers, newScores, epoch, proof, fees)
       );
       this.logger.log(`executeWithProof(id ${id}, epoch ${epoch}) submitted: ${tx.hash}`);
       const receipt = await tx.wait();

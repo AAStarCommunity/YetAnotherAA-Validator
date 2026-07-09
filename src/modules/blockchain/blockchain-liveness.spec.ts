@@ -256,17 +256,42 @@ describe("BlockchainService operator-wallet slash priority", () => {
     );
   });
 
-  it("enqueueSlashWrite bumps slashPending during the write and clears it after (even on throw)", async () => {
+  it("runWithSlashPriority bumps slashPending during the write and clears it after (even on throw)", async () => {
     const svc = svcWithWallet();
     let seenDuring = -1;
     await (svc as any)
-      .enqueueSlashWrite(async () => {
+      .runWithSlashPriority(async () => {
         seenDuring = (svc as any).slashPending;
         throw new Error("boom");
       })
       .catch(() => undefined);
     expect(seenDuring).toBe(1); // pending while running
     expect((svc as any).slashPending).toBe(0); // cleared in finally even though it threw
+  });
+
+  it("a slash-priority op does NOT hold the wallet FIFO during its WAIT (Codex r3 deadlock-free)", async () => {
+    const svc = svcWithWallet();
+    let concurrentRan = false;
+    let releaseWait!: () => void;
+    const waitGate = new Promise<void>(r => (releaseWait = r));
+    // Model a slash: broadcast under the lock (brief), then WAIT outside it (gated). If the wait
+    // held the FIFO, the concurrent write below would deadlock behind it.
+    const slash = (svc as any).runWithSlashPriority(async () => {
+      await (svc as any).enqueueWalletWrite(async () => "slash-broadcast");
+      await waitGate; // wait phase — must run OUTSIDE the FIFO
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    // A concurrent operator-wallet write (e.g. an attest fee-bump of a stuck nonce) must proceed
+    // WHILE the slash is waiting — this is exactly the replace-N path the r3 deadlock blocked.
+    await (svc as any).enqueueWalletWrite(async () => {
+      concurrentRan = true;
+    });
+    expect(concurrentRan).toBe(true); // FIFO was free during the slash's wait → no deadlock
+    expect((svc as any).slashPending).toBe(1); // priority signal stays up through the wait
+    releaseWait();
+    await slash;
+    expect((svc as any).slashPending).toBe(0);
   });
 });
 
