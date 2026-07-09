@@ -66,6 +66,14 @@ const RULE_OFFLINE = "offline";
  * 10 minutes. (The effective window is this + the finality lag of the evidence block.)
  */
 const OFFLINE_THRESHOLD_MS = 600_000;
+/**
+ * Rule ③ over-issue (CC-28). MINOR (3-of-3 quorum) — a community minting xPNTs beyond its governance
+ * cap is a serious economic abuse, and the evidence is OBJECTIVE (on-chain isOverIssued() bool), so
+ * the strict quorum is warranted. Slash SUBJECT = the token's communityOwner. Cleared when the token
+ * is next seen within cap.
+ */
+const SLASH_LEVEL_OVER_ISSUE = SlashLevel.MINOR;
+const RULE_OVER_ISSUE = "over-issue";
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
 
@@ -140,6 +148,10 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   /** Stable operator→nodeId cache (offline rule ②). A transient resolve failure keeps the cached
    *  nodeId so a still-relevant operator is never pruned from the gossip ledger on an RPC blip. */
   private readonly offlineNodeIdCache = new Map<string, string>();
+  /** Rule ③ over-issue — opt-in; audits each community xPNTs token's on-chain isOverIssued() flag. */
+  private readonly overIssueEnabled: boolean;
+  /** Community xPNTs token addresses to check for over-issuance (checksummed at ingest). */
+  private readonly xpntsTokens: string[];
   /** Last successfully-derived on-chain operator set (checksummed); UNIONed with the static list. */
   private derivedOperators: string[] = [];
   /** Wall-clock of the last SUCCESSFUL role derivation (null = never); drives freshness. */
@@ -304,6 +316,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.roleUseGetter = config.get<boolean>("auditRoleUseGetter") === true;
     this.roleMaxStaleMs = config.get<number>("auditRoleMaxStaleMs") ?? 900_000;
     this.offlineEnabled = config.get<boolean>("auditOfflineEnabled") === true;
+    this.overIssueEnabled = config.get<boolean>("auditOverIssueEnabled") === true;
+    this.xpntsTokens = (config.get<string[]>("auditXpntsTokens") ?? [])
+      .map(a => a.trim())
+      .filter(Boolean)
+      .map(a => {
+        try {
+          return ethers.getAddress(a);
+        } catch {
+          this.logger.warn(`Audit: dropping invalid AUDIT_XPNTS_TOKENS entry "${a}"`);
+          return null;
+        }
+      })
+      .filter((a): a is string => a !== null);
     this.gossip = gossip ?? null;
     this.clock = clock ?? (() => Date.now());
     this.random = random ?? (() => Math.random());
@@ -678,6 +703,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           }
         }
         this.gossip.setRelevantNodeIds(this.offlineNodeIdCache.values());
+      }
+      // Rule ③ over-issue — audits TOKENS (per community), INDEPENDENT of the operator set, so it runs
+      // even when the operator watchlist is empty. One token's failure never skips another.
+      if (this.overIssueEnabled) {
+        for (const token of this.xpntsTokens) {
+          try {
+            await this.auditOverIssueForToken(token, pinnedBlock);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.logger.error(`Audit: over-issue audit failed for token ${token} — ${msg}`);
+            this.emitAuditEvent("ERROR", { operator: token, error: msg });
+          }
+        }
       }
       if (operators.length === 0) {
         this.logger.debug("Audit: no operators to watch this tick (static + derived both empty)");
@@ -1115,6 +1153,81 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       identity,
       observed: `offline ${offlineForMs}ms`,
       threshold: `${OFFLINE_THRESHOLD_MS}ms`,
+    });
+  }
+
+  /**
+   * Rule ③ over-issue (CC-28) for ONE community xPNTs token, pinned to the finalized block. Reads the
+   * token's OBJECTIVE on-chain isOverIssued() flag (issued value > governance effectiveCap). On true,
+   * the SLASH SUBJECT is the token's communityOwner (the community that minted beyond its cap). The
+   * evidence is a deterministic on-chain bool → every DVT node agrees → SAFELY quorum-slashable
+   * (unlike gossip-offline). Fail-SAFE: over-issue disabled, an isOverIssued/communityOwner read
+   * error, or a null owner → SKIP (never fabricate). A within-cap read CLEARS any coarse marker.
+   */
+  private async auditOverIssueForToken(
+    token: string,
+    pinnedBlock: { number: number; hash: string }
+  ): Promise<void> {
+    if (!this.overIssueEnabled) return;
+
+    let over: boolean;
+    try {
+      over = await this.blockchainService.getIsOverIssued(token, pinnedBlock.number);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Audit: over-issue isOverIssued read failed for token ${token} — ${msg}`);
+      return;
+    }
+
+    // The communityOwner is the slash subject — read it at the SAME block so the subject is pinned.
+    const owner = await this.blockchainService.getCommunityOwner(token, pinnedBlock.number);
+    if (!owner) return; // can't identify the subject → skip (fail-safe)
+
+    if (!over) {
+      await this.clearCoarseSlashed(owner, RULE_OVER_ISSUE);
+      return;
+    }
+
+    // OVER-ISSUE violation. DETERMINISTIC identity — on-chain bool, no per-node data.
+    const identity: ProofIdentity = {
+      proofSchemaVersion: PROOF_SCHEMA_VERSION,
+      chainId: this.chainId,
+      operator: owner,
+      rule: RULE_OVER_ISSUE,
+      violationBlock: pinnedBlock.number,
+      slashLevel: SLASH_LEVEL_OVER_ISSUE,
+      registry: this.normalizeAddress(this.registryAddress),
+      dvtValidator: this.normalizeAddress(this.dvtValidatorAddress),
+      overIssueToken: this.normalizeAddress(token),
+    };
+    const reason = `${RULE_OVER_ISSUE}: community ${owner} over-issued xPNTs token ${token} (isOverIssued=true @block ${pinnedBlock.number})`;
+    this.logger.warn(reason);
+    const sources: EvidenceSource[] = [
+      {
+        type: "view",
+        name: "xPNTs.isOverIssued()",
+        value: "true",
+        block: pinnedBlock.number,
+      },
+      {
+        type: "view",
+        name: "xPNTs.communityOwner()",
+        value: owner,
+        block: pinnedBlock.number,
+      },
+    ];
+    await this.handleViolation({
+      operator: owner,
+      slashLevel: SLASH_LEVEL_OVER_ISSUE,
+      reason,
+      rule: RULE_OVER_ISSUE,
+      violationBlock: pinnedBlock.number,
+      violationBlockHash: pinnedBlock.hash,
+      sources,
+      observedAt: this.clock(),
+      identity,
+      observed: `over-issued (token ${token})`,
+      threshold: "isOverIssued=false",
     });
   }
 
@@ -1847,10 +1960,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     coSignAborted: boolean;
   }> {
     const { operator, slashLevel, reason, epoch, evidenceHash } = args;
-    // Rule ② offline (inc-1) is FILE-ONLY: the armed BLS co-sign for offline (the responder re-checking
-    // its OWN gossip liveness) is inc-2, so the offline path never queues/executes — it only files a
-    // proposal + archives the proof. The credit rule is unaffected.
-    const fileOnlyRule = args.rule === RULE_OFFLINE;
+    // FILE-ONLY rules (inc-1): file a proposal + archive the proof, but never queue/execute an on-chain
+    // slash yet. Offline's armed co-sign is deferred (its evidence is gossip-local; see #202). Over-
+    // issue's evidence IS objective (on-chain isOverIssued) so it is armable in principle, but its slash
+    // SUBJECT is a communityOwner (not a BLS-slotted DVT operator) — arming waits until the SP contract
+    // community-slash path is confirmed. The credit rule is unaffected (stays armed).
+    const fileOnlyRule = args.rule === RULE_OFFLINE || args.rule === RULE_OVER_ISSUE;
     // A1#6 (Codex High-2 + round-3) — a derived-ONLY operator is armed for the irreversible on-chain
     // slash only when its membership is CONFIRMED at the evidence block (epoch) via hasRole — not just
     // the cached set's wall-clock freshness. Stale/never-confirmed/exited-by-epoch membership degrades

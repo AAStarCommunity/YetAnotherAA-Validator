@@ -316,6 +316,13 @@ export default () => {
       }
       return process.env.AUDIT_OFFLINE_ENABLED === "true";
     })(),
+    // Rule ③ over-issue detection (CC-28). Opt-in; audits each configured community xPNTs TOKEN's
+    // OBJECTIVE on-chain isOverIssued() flag (issued value > governance cap). The slash SUBJECT is the
+    // token's communityOwner. Unlike offline, this is objectively slashable (deterministic on-chain
+    // bool). AUDIT_XPNTS_TOKENS: comma-separated community xPNTs token addresses to check (later:
+    // derive from the xPNTs factory, like the rule ① watchlist).
+    auditOverIssueEnabled: process.env.AUDIT_OVER_ISSUE_ENABLED === "true",
+    auditXpntsTokens: parseAllowlist(process.env.AUDIT_XPNTS_TOKENS || ""),
 
     // Gossip Network
     gossipPublicUrl: process.env.GOSSIP_PUBLIC_URL || `ws://localhost:${port}/ws`,

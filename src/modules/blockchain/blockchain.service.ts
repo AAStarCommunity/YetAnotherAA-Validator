@@ -886,6 +886,42 @@ export class BlockchainService {
   }
 
   /**
+   * Over-issue-audit rule ③ (CC-28) — read a community xPNTs token's OBJECTIVE over-issuance flag,
+   * pinned to a finalized block. `isOverIssued()` is the SP-delivered getter: true when the token's
+   * issued value (totalSupply × exchangeRate × apntsPrice) exceeds its governance effectiveCap
+   * (industryScale × capRatio + staked backing). A pure on-chain bool → every DVT node reads the SAME
+   * value → deterministic content-address (unlike gossip-offline, this is objectively slashable).
+   * THROWS on a provider/read error (fail-loud: the caller skips this token, never guesses a violation).
+   */
+  async getIsOverIssued(xpntsToken: string, blockTag?: number): Promise<boolean> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function isOverIssued() view returns (bool)"];
+    const contract = new ethers.Contract(xpntsToken, abi, this.provider);
+    return await contract.isOverIssued({ blockTag });
+  }
+
+  /**
+   * Over-issue-audit rule ③ — the community owner of an xPNTs token (the SLASH SUBJECT for over-
+   * issuance; it is the community that minted beyond its cap). Read pinned to the evidence block so
+   * the subject is fixed with the violation. Returns null on a read error (caller skips the token).
+   */
+  async getCommunityOwner(xpntsToken: string, blockTag?: number): Promise<string | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = ["function communityOwner() view returns (address)"];
+    const contract = new ethers.Contract(xpntsToken, abi, this.provider);
+    try {
+      return ethers.getAddress(await contract.communityOwner({ blockTag }));
+    } catch (error: any) {
+      this.logger.warn(`getCommunityOwner(${xpntsToken}) failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
    * Offline-audit rule ② — resolve an on-chain operator to its gossip `nodeId`, the bridge between
    * the on-chain slash target (operator EOA) and the off-chain liveness key (gossip peer id). Reads
    * BLSAggregator.getBLSPublicKey(operator) → the registered EIP-2537 G1 key tuple (x_a,x_b,y_a,y_b =

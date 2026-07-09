@@ -206,6 +206,11 @@ export interface ProofIdentity {
   offlineThresholdMs?: number;
   /** BLSAggregator used to resolve operator → registered BLS key → gossip nodeId (checksummed). */
   blsAggregator?: string;
+
+  // ── over-issue rule fields (rule ③). Present ONLY on over-issue proofs. The violation is the
+  //    token's on-chain isOverIssued() bool at violationBlock (objective); operator = communityOwner.
+  /** The community xPNTs token whose isOverIssued() was true (checksummed). */
+  overIssueToken?: string;
 }
 
 /** Deterministic JSON with recursively sorted keys — a stable content-address preimage. */

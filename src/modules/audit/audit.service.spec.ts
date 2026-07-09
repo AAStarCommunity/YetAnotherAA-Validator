@@ -90,6 +90,8 @@ function makeBlockchain(
     ) => Promise<boolean>;
     getOperatorNodeId: (blsAgg: string, operator: string) => Promise<string | null>;
     getBlockTimestamp: (blockNumber: number) => Promise<number>;
+    getIsOverIssued: (token: string, blockTag?: number) => Promise<boolean>;
+    getCommunityOwner: (token: string, blockTag?: number) => Promise<string | null>;
   }> = {}
 ): any {
   return {
@@ -123,6 +125,10 @@ function makeBlockchain(
     // A1#6 (round-3) — per-operator membership at the evidence block. Default TRUE (a derived operator
     // is still a role member); a test overrides to model an operator that exited by the epoch block.
     hasRole: overrides.hasRole ?? (async () => true),
+    // Rule ③ over-issue — default WITHIN cap (isOverIssued false); a fixed community owner.
+    getIsOverIssued: overrides.getIsOverIssued ?? (async () => false),
+    getCommunityOwner:
+      overrides.getCommunityOwner ?? (async () => ethers.getAddress("0x" + "c0".repeat(20))),
     // Rule ② offline — operator → nodeId resolution + block timestamp. Defaults model an operator with
     // an active slot (nodeId) and a fixed block time; offline tests override these.
     getOperatorNodeId: overrides.getOperatorNodeId ?? (async () => "0x" + "ab".repeat(32)),
@@ -2730,6 +2736,106 @@ describe("AuditService", () => {
       );
       await svc.tick();
       expect(queued).toBe(false); // offline never queues an on-chain slash in inc-1
+    });
+  });
+
+  // ── Rule ③ over-issue detection (CC-28, inc-1 file-only) ──────────────────────
+  describe("rule ③ over-issue detection", () => {
+    const TOKEN = "0x" + "17".repeat(20);
+    const OWNER = ethers.getAddress("0x" + "c0".repeat(20));
+    const overIssueConfig = (overrides: Record<string, unknown> = {}) =>
+      makeConfig({ auditOverIssueEnabled: true, auditXpntsTokens: [TOKEN], ...overrides });
+
+    it("files an over-issue proposal when a token's isOverIssued() is true (subject = communityOwner)", async () => {
+      const created: string[] = [];
+      const blockchain = makeBlockchain({
+        getIsOverIssued: async () => true,
+        getCommunityOwner: async () => OWNER,
+        createProposalWithEvidence: async (_a: string, operator: string) => {
+          created.push(operator);
+          return { txHash: "0xTX", proposalId: 11n };
+        },
+      });
+      const archive = makeArchive();
+      const svc = makeService(blockchain, overIssueConfig(), archive);
+      await svc.tick();
+      const proof = archive.records.find(r => r.evidence.rule === "over-issue");
+      expect(proof).toBeDefined();
+      expect(proof!.slashLevel).toBe(1); // SlashLevel.MINOR
+      expect(created).toEqual([ethers.getAddress(OWNER)]); // slash subject = communityOwner
+    });
+
+    it("does NOT flag a token within cap (isOverIssued=false)", async () => {
+      const archive = makeArchive();
+      const svc = makeService(
+        makeBlockchain({ getIsOverIssued: async () => false }),
+        overIssueConfig(),
+        archive
+      );
+      await svc.tick();
+      expect(archive.records.find(r => r.evidence.rule === "over-issue")).toBeUndefined();
+    });
+
+    it("SKIPS when communityOwner can't be resolved (fail-safe, no fabricated subject)", async () => {
+      const archive = makeArchive();
+      const svc = makeService(
+        makeBlockchain({ getIsOverIssued: async () => true, getCommunityOwner: async () => null }),
+        overIssueConfig(),
+        archive
+      );
+      await svc.tick();
+      expect(archive.records.find(r => r.evidence.rule === "over-issue")).toBeUndefined();
+    });
+
+    it("is a no-op when AUDIT_OVER_ISSUE_ENABLED is not set (isOverIssued never called)", async () => {
+      let called = false;
+      const blockchain = makeBlockchain({
+        getIsOverIssued: async () => {
+          called = true;
+          return true;
+        },
+      });
+      const svc = makeService(blockchain, makeConfig({ auditXpntsTokens: [TOKEN] }), makeArchive());
+      await svc.tick();
+      expect(called).toBe(false);
+    });
+
+    it("over-issue proofHash is DETERMINISTIC (on-chain bool, no per-node data)", async () => {
+      const build = async () => {
+        const archive = makeArchive();
+        const svc = makeService(
+          makeBlockchain({
+            getIsOverIssued: async () => true,
+            getCommunityOwner: async () => OWNER,
+          }),
+          overIssueConfig(),
+          archive
+        );
+        await svc.tick();
+        return archive.records.find(r => r.evidence.rule === "over-issue")!.proofHash;
+      };
+      expect(await build()).toBe(await build());
+    });
+
+    it("is FILE-ONLY in inc-1 — no queue/execute even when armed (community-slash path unconfirmed)", async () => {
+      let queued = false;
+      const blockchain = makeBlockchain({
+        getIsOverIssued: async () => true,
+        getCommunityOwner: async () => OWNER,
+        queueSlashWithProof: async () => {
+          queued = true;
+          return "0xQUEUE";
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        overIssueConfig({ auditExecuteSlash: true }),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        makeCoSigner()
+      );
+      await svc.tick();
+      expect(queued).toBe(false);
     });
   });
 });
