@@ -1247,16 +1247,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       return;
     }
 
-    // The communityOwner is the slash subject — read it at the SAME block so the subject is pinned.
-    const owner = await this.blockchainService.getCommunityOwner(token, pinnedBlock.number);
-    if (!owner) return; // can't identify the subject → skip (fail-safe)
-
     if (!over) {
       // Cure: within cap → clear the TOKEN-scoped marker so a later re-breach of THIS token can file
-      // again (episode semantics: one open episode per token, cleared on cure).
+      // again (episode semantics: one open episode per token). Checked BEFORE reading communityOwner
+      // (Codex Low): a within-cap token needs no owner read, and a transient owner-null must not block
+      // the marker clear.
       await this.clearCoarseSlashed(token, RULE_OVER_ISSUE);
       return;
     }
+
+    // Over-issued → the communityOwner is the slash subject; read it at the SAME block (pinned). Only
+    // fetched on a real violation (not on every within-cap token).
+    const owner = await this.blockchainService.getCommunityOwner(token, pinnedBlock.number);
+    if (!owner) return; // can't identify the subject → skip (fail-safe)
 
     // OVER-ISSUE violation. DETERMINISTIC identity — on-chain bool, no per-node data.
     const identity: ProofIdentity = {
