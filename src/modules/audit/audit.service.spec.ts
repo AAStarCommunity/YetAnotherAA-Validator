@@ -524,6 +524,53 @@ describe("AuditService", () => {
       expect(created).toEqual([ethers.getAddress(OPERATOR)]);
     });
 
+    // Generic handleViolation behaviour (dedup / evidence-never-lost) is now exercised through the
+    // offline rule — the only active rule — after the credit rule (its former test driver) was removed.
+    it("dedup: the SAME offline violation over many ticks files exactly ONE proposal", async () => {
+      const created: string[] = [];
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => NODE_ID,
+        createProposalWithEvidence: async (_a: string, operator: string) => {
+          created.push(operator);
+          return { txHash: "0xTX", proposalId: 9n };
+        },
+      });
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        makeArchive(),
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(OFFLINE_LAST_SEEN)
+      );
+      await svc.tick();
+      await svc.tick();
+      await svc.tick();
+      // coarseKey (subject|rule) guard + cooldown: one proposal despite three ticks on the same block.
+      expect(created).toHaveLength(1);
+    });
+
+    it("proposal write failure → the offline proof is STILL archived (evidence never lost)", async () => {
+      const blockchain = makeBlockchain({
+        getOperatorNodeId: async () => NODE_ID,
+        createProposalWithEvidence: async () => {
+          throw new Error("RPC down");
+        },
+      });
+      const archive = makeArchive();
+      const svc = makeService(
+        blockchain,
+        offlineConfig(),
+        archive,
+        clockAt(1_700_000_000_000),
+        undefined,
+        makeGossip(OFFLINE_LAST_SEEN)
+      );
+      await svc.tick();
+      // The archive-before-propose invariant: a failed on-chain write must never lose the evidence.
+      expect(archive.records.find(r => r.evidence.rule === "offline")).toBeDefined();
+    });
+
     it("does NOT flag an operator seen within the threshold (online)", async () => {
       const blockchain = makeBlockchain({ getOperatorNodeId: async () => NODE_ID });
       const archive = makeArchive();
