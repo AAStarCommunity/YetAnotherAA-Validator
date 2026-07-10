@@ -38,8 +38,14 @@ const die = m => {
 const ok = m => console.log(`✅ ${m}`);
 const info = m => console.log(`•  ${m}`);
 
-// PoP domain — must match how the node's key proved possession (deploy/onboarding/onboard.mjs).
-const POP_DST = "AASTAR_DVT_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_";
+// PoP domain. Aligned with the PRODUCTION signer stack — SDK core buildDvtPop + the KMS-TEE /
+// Rust signer golden vectors (@aastar/sdk 0.42.0, CC-36/CC-37): the PoP is signed under the same
+// suite DST as normal signing. The on-chain contract is DST-agnostic (registerWithProof takes
+// popPoint as a free calldata param and only pairing-checks popSig = sk·popPoint), so any DST
+// passes — BUT a KMS-TEE node's PoP is produced by KMS /pop, which uses THIS DST, so the popPoint
+// we derive here must match it. (The Solidity KAT in AAStarValidatorStakeBinding.t.sol still uses
+// the old AASTAR_DVT_POP_ vectors — self-consistent + still pass, since the contract is DST-agnostic.)
+const POP_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 // EIP-2537 wire encodings (G1 = 128B, G2 = 256B; each Fp padded 16-zero+48). Matches the contract.
 const _fp = x => {
@@ -119,25 +125,26 @@ function loadNode(path) {
   return { nodeId, pubEip2537, privateKey: s.privateKey, keyless: !s.privateKey };
 }
 
-// --- proof-of-possession: popPoint = hashToG2(operator, POP_DST); popSig = sk · popPoint -------
-async function buildPoP(node, operator) {
-  const msg = ethers.getBytes(operator); // 20-byte operator address, operator-bound (anti-replay)
-  const popPointPt = await bls.G2.hashToCurve(msg, { DST: POP_DST });
-  const popPoint = eip2537G2(popPointPt);
-
+// --- proof-of-possession: popPoint = hashToCurve(PUBLICKEY, POP_DST); popSig = sk · popPoint.
+// Hashing the PUBLIC KEY (not the operator) under this DST matches SDK core buildDvtPop + the KMS
+// /pop TEE golden (CC-36/CC-37), so a PoP is byte-identical however it is produced. The contract is
+// message/DST-agnostic (popPoint is a free calldata param; the pairing only checks popSig=sk·popPoint).
+async function buildPoP(node) {
+  const pubBytes = ethers.getBytes(node.pubEip2537);
   if (!node.keyless) {
+    const popPointPt = await bls.G2.hashToCurve(pubBytes, { DST: POP_DST });
     const sk = Uint8Array.from(Buffer.from(node.privateKey.replace(/^0x/, ""), "hex"));
-    const popSig = eip2537G2(await sigs.sign(popPointPt, sk));
-    return { popPoint, popSig };
+    return { popPoint: eip2537G2(popPointPt), popSig: eip2537G2(await sigs.sign(popPointPt, sk)) };
   }
-  // Key-less (KMS-TEE): the BLS key is sealed in the TEE — ask KMS to sign the popPoint.
+  // Key-less (KMS-TEE): the BLS key is sealed in the TEE. KMS /pop (CC-37) derives popPoint =
+  // hashToCurve(publicKey) AND signs it in the TEE, returning both — we never touch the key.
   const url = process.env.RUST_SIGNER_URL;
   if (!url) {
     die(
-      "key-less node (KMS-TEE) but RUST_SIGNER_URL not set — the PoP must be signed by the KMS TEE.\n" +
-        "  Set RUST_SIGNER_URL (+ RUST_SIGNER_TOKEN) to the KMS loopback, and the KMS must expose\n" +
-        "  POST /pop { node_id, pop_point } → { pop_sig } (signs popPoint with the TEE BLS key).\n" +
-        "  This is the one cross-repo piece for registering a KMS-TEE node (raise to @repo:kms)."
+      "key-less node (KMS-TEE) but RUST_SIGNER_URL not set — the PoP must be produced by the KMS TEE.\n" +
+        "  Set RUST_SIGNER_URL (+ RUST_SIGNER_TOKEN); KMS must expose POST /pop (CC-37):\n" +
+        "  { node_id | publicKey } → { publicKey, popPoint, popSig }. Until CC-37 lands, register a\n" +
+        "  KMS-TEE node via SDK onboardDvtNode's popSigner (same /pop)."
     );
   }
   const headers = { "content-type": "application/json" };
@@ -145,17 +152,12 @@ async function buildPoP(node, operator) {
   const res = await fetch(`${url.replace(/\/+$/, "")}/pop`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ node_id: node.nodeId, pop_point: popPoint }),
+    body: JSON.stringify({ node_id: node.nodeId, publicKey: node.pubEip2537 }),
     signal: AbortSignal.timeout(8000),
   }).catch(e => die(`KMS /pop request failed: ${e.message}`));
-  if (!res.ok) {
-    die(
-      `KMS /pop returned HTTP ${res.status}. If 404, the KMS has no PoP endpoint yet — that is the\n` +
-        "  cross-repo gap for KMS-TEE staked registration (KMS must sign popPoint with the TEE key)."
-    );
-  }
-  const { pop_sig: popSig } = await res.json();
-  if (!popSig) die("KMS /pop response missing pop_sig");
+  if (!res.ok) die(`KMS /pop returned HTTP ${res.status}. If 404, KMS has no /pop yet (CC-37 pending).`);
+  const { popPoint, popSig } = await res.json(); // CC-37 shape: { publicKey, popPoint, popSig }
+  if (!popPoint || !popSig) die("KMS /pop response missing popPoint/popSig (expected CC-37 shape)");
   return { popPoint, popSig };
 }
 
@@ -259,7 +261,7 @@ async function main() {
       die(`operator ${operator} already anchors node ${existingNode} (one node per operator in staked mode).`);
     }
     info("staked mode → building BLS proof-of-possession");
-    const { popPoint, popSig } = await buildPoP(node, operator);
+    const { popPoint, popSig } = await buildPoP(node);
     ok("PoP built");
     method = "registerWithProof";
     methodArgs = [node.pubEip2537, popPoint, popSig];

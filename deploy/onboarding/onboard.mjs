@@ -37,8 +37,11 @@ function loadState() {
   return JSON.parse(readFileSync(STATE, "utf8"));
 }
 
-// PoP domain (must match AAStarValidator's KAT / the contract's expected DST).
-const POP_DST = "AASTAR_DVT_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_";
+// PoP domain. Aligned with the production signer stack (SDK core buildDvtPop + KMS-TEE / Rust
+// signer golden, @aastar/sdk 0.42.0). registerWithProof is DST-agnostic on-chain (popPoint is a
+// free param, pairing only checks popSig = sk·popPoint), so this must simply match whatever signs
+// the PoP — for KMS-TEE nodes that is KMS /pop, which uses this DST.
+const POP_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 // EIP-2537 encodings (the on-chain wire): G1 = 128 bytes, G2 = 256 bytes, each Fp padded
 // to 64 (16 zero + 48). Matches the contract + src/utils/bls.util.ts.
@@ -120,9 +123,9 @@ async function pop() {
   const sk = Uint8Array.from(Buffer.from(s.privateKey.replace(/^0x/, ""), "hex"));
   const pubHex = s.publicKeyEip2537 || eip2537G1(sigs.getPublicKey(sk));
 
-  // popPoint = hash_to_G2(operatorAddress, POP_DST); popSig = sk * popPoint.
-  const msg = ethers.getBytes(operator); // 20-byte address
-  const popPoint = await bls.G2.hashToCurve(msg, { DST: POP_DST });
+  // popPoint = hash_to_G2(PUBLICKEY, POP_DST); popSig = sk * popPoint. Hashing the pubkey (not the
+  // operator) matches SDK core buildDvtPop + the KMS /pop golden (CC-36/CC-37) — one PoP everywhere.
+  const popPoint = await bls.G2.hashToCurve(ethers.getBytes(pubHex), { DST: POP_DST });
   const popSig = await sigs.sign(popPoint, sk);
 
   console.log("\n── registerWithProof params (call from your operator EOA/Safe) ──");
