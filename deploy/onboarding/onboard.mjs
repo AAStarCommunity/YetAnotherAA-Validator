@@ -123,9 +123,9 @@ async function pop() {
   const sk = Uint8Array.from(Buffer.from(s.privateKey.replace(/^0x/, ""), "hex"));
   const pubHex = s.publicKeyEip2537 || eip2537G1(sigs.getPublicKey(sk));
 
-  // popPoint = hash_to_G2(operatorAddress, POP_DST); popSig = sk * popPoint.
-  const msg = ethers.getBytes(operator); // 20-byte address
-  const popPoint = await bls.G2.hashToCurve(msg, { DST: POP_DST });
+  // popPoint = hash_to_G2(PUBLICKEY, POP_DST); popSig = sk * popPoint. Hashing the pubkey (not the
+  // operator) matches SDK core buildDvtPop + the KMS /pop golden (CC-36/CC-37) — one PoP everywhere.
+  const popPoint = await bls.G2.hashToCurve(ethers.getBytes(pubHex), { DST: POP_DST });
   const popSig = await sigs.sign(popPoint, sk);
 
   console.log("\n── registerWithProof params (call from your operator EOA/Safe) ──");
