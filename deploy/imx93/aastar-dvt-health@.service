@@ -10,4 +10,6 @@ Type=oneshot
 EnvironmentFile=/opt/aastar-dvt/env/%i.env
 # curl the node's own /health; on failure (non-2xx / refused / timeout) restart it.
 # --max-time guards against the probe itself hanging on a stuck socket.
-ExecStart=/bin/sh -c 'curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/health" >/dev/null || { echo "aastar-dvt@%i unhealthy — restarting"; systemctl restart aastar-dvt@%i.service; }'
+# ${PORT:-4001}: an empty PORT must not build a malformed URL (http://127.0.0.1:/health)
+# and restart-storm every 30s — fall back to the imx93 default.
+ExecStart=/bin/sh -c 'curl -fsS --max-time 5 "http://127.0.0.1:${PORT:-4001}/health" >/dev/null || { echo "aastar-dvt@%i unhealthy — restarting"; systemctl restart aastar-dvt@%i.service; }'

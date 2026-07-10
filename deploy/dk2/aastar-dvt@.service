@@ -1,0 +1,61 @@
+# systemd template unit for an AAStar DVT node on the STM32MP157F-DK2
+# (ARMv7-A, 512 MB, DVT-ONLY — no KMS co-located). Instance name = node id,
+# e.g. `aastar-dvt@node2`. Enable/start:
+#   systemctl enable --now aastar-dvt@node2
+#
+# Same unit name as the i.MX93 path (aastar-dvt@%i) on purpose: units are
+# per-board, so the shared health probe (aastar-dvt-health@%i) works unchanged.
+# The ONLY delta vs deploy/imx93/aastar-dvt@.service is the 512 MB memory tuning
+# below — the DK2 has a quarter of the i.MX93's RAM and must leave headroom for
+# the OS, so the caps are tighter and V8's heap is bounded explicitly.
+#
+# Self-heal layer 1: Restart=always → recover from crash / OOM / non-zero exit,
+# and (via `enable`) auto-start on boot. The hung-but-alive case is handled by the
+# companion aastar-dvt-health@.timer (probes /health, restarts on failure).
+[Unit]
+Description=AAStar DVT signer node (%i) — DK2 armv7
+Documentation=https://github.com/AAStarCommunity/YetAnotherAA-Validator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Per-node config: PORT, ETH_RPC_URL, VALIDATOR_CONTRACT_ADDRESS…
+# DVT-only: do NOT set RUST_SIGNER_URL — this node signs with its OWN local
+# EIP-2335 keystore / node_state.json (no KMS-TEE custody on the DK2).
+EnvironmentFile=/opt/aastar-dvt/env/%i.env
+# 512 MB board: bound V8's old-space so a leak/burst can't OOM-kill the box.
+# 224 MB heap ceiling keeps RSS (heap + ~60 MB binary/buffers) comfortably under the
+# 320 MB MemoryMax below, vs 256 which left only ~64 MB non-heap headroom. Baseline RSS
+# is ~103-110 MB so this is a guard rail, not a working limit. TUNE on real hardware:
+# watch `systemctl show -p MemoryPeak aastar-dvt@node2` under gossip/audit load.
+Environment=NODE_OPTIONS=--max-old-space-size=224
+# The BLS private key for THIS node (its own node_state.json). cwd = state dir so the
+# app finds ./node_state.json exactly like the dev/script deployments.
+WorkingDirectory=/opt/aastar-dvt/state/%i
+ExecStart=/opt/aastar-dvt/current/node /opt/aastar-dvt/current/dist/main.js
+
+Restart=always
+RestartSec=3
+# Don't let a crash-loop hammer the flash/CPU: cap restarts, back off if it storms.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- hardening (defence in depth for a key-holding process) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Only the state dir is writable; everything else read-only.
+ReadWritePaths=/opt/aastar-dvt/state/%i
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Resource guard rails for a 512 MB board running ONE DVT-only node.
+# MemoryMax is a hard cap (kernel OOM-kills the cgroup above it); MemoryHigh is the
+# soft throttle where the kernel starts reclaiming. Leaves ~190 MB for OS + WiFi.
+MemoryMax=320M
+MemoryHigh=256M
+
+[Install]
+WantedBy=multi-user.target
