@@ -25,8 +25,10 @@ signs.
 #   RUST_SIGNER_URL / RUST_SIGNER_REQUIRED / RUST_SIGNER_TOKEN  +  KMS_BLS_PUBKEY
 . /etc/airaccount/dvt-handoff.env
 
-# 1. DVT v1.9.0/v1.7.1 → v1.11.0, bare-node build (pure JS, board-proven)
-cd /opt/dvt-build && git fetch --tags && git checkout v1.11.0 && ./scripts/build-bare-node.sh
+# 1. DVT v1.9.0/v1.7.1 → v1.12.0, bare-node build (pure JS, board-proven)
+#    v1.12.0 is the first tag that bundles v1.11.0's signing + the CC-24 helpers
+#    (write-keyless-node-state.mjs, this dir) + the CC-34 KmsEcdsaSigner.
+cd /opt/dvt-build && git fetch --tags && git checkout v1.12.0 && ./scripts/build-bare-node.sh
 
 # 2. key-less node_state from KMS's pubkey (DVT derives the nodeId — don't re-implement it)
 node scripts/write-keyless-node-state.mjs "$KMS_BLS_PUBKEY"      # → /opt/dvt-build/node_state.json
