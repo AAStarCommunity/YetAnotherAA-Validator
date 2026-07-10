@@ -25,16 +25,30 @@ signs.
 #   RUST_SIGNER_URL / RUST_SIGNER_REQUIRED / RUST_SIGNER_TOKEN  +  KMS_BLS_PUBKEY
 . /etc/airaccount/dvt-handoff.env
 
-# 1. DVT v1.9.0/v1.7.1 → v1.12.0, bare-node build (pure JS, board-proven)
-#    v1.12.0 is the first tag that bundles v1.11.0's signing + the CC-24 helpers
-#    (write-keyless-node-state.mjs, this dir) + the CC-34 KmsEcdsaSigner.
-cd /opt/dvt-build && git fetch --tags && git checkout v1.12.0 && ./scripts/build-bare-node.sh
+# 1. Get DVT v1.12.0 SOURCE onto the board, then build with DVT's own script (method ②).
+#    v1.12.0 is the first tag bundling v1.11.0 signing + the CC-24 helpers + the CC-34 signer.
+#    The A-board has NO git, so check out on a machine that does (your Mac) and rsync the
+#    source — the board still builds DVT's UNMODIFIED code. Excludes preserve board state and
+#    skip heavy/arch trees (build-bare-node re-installs node_modules fresh):
+#      # on your Mac, in the DVT repo:
+#      git fetch --tags && git checkout v1.12.0
+#      rsync -a --delete \
+#        --exclude .git --exclude node_modules --exclude dist --exclude contracts/lib \
+#        --exclude node_state.json --exclude dvt.env --exclude 'dvt.log*' \
+#        ./ root@<board>:/opt/dvt-build/
+#    (Board WITH git instead: cd /opt/dvt-build && git fetch --tags && git checkout v1.12.0)
+cd /opt/dvt-build && ./scripts/build-bare-node.sh               # npm ci + build → dist/main.js
 
-# 2. key-less node_state from KMS's pubkey (DVT derives the nodeId — don't re-implement it)
-node scripts/write-keyless-node-state.mjs "$KMS_BLS_PUBKEY"      # → /opt/dvt-build/node_state.json
+# 2. Swap the OLD (v1.7.1 encrypted-keystore) node_state for a key-less one from KMS's pubkey.
+rm -f /opt/dvt-build/node_state.json                            # drop the old keystore state
+node scripts/write-keyless-node-state.mjs "$KMS_BLS_PUBKEY"     # → node_state.json (no privateKey)
 
-# 3. config: DVT-owned dvt.env (non-secret) + KMS-owned handoff (signer wiring, already on disk)
-cp deploy/kms-tee/dvt.env.example /opt/dvt-build/dvt.env         # edit only if PORT/validator differ
+# 3. config: DVT-owned dvt.env. ⚠️ PRESERVE the board's existing ETH_RPC_URL (don't clobber the
+#    working RPC key) — only update VALIDATOR to 0x539B96 and add PORT/entrypoint if missing.
+#    (Signer wiring RUST_SIGNER_* comes from the KMS handoff via dvt.service, not this file.)
+#      sed -i 's|^VALIDATOR_CONTRACT_ADDRESS=.*|VALIDATOR_CONTRACT_ADDRESS=0x539B9681aFd5BFbCaa655Fe4c6BdcFe1fa7864bC|' /opt/dvt-build/dvt.env
+#    or start from the template and re-add ETH_RPC_URL:
+#      cp deploy/kms-tee/dvt.env.example /opt/dvt-build/dvt.env && $EDITOR /opt/dvt-build/dvt.env
 
 # 4. key-less unit: no /run/dvt/pass, ordered after KMS, enabled for boot
 cp deploy/kms-tee/dvt.service /etc/systemd/system/dvt.service
