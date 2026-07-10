@@ -4,13 +4,16 @@ Status: **evaluation + plan** (not built). Owner: DVT + KMS (cross-repo).
 
 ## Problem
 
-KMS-TEE custody protects the **BLS** co-signing key (key-less `node_state.json` +
-`RUST_SIGNER_URL` → KMS `/sign`). It does **not** protect the **operator/keeper
-ECDSA key**: today all on-chain writes sign with a plaintext EOA from `.env`.
+KMS-TEE custody protects the **BLS** co-signing key (key-less
+`node_state.json` + `RUST_SIGNER_URL` → KMS `/sign`). It does **not** protect
+the **operator/keeper ECDSA key**: today all on-chain writes sign with a
+plaintext EOA from `.env`.
 
 Evidence:
+
 - `blockchain.service.ts:136` `this.wallet = new ethers.Wallet(ETH_PRIVATE_KEY)`
-- `blockchain.service.ts:148` `keeperWallet = new ethers.Wallet(KEEPER_PRIVATE_KEY)`
+- `blockchain.service.ts:148`
+  `keeperWallet = new ethers.Wallet(KEEPER_PRIVATE_KEY)`
 - `liveness-keeper.service.ts:21` — `attestLiveness()` from the **operator EOA**
 - The only remote-signer seam that exists is **BLS-only** (`RUST_SIGNER_URL`,
   `bls.service.ts signViaRust`). There is **no ECDSA remote seam**.
@@ -35,50 +38,53 @@ ECDSA (new):    no local EOA key     + KEEPER_SIGNER_URL  → KMS /kms/sign (sec
 ```
 
 - New `KmsEcdsaSigner extends ethers.AbstractSigner`: `getAddress()` from a
-  configured keeper address; `signTransaction(tx)` → serialize unsigned →
-  KMS `/kms/sign` (keyId=keeper) → assemble `{r,s,v}` → return signed tx.
-  Same `X-Signer-Token` auth as the BLS seam (`#182`).
-- `BlockchainService.initializeProvider()`: when `KEEPER_SIGNER_URL` is set, build
-  `wallet`/`keeperWallet` as `KmsEcdsaSigner` instead of `new ethers.Wallet(pk)`.
-  **Fallback preserved**: `KEEPER_SIGNER_URL` unset → today's `.env` EOA path
-  (standalone / non-co-located boards keep working — "允许降级为独立 env").
-- `enqueueWalletWrite` nonce FIFO is unchanged (the signer swap is transparent to it).
+  configured keeper address; `signTransaction(tx)` → serialize unsigned → KMS
+  `/kms/sign` (keyId=keeper) → assemble `{r,s,v}` → return signed tx. Same
+  `X-Signer-Token` auth as the BLS seam (`#182`).
+- `BlockchainService.initializeProvider()`: when `KEEPER_SIGNER_URL` is set,
+  build `wallet`/`keeperWallet` as `KmsEcdsaSigner` instead of
+  `new ethers.Wallet(pk)`. **Fallback preserved**: `KEEPER_SIGNER_URL` unset →
+  today's `.env` EOA path (standalone / non-co-located boards keep working —
+  "允许降级为独立 env").
+- `enqueueWalletWrite` nonce FIFO is unchanged (the signer swap is transparent
+  to it).
 
 ## Provisioning flow — DVT-driven self-service (not KMS-manual)
 
 The node **drives** provisioning; KMS is the key-custody backend it calls. One
-`dvt init-kms` command / admin endpoint does the whole thing so it works the same
-on any board (not a KMS operator hand-running commands on each box):
+`dvt init-kms` command / admin endpoint does the whole thing so it works the
+same on any board (not a KMS operator hand-running commands on each box):
 
 1. DVT → KMS `gen-bls-key` (TEE-sealed) → BLS pubkey → write key-less
    `node_state.json` → on-chain `registerPublicKey` on the target validator.
 2. DVT → KMS `gen-keeper-eoa` (TEE-sealed secp256k1) → **keeper EOA address**.
-3. DVT records the full pubkey + keeper EOA in its **config** (single source), and
-   **displays them on the dashboard** (`dvt.aastar.io` / `/admin`) **masked in the
-   middle** (e.g. `0x539B…64bC`) so the operator can read enough to act without the
-   panel leaking full values. The full keeper EOA is in config so the operator can
-   **fund it with ETH**.
+3. DVT records the full pubkey + keeper EOA in its **config** (single source),
+   and **displays them on the dashboard** (`dvt.aastar.io` / `/admin`) **masked
+   in the middle** (e.g. `0x539B…64bC`) so the operator can read enough to act
+   without the panel leaking full values. The full keeper EOA is in config so
+   the operator can **fund it with ETH**.
 4. `dvt.env`: `KEEPER_SIGNER_URL=http://127.0.0.1:3100`, `KEEPER_ADDRESS=0x…`,
    `KEEPER_ENABLED=true` (no `KEEPER_PRIVATE_KEY`).
 5. Operator funds the keeper EOA. Keeper runs; every
    `attestLiveness`/`updatePrice`/`registerPublicKey` tx is signed in the TEE.
    Unattended-boot safe (no plaintext key, no tmpfs passphrase).
 
-> Masking is display-only. Full values live in the node's config (readable by the
-> operator on the box), never only-on-screen — the operator must be able to copy the
-> keeper EOA to fund it.
+> Masking is display-only. Full values live in the node's config (readable by
+> the operator on the box), never only-on-screen — the operator must be able to
+> copy the keeper EOA to fund it.
 
 ## Cross-repo dependency (KMS side — must land first)
 
 - KMS `/kms/sign` for secp256k1 reachable on the loopback `:3100` contract (like
   BLS `/sign`): `{keyId, digest}` → `{r,s,v}` (or `{signature}`). Confirm exact
   wire + whether it signs a raw 32-byte digest (needed for `signTransaction`).
-- KMS `gen-keeper-key` provisioning (behind the same `KMS_BLS_PROVISIONING`-style
-  gate) that returns the k1 address.
+- KMS `gen-keeper-key` provisioning (behind the same
+  `KMS_BLS_PROVISIONING`-style gate) that returns the k1 address.
 
 ## Phases
 
-1. **KMS**: expose secp256k1 `/kms/sign` (raw-digest) + `gen-keeper-key` on `:3100`.
+1. **KMS**: expose secp256k1 `/kms/sign` (raw-digest) + `gen-keeper-key` on
+   `:3100`.
 2. **DVT**: `KmsEcdsaSigner` + `KEEPER_SIGNER_URL` seam in `BlockchainService`
    (fallback to `.env` when unset). Unit tests: byte-identical signature vs a
    local `ethers.Wallet` for the same key/digest.
