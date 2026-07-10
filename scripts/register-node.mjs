@@ -38,8 +38,14 @@ const die = m => {
 const ok = m => console.log(`✅ ${m}`);
 const info = m => console.log(`•  ${m}`);
 
-// PoP domain — must match how the node's key proved possession (deploy/onboarding/onboard.mjs).
-const POP_DST = "AASTAR_DVT_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_";
+// PoP domain. Aligned with the PRODUCTION signer stack — SDK core buildDvtPop + the KMS-TEE /
+// Rust signer golden vectors (@aastar/sdk 0.42.0, CC-36/CC-37): the PoP is signed under the same
+// suite DST as normal signing. The on-chain contract is DST-agnostic (registerWithProof takes
+// popPoint as a free calldata param and only pairing-checks popSig = sk·popPoint), so any DST
+// passes — BUT a KMS-TEE node's PoP is produced by KMS /pop, which uses THIS DST, so the popPoint
+// we derive here must match it. (The Solidity KAT in AAStarValidatorStakeBinding.t.sol still uses
+// the old AASTAR_DVT_POP_ vectors — self-consistent + still pass, since the contract is DST-agnostic.)
+const POP_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 // EIP-2537 wire encodings (G1 = 128B, G2 = 256B; each Fp padded 16-zero+48). Matches the contract.
 const _fp = x => {
