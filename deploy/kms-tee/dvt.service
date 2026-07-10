@@ -1,0 +1,52 @@
+# AAStar DVT (aNode) — KMS-TEE KEY-LESS, co-located with KMS on one board (CC-24).
+#
+# The key-less counterpart of the board's isolated-keystore dvt.service. Two deltas make
+# "power-on → unattended KMS+DVT1" work:
+#   1. NO /run/dvt/pass (tmpfs passphrase) — the BLS private key is sealed in the KMS OP-TEE,
+#      so there is nothing to re-type after a power cut. Signing goes via RUST_SIGNER_URL.
+#   2. Ordered After=kms-api.service — KMS starts first. (Even if DVT wins the race it boots
+#      key-less without probing KMS, and /health is pure liveness, so it just waits quietly
+#      until KMS :3100 is up — verified in node.service.ts. Wants= keeps them coupled.)
+#
+# Signer wiring (RUST_SIGNER_URL / RUST_SIGNER_REQUIRED / RUST_SIGNER_TOKEN) is provided by the
+# KMS handoff file the KMS self-init writes; DVT owns only the non-secret dvt.env. Apply on the
+# board (KMS node-setup does this, method ②):
+#   cp deploy/kms-tee/dvt.service /etc/systemd/system/dvt.service
+#   systemctl daemon-reload && systemctl enable --now dvt.service
+[Unit]
+Description=AAStar DVT (aNode) — KMS-TEE key-less (co-located)
+Documentation=https://github.com/AAStarCommunity/YetAnotherAA-Validator
+After=network-online.target kms-api.service
+Wants=network-online.target kms-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dvt-build
+# DVT-owned non-secret config (PORT / VALIDATOR / ENTRY_POINT / NODE_STATE_FILE).
+EnvironmentFile=/opt/dvt-build/dvt.env
+# KMS-owned handoff (RUST_SIGNER_URL / RUST_SIGNER_REQUIRED / RUST_SIGNER_TOKEN), written by the
+# KMS self-init. Leading '-' = optional: absent → node falls back to local-keystore mode.
+EnvironmentFile=-/etc/airaccount/dvt-handoff.env
+ExecStart=/opt/node20/bin/node /opt/dvt-build/dist/main.js
+
+# Unattended self-heal: recover from crash/OOM and auto-start on boot. (on-failure would not
+# restart a clean exit; a key-holding signer should always come back.) StartLimit caps a storm.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+StandardOutput=append:/opt/dvt-build/dvt.log
+StandardError=append:/opt/dvt-build/dvt.log
+
+# --- hardening (unchanged from the board's unit) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/opt/dvt-build
+
+[Install]
+WantedBy=multi-user.target
