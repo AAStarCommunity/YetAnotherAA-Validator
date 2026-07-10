@@ -44,14 +44,29 @@ ECDSA (new):    no local EOA key     + KEEPER_SIGNER_URL  → KMS /kms/sign (sec
   (standalone / non-co-located boards keep working — "允许降级为独立 env").
 - `enqueueWalletWrite` nonce FIFO is unchanged (the signer swap is transparent to it).
 
-## Provisioning flow (the operator's UX)
+## Provisioning flow — DVT-driven self-service (not KMS-manual)
 
-1. KMS `gen keeper k1 key` (TEE-sealed) → returns the **keeper EOA address**.
-2. Operator funds that address with ETH on the target network.
-3. `dvt.env`: `KEEPER_SIGNER_URL=http://127.0.0.1:3100`, `KEEPER_ADDRESS=0x…`,
+The node **drives** provisioning; KMS is the key-custody backend it calls. One
+`dvt init-kms` command / admin endpoint does the whole thing so it works the same
+on any board (not a KMS operator hand-running commands on each box):
+
+1. DVT → KMS `gen-bls-key` (TEE-sealed) → BLS pubkey → write key-less
+   `node_state.json` → on-chain `registerPublicKey` on the target validator.
+2. DVT → KMS `gen-keeper-eoa` (TEE-sealed secp256k1) → **keeper EOA address**.
+3. DVT records the full pubkey + keeper EOA in its **config** (single source), and
+   **displays them on the dashboard** (`dvt.aastar.io` / `/admin`) **masked in the
+   middle** (e.g. `0x539B…64bC`) so the operator can read enough to act without the
+   panel leaking full values. The full keeper EOA is in config so the operator can
+   **fund it with ETH**.
+4. `dvt.env`: `KEEPER_SIGNER_URL=http://127.0.0.1:3100`, `KEEPER_ADDRESS=0x…`,
    `KEEPER_ENABLED=true` (no `KEEPER_PRIVATE_KEY`).
-4. Keeper runs; every `attestLiveness`/`updatePrice`/`registerPublicKey` tx is
-   signed in the TEE. Unattended-boot safe (no plaintext key, no tmpfs passphrase).
+5. Operator funds the keeper EOA. Keeper runs; every
+   `attestLiveness`/`updatePrice`/`registerPublicKey` tx is signed in the TEE.
+   Unattended-boot safe (no plaintext key, no tmpfs passphrase).
+
+> Masking is display-only. Full values live in the node's config (readable by the
+> operator on the box), never only-on-screen — the operator must be able to copy the
+> keeper EOA to fund it.
 
 ## Cross-repo dependency (KMS side — must land first)
 
