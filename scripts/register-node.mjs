@@ -20,6 +20,7 @@
 //   • operator funded with gas • operator staked (ROLE_DVT + minStake) in staked mode
 //   • operator has no other node (contract enforces one node per operator in staked mode).
 import { readFileSync, existsSync } from "fs";
+import { execFileSync } from "child_process";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
 import { ethers } from "ethers";
 
@@ -63,6 +64,24 @@ const eip2537G2 = p => {
   r.set(_fp(a.y.c1), 208);
   return "0x" + Buffer.from(r).toString("hex");
 };
+
+// Solidity signatures for the two register paths (used by the `cast send` broadcast path).
+const REGISTER_SIGS = {
+  registerPublicKey: "registerPublicKey(bytes32,bytes)",
+  registerWithProof: "registerWithProof(bytes,bytes,bytes)",
+};
+
+// Load a dotenv-style deploy config (e.g. deploy/.env.testnet) — fills MISSING vars only, so an
+// explicit env/CLI value always wins. Lets "deployed 资料" supply the operator + RPC + validator.
+function loadEnvFile(path) {
+  if (!existsSync(path)) die(`--env-file not found: ${path}`);
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (m && process.env[m[1]] === undefined) {
+      process.env[m[1]] = m[2].replace(/\s*#.*$/, "").trim().replace(/^["']|["']$/g, "");
+    }
+  }
+}
 
 const VALIDATOR_ABI = [
   "function isRegistered(bytes32) view returns (bool)",
@@ -141,9 +160,10 @@ async function buildPoP(node, operator) {
 }
 
 async function main() {
+  const envFile = opt("--env-file", process.env.REGISTER_ENV_FILE);
+  if (envFile) loadEnvFile(envFile); // must run BEFORE reading any env var below
   const rpc = process.env.ETH_RPC_URL || die("set ETH_RPC_URL");
   const validatorAddr = process.env.VALIDATOR_CONTRACT_ADDRESS || die("set VALIDATOR_CONTRACT_ADDRESS");
-  const pk = process.env.OPERATOR_PRIVATE_KEY || process.env.ETH_PRIVATE_KEY;
   const dryRun = flag("--dry-run");
   const node = loadNode(opt("--node-state", process.env.NODE_STATE_FILE || "./node_state.json"));
   info(`nodeId ${node.nodeId} (${node.keyless ? "key-less / KMS-TEE" : "local key"})`);
@@ -163,11 +183,50 @@ async function main() {
   ]);
   info(`validator: requireStake=${requireStake} owner=${owner} minStake=${ethers.formatEther(minStake)} GToken`);
 
-  if (!pk) die("set OPERATOR_PRIVATE_KEY (or ETH_PRIVATE_KEY) — the EOA that sends the register tx");
-  const wallet = new ethers.Wallet(pk, provider);
-  const operator = wallet.address;
-  const v = readV.connect(wallet);
-  info(`operator (tx sender): ${operator}`);
+  // --- resolve the operator address (for PoP + stake check) + how to broadcast. Signer sources:
+  //   • --cast (or SIGNER=cast): sign+send via Foundry `cast send` — keystore/account/ledger/pk via
+  //     CAST_WALLET_ARGS (e.g. "--account dvt-op", "--keystore ks.json --password …", "--ledger").
+  //     Operator address from OPERATOR_ADDRESS or `cast wallet address $CAST_WALLET_ARGS`.
+  //   • OPERATOR_PRIVATE_KEY / ETH_PRIVATE_KEY: raw key → ethers.Wallet.
+  //   • --keystore <json> (+ OPERATOR_KEYSTORE_PASSWORD): encrypted keystore → ethers.
+  const useCast = flag("--cast") || process.env.SIGNER === "cast";
+  let operator, broadcast;
+  if (useCast) {
+    const castArgs = (process.env.CAST_WALLET_ARGS || "").trim().split(/\s+/).filter(Boolean);
+    if (!castArgs.length && !process.env.OPERATOR_ADDRESS) {
+      die('--cast needs CAST_WALLET_ARGS (e.g. "--account dvt-op" / "--keystore ks.json" / "--ledger")');
+    }
+    operator = ethers.getAddress(
+      process.env.OPERATOR_ADDRESS ||
+        execFileSync("cast", ["wallet", "address", ...castArgs], { encoding: "utf8" }).trim()
+    );
+    broadcast = (method, argv) => {
+      const cmd = ["send", validatorAddr, REGISTER_SIGS[method], ...argv, "--rpc-url", rpc, ...castArgs];
+      info(`+ cast ${cmd.join(" ")}`);
+      execFileSync("cast", cmd, { stdio: "inherit" }); // cast signs + waits + prints its own receipt
+      return null;
+    };
+  } else {
+    const pk = process.env.OPERATOR_PRIVATE_KEY || process.env.ETH_PRIVATE_KEY;
+    const ksPath = opt("--keystore", process.env.OPERATOR_KEYSTORE);
+    let wallet;
+    if (pk) {
+      wallet = new ethers.Wallet(pk, provider);
+    } else if (ksPath) {
+      const pw = process.env.OPERATOR_KEYSTORE_PASSWORD || die("set OPERATOR_KEYSTORE_PASSWORD for --keystore");
+      wallet = (await ethers.Wallet.fromEncryptedJson(readFileSync(ksPath, "utf8"), pw)).connect(provider);
+    } else {
+      die("no signer — set OPERATOR_PRIVATE_KEY / ETH_PRIVATE_KEY, or --keystore <json>, or --cast (+ CAST_WALLET_ARGS)");
+    }
+    operator = wallet.address;
+    const v = readV.connect(wallet);
+    broadcast = async (method, argv) => {
+      const tx = await v[method](...argv);
+      info(`tx ${tx.hash} — waiting for confirmation`);
+      return tx.wait();
+    };
+  }
+  info(`operator (tx sender): ${operator}${useCast ? " (via cast)" : ""}`);
 
   // Resolve the method + args ONCE (so --dry-run and the real send use the same PoP — no double
   // KMS /pop call), then either static-call (preflight) or broadcast.
@@ -207,16 +266,18 @@ async function main() {
   }
 
   if (dryRun) {
-    await v[method].staticCall(...methodArgs); // preflight against the real contract, no broadcast
+    // Preflight against the real contract with the operator as msg.sender — no key needed, no tx.
+    await readV[method].staticCall(...methodArgs, { from: operator });
     return ok("dry-run: static call passed — a real run would register. No tx sent.");
   }
 
   info("sending register tx…");
-  const tx = await v[method](...methodArgs);
-  info(`tx ${tx.hash} — waiting for confirmation`);
-  const rc = await tx.wait();
-  if (await readV.isRegistered(node.nodeId)) ok(`registered on-chain in block ${rc.blockNumber} ✅`);
-  else die("tx mined but isRegistered still false — check the validator");
+  const rc = await broadcast(method, methodArgs);
+  if (await readV.isRegistered(node.nodeId)) {
+    ok(`registered on-chain${rc?.blockNumber ? " in block " + rc.blockNumber : ""} ✅`);
+  } else {
+    die("tx sent but isRegistered still false — check the validator");
+  }
 }
 
 main().catch(e => die(e.shortMessage || e.message || String(e)));
