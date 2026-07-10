@@ -1,11 +1,15 @@
 import { Controller, Get, Post } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import { ApiTags, ApiOperation, ApiResponse } from "@nestjs/swagger";
 import { NodeService } from "./node.service.js";
 
 @ApiTags("node")
 @Controller("node")
 export class NodeController {
-  constructor(private readonly nodeService: NodeService) {}
+  constructor(
+    private readonly nodeService: NodeService,
+    private readonly configService: ConfigService
+  ) {}
 
   @ApiOperation({ summary: "Get current node information (private key never exposed)" })
   @ApiResponse({
@@ -31,7 +35,10 @@ export class NodeController {
     // NodeService.getNodeForSigning(), not this DTO.
     const { privateKey: _omitted, ...safe } = this.nodeService.getCurrentNode();
     void _omitted;
-    return safe;
+    // Surface the PUBLIC keeper EOA (secp256k1 address for on-chain keeper txs) so it can be
+    // verified/funded (CC-34). null when the keeper isn't provisioned into this node's config.
+    const keeperAddress = this.configService.get<string>("keeperAddress") || null;
+    return { ...safe, keeperAddress };
   }
 
   @ApiOperation({ summary: "Register current node on-chain" })
