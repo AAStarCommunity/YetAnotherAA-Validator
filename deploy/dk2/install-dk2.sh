@@ -115,7 +115,7 @@ fi
 cp "$SELF/aastar-dvt@.service" "$SELF/aastar-dvt-health@.service" "$SELF/aastar-dvt-health@.timer" "$UNIT_DIR/"
 chmod 600 "$ENVF" 2>/dev/null || true
 systemctl daemon-reload
-echo "• installed systemd units (MemoryMax=320M, --max-old-space-size=256)"
+echo "• installed systemd units (MemoryMax=320M, --max-old-space-size=224)"
 
 # 5. Enable for boot. Only START when actually configured — starting with an empty
 #    ETH_RPC_URL (config validation throws) or a missing node_state.json (node.service
@@ -132,22 +132,25 @@ RPC_VAL="$(env_val ETH_RPC_URL)"
 VALIDATOR_VAL="$(env_val VALIDATOR_CONTRACT_ADDRESS)"
 PORT_VAL="$(env_val PORT)"
 
-# App startup (config/configuration.ts) throws without BOTH ETH_RPC_URL and
-# VALIDATOR_CONTRACT_ADDRESS, and node.service errors without node_state.json. Only
-# start when all three are present — otherwise enable-for-boot and print what's missing.
-if [ -n "$RPC_VAL" ] && [ -n "$VALIDATOR_VAL" ] && [ -f "$STATEF" ]; then
+# App startup (config/configuration.ts) throws without ETH_RPC_URL /
+# VALIDATOR_CONTRACT_ADDRESS, node.service errors without node_state.json, and an empty
+# PORT makes the app fall back to :3000 while the health probe expects 4002 (30s restart
+# storm). Only start when all four are present — otherwise enable-for-boot and print what's
+# missing.
+if [ -n "$RPC_VAL" ] && [ -n "$VALIDATOR_VAL" ] && [ -n "$PORT_VAL" ] && [ -f "$STATEF" ]; then
   systemctl restart "aastar-dvt@$NODE_ID.service"
   systemctl restart "aastar-dvt-health@$NODE_ID.timer"
   echo ""
   echo "✅ v$VER active for $NODE_ID (DK2 armv7, DVT-only)"
   echo "   systemctl status aastar-dvt@$NODE_ID"
   echo "   journalctl -u aastar-dvt@$NODE_ID -f"
-  echo "   curl -s http://127.0.0.1:${PORT_VAL:-4002}/health   # {version:\"$VER\",...}"
+  echo "   curl -s http://127.0.0.1:${PORT_VAL}/health   # {version:\"$VER\",...}"
 else
   echo ""
   echo "✅ v$VER installed + enabled for boot — NOT started yet (needs config):"
   [ -z "$RPC_VAL" ]       && echo "   • set ETH_RPC_URL in $ENVF"
   [ -z "$VALIDATOR_VAL" ] && echo "   • set VALIDATOR_CONTRACT_ADDRESS in $ENVF"
+  [ -z "$PORT_VAL" ]      && echo "   • set PORT in $ENVF (probe + app must agree)"
   [ ! -f "$STATEF" ]      && echo "   • put this node's BLS key at $STATEF (see the ⚠ above)"
   echo "   then start:  systemctl start aastar-dvt@$NODE_ID aastar-dvt-health@$NODE_ID.timer"
   echo "   verify:      curl -s http://127.0.0.1:${PORT_VAL:-4002}/health"

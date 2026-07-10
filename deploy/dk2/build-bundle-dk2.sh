@@ -42,16 +42,28 @@ echo "  • npm ci --omit=dev (linux/arm — 32-bit)"
 cp package.json package-lock.json "$STAGE/"
 ( cd "$STAGE" && npm ci --omit=dev --os=linux --cpu=arm --ignore-scripts >/dev/null )
 
-# 3. Fetch the glibc linux-armv7l Node runtime. latest-vNN.x always points at the
-#    newest LTS patch, so we never pin a dead URL. (Verified upstream: e.g.
-#    node-v20.20.2-linux-armv7l.tar.xz exists.)
-BASE="https://nodejs.org/dist/latest-v${NODE_MAJOR}.x"
-TARBALL="$(curl -fsSL "$BASE/" | grep -oE "node-v${NODE_MAJOR}\.[0-9]+\.[0-9]+-linux-armv7l\.tar\.xz" | head -1)"
-[ -n "$TARBALL" ] || { echo "‼ could not resolve Node linux-armv7l tarball from $BASE"; exit 1; }
+# 3. Fetch the glibc linux-armv7l Node runtime.
+#    - Default: latest-vNN.x → newest LTS patch (never a dead URL), but the exact
+#      version floats, so two builds weeks apart can ship different Node patches.
+#    - Reproducible: pin NODE_VERSION=20.20.2 to lock the exact patch (recommended
+#      for a release bundle / CI — record the pinned version alongside the app tag).
+if [ -n "${NODE_VERSION:-}" ]; then
+  BASE="https://nodejs.org/dist/v${NODE_VERSION}"
+  TARBALL="node-v${NODE_VERSION}-linux-armv7l.tar.xz"
+  echo "  • Node pinned to v${NODE_VERSION} (reproducible)"
+else
+  BASE="https://nodejs.org/dist/latest-v${NODE_MAJOR}.x"
+  TARBALL="$(curl -fsSL "$BASE/" | grep -oE "node-v${NODE_MAJOR}\.[0-9]+\.[0-9]+-linux-armv7l\.tar\.xz" | head -1)"
+  [ -n "$TARBALL" ] || { echo "‼ could not resolve Node linux-armv7l tarball from $BASE"; exit 1; }
+fi
 echo "  • fetching $TARBALL"
 curl -fsSL "$BASE/$TARBALL" -o "$STAGE/node.tar.xz"
 # Verify the runtime against Node's published SHASUMS256 — this binary runs as root
 # under systemd on the board, so a tampered/corrupted download must not slip through.
+# Integrity boundary here is HTTPS + this SHA-256. Note: we do NOT GPG-verify SHASUMS256
+# itself, so this defends against a corrupted/MITM'd tarball but not a full nodejs.org
+# release-signing compromise — pin NODE_VERSION + record the hash for release builds if
+# that threat is in scope.
 echo "  • verifying SHA-256"
 curl -fsSL "$BASE/SHASUMS256.txt" -o "$STAGE/SHASUMS256.txt"
 EXPECTED="$(grep " $TARBALL\$" "$STAGE/SHASUMS256.txt" | awk '{print $1}')"

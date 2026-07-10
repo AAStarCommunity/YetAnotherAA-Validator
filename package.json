@@ -35,7 +35,6 @@
     "release:patch": "npm version patch --no-git-tag-version && npm run build && echo '✅ Bumped to '$(jq -r .version package.json)"
   },
   "dependencies": {
-    "@nestjs/cli": "^11.0.23",
     "@nestjs/common": "^11.1.27",
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.1.27",
@@ -43,9 +42,6 @@
     "@nestjs/swagger": "^11.4.5",
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
-    "@types/node": "^26.1.0",
-    "@types/uuid": "^11.0.0",
-    "@types/ws": "^8.18.1",
     "axios": "^1.18.1",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
@@ -53,8 +49,6 @@
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
     "swagger-ui-express": "^5.0.1",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.2",
     "uuid": "^14.0.1",
     "ws": "^8.21.0"
   },
@@ -86,14 +80,20 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@jest/globals": "^30.4.1",
+    "@nestjs/cli": "^11.0.23",
     "@types/express": "^5.0.6",
     "@types/jest": "^30.0.0",
+    "@types/node": "^26.1.0",
+    "@types/uuid": "^11.0.0",
+    "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.63.0",
     "@typescript-eslint/parser": "^8.62.1",
     "eslint": "^10.6.0",
     "jest": "^30.4.2",
     "prettier": "^3.9.4",
     "prettier-plugin-solidity": "^2.3.1",
-    "ts-jest": "^29.4.11"
+    "ts-jest": "^29.4.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
   }
 }
