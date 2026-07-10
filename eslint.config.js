@@ -33,6 +33,7 @@ export default [
         atob: "readonly",
         btoa: "readonly",
         fetch: "readonly", // Node 18+ global fetch (used by notification.service.ts)
+        AbortController: "readonly", // Node 18+ global (kms-ecdsa-signer.ts fetch timeout)
         jest: "readonly",
         describe: "readonly",
         it: "readonly",

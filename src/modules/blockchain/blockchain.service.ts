@@ -2,6 +2,14 @@ import { Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { bumpedFees } from "../../utils/gas.util.js";
+import { KmsEcdsaSigner } from "./kms-ecdsa-signer.js";
+
+/**
+ * An ethers Signer that also exposes a synchronous `.address` (like ethers.Wallet). Both the
+ * plaintext `ethers.Wallet` and the KMS-TEE `KmsEcdsaSigner` (CC-34) satisfy it, so the wallet
+ * fields can hold either without the call sites (which read `.address` sync) caring which.
+ */
+type OnchainSigner = ethers.Signer & { readonly address: string };
 
 /**
  * CROSS-REPO INTERFACE CONTRACT — the account owner-auth gate.
@@ -53,12 +61,12 @@ export interface PackedUserOp {
 export class BlockchainService {
   private readonly logger = new Logger(BlockchainService.name);
   private provider: ethers.Provider;
-  private wallet: ethers.Wallet;
+  private wallet: OnchainSigner;
   /** Dedicated keeper signer (KEEPER_PRIVATE_KEY) — kept SEPARATE from the relay
    *  operator key and the admin/registration key so the keeper's updatePrice()
    *  nonce queue can't contend with relay submissions on the same EOA. Falls back
    *  to `wallet` (ETH_PRIVATE_KEY) only when KEEPER_PRIVATE_KEY is unset. */
-  private keeperWallet?: ethers.Wallet;
+  private keeperWallet?: OnchainSigner;
 
   /**
    * Nonce-race protection for the shared operator EOA (`this.wallet`): the attest keeper (inc-2)
@@ -141,9 +149,44 @@ export class BlockchainService {
       }
     }
 
-    // Dedicated keeper signer (optional). Unset → keeper reuses `wallet`.
+    // Dedicated keeper signer (optional). Precedence: KMS-TEE custody (KEEPER_SIGNER_URL, CC-34)
+    // > plaintext KEEPER_PRIVATE_KEY. Unset both → keeper reuses `wallet`.
+    const keeperSignerUrl = this.configService.get<string>("keeperSignerUrl");
     const keeperKey = this.configService.get<string>("keeperPrivateKey");
-    if (keeperKey && /^0x[0-9a-fA-F]{64}$/.test(keeperKey)) {
+    if (keeperSignerUrl) {
+      // KMS-TEE keeper: the secp256k1 key is sealed in the co-located KMS, never on disk. The
+      // keeper EOA (funded with ETH) comes from provisioning (KMS_KEEPER_ADDRESS → KEEPER_ADDRESS).
+      const keeperAddress = this.configService.get<string>("keeperAddress");
+      if (!keeperAddress) {
+        this.logger.error(
+          "KEEPER_SIGNER_URL is set but KEEPER_ADDRESS is missing — KMS keeper signer DISABLED"
+        );
+      } else {
+        try {
+          const kms = new KmsEcdsaSigner(
+            {
+              url: keeperSignerUrl,
+              address: keeperAddress,
+              token: this.configService.get<string>("keeperSignerToken"),
+              keeperId: this.configService.get<string>("keeperId"),
+            },
+            this.provider
+          );
+          // Same-EOA guard (as below): only treat as dedicated when it differs from the operator,
+          // so a shared address still serializes on the operator nonce FIFO.
+          if (this.wallet && kms.address.toLowerCase() === this.wallet.address.toLowerCase()) {
+            this.logger.warn(
+              "KEEPER_ADDRESS is the SAME EOA as the operator wallet — keeper writes serialize on the shared nonce FIFO"
+            );
+          } else {
+            this.keeperWallet = kms;
+            this.logger.log(`Keeper signer (KMS-TEE): ${kms.address}`);
+          }
+        } catch (error: any) {
+          this.logger.error(`Invalid KMS keeper signer config: ${error.message}`);
+        }
+      }
+    } else if (keeperKey && /^0x[0-9a-fA-F]{64}$/.test(keeperKey)) {
       try {
         const kw = new ethers.Wallet(keeperKey, this.provider);
         // If KEEPER_PRIVATE_KEY resolves to the SAME EOA as ETH_PRIVATE_KEY (two Wallet objects, one
@@ -166,7 +209,7 @@ export class BlockchainService {
   }
 
   /** Signer the keeper uses for updatePrice() — dedicated key if set, else the admin wallet. */
-  private get keeperSigner(): ethers.Wallet | undefined {
+  private get keeperSigner(): OnchainSigner | undefined {
     return this.keeperWallet ?? this.wallet;
   }
 

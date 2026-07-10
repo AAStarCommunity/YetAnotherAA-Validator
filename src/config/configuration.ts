@@ -131,6 +131,14 @@ export default () => {
     // keeper's updatePrice() nonce queue can't contend with relay submissions on
     // one EOA. Falls back to ETH_PRIVATE_KEY only when unset.
     keeperPrivateKey: process.env.KEEPER_PRIVATE_KEY || undefined,
+    // KMS-TEE keeper signer (CC-34) — takes precedence over KEEPER_PRIVATE_KEY. The secp256k1
+    // key is sealed in the co-located KMS; DVT signs raw 32B digests via loopback :3100 and never
+    // holds the key. KEEPER_ADDRESS is the funded keeper EOA (from KMS provisioning). Fail-closed:
+    // KMS rejects signing without KEEPER_SIGNER_TOKEN. Unset KEEPER_SIGNER_URL → plaintext fallback.
+    keeperSignerUrl: process.env.KEEPER_SIGNER_URL || undefined,
+    keeperSignerToken: process.env.KEEPER_SIGNER_TOKEN || undefined,
+    keeperAddress: process.env.KEEPER_ADDRESS || undefined,
+    keeperId: process.env.KEEPER_ID || undefined,
     keeperChainlinkFeed:
       process.env.KEEPER_CHAINLINK_FEED || "0x694AA1769357215DE4FAC081bf1f309aDC325306",
 
