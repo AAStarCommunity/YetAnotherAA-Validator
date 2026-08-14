@@ -3,6 +3,11 @@
 > Authoritative model for how the DVT node enforces rules. Corrected after a
 > design review (2026-07-09) that removed the credit① and over-issue③
 > stake-slash rules. See PR #205.
+>
+> This doc covers the quorum auditing **operators**. For the inverse — slashing
+> the **guardians** (co-signers) themselves when ≥m collude to pass a false slash
+> — see [`design/guardian-collusion-slash.md`](design/guardian-collusion-slash.md)
+> (CC-89, Protocol B).
 
 ## 1. Two enforcement mechanisms
 
