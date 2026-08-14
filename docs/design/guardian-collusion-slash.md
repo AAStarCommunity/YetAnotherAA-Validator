@@ -73,8 +73,8 @@ The obvious problem: `queueSlashWithConsensus` / `verifyAndExecute` require
 `msg.sender == DVT_VALIDATOR || owner()`, and the colluders **are** that quorum —
 they will never slash themselves. A same-quorum trigger cannot work.
 
-SP's `executeGuardianSlash` (BLSAggregator 4.2.0, **PR #370 — OPEN, not yet
-merged**) is designed to resolve this at the contract layer:
+SP's `executeGuardianSlash` (BLSAggregator 4.2.0, **PR #370 — merged, but
+dormant** until a verifier is wired) resolves this at the contract layer:
 
 | Property | How | Why it matters |
 | --- | --- | --- |
@@ -251,8 +251,8 @@ tracked separately.
 
 | Stage | Owner | Status |
 | --- | --- | --- |
-| 1 — `executeGuardianSlash` thin entry | SP | 🔶 **PR #370 OPEN** (dormant/fail-closed, address-based, per-`(proof,guardian)` idempotent). NOT merged — review in progress. Do not treat as deployed. |
-| 0 — this doc (auto-eject + threat model + trigger authority) | dvt | 🔶 PR #221 OPEN (review in progress) |
+| 1 — `executeGuardianSlash` thin entry | SP | ✅ **merged** (PR #370, BLSAggregator 4.2.0) — but **dormant/fail-closed** (`fraudProofVerifier == 0` → revert), address-based, per-`(proof,guardian)` idempotent. Code is in-tree but inert until a verifier is wired. |
+| 0 — this doc (auto-eject + threat model + trigger authority) | dvt | PR #221 |
 | 2 — `IFraudProofVerifier` + off-chain detection (produces ρ) | dvt (+ SP `proposalSignersCommitment`, §4b) | ⏳ spec drafted (§4b, attribution = A'); impl blocked on: an armed slash rule + a historical-state/challenge-window mechanism + (liveness) CC-29 |
 
 **When to activate:** N large + operators independent (not co-located) + an
