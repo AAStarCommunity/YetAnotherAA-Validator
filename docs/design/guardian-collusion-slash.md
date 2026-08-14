@@ -225,6 +225,32 @@ verifier — never a caller-free value — so a valid proof can't be consumed un
 an unrelated id and the same fraud can't be double-filed. SP's per-`(proof,
 guardian)` `guardianSlashed` map is then a correct replay guard.
 
+### Over-issue evidence & slash convention (the filer MUST match)
+
+To bind the disputed `token` into the commitment (closing the token-swap forgery
+a naive verifier allows — CC-89 Codex review), the verifier does **not** trust a
+caller-supplied message hash. It reconstructs SP's slash-only `expectedMessageHash`
+from the slash fields, where the over-issue `evidenceHash` has a **fixed preimage**:
+
+```
+evidenceHash = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", token, operator, epoch))
+messageHash  = keccak256(abi.encode(proposalId, operator, slashLevel,
+                                    address[](0), uint256[](0),   // repUsers, newScores — see below
+                                    epoch, block.chainid, evidenceHash))
+commitment   = keccak256(abi.encode("BLS_SIGNERS_COMMITMENT_V1", chainid, aggregator,
+                                    proposalId, messageHash, signerMask, claimedSigners))
+```
+
+**Whoever files an over-issue slash (the E2E filer / the future audit rule) MUST**:
+1. set `evidenceHash = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", token, operator, epoch))`;
+2. file it as a **pure** slash — `repUsers` **and** `newScores` both empty. SP's
+   slash-only branch fires on `repUsers.length == 0` alone, but the verifier only
+   recognises the canonical empty/empty form; a non-empty `newScores` yields a
+   different `messageHash` and the proof will (fail-closed) not verify.
+
+Any deviation just means that slash cannot be fraud-proven (no wrongful slash) —
+but it is a **cross-repo alignment point**, not something the verifier can self-enforce.
+
 ### Prerequisites (why stage-2 implementation can't start yet)
 
 1. **An armed, on-chain-objective slash rule** to defend. Today none exists:

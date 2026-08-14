@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.19;
+
+import {IFraudProofVerifier} from "../interfaces/IFraudProofVerifier.sol";
+
+/// @dev The BLSAggregator's A' commitment getter (SuperPaymaster PR #371).
+interface IBLSAggregatorCommitment {
+    function proposalSignersCommitment(uint256 proposalId) external view returns (bytes32);
+}
+
+/// @dev A community xPNTs token's objective over-issue flag (CC-28).
+interface IOverIssuable {
+    function isOverIssued() external view returns (bool);
+}
+
+/**
+ * @title OverIssueFraudProofVerifier
+ * @notice CC-89 stage-2, over-issue class. Proves a guardian-collusion slash was fraudulent so
+ *         `BLSAggregator.executeGuardianSlash` (SP PR #370) can slash the colluding guardians'
+ *         ROLE_DVT stake. SP trusts only this verifier's boolean and never judges fraud itself.
+ *
+ * A fraud proof is accepted iff ALL hold (fail-closed → returns `false`, NEVER reverts):
+ *   1. `fraudProofId` is the canonical derivation of the disputed `proposalId` (content-bound).
+ *   2. `claimedSigners` is canonical: strictly ascending by uint160, non-zero, bounded.
+ *   3. The FULL disputed slash message is reconstructed from the proof's slash fields and matches
+ *      SP's fraud-time A' commitment for `proposalId`. Crucially the `disputedToken` is bound INTO
+ *      the recomputed `evidenceHash → messageHash → commitment` chain, so an attacker cannot take a
+ *      real proposal's signer set and point it at an unrelated not-over-issued token to slash the
+ *      honest guardians who signed it (the CC-89 Codex-review Critical).
+ *   4. `guiltyGuardians ⊆ claimedSigners` — the commitment proves the SET, not that the accused are
+ *      in it; without this a valid commitment could slash an innocent address.
+ *   5. the over-issue the slash cited is FALSE — the token is not over-issued → the slash was unjust.
+ *
+ * @dev EVIDENCE STRUCTURE (cross-repo alignment). The disputed slash's `evidenceHash` (opaque to SP,
+ *      supplied by the slash filer) MUST be `keccak256(abi.encode(OVERISSUE_EVIDENCE_TAG, token,
+ *      operator, epoch))`. The E2E slash filer must file with exactly this — else the message
+ *      reconstruction won't match and every proof is rejected.
+ *
+ * @dev STAGE / SCOPE. Step 5 reads the disputed token's CURRENT `isOverIssued()`. This is the
+ *      **testnet-E2E variant**, sound ONLY while the token's over-issue state is held constant
+ *      between the disputed slash and this proof. PRODUCTION must recompute against the disputed
+ *      epoch-block state (BLOCKHASH + storage proof, bounded challenge window) — the historical-state
+ *      gap in docs/design/guardian-collusion-slash.md §4b. NOT mainnet-ready as-is.
+ */
+contract OverIssueFraudProofVerifier is IFraudProofVerifier {
+    string internal constant FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1";
+    string internal constant SIGNERS_COMMITMENT_TAG = "BLS_SIGNERS_COMMITMENT_V1"; // must match SP PR #371
+    string internal constant OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1";
+    uint256 internal constant MAX_SIGNERS = 13; // == BLSAggregator.MAX_VALIDATORS
+
+    /// @notice The BLSAggregator whose commitment we read AND whose address SP bound into the
+    ///         commitment (`address(this)` in `_computeSignersCommitment`). The recompute only
+    ///         matches when this equals the aggregator that stored the commitment.
+    address public immutable AGGREGATOR;
+
+    constructor(address aggregator) {
+        require(aggregator != address(0), "aggregator=0");
+        AGGREGATOR = aggregator;
+    }
+
+    /// @notice Canonical fraudProofId for a disputed proposal (callers derive the same value).
+    function deriveFraudProofId(uint256 proposalId) public pure returns (uint256) {
+        return uint256(keccak256(abi.encode(FRAUD_ID_TAG, proposalId)));
+    }
+
+    /// @notice The over-issue evidenceHash the slash filer MUST use (binds token+operator+epoch).
+    function evidenceHash(address disputedToken, address operator, uint256 epoch) public pure returns (bytes32) {
+        return keccak256(abi.encode(OVERISSUE_EVIDENCE_TAG, disputedToken, operator, epoch));
+    }
+
+    /// @notice Reconstruct SP's slash-only `expectedMessageHash` (byte-identical to
+    ///         BLSAggregator.verifyAndExecute's slash-path encoding: repUsers/newScores empty).
+    function slashMessageHash(uint256 proposalId, address operator, uint8 slashLevel, uint256 epoch, address disputedToken)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encode(
+                proposalId,
+                operator,
+                slashLevel,
+                new address[](0),
+                new uint256[](0),
+                epoch,
+                block.chainid,
+                evidenceHash(disputedToken, operator, epoch)
+            )
+        );
+    }
+
+    /**
+     * @inheritdoc IFraudProofVerifier
+     * @dev fraudProof = abi.encode(
+     *        uint256 proposalId, address operator, uint8 slashLevel, uint256 epoch,
+     *        address disputedToken, uint256 signerMask, address[] claimedSigners)
+     *      Wraps the real check in a self-staticcall so a malformed proof or a malicious
+     *      `disputedToken` that reverts can only make verify return false — never revert.
+     */
+    function verify(uint256 fraudProofId, address[] calldata guiltyGuardians, bytes calldata fraudProof)
+        external
+        view
+        override
+        returns (bool)
+    {
+        try this.check(fraudProofId, guiltyGuardians, fraudProof) returns (bool ok) {
+            return ok;
+        } catch {
+            return false; // fail-closed: decode revert, missing commitment call, or token revert
+        }
+    }
+
+    /// @dev The real verification. External only so `verify` can try/catch it; self-call-gated.
+    function check(uint256 fraudProofId, address[] calldata guiltyGuardians, bytes calldata fraudProof)
+        external
+        view
+        returns (bool)
+    {
+        require(msg.sender == address(this), "self only");
+
+        (
+            uint256 proposalId,
+            address operator,
+            uint8 slashLevel,
+            uint256 epoch,
+            address disputedToken,
+            uint256 signerMask,
+            address[] memory claimedSigners
+        ) = abi.decode(fraudProof, (uint256, address, uint8, uint256, address, uint256, address[]));
+
+        // 1. Content binding: fraudProofId MUST be the canonical derivation of proposalId.
+        if (fraudProofId != deriveFraudProofId(proposalId)) return false;
+
+        // 2. claimedSigners canonical: strictly ascending uint160, non-zero, bounded.
+        if (!_canonicalSigners(claimedSigners)) return false;
+
+        // 3. Commitment check with disputedToken bound in via evidenceHash → messageHash (an
+        //    attacker can't swap disputedToken without breaking evidenceHash → messageHash → commitment).
+        //    Extracted into a helper to keep this frame's local count low (coverage compiles without viaIR).
+        if (!_commitmentMatches(proposalId, operator, slashLevel, epoch, disputedToken, signerMask, claimedSigners)) {
+            return false;
+        }
+
+        // 4. Subset: guiltyGuardians ⊆ claimedSigners (both strictly ascending → single merge pass).
+        if (!_isSubset(guiltyGuardians, claimedSigners)) return false;
+
+        // 5. Over-issue evidence (E2E current-state variant; see contract @dev). A revert here bubbles
+        //    to verify's catch → false (fail-closed). `false` ⇒ not over-issued ⇒ slash was fraudulent.
+        if (IOverIssuable(disputedToken).isOverIssued()) return false;
+
+        return true;
+    }
+
+    /// @dev claimedSigners canonical form: strictly ascending uint160, non-zero, bounded.
+    function _canonicalSigners(address[] memory claimedSigners) internal pure returns (bool) {
+        uint256 n = claimedSigners.length;
+        if (n == 0 || n > MAX_SIGNERS) return false;
+        for (uint256 i = 0; i < n; i++) {
+            if (claimedSigners[i] == address(0)) return false;
+            if (i > 0 && uint160(claimedSigners[i - 1]) >= uint160(claimedSigners[i])) return false;
+        }
+        return true;
+    }
+
+    /// @dev Reconstruct SP's slash message (binding disputedToken) and match the A' commitment.
+    function _commitmentMatches(
+        uint256 proposalId,
+        address operator,
+        uint8 slashLevel,
+        uint256 epoch,
+        address disputedToken,
+        uint256 signerMask,
+        address[] memory claimedSigners
+    ) internal view returns (bool) {
+        bytes32 anchor = IBLSAggregatorCommitment(AGGREGATOR).proposalSignersCommitment(proposalId);
+        if (anchor == bytes32(0)) return false; // not a recorded proposal
+        bytes32 messageHash = slashMessageHash(proposalId, operator, slashLevel, epoch, disputedToken);
+        bytes32 recomputed = keccak256(
+            abi.encode(
+                SIGNERS_COMMITMENT_TAG, block.chainid, AGGREGATOR, proposalId, messageHash, signerMask, claimedSigners
+            )
+        );
+        return recomputed == anchor;
+    }
+
+    /// @dev `sub ⊆ set` where BOTH are strictly ascending by uint160. Requires ≥1 accused.
+    function _isSubset(address[] calldata sub, address[] memory set) internal pure returns (bool) {
+        uint256 m = sub.length;
+        if (m == 0) return false;
+        uint256 j = 0;
+        uint256 len = set.length;
+        for (uint256 i = 0; i < m; i++) {
+            if (sub[i] == address(0)) return false;
+            if (i > 0 && uint160(sub[i - 1]) >= uint160(sub[i])) return false; // sub not canonical
+            while (j < len && uint160(set[j]) < uint160(sub[i])) {
+                unchecked {
+                    j++;
+                }
+            }
+            if (j >= len || set[j] != sub[i]) return false; // sub[i] not present in set
+        }
+        return true;
+    }
+}
