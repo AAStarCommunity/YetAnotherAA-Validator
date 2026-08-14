@@ -125,13 +125,74 @@ That bounds which collusion is objectively provable:
 - Double-slash is already prevented by SP's 0-lock skip: a re-submitted proof
   finds `amount == 0` and no-ops.
 
+## 4b. Stage-2 fraud-proof spec (draft — CC-89 stage-2 kickoff)
+
+A fraud proof disputes **one executed slash** and asks the verifier to confirm
+two independent things. The second one is the hard, newly-surfaced blocker.
+
+**What is disputed:** an executed slash proposal
+`(proposalId, operator, slashLevel, epoch, evidenceHash)` — the tuple
+`verifyAndExecute` signed over. `BLSAggregator.executedProposals[proposalId]`
+proves it actually ran (view-readable).
+
+**The verifier must confirm BOTH:**
+
+| # | Claim | Difficulty |
+| --- | --- | --- |
+| (i) | the cited violation was **false at `epoch`** (the slash was unjustified) | **tractable** for on-chain-objective classes: recompute the evidence from state pinned at the `epoch` block (e.g. `isOverIssued()` was false) |
+| (ii) | a specific set of **guardian addresses co-signed** this exact proposal | **blocked** — see below |
+
+### The attribution gap (ii) — the real stage-2 blocker
+
+`BLSAggregator` persists **only `executedProposals[proposalId]` (a bool)**. It
+does **not** store the signer set, the `signerMask`, or the signature; the
+`SlashExecuted` / `SlashConsensusReached` events carry some of it but **a `view`
+verifier cannot read logs**. And `signerMask → validatorAtSlot` is **not**
+back-resolvable: slots are reassignable (`revokeBLSPublicKey`), so today's
+mapping ≠ the fraud-time mapping. **Result: after the fact, on-chain state cannot
+tell you which addresses co-signed a past slash.** You can prove the slash was
+wrong (i) but not who to punish (ii).
+
+Two ways to close (ii):
+
+| Option | Mechanism | Cost / risk |
+| --- | --- | --- |
+| **A — SP persists attribution** | `verifyAndExecute` stores, per `proposalId`, the resolved **signer address set** (addresses, not slots). Verifier reads it. | needs an **SP change** (storage + a getter); robust. |
+| **B — proof carries re-verifiable sig** | fraud proof carries `{message, claimedSigners[], sigG2}`; verifier reconstructs the claimed signers' aggregate pubkey from their **current** BLS keys and re-checks the pairing → proves they signed. | no SP storage change, but **breaks if a colluder rotates/revokes its BLS key post-attack** (key no longer on-chain to reconstruct). Needs a key snapshot or accepts the gap. |
+
+> **Decision needed with SP.** Option A is the clean, robust path but makes
+> stage 2 a **joint SP+dvt** change, not dvt-only. Option B keeps it dvt-side but
+> has a post-attack key-revocation hole. This must be settled before any verifier
+> code — it changes who builds what.
+
+### fraudProofId binding
+
+`fraudProofId` must be a **deterministic derivation of the disputed
+`proposalId`** (e.g. `keccak256("GUARDIAN_FRAUD", proposalId)`), computed by the
+verifier — never a caller-free value — so a valid proof can't be consumed under
+an unrelated id and the same fraud can't be double-filed. SP's
+`consumedFraudProofs[fraudProofId]` is then a correct replay guard.
+
+### Prerequisites (why stage-2 implementation can't start yet)
+
+1. **An armed, on-chain-objective slash rule** to defend. Today none exists:
+   over-issue is a *view* (not a slash), liveness is *auto-jail* (not a
+   stake-slash), the slash pipeline is dormant (`AUDIT_SLASH_MODEL.md §4`). No
+   armed slash ⇒ nothing to fraud-prove.
+2. **Attribution (ii)** resolved — Option A (SP) or B (dvt), above.
+3. **Liveness class only:** CC-29 `LivenessRegistry` deployed (liveness must be
+   an on-chain fact before a `view` proof can dispute an offline-slash).
+
+The **spec is dependency-free and complete enough to build against**; the
+**implementation** waits on 1 + 2 (+ 3 for liveness).
+
 ## 5. Ownership & sequencing
 
 | Stage | Owner | Status |
 | --- | --- | --- |
 | 1 — `executeGuardianSlash` thin entry | SP | ✅ landed dormant (PR #370, BLSAggregator 4.2.0) |
 | 0 — this doc (auto-eject + threat model + trigger authority) | dvt | ✅ this file |
-| 2 — `IFraudProofVerifier` + off-chain detection (produces ρ) | dvt | ⏳ over-issue class first; liveness class gated on **CC-29** |
+| 2 — `IFraudProofVerifier` + off-chain detection (produces ρ) | dvt (+ SP for attribution, §4b) | ⏳ spec drafted (§4b); impl blocked on: an armed slash rule + attribution decision (A/B) + (liveness) CC-29 |
 
 **When to activate:** N large + operators independent (not co-located) + an
 on-chain-verifiable independent adjudication path. At the current 3-node,
