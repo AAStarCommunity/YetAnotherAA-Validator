@@ -205,6 +205,27 @@ contract OverIssueFraudProofVerifierTest is Test {
         assertFalse(verifier.verify(_fpid(), _g(S2), _proof(_claimed(), address(bad))));
     }
 
+    // ---- golden vector: Solidity commitment == the TS watcher's (byte-alignment) ----
+
+    function test_Golden_CommitmentByteAlignment_MatchesTS() public {
+        // Same fixed vector asserted in src/modules/audit/guardian-fraud-proof.spec.ts.
+        // If Solidity abi.encode and ethers abi.encode ever diverge for these types, both break.
+        vm.chainId(1);
+        address AGG = address(0x0A99);
+        address goldToken = address(0xBEEF);
+        bytes32 mh = verifier.slashMessageHash(42, OPERATOR, 2, 1000, goldToken);
+        assertEq(mh, bytes32(0x593a53c8408d4f89674782c8cf0d3d2b3def99ac442ee6431f64e05965c50a46), "messageHash");
+
+        address[] memory signers = new address[](3);
+        signers[0] = S1;
+        signers[1] = S2;
+        signers[2] = S3;
+        bytes32 commitment = keccak256(
+            abi.encode("BLS_SIGNERS_COMMITMENT_V1", block.chainid, AGG, uint256(42), mh, uint256(0x7), signers)
+        );
+        assertEq(commitment, bytes32(0x8c38195124813c84cddbf33daca3efbb3f4718ba43167e6b30550229693f6588), "commitment");
+    }
+
     function test_Check_NotSelfCallable() public {
         // Pre-compute args so vm.expectRevert applies to the check() call, not the view helpers.
         uint256 id = _fpid();

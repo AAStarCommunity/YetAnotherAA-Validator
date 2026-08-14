@@ -23,13 +23,21 @@ import { ethers } from "ethers";
 /** Domain tags — MUST match OverIssueFraudProofVerifier.sol exactly. */
 export const FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1";
 export const OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1";
+export const SIGNERS_COMMITMENT_TAG = "BLS_SIGNERS_COMMITMENT_V1";
 /** BLSAggregator.MAX_VALIDATORS. */
 export const MAX_VALIDATORS = 13;
 
-/** Decode the `signerMask` from a verifyAndExecute `proof` (= abi.encode(uint256 signerMask, bytes sigG2)). */
-export function decodeSignerMask(proof: string): bigint {
-  // Only the first 32-byte word is the mask; SP decodes proof[:32] likewise.
-  const [signerMask] = ethers.AbiCoder.defaultAbiCoder().decode(["uint256"], ethers.dataSlice(proof, 0, 32));
+/**
+ * Decode the `signerMask` from a raw verifyAndExecute BLS `proof`
+ * (= `abi.encode(uint256 signerMask, bytes sigG2)`). NOTE: this is the SP-side BLS proof,
+ * NOT the verifier's `fraudProof` (which starts with `proposalId`, mask being its 6th field).
+ * Only the first 32-byte word is the mask; SP decodes `proof[:32]` likewise.
+ */
+export function decodeSignerMaskFromBlsProof(proof: string): bigint {
+  const [signerMask] = ethers.AbiCoder.defaultAbiCoder().decode(
+    ["uint256"],
+    ethers.dataSlice(proof, 0, 32)
+  );
   return BigInt(signerMask);
 }
 
@@ -52,27 +60,46 @@ export async function resolveClaimedSigners(
     ["function validatorAtSlot(uint8 slot) view returns (address)"],
     provider
   );
+  return orderSignersFromSlotMap(signerMask, slot =>
+    agg.validatorAtSlot(slot, { blockTag: executionBlock })
+  );
+}
+
+/**
+ * The pure, testable core of the derivation: given a `signerMask` and an async slot→address
+ * resolver (pinned to the execution block), produce the strictly-ascending-by-uint160 signer set
+ * that reproduces SP's `_computeSignersCommitment` `sorted` array. Rejects high mask bits, zero
+ * slots, and duplicates (never a partial/wrong set).
+ */
+export async function orderSignersFromSlotMap(
+  signerMask: bigint,
+  resolveSlot: (slot: number) => Promise<string>
+): Promise<string[]> {
+  // Reject mask bits beyond MAX_VALIDATORS — SP's _reconstructPkAgg rejects them outright, so a
+  // high bit means the mask is wrong; never silently drop it (the fraudProof embeds the raw mask).
+  if (signerMask >> BigInt(MAX_VALIDATORS) !== 0n) {
+    throw new Error(
+      `orderSignersFromSlotMap: signerMask ${signerMask.toString(16)} has bits above slot ${MAX_VALIDATORS}`
+    );
+  }
   const signers: string[] = [];
   for (let slot = 1; slot <= MAX_VALIDATORS; slot++) {
     if (((signerMask >> BigInt(slot - 1)) & 1n) === 0n) continue;
-    const addr: string = await agg.validatorAtSlot(slot, { blockTag: executionBlock });
+    const addr = await resolveSlot(slot);
     if (addr === ethers.ZeroAddress) {
-      throw new Error(
-        `resolveClaimedSigners: slot ${slot} is zero at block ${executionBlock} — wrong mask/block?`
-      );
+      throw new Error(`orderSignersFromSlotMap: slot ${slot} is zero — wrong mask/block?`);
     }
     signers.push(ethers.getAddress(addr));
   }
-  // Strictly ascending by uint160(address). getAddress → checksummed; compare on the numeric value.
+  // Strictly ascending by uint160(address) — matches SP's uint160 sort (checksum doesn't affect it).
   signers.sort((a, b) => {
     const x = BigInt(a);
     const y = BigInt(b);
     return x < y ? -1 : x > y ? 1 : 0;
   });
-  // Reject a duplicate (a healthy slot map never repeats an address across selected slots).
   for (let i = 1; i < signers.length; i++) {
     if (BigInt(signers[i - 1]) >= BigInt(signers[i])) {
-      throw new Error(`resolveClaimedSigners: duplicate/unordered signer ${signers[i]}`);
+      throw new Error(`orderSignersFromSlotMap: duplicate/unordered signer ${signers[i]}`);
     }
   }
   return signers;
@@ -81,12 +108,18 @@ export async function resolveClaimedSigners(
 /** Canonical fraudProofId — MUST match verifier.deriveFraudProofId. */
 export function deriveFraudProofId(proposalId: bigint): bigint {
   return BigInt(
-    ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["string", "uint256"], [FRAUD_ID_TAG, proposalId]))
+    ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(["string", "uint256"], [FRAUD_ID_TAG, proposalId])
+    )
   );
 }
 
 /** The over-issue evidenceHash the slash filer MUST use — binds token+operator+epoch. */
-export function overIssueEvidenceHash(disputedToken: string, operator: string, epoch: bigint): string {
+export function overIssueEvidenceHash(
+  disputedToken: string,
+  operator: string,
+  epoch: bigint
+): string {
   return ethers.keccak256(
     ethers.AbiCoder.defaultAbiCoder().encode(
       ["string", "address", "address", "uint256"],
@@ -114,6 +147,73 @@ export interface OverIssueFraudProofInputs {
 export function encodeOverIssueFraudProof(i: OverIssueFraudProofInputs): string {
   return ethers.AbiCoder.defaultAbiCoder().encode(
     ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]"],
-    [i.proposalId, i.operator, i.slashLevel, i.epoch, i.disputedToken, i.signerMask, i.claimedSigners]
+    [
+      i.proposalId,
+      i.operator,
+      i.slashLevel,
+      i.epoch,
+      i.disputedToken,
+      i.signerMask,
+      i.claimedSigners,
+    ]
+  );
+}
+
+/**
+ * Reconstruct SP's slash-only `expectedMessageHash` (byte-identical to
+ * BLSAggregator.verifyAndExecute's slash path AND to verifier.slashMessageHash): over-issue
+ * slashes are pure slashes, so `repUsers` and `newScores` are BOTH empty.
+ */
+export function overIssueSlashMessageHash(
+  chainId: bigint,
+  proposalId: bigint,
+  operator: string,
+  slashLevel: number,
+  epoch: bigint,
+  disputedToken: string
+): string {
+  return ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256", "bytes32"],
+      [
+        proposalId,
+        operator,
+        slashLevel,
+        [],
+        [],
+        epoch,
+        chainId,
+        overIssueEvidenceHash(disputedToken, operator, epoch),
+      ]
+    )
+  );
+}
+
+/**
+ * Recompute SP's A' `proposalSignersCommitment` (byte-identical to `_computeSignersCommitment`).
+ * The watcher can self-check that its assembled proof WILL pass on-chain before submitting.
+ * `messageHash` must be built with the SAME chainId as `overIssueSlashMessageHash` used.
+ */
+export function computeSignersCommitment(
+  aggregator: string,
+  chainId: bigint,
+  proposalId: bigint,
+  messageHash: string,
+  signerMask: bigint,
+  claimedSigners: string[]
+): string {
+  return ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["string", "uint256", "address", "uint256", "bytes32", "uint256", "address[]"],
+      [
+        SIGNERS_COMMITMENT_TAG,
+        chainId,
+        aggregator,
+        proposalId,
+        messageHash,
+        signerMask,
+        claimedSigners,
+      ]
+    )
   );
 }
