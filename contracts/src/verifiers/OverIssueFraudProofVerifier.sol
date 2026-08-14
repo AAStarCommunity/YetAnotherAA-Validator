@@ -132,25 +132,14 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         if (fraudProofId != deriveFraudProofId(proposalId)) return false;
 
         // 2. claimedSigners canonical: strictly ascending uint160, non-zero, bounded.
-        uint256 n = claimedSigners.length;
-        if (n == 0 || n > MAX_SIGNERS) return false;
-        for (uint256 i = 0; i < n; i++) {
-            if (claimedSigners[i] == address(0)) return false;
-            if (i > 0 && uint160(claimedSigners[i - 1]) >= uint160(claimedSigners[i])) return false;
-        }
+        if (!_canonicalSigners(claimedSigners)) return false;
 
-        // 3. Commitment check with disputedToken bound in via evidenceHash → messageHash.
-        //    Reconstruct SP's slash message from the fields (attacker can't swap disputedToken
-        //    without breaking evidenceHash → messageHash → commitment).
-        bytes32 messageHash = slashMessageHash(proposalId, operator, slashLevel, epoch, disputedToken);
-        bytes32 anchor = IBLSAggregatorCommitment(AGGREGATOR).proposalSignersCommitment(proposalId);
-        if (anchor == bytes32(0)) return false; // not a recorded proposal
-        bytes32 recomputed = keccak256(
-            abi.encode(
-                SIGNERS_COMMITMENT_TAG, block.chainid, AGGREGATOR, proposalId, messageHash, signerMask, claimedSigners
-            )
-        );
-        if (recomputed != anchor) return false;
+        // 3. Commitment check with disputedToken bound in via evidenceHash → messageHash (an
+        //    attacker can't swap disputedToken without breaking evidenceHash → messageHash → commitment).
+        //    Extracted into a helper to keep this frame's local count low (coverage compiles without viaIR).
+        if (!_commitmentMatches(proposalId, operator, slashLevel, epoch, disputedToken, signerMask, claimedSigners)) {
+            return false;
+        }
 
         // 4. Subset: guiltyGuardians ⊆ claimedSigners (both strictly ascending → single merge pass).
         if (!_isSubset(guiltyGuardians, claimedSigners)) return false;
@@ -160,6 +149,38 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         if (IOverIssuable(disputedToken).isOverIssued()) return false;
 
         return true;
+    }
+
+    /// @dev claimedSigners canonical form: strictly ascending uint160, non-zero, bounded.
+    function _canonicalSigners(address[] memory claimedSigners) internal pure returns (bool) {
+        uint256 n = claimedSigners.length;
+        if (n == 0 || n > MAX_SIGNERS) return false;
+        for (uint256 i = 0; i < n; i++) {
+            if (claimedSigners[i] == address(0)) return false;
+            if (i > 0 && uint160(claimedSigners[i - 1]) >= uint160(claimedSigners[i])) return false;
+        }
+        return true;
+    }
+
+    /// @dev Reconstruct SP's slash message (binding disputedToken) and match the A' commitment.
+    function _commitmentMatches(
+        uint256 proposalId,
+        address operator,
+        uint8 slashLevel,
+        uint256 epoch,
+        address disputedToken,
+        uint256 signerMask,
+        address[] memory claimedSigners
+    ) internal view returns (bool) {
+        bytes32 anchor = IBLSAggregatorCommitment(AGGREGATOR).proposalSignersCommitment(proposalId);
+        if (anchor == bytes32(0)) return false; // not a recorded proposal
+        bytes32 messageHash = slashMessageHash(proposalId, operator, slashLevel, epoch, disputedToken);
+        bytes32 recomputed = keccak256(
+            abi.encode(
+                SIGNERS_COMMITMENT_TAG, block.chainid, AGGREGATOR, proposalId, messageHash, signerMask, claimedSigners
+            )
+        );
+        return recomputed == anchor;
     }
 
     /// @dev `sub ⊆ set` where BOTH are strictly ascending by uint160. Requires ≥1 accused.
