@@ -160,9 +160,55 @@ export function encodeOverIssueFraudProof(i: OverIssueFraudProofInputs): string 
 }
 
 /**
- * Reconstruct SP's slash-only `expectedMessageHash` (byte-identical to
- * BLSAggregator.verifyAndExecute's slash path AND to verifier.slashMessageHash): over-issue
- * slashes are pure slashes, so `repUsers` and `newScores` are BOTH empty.
+ * Reconstruct SP's slash-only `expectedMessageHash` from a RAW evidenceHash (byte-identical to
+ * BLSAggregator.verifyAndExecute's slash-only branch: `repUsers`/`newScores` empty, commits
+ * `evidenceHash` + chainId). The watcher uses this with the evidenceHash it read from the
+ * verifyAndExecute calldata — it does NOT need to know which token the slash cited.
+ */
+export function rawSlashMessageHash(
+  chainId: bigint,
+  proposalId: bigint,
+  operator: string,
+  slashLevel: number,
+  epoch: bigint,
+  evidenceHash: string
+): string {
+  return ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256", "bytes32"],
+      [proposalId, operator, slashLevel, [], [], epoch, chainId, evidenceHash]
+    )
+  );
+}
+
+/**
+ * Reconstruct SP's reputation/combined-path `expectedMessageHash` (7-field encoding, no
+ * evidenceHash — BLSAggregator.verifyAndExecute's `repUsers.length > 0` branch). The watcher
+ * needs this to self-check the commitment for combined proposals (operator slashed AND rep
+ * updated); over-issue fraud proofs themselves only target the slash-only branch.
+ */
+export function repSlashMessageHash(
+  chainId: bigint,
+  proposalId: bigint,
+  operator: string,
+  slashLevel: number,
+  repUsers: string[],
+  newScores: bigint[],
+  epoch: bigint
+): string {
+  return ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256"],
+      [proposalId, operator, slashLevel, repUsers, newScores, epoch, chainId]
+    )
+  );
+}
+
+/**
+ * Reconstruct SP's slash-only `expectedMessageHash` for the OVER-ISSUE class (binds the
+ * disputed token via the fixed-preimage evidenceHash). Byte-identical to
+ * `verifier.slashMessageHash` — this is what the fraud-proof ASSEMBLER uses when it knows the
+ * token; the watcher uses `rawSlashMessageHash` with the on-chain evidenceHash instead.
  */
 export function overIssueSlashMessageHash(
   chainId: bigint,
@@ -172,21 +218,58 @@ export function overIssueSlashMessageHash(
   epoch: bigint,
   disputedToken: string
 ): string {
-  return ethers.keccak256(
-    ethers.AbiCoder.defaultAbiCoder().encode(
-      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256", "bytes32"],
-      [
-        proposalId,
-        operator,
-        slashLevel,
-        [],
-        [],
-        epoch,
-        chainId,
-        overIssueEvidenceHash(disputedToken, operator, epoch),
-      ]
-    )
+  return rawSlashMessageHash(
+    chainId,
+    proposalId,
+    operator,
+    slashLevel,
+    epoch,
+    overIssueEvidenceHash(disputedToken, operator, epoch)
   );
+}
+
+/** The exact ABI of BLSAggregator.verifyAndExecute (SP `contracts/src/modules/monitoring/BLSAggregator.sol`). */
+export const VERIFY_AND_EXECUTE_ABI =
+  "function verifyAndExecute(uint256 proposalId, address operator, uint8 slashLevel, " +
+  "address[] repUsers, uint256[] newScores, uint256 epoch, bytes32 evidenceHash, bytes proof)";
+
+export interface VerifyAndExecuteArgs {
+  proposalId: bigint;
+  operator: string;
+  slashLevel: number;
+  repUsers: string[];
+  newScores: bigint[];
+  epoch: bigint;
+  evidenceHash: string;
+  /** signerMask decoded from proof[:32] (proof = abi.encode(uint256 signerMask, bytes sigG2)). */
+  signerMask: bigint;
+}
+
+/**
+ * Decode a top-level `verifyAndExecute` tx's calldata into the fields the watcher needs to
+ * reproduce SP's A' commitment. THROWS if `data` is not a verifyAndExecute call (wrong selector
+ * / undecodable) — the caller treats that as "not the direct call I expected" and skips (never
+ * records a guessed set). NOTE: this decodes the OUTER call; a proposal executed through an
+ * intermediary (e.g. DVT_VALIDATOR wrapping the call) won't decode here — a Phase-3 hardening
+ * concern (trace/internal-call resolution), out of scope for the direct-call E2E.
+ */
+export function decodeVerifyAndExecuteCalldata(data: string): VerifyAndExecuteArgs {
+  const iface = new ethers.Interface([VERIFY_AND_EXECUTE_ABI]);
+  const parsed = iface.parseTransaction({ data });
+  if (!parsed || parsed.name !== "verifyAndExecute") {
+    throw new Error("decodeVerifyAndExecuteCalldata: not a verifyAndExecute call");
+  }
+  const a = parsed.args;
+  return {
+    proposalId: BigInt(a[0]),
+    operator: ethers.getAddress(a[1]),
+    slashLevel: Number(a[2]),
+    repUsers: [...a[3]].map((x: string) => ethers.getAddress(x)),
+    newScores: [...a[4]].map((x: bigint) => BigInt(x)),
+    epoch: BigInt(a[5]),
+    evidenceHash: a[6],
+    signerMask: decodeSignerMaskFromBlsProof(a[7]),
+  };
 }
 
 /**

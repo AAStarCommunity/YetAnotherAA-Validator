@@ -13,6 +13,7 @@ import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { IQuorumCoSigner, PendingSlotCoSigner, QUORUM_COSIGNER } from "./slash-consensus.js";
 import { GossipQuorumCoSigner } from "./gossip-quorum-cosigner.js";
 import { LivenessKeeperService } from "./liveness-keeper.service.js";
+import { GuardianSlashWatcherService } from "./guardian-slash-watcher.service.js";
 
 /**
  * DVT Phase 2 (目标2) — autonomous operator audit module. Reuses the shared BlockchainService
@@ -32,6 +33,9 @@ import { LivenessKeeperService } from "./liveness-keeper.service.js";
     // inc-2 C1 — liveness attest keeper (opt-in AUDIT_ATTEST_ENABLED). Self-disables at bootstrap
     // when unconfigured; OpsAlertService is @Global so it injects without an explicit import.
     LivenessKeeperService,
+    // CC-89 stage-2 — guardian-slash watcher (opt-in AUDIT_GUARDIAN_WATCH_ENABLED). Self-disables at
+    // bootstrap when unconfigured. Owns its own read-only provider; OpsAlertService is @Global.
+    GuardianSlashWatcherService,
     {
       provide: QUORUM_COSIGNER,
       useFactory: (
