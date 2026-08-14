@@ -38,19 +38,26 @@ contract MockToken {
     }
 }
 
+contract RevertingToken {
+    function isOverIssued() external pure returns (bool) {
+        revert("boom");
+    }
+}
+
 contract OverIssueFraudProofVerifierTest is Test {
     OverIssueFraudProofVerifier internal verifier;
     MockAggregator internal agg;
     MockToken internal token;
 
-    // Ascending-by-uint160 signer set (numeric order == uint160 order for these).
     address internal constant S1 = address(0x1111);
     address internal constant S2 = address(0x2222);
     address internal constant S3 = address(0x3333);
     address internal constant OUTSIDER = address(0x9999);
 
+    address internal constant OPERATOR = address(0xABCD);
+    uint8 internal constant SLASH_LEVEL = 2; // MAJOR
+    uint256 internal constant EPOCH = 1000;
     uint256 internal constant PROPOSAL_ID = 42;
-    bytes32 internal constant MESSAGE_HASH = keccak256("msg");
     uint256 internal constant SIGNER_MASK = 0x7; // bits 1,2,3
 
     function setUp() public {
@@ -68,66 +75,86 @@ contract OverIssueFraudProofVerifierTest is Test {
         a[2] = S3;
     }
 
-    function _recordCommitment(address[] memory signers) internal {
-        agg.record(PROPOSAL_ID, MESSAGE_HASH, SIGNER_MASK, signers);
+    /// records the commitment for a slash over `disputedToken`, using the verifier's own messageHash
+    /// reconstruction (so test + contract are guaranteed consistent).
+    function _record(address[] memory signers, address disputedToken) internal {
+        bytes32 mh = verifier.slashMessageHash(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, disputedToken);
+        agg.record(PROPOSAL_ID, mh, SIGNER_MASK, signers);
     }
 
-    function _fraudProof(address[] memory claimedSigners) internal view returns (bytes memory) {
-        return abi.encode(PROPOSAL_ID, MESSAGE_HASH, SIGNER_MASK, claimedSigners, address(token));
+    function _proof(address[] memory claimedSigners, address disputedToken) internal pure returns (bytes memory) {
+        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, disputedToken, SIGNER_MASK, claimedSigners);
     }
 
     function _fpid() internal view returns (uint256) {
         return verifier.deriveFraudProofId(PROPOSAL_ID);
     }
 
-    function _guilty(address one) internal pure returns (address[] memory g) {
+    function _g(address a) internal pure returns (address[] memory g) {
         g = new address[](1);
-        g[0] = one;
+        g[0] = a;
     }
 
     // ---- happy path -------------------------------------------------------
 
     function test_HappyPath_ProvenFraud_ReturnsTrue() public {
-        _recordCommitment(_claimed());
+        _record(_claimed(), address(token));
         token.setOver(false); // NOT over-issued ⇒ the over-issue slash was fraudulent
-        assertTrue(verifier.verify(_fpid(), _guilty(S2), _fraudProof(_claimed())));
+        assertTrue(verifier.verify(_fpid(), _g(S2), _proof(_claimed(), address(token))));
+    }
+
+    function test_HappyPath_MultiGuardianGuilty() public {
+        _record(_claimed(), address(token));
+        token.setOver(false);
+        address[] memory guilty = new address[](2);
+        guilty[0] = S1;
+        guilty[1] = S3; // ascending subset
+        assertTrue(verifier.verify(_fpid(), guilty, _proof(_claimed(), address(token))));
+    }
+
+    // ---- CRITICAL regression: disputedToken must be bound to the slash --------
+
+    function test_Reject_TokenSwap_CannotSlashHonestSignersOfARealSlash() public {
+        // A real slash cited tokenA (say tokenA IS over-issued → the slash was JUST, signers honest).
+        _record(_claimed(), address(token));
+        // Attacker keeps the same proposalId/signers/commitment but points at a fresh not-over-issued token.
+        MockToken tokenB = new MockToken();
+        tokenB.setOver(false);
+        assertFalse(verifier.verify(_fpid(), _g(S2), _proof(_claimed(), address(tokenB))));
     }
 
     // ---- fail-closed negatives -------------------------------------------
 
     function test_Reject_GuiltyNotSubset_CannotSlashInnocent() public {
-        _recordCommitment(_claimed());
+        _record(_claimed(), address(token));
         token.setOver(false);
-        // OUTSIDER co-signed nothing; a valid commitment must not let it be slashed.
-        assertFalse(verifier.verify(_fpid(), _guilty(OUTSIDER), _fraudProof(_claimed())));
+        assertFalse(verifier.verify(_fpid(), _g(OUTSIDER), _proof(_claimed(), address(token))));
     }
 
     function test_Reject_CommitmentMissing() public {
-        // no agg.record(...)
         token.setOver(false);
-        assertFalse(verifier.verify(_fpid(), _guilty(S2), _fraudProof(_claimed())));
+        assertFalse(verifier.verify(_fpid(), _g(S2), _proof(_claimed(), address(token))));
     }
 
     function test_Reject_TamperedClaimedSigners_CommitmentMismatch() public {
-        _recordCommitment(_claimed());
+        _record(_claimed(), address(token));
         token.setOver(false);
-        // Present a different (but canonical) set than the one committed.
         address[] memory tampered = new address[](2);
         tampered[0] = S1;
         tampered[1] = S3;
-        assertFalse(verifier.verify(_fpid(), _guilty(S1), _fraudProof(tampered)));
+        assertFalse(verifier.verify(_fpid(), _g(S1), _proof(tampered, address(token))));
     }
 
     function test_Reject_StillOverIssued_SlashWasJustified() public {
-        _recordCommitment(_claimed());
-        token.setOver(true); // still over-issued ⇒ slash justified ⇒ not fraud
-        assertFalse(verifier.verify(_fpid(), _guilty(S2), _fraudProof(_claimed())));
+        _record(_claimed(), address(token));
+        token.setOver(true);
+        assertFalse(verifier.verify(_fpid(), _g(S2), _proof(_claimed(), address(token))));
     }
 
     function test_Reject_WrongFraudProofId() public {
-        _recordCommitment(_claimed());
+        _record(_claimed(), address(token));
         token.setOver(false);
-        assertFalse(verifier.verify(_fpid() + 1, _guilty(S2), _fraudProof(_claimed())));
+        assertFalse(verifier.verify(_fpid() + 1, _g(S2), _proof(_claimed(), address(token))));
     }
 
     function test_Reject_ClaimedSignersNotCanonical_Unsorted() public {
@@ -135,21 +162,55 @@ contract OverIssueFraudProofVerifierTest is Test {
         unsorted[0] = S3;
         unsorted[1] = S1;
         unsorted[2] = S2;
-        _recordCommitment(unsorted); // commitment over the unsorted set...
+        _record(unsorted, address(token));
         token.setOver(false);
-        // verifier rejects non-canonical claimedSigners regardless of commitment match.
-        assertFalse(verifier.verify(_fpid(), _guilty(S1), _fraudProof(unsorted)));
+        assertFalse(verifier.verify(_fpid(), _g(S1), _proof(unsorted, address(token))));
     }
 
     function test_Reject_ClaimedSignersHasZero() public {
         address[] memory withZero = new address[](2);
         withZero[0] = address(0);
         withZero[1] = S1;
-        _recordCommitment(withZero);
+        _record(withZero, address(token));
         token.setOver(false);
-        assertFalse(verifier.verify(_fpid(), _guilty(S1), _fraudProof(withZero)));
+        assertFalse(verifier.verify(_fpid(), _g(S1), _proof(withZero, address(token))));
     }
 
-    // TODO(stage-2): multi-guardian guilty subset; empty guilty; guilty not ascending;
-    // fuzz over signer sets; historical-state (production) variant once challenge-window lands.
+    function test_Reject_EmptyGuilty() public {
+        _record(_claimed(), address(token));
+        token.setOver(false);
+        assertFalse(verifier.verify(_fpid(), new address[](0), _proof(_claimed(), address(token))));
+    }
+
+    function test_Reject_GuiltyNotAscending() public {
+        _record(_claimed(), address(token));
+        token.setOver(false);
+        address[] memory guilty = new address[](2);
+        guilty[0] = S3;
+        guilty[1] = S1; // descending → rejected
+        assertFalse(verifier.verify(_fpid(), guilty, _proof(_claimed(), address(token))));
+    }
+
+    // ---- never-revert (fail-closed) --------------------------------------
+
+    function test_MalformedProof_ReturnsFalse_NoRevert() public view {
+        bytes memory garbage = hex"deadbeef";
+        assertFalse(verifier.verify(_fpid(), _g(S2), garbage));
+    }
+
+    function test_MaliciousTokenRevert_ReturnsFalse_NoRevert() public {
+        RevertingToken bad = new RevertingToken();
+        _record(_claimed(), address(bad));
+        // token reverts on isOverIssued() → verify catches → false (not a revert, no slash).
+        assertFalse(verifier.verify(_fpid(), _g(S2), _proof(_claimed(), address(bad))));
+    }
+
+    function test_Check_NotSelfCallable() public {
+        // Pre-compute args so vm.expectRevert applies to the check() call, not the view helpers.
+        uint256 id = _fpid();
+        address[] memory g = _g(S2);
+        bytes memory p = _proof(_claimed(), address(token));
+        vm.expectRevert(bytes("self only"));
+        verifier.check(id, g, p);
+    }
 }
