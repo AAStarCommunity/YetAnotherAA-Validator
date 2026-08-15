@@ -4,6 +4,46 @@ All notable changes to YetAnotherAA-Validator (the DVT BLS signer node) are
 documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [1.13.1] — 2026-08-15 — CC-89 follow-up: aggregator-default alignment + audit/watcher bootstrap fail-closure
+
+Backward-compatible hardening patch (raised on CC-90 by the KMS工兵: the DVT
+code default `AUDIT_BLS_AGGREGATOR_ADDRESS` was a stale pre-CC-89 address).
+Every touched path is opt-in (offline audit + guardian watcher, both default
+off) — no change to default runtime behaviour, no breaking change. SP / SDK /
+airaccount / paper need no changes; KMS only updates the watcher env example.
+
+### Changed
+
+- **Aggregator default aligned** `0xF51c0298…` (stale, SP's pre-CC-89 canonical)
+  → `0x174b60bB462b00550F0EC7Bc35Fe39dDB6310158` (SP production A' 4.3.0).
+  Tracks the real aggregator rotation that shipped with CC-89.
+
+### Added (fail-closed hardening)
+
+- **`aggregator-bootstrap-guard.ts`** (pure, shared) — one fail-closed policy
+  for both audit consumers: reject a provider chain ≠ `AUDIT_CHAIN_ID`, and
+  reject the Sepolia default silently inherited **off-Sepolia** unless
+  `AUDIT_BLS_AGGREGATOR_ADDRESS` is set explicitly (a non-empty default
+  otherwise masks the unset case).
+- **`auditBlsAggregatorAddressFromEnv`** (`configuration.ts`) — tracks whether
+  the aggregator address was set explicitly (not the resolved value).
+- **Interface probe at bootstrap** — the offline rule (`getBLSPublicKey` +
+  `validatorAtSlot`) and the guardian watcher (`validatorAtSlot` +
+  `proposalSignersCommitment`) each statically exercise the exact methods they
+  call at runtime, so a wrong-but-deployed address fails-closed at startup
+  instead of fail-open per tick. New `BlockchainService.getChainId()` /
+  `probeBlsAggregator()`.
+- `.gitignore`: `guardian-operators.json` (production guardian EOA keys).
+
+### Notes
+
+- Codex Tier-1: 5 rounds, final verdict CLEAN (0 Critical/High/Medium/Low). One
+  Medium (a hard canonical-identity address/codehash pin) deferred with
+  rationale — it would false-disable on legitimate SP aggregator redeploys; the
+  silent-default footgun this patch closes is the real issue.
+- docs `cc89-e2e-record.md`: distinguishes the E2E throwaway aggregator from
+  production.
+
 ## [1.13.0] — 2026-08-15 — CC-89 stage-2: over-issue guardian-collusion slash (testnet-E2E proven)
 
 Production release. Adds the DVT half of the CC-89 guardian-collusion slashing
