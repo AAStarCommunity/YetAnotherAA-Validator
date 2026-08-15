@@ -231,11 +231,18 @@ export default () => {
     // DVTValidator (SP #329 finalized interface). Default is the Sepolia deployment.
     auditDvtValidatorAddress:
       process.env.AUDIT_DVT_VALIDATOR_ADDRESS || "0x568b1486BFE036e603eA11f0D03Dc47fa62c9E0e",
-    // BLSAggregator (SP #329). Currently informational — the on-chain queue/execute writes go
-    // through DVTValidator; the aggregator address is recorded for the future live gossip
-    // co-sign that will aggregate peer BLS signatures by SP-assigned validator slot.
+    // SP BLSAggregator (A' 4.3.0) — the aggregator the guardian-slash watcher (CC-89) reads
+    // proposalSignersCommitment/validatorAtSlot from, and the offline-audit rule resolves
+    // operator→BLS key through. Default is the Sepolia PRODUCTION deployment (CC-89 0fe793f2;
+    // supersedes the pre-migration 0xF51c0298… which was stale/informational). ALWAYS set
+    // AUDIT_BLS_AGGREGATOR_ADDRESS explicitly per network — never rely on the default off-Sepolia.
     auditBlsAggregatorAddress:
-      process.env.AUDIT_BLS_AGGREGATOR_ADDRESS || "0xF51c029879685Ced8fbCfa4b647c2eAe50Cd8B13",
+      process.env.AUDIT_BLS_AGGREGATOR_ADDRESS || "0x174b60bB462b00550F0EC7Bc35Fe39dDB6310158",
+    // Whether the aggregator address was set EXPLICITLY (not the resolved value — the resolved value
+    // always carries the Sepolia default above, which would mask the unset case). Consumed by the
+    // fail-closed off-Sepolia guard so the Sepolia default is never silently inherited on another
+    // chain. See aggregator-bootstrap-guard.ts.
+    auditBlsAggregatorAddressFromEnv: Boolean(process.env.AUDIT_BLS_AGGREGATOR_ADDRESS),
     auditGtokenStakingAddress: process.env.AUDIT_GTOKEN_STAKING_ADDRESS || undefined,
     // SECOND safety gate (increment 2). AUDIT_ENABLED alone only FILES slash proposals; the
     // two-step on-chain slash (queueSlashWithProof → executeWithProof, each quorum co-signed)

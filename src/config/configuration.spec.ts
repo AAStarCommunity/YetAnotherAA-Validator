@@ -4,6 +4,31 @@ import configuration from "./configuration.js";
  * Config-floor tests (Codex round-2 LOW): AUDIT_FINALITY_CONFIRMATIONS must be floored to a
  * POSITIVE value so the finalized-block fallback never resolves to the unconfirmed head (latest − 0).
  */
+describe("configuration: auditBlsAggregatorAddressFromEnv (CC-89 explicit-presence flag)", () => {
+  const saved = { ...process.env };
+  beforeEach(() => {
+    process.env.ETH_RPC_URL = "http://localhost:8545";
+    process.env.VALIDATOR_CONTRACT_ADDRESS = "0x" + "12".repeat(20);
+    delete process.env.AUDIT_BLS_AGGREGATOR_ADDRESS;
+  });
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it("unset env → resolved value carries the built-in default, but fromEnv is FALSE", () => {
+    const c = configuration();
+    expect(c.auditBlsAggregatorAddress).toBe("0x174b60bB462b00550F0EC7Bc35Fe39dDB6310158");
+    expect(c.auditBlsAggregatorAddressFromEnv).toBe(false);
+  });
+
+  it("explicit env → fromEnv is TRUE and the value is the env value", () => {
+    process.env.AUDIT_BLS_AGGREGATOR_ADDRESS = "0x" + "cd".repeat(20);
+    const c = configuration();
+    expect(c.auditBlsAggregatorAddress).toBe("0x" + "cd".repeat(20));
+    expect(c.auditBlsAggregatorAddressFromEnv).toBe(true);
+  });
+});
+
 describe("configuration: auditFinalityConfirmations floor", () => {
   const saved = { ...process.env };
 

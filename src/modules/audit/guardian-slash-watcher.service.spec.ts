@@ -249,4 +249,33 @@ describe("GuardianSlashWatcherService (CC-89 stage-2 durability)", () => {
     await svc.tick();
     expect(await store.readCursor()).toBeNull();
   });
+
+  it("bootstrap fail-closed: aggregator answers validatorAtSlot but REVERTS proposalSignersCommitment → DISABLED", async () => {
+    // Proves the watcher's bootstrap probe exercises proposalSignersCommitment INDEPENDENTLY — a
+    // wrong-but-deployed contract implementing only validatorAtSlot must not start the poller.
+    let sawCommitmentProbe = false;
+    const bootProvider: any = {
+      getCode: async () => "0x60006000fd",
+      getNetwork: async () => ({ chainId: CHAIN_ID }),
+      call: async (tx: { data: string }) => {
+        const sel = tx.data.slice(0, 10);
+        if (sel === va.getFunction("validatorAtSlot")!.selector) {
+          return va.encodeFunctionResult("validatorAtSlot", [ethers.ZeroAddress]);
+        }
+        sawCommitmentProbe = true;
+        throw new Error("execution reverted (no proposalSignersCommitment)");
+      },
+    };
+    const svc = new GuardianSlashWatcherService(undefined, undefined, store);
+    (svc as any).provider = bootProvider;
+    (svc as any).aggregatorAddress = AGG;
+    (svc as any).expectedChainId = Number(CHAIN_ID);
+    (svc as any).aggregatorFromEnv = true;
+
+    await (svc as any).bootstrapAndPoll();
+
+    expect(sawCommitmentProbe).toBe(true); // the second probe method actually fired
+    expect((svc as any).timer).toBeNull(); // poller NOT started (fail-closed)
+    expect((svc as any).chainId).toBeNull(); // never advanced past the probe
+  });
 });
