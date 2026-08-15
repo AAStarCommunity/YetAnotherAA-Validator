@@ -61,6 +61,16 @@ between the messageHash field and the evidence op — for a no-real-victim demo,
 | GTokenStaking                                      | `0x472297B557c1d0F030f281a5Bb8A535f6c5AB65e` |
 | MockOverIssuableToken (`isOverIssued()==false`)    | `0x8dE1b6585Bdf5a3e6F13B3125B2d40CC34fc005b` |
 
+> **⚠️ These are the E2E throwaway deployment addresses — NOT production.** The
+> aggregator `0xf44E7E51…` above was a single-run fixture (its 3 guardians are
+> now slashed to 0 and ejected). The **production** Sepolia SuperPaymaster
+> BLSAggregator (A' 4.3.0) is **`0x174b60bB462b00550F0EC7Bc35Fe39dDB6310158`**
+> (the config default; see `src/config/configuration.ts`
+> `auditBlsAggregatorAddress`), with production verifier `0x128847cF…` and 3
+> persistent guardians (CC-89 comment `b26903ec`). Guardian nodes must set
+> `AUDIT_BLS_AGGREGATOR_ADDRESS` to the **production** aggregator; do not copy
+> the E2E address from this record.
+
 3 guardians registered at slots 1/2/3, each with **30e18 ROLE_DVT** locked
 (`ROLE_DVT = keccak256("DVT")`): `0xb5600060…` (slot1), `0x6F7D30f2…F96E`
 (slot2), `0x09a0ca08…5c93` (slot3).

@@ -66,3 +66,6 @@ deploy/.drill-archive-backup/
 
 # Foundry broadcast logs (auto-generated per deploy; addresses recorded in docs)
 contracts/broadcast/
+
+# CC-89 production guardian operator EOA keys (NEVER commit)
+guardian-operators.json

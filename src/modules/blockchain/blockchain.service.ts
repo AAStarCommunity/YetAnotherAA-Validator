@@ -1385,6 +1385,34 @@ export class BlockchainService {
     return this.provider.getCode(address, blockTag);
   }
 
+  /** The RPC provider's actual chainId. Used for a fail-closed bootstrap guard so the audit never
+   *  inherits a network-specific default address (e.g. the Sepolia BLS aggregator) on the wrong
+   *  chain. */
+  async getChainId(): Promise<number> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    return Number((await this.provider.getNetwork()).chainId);
+  }
+
+  /** Interface sanity-probe for the OFFLINE-audit consumer's BLS aggregator surface. `getCode != 0x`
+   *  only proves *some* bytecode exists; this statically exercises the exact methods the offline rule
+   *  calls at runtime — `validatorAtSlot(1)` and `getBLSPublicKey(address(0))` (the latter is what
+   *  `getOperatorNodeId` uses) — so a wrong-but-deployed contract that implements one but not the
+   *  other still fails-closed at bootstrap instead of at runtime. Throws on any failure. */
+  async probeBlsAggregator(aggregatorAddress: string): Promise<void> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const abi = [
+      "function validatorAtSlot(uint8) view returns (address)",
+      "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
+    ];
+    const contract = new ethers.Contract(aggregatorAddress, abi, this.provider);
+    await contract.validatorAtSlot(1);
+    await contract.getBLSPublicKey(ethers.ZeroAddress);
+  }
+
   /** Registry.getCreditLimit(operator) — the operator's on-chain credit ceiling (wei-scaled). */
   async getCreditLimit(
     registryAddress: string,

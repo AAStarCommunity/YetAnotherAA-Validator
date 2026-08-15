@@ -45,6 +45,8 @@ function makeBlockchain(
       fromBlock: number
     ) => Promise<boolean | null>;
     getCode: (addr: string) => Promise<string>;
+    getChainId: () => Promise<number>;
+    probeBlsAggregator: (addr: string) => Promise<void>;
     getCreditLimit: (addr: string, op: string, bt?: number) => Promise<bigint>;
     getAvailableCredit: (addr: string, op: string, token: string, bt?: number) => Promise<bigint>;
     getDebt: (tokenAddr: string, op: string, bt?: number) => Promise<bigint | null>;
@@ -89,6 +91,11 @@ function makeBlockchain(
     // No prior slash by default → the durable on-chain over-slash guard reports "not slashed".
     getRecentSlashExecuted: overrides.getRecentSlashExecuted ?? (async () => false),
     getCode: overrides.getCode ?? (async () => "0x60006000fd"),
+    // Provider chainId matches the default auditChainId (11155111) so the bootstrap chain guard
+    // passes; the invalid-chainId test bails earlier (auditChainId<=0) before this is read.
+    getChainId: overrides.getChainId ?? (async () => 11155111),
+    // Aggregator interface probe succeeds by default (validatorAtSlot(1) did not revert).
+    probeBlsAggregator: overrides.probeBlsAggregator ?? (async () => {}),
     getCreditLimit: overrides.getCreditLimit ?? (async () => 1000n),
     getAvailableCredit: overrides.getAvailableCredit ?? (async () => 1000n),
     getDebt: overrides.getDebt ?? (async () => 0n),
@@ -251,6 +258,75 @@ describe("AuditService", () => {
     await svc.onApplicationBootstrap();
     expect((svc as any).startupTimer).toBeNull();
     expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  it("fail-closed: RPC chainId != AUDIT_CHAIN_ID → DISABLED (wrong-chain default addresses)", async () => {
+    // Provider is actually on mainnet (1) while AUDIT_CHAIN_ID declares Sepolia (11155111) — the
+    // Sepolia default addresses would be garbage, so the audit must refuse to start.
+    const blockchain = makeBlockchain({ getChainId: async () => 1 });
+    const svc = makeService(blockchain, makeConfig(), makeArchive());
+    await svc.onApplicationBootstrap();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  it("fail-closed: offline audit ON but AUDIT_BLS_AGGREGATOR_ADDRESS empty → DISABLED", async () => {
+    const svc = makeService(
+      makeBlockchain(),
+      makeConfig({ auditOfflineEnabled: true, auditBlsAggregatorAddress: "" }),
+      makeArchive()
+    );
+    await svc.onApplicationBootstrap();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  it("fail-closed: offline audit ON + aggregator set but no on-chain code → DISABLED", async () => {
+    // Aggregator address is set but the only address returning empty code is the aggregator; every
+    // other required address has code. This proves the aggregator is in the existence check.
+    const AGG = "0x" + "ab".repeat(20);
+    const blockchain = makeBlockchain({
+      getCode: async (addr: string) => (addr.toLowerCase() === AGG ? "0x" : "0x60006000fd"),
+    });
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditOfflineEnabled: true, auditBlsAggregatorAddress: AGG }),
+      makeArchive()
+    );
+    await svc.onApplicationBootstrap();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  it("fail-closed: offline audit ON + aggregator has code but is not a BLSAggregator → DISABLED", async () => {
+    // getCode passes (bytecode exists) but the interface probe (validatorAtSlot(1)) reverts — a
+    // wrong-but-deployed address. Must fail-closed rather than trust it.
+    const AGG = "0x" + "ac".repeat(20);
+    const blockchain = makeBlockchain({
+      probeBlsAggregator: async () => {
+        throw new Error("execution reverted (not a BLSAggregator)");
+      },
+    });
+    const svc = makeService(
+      blockchain,
+      makeConfig({ auditOfflineEnabled: true, auditBlsAggregatorAddress: AGG }),
+      makeArchive()
+    );
+    await svc.onApplicationBootstrap();
+    expect((svc as any).startupTimer).toBeNull();
+    expect((await svc.getStatus()).enabled).toBe(false);
+  });
+
+  it("offline audit ON + aggregator set + code + probe OK + chain matches → ENABLED", async () => {
+    // Positive path: proves the new fail-closed guards do NOT false-disable a correct offline setup.
+    const AGG = "0x" + "ad".repeat(20);
+    const svc = makeService(
+      makeBlockchain(),
+      makeConfig({ auditOfflineEnabled: true, auditBlsAggregatorAddress: AGG }),
+      makeArchive()
+    );
+    await svc.onApplicationBootstrap();
+    expect((await svc.getStatus()).enabled).toBe(true);
   });
 
   it("computeJitterMs stays within [0, intervalMs)", () => {

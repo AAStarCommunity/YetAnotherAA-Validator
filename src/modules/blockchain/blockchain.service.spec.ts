@@ -580,3 +580,64 @@ describe("BlockchainService.getRegisteredSlot (finding-3 O(1) own-slot)", () => 
     expect(calls).toBe(0);
   });
 });
+
+describe("BlockchainService.probeBlsAggregator (CC-89 interface probe)", () => {
+  const BLS_AGG = ethers.getAddress("0x" + "aa".repeat(20));
+  const iface = new ethers.Interface([
+    "function validatorAtSlot(uint8) view returns (address)",
+    "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
+  ]);
+  const SLOT_SEL = iface.getFunction("validatorAtSlot")!.selector;
+  const PK_SEL = iface.getFunction("getBLSPublicKey")!.selector;
+  const okSlot = () => iface.encodeFunctionResult("validatorAtSlot", [ethers.ZeroAddress]);
+  const okPk = () =>
+    iface.encodeFunctionResult("getBLSPublicKey", [
+      [
+        "0x" + "00".repeat(32),
+        "0x" + "00".repeat(32),
+        "0x" + "00".repeat(32),
+        "0x" + "00".repeat(32),
+      ],
+      0,
+      false,
+    ]);
+
+  function makeService(call: (tx: { data: string }) => Promise<string>): BlockchainService {
+    const svc = new BlockchainService({ get: (_k: string) => undefined } as any);
+    (svc as any).provider = { call };
+    return svc;
+  }
+
+  it("exercises BOTH validatorAtSlot(1) AND getBLSPublicKey(0) — resolves when both succeed", async () => {
+    const hit = { slot: false, pk: false };
+    const svc = makeService(async tx => {
+      const sel = tx.data.slice(0, 10);
+      if (sel === SLOT_SEL) {
+        hit.slot = true;
+        return okSlot();
+      }
+      if (sel === PK_SEL) {
+        hit.pk = true;
+        return okPk();
+      }
+      throw new Error("unexpected selector");
+    });
+    await expect(svc.probeBlsAggregator(BLS_AGG)).resolves.toBeUndefined();
+    expect(hit).toEqual({ slot: true, pk: true }); // proves each method actually fires
+  });
+
+  it("fails-closed (throws) when getBLSPublicKey reverts even though validatorAtSlot works", async () => {
+    const svc = makeService(async tx => {
+      if (tx.data.slice(0, 10) === SLOT_SEL) return okSlot();
+      throw new Error("execution reverted (no getBLSPublicKey)");
+    });
+    await expect(svc.probeBlsAggregator(BLS_AGG)).rejects.toThrow();
+  });
+
+  it("fails-closed (throws) when validatorAtSlot reverts", async () => {
+    const svc = makeService(async () => {
+      throw new Error("execution reverted (not an aggregator)");
+    });
+    await expect(svc.probeBlsAggregator(BLS_AGG)).rejects.toThrow();
+  });
+});

@@ -13,6 +13,7 @@ import { GossipService } from "../gossip/gossip.service.js";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
 import type { IProofArchive, SlashProof, EvidenceSource, ProofIdentity } from "./proof-archive.js";
 import { LocalProofArchive, computeProofHash, PROOF_SCHEMA_VERSION } from "./proof-archive.js";
+import { checkAggregatorChainPolicy } from "./aggregator-bootstrap-guard.js";
 import type { IQuorumCoSigner } from "./slash-consensus.js";
 import {
   SlashLevel,
@@ -94,6 +95,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
   private readonly superPaymasterAddress: string;
   private readonly dvtValidatorAddress: string;
   private readonly blsAggregatorAddress: string;
+  /** Whether AUDIT_BLS_AGGREGATOR_ADDRESS was set explicitly (see aggregator-bootstrap-guard.ts). */
+  private readonly blsAggregatorAddressFromEnv: boolean;
   private readonly gtokenStakingAddress: string;
   /**
    * SECOND safety gate (increment 2). When false (default) a violation only FILES + ARCHIVES a
@@ -280,6 +283,8 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     this.superPaymasterAddress = config.get<string>("auditSuperPaymasterAddress") ?? "";
     this.dvtValidatorAddress = config.get<string>("auditDvtValidatorAddress") ?? "";
     this.blsAggregatorAddress = config.get<string>("auditBlsAggregatorAddress") ?? "";
+    this.blsAggregatorAddressFromEnv =
+      config.get<boolean>("auditBlsAggregatorAddressFromEnv") === true;
     this.gtokenStakingAddress = config.get<string>("auditGtokenStakingAddress") ?? "";
     this.executeSlash = config.get<boolean>("auditExecuteSlash") === true;
     this.dryRun = config.get<boolean>("auditDryRun") === true;
@@ -332,6 +337,12 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
     if (!this.registryAddress) missing.push("AUDIT_REGISTRY_ADDRESS");
     if (!this.superPaymasterAddress) missing.push("AUDIT_SUPER_PAYMASTER_ADDRESS");
     if (!this.dvtValidatorAddress) missing.push("AUDIT_DVT_VALIDATOR_ADDRESS");
+    // The offline rule resolves operator→nodeId through the BLS aggregator (getOperatorNodeId).
+    // With a built-in network-specific default it would otherwise fail lazily per tick (silently
+    // fail-OPEN on offline detection). Require it explicitly whenever offline audit is on.
+    if (this.offlineEnabled && !this.blsAggregatorAddress) {
+      missing.push("AUDIT_BLS_AGGREGATOR_ADDRESS");
+    }
     if (missing.length > 0) {
       this.enabled = false;
       this.logger.error(
@@ -344,12 +355,40 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       this.logger.error(`Audit: invalid AUDIT_CHAIN_ID=${this.chainId} — DISABLED (fail-closed)`);
       return;
     }
+    // Chain guard: the config carries network-specific default addresses (Sepolia BLS aggregator /
+    // DVTValidator). If the RPC points at a different chain than AUDIT_CHAIN_ID, or the Sepolia
+    // aggregator default is silently inherited off-Sepolia, those addresses are garbage. Shared
+    // fail-closed policy (aggregator-bootstrap-guard.ts) — mirrored by the guardian watcher.
+    let providerChainId: number;
+    try {
+      providerChainId = await this.blockchainService.getChainId();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.enabled = false;
+      this.logger.error(`Audit: could not read provider chainId (${msg}) — DISABLED (fail-closed)`);
+      return;
+    }
+    const policy = checkAggregatorChainPolicy({
+      expectedChainId: this.chainId,
+      providerChainId,
+      aggregatorFromEnv: this.blsAggregatorAddressFromEnv,
+      aggregatorRequired: this.offlineEnabled,
+    });
+    if (!policy.ok) {
+      this.enabled = false;
+      this.logger.error(`Audit: ${policy.reason} — DISABLED (fail-closed)`);
+      return;
+    }
     // On-chain existence check: reject any address with no deployed code (wrong chain / typo).
     const toCheck: Array<[string, string]> = [
       ["AUDIT_REGISTRY_ADDRESS", this.registryAddress],
       ["AUDIT_SUPER_PAYMASTER_ADDRESS", this.superPaymasterAddress],
       ["AUDIT_DVT_VALIDATOR_ADDRESS", this.dvtValidatorAddress],
     ];
+    // When offline audit is on, the aggregator must also exist on-chain (it's required above).
+    if (this.offlineEnabled && this.blsAggregatorAddress) {
+      toCheck.push(["AUDIT_BLS_AGGREGATOR_ADDRESS", this.blsAggregatorAddress]);
+    }
     if (this.gtokenStakingAddress) {
       toCheck.push(["AUDIT_GTOKEN_STAKING_ADDRESS", this.gtokenStakingAddress]);
     }
@@ -369,6 +408,21 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
         this.enabled = false;
         this.logger.error(
           `Audit: ${name}=${addr} has no on-chain code on chainId ${this.chainId} — DISABLED (fail-closed)`
+        );
+        return;
+      }
+    }
+    // Interface sanity-probe for the aggregator (offline rule only): getCode proves bytecode exists,
+    // not that it's a BLSAggregator. A static validatorAtSlot(1) catches a wrong-but-deployed address.
+    if (this.offlineEnabled && this.blsAggregatorAddress) {
+      try {
+        await this.blockchainService.probeBlsAggregator(this.blsAggregatorAddress);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.enabled = false;
+        this.logger.error(
+          `Audit: AUDIT_BLS_AGGREGATOR_ADDRESS=${this.blsAggregatorAddress} did not respond to ` +
+            `validatorAtSlot(1) (${msg}) — not a BLSAggregator? DISABLED (fail-closed)`
         );
         return;
       }

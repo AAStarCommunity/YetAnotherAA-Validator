@@ -11,6 +11,7 @@ import { OpsAlertService } from "../ops-alert/ops-alert.service.js";
 import type { IGuardianSignerStore } from "./guardian-signer-store.js";
 import { LocalGuardianSignerStore } from "./guardian-signer-store.js";
 import { SLASH_EXECUTED_EVENT, buildGuardianSignerRecord } from "./guardian-slash-watcher.core.js";
+import { checkAggregatorChainPolicy } from "./aggregator-bootstrap-guard.js";
 
 /**
  * CC-89 stage-2 — guardian-slash WATCHER (the off-chain data-availability half).
@@ -54,6 +55,10 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
   private readonly logger = new Logger(GuardianSlashWatcherService.name);
   private readonly enabled: boolean;
   private readonly aggregatorAddress: string;
+  /** AUDIT_CHAIN_ID — cross-checked against the RPC's actual chain (shared fail-closed policy). */
+  private readonly expectedChainId: number;
+  /** Whether AUDIT_BLS_AGGREGATOR_ADDRESS was set explicitly (guards the Sepolia default). */
+  private readonly aggregatorFromEnv: boolean;
   private readonly rpcUrl: string;
   private readonly intervalMs: number;
   private readonly fromBlock: number;
@@ -75,6 +80,8 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
   ) {
     this.enabled = this.config?.get<boolean>("auditGuardianWatchEnabled") === true;
     this.aggregatorAddress = this.config?.get<string>("auditBlsAggregatorAddress") ?? "";
+    this.expectedChainId = this.config?.get<number>("auditChainId") ?? 0;
+    this.aggregatorFromEnv = this.config?.get<boolean>("auditBlsAggregatorAddressFromEnv") === true;
     this.rpcUrl = this.config?.get<string>("ethRpcUrl") ?? "";
     this.intervalMs = this.config?.get<number>("auditGuardianWatchIntervalMs") ?? 60_000;
     this.fromBlock = this.config?.get<number>("auditGuardianWatchFromBlock") ?? 0;
@@ -144,6 +151,31 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
         return;
       }
       const net = await this.provider!.getNetwork();
+      // Shared fail-closed policy (mirrors AuditService): reject a wrong-chain RPC or a Sepolia
+      // aggregator default silently inherited off-Sepolia. getCode above only proves bytecode exists.
+      const policy = checkAggregatorChainPolicy({
+        expectedChainId: this.expectedChainId,
+        providerChainId: Number(net.chainId),
+        aggregatorFromEnv: this.aggregatorFromEnv,
+        aggregatorRequired: true,
+      });
+      if (!policy.ok) {
+        this.logger.warn(`${policy.reason} — watcher DISABLED`);
+        return;
+      }
+      // Interface sanity-probe: statically exercise the EXACT methods this watcher calls at runtime
+      // (validatorAtSlot + proposalSignersCommitment). A wrong-but-deployed address passes getCode
+      // but reverts / fails to decode here → fail-closed at bootstrap, not at runtime.
+      const probe = new ethers.Contract(
+        this.aggregatorAddress,
+        [
+          "function validatorAtSlot(uint8) view returns (address)",
+          "function proposalSignersCommitment(uint256) view returns (bytes32)",
+        ],
+        this.provider!
+      );
+      await probe.validatorAtSlot(1);
+      await probe.proposalSignersCommitment(0);
       this.chainId = net.chainId;
     } catch (e: any) {
       this.logger.warn(`watcher bootstrap read failed — DISABLED: ${e?.message ?? String(e)}`);
