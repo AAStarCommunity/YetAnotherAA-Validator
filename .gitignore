@@ -63,3 +63,6 @@ audit-proofs/
 
 # Drill proof-archive backups (Stage-3 dry-run artifacts) — never commit
 deploy/.drill-archive-backup/
+
+# Foundry broadcast logs (auto-generated per deploy; addresses recorded in docs)
+contracts/broadcast/
