@@ -36,7 +36,11 @@ const die = m => {
 const PK = (() => {
   for (const line of readFileSync(".env.sepolia", "utf8").split("\n")) {
     const m = line.match(/^PRIVATE_KEY_JASON=(.*)$/);
-    if (m) return m[1].replace(/#.*/, "").trim().replace(/^["']|["']$/g, "");
+    if (m)
+      return m[1]
+        .replace(/#.*/, "")
+        .trim()
+        .replace(/^["']|["']$/g, "");
   }
   die("PRIVATE_KEY_JASON not in .env.sepolia");
 })();
@@ -66,7 +70,9 @@ const staking = new ethers.Contract(
 const lockOf = async g => (await staking.roleLocks(g, ROLE_DVT))[0];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-console.log(`CC-89 resident finisher armed — waiting for SP verifyAndExecute on proposal ${PID}...`);
+console.log(
+  `CC-89 resident finisher armed — waiting for SP verifyAndExecute on proposal ${PID}...`
+);
 
 // ---- 1. wait for SP's verifyAndExecute (commitment set) ---------------------
 let commitment = ethers.ZeroHash;
@@ -76,7 +82,8 @@ while (Date.now() < deadline) {
   if (commitment !== ethers.ZeroHash) break;
   await sleep(20000);
 }
-if (commitment === ethers.ZeroHash) die("timed out waiting for verifyAndExecute (commitment still 0)");
+if (commitment === ethers.ZeroHash)
+  die("timed out waiting for verifyAndExecute (commitment still 0)");
 console.log(`\n✓ SP submitted — proposalSignersCommitment(${PID}) = ${commitment}`);
 
 // ---- 2. resolveClaimedSigners = sorted validatorAtSlot over the mask --------
@@ -84,7 +91,9 @@ const slots = [];
 for (let s = 1n; s <= 13n; s++) if ((MASK >> (s - 1n)) & 1n) slots.push(Number(s));
 const raw = [];
 for (const s of slots) raw.push(ethers.getAddress(await agg.validatorAtSlot(s)));
-const claimedSigners = [...raw].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0));
+const claimedSigners = [...raw].sort((a, b) =>
+  BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0
+);
 console.log("claimedSigners (sorted):", claimedSigners);
 
 // ---- 3. assemble fraudProof + fraudProofId ---------------------------------
@@ -105,24 +114,37 @@ if (!ok) die("verifier rejected the fraudProof — NOT submitting executeGuardia
 // ---- 5. locks BEFORE -------------------------------------------------------
 const before = {};
 for (const g of guilty) before[g] = await lockOf(g);
-console.log("ROLE_DVT locks BEFORE:", Object.fromEntries(guilty.map(g => [g, before[g].toString()])));
+console.log(
+  "ROLE_DVT locks BEFORE:",
+  Object.fromEntries(guilty.map(g => [g, before[g].toString()]))
+);
 
 // ---- 6. broadcast executeGuardianSlash -------------------------------------
 console.log("\nbroadcasting executeGuardianSlash...");
 const tx = await agg.executeGuardianSlash(fraudProofId, guilty, fraudProof);
 const rcpt = await tx.wait();
-console.log(`✓ executeGuardianSlash mined: ${rcpt.hash} (status ${rcpt.status}, gas ${rcpt.gasUsed})`);
+console.log(
+  `✓ executeGuardianSlash mined: ${rcpt.hash} (status ${rcpt.status}, gas ${rcpt.gasUsed})`
+);
 
 // ---- 7. locks AFTER (expect 0) ---------------------------------------------
 const after = {};
 for (const g of guilty) after[g] = await lockOf(g);
-console.log("ROLE_DVT locks AFTER: ", Object.fromEntries(guilty.map(g => [g, after[g].toString()])));
+console.log(
+  "ROLE_DVT locks AFTER: ",
+  Object.fromEntries(guilty.map(g => [g, after[g].toString()]))
+);
 const allZero = guilty.every(g => after[g] === 0n);
 
 // ---- 8. auto-eject: a fresh verify(mask) must now REVERT --------------------
 let autoEject = false;
 try {
-  await agg.verify(ethers.keccak256(ethers.toUtf8Bytes("auto-eject-probe")), MASK, 3n, "0x" + "00".repeat(256));
+  await agg.verify(
+    ethers.keccak256(ethers.toUtf8Bytes("auto-eject-probe")),
+    MASK,
+    3n,
+    "0x" + "00".repeat(256)
+  );
   autoEject = false; // did NOT revert
 } catch {
   autoEject = true; // reverted (SlotValidatorStakeBelowMinimum) → slashed slots ejected

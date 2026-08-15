@@ -63,7 +63,8 @@ function loadKey(slot) {
 const selftest = process.argv.includes("--selftest");
 const chainId = BigInt(process.env.CHAIN_ID || "11155111");
 const aggregator = process.env.AGGREGATOR || die("AGGREGATOR required");
-const rpc = process.env.SEPOLIA_RPC_URL || process.env.ETH_RPC_URL || die("SEPOLIA_RPC_URL required");
+const rpc =
+  process.env.SEPOLIA_RPC_URL || process.env.ETH_RPC_URL || die("SEPOLIA_RPC_URL required");
 
 // ---- 1. messageHash ---------------------------------------------------------
 let messageHash;
