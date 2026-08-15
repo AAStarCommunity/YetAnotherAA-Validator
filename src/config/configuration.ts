@@ -208,6 +208,23 @@ export default () => {
     auditCooldownMs: parseInt(process.env.AUDIT_COOLDOWN_MS || "3600000", 10),
     auditWatchlist: parseAllowlist(process.env.AUDIT_WATCHLIST || ""),
     auditProofDir: process.env.AUDIT_PROOF_DIR || "./audit-proofs",
+    // CC-89 stage-2 guardian-slash WATCHER (opt-in, default off). Captures each SlashExecuted's
+    // signer ADDRESS set (validatorAtSlot @ execution block) so a later over-issue fraud proof can
+    // reproduce SP's irreversible A' commitment. Pure observer — never signs/files/slashes. Runs in
+    // every node; the fleet's redundancy is what guarantees a slash's set is never wholly missed.
+    // AUDIT_GUARDIAN_WATCH_FROM_BLOCK: the BLSAggregator (A' commitment) deploy block — scan lower
+    //   bound (0 = genesis, slow). AUDIT_GUARDIAN_WATCH_DIR: per-node record store (contains no keys).
+    //   Reuses AUDIT_BLS_AGGREGATOR_ADDRESS, AUDIT_FINALITY_CONFIRMATIONS, AUDIT_ROLE_LOG_CHUNK.
+    auditGuardianWatchEnabled: process.env.AUDIT_GUARDIAN_WATCH_ENABLED === "true",
+    auditGuardianWatchDir: process.env.AUDIT_GUARDIAN_WATCH_DIR || "./guardian-signer-records",
+    auditGuardianWatchIntervalMs: parseInt(
+      process.env.AUDIT_GUARDIAN_WATCH_INTERVAL_MS || "60000",
+      10
+    ),
+    auditGuardianWatchFromBlock: (() => {
+      const parsed = parseInt(process.env.AUDIT_GUARDIAN_WATCH_FROM_BLOCK || "0", 10);
+      return Math.max(0, Number.isFinite(parsed) ? parsed : 0);
+    })(),
     auditChainId: parseInt(process.env.AUDIT_CHAIN_ID || "11155111", 10),
     auditRegistryAddress: process.env.AUDIT_REGISTRY_ADDRESS || undefined,
     auditSuperPaymasterAddress: process.env.AUDIT_SUPER_PAYMASTER_ADDRESS || undefined,

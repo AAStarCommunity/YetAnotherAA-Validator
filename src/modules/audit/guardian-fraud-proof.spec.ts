@@ -4,9 +4,12 @@ import {
   deriveFraudProofId,
   overIssueEvidenceHash,
   overIssueSlashMessageHash,
+  rawSlashMessageHash,
   computeSignersCommitment,
   encodeOverIssueFraudProof,
+  decodeVerifyAndExecuteCalldata,
   orderSignersFromSlotMap,
+  VERIFY_AND_EXECUTE_ABI,
   FRAUD_ID_TAG,
   OVERISSUE_EVIDENCE_TAG,
   OverIssueFraudProofInputs,
@@ -73,6 +76,50 @@ describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
     expect(disputedToken).toBe(TOKEN);
     expect(BigInt(signerMask)).toBe(0x7n);
     expect([...claimedSigners]).toEqual([S1, S2, S3]);
+  });
+
+  it("overIssueSlashMessageHash == rawSlashMessageHash with the fixed-preimage evidenceHash", () => {
+    const raw = rawSlashMessageHash(
+      1n,
+      42n,
+      OPERATOR,
+      2,
+      1000n,
+      overIssueEvidenceHash(TOKEN, OPERATOR, 1000n)
+    );
+    expect(overIssueSlashMessageHash(1n, 42n, OPERATOR, 2, 1000n, TOKEN)).toBe(raw);
+  });
+
+  describe("decodeVerifyAndExecuteCalldata (watcher calldata decode)", () => {
+    const iface = new ethers.Interface([VERIFY_AND_EXECUTE_ABI]);
+    const blsProof = coder.encode(["uint256", "bytes"], [0x7n, "0xdead"]);
+
+    it("decodes a slash-only verifyAndExecute call into its signed fields + signerMask", () => {
+      const evidenceHash = ethers.keccak256("0x1234");
+      const data = iface.encodeFunctionData("verifyAndExecute", [
+        42n,
+        OPERATOR,
+        2,
+        [], // repUsers
+        [], // newScores
+        1000n,
+        evidenceHash,
+        blsProof,
+      ]);
+      const args = decodeVerifyAndExecuteCalldata(data);
+      expect(args.proposalId).toBe(42n);
+      expect(args.operator).toBe(OPERATOR);
+      expect(args.slashLevel).toBe(2);
+      expect(args.repUsers).toEqual([]);
+      expect(args.newScores).toEqual([]);
+      expect(args.epoch).toBe(1000n);
+      expect(args.evidenceHash).toBe(evidenceHash);
+      expect(args.signerMask).toBe(0x7n); // from proof[:32]
+    });
+
+    it("throws on a non-verifyAndExecute selector (guards against wrong/wrapped calls)", () => {
+      expect(() => decodeVerifyAndExecuteCalldata("0xdeadbeef")).toThrow();
+    });
   });
 
   describe("orderSignersFromSlotMap (byte-critical derivation)", () => {
