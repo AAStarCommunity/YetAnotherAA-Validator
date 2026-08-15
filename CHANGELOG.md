@@ -4,6 +4,56 @@ All notable changes to YetAnotherAA-Validator (the DVT BLS signer node) are
 documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [1.13.0] — 2026-08-15 — CC-89 stage-2: over-issue guardian-collusion slash (testnet-E2E proven)
+
+Production release. Adds the DVT half of the CC-89 guardian-collusion slashing
+mechanism — the fraud-proof path that punishes ≥m colluding guardians who pass a
+fraudulent over-issue slash — and proves the whole chain end-to-end on Sepolia
+with SuperPaymaster.
+
+### Added
+
+- **`OverIssueFraudProofVerifier`** (`contracts/`, #223) + `IFraudProofVerifier`
+  — the on-chain `verify()` (fail-closed view) that
+  `BLSAggregator.executeGuardianSlash` calls: 5 checks (fraudProofId
+  content-binding, canonical claimedSigners, A'-commitment reconstruction
+  binding the disputed token, `guiltyGuardians ⊆ claimedSigners`,
+  `isOverIssued(token)==false`). 16 Foundry tests + TS↔Solidity golden vector.
+- **Guardian-slash watcher** (`src/modules/audit/guardian-slash-watcher.*`,
+  #224) — in-process, opt-in (`AUDIT_GUARDIAN_WATCH_ENABLED`, default off),
+  fail-closed: captures each `SlashExecuted`'s signer address set at the
+  execution block into a 3-area durable store (verified / quarantine /
+  dead-letter), the irreversible-A' data-availability layer. Restart-safe
+  cursor.
+- **Fraud-proof assembler** (`guardian-fraud-proof-assembler.ts`, #225) — builds
+  the `(fraudProofId, guiltyGuardians, fraudProof)` the verifier accepts;
+  refuses doomed/harmful inputs.
+- **Stage-0 design + E2E runbook + shipping plan + E2E record** (docs/design/,
+  #221/#226 + this release) — threat model, A' spec, cross-repo evidence
+  convention, and the authoritative Sepolia E2E record for the RepCredit paper.
+- **Joint-testnet tooling** — `DeployOverIssueVerifier.s.sol` (#227),
+  `cc89-cosign.mjs` + `cc89-e2e-finish.mjs` + `MockOverIssuableToken.sol`
+  (#229), `/goal` shipping-pipeline command.
+
+### Verified
+
+- **Testnet E2E PASSED on Sepolia** (CC-89): SP `verifyAndExecute` → A'
+  commitment → DVT fraud proof → `executeGuardianSlash` (tx `0xb870688e…91ba`) →
+  3 guardians' ROLE_DVT stake 30e18 → 0 → auto-eject. The paper's `ρ` detection
+  half is now "implemented + testnet-verified" for the on-chain-objective
+  (over-issue) class.
+
+### Fixed (security)
+
+- **`.gitignore`** (#228) — drop the stale `!node_dev_001.json` un-ignore that
+  force-included a BLS private-key filename; all `node_dev_*.json` now ignored.
+
+### Deferred (Phase-3 / gated)
+
+- Trustless historical-state over-issue proof (BLOCKHASH + storage proof,
+  bounded challenge window); watcher wrapped-call trace resolution; liveness
+  class (gated on CC-29); production arming of an on-chain-objective slash rule.
+
 ## [1.3.0] — 2026-06-16 — node hardening + dependency pinning
 
 ### Added
