@@ -5,9 +5,11 @@ data/*
 .agent/
 .env
 
-# Node development config files
+# Node development config files — ALL contain BLS private keys, NEVER commit.
+# (No exception for node_dev_001.json: the old `!node_dev_001.json` un-ignore was a stale
+#  footgun — the file is no longer tracked, so the negation only risked re-committing a fresh
+#  private key. See CLAUDE.md: "all node_*.json files contain private keys and are git-ignored".)
 node_dev_*.json
-!node_dev_001.json
 
 # Node state files (contain the node's BLS private key — NEVER commit).
 # The root node_state.json is git-ignored: each deployment MUST generate its own
