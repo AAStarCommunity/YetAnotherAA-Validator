@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "forge-std/Test.sol";
 import "forge-std/console2.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import "../src/AAStarValidator.sol";
 
 /// @title AAStarValidator.validate() gas profile — reproducible ABSOLUTE cost attribution
@@ -150,6 +151,19 @@ contract AAStarValidatorGasProfileTest is Test {
         // polices. The published ceiling and its harness caveats (2-node vs 3-node, forge --isolate)
         // live in the paper §5.1 / evidence/04_gas.md; this test only supplies the absolute buckets.
 
+        // Correctness is asserted in every context. The golden aggregate must verify regardless of
+        // how gas is metered.
+        assertLt(CRYPTO_FLOOR, total, "crypto floor must be below total");
+        assertGt(h2cMeasured, HASH_TO_CURVE_FLOOR, "hashToG2 must exceed its own crypto floor (has glue)");
+        assertGt(implOverhead, CRYPTO_FLOOR, "on this design non-crypto EVM cost exceeds the crypto floor");
+
+        // Gas-MAGNITUDE regression baselines only hold under the production build. `forge coverage`
+        // compiles with the optimizer disabled + source instrumentation, which inflates every number
+        // (e.g. total ~490k → ~567k), so pinning an absolute baseline there is meaningless and would
+        // red the coverage run. Gate the magnitude asserts to the real `forge test` build; the console
+        // profile above (the paper's appendix-C artifact) still prints in all contexts.
+        if (vm.isContext(VmSafe.ForgeContext.Coverage)) return;
+
         // Regression baseline (cold single-call profile @ HEAD): total ~490k. NB the paper's canonical
         // staked figure is 458,380 — that comes from the `-vvvv` router trace where validate() ran with
         // registration slots already warm in the same call frame; this test's cold single call reads
@@ -157,13 +171,8 @@ contract AAStarValidatorGasProfileTest is Test {
         // standalone on-chain cost and do NOT build a bucket-size argument on the cold−warm gap.
         // Wide tolerance so a compiler/opt bump nudging the glue does not red the whole run.
         assertApproxEqAbs(total, 490_000, 15_000, "validate() total gas drifted from baseline");
-        assertLt(CRYPTO_FLOOR, total, "crypto floor must be below total");
         // Measured cross-check: hashToG2 sits just above its schedule floor (glue is small, ~15k),
         // and well under a full pairing — the crypto floor constants are not fabricated.
-        assertGt(h2cMeasured, HASH_TO_CURVE_FLOOR, "hashToG2 must exceed its own crypto floor (has glue)");
         assertLt(h2cMeasured, HASH_TO_CURVE_FLOOR + 30_000, "hashToG2 glue should be modest, not dominant");
-        // Measured fact (NOT a claimed floor): on THIS design the non-crypto EVM cost is the majority.
-        // The second data point shows this is implementation-dependent, not structural.
-        assertGt(implOverhead, CRYPTO_FLOOR, "on this design non-crypto EVM cost exceeds the crypto floor");
     }
 }
