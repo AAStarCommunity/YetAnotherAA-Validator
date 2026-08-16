@@ -60,11 +60,11 @@ TA 版本。每个 `gh` 查询带重试退避,**退出码**:`0` 对齐 · `1`
 真 drift(发版前必须适配)· `2` transient(重试后仍失败,网络/代理/限流,**非**
 drift,重跑即可)。可做发版/CI 闸门。
 
-| 仓库                                    | 关系                   | 钉定基线                 | 集成点                                                                                                                                                  |
-| --------------------------------------- | ---------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **AAStarCommunity/SuperPaymaster**      | UPSTREAM               | `v5.4.0-beta.1-redeploy` | PolicyRegistry `0x8c2488d46d5447418558c38AA6441720df656094`（2026-06-16 fresh redeploy；layer-1 `checkPolicy`）+ ROLE_DVT 注册 + BLSAggregator          |
-| **AAStarCommunity/airaccount-contract** | 协作（链上验签消费方） | `v0.20.0`                | `AAStarBLSAlgorithm` `0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174`：`validate(userOpHash, [nodeIds][blsSig])`，DST `_POP_`，messagePoint 链上重算（#45） |
-| **AAStarCommunity/AirAccount (KMS)**    | UPSTREAM               | `v0.23.0`                | `ownerAuth` = 账户 `owner()` 的 EIP-191 secp256k1 签名（KMS 产）；C1 绑定 `challenge=SHA256(nonce‖userOpHash)`                                          |
+| 仓库                                    | 关系                   | 钉定基线                 | 集成点                                                                                                                                                                                                                                                                                                 |
+| --------------------------------------- | ---------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **AAStarCommunity/SuperPaymaster**      | UPSTREAM               | `v5.4.0-beta.1-redeploy` | PolicyRegistry `0x8c2488d46d5447418558c38AA6441720df656094`（2026-06-16 fresh redeploy；layer-1 `checkPolicy`）+ ROLE_DVT 注册 + BLSAggregator                                                                                                                                                         |
+| **AAStarCommunity/airaccount-contract** | 协作（链上验签消费方） | `v0.29.0`                | v0.29.0 账户经 ValidatorRouter `getAlgorithm(0x01)` 挂载**本仓库** `AAStarValidator` `0x539B9681aFd5BFbCaa655Fe4c6BdcFe1fa7864bC` 的 `validate(userOpHash, [nodeIds][blsSig])`（DST `_POP_`，messagePoint 链上重算 #45）；旧 airaccount v0.20.0 `AAStarBLSAlgorithm 0xAF525A…` 自 v0.27.0 起**已废弃** |
+| **AAStarCommunity/AirAccount (KMS)**    | UPSTREAM               | `v0.23.0`                | `ownerAuth` = 账户 `owner()` 的 EIP-191 secp256k1 签名（KMS 产）；C1 绑定 `challenge=SHA256(nonce‖userOpHash)`                                                                                                                                                                                         |
 
 **下游 /
 Downstream**：[`AAStarCommunity/aastar-sdk` #63](https://github.com/AAStarCommunity/aastar-sdk/issues/63)（运行时组装方）。

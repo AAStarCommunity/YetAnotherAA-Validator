@@ -68,8 +68,10 @@ where applicable).
 
 **(a) AAStar testnet (owner-registered, fastest):** open an issue / ping the
 validator owner with each node's `nodeId` + `publicKey` (from step 1) to get
-registered on `0xAF525A…`. Verify `isRegistered(nodeId) == true` and
-`getRegisteredNodeCount()` includes your nodes.
+registered on `0x539B…` (this repo's Plan A v3 AAStarValidator; the old
+airaccount v0.20.0 `AAStarBLSAlgorithm 0xAF525A…` is retired). Verify
+`isRegistered(nodeId) == true` and `getRegisteredNodeCount()` includes your
+nodes.
 
 **(b) Permissionless via staking (run your OWN community DVT, no owner
 approval):**
