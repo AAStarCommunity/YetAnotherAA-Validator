@@ -20,40 +20,34 @@ import "../src/AAStarValidator.sol";
 ///         each term is independently grounded (this is exactly the decomposition DSR uses in-paper).
 ///
 ///         Buckets:
-///           • crypto floor  — deterministic EIP-2537 schedule (also cross-checked below by a direct
-///                             hashToG2() measurement): hash-to-curve (RFC-9380) + pairing(k=2) +
-///                             G1 aggregation. FIXED by the protocol, not by this implementation.
-///           • RFC-9380 glue — hashToG2() measured − hash-to-curve crypto floor. The Solidity
-///                             expand_message_xmd loop + Fp field-reduction marshalling. MEASURED.
+///           • crypto floor  — deterministic EIP-2537 schedule: hash-to-curve (RFC-9380) +
+///                             pairing(k=2) + G1 aggregation. FIXED by the protocol, not by this
+///                             implementation. NB the schedule is pinned to evm_version = "osaka"
+///                             (foundry.toml). One term is NOT EIP-2537 and IS fork-sensitive: the
+///                             Fp modular reduction runs on MODEXP (precompile 0x05), repriced by
+///                             EIP-2565 → EIP-7883; under a different fork the RFC-9380 glue below
+///                             shifts by ~1.2k. See MODEXP_REDUCE.
+///           • RFC-9380 glue — hashToG2() measured − hash-to-curve schedule floor. The Solidity
+///                             expand_message_xmd loop + Fp field-reduction marshalling. This is a
+///                             DEFINITION (measured minus schedule), not an independent check of the
+///                             floor — it just names the non-precompile remainder of hash-to-curve.
 ///           • remainder     — total − hashToG2() − pairing − G1 agg. Calldata parse, EIP-2537 G1/G2
 ///                             point decode + subgroup checks, pairing-path memory marshalling, and
-///                             per-node registration/state SLOADs. Still a bundle; isolating the
-///                             stake/registration SLOAD sub-bucket cleanly needs a same-harness
-///                             requireStake on/off two-arm run — the paper's §6.5 remaining work,
-///                             NOT claimed here.
+///                             per-node registration/state SLOADs. Still a bundle; the requireStake
+///                             gate sub-cost is isolated cleanly by the same-method two-arm test in
+///                             this file (test_requireStake_gate_gas_two_arm) — measured at 5,030 gas
+///                             per verify, NOT claimed from this bundle.
 ///
-///         Second data point (CC-95, airaccount-contract profiled its own AAStarBLSKeyRegistry):
-///         two independently assembly-optimised validators doing the SAME BLS aggregate verification
-///         do NOT share a ~300k floor. Safe-curated / no-stake ≈ 220k vs stake-bound decentralised
-///         ≈ 458k (≈2×). Crypto floors agree within 8% (same cryptography); the whole spread is in
-///         the non-precompile EVM layer (impl overhead ≈52k vs ≈304k, ≈6×) ⇒ implementation-dependent
-///         variance, NOT a structural floor.
-///
-///         What the ≈238k curated-vs-staked gap is (and is NOT) — the paper sides with neither
-///         "floor" nor "waste" (§5.1/§6.2, refined after this test caught a mislabel):
-///           • It is NOT mostly the price of decentralisation. Per-node stake-state verification is
-///             a small, separately-measured ≈24k (< 5% of one validate()), and it is not even in
-///             this requireStake=false table. The nodeId→pubkey registration lookup that IS in this
-///             table is NOT decentralisation-specific — a curated registry reads its key table too.
-///           • The gap is dominated by non-precompile EVM marshalling. Its recoverability is UNPROVEN:
-///             airaccount's curated 52k impl-overhead suggests headroom, but its scope (does it do
-///             the same point decode + subgroup checks? pubkeys from storage or calldata?) is not
-///             externally verifiable, so this test does NOT claim the 66% is a floor OR waste. The
-///             only way to settle it is running BOTH validators under ONE harness with ONE bucket
-///             definition — the paper's remaining work, not gating submission.
-///           • "≈238k" survives only as an UPPER BOUND on binding verification to a staked committee
-///             vs a curated key list (it absorbs all efficiency difference) — a ceiling, not an
-///             attribution. See evidence/04_gas.md.
+///         Second data point / two-implementation comparison lives in the paper (§5.1) and CC-95,
+///         NOT hardcoded here. It is deliberately not reproduced as constants in this test for two
+///         reasons: (1) airaccount's curated AAStarBLSKeyRegistry numbers cannot be regenerated in
+///         THIS repo, so pinning them here would be an un-runnable citation; (2) an earlier version
+///         of this file did hardcode them and mixed bucket definitions — comparing our schedule-floor
+///         impl-overhead (glue INCLUDED) against a curated measured-floor overhead (glue EXCLUDED)
+///         and reading the ~13k difference as "crypto floors agree within 8%". That was a bucket
+///         mismatch, not a physical agreement. The cross-implementation claim belongs in the paper,
+///         where both sides can be put on ONE bucket definition; this test only supplies THIS
+///         validator's own absolute buckets. See evidence/04_gas.md.
 contract AAStarValidatorGasProfileTest is Test {
     AAStarValidator validator;
 
@@ -67,19 +61,19 @@ contract AAStarValidatorGasProfileTest is Test {
     bytes AGG_SIG =
         hex"000000000000000000000000000000000b9f176f5113c4ccad075895d342d551ab705281d3a134902b8f6f0eb172a02b476efe18a58791bb5308a721bd87a417000000000000000000000000000000000f28139976fdab5e48503ad8d94c08ed65ef56219e423aa5942ae4b1926545ecabd48cde24179509a99ccac4b958499e000000000000000000000000000000000b7f5bcdb9f61925e00695c3a8c04dfe93258e7db5b923f6dd9b18a620e86ad45df02f23039a3ece1a09ea58e0e1677b0000000000000000000000000000000009ccf8330835ca4660012e0f587a6e0727241c3ac771858cc6d3b01d8659e3bf8a4582015610cacb9bee5f10945887af";
 
-    // --- Deterministic EIP-2537 schedule (the crypto precompile floor; confirmed by -vvvv trace) ---
+    // --- EIP-2537 schedule (the crypto precompile floor). All terms below EXCEPT MODEXP_REDUCE are
+    //     protocol-fixed EIP-2537 prices (98.1% of CRYPTO_FLOOR); those are legitimately hardcoded.
     uint256 constant SHA256_EXPAND = 888; // expand_message_xmd: 9 SHA-256 rounds over the golden msg
-    uint256 constant MODEXP_REDUCE = 4 * 500; // 4× Fp field reduction (2 Fp2 = 4 Fp)
+    // MODEXP (precompile 0x05) — NOT EIP-2537, and the one fork-sensitive term. 500/op is the
+    // EIP-7883 (osaka) price; EIP-2565 (pre-osaka) charged less, so this line — and the RFC-9380
+    // glue derived from it — is only exact under evm_version = "osaka" (pinned in foundry.toml).
+    uint256 constant MODEXP_REDUCE = 4 * 500; // 4× Fp field reduction (2 Fp2 = 4 Fp) @ osaka
     uint256 constant MAP_FP2_TO_G2 = 2 * 23_800; // hash_to_field → two G2 points
     uint256 constant G2ADD = 600; // sum the two mapped points
     uint256 constant HASH_TO_CURVE_FLOOR = SHA256_EXPAND + MODEXP_REDUCE + MAP_FP2_TO_G2 + G2ADD; // 51,088
     uint256 constant PAIRING_FLOOR = 102_900; // PAIRING_CHECK, k=2 (= 32,600·2 + 37,700)
     uint256 constant G1_AGG_FLOOR = 375; // 1× G1ADD to aggregate two pubkeys
     uint256 constant CRYPTO_FLOOR = HASH_TO_CURVE_FLOOR + PAIRING_FLOOR + G1_AGG_FLOOR; // 154,363
-
-    // --- Second data point (CC-95, airaccount-contract AAStarBLSKeyRegistry, forge golden 3-node) ---
-    uint256 constant CURATED_TOTAL = 219_963; // Safe-curated / no-stake validator.validate()
-    uint256 constant CURATED_CRYPTO_FLOOR = 167_530; // ≈ h2c 63,880 + pairing 102,900 + 2×G1ADD 750
 
     function setUp() public {
         validator = new AAStarValidator();
@@ -127,7 +121,7 @@ contract AAStarValidatorGasProfileTest is Test {
 
         console2.log("=== AAStarValidator.validate() ABSOLUTE gas attribution (golden 2-node) ===");
         console2.log("validate() total (cold storage)         :", total);
-        console2.log("--- crypto precompile floor (EIP-2537 schedule, fixed) ---");
+        console2.log("--- crypto precompile floor (EIP-2537 schedule @ evm_version=osaka) ---");
         console2.log("  hash-to-curve floor (RFC-9380)        :", HASH_TO_CURVE_FLOOR);
         console2.log("  pairing check (k=2)                   :", PAIRING_FLOOR);
         console2.log("  G1 pubkey aggregation                 :", G1_AGG_FLOOR);
@@ -139,17 +133,12 @@ contract AAStarValidatorGasProfileTest is Test {
         console2.log("  impl overhead (total - crypto floor)  :", implOverhead);
         console2.log("  remainder after hashToG2+pairing+G1   :", remainder);
         console2.log("    (= calldata parse + point decode + subgroup + pairing-path");
-        console2.log("       marshalling + per-node registration/state SLOADs; the");
-        console2.log("       stake-SLOAD sub-split is paper's 6.5 remaining work)");
-        console2.log("--- second data point (airaccount AAStarBLSKeyRegistry, curated/no-stake) ---");
-        console2.log("  curated validate() total              :", CURATED_TOTAL);
-        console2.log("  curated impl overhead (- crypto floor):", CURATED_TOTAL - CURATED_CRYPTO_FLOOR);
-        // Deliberately NOT printing a single staked-vs-curated subtraction here: this test's staked
-        // number is the COLD single-call (489,626) while the paper's canonical ceiling of ~238,417 is
-        // computed from the warm -vvvv trace figure (458,380) against curated 219,963. Mixing the two
-        // harnesses would manufacture a false-precision gap — exactly the cross-method error CC-95
-        // polices. The published ceiling and its harness caveats (2-node vs 3-node, forge --isolate)
-        // live in the paper §5.1 / evidence/04_gas.md; this test only supplies the absolute buckets.
+        console2.log("       marshalling + per-node registration/state SLOADs; the requireStake");
+        console2.log("       gate sub-cost is isolated to 5,030 by the two-arm test in this file)");
+        // The curated (airaccount) second data point and the two-implementation comparison are NOT
+        // printed here: they cannot be regenerated in this repo, and putting our schedule-floor buckets
+        // beside their measured-floor buckets is apples-to-oranges. That comparison lives in the paper
+        // §5.1 / CC-95, on one unified bucket definition. This test reports only THIS validator.
 
         // Correctness is asserted in every context. The golden aggregate must verify regardless of
         // how gas is metered.
@@ -171,8 +160,9 @@ contract AAStarValidatorGasProfileTest is Test {
         // standalone on-chain cost and do NOT build a bucket-size argument on the cold−warm gap.
         // Wide tolerance so a compiler/opt bump nudging the glue does not red the whole run.
         assertApproxEqAbs(total, 490_000, 15_000, "validate() total gas drifted from baseline");
-        // Measured cross-check: hashToG2 sits just above its schedule floor (glue is small, ~15k),
-        // and well under a full pairing — the crypto floor constants are not fabricated.
+        // NOT a cross-check of the floor (rfc9380Glue = h2cMeasured − FLOOR is a definition, so it
+        // cannot validate FLOOR). This is only a loose sanity bound that the hash-to-curve glue is a
+        // modest addition, not a dominant cost — it does not pin the schedule constants.
         assertLt(h2cMeasured, HASH_TO_CURVE_FLOOR + 30_000, "hashToG2 glue should be modest, not dominant");
     }
 }
