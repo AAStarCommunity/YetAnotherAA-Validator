@@ -61,8 +61,10 @@ contract AAStarValidatorGasProfileTest is Test {
     bytes AGG_SIG =
         hex"000000000000000000000000000000000b9f176f5113c4ccad075895d342d551ab705281d3a134902b8f6f0eb172a02b476efe18a58791bb5308a721bd87a417000000000000000000000000000000000f28139976fdab5e48503ad8d94c08ed65ef56219e423aa5942ae4b1926545ecabd48cde24179509a99ccac4b958499e000000000000000000000000000000000b7f5bcdb9f61925e00695c3a8c04dfe93258e7db5b923f6dd9b18a620e86ad45df02f23039a3ece1a09ea58e0e1677b0000000000000000000000000000000009ccf8330835ca4660012e0f587a6e0727241c3ac771858cc6d3b01d8659e3bf8a4582015610cacb9bee5f10945887af";
 
-    // --- EIP-2537 schedule (the crypto precompile floor). All terms below EXCEPT MODEXP_REDUCE are
-    //     protocol-fixed EIP-2537 prices (98.1% of CRYPTO_FLOOR); those are legitimately hardcoded.
+    // --- Crypto precompile floor. The EIP-2537 terms — MAP_FP2_TO_G2 + G2ADD + PAIRING + G1ADD —
+    //     are protocol-fixed and legitimately hardcoded. Two terms are NOT EIP-2537: SHA256_EXPAND
+    //     (SHA-256, precompile 0x02) and MODEXP_REDUCE (0x05). Of those, MODEXP is the one
+    //     FORK-SENSITIVE term (repriced EIP-2565 → EIP-7883); everything else is fork-invariant.
     uint256 constant SHA256_EXPAND = 888; // expand_message_xmd: 9 SHA-256 rounds over the golden msg
     // MODEXP (precompile 0x05) — NOT EIP-2537, and the one fork-sensitive term. 500/op is the
     // EIP-7883 (osaka) price; EIP-2565 (pre-osaka) charged less, so this line — and the RFC-9380
@@ -133,8 +135,11 @@ contract AAStarValidatorGasProfileTest is Test {
         console2.log("  impl overhead (total - crypto floor)  :", implOverhead);
         console2.log("  remainder after hashToG2+pairing+G1   :", remainder);
         console2.log("    (= calldata parse + point decode + subgroup + pairing-path");
-        console2.log("       marshalling + per-node registration/state SLOADs; the requireStake");
-        console2.log("       gate sub-cost is isolated to 5,030 by the two-arm test in this file)");
+        console2.log("       marshalling + per-node registration/state SLOADs).");
+        console2.log("    NB the requireStake gate is NOT in this remainder -- this profile runs the");
+        console2.log("       requireStake=false path (the gate's per-node isBootstrap SLOAD short-");
+        console2.log("       circuits and never executes here). Its per-verify cost (5,030) is a");
+        console2.log("       SEPARATE add-on, measured by the two-arm test, not a slice of 320k.");
         // The curated (airaccount) second data point and the two-implementation comparison are NOT
         // printed here: they cannot be regenerated in this repo, and putting our schedule-floor buckets
         // beside their measured-floor buckets is apples-to-oranges. That comparison lives in the paper
@@ -153,17 +158,20 @@ contract AAStarValidatorGasProfileTest is Test {
         // profile above (the paper's appendix-C artifact) still prints in all contexts.
         if (vm.isContext(VmSafe.ForgeContext.Coverage)) return;
 
-        // Regression baseline (cold single-call profile @ HEAD): total ~490k. NB the paper's canonical
-        // staked figure is 458,380 — that comes from the `-vvvv` router trace where validate() ran with
-        // registration slots already warm in the same call frame; this test's cold single call reads
-        // higher by the EIP-2929 first-touch surcharge. We report the cold number as the realistic
-        // standalone on-chain cost and do NOT build a bucket-size argument on the cold−warm gap.
-        // Wide tolerance so a compiler/opt bump nudging the glue does not red the whole run.
-        assertApproxEqAbs(total, 490_000, 15_000, "validate() total gas drifted from baseline");
-        // NOT a cross-check of the floor (rfc9380Glue = h2cMeasured − FLOOR is a definition, so it
-        // cannot validate FLOOR). This is only a loose sanity bound that the hash-to-curve glue is a
-        // modest addition, not a dominant cost — it does not pin the schedule constants.
-        assertLt(h2cMeasured, HASH_TO_CURVE_FLOOR + 30_000, "hashToG2 glue should be modest, not dominant");
+        // Regression baseline: total = 489,625 at HEAD, deterministic across solc 0.8.28/31/33.
+        // Tight tolerance: the only measurable drift source is the MODEXP fork term (~1,200), and the
+        // assertEq below locks the fork, so a real code regression can't hide inside a wide band.
+        // NB the paper §5.1 "staked" figure 458,380 is close to this file's requireStake=FALSE arm
+        // (gate-OFF 458,853 in the two-arm test), not the gate-ON arm (463,883) — i.e. that paper
+        // number is very likely a requireStake=false measurement. Different harness (trace vs this
+        // cold call), so not proof; flagged for the paper to reconcile, not asserted here.
+        assertApproxEqAbs(total, 489_625, 2_000, "validate() total gas drifted from baseline");
+        // Fork lock (replaces the old circular "cross-check"). The RFC-9380 glue is fork-sensitive via
+        // MODEXP (0x05): ~15,075 under evm_version=osaka vs ~13,875 under prague — a stable 1,200 gap.
+        // Pinning it to the osaka band (±300 absorbs the few-gas harness-layout jitter, far under the
+        // 1,200 fork gap) makes a wrong-fork run fail HERE instead of silently printing "@osaka" with
+        // every number ~1,200 low.
+        assertApproxEqAbs(rfc9380Glue, 15_075, 300, "RFC-9380 glue outside osaka band; wrong evm_version?");
     }
 }
 
@@ -189,8 +197,11 @@ contract GasProfileStakeRegistry is IDVTRegistry {
 ///         not. DSR flagged (and requested) that this be re-measured with ONE method.
 ///
 ///         This test does exactly that: two fresh AAStarValidator deployments, identical keys /
-///         nodeIds / signature / userOpHash, each measured as a cold first `validate()` in the same
-///         forge harness, differing ONLY in whether the requireStake gate is active:
+///         nodeIds / signature / userOpHash, each a first `validate()` in the same forge harness,
+///         differing ONLY in whether the requireStake gate is active. Registration happens in the
+///         test body (not setUp), so the measured slots are WARM — absolute totals here (458,824 /
+///         463,854) are ~26k below the `--isolate` cold totals (484,824 / 489,854); the 5,030 DELTA
+///         is identical in both modes (it is what we report), only the absolute base differs:
 ///           • Arm OFF — bootstrap nodes (owner registerPublicKey), requireStake = false.
 ///           • Arm ON  — staked nodes (permissionless registerWithProof + mock staked Registry),
 ///                       requireStake = true.
@@ -235,7 +246,7 @@ contract AAStarValidatorStakeGateGasTest is Test {
     function test_requireStake_gate_gas_two_arm() public {
         bytes memory sig = _sig();
 
-        // --- Arm OFF: bootstrap nodes, requireStake = false. Fresh deploy → cold first validate().
+        // --- Arm OFF: bootstrap nodes, requireStake = false. Fresh deploy; registration in-body ⇒
         AAStarValidator off = new AAStarValidator();
         off.registerPublicKey(keccak256(V1_PUB), V1_PUB);
         off.registerPublicKey(keccak256(V2_PUB), V2_PUB);
@@ -243,7 +254,7 @@ contract AAStarValidatorStakeGateGasTest is Test {
         off.validate(USER_OP_HASH, sig);
         uint256 offGas = g0 - gasleft();
 
-        // --- Arm ON: staked nodes, requireStake = true. Fresh deploy → cold first validate().
+        // --- Arm ON: staked nodes, requireStake = true. Fresh deploy; registration in-body ⇒ warm slots.
         AAStarValidator on = new AAStarValidator();
         GasProfileStakeRegistry reg = new GasProfileStakeRegistry();
         on.setRegistry(address(reg));
@@ -263,7 +274,7 @@ contract AAStarValidatorStakeGateGasTest is Test {
 
         uint256 gateCost = onGas > offGas ? onGas - offGas : 0;
 
-        console2.log("=== requireStake gate: SAME-METHOD two-arm (2 nodes, cold first validate) ===");
+        console2.log("=== requireStake gate: SAME-METHOD two-arm (2 nodes, warm slots; delta invariant) ===");
         console2.log("validate() gate OFF (bootstrap)          :", offGas);
         console2.log("validate() gate ON  (staked)             :", onGas);
         console2.log("per-verify stake-gate cost (same-method) :", gateCost);
