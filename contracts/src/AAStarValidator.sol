@@ -75,6 +75,26 @@ contract AAStarValidator is IAAStarAlgorithm {
     /// @dev DVT role id in the SuperPaymaster Registry.
     bytes32 public constant ROLE_DVT = keccak256("DVT");
 
+    // --- On-chain quorum enforcement (CC-97) -------------------------------------
+    /// @dev Accurate count of currently-active registered nodes. Unlike
+    ///      `registeredNodes.length` (which keeps stale ids after `_deactivate` for gas
+    ///      reasons), this is maintained O(1) on every add/remove and is the authoritative N.
+    uint256 public activeNodeCount;
+    /// @dev Subset of `activeNodeCount` that are bootstrap (owner-registered, no stake). When
+    ///      `requireStake` is on, bootstrap nodes are retired and NOT eligible signers, so the
+    ///      eligible committee size is `activeNodeCount - bootstrapNodeCount`.
+    uint256 public bootstrapNodeCount;
+    /// @dev When true, `validate()` requires the aggregate to carry ⌈2N/3⌉ distinct signers of
+    ///      the eligible committee (BFT quorum), and the committee to be ≥ `minCommittee`.
+    ///      Default false for migration safety (matches the `requireStake` cutover pattern): a
+    ///      fresh deploy enables it via `setQuorumRequired(true)` once the off-chain aggregator is
+    ///      known to always gather quorum. While false, verification is signature-only (legacy).
+    bool public quorumRequired;
+    /// @dev Hard minimum committee size (CC-97: N ≥ 3). Below this, `validate()` fails closed
+    ///      when `quorumRequired` — a committee too small to be Byzantine-fault-tolerant must not
+    ///      validate. Owner-settable but floored at 3.
+    uint256 public minCommittee;
+
     /// @dev Modifier to restrict access to owner only
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner can call this function");
@@ -103,6 +123,7 @@ contract AAStarValidator is IAAStarAlgorithm {
 
     constructor() {
         owner = msg.sender;
+        minCommittee = 3; // CC-97 hard floor; raisable via setMinCommittee, never below 3.
         emit OwnershipTransferred(address(0), msg.sender);
     }
 
@@ -156,6 +177,8 @@ contract AAStarValidator is IAAStarAlgorithm {
     event RegistrySet(address indexed registry);
     event RequireStakeSet(bool requireStake);
     event MinStakeSet(uint256 minStake);
+    event QuorumRequiredSet(bool quorumRequired);
+    event MinCommitteeSet(uint256 minCommittee);
 
     function validateAggregateSignature(
         bytes32[] calldata nodeIds,
@@ -245,6 +268,18 @@ contract AAStarValidator is IAAStarAlgorithm {
             if (!isRegistered[nid]) return 1;
             if (requireStake && isBootstrap[nid]) return 1;
             nodeIds[i] = nid;
+        }
+
+        // CC-97: on-chain BFT quorum. `nodeCount` distinct signers (strictly-increasing above)
+        // must be at least ⌈2N/3⌉ of the eligible committee, and the committee must be ≥
+        // minCommittee. Checked BEFORE the expensive pairing so a sub-quorum aggregate is rejected
+        // cheaply. Fail-closed (return 1). While `quorumRequired` is false this is a no-op (legacy
+        // signature-only behaviour), so existing single-/dual-signer flows keep working until the
+        // deployment flips the flag on.
+        if (quorumRequired) {
+            uint256 committee = _eligibleNodeCount();
+            if (committee < minCommittee) return 1;
+            if (nodeCount < _quorumOf(committee)) return 1;
         }
 
         bytes calldata blsSignature = signature[nodeIdsBytes:nodeIdsBytes + G2_POINT_LENGTH];
@@ -840,6 +875,8 @@ contract AAStarValidator is IAAStarAlgorithm {
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
         registeredNodes.push(nodeId);
+        activeNodeCount++; // CC-97 quorum N
+        bootstrapNodeCount++; // owner-registered, not stake-eligible when requireStake is on
 
         emit PublicKeyRegistered(nodeId, publicKey);
     }
@@ -881,6 +918,7 @@ contract AAStarValidator is IAAStarAlgorithm {
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
         registeredNodes.push(nodeId);
+        activeNodeCount++; // CC-97 quorum N (staked node — eligible under requireStake)
 
         emit NodeBound(nodeId, msg.sender);
         emit PublicKeyRegistered(nodeId, publicKey);
@@ -938,11 +976,15 @@ contract AAStarValidator is IAAStarAlgorithm {
     /// @dev Remove a node from the active set + clear its operator binding.
     function _deactivate(bytes32 nodeId) internal {
         address op = nodeOperator[nodeId];
+        bool wasBootstrap = isBootstrap[nodeId]; // capture before delete for the counter
         isRegistered[nodeId] = false;
         delete registeredKeys[nodeId];
         delete nodeOperator[nodeId];
         delete isBootstrap[nodeId];
         if (op != address(0) && operatorNode[op] == nodeId) delete operatorNode[op];
+        // CC-97 counters: this node was active (syncNode requires isRegistered), so decrement.
+        activeNodeCount--;
+        if (wasBootstrap) bootstrapNodeCount--;
         // registeredNodes[] is an unordered enumeration; leave the stale id (isRegistered
         // gates all reads). Compaction is a gas trade-off deferred to a later pass.
     }
@@ -961,6 +1003,53 @@ contract AAStarValidator is IAAStarAlgorithm {
     function setMinStake(uint256 _v) external onlyOwner {
         minStake = _v;
         emit MinStakeSet(_v);
+    }
+
+    // --- On-chain quorum governance + views (CC-97) -------------------------------
+    /// @dev Turn ⌈2N/3⌉ quorum enforcement in `validate()` on/off. Owner (a Gnosis Safe in
+    ///      production) coordinates the cutover with the off-chain aggregator.
+    function setQuorumRequired(bool _v) external onlyOwner {
+        quorumRequired = _v;
+        emit QuorumRequiredSet(_v);
+    }
+
+    /// @dev Raise the hard minimum committee size. Floored at 3 (CC-97): governance may demand a
+    ///      larger committee but can never drop below the BFT-meaningful minimum.
+    function setMinCommittee(uint256 _v) external onlyOwner {
+        require(_v >= 3, "minCommittee < 3");
+        minCommittee = _v;
+        emit MinCommitteeSet(_v);
+    }
+
+    /// @dev BFT quorum ⌈2n/3⌉ for a committee of n (3→2, 4→3, 5→4, 6→4, 7→5). Pure — exposed so
+    ///      the account/router side and the paper can compute the same threshold off-chain.
+    function quorumFor(uint256 n) external pure returns (uint256) {
+        return _quorumOf(n);
+    }
+
+    /// @dev Eligible committee size N: active nodes that can actually sign under the current mode.
+    ///      When staking is mandatory, retired bootstrap nodes are excluded.
+    function eligibleNodeCount() external view returns (uint256) {
+        return _eligibleNodeCount();
+    }
+
+    /// @dev The number of distinct signers `validate()` currently requires (0 when quorum is off).
+    function requiredQuorum() external view returns (uint256) {
+        if (!quorumRequired) return 0;
+        uint256 n = _eligibleNodeCount();
+        return n < minCommittee ? type(uint256).max : _quorumOf(n); // max = unsatisfiable (fails closed)
+    }
+
+    /// @dev ⌈2n/3⌉ without overflow for any realistic n (n ≤ MAX_NODE_COUNT bounds the caller side).
+    function _quorumOf(uint256 n) internal pure returns (uint256) {
+        return (2 * n + 2) / 3;
+    }
+
+    /// @dev Active nodes eligible to sign now. Defensive against underflow even though the
+    ///      invariant bootstrapNodeCount ≤ activeNodeCount always holds.
+    function _eligibleNodeCount() internal view returns (uint256) {
+        if (!requireStake) return activeNodeCount;
+        return activeNodeCount >= bootstrapNodeCount ? activeNodeCount - bootstrapNodeCount : 0;
     }
 
     /**
@@ -999,11 +1088,15 @@ contract AAStarValidator is IAAStarAlgorithm {
         // revoked node and strand the operator's 1:1 slot forever (syncNode can't fix it
         // once isRegistered is false).
         address op = nodeOperator[nodeId];
+        bool wasBootstrap = isBootstrap[nodeId]; // capture before delete for the counter
         if (op != address(0) && operatorNode[op] == nodeId) delete operatorNode[op];
         delete nodeOperator[nodeId];
         delete isBootstrap[nodeId];
         delete registeredKeys[nodeId];
         isRegistered[nodeId] = false;
+        // CC-97 counters: node was active (require isRegistered above), so decrement.
+        activeNodeCount--;
+        if (wasBootstrap) bootstrapNodeCount--;
 
         // Remove node ID from array
         for (uint256 i = 0; i < registeredNodes.length; i++) {
@@ -1043,6 +1136,8 @@ contract AAStarValidator is IAAStarAlgorithm {
             registeredKeys[nodeIds[i]] = publicKeys[i];
             isRegistered[nodeIds[i]] = true;
             registeredNodes.push(nodeIds[i]);
+            activeNodeCount++; // CC-97 quorum N
+            bootstrapNodeCount++;
 
             emit PublicKeyRegistered(nodeIds[i], publicKeys[i]);
         }
