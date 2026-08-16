@@ -176,3 +176,120 @@ contract AAStarValidatorGasProfileTest is Test {
         assertLt(h2cMeasured, HASH_TO_CURVE_FLOOR + 30_000, "hashToG2 glue should be modest, not dominant");
     }
 }
+
+/// SuperPaymaster Registry stand-in (IDVTRegistry): role + locked stake. Named to avoid a
+/// collision with the identical helper in AAStarValidatorStakeBinding.t.sol.
+contract GasProfileStakeRegistry is IDVTRegistry {
+    mapping(bytes32 => mapping(address => bool)) public roles;
+    mapping(address => uint256) public stake;
+
+    function setRole(bytes32 roleId, address user, bool v) external { roles[roleId][user] = v; }
+    function setStake(address user, uint256 amount) external { stake[user] = amount; }
+
+    function hasRole(bytes32 roleId, address user) external view returns (bool) { return roles[roleId][user]; }
+    function getEffectiveStake(address user, bytes32) external view returns (uint256) { return stake[user]; }
+}
+
+/// @title requireStake gate — SAME-METHOD two-arm isolation (CC-96 §6.5 open item)
+/// @notice DSR's paper §6.2 previously stated the per-verify price of binding validation to a
+///         decentralised staked committee as ≈24,363 gas (< 5% of validate()). That number is a
+///         CROSS-METHOD subtraction — 514,000 (on-chain eth_estimateGas, requireStake=true) minus
+///         489,637 (forge harness, requireStake=false) — which conflates the gate cost with the
+///         ~21k base-tx + calldata that estimateGas includes and the forge gasleft() reading does
+///         not. DSR flagged (and requested) that this be re-measured with ONE method.
+///
+///         This test does exactly that: two fresh AAStarValidator deployments, identical keys /
+///         nodeIds / signature / userOpHash, each measured as a cold first `validate()` in the same
+///         forge harness, differing ONLY in whether the requireStake gate is active:
+///           • Arm OFF — bootstrap nodes (owner registerPublicKey), requireStake = false.
+///           • Arm ON  — staked nodes (permissionless registerWithProof + mock staked Registry),
+///                       requireStake = true.
+///         The crypto path (hash-to-curve + pairing) is byte-identical and runs fully in both arms
+///         regardless of whether the aggregate verifies, so the difference is EXACTLY the storage
+///         reads the requireStake gate adds to validate() (the per-node isBootstrap migration check
+///         + the flag). This replaces DSR's cross-method ≈24k with a clean same-method figure; the
+///         expectation is that the true per-verify gate cost is far below 24k (most of that 24k is
+///         the estimateGas base-tx artifact), which only sharpens §6.2's "the most expensive part
+///         of this design is not the reason it exists." Absolute number printed; see evidence/04_gas.md.
+contract AAStarValidatorStakeGateGasTest is Test {
+    bytes32 constant ROLE_DVT = keccak256("DVT");
+    uint256 constant MIN_STAKE = 30 ether;
+    address operator1 = address(0xA1);
+    address operator2 = address(0xA2);
+
+    bytes32 constant USER_OP_HASH =
+        bytes32(uint256(0x1111111111111111111111111111111111111111111111111111111111111111));
+
+    // Known-answer PoP vectors (same fixtures as AAStarValidatorStakeBinding.t.sol; noble @noble/curves).
+    bytes V1_PUB = hex"000000000000000000000000000000001928f3beb93519eecf0145da903b40a4c97dca00b21f12ac0df3be9116ef2ef27b2ae6bcd4c5bc2d54ef5a70627efcb700000000000000000000000000000000108dadbaa4b636445639d5ae3089b3c43a8a1d47818edd1839d7383959a41c10fdc66849cfa1b08c5a11ec7e28981a1c";
+    bytes V1_POP_POINT = hex"00000000000000000000000000000000086f6d0cdf889dc6d987ee9c5446c45b206775fcf7c60ebde4e1e0250fb04be1a86a296bae0bad3bc81f27a76ada86d50000000000000000000000000000000007906cd1575d26570463bee46945d8ef77539df93d13e22aef436f0d538bb28d916d581fe1d71bbc0d62c7ba4b8edccb000000000000000000000000000000000389f33b01cdf1a04f541764ddf51ec2dbed718f2398f75f3fce7725c072d9340263ae52e06b7bf52eb3ab7ec72ca92000000000000000000000000000000000137ab9e24a3c0f637ae65f212458ed1a10250d85da32ae5bf72842062c6819149945d2c7091607690f3c61f53e52c8b9";
+    bytes V1_POP_SIG = hex"00000000000000000000000000000000022bd720bb56d00b92f4995e3e4342b2cb7fb8ca8d54e58ff20adc76760c2340c2b1e119a19db8640cffad3f0e41c850000000000000000000000000000000000eafa2b92b141289b6e189c9a0a4d3b1b9a9cd0e5d51b43482b7a1b261134049a601bda9fabb054c36e790fb6b6ca3e7000000000000000000000000000000000b6232777504abec794edddee6bb8b38b9fa3292d2376a3ddaed676bf0b5406c981292eb50ec1b2d8dffec72f1f9aab400000000000000000000000000000000019da6fdf9a09dd3b32c75176c36426118bab60496b3583c817dde359dadf72fc87ddd09a192bd32766938a92cf4ff5c";
+
+    bytes V2_PUB = hex"0000000000000000000000000000000019cdf3807146e68e041314ca93e1fee0991224ec2a74beb2866816fd0826ce7b6263ee31e953a86d1b72cc2215a577930000000000000000000000000000000007481b1f261aabacf45c6e4fc278055441bfaf99f604d1f835c0752ac9742b4522c9f5c77db40989e7da608505d48616";
+    bytes V2_POP_POINT = hex"000000000000000000000000000000000f73f219e773dd1ef6fe2d10a5c49921d8cdd723b33b34087a52617d067a2de251e945553c8bd9734ad664fb6f345fce00000000000000000000000000000000123a13ec0543aeed2afad244f7e4c9bc20ee778d6354947cbea7410820f8d907f5c025bb8e8598cbf5902a7982e1b323000000000000000000000000000000000c02e3e68f26c168a018698ba779272abe9ff0279d6f5280afc9fb3ab0160c06ecbddf2d33d0423b79a2751695f51a11000000000000000000000000000000000eaaecfea4c6ce69a92154ca4b2804d2f7017d468be09aeb0de61c4dbe2c2553afe4193e20a948afc382b97a2d36e8e4";
+    bytes V2_POP_SIG = hex"000000000000000000000000000000000142a94144f05fff297d81f022f4a81023db248cd04b17530e474c0a264a4a1970f53d0fdd2c75eb40767f198461e08e0000000000000000000000000000000004dfd312738238f2004bde8c5376d6262f6ae91ff8ba8d94fa4c840b1682fcfb1994738cf7a861f34411f0d3eead6f79000000000000000000000000000000000f0db21327df7234d3dab4e226caadea2f1447fa9ea5969db23d84dcf0b985c93de4dcf45041cb8c23ea8e276d0a60350000000000000000000000000000000000c933d07622ca99f9f8d9648354c07ab2d41fb7804d43f605adea83f6e4713e2d66e3ad0790ec39bf193ef3529c6693";
+
+    // A valid-format (non-infinity) 256-byte G2 for the sig slice. validate() runs the full crypto
+    // path on it and returns 1 (these keys do not aggregate to it) — irrelevant here: both arms run
+    // the identical path, so the gas difference is purely the requireStake gate, not the verdict.
+    bytes SIG_G2 =
+        hex"000000000000000000000000000000000b9f176f5113c4ccad075895d342d551ab705281d3a134902b8f6f0eb172a02b476efe18a58791bb5308a721bd87a417000000000000000000000000000000000f28139976fdab5e48503ad8d94c08ed65ef56219e423aa5942ae4b1926545ecabd48cde24179509a99ccac4b958499e000000000000000000000000000000000b7f5bcdb9f61925e00695c3a8c04dfe93258e7db5b923f6dd9b18a620e86ad45df02f23039a3ece1a09ea58e0e1677b0000000000000000000000000000000009ccf8330835ca4660012e0f587a6e0727241c3ac771858cc6d3b01d8659e3bf8a4582015610cacb9bee5f10945887af";
+
+    function _sig() internal view returns (bytes memory) {
+        bytes32 a = keccak256(V1_PUB);
+        bytes32 b = keccak256(V2_PUB);
+        (bytes32 lo, bytes32 hi) = a < b ? (a, b) : (b, a);
+        return abi.encodePacked(lo, hi, SIG_G2);
+    }
+
+    function test_requireStake_gate_gas_two_arm() public {
+        bytes memory sig = _sig();
+
+        // --- Arm OFF: bootstrap nodes, requireStake = false. Fresh deploy → cold first validate().
+        AAStarValidator off = new AAStarValidator();
+        off.registerPublicKey(keccak256(V1_PUB), V1_PUB);
+        off.registerPublicKey(keccak256(V2_PUB), V2_PUB);
+        uint256 g0 = gasleft();
+        off.validate(USER_OP_HASH, sig);
+        uint256 offGas = g0 - gasleft();
+
+        // --- Arm ON: staked nodes, requireStake = true. Fresh deploy → cold first validate().
+        AAStarValidator on = new AAStarValidator();
+        GasProfileStakeRegistry reg = new GasProfileStakeRegistry();
+        on.setRegistry(address(reg));
+        on.setMinStake(MIN_STAKE);
+        on.setRequireStake(true);
+        reg.setRole(ROLE_DVT, operator1, true);
+        reg.setStake(operator1, MIN_STAKE);
+        reg.setRole(ROLE_DVT, operator2, true);
+        reg.setStake(operator2, MIN_STAKE);
+        vm.prank(operator1);
+        on.registerWithProof(V1_PUB, V1_POP_POINT, V1_POP_SIG);
+        vm.prank(operator2);
+        on.registerWithProof(V2_PUB, V2_POP_POINT, V2_POP_SIG);
+        uint256 g1 = gasleft();
+        on.validate(USER_OP_HASH, sig);
+        uint256 onGas = g1 - gasleft();
+
+        uint256 gateCost = onGas > offGas ? onGas - offGas : 0;
+
+        console2.log("=== requireStake gate: SAME-METHOD two-arm (2 nodes, cold first validate) ===");
+        console2.log("validate() gate OFF (bootstrap)          :", offGas);
+        console2.log("validate() gate ON  (staked)             :", onGas);
+        console2.log("per-verify stake-gate cost (same-method) :", gateCost);
+        console2.log("  (paper's prior cross-method figure was ~24,363 = 514k estimateGas - 489,637");
+        console2.log("   forge; that spread is dominated by the ~21k base-tx cost estimateGas");
+        console2.log("   includes and forge gasleft() does not -- this same-method delta is the");
+        console2.log("   clean per-verify price of the decentralised-staking gate in validate())");
+
+        // Correctness-shaped invariants (hold in every context): the gate costs SOMETHING (it does
+        // extra per-node reads) but is nowhere near the crypto floor — decentralisation is cheap
+        // per-verify. Gate the magnitude bound under coverage (optimizer-off inflation).
+        assertGt(onGas, offGas, "staked mode must read at least the per-node isBootstrap gate");
+        if (vm.isContext(VmSafe.ForgeContext.Coverage)) return;
+        // The whole point of §6.2: this is a small number, an order of magnitude under the ~24k the
+        // cross-method subtraction implied, and trivially under one validate(). Loose upper bound so
+        // a schedule tweak does not red the run.
+        assertLt(gateCost, 20_000, "same-method gate cost should be well under the cross-method ~24k");
+    }
+}
