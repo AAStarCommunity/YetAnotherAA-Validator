@@ -146,19 +146,19 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST https://<域名>/signature/sign
 
 按层跑全，**全绿才算上线**:
 
-| 层             | 怎么跑                                                   | 通过标准                                                                                 |
-| -------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| 单元/集成      | `npm run test:ci`                                        | 全部通过（含 owner-auth、policy、keeper、relay、gas）                                    |
-| 合约一致性     | `cd contracts && forge test`                             | 通过；`npm run check-deps` 对**主网** baseline 无漂移                                    |
-| 多节点链上 E2E | `scripts/e2e/realnode-e2e.mjs` 指向主网节点 URL + nodeId | N 节点共签 → 主网 `AAStarBLSAlgorithm.validate() === 0`；ECDSA(0x02) 被拒                |
-| owner-auth 门  | 空体/伪造 ownerAuth                                      | 一律 **403**（永不 400）                                                                 |
-| 策略门         | 构造越界 op（超 perTxMax / 非 allowlist 收款人）         | 被拒（独立第二因子生效）                                                                 |
-| Relay E2E      | 主网发一笔**小额**真实 gasless 购买（SDK `buyGasless`）  | 链上 tx success；`/relay/health` operator 正常                                           |
-| Keeper         | 等价格接近 stale，观察                                   | 主网 paymaster `cachedPrice.updatedAt` 被刷新；**无 nonce 积压**（PR #105 已修，重点盯） |
-| 限流           | 超频打 `/signature/sign`                                 | 触发 429                                                                                 |
-| 自愈           | `docker kill` 一个容器                                   | 自动重启、健康恢复                                                                       |
-| 监控           | 触发一次 keeper/relay 失败                               | 告警到位                                                                                 |
-| 软压测/soak    | 持续观察 24–72h                                          | 余额平稳、nonce 健康、价格常新、无堆积                                                   |
+| 层             | 怎么跑                                                   | 通过标准                                                                                                             |
+| -------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| 单元/集成      | `npm run test:ci`                                        | 全部通过（含 owner-auth、policy、keeper、relay、gas）                                                                |
+| 合约一致性     | `cd contracts && forge test`                             | 通过；`npm run check-deps` 对**主网** baseline 无漂移                                                                |
+| 多节点链上 E2E | `scripts/e2e/realnode-e2e.mjs` 指向主网节点 URL + nodeId | N 节点共签 → 主网 `AAStarValidator.validate() === 0`（本仓验证器；旧名 AAStarBLSAlgorithm 已废弃）；ECDSA(0x02) 被拒 |
+| owner-auth 门  | 空体/伪造 ownerAuth                                      | 一律 **403**（永不 400）                                                                                             |
+| 策略门         | 构造越界 op（超 perTxMax / 非 allowlist 收款人）         | 被拒（独立第二因子生效）                                                                                             |
+| Relay E2E      | 主网发一笔**小额**真实 gasless 购买（SDK `buyGasless`）  | 链上 tx success；`/relay/health` operator 正常                                                                       |
+| Keeper         | 等价格接近 stale，观察                                   | 主网 paymaster `cachedPrice.updatedAt` 被刷新；**无 nonce 积压**（PR #105 已修，重点盯）                             |
+| 限流           | 超频打 `/signature/sign`                                 | 触发 429                                                                                                             |
+| 自愈           | `docker kill` 一个容器                                   | 自动重启、健康恢复                                                                                                   |
+| 监控           | 触发一次 keeper/relay 失败                               | 告警到位                                                                                                             |
+| 软压测/soak    | 持续观察 24–72h                                          | 余额平稳、nonce 健康、价格常新、无堆积                                                                               |
 
 > 验证脚本可参考 `deploy/verify-prod-e2e.mjs`（已含 RPC 重试），改指主网。
 
