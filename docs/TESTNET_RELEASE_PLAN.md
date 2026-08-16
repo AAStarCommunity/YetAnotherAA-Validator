@@ -33,12 +33,12 @@
 
 ### 1.1 依赖清单（本节点绑定的上下游，来源 `scripts/check-deps.mjs`）
 
-| 角色     | 仓库                | 绑定物                                          | 当前 pin                      | 校验维度               |
-| -------- | ------------------- | ----------------------------------------------- | ----------------------------- | ---------------------- |
-| **上游** | SuperPaymaster      | `PolicyRegistry.checkPolicy`（layer-1 策略）    | `v5.4.0-beta.1` · `0x8c2488…` | 地址 + 源码 diff + ABI |
-| **下游** | airaccount-contract | `AAStarBLSAlgorithm.validate`（链上验聚合签名） | `v0.20.0` · `0xAF525A…`       | 地址 + 源码 diff + ABI |
-| **上游** | AirAccount (KMS)    | owner secp256k1 `ownerAuth`（Stage-1 验签）     | TA `0.5.0`                    | TA/签名方案版本守卫    |
-| 规范     | EntryPoint v0.7     | `getUserOpHash`                                 | `0x0000…71727De2…`            | 固定规范地址           |
+| 角色     | 仓库                | 绑定物                                                                               | 当前 pin                                               | 校验维度                        |
+| -------- | ------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------ | ------------------------------- |
+| **上游** | SuperPaymaster      | `PolicyRegistry.checkPolicy`（layer-1 策略）                                         | `v5.4.0-beta.1` · `0x8c2488…`                          | 地址 + 源码 diff + ABI          |
+| **下游** | airaccount-contract | 经 ValidatorRouter(algId 0x01) 挂载本仓 `AAStarValidator.validate`（链上验聚合签名） | `v0.29.0` · `0x539B…`（旧 `0xAF525A…` v0.20.0 已废弃） | 地址 + getAlgorithm(0x01) + ABI |
+| **上游** | AirAccount (KMS)    | owner secp256k1 `ownerAuth`（Stage-1 验签）                                          | TA `0.5.0`                                             | TA/签名方案版本守卫             |
+| 规范     | EntryPoint v0.7     | `getUserOpHash`                                                                      | `0x0000…71727De2…`                                     | 固定规范地址                    |
 
 ### 1.2 "如何确定是最新且与我一致的版本"
 
@@ -88,11 +88,11 @@
 
 ### 2.1 权威地址（以 `check-deps` 为准，发布前重新核对）
 
-| 用途                                | 地址                                         | 版本                            |
-| ----------------------------------- | -------------------------------------------- | ------------------------------- |
-| BLS 验证器（下游消费聚合签名）      | `0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174` | airaccount-contract **v0.20.0** |
-| PolicyRegistry（上游 layer-1 策略） | `0x8c2488d46d5447418558c38AA6441720df656094` | SuperPaymaster v5.4.0-beta.1    |
-| EntryPoint v0.7                     | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | 规范                            |
+| 用途                                                                     | 地址                                         | 版本                                       |
+| ------------------------------------------------------------------------ | -------------------------------------------- | ------------------------------------------ |
+| BLS 验证器（本仓 AAStarValidator，airaccount 经 router algId 0x01 挂载） | `0x539B9681aFd5BFbCaa655Fe4c6BdcFe1fa7864bC` | Plan A v3（旧 `0xAF525A…` v0.20.0 已废弃） |
+| PolicyRegistry（上游 layer-1 策略）                                      | `0x8c2488d46d5447418558c38AA6441720df656094` | SuperPaymaster v5.4.0-beta.1               |
+| EntryPoint v0.7                                                          | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | 规范                                       |
 
 ### 2.2 版本漂移历史（已处理）
 

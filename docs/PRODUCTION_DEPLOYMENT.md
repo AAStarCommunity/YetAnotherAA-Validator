@@ -20,22 +20,22 @@ DVT 节点本身是**链无关**的：换一套
 
 ## 1. 测试 vs 生产 —— 全景对照表
 
-| 维度                      | 测试环境（当前，Sepolia）                                                                       | 生产环境（mainnet）                                                                                                          |
-| ------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| **链**                    | Sepolia `chainId 11155111`                                                                      | 目标主网（Ethereum / Optimism `chainId 1` / `10`）—— 先定链                                                                  |
-| **合约地址**              | validator `0xAF525A…`、SuperPaymaster `0x030025…`、PaymasterV4 `0x957852…`、BuyHelper `0xF78f…` | **全部换主网部署地址**（EntryPoint v0.7 `0x0000000071727De…` 跨链同址，是唯一不变的）                                        |
-| **BLS 签名密钥**          | 本地生成、明文存 gitignored `node_state.json`                                                   | **HSM / KMS 托管**（`SIGNER_BACKEND`，arch #67）或至少加密磁盘 + 受限主机                                                    |
-| **Relay / Keeper 热钱包** | 水龙头 ETH，0.2–0.5 ETH，随手生成                                                               | **真金 ETH**，预算化、限额、监控余额、定期轮换                                                                               |
-| **Gas**                   | 免费、不在乎                                                                                    | **真钱**——估值 +15% 自动 bump（已在 PR #105）；relay 还要补**提交前 eth_call 预检**（见 §6）避免给注定 revert 的 tx 烧真 gas |
-| **RPC**                   | 凑合（本次就因 RPC mempool 不广播导致 nonce 卡 10 小时）                                        | **专用付费 RPC（Alchemy/Infura 付费档或自建全节点）+ 故障转移**，这是硬要求                                                  |
-| **主机 / HA**             | 一台 Mac，3 进程 + cloudflared                                                                  | **≥2 台**互备（单机=单点）；不同操作方/不同机房更佳                                                                          |
-| **自愈**                  | `dvt-testnet.sh` 手动                                                                           | **Docker `restart: unless-stopped` / systemd `Restart=always`** + 开机自启                                                   |
-| **公网入口**              | cloudflared quick/named tunnel                                                                  | 稳定域名 + named tunnel **或**反代 + TLS + 负载均衡                                                                          |
-| **策略门**                | `POLICY_ENABLED=false`                                                                          | **`POLICY_ENABLED=true`** + 主网 `POLICY_REGISTRY_ADDRESS`（独立第二因子，强烈建议开）                                       |
-| **限流**                  | 可选                                                                                            | `RATE_LIMIT_ENABLED=true`（挡 pre-auth RPC 放大）                                                                            |
-| **Keeper 冗余**           | 3 节点都开（输家偶尔冗余 revert，免费）                                                         | 冗余 revert 烧**真 gas** → 建议**单 keeper + 热备**或确定性分配（见 §6）                                                     |
-| **监控告警**              | 看日志                                                                                          | **必须**：健康探针 + 余额看护 + nonce 健康 + 价格新鲜度 + 失败告警（接 #52 通知）                                            |
-| **变更/漂移**             | 手动                                                                                            | `npm run check-deps` 定期对主网 baseline 跑，合约漂移即告警                                                                  |
+| 维度                      | 测试环境（当前，Sepolia）                                                                                                                         | 生产环境（mainnet）                                                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| **链**                    | Sepolia `chainId 11155111`                                                                                                                        | 目标主网（Ethereum / Optimism `chainId 1` / `10`）—— 先定链                                                                  |
+| **合约地址**              | validator `0x539B…`（Plan A v3 AAStarValidator；旧 `0xAF525A…` 已废弃）、SuperPaymaster `0x030025…`、PaymasterV4 `0x957852…`、BuyHelper `0xF78f…` | **全部换主网部署地址**（EntryPoint v0.7 `0x0000000071727De…` 跨链同址，是唯一不变的）                                        |
+| **BLS 签名密钥**          | 本地生成、明文存 gitignored `node_state.json`                                                                                                     | **HSM / KMS 托管**（`SIGNER_BACKEND`，arch #67）或至少加密磁盘 + 受限主机                                                    |
+| **Relay / Keeper 热钱包** | 水龙头 ETH，0.2–0.5 ETH，随手生成                                                                                                                 | **真金 ETH**，预算化、限额、监控余额、定期轮换                                                                               |
+| **Gas**                   | 免费、不在乎                                                                                                                                      | **真钱**——估值 +15% 自动 bump（已在 PR #105）；relay 还要补**提交前 eth_call 预检**（见 §6）避免给注定 revert 的 tx 烧真 gas |
+| **RPC**                   | 凑合（本次就因 RPC mempool 不广播导致 nonce 卡 10 小时）                                                                                          | **专用付费 RPC（Alchemy/Infura 付费档或自建全节点）+ 故障转移**，这是硬要求                                                  |
+| **主机 / HA**             | 一台 Mac，3 进程 + cloudflared                                                                                                                    | **≥2 台**互备（单机=单点）；不同操作方/不同机房更佳                                                                          |
+| **自愈**                  | `dvt-testnet.sh` 手动                                                                                                                             | **Docker `restart: unless-stopped` / systemd `Restart=always`** + 开机自启                                                   |
+| **公网入口**              | cloudflared quick/named tunnel                                                                                                                    | 稳定域名 + named tunnel **或**反代 + TLS + 负载均衡                                                                          |
+| **策略门**                | `POLICY_ENABLED=false`                                                                                                                            | **`POLICY_ENABLED=true`** + 主网 `POLICY_REGISTRY_ADDRESS`（独立第二因子，强烈建议开）                                       |
+| **限流**                  | 可选                                                                                                                                              | `RATE_LIMIT_ENABLED=true`（挡 pre-auth RPC 放大）                                                                            |
+| **Keeper 冗余**           | 3 节点都开（输家偶尔冗余 revert，免费）                                                                                                           | 冗余 revert 烧**真 gas** → 建议**单 keeper + 热备**或确定性分配（见 §6）                                                     |
+| **监控告警**              | 看日志                                                                                                                                            | **必须**：健康探针 + 余额看护 + nonce 健康 + 价格新鲜度 + 失败告警（接 #52 通知）                                            |
+| **变更/漂移**             | 手动                                                                                                                                              | `npm run check-deps` 定期对主网 baseline 跑，合约漂移即告警                                                                  |
 
 ---
 
@@ -146,19 +146,19 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST https://<域名>/signature/sign
 
 按层跑全，**全绿才算上线**:
 
-| 层             | 怎么跑                                                   | 通过标准                                                                                 |
-| -------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| 单元/集成      | `npm run test:ci`                                        | 全部通过（含 owner-auth、policy、keeper、relay、gas）                                    |
-| 合约一致性     | `cd contracts && forge test`                             | 通过；`npm run check-deps` 对**主网** baseline 无漂移                                    |
-| 多节点链上 E2E | `scripts/e2e/realnode-e2e.mjs` 指向主网节点 URL + nodeId | N 节点共签 → 主网 `AAStarBLSAlgorithm.validate() === 0`；ECDSA(0x02) 被拒                |
-| owner-auth 门  | 空体/伪造 ownerAuth                                      | 一律 **403**（永不 400）                                                                 |
-| 策略门         | 构造越界 op（超 perTxMax / 非 allowlist 收款人）         | 被拒（独立第二因子生效）                                                                 |
-| Relay E2E      | 主网发一笔**小额**真实 gasless 购买（SDK `buyGasless`）  | 链上 tx success；`/relay/health` operator 正常                                           |
-| Keeper         | 等价格接近 stale，观察                                   | 主网 paymaster `cachedPrice.updatedAt` 被刷新；**无 nonce 积压**（PR #105 已修，重点盯） |
-| 限流           | 超频打 `/signature/sign`                                 | 触发 429                                                                                 |
-| 自愈           | `docker kill` 一个容器                                   | 自动重启、健康恢复                                                                       |
-| 监控           | 触发一次 keeper/relay 失败                               | 告警到位                                                                                 |
-| 软压测/soak    | 持续观察 24–72h                                          | 余额平稳、nonce 健康、价格常新、无堆积                                                   |
+| 层             | 怎么跑                                                   | 通过标准                                                                                                             |
+| -------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| 单元/集成      | `npm run test:ci`                                        | 全部通过（含 owner-auth、policy、keeper、relay、gas）                                                                |
+| 合约一致性     | `cd contracts && forge test`                             | 通过；`npm run check-deps` 对**主网** baseline 无漂移                                                                |
+| 多节点链上 E2E | `scripts/e2e/realnode-e2e.mjs` 指向主网节点 URL + nodeId | N 节点共签 → 主网 `AAStarValidator.validate() === 0`（本仓验证器；旧名 AAStarBLSAlgorithm 已废弃）；ECDSA(0x02) 被拒 |
+| owner-auth 门  | 空体/伪造 ownerAuth                                      | 一律 **403**（永不 400）                                                                                             |
+| 策略门         | 构造越界 op（超 perTxMax / 非 allowlist 收款人）         | 被拒（独立第二因子生效）                                                                                             |
+| Relay E2E      | 主网发一笔**小额**真实 gasless 购买（SDK `buyGasless`）  | 链上 tx success；`/relay/health` operator 正常                                                                       |
+| Keeper         | 等价格接近 stale，观察                                   | 主网 paymaster `cachedPrice.updatedAt` 被刷新；**无 nonce 积压**（PR #105 已修，重点盯）                             |
+| 限流           | 超频打 `/signature/sign`                                 | 触发 429                                                                                                             |
+| 自愈           | `docker kill` 一个容器                                   | 自动重启、健康恢复                                                                                                   |
+| 监控           | 触发一次 keeper/relay 失败                               | 告警到位                                                                                                             |
+| 软压测/soak    | 持续观察 24–72h                                          | 余额平稳、nonce 健康、价格常新、无堆积                                                                               |
 
 > 验证脚本可参考 `deploy/verify-prod-e2e.mjs`（已含 RPC 重试），改指主网。
 
