@@ -314,15 +314,28 @@ contract AAStarValidator is IAAStarAlgorithm {
             dstPrime
         );
         bytes32 b0 = sha256(msgPrime);
-        bytes32 b1 = sha256(abi.encodePacked(b0, uint8(1), dstPrime));
+
+        // b_i = sha256( (b0 ^ b_{i-1}) || I2OSP(i,1) || DST_prime ), i=1..ell, with b_0 substituted
+        // for the xor term when i==1 (RFC 9380 §5.3.1). Reuse ONE buffer whose DST_prime tail is
+        // written once; each round only rewrites the leading 32-byte word + the 1-byte counter.
+        // The sha256 pre-image is byte-identical to the per-round abi.encodePacked (golden-vector
+        // test guards this), so this is a pure allocation-count optimization — output unchanged.
+        uint256 dpLen = dstPrime.length;
+        bytes memory tmp = new bytes(33 + dpLen);
+        assembly {
+            mcopy(add(add(tmp, 0x20), 33), add(dstPrime, 0x20), dpLen)
+        }
+        _writeWord(tmp, 0, b0); // i==1: leading term is b0 (not xored)
+        tmp[32] = 0x01;
+        bytes32 prev = sha256(tmp); // b1
 
         uniform = new bytes(XMD_LEN);
-        _writeWord(uniform, 0, b1);
-        bytes32 prev = b1;
+        _writeWord(uniform, 0, prev);
         for (uint256 i = 2; i <= XMD_ELL; i++) {
-            bytes32 bi = sha256(abi.encodePacked(b0 ^ prev, uint8(i), dstPrime));
-            _writeWord(uniform, (i - 1) * 32, bi);
-            prev = bi;
+            _writeWord(tmp, 0, b0 ^ prev);
+            tmp[32] = bytes1(uint8(i));
+            prev = sha256(tmp);
+            _writeWord(uniform, (i - 1) * 32, prev);
         }
     }
 
