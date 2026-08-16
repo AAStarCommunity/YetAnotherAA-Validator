@@ -120,10 +120,17 @@ contract AAStarValidatorGasProfileTest is Test {
         uint256 cryptoInValidate = h2cMeasured + PAIRING_FLOOR + G1_AGG_FLOOR;
         uint256 remainder = total > cryptoInValidate ? total - cryptoInValidate : 0;
         uint256 implOverhead = total > CRYPTO_FLOOR ? total - CRYPTO_FLOOR : 0;
+        // Fork tell (MODEXP 0x05 reprices across forks): ~15,075 under evm_version=osaka. Computed
+        // here so the console header below reflects the ACTUAL fork, never a hardcoded "osaka" claim.
+        bool onOsaka = rfc9380Glue >= 14_775 && rfc9380Glue <= 15_375;
 
         console2.log("=== AAStarValidator.validate() ABSOLUTE gas attribution (golden 2-node) ===");
         console2.log("validate() total (cold storage)         :", total);
-        console2.log("--- crypto precompile floor (EIP-2537 schedule @ evm_version=osaka) ---");
+        console2.log(
+            onOsaka
+                ? "--- crypto precompile floor (EIP-2537 schedule @ evm_version=osaka) ---"
+                : "--- crypto precompile floor (schedule; toolchain NOT osaka - see NOTE below) ---"
+        );
         console2.log("  hash-to-curve floor (RFC-9380)        :", HASH_TO_CURVE_FLOOR);
         console2.log("  pairing check (k=2)                   :", PAIRING_FLOOR);
         console2.log("  G1 pubkey aggregation                 :", G1_AGG_FLOOR);
@@ -166,7 +173,6 @@ contract AAStarValidatorGasProfileTest is Test {
         // baselines with a LOUD note, rather than either (a) red-failing an unrelated CI on a toolchain
         // we don't control, or (b) silently printing "@osaka" numbers that aren't osaka. The console
         // profile above (appendix-C artifact) still prints in every context.
-        bool onOsaka = rfc9380Glue >= 14_775 && rfc9380Glue <= 15_375; // osaka band (±300 jitter)
         if (!onOsaka) {
             console2.log("NOTE: RFC-9380 glue is", rfc9380Glue, "-> toolchain is NOT evm_version=osaka.");
             console2.log("      Absolute-gas baselines skipped; the paper's numbers apply only under osaka.");
