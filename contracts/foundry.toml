@@ -5,5 +5,13 @@ libs = ["lib"]
 optimizer = true
 optimizer_runs = 200
 via_ir = true
+# Pin the EVM version so gas figures are deterministic across machines/forge versions.
+# The gas-profile test (test/AAStarValidatorGasProfile.t.sol) reports absolute numbers used
+# by the DSR "Onion" paper appendix C; without a pin, forge resolves to whatever its default
+# fork is and the MODEXP (0x05) component of hash-to-curve reprices (EIP-2565 → EIP-7883),
+# shifting the reported RFC-9380 glue by ~1,200. "osaka" is the fork whose EIP-7883 MODEXP
+# pricing the test's schedule constants assume; the test asserts this in-repo
+# (rfc9380Glue in the osaka band), so a wrong-fork run fails loudly instead of silently.
+evm_version = "osaka"
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
