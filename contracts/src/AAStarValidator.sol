@@ -76,9 +76,12 @@ contract AAStarValidator is IAAStarAlgorithm {
     bytes32 public constant ROLE_DVT = keccak256("DVT");
 
     // --- On-chain quorum enforcement (CC-97) -------------------------------------
-    /// @dev Accurate count of currently-active registered nodes. Unlike
+    /// @dev Accurate count of currently-active registered nodes (bootstrap + staked). Unlike
     ///      `registeredNodes.length` (which keeps stale ids after `_deactivate` for gas
-    ///      reasons), this is maintained O(1) on every add/remove and is the authoritative N.
+    ///      reasons), this is maintained O(1) on every add/remove.
+    ///      ⚠️ This is the RAW total, NOT the quorum denominator. Integrators computing ⌈2N/3⌉
+    ///      MUST read `eligibleNodeCount()` instead — it is the committee `validate()` actually
+    ///      enforces against (it excludes retired bootstrap nodes when `requireStake` is on).
     uint256 public activeNodeCount;
     /// @dev Subset of `activeNodeCount` that are bootstrap (owner-registered, no stake). When
     ///      `requireStake` is on, bootstrap nodes are retired and NOT eligible signers, so the
