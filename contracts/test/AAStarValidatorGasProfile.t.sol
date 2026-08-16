@@ -36,11 +36,23 @@ import "../src/AAStarValidator.sol";
 ///         do NOT share a ~300k floor. Safe-curated / no-stake ≈ 220k vs stake-bound decentralised
 ///         ≈ 458k (≈2×). Crypto floors agree within 8% (same cryptography); the whole spread is in
 ///         the non-precompile EVM layer (impl overhead ≈52k vs ≈304k, ≈6×) ⇒ implementation-dependent
-///         variance, NOT a structural floor. The ≈238k gap is a mix of the decentralised-staking
-///         machinery (which curated designs simply do not have) and implementation-efficiency
-///         difference; it is an UPPER BOUND on the price of binding verification to a staked
-///         committee rather than a curated key list — a ceiling, not an attribution. See
-///         evidence/04_gas.md.
+///         variance, NOT a structural floor.
+///
+///         What the ≈238k curated-vs-staked gap is (and is NOT) — the paper sides with neither
+///         "floor" nor "waste" (§5.1/§6.2, refined after this test caught a mislabel):
+///           • It is NOT mostly the price of decentralisation. Per-node stake-state verification is
+///             a small, separately-measured ≈24k (< 5% of one validate()), and it is not even in
+///             this requireStake=false table. The nodeId→pubkey registration lookup that IS in this
+///             table is NOT decentralisation-specific — a curated registry reads its key table too.
+///           • The gap is dominated by non-precompile EVM marshalling. Its recoverability is UNPROVEN:
+///             airaccount's curated 52k impl-overhead suggests headroom, but its scope (does it do
+///             the same point decode + subgroup checks? pubkeys from storage or calldata?) is not
+///             externally verifiable, so this test does NOT claim the 66% is a floor OR waste. The
+///             only way to settle it is running BOTH validators under ONE harness with ONE bucket
+///             definition — the paper's remaining work, not gating submission.
+///           • "≈238k" survives only as an UPPER BOUND on binding verification to a staked committee
+///             vs a curated key list (it absorbs all efficiency difference) — a ceiling, not an
+///             attribution. See evidence/04_gas.md.
 contract AAStarValidatorGasProfileTest is Test {
     AAStarValidator validator;
 
