@@ -484,6 +484,51 @@ contract AAStarCommitteeValidatorTest is Test {
         assertEq(v.validate(keccak256("op"), _payload(address(0xDEAD), signers)), 1, "unenrolled => fail-closed");
     }
 
+    // pr-daemon B4: accountId must be canonical (high 96 bits zero). The enrollment gate reads the low
+    // 160 bits but the draw consumes all 256, so a set high bit would be a free grind surface.
+    function test_validate_rejects_noncanonical_accountId() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        // Canonical accountId (== ACCOUNT, enrolled) validates.
+        bytes memory good = _payload(ACCOUNT, signers);
+        assertEq(v.validate(keccak256("op"), good), 0, "canonical accountId valid");
+        // Same low 160 bits (ACCOUNT, enrolled) but a high bit set -> must be rejected, not accepted via
+        // the low-160 enrollment match.
+        bytes memory bad = good;
+        uint256 highBit = 1 << 160;
+        bytes32 tainted = bytes32(uint256(uint160(ACCOUNT)) | highBit);
+        for (uint256 b = 0; b < 32; b++) bad[b] = tainted[b];
+        assertEq(v.validate(keccak256("op"), bad), 1, "non-canonical accountId must fail");
+    }
+
+    // Bounded grind on the high 96 bits: none may be accepted (the probe found a low-160 collision fast).
+    function test_validate_highbits_grind_all_rejected() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        bytes memory p = _payload(ACCOUNT, signers);
+        uint256 base = uint256(uint160(ACCOUNT));
+        for (uint256 g = 1; g <= 300; g++) {
+            bytes32 tainted = bytes32(base | (g << 160)); // vary only the high 96 bits
+            for (uint256 b = 0; b < 32; b++) p[b] = tainted[b];
+            assertEq(v.validate(keccak256("op"), p), 1, "no high-bit grind may be accepted");
+        }
+    }
+
+    // pr-daemon Low: pin the requiredQuorum sentinel (max, NOT 0 which would be fail-open) + the
+    // constructor oversample default (the whole B1 argument rests on it).
+    function test_requiredQuorum_sentinel_is_max_not_zero() public {
+        MockCommitteeValidator w = new MockCommitteeValidator(); // epochLength 0
+        assertEq(w.requiredQuorum(), type(uint256).max, "sentinel must be max (fail-closed), never 0");
+    }
+
     // pr-daemon B3: setOversample must bump configVersion so it cannot retroactively relax the
     // sortition gate on an already-pinned epoch (setOversample(5,1) collapses T to max otherwise).
     function test_setOversample_invalidates_pinned_epochs() public {

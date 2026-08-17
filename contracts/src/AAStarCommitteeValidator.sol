@@ -131,12 +131,13 @@ contract AAStarCommitteeValidator is AAStarValidator {
     /// @dev Accounts that have self-enrolled for committee validation. validate() fails closed unless the
     ///      injected accountId maps to an enrolled account. This is DEFENSE-IN-DEPTH for the accountId
     ///      trust (pr-daemon B2, agreed with airaccount f444db89): the MANDATORY fix is the account
-    ///      injecting address(this), but enrollment (a) blocks the flip-order shape collision — a
-    ///      legacy-shaped payload's fabricated accountId prefix maps to a non-enrolled address → reject
-    ///      — and (b) turns a FREE offline grind over 2^256 accountIds into a gas-metered grind over
-    ///      addresses the attacker had to enroll (enroll self-proves via msg.sender). It does NOT
-    ///      replace injection: an attacker can still enroll its own accounts, so accountId==address(this)
-    ///      at the account remains the primary guarantee.
+    ///      injecting address(this). Enrollment blocks the flip-order shape collision — a legacy-shaped
+    ///      payload's fabricated accountId maps to a non-enrolled address → reject. Combined with the
+    ///      canonical-accountId check in validate() (high 96 bits must be zero, pr-daemon B4), the value
+    ///      the gate reads (low 160) equals the value the draw consumes (all 256), so an enrolled
+    ///      address's committee cannot be shifted by grinding unused bits. It does NOT replace injection:
+    ///      an attacker can still enroll its own accounts, so accountId==address(this) at the account
+    ///      remains the primary guarantee.
     mapping(address => bool) public enrolledAccount;
 
     event AccountEnrolled(address indexed account);
@@ -407,9 +408,15 @@ contract AAStarCommitteeValidator is AAStarValidator {
         uint256 T = _thresholdOf(committedCount, m);
 
         bytes32 accountId = bytes32(signature[0:32]);
+        // accountId MUST be the canonical zero-extension of a 160-bit address. The enrollment gate below
+        // reads the low 160 bits, but the sortition draw consumes all 256 — so a set high bit is a free
+        // offline grind surface on committee membership (pr-daemon B4). Reject non-canonical, symmetric
+        // to the canonical-slot check below. (The account injecting address(this) always has zero high
+        // bits, so this never rejects an honest op.)
+        if (uint256(accountId) >> 160 != 0) return 1;
         // Defense-in-depth for the account-injected accountId (pr-daemon B2): the account must have
-        // self-enrolled. A flip-order legacy-shaped payload whose fabricated accountId prefix maps to a
-        // non-enrolled address fails closed here, and grinding accountId now costs an enroll tx per try.
+        // self-enrolled. A flip-order legacy-shaped payload whose fabricated accountId maps to a
+        // non-enrolled address fails closed here.
         if (!enrolledAccount[address(uint160(uint256(accountId)))]) return 1;
 
         bytes32[] memory nodeIds = new bytes32[](k);
