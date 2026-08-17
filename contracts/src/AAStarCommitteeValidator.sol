@@ -360,12 +360,11 @@ contract AAStarCommitteeValidator is AAStarValidator {
 
     /// @dev Verify a fixed-depth Merkle proof: fold `leaf` at position `slot` up through `proof`
     ///      (TREE_DEPTH sibling words) and compare to `root`. Bit i of `slot` selects left/right.
-    function _verifyMerkle(
-        bytes32 root,
-        uint256 slot,
-        bytes32 leaf,
-        bytes calldata proof
-    ) internal pure returns (bool) {
+    function _verifyMerkle(bytes32 root, uint256 slot, bytes32 leaf, bytes calldata proof)
+        internal
+        pure
+        returns (bool)
+    {
         if (proof.length != TREE_DEPTH * 32) return false;
         bytes32 cur = leaf;
         uint256 idx = slot;

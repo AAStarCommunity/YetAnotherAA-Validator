@@ -14,20 +14,20 @@ contract MockCommitteeValidator is AAStarCommitteeValidator {
         blsResult = v;
     }
 
-    function _validateBLSSignatureMem(
-        bytes32[] memory,
-        bytes memory,
-        bytes memory
-    ) internal view override returns (bool) {
+    function _validateBLSSignatureMem(bytes32[] memory, bytes memory, bytes memory)
+        internal
+        view
+        override
+        returns (bool)
+    {
         return blsResult;
     }
 
-    function exposedVerifyMerkle(
-        bytes32 root,
-        uint256 slot,
-        bytes32 leaf,
-        bytes calldata proof
-    ) external pure returns (bool) {
+    function exposedVerifyMerkle(bytes32 root, uint256 slot, bytes32 leaf, bytes calldata proof)
+        external
+        pure
+        returns (bool)
+    {
         return _verifyMerkle(root, slot, leaf, proof);
     }
 
@@ -52,8 +52,12 @@ contract AAStarCommitteeValidatorTest is Test {
 
         DUMMY_KEY = new bytes(128);
         DUMMY_SIG = new bytes(256);
-        for (uint256 i = 0; i < 128; i++) DUMMY_KEY[i] = bytes1(uint8(1 + (i % 250)));
-        for (uint256 i = 0; i < 256; i++) DUMMY_SIG[i] = bytes1(uint8(1 + (i % 250)));
+        for (uint256 i = 0; i < 128; i++) {
+            DUMMY_KEY[i] = bytes1(uint8(1 + (i % 250)));
+        }
+        for (uint256 i = 0; i < 256; i++) {
+            DUMMY_SIG[i] = bytes1(uint8(1 + (i % 250)));
+        }
     }
 
     // ---- helpers -------------------------------------------------------------------------------
@@ -86,15 +90,14 @@ contract AAStarCommitteeValidatorTest is Test {
     }
 
     /// @dev Build the committee payload: accountId || [nodeId || proof]... || blsSig.
-    function _payload(
-        address account,
-        bytes32[] memory signers
-    ) internal view returns (bytes memory out) {
+    function _payload(address account, bytes32[] memory signers) internal view returns (bytes memory out) {
         out = abi.encodePacked(bytes32(uint256(uint160(account))));
         for (uint256 i = 0; i < signers.length; i++) {
             (, bytes32[] memory proof) = v.getMerkleProof(signers[i]);
             out = abi.encodePacked(out, signers[i]);
-            for (uint256 j = 0; j < proof.length; j++) out = abi.encodePacked(out, proof[j]);
+            for (uint256 j = 0; j < proof.length; j++) {
+                out = abi.encodePacked(out, proof[j]);
+            }
         }
         out = abi.encodePacked(out, DUMMY_SIG);
     }
@@ -106,16 +109,14 @@ contract AAStarCommitteeValidatorTest is Test {
         for (uint256 i = 0; i < ids.length; i++) {
             (uint256 slot, bytes32[] memory proof) = v.getMerkleProof(ids[i]);
             bytes memory flat;
-            for (uint256 j = 0; j < proof.length; j++) flat = abi.encodePacked(flat, proof[j]);
+            for (uint256 j = 0; j < proof.length; j++) {
+                flat = abi.encodePacked(flat, proof[j]);
+            }
             assertTrue(
-                v.exposedVerifyMerkle(v.runningRoot(), slot, ids[i], flat),
-                "proof must verify against current root"
+                v.exposedVerifyMerkle(v.runningRoot(), slot, ids[i], flat), "proof must verify against current root"
             );
             // A wrong leaf must NOT verify.
-            assertFalse(
-                v.exposedVerifyMerkle(v.runningRoot(), slot, keccak256("wrong"), flat),
-                "wrong leaf must fail"
-            );
+            assertFalse(v.exposedVerifyMerkle(v.runningRoot(), slot, keccak256("wrong"), flat), "wrong leaf must fail");
         }
     }
 
@@ -189,7 +190,9 @@ contract AAStarCommitteeValidatorTest is Test {
         // whole set (m=12), quorum = ceil(2*12/3) = 8. Provide 8 ascending signers.
         assertEq(v.requiredQuorum(), 8);
         bytes32[] memory signers = new bytes32[](8);
-        for (uint256 i = 0; i < 8; i++) signers[i] = ids[i];
+        for (uint256 i = 0; i < 8; i++) {
+            signers[i] = ids[i];
+        }
         assertEq(v.validate(keccak256("op"), _payload(ACCOUNT, signers)), 0, "12-node pool must be satisfiable");
     }
 
@@ -294,7 +297,9 @@ contract AAStarCommitteeValidatorTest is Test {
         bytes32[] memory chosen = new bytes32[](required);
         uint256 c;
         for (uint256 i = 0; i < ids.length && c < required; i++) {
-            uint256 draw = uint256(keccak256(abi.encode(keccak256("CMT_SELECT"), seed, bytes32(uint256(uint160(ACCOUNT))), ids[i])));
+            uint256 draw = uint256(
+                keccak256(abi.encode(keccak256("CMT_SELECT"), seed, bytes32(uint256(uint160(ACCOUNT))), ids[i]))
+            );
             if (draw < T) {
                 chosen[c++] = ids[i];
             }
@@ -308,7 +313,9 @@ contract AAStarCommitteeValidatorTest is Test {
         // sanity: ensure not all `chosen` are also selected for `other` (else the test is vacuous)
         bool someExcluded;
         for (uint256 i = 0; i < chosen.length; i++) {
-            uint256 draw = uint256(keccak256(abi.encode(keccak256("CMT_SELECT"), seed, bytes32(uint256(uint160(other))), chosen[i])));
+            uint256 draw = uint256(
+                keccak256(abi.encode(keccak256("CMT_SELECT"), seed, bytes32(uint256(uint160(other))), chosen[i]))
+            );
             if (draw >= T) someExcluded = true;
         }
         if (someExcluded) {
