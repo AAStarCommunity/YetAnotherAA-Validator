@@ -49,26 +49,34 @@ async function tick() {
   // Window: strictly after the epoch's first block, within 256 blocks (blockhash availability).
   const inWindow = bn > start && bn <= start + 256n;
 
-  if (usable) { console.log(new Date().toISOString(), `epoch ${e} already pinned (usable) — nothing to do`); return; }
+  if (usable) { console.log(new Date().toISOString(), `epoch ${e} already pinned (usable) — nothing to do`); return "ok"; }
   if (!inWindow) {
     console.log(new Date().toISOString(), `epoch ${e}: block ${bn} outside pin window [${start + 1n}, ${start + 256n}] — cannot pin (self-heals next epoch)`);
-    return;
+    return "outside-window";
   }
   console.log(new Date().toISOString(), `epoch ${e}: pinning (block ${bn}, window ok)...`);
   try {
     const tx = await v.snapshotEpoch();
     console.log("  snapshotEpoch tx:", tx.hash);
-    const r = await tx.wait();
+    const r = await tx.wait(1, 120000); // 120s timeout so a mispriced tx doesn't hang forever
+    if (!r) { console.warn("  pin tx not mined within timeout — retry next tick"); return "timeout"; }
     console.log("  pinned in block", r.blockNumber, "status", r.status);
+    return "pinned";
   } catch (err) {
-    console.log("  snapshotEpoch failed:", err.shortMessage || err.reason || err.code || err.message);
+    const msg = err.shortMessage || err.reason || err.code || err.message || "";
+    // A redundant keeper that lost the race sees "epoch already pinned" — benign, log-and-continue.
+    if (/already pinned/i.test(msg)) { console.log("  another keeper pinned it first (benign):", msg); return "ok"; }
+    console.error("  snapshotEpoch FAILED:", msg);
+    return "error";
   }
 }
 
 if (WATCH) {
   console.log("keeper watching", VALIDATOR, "— Ctrl-C to stop");
-  const loop = async () => { try { await tick(); } catch (e) { console.log("tick err", e.shortMessage || e.message); } setTimeout(loop, 30000); };
+  const loop = async () => { try { await tick(); } catch (e) { console.error("tick err", e.shortMessage || e.message); } setTimeout(loop, 30000); };
   loop();
 } else {
-  tick().catch(e => { console.error(e.shortMessage || e.message); process.exit(1); });
+  tick()
+    .then(status => { if (status === "error" || status === "timeout") process.exit(1); }) // cron/systemd must see failure
+    .catch(e => { console.error(e.shortMessage || e.message); process.exit(1); });
 }

@@ -37,14 +37,19 @@ contract DeployCommitteeValidator is Script {
         address registry = vm.envOr("SP_REGISTRY", SP_REGISTRY_SEPOLIA);
         uint256 minStake = vm.envOr("MIN_STAKE", uint256(30 ether));
         bool requireStake = vm.envOr("REQUIRE_STAKE", false);
+        address newOwner = vm.envOr("OWNER", address(0)); // optional: hand off to a Safe in the same broadcast
 
         vm.startBroadcast();
 
         AAStarCommitteeValidator validator = new AAStarCommitteeValidator();
+        // Guard against wiring to a non-existent registry (e.g. the Sepolia default constant on a wrong chain).
+        require(registry.code.length > 0, "registry has no code on this chain");
         validator.setRegistry(registry);
         validator.setMinStake(minStake);
         if (requireStake) validator.setRequireStake(true);
         // NOTE: epochLength is deliberately left at 0 (committee mode OFF). See the migration interlock.
+        // Ownership transfer LAST — after the onlyOwner config above — so it doesn't strand those calls.
+        if (newOwner != address(0)) validator.transferOwnership(newOwner);
 
         vm.stopBroadcast();
 
