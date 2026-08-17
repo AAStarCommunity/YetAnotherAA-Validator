@@ -30,7 +30,27 @@ import "./AAStarValidator.sol";
 ///         accepted from calldata), m_e follows the DSR curve over the committed node count.
 ///
 ///         Wire format of `signature` (the account prepends accountId; the submitter provides the rest):
-///           [ accountId(32) ] [ per signer: nodeId(32) ‖ merkleProof(TREE_DEPTH×32) ]... [ blsSig(256) ]
+///           [ accountId(32) ] [ per signer: nodeId(32) | slot(32) | merkleProof(TREE_DEPTH*32) ]... [ blsSig(256) ]
+///         (slot is the node's leaf index in the FROZEN setRoot[e-1]; it is authenticated by the proof.)
+///
+///         SECURITY ASSUMPTIONS (residuals from adversarial review — read before mounting):
+///         - accountId is SECURITY-CRITICAL, not formatting. This contract cannot bind it to msg.sender
+///           because a ValidatorRouter sits between account and validator. The account MUST inject its own
+///           address(this) and MUST NOT forward any submitter-supplied accountId. If that account-side rule
+///           is violated/bypassed, a submitter can shop accountId after seed[e] is known and place its own
+///           nodes into the committee -> forgery. Enforcement is the account's responsibility (airaccount).
+///         - LIVENESS (not safety): quorum is over the frozen count epochSetCount[e-1] but signers must be
+///           currently registered. If more than ~1/3 of an account's frozen committee unregisters mid-epoch
+///           (unstake/syncNode/revoke), ops for that account fail until the next epoch's fresh set. This is
+///           the standard BFT liveness bound; mitigated by DSR oversampling (E[selected] ~ 1.15*m), the SP
+///           unbonding delay (bounds mass-exit), and per-epoch retry. Lowering quorum on churn would break
+///           safety, so it is intentionally NOT done.
+///         - LIVENESS: if a keeper misses the 256-block pin window for an epoch, committee ops fail for that
+///           epoch (no seed) and the next (no setRoot), then self-heal. No late seed fallback exists because
+///           a caller-chosen late seed would be grindable. Run redundant permissionless keepers.
+///         - The active-set freeze time within the pin window is caller-chosen (first call wins); this cannot
+///           reopen register-to-order (seed still unknowable at freeze) but lets a griefer exclude
+///           registrations made between the epoch boundary and the pin. Minor fairness, not safety.
 contract AAStarCommitteeValidator is AAStarValidator {
     // Base declares these as private constants; re-declare the two lengths the committee path needs.
     uint256 private constant G1_LEN = 128;
@@ -93,6 +113,12 @@ contract AAStarCommitteeValidator is AAStarValidator {
     mapping(uint256 => uint256) public epochSetCount;
     /// @dev epoch → whether snapshotEpoch() has run for it (both seed and setRoot are then final).
     mapping(uint256 => bool) public epochPinned;
+    /// @dev epoch → the config version in force when it was pinned. A snapshot is only usable while it
+    ///      matches the CURRENT configVersion, so changing epochLength cannot silently reuse a seed/root
+    ///      that belonged to a different epoch schedule (Codex Low: reconfiguration provenance).
+    mapping(uint256 => uint256) public epochConfigVersion;
+    /// @dev Bumped on every epochLength change; namespaces all epoch snapshots to their schedule.
+    uint256 public configVersion;
 
     constructor() AAStarValidator() {
         // Empty-subtree hashes + empty-tree root.
@@ -108,13 +134,22 @@ contract AAStarCommitteeValidator is AAStarValidator {
     //                          ADMIN
     // ---------------------------------------------------------------------------------------------
 
+    /// @dev 0 disables committee mode. Must be >= 2: with epochLength == 1, startBlock == block.number
+    ///      for every block, so `block.number > startBlock` in snapshotEpoch is never true and committee
+    ///      mode is permanently unpinnable (Codex High). Bumps configVersion so snapshots taken under a
+    ///      previous schedule are not reused under the new one (Codex Low).
     function setEpochLength(uint256 _epochLength) external onlyOwner {
+        require(_epochLength == 0 || _epochLength >= 2, "epochLength must be 0 or >= 2");
         epochLength = _epochLength;
+        configVersion += 1;
         emit EpochLengthSet(_epochLength);
     }
 
+    /// @dev Bounded so `oversampleNum * m` in _thresholdOf cannot overflow and turn a fail-closed
+    ///      `return 1` into a revert (Codex Medium). num/den in [1, 8], den in [1, 1e9].
     function setOversample(uint256 num, uint256 den) external onlyOwner {
-        require(den != 0 && num >= den, "oversample must be >= 1");
+        require(den != 0 && den <= 1e9, "den out of range");
+        require(num >= den && num <= 8 * den, "oversample must be in [1, 8]");
         oversampleNum = num;
         oversampleDen = den;
         emit OversampleSet(num, den);
@@ -190,6 +225,7 @@ contract AAStarCommitteeValidator is AAStarValidator {
         epochSeed[e] = bh;
         epochSetRoot[e] = runningRoot;
         epochSetCount[e] = activeCount;
+        epochConfigVersion[e] = configVersion;
         epochPinned[e] = true;
         emit EpochSnapshotted(e, bh, runningRoot, activeCount);
     }
@@ -237,9 +273,16 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///         it — the account's mirror check then fails closed too).
     function requiredQuorum() public view returns (uint256) {
         uint256 e = currentEpoch();
-        if (e == 0 || !epochPinned[e - 1]) return type(uint256).max;
+        if (e == 0 || !_epochUsable(e - 1)) return type(uint256).max;
         uint256 m = expectedCommittee(epochSetCount[e - 1]);
         return _quorumOf(m);
+    }
+
+    /// @dev An epoch's snapshot is usable only if it was pinned AND under the current epoch schedule
+    ///      (configVersion). This makes a post-reconfiguration seed/root fail-closed rather than being
+    ///      combined across incompatible schedules.
+    function _epochUsable(uint256 e) internal view returns (bool) {
+        return epochPinned[e] && epochConfigVersion[e] == configVersion;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -251,15 +294,20 @@ contract AAStarCommitteeValidator is AAStarValidator {
         if (epochLength == 0) return _validateWholeSet(hash, signature);
 
         uint256 e = block.number / epochLength;
-        // Need seed[e] (this epoch) and setRoot[e-1] (frozen last epoch, the look-ahead set). Fail-closed
-        // if either is missing: the permissionless keeper must snapshot each epoch inside its window.
-        if (e == 0 || !epochPinned[e] || !epochPinned[e - 1]) return 1;
+        // Need seed[e] (this epoch) and setRoot[e-1] (frozen last epoch, the look-ahead set), both under
+        // the current epoch schedule. Fail-closed if either is missing/stale: the permissionless keeper
+        // must snapshot each epoch inside its window.
+        if (e == 0 || !_epochUsable(e) || !_epochUsable(e - 1)) return 1;
         bytes32 seed = epochSeed[e];
         bytes32 setRoot = epochSetRoot[e - 1];
         uint256 committedCount = epochSetCount[e - 1];
 
-        // ---- parse layout: accountId(32) ‖ k×(nodeId(32) ‖ proof(TREE_DEPTH*32)) ‖ blsSig(256) ----
-        uint256 perSigner = 32 + TREE_DEPTH * 32;
+        // ---- parse layout: accountId(32) || k×(nodeId(32) || slot(32) || proof(TREE_DEPTH*32)) || blsSig(256)
+        //      The slot is submitter-provided and authenticated by the Merkle proof against setRoot[e-1]:
+        //      each nodeId sits at exactly one slot in the frozen tree, so a wrong slot cannot verify. This
+        //      binds membership to the node's HISTORICAL slot in the frozen set, so a node whose live slot
+        //      was recycled+reassigned after the snapshot is still provable (Codex Medium: slot-reuse).
+        uint256 perSigner = 64 + TREE_DEPTH * 32;
         if (signature.length < 32 + G2_LEN) return 1;
         uint256 body = signature.length - 32 - G2_LEN;
         if (body == 0 || body % perSigner != 0) return 1;
@@ -279,17 +327,16 @@ contract AAStarCommitteeValidator is AAStarValidator {
         uint256 off = 32;
         for (uint256 i = 0; i < k; i++) {
             bytes32 nid = bytes32(signature[off:off + 32]);
-            off += 32;
+            uint256 slot = uint256(bytes32(signature[off + 32:off + 64]));
+            off += 64;
             // Distinct, strictly-increasing signers (blocks self-repetition inflating the aggregate).
             if (i != 0 && nid <= prevId) return 1;
             prevId = nid;
             // Still-active + economically backed (rejects retired bootstrap in staked mode).
             if (!isRegistered[nid]) return 1;
             if (requireStake && isBootstrap[nid]) return 1;
-            // (a) Membership in the look-ahead set: Merkle proof at the node's slot against setRoot[e-1].
-            uint256 sp = slotPlusOne[nid];
-            if (sp == 0) return 1;
-            if (!_verifyMerkle(setRoot, sp - 1, nid, signature[off:off + TREE_DEPTH * 32])) return 1;
+            // (a) Membership in the look-ahead set: Merkle proof at the submitted (authenticated) slot.
+            if (!_verifyMerkle(setRoot, slot, nid, signature[off:off + TREE_DEPTH * 32])) return 1;
             off += TREE_DEPTH * 32;
             // (b) Sortition: the committee membership the submitter cannot choose. When T == max the
             //     pool degrades to the whole set (bootstrap/tiny pool) — skip the draw so membership is

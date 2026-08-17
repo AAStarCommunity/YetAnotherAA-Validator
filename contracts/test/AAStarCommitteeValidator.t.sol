@@ -93,8 +93,8 @@ contract AAStarCommitteeValidatorTest is Test {
     function _payload(address account, bytes32[] memory signers) internal view returns (bytes memory out) {
         out = abi.encodePacked(bytes32(uint256(uint160(account))));
         for (uint256 i = 0; i < signers.length; i++) {
-            (, bytes32[] memory proof) = v.getMerkleProof(signers[i]);
-            out = abi.encodePacked(out, signers[i]);
+            (uint256 slot, bytes32[] memory proof) = v.getMerkleProof(signers[i]);
+            out = abi.encodePacked(out, signers[i], bytes32(slot));
             for (uint256 j = 0; j < proof.length; j++) {
                 out = abi.encodePacked(out, proof[j]);
             }
@@ -274,8 +274,8 @@ contract AAStarCommitteeValidatorTest is Test {
         signers[0] = ids[0];
         signers[1] = ids[1];
         bytes memory payload = _payload(ACCOUNT, signers);
-        // Corrupt one byte inside the first signer's Merkle proof (offset: 32 accountId + 32 nodeId).
-        payload[64] = bytes1(uint8(payload[64]) ^ 0xFF);
+        // Corrupt one byte inside the first signer's Merkle proof (offset: 32 accountId + 32 nodeId + 32 slot).
+        payload[96] = bytes1(uint8(payload[96]) ^ 0xFF);
         assertEq(v.validate(keccak256("op"), payload), 1, "tampered proof must fail");
     }
 
@@ -341,5 +341,58 @@ contract AAStarCommitteeValidatorTest is Test {
         // legacy format: [nodeId][blsSig]
         bytes memory legacy = abi.encodePacked(nid, DUMMY_SIG);
         assertEq(w.validate(keccak256("op"), legacy), 0, "epochLength=0 => whole-set path validates");
+    }
+
+    // ---- Codex-round fixes ---------------------------------------------------------------------
+
+    // High: epochLength == 1 is permanently unpinnable, so the setter must reject it.
+    function test_setEpochLength_rejects_one() public {
+        MockCommitteeValidator w = new MockCommitteeValidator();
+        vm.expectRevert("epochLength must be 0 or >= 2");
+        w.setEpochLength(1);
+        w.setEpochLength(0); // 0 (disable) allowed
+        w.setEpochLength(2); // >= 2 allowed
+    }
+
+    // Medium: unbounded oversample would overflow _thresholdOf and turn fail-closed into a revert.
+    function test_setOversample_bounds() public {
+        vm.expectRevert("oversample must be in [1, 8]");
+        v.setOversample(type(uint256).max, 1);
+        vm.expectRevert("oversample must be in [1, 8]");
+        v.setOversample(1, 2); // num < den
+        vm.expectRevert("den out of range");
+        v.setOversample(2e9, 2e9);
+        v.setOversample(2, 1); // ok (2x)
+    }
+
+    // Medium: the submitted slot is authenticated by the proof — a wrong slot must fail.
+    function test_validate_rejects_wrong_slot() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        bytes memory payload = _payload(ACCOUNT, signers);
+        // Slot word for signer 0 is at offset 32(accountId)+32(nodeId) = 64; flip its low byte.
+        payload[95] = bytes1(uint8(payload[95]) ^ 0x01);
+        assertEq(v.validate(keccak256("op"), payload), 1, "wrong slot must fail Merkle");
+    }
+
+    // Low: changing epochLength must invalidate snapshots taken under the old schedule (fail-closed).
+    function test_configVersion_invalidates_snapshots() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        bytes memory payload = _payload(ACCOUNT, signers);
+        assertEq(v.validate(keccak256("op"), payload), 0, "valid before reconfig");
+
+        // Reconfigure epoch schedule -> configVersion bumps -> old snapshots become stale.
+        v.setEpochLength(EPOCH_LEN);
+        assertEq(v.validate(keccak256("op"), payload), 1, "stale snapshots => fail-closed after reconfig");
+        assertEq(v.requiredQuorum(), type(uint256).max, "requiredQuorum unusable until re-pinned");
     }
 }
