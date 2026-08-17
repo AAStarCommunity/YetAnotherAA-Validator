@@ -218,7 +218,7 @@ contract AAStarValidator is IAAStarAlgorithm {
     ///      fail-closed: EVERY malformed / unregistered / retired-bootstrap / non-quorum input
     ///      returns 1 rather than reverting (the account calls it under try/catch, treating a
     ///      revert as fail; returning 1 keeps the failure signal uniform).
-    function validate(bytes32 hash, bytes calldata signature) external view override returns (uint256) {
+    function validate(bytes32 hash, bytes calldata signature) external view virtual override returns (uint256) {
         // Parse: variable-length nodeIds + 256-byte BLS sig (messagePoint dropped — see above).
         uint256 fixedLen = G2_POINT_LENGTH; // 256
         if (signature.length <= fixedLen) return 1;
@@ -432,7 +432,7 @@ contract AAStarValidator is IAAStarAlgorithm {
         bytes32[] memory nodeIds,
         bytes memory signature,
         bytes memory messagePoint
-    ) internal view returns (bool isValid) {
+    ) internal view virtual returns (bool isValid) {
         bytes[] memory publicKeys = _getPublicKeysByNodesMem(nodeIds);
         bytes memory aggregatedKey = _aggregatePublicKeysFromMemory(publicKeys);
         bytes memory negatedAggregatedKey = _negateG1Point(aggregatedKey);
@@ -823,7 +823,7 @@ contract AAStarValidator is IAAStarAlgorithm {
      * @param nodeId Unique node identifier
      * @param publicKey G1 public key (128 bytes)
      */
-    function registerPublicKey(bytes32 nodeId, bytes calldata publicKey) external {
+    function registerPublicKey(bytes32 nodeId, bytes calldata publicKey) external virtual {
         require(nodeId != bytes32(0), "Invalid node ID");
         require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
         require(!_isInfinity(publicKey), "pubkey is infinity");
@@ -840,6 +840,7 @@ contract AAStarValidator is IAAStarAlgorithm {
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
         registeredNodes.push(nodeId);
+        _onNodeActivated(nodeId);
 
         emit PublicKeyRegistered(nodeId, publicKey);
     }
@@ -862,7 +863,7 @@ contract AAStarValidator is IAAStarAlgorithm {
         bytes calldata publicKey,
         bytes calldata popPoint,
         bytes calldata popSig
-    ) external {
+    ) external virtual {
         require(requireStake, "Staked registration disabled");
         require(publicKey.length == G1_POINT_LENGTH, "Invalid public key length");
         // Reject the point-at-infinity encoding (all-zero). e(_, infinity)=1, so an
@@ -881,6 +882,7 @@ contract AAStarValidator is IAAStarAlgorithm {
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
         registeredNodes.push(nodeId);
+        _onNodeActivated(nodeId);
 
         emit NodeBound(nodeId, msg.sender);
         emit PublicKeyRegistered(nodeId, publicKey);
@@ -936,7 +938,7 @@ contract AAStarValidator is IAAStarAlgorithm {
     }
 
     /// @dev Remove a node from the active set + clear its operator binding.
-    function _deactivate(bytes32 nodeId) internal {
+    function _deactivate(bytes32 nodeId) internal virtual {
         address op = nodeOperator[nodeId];
         isRegistered[nodeId] = false;
         delete registeredKeys[nodeId];
@@ -945,7 +947,14 @@ contract AAStarValidator is IAAStarAlgorithm {
         if (op != address(0) && operatorNode[op] == nodeId) delete operatorNode[op];
         // registeredNodes[] is an unordered enumeration; leave the stale id (isRegistered
         // gates all reads). Compaction is a gas trade-off deferred to a later pass.
+        _onNodeDeactivated(nodeId);
     }
+
+    // --- CC-98 committee subsystem hooks (no-op in the base; overridden by the committee validator
+    //     to maintain an incremental Merkle commitment of the active set). Called at EVERY set
+    //     mutation so a subclass's commitment can never drift from isRegistered[]. ---
+    function _onNodeActivated(bytes32 nodeId) internal virtual {}
+    function _onNodeDeactivated(bytes32 nodeId) internal virtual {}
 
     // --- Owner/Safe governance (transfer owner to a Gnosis Safe after init) --------
     function setRegistry(address _registry) external onlyOwner {
@@ -992,7 +1001,7 @@ contract AAStarValidator is IAAStarAlgorithm {
      *
      * @param nodeId Unique node identifier
      */
-    function revokePublicKey(bytes32 nodeId) external onlyOwner {
+    function revokePublicKey(bytes32 nodeId) external virtual onlyOwner {
         require(isRegistered[nodeId], "Node not registered");
 
         // Clear the operator binding too, or operatorNode[op] would stay pointing at a
@@ -1004,6 +1013,7 @@ contract AAStarValidator is IAAStarAlgorithm {
         delete isBootstrap[nodeId];
         delete registeredKeys[nodeId];
         isRegistered[nodeId] = false;
+        _onNodeDeactivated(nodeId);
 
         // Remove node ID from array
         for (uint256 i = 0; i < registeredNodes.length; i++) {
@@ -1023,7 +1033,7 @@ contract AAStarValidator is IAAStarAlgorithm {
      * @param nodeIds Array of node identifiers
      * @param publicKeys Corresponding public key array
      */
-    function batchRegisterPublicKeys(bytes32[] calldata nodeIds, bytes[] calldata publicKeys) external onlyOwner {
+    function batchRegisterPublicKeys(bytes32[] calldata nodeIds, bytes[] calldata publicKeys) external virtual onlyOwner {
         // Bootstrap-only, same as registerPublicKey: once staking is mandatory this owner
         // path would let stake-less/PoP-less nodes into the active set.
         require(!requireStake, "Staking on: use registerWithProof");
@@ -1043,6 +1053,7 @@ contract AAStarValidator is IAAStarAlgorithm {
             registeredKeys[nodeIds[i]] = publicKeys[i];
             isRegistered[nodeIds[i]] = true;
             registeredNodes.push(nodeIds[i]);
+            _onNodeActivated(nodeIds[i]);
 
             emit PublicKeyRegistered(nodeIds[i], publicKeys[i]);
         }
