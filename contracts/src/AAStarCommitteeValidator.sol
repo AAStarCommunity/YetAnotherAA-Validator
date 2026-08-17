@@ -94,11 +94,13 @@ contract AAStarCommitteeValidator is AAStarValidator {
     uint256[] public freeSlots;
     /// @dev Count of currently active leaves (slots occupied). Feeds the m_e curve.
     uint256 public activeCount;
-    /// @dev Block of the most recent set mutation (activate/deactivate). snapshotEpoch requires this to
-    ///      be strictly in the past, so a keeper cannot atomically evict nodes (syncNode is permissionless
-    ///      and owner-free) and freeze the shrunken count in the SAME tx to depress m/quorum (pr-daemon
-    ///      Medium — this manipulation feeds the B1 forgery budget).
+    /// @dev Block of the current block's first set mutation, plus the root/count captured just BEFORE it.
+    ///      snapshotEpoch freezes these block-start values when the set was mutated in its own block, so a
+    ///      permissionless syncNode eviction cannot be atomically composed with the freeze to depress
+    ///      epochSetCount — without snapshotEpoch reverting (pr-daemon round-2 High). See _latchBlockStart.
     uint256 public lastSetMutationBlock;
+    bytes32 public rootAtBlockStart;
+    uint256 public countAtBlockStart;
 
     /// @dev SMT internal nodes: node[level][index]. Level 0 = leaves (leaf = nodeId, or 0 if empty).
     ///      Unset entries read as the empty-subtree hash `zeros[level]`.
@@ -149,12 +151,12 @@ contract AAStarCommitteeValidator is AAStarValidator {
             zeros[i + 1] = keccak256(abi.encode(zeros[i], zeros[i]));
         }
         runningRoot = zeros[TREE_DEPTH];
-        // oversample = 1.0: DSR's B1 security calc assumes E[committee] = m_e (λ = β*m_e). Any value > 1
-        // inflates the attacker's expected selections and breaks the N>=430 β=1/3 guarantee, so the
-        // default matches the security model exactly. setOversample can raise it (trading the DSR margin
-        // for honest-liveness headroom) but that is an explicit, configVersion-bumping deviation.
-        oversampleNum = 1;
-        oversampleDen = 1;
+        // oversample = 1.25 (pr-daemon B5): raises E[committee] to 1.25*m_e so the actual committee clears
+        // requiredQuorum with margin (liveness tail <=1.65e-4), while floor 30's forgery headroom keeps
+        // P(forge) <= ~4.4e-9 @ β=10%. This is the two-tail operating point; it gives up the old β=1/3
+        // "free gift" (out of scope under the β<=10% assumption). Pinned by test_constructor_oversample.
+        oversampleNum = 5;
+        oversampleDen = 4;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -205,6 +207,7 @@ contract AAStarCommitteeValidator is AAStarValidator {
     function _onNodeActivated(bytes32 nodeId) internal override {
         // base already guaranteed !isRegistered before this; defensively no-op on a double-activate.
         if (slotPlusOne[nodeId] != 0) return;
+        _latchBlockStart();
         uint256 slot;
         uint256 free = freeSlots.length;
         if (free != 0) {
@@ -217,7 +220,6 @@ contract AAStarCommitteeValidator is AAStarValidator {
         }
         slotPlusOne[nodeId] = slot + 1;
         activeCount += 1;
-        lastSetMutationBlock = block.number;
         _smtSet(slot, nodeId);
         emit SlotAssigned(nodeId, slot);
     }
@@ -225,13 +227,27 @@ contract AAStarCommitteeValidator is AAStarValidator {
     function _onNodeDeactivated(bytes32 nodeId) internal override {
         uint256 sp = slotPlusOne[nodeId];
         if (sp == 0) return; // defensive: never activated in committee accounting
+        _latchBlockStart();
         uint256 slot = sp - 1;
         delete slotPlusOne[nodeId];
         freeSlots.push(slot);
         activeCount -= 1;
-        lastSetMutationBlock = block.number;
         _smtSet(slot, bytes32(0));
         emit SlotCleared(nodeId, slot);
+    }
+
+    /// @dev On the FIRST set mutation of a block, capture the pre-mutation (block-start) root + count.
+    ///      snapshotEpoch freezes those when the set was mutated in its own block, so an atomic
+    ///      "evict-then-freeze" cannot depress epochSetCount, WITHOUT snapshotEpoch having to revert
+    ///      (the revert was a zero-capital migration-boundary DoS: setRequireStake(true) makes every
+    ///      bootstrap node permissionlessly syncNode-able, and a forced same-block collision could block
+    ///      pinning for a whole epoch — pr-daemon round-2 High). This keeps snapshotEpoch unconditional.
+    function _latchBlockStart() internal {
+        if (block.number != lastSetMutationBlock) {
+            rootAtBlockStart = runningRoot;
+            countAtBlockStart = activeCount;
+            lastSetMutationBlock = block.number;
+        }
     }
 
     /// @dev Set leaf `slot` to `leaf` and fold the change up to the root: O(TREE_DEPTH) hashes + SSTOREs.
@@ -272,17 +288,19 @@ contract AAStarCommitteeValidator is AAStarValidator {
         require(block.number <= startBlock + 256, "pin window elapsed");
         bytes32 bh = blockhash(startBlock);
         require(bh != bytes32(0), "blockhash unavailable");
-        // No set mutation in THIS block: forces any set change (esp. permissionless syncNode evictions)
-        // to land in an earlier block than the freeze, turning an atomic "evict-then-freeze" depression
-        // of epochSetCount into a race an honest keeper can win (pr-daemon Medium).
-        require(lastSetMutationBlock < block.number, "set mutated this block");
+        // Freeze the block-START set state: if the set was mutated in THIS block, use the pre-mutation
+        // root/count so a permissionless syncNode eviction cannot be atomically composed with the freeze
+        // to depress epochSetCount. Unconditional (no revert) → no forced-collision DoS (round-2 High).
+        bool mutatedThisBlock = lastSetMutationBlock == block.number;
+        bytes32 setRoot = mutatedThisBlock ? rootAtBlockStart : runningRoot;
+        uint256 setCount = mutatedThisBlock ? countAtBlockStart : activeCount;
 
         epochSeed[e] = bh;
-        epochSetRoot[e] = runningRoot;
-        epochSetCount[e] = activeCount;
+        epochSetRoot[e] = setRoot;
+        epochSetCount[e] = setCount;
         epochConfigVersion[e] = configVersion;
         epochPinned[e] = true;
-        emit EpochSnapshotted(e, bh, runningRoot, activeCount);
+        emit EpochSnapshotted(e, bh, setRoot, setCount);
     }
 
     function currentEpoch() public view returns (uint256) {
@@ -306,7 +324,10 @@ contract AAStarCommitteeValidator is AAStarValidator {
         emit AccountEnrolled(msg.sender);
     }
 
-    /// @notice Un-enroll the caller (e.g. before migrating away). Only the account itself can.
+    /// @notice Un-enroll the caller. Only the account itself can. WARNING: while this validator is the
+    ///         mounted one and committee mode is on, an account has to pass validate() to send ANY tx, and
+    ///         validate() requires enrollment — so unenrolling first is self-bricking. Un-enroll only
+    ///         AFTER unmounting this validator (or via owner disabling committee mode).
     function unenroll() external {
         enrolledAccount[msg.sender] = false;
         emit AccountUnenrolled(msg.sender);
@@ -318,20 +339,26 @@ contract AAStarCommitteeValidator is AAStarValidator {
 
     /// @dev DSR expected-committee curve over committed pool size n:
     ///      n ≤ 8 → whole set (bootstrap); else m_e = min(110, max(16, n/5)).
-    ///      DSR-locked curve (CC-98 comment 9a9f47c9, Jason-adjudicated target): m_e(N) = N for N<=8
-    ///      (bootstrap whole set); else clamp(ceil(N/5), 17, 86). Security target: forgery probability
-    ///      ε = P(Poisson(β*m_e) >= ceil(2*m_e/3)) <= 1e-6 per (account, epoch) under the explicit
-    ///      assumption β <= 10% malicious stake. floor 17 hits ε=2.6e-7 @ β=10% (floor 16 was 1.02e-6,
-    ///      just over); cap 86 is the β=1/3 1e-6 point, so pools of N>=430 meet 1e-6 even at worst-case
-    ///      β=1/3 for free. This methodology REQUIRES E[committee] = m_e, i.e. oversample = 1.0 (see the
-    ///      constructor) — any oversample > 1 inflates λ and breaks the N>=430 worst-case guarantee.
-    ///      CAPPED AT n keeps requiredQuorum = ceil(2*m_e/3) <= n for the 9..16 bootstrap band (where the
-    ///      floor 17 would otherwise exceed the pool); airaccount gates committee mode on N >= N0 to keep
-    ///      such small pools off the sampling path (bootstrap-cliff avoidance).
+    ///      Curve: m_e(N) = N for N<=8 (bootstrap whole set); else clamp(ceil(N/5), 30, 86).
+    ///
+    ///      TWO tails must both hold (pr-daemon round-2 B5 — B1's original single-tail floor-17/o-1.0
+    ///      curve left a 6.3% honest-liveness failure). With committee K ~ Binom(n, oversample*m_e/n) and
+    ///      requiredQuorum = ceil(2*m_e/3):
+    ///        - forgery : P(Poisson(β*oversample*m_e) >= requiredQuorum) <= 1e-6, β <= 10% (unchanged).
+    ///        - liveness: P(K < requiredQuorum) <= 1e-3 (LOOSER target, Jason-adjudicated) — a liveness
+    ///          miss is a retryable one-epoch stall (seed re-draws each epoch: two-in-a-row ~5.9e-7),
+    ///          not fund loss, so it is not held to the 1e-6 forgery bar.
+    ///      floor 30 (up from 17) gives the forgery tail enough headroom (~4.4e-9 @ β=10% in the sampling
+    ///      regime) to afford oversample = 1.25 (see constructor), which pulls the liveness tail to
+    ///      <=1.65e-4 (100% online) / <=5.9e-4 (95% online) — verified by an exact Binom/Poisson scan over
+    ///      n in [9,20000]. floor 17 could NOT afford any oversample (its forgery tail was 4.6e-7, razor
+    ///      thin). Cost: requiredQuorum in [20,58], ~10KB (typical N<=150) to ~29KB (N>=430) calldata/op.
+    ///      CAPPED AT n keeps requiredQuorum <= n in the bootstrap band; airaccount gates committee mode
+    ///      on N >= N0 (>= ~39, where sampling begins) to keep small pools off the sampling path.
     function expectedCommittee(uint256 n) public pure returns (uint256) {
         if (n <= 8) return n;
         uint256 m = (n + 4) / 5; // ceil(n/5)
-        if (m < 17) m = 17;
+        if (m < 30) m = 30;
         if (m > 86) m = 86;
         if (m > n) m = n; // never sample more than the pool
         return m;

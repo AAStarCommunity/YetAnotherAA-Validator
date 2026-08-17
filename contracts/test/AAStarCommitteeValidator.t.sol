@@ -194,30 +194,33 @@ contract AAStarCommitteeValidatorTest is Test {
 
     // ---- committee math ------------------------------------------------------------------------
 
-    // DSR-locked curve (9a9f47c9): m_e = N for N<=8; else clamp(ceil(N/5), 17, 86).
+    // Two-tail curve (B5): m_e = N for N<=8; else clamp(ceil(N/5), 30, 86).
     function test_expectedCommittee_curve() public view {
         assertEq(v.expectedCommittee(3), 3); // bootstrap: whole set
         assertEq(v.expectedCommittee(8), 8);
-        assertEq(v.expectedCommittee(9), 9); // floor 17 > n => capped to n (whole set)
-        assertEq(v.expectedCommittee(16), 16); // still capped at n
-        assertEq(v.expectedCommittee(17), 17); // floor 17
-        assertEq(v.expectedCommittee(20), 17); // ceil(20/5)=4 -> floor 17
-        assertEq(v.expectedCommittee(81), 17); // ceil(81/5)=17
-        assertEq(v.expectedCommittee(100), 20); // ceil(100/5)=20
+        assertEq(v.expectedCommittee(9), 9); // floor 30 > n => capped to n (whole set)
+        assertEq(v.expectedCommittee(29), 29); // still capped at n
+        assertEq(v.expectedCommittee(30), 30); // floor 30
+        assertEq(v.expectedCommittee(100), 30); // ceil(100/5)=20 -> floor 30
         assertEq(v.expectedCommittee(150), 30); // ceil(150/5)=30
+        assertEq(v.expectedCommittee(155), 31); // ceil(155/5)=31
         assertEq(v.expectedCommittee(300), 60); // ceil(300/5)=60
         assertEq(v.expectedCommittee(430), 86); // ceil(430/5)=86 = cap
         assertEq(v.expectedCommittee(1000), 86); // cap
     }
 
-    // pr-daemon B1 discriminators: (a) the on-chain (m_e, requiredQuorum) triple matches DSR's ε table
-    // rows, and (b) m_e is monotonic non-decreasing in N (=> the Poisson tail ε is non-increasing in N,
-    // closing the "security gets worse as the pool grows" finding).
-    function test_B1_curve_matches_DSR_table() public view {
-        // (N, m_e, requiredQuorum=ceil(2*m_e/3)) from DSR 9a9f47c9.
+    // pr-daemon B5 discriminator: the table must assert BOTH tails, not just forgery. On-chain we assert
+    // the (m_e, requiredQuorum) pair AND the deterministic liveness precondition the low liveness tail
+    // rests on — E[committee] = ceil(1.25*m_e) clears requiredQuorum with margin. Offline exact tails
+    // (oversample=1.25, verified by a full Binom/Poisson scan over n in [9,20000]):
+    //   N=40   m_e=30 req=20  forgery @β10% ~4.4e-9   liveness ~1.6e-4
+    //   N=150  m_e=30 req=20  forgery ~4.4e-9         liveness ~1.6e-4 (worst liveness point ~n=160)
+    //   N=300  m_e=60 req=40  forgery ~1e-16          liveness ~1e-8
+    //   N=430  m_e=86 req=58  forgery ~1e-24          liveness ~0
+    function test_B5_curve_two_tail_table() public view {
         uint256[3][6] memory rows = [
-            [uint256(20), 17, 12],
-            [uint256(100), 20, 14],
+            [uint256(40), 30, 20],
+            [uint256(100), 30, 20],
             [uint256(150), 30, 20],
             [uint256(300), 60, 40],
             [uint256(430), 86, 58],
@@ -225,9 +228,20 @@ contract AAStarCommitteeValidatorTest is Test {
         ];
         for (uint256 i = 0; i < rows.length; i++) {
             uint256 me = v.expectedCommittee(rows[i][0]);
-            assertEq(me, rows[i][1], "m_e mismatch vs DSR table");
-            assertEq((2 * me + 2) / 3, rows[i][2], "requiredQuorum mismatch vs DSR table");
+            uint256 req = (2 * me + 2) / 3;
+            assertEq(me, rows[i][1], "m_e mismatch");
+            assertEq(req, rows[i][2], "requiredQuorum mismatch");
+            // Liveness precondition: the oversampled mean committee must exceed requiredQuorum.
+            uint256 target = (v.oversampleNum() * me + v.oversampleDen() - 1) / v.oversampleDen();
+            assertGt(target, req, "E[committee] must clear requiredQuorum (liveness margin)");
         }
+    }
+
+    // The whole two-tail argument rests on oversample=1.25; pin the constructor default (a prior-round
+    // surviving mutant flipped it back to 1/1 with all-green tests).
+    function test_constructor_oversample() public view {
+        assertEq(v.oversampleNum(), 5);
+        assertEq(v.oversampleDen(), 4);
     }
 
     function test_B1_curve_monotonic() public view {
@@ -501,7 +515,9 @@ contract AAStarCommitteeValidatorTest is Test {
         bytes memory bad = good;
         uint256 highBit = 1 << 160;
         bytes32 tainted = bytes32(uint256(uint160(ACCOUNT)) | highBit);
-        for (uint256 b = 0; b < 32; b++) bad[b] = tainted[b];
+        for (uint256 b = 0; b < 32; b++) {
+            bad[b] = tainted[b];
+        }
         assertEq(v.validate(keccak256("op"), bad), 1, "non-canonical accountId must fail");
     }
 
@@ -517,7 +533,9 @@ contract AAStarCommitteeValidatorTest is Test {
         uint256 base = uint256(uint160(ACCOUNT));
         for (uint256 g = 1; g <= 300; g++) {
             bytes32 tainted = bytes32(base | (g << 160)); // vary only the high 96 bits
-            for (uint256 b = 0; b < 32; b++) p[b] = tainted[b];
+            for (uint256 b = 0; b < 32; b++) {
+                p[b] = tainted[b];
+            }
             assertEq(v.validate(keccak256("op"), p), 1, "no high-bit grind may be accepted");
         }
     }
@@ -545,16 +563,30 @@ contract AAStarCommitteeValidatorTest is Test {
         assertEq(v.validate(keccak256("op"), payload), 1, "pinned epochs fail-closed after oversample change");
     }
 
-    // pr-daemon Medium: a set mutation in the same block as the freeze is rejected, so syncNode
-    // evictions cannot be atomically composed with snapshotEpoch to depress epochSetCount.
-    function test_snapshot_rejects_same_block_mutation() public {
+    // pr-daemon round-2 High: snapshotEpoch no longer reverts on a same-block mutation (that revert was
+    // a migration-boundary DoS). Instead it freezes the BLOCK-START state, so an atomic evict-then-freeze
+    // cannot depress epochSetCount. Here: 3 nodes, then a same-block registration, then freeze in that
+    // block -> the snapshot must pin count 3 (pre-mutation), not 4, and NOT revert.
+    function test_snapshot_freezes_block_start_state() public {
         _registerNodes(3);
+        bytes32 rootBefore = v.runningRoot();
         vm.roll(EPOCH_LEN + 1);
         vm.setBlockhash(EPOCH_LEN, bytes32(uint256(0xAA)));
-        // Mutate the set in THIS block, then try to freeze in the same block.
-        v.registerPublicKey(keccak256("same-block"), DUMMY_KEY);
-        vm.expectRevert("set mutated this block");
+        v.registerPublicKey(keccak256("same-block"), DUMMY_KEY); // mutate in the freeze block
+        v.snapshotEpoch(); // must NOT revert
+        assertEq(v.epochSetCount(1), 3, "freezes pre-mutation (block-start) count, not 4");
+        assertEq(v.epochSetRoot(1), rootBefore, "freezes pre-mutation root");
+    }
+
+    // A mutation in an EARLIER block than the freeze is included normally (block-start == current).
+    function test_snapshot_includes_prior_block_mutation() public {
+        _registerNodes(3);
+        vm.roll(EPOCH_LEN - 1);
+        v.registerPublicKey(keccak256("prior-block"), DUMMY_KEY); // 4th node, earlier block
+        vm.roll(EPOCH_LEN + 1);
+        vm.setBlockhash(EPOCH_LEN, bytes32(uint256(0xAA)));
         v.snapshotEpoch();
+        assertEq(v.epochSetCount(1), 4, "prior-block mutation included");
     }
 
     // Medium: unbounded oversample would overflow _thresholdOf and turn fail-closed into a revert.
