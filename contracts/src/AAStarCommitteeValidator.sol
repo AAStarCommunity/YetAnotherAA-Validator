@@ -52,8 +52,7 @@ import "./AAStarValidator.sol";
 ///           reopen register-to-order (seed still unknowable at freeze) but lets a griefer exclude
 ///           registrations made between the epoch boundary and the pin. Minor fairness, not safety.
 contract AAStarCommitteeValidator is AAStarValidator {
-    // Base declares these as private constants; re-declare the two lengths the committee path needs.
-    uint256 private constant G1_LEN = 128;
+    // Base declares these as private constants; re-declare the length the committee path needs.
     uint256 private constant G2_LEN = 256;
     /// @dev Mirrors the base's private MAX_NODE_COUNT: upper bound on signers parsed in one validate().
     uint256 private constant MAX_NODE_COUNT = 100;
@@ -79,6 +78,10 @@ contract AAStarCommitteeValidator is AAStarValidator {
     event EpochSnapshotted(uint256 indexed epoch, bytes32 seed, bytes32 setRoot, uint256 setCount);
     event EpochLengthSet(uint256 epochLength);
     event OversampleSet(uint256 num, uint256 den);
+    /// @dev Emitted on every SMT leaf mutation so off-chain aggregators can reconstruct any historical
+    ///      (frozen) tree from logs alone, without re-deriving the slot allocator (pr-daemon Low).
+    event SlotAssigned(bytes32 indexed nodeId, uint256 slot);
+    event SlotCleared(bytes32 indexed nodeId, uint256 slot);
 
     // ---------------------------------------------------------------------------------------------
     //                          INCREMENTAL SPARSE MERKLE TREE (active-set commitment)
@@ -91,6 +94,11 @@ contract AAStarCommitteeValidator is AAStarValidator {
     uint256[] public freeSlots;
     /// @dev Count of currently active leaves (slots occupied). Feeds the m_e curve.
     uint256 public activeCount;
+    /// @dev Block of the most recent set mutation (activate/deactivate). snapshotEpoch requires this to
+    ///      be strictly in the past, so a keeper cannot atomically evict nodes (syncNode is permissionless
+    ///      and owner-free) and freeze the shrunken count in the SAME tx to depress m/quorum (pr-daemon
+    ///      Medium — this manipulation feeds the B1 forgery budget).
+    uint256 public lastSetMutationBlock;
 
     /// @dev SMT internal nodes: node[level][index]. Level 0 = leaves (leaf = nodeId, or 0 if empty).
     ///      Unset entries read as the empty-subtree hash `zeros[level]`.
@@ -138,20 +146,30 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///      for every block, so `block.number > startBlock` in snapshotEpoch is never true and committee
     ///      mode is permanently unpinnable (Codex High). Bumps configVersion so snapshots taken under a
     ///      previous schedule are not reused under the new one (Codex Low).
+    /// @dev 0 disables committee mode; otherwise >= 64. The real pin window is min(256, epochLength-1)
+    ///      blocks (blockhash availability vs epoch span), so epochLength == 1 is unpinnable and tiny
+    ///      values leave a window too small for a keeper; 64 keeps a usable window (pr-daemon Low).
+    ///      Bumps configVersion so snapshots taken under a previous schedule are not reused (Codex Low).
     function setEpochLength(uint256 _epochLength) external onlyOwner {
-        require(_epochLength == 0 || _epochLength >= 2, "epochLength must be 0 or >= 2");
+        require(_epochLength == 0 || _epochLength >= 64, "epochLength must be 0 or >= 64");
         epochLength = _epochLength;
         configVersion += 1;
         emit EpochLengthSet(_epochLength);
     }
 
-    /// @dev Bounded so `oversampleNum * m` in _thresholdOf cannot overflow and turn a fail-closed
-    ///      `return 1` into a revert (Codex Medium). num/den in [1, 8], den in [1, 1e9].
+    /// @dev The threshold `oversample` scales the OTHER half of the committee definition, so — exactly
+    ///      like setEpochLength — it bumps configVersion. Without this, setOversample RETROACTIVELY
+    ///      relaxes the sortition gate on ALREADY-PINNED epochs (e.g. setOversample(5,1) collapses
+    ///      _thresholdOf to type(uint256).max, admitting nodes that were out of committee), which is a
+    ///      committee-definition mutation on a frozen epoch (pr-daemon B3). Bumping fails those epochs
+    ///      closed until re-pinned. Bounds also keep `oversampleNum * m` from overflowing (num/den in
+    ///      [1,8], den in [1,1e9]).
     function setOversample(uint256 num, uint256 den) external onlyOwner {
         require(den != 0 && den <= 1e9, "den out of range");
         require(num >= den && num <= 8 * den, "oversample must be in [1, 8]");
         oversampleNum = num;
         oversampleDen = den;
+        configVersion += 1;
         emit OversampleSet(num, den);
     }
 
@@ -174,7 +192,9 @@ contract AAStarCommitteeValidator is AAStarValidator {
         }
         slotPlusOne[nodeId] = slot + 1;
         activeCount += 1;
+        lastSetMutationBlock = block.number;
         _smtSet(slot, nodeId);
+        emit SlotAssigned(nodeId, slot);
     }
 
     function _onNodeDeactivated(bytes32 nodeId) internal override {
@@ -184,7 +204,9 @@ contract AAStarCommitteeValidator is AAStarValidator {
         delete slotPlusOne[nodeId];
         freeSlots.push(slot);
         activeCount -= 1;
+        lastSetMutationBlock = block.number;
         _smtSet(slot, bytes32(0));
+        emit SlotCleared(nodeId, slot);
     }
 
     /// @dev Set leaf `slot` to `leaf` and fold the change up to the root: O(TREE_DEPTH) hashes + SSTOREs.
@@ -225,6 +247,10 @@ contract AAStarCommitteeValidator is AAStarValidator {
         require(block.number <= startBlock + 256, "pin window elapsed");
         bytes32 bh = blockhash(startBlock);
         require(bh != bytes32(0), "blockhash unavailable");
+        // No set mutation in THIS block: forces any set change (esp. permissionless syncNode evictions)
+        // to land in an earlier block than the freeze, turning an atomic "evict-then-freeze" depression
+        // of epochSetCount into a race an honest keeper can win (pr-daemon Medium).
+        require(lastSetMutationBlock < block.number, "set mutated this block");
 
         epochSeed[e] = bh;
         epochSetRoot[e] = runningRoot;
@@ -276,7 +302,11 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///         Returns type(uint256).max when the prerequisite snapshot is missing (nothing can satisfy
     ///         it — the account's mirror check then fails closed too).
     function requiredQuorum() public view returns (uint256) {
-        uint256 e = currentEpoch();
+        // Read epochLength directly — do NOT go through currentEpoch(), which reverts when epochLength
+        // == 0 (the DEFAULT/committee-off config). Returning the sentinel keeps this view fail-closed
+        // and consistent with validate()'s "return 1" for the same state (pr-daemon Medium).
+        if (epochLength == 0) return type(uint256).max;
+        uint256 e = block.number / epochLength;
         if (e == 0 || !_epochUsable(e - 1)) return type(uint256).max;
         uint256 m = expectedCommittee(epochSetCount[e - 1]);
         return _quorumOf(m);

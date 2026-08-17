@@ -134,6 +134,27 @@ contract AAStarCommitteeValidatorTest is Test {
         assertEq(v.activeCount(), 3);
     }
 
+    // pr-daemon Medium (coverage): _deactivate (via permissionless syncNode) must fire the SMT hook.
+    // Exercised through the syncNode path (distinct from revokePublicKey), which the mutant survives.
+    function test_syncNode_updates_smt() public {
+        bytes32[] memory ids = _registerNodes(3);
+        assertEq(v.activeCount(), 3);
+        uint256 slot = v.slotPlusOne(ids[1]) - 1;
+        bytes32 rootBefore = v.runningRoot();
+
+        v.setRequireStake(true); // now bootstrap nodes are stale -> syncNode can deactivate them
+        v.syncNode(ids[1]); // permissionless; goes through _deactivate -> _onNodeDeactivated
+
+        assertEq(v.activeCount(), 2, "syncNode must decrement activeCount via the hook");
+        assertEq(v.slotPlusOne(ids[1]), 0, "syncNode must free the slot via the hook");
+        assertTrue(v.runningRoot() != rootBefore, "syncNode must update the SMT root via the hook");
+        // Slot is recycled on the next activation.
+        v.setRequireStake(false);
+        bytes32 fresh = keccak256("fresh-after-sync");
+        v.registerPublicKey(fresh, DUMMY_KEY);
+        assertEq(v.slotPlusOne(fresh) - 1, slot, "freed slot recycled after syncNode");
+    }
+
     // ---- snapshot / epoch ----------------------------------------------------------------------
 
     function test_snapshot_pins_seed_setroot_count() public {
@@ -345,13 +366,80 @@ contract AAStarCommitteeValidatorTest is Test {
 
     // ---- Codex-round fixes ---------------------------------------------------------------------
 
-    // High: epochLength == 1 is permanently unpinnable, so the setter must reject it.
-    function test_setEpochLength_rejects_one() public {
+    // epochLength must be 0 or >= 64 (window min(256, epochLength-1) must be usable; 1 is unpinnable).
+    function test_setEpochLength_bounds() public {
         MockCommitteeValidator w = new MockCommitteeValidator();
-        vm.expectRevert("epochLength must be 0 or >= 2");
+        vm.expectRevert("epochLength must be 0 or >= 64");
         w.setEpochLength(1);
-        w.setEpochLength(0); // 0 (disable) allowed
-        w.setEpochLength(2); // >= 2 allowed
+        vm.expectRevert("epochLength must be 0 or >= 64");
+        w.setEpochLength(63);
+        w.setEpochLength(0); // disable allowed
+        w.setEpochLength(64); // >= 64 allowed
+    }
+
+    // pr-daemon Medium (coverage): the discriminating look-ahead test. A node registered AFTER the
+    // set was frozen for the epoch (i.e. not in setRoot[e-1]) must be rejected even though it is
+    // currently registered and would pass sortition. Deleting the look-ahead (using setRoot[e]) flips
+    // this to accept. Uses getMerkleProof against the CURRENT tree, so the frozen vs live divergence
+    // is genuinely exercised.
+    function test_validate_lookahead_rejects_post_freeze_registrant() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA))); // setRoot[1] frozen with exactly these 3 nodes
+
+        // Capture a valid frozen-member payload NOW, while the live tree still equals setRoot[1].
+        bytes32[] memory frozen = new bytes32[](2);
+        frozen[0] = ids[0];
+        frozen[1] = ids[1];
+        bytes memory frozenPayload = _payload(ACCOUNT, frozen);
+
+        // Register a 4th node AFTER the freeze: it enters the live tree (root changes) but NOT setRoot[1].
+        vm.roll(EPOCH_LEN + 5);
+        bytes32 late = keccak256("late-node");
+        v.registerPublicKey(late, DUMMY_KEY);
+        _rollAndSnapshot(2, bytes32(uint256(0xBB))); // seed[2]; epoch-2 committees use setRoot[1]
+
+        // The pre-captured frozen payload still validates (setRoot[1] is immutable).
+        assertEq(v.validate(keccak256("op"), frozenPayload), 0, "frozen members remain valid");
+
+        // The late node is currently registered and passes whole-set sortition, but ANY proof for it
+        // (built against the live root) cannot match setRoot[1] -> rejected. This is the discriminator:
+        // deleting the look-ahead (validating against setRoot[e]) would ACCEPT it.
+        bytes32[] memory withLate = new bytes32[](2);
+        withLate[0] = ids[0] < late ? ids[0] : late;
+        withLate[1] = ids[0] < late ? late : ids[0];
+        assertEq(
+            v.validate(keccak256("op"), _payload(ACCOUNT, withLate)),
+            1,
+            "post-freeze registrant must not be a valid committee member"
+        );
+    }
+
+    // pr-daemon B3: setOversample must bump configVersion so it cannot retroactively relax the
+    // sortition gate on an already-pinned epoch (setOversample(5,1) collapses T to max otherwise).
+    function test_setOversample_invalidates_pinned_epochs() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        bytes memory payload = _payload(ACCOUNT, signers);
+        assertEq(v.validate(keccak256("op"), payload), 0, "valid before oversample change");
+
+        v.setOversample(5, 1); // would collapse the gate — must instead invalidate pinned epochs
+        assertEq(v.validate(keccak256("op"), payload), 1, "pinned epochs fail-closed after oversample change");
+    }
+
+    // pr-daemon Medium: a set mutation in the same block as the freeze is rejected, so syncNode
+    // evictions cannot be atomically composed with snapshotEpoch to depress epochSetCount.
+    function test_snapshot_rejects_same_block_mutation() public {
+        _registerNodes(3);
+        vm.roll(EPOCH_LEN + 1);
+        vm.setBlockhash(EPOCH_LEN, bytes32(uint256(0xAA)));
+        // Mutate the set in THIS block, then try to freeze in the same block.
+        v.registerPublicKey(keccak256("same-block"), DUMMY_KEY);
+        vm.expectRevert("set mutated this block");
+        v.snapshotEpoch();
     }
 
     // Medium: unbounded oversample would overflow _thresholdOf and turn fail-closed into a revert.
