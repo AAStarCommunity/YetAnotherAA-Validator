@@ -215,7 +215,11 @@ contract AAStarCommitteeValidator is AAStarValidator {
     function snapshotEpoch() external {
         require(epochLength != 0, "committee mode off");
         uint256 e = block.number / epochLength;
-        require(!epochPinned[e], "epoch already pinned");
+        // Re-pinning is allowed only when the existing pin belongs to a PREVIOUS epoch schedule
+        // (configVersion). Otherwise, after an epochLength change, new-schedule epoch numbers that
+        // collide with old pinned IDs could never be re-snapshotted under the current version, stranding
+        // committee mode until the epoch counter passed every colliding old ID (Codex round-2 High).
+        require(!epochPinned[e] || epochConfigVersion[e] != configVersion, "epoch already pinned");
         uint256 startBlock = e * epochLength;
         require(block.number > startBlock, "wait for epoch start block");
         require(block.number <= startBlock + 256, "pin window elapsed");
@@ -329,6 +333,9 @@ contract AAStarCommitteeValidator is AAStarValidator {
             bytes32 nid = bytes32(signature[off:off + 32]);
             uint256 slot = uint256(bytes32(signature[off + 32:off + 64]));
             off += 64;
+            // Canonical slot only: _verifyMerkle folds just the low TREE_DEPTH bits, so slot and
+            // slot + q*2^TREE_DEPTH would share a path. Reject non-canonical aliases (Codex round-2 Low).
+            if (slot >= (1 << TREE_DEPTH)) return 1;
             // Distinct, strictly-increasing signers (blocks self-repetition inflating the aggregate).
             if (i != 0 && nid <= prevId) return 1;
             prevId = nid;

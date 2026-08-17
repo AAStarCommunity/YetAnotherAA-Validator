@@ -395,4 +395,44 @@ contract AAStarCommitteeValidatorTest is Test {
         assertEq(v.validate(keccak256("op"), payload), 1, "stale snapshots => fail-closed after reconfig");
         assertEq(v.requiredQuorum(), type(uint256).max, "requiredQuorum unusable until re-pinned");
     }
+
+    // Round-2 High: after a configVersion bump, an epoch pinned under the OLD version must be
+    // re-pinnable under the new one (else colliding epoch numbers strand committee mode forever).
+    function test_snapshot_repin_after_reconfig() public {
+        _registerNodes(3);
+        vm.roll(3 * EPOCH_LEN + 1);
+        vm.setBlockhash(3 * EPOCH_LEN, bytes32(uint256(0xCC)));
+        v.snapshotEpoch(); // pinned under configVersion 1
+        assertEq(v.epochConfigVersion(3), 1);
+
+        v.setEpochLength(EPOCH_LEN); // configVersion -> 2
+        // Same epoch/block: the stale pin must be replaceable, not rejected as "already pinned".
+        v.snapshotEpoch();
+        assertEq(v.epochConfigVersion(3), 2, "epoch re-pinned under new configVersion");
+    }
+
+    // Round-2 Low: a non-canonical slot (slot + 2^TREE_DEPTH) must be rejected, not aliased.
+    function test_validate_rejects_noncanonical_slot() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        bytes memory payload = _payload(ACCOUNT, signers);
+        // Add 2^TREE_DEPTH to signer 0's slot word (offset 64) — same low bits, must be rejected.
+        uint256 aliased = (1 << v.TREE_DEPTH()); // canonical slot is 0 or 1 here; +2^depth aliases it
+        bytes32 slotWord = bytes32(uint256(bytes32(_slice(payload, 64, 32))) + aliased);
+        for (uint256 b = 0; b < 32; b++) {
+            payload[64 + b] = slotWord[b];
+        }
+        assertEq(v.validate(keccak256("op"), payload), 1, "non-canonical slot must be rejected");
+    }
+
+    function _slice(bytes memory data, uint256 start, uint256 len) internal pure returns (bytes memory out) {
+        out = new bytes(len);
+        for (uint256 i = 0; i < len; i++) {
+            out[i] = data[start + i];
+        }
+    }
 }
