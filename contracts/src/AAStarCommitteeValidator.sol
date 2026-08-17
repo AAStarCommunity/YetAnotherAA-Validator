@@ -70,8 +70,9 @@ contract AAStarCommitteeValidator is AAStarValidator {
 
     /// @dev Blocks per epoch. 0 ⇒ committee mode OFF (validate() falls back to the base whole-set path).
     uint256 public epochLength;
-    /// @dev Oversampling numerator/denominator applied to the expected committee size m_e when deriving
-    ///      the sortition threshold T (DSR: E[selected] ≈ 1.15·m_e buys liveness margin). Default 115/100.
+    /// @dev Oversampling numerator/denominator applied to m_e when deriving the sortition threshold T:
+    ///      E[committee] = oversample·m_e, which pulls the liveness tail below its 1e-3 target. Default
+    ///      5/4 = 1.25 (pr-daemon B5 two-tail operating point; see the constructor).
     uint256 public oversampleNum;
     uint256 public oversampleDen;
 
@@ -407,32 +408,19 @@ contract AAStarCommitteeValidator is AAStarValidator {
         // Committee mode disabled → behave exactly like the base contract (whole-set aggregate verify).
         if (epochLength == 0) return _validateWholeSet(hash, signature);
 
-        uint256 e = block.number / epochLength;
-        // Need seed[e] (this epoch) and setRoot[e-1] (frozen last epoch, the look-ahead set), both under
-        // the current epoch schedule. Fail-closed if either is missing/stale: the permissionless keeper
-        // must snapshot each epoch inside its window.
-        if (e == 0 || !_epochUsable(e) || !_epochUsable(e - 1)) return 1;
-        bytes32 seed = epochSeed[e];
-        bytes32 setRoot = epochSetRoot[e - 1];
-        uint256 committedCount = epochSetCount[e - 1];
-
-        // ---- parse layout: accountId(32) || k×(nodeId(32) || slot(32) || proof(TREE_DEPTH*32)) || blsSig(256)
-        //      The slot is submitter-provided and authenticated by the Merkle proof against setRoot[e-1]:
-        //      each nodeId sits at exactly one slot in the frozen tree, so a wrong slot cannot verify. This
-        //      binds membership to the node's HISTORICAL slot in the frozen set, so a node whose live slot
-        //      was recycled+reassigned after the snapshot is still provable (Codex Medium: slot-reuse).
-        uint256 perSigner = 64 + TREE_DEPTH * 32;
-        if (signature.length < 32 + G2_LEN) return 1;
-        uint256 body = signature.length - 32 - G2_LEN;
-        if (body == 0 || body % perSigner != 0) return 1;
-        uint256 k = body / perSigner;
-        if (k > MAX_NODE_COUNT) return 1; // gas-griefing bound (shared with the base cap)
-
-        // requiredQuorum for THIS epoch (over the look-ahead set).
-        uint256 m = expectedCommittee(committedCount);
-        uint256 required = _quorumOf(m);
-        if (k < required) return 1;
-        uint256 T = _thresholdOf(committedCount, m);
+        bytes32 seed;
+        bytes32 setRoot;
+        uint256 committedCount;
+        {
+            uint256 e = block.number / epochLength;
+            // Need seed[e] (this epoch) and setRoot[e-1] (frozen last epoch, the look-ahead set), both
+            // under the current epoch schedule. Fail-closed if either is missing/stale (keeper must
+            // snapshot each epoch inside its window).
+            if (e == 0 || !_epochUsable(e) || !_epochUsable(e - 1)) return 1;
+            seed = epochSeed[e];
+            setRoot = epochSetRoot[e - 1];
+            committedCount = epochSetCount[e - 1];
+        }
 
         bytes32 accountId = bytes32(signature[0:32]);
         // accountId MUST be the canonical zero-extension of a 160-bit address. The enrollment gate below
@@ -446,6 +434,60 @@ contract AAStarCommitteeValidator is AAStarValidator {
         // non-enrolled address fails closed here.
         if (!enrolledAccount[address(uint160(uint256(accountId)))]) return 1;
 
+        // ---- parse layout: accountId(32) || k×(nodeId(32) || slot(32) || proof(TREE_DEPTH*32)) || blsSig
+        //      The slot is submitter-provided and authenticated by the Merkle proof against setRoot[e-1];
+        //      a wrong slot cannot verify, so membership binds to the node's HISTORICAL slot (Codex Medium).
+        //      Intermediate parse/quorum locals are block-scoped so validate()'s live stack stays within
+        //      the non-via-IR limit that `forge coverage` compiles under.
+        uint256 k;
+        uint256 T;
+        {
+            uint256 perSigner = 64 + TREE_DEPTH * 32;
+            if (signature.length < 32 + G2_LEN) return 1;
+            uint256 body = signature.length - 32 - G2_LEN;
+            if (body == 0 || body % perSigner != 0) return 1;
+            k = body / perSigner;
+            if (k > MAX_NODE_COUNT) return 1; // gas-griefing bound (shared with the base cap)
+            uint256 m = expectedCommittee(committedCount);
+            if (k < _quorumOf(m)) return 1; // requiredQuorum for THIS epoch (over the look-ahead set)
+            T = _thresholdOf(committedCount, m);
+        }
+
+        // Per-signer membership + sortition is factored into a helper (params packed into a memory struct
+        // = one stack slot) so validate()'s own stack stays within the non-via-IR limit `forge coverage`
+        // compiles under. ok=false means some check failed (fail-closed).
+        (bool ok, bytes32[] memory nodeIds) = _verifyCommitteeSigners(signature, k, _Ctx(seed, setRoot, accountId, T));
+        if (!ok) return 1;
+
+        // blsSig is the trailing G2_LEN bytes: off after k signers is exactly signature.length - G2_LEN.
+        bytes calldata blsSignature = signature[signature.length - G2_LEN:];
+        if (_isG2InfinityCalldata(blsSignature)) return 1;
+
+        bytes memory messagePoint = _hashToG2(hash);
+        if (_isG2InfinityMemory(messagePoint)) return 1;
+
+        bytes memory blsSigMem = blsSignature;
+        return _validateBLSSignatureMem(nodeIds, blsSigMem, messagePoint) ? 0 : 1;
+    }
+
+    /// @dev Parse and verify the k committee signers: canonical slot, strictly-increasing distinct
+    ///      nodeIds, still-registered + staked, Merkle membership in the look-ahead setRoot, and the
+    ///      sortition draw. Returns (true, nodeIds) on full success; (false, []) the moment any check
+    ///      fails. Split out of validate() to keep that frame within the non-via-IR stack limit.
+    /// @dev Committee-verification parameters, packed so the helper takes one memory pointer instead of
+    ///      four stack words (keeps both frames within the non-via-IR limit for `forge coverage`).
+    struct _Ctx {
+        bytes32 seed;
+        bytes32 setRoot;
+        bytes32 accountId;
+        uint256 T;
+    }
+
+    function _verifyCommitteeSigners(bytes calldata signature, uint256 k, _Ctx memory ctx)
+        internal
+        view
+        returns (bool, bytes32[] memory)
+    {
         bytes32[] memory nodeIds = new bytes32[](k);
         bytes32 prevId = bytes32(0);
         uint256 off = 32;
@@ -455,35 +497,28 @@ contract AAStarCommitteeValidator is AAStarValidator {
             off += 64;
             // Canonical slot only: _verifyMerkle folds just the low TREE_DEPTH bits, so slot and
             // slot + q*2^TREE_DEPTH would share a path. Reject non-canonical aliases (Codex round-2 Low).
-            if (slot >= (1 << TREE_DEPTH)) return 1;
+            if (slot >= (1 << TREE_DEPTH)) return (false, nodeIds);
             // Distinct, strictly-increasing signers (blocks self-repetition inflating the aggregate).
-            if (i != 0 && nid <= prevId) return 1;
+            if (i != 0 && nid <= prevId) return (false, nodeIds);
             prevId = nid;
             // Still-active + economically backed (rejects retired bootstrap in staked mode).
-            if (!isRegistered[nid]) return 1;
-            if (requireStake && isBootstrap[nid]) return 1;
+            if (!isRegistered[nid]) return (false, nodeIds);
+            if (requireStake && isBootstrap[nid]) return (false, nodeIds);
             // (a) Membership in the look-ahead set: Merkle proof at the submitted (authenticated) slot.
-            if (!_verifyMerkle(setRoot, slot, nid, signature[off:off + TREE_DEPTH * 32])) return 1;
+            if (!_verifyMerkle(ctx.setRoot, slot, nid, signature[off:off + TREE_DEPTH * 32])) {
+                return (false, nodeIds);
+            }
             off += TREE_DEPTH * 32;
-            // (b) Sortition: the committee membership the submitter cannot choose. When T == max the
-            //     pool degrades to the whole set (bootstrap/tiny pool) — skip the draw so membership is
-            //     truly universal (a draw == max, prob 2^-256, must not spuriously exclude a node).
-            if (T != type(uint256).max) {
-                uint256 draw = uint256(keccak256(abi.encode(CMT_DOMAIN, seed, accountId, nid)));
-                if (draw >= T) return 1;
+            // (b) Sortition: the committee membership the submitter cannot choose. When T == max the pool
+            //     degrades to the whole set — skip the draw so membership is truly universal.
+            if (ctx.T != type(uint256).max) {
+                if (uint256(keccak256(abi.encode(CMT_DOMAIN, ctx.seed, ctx.accountId, nid))) >= ctx.T) {
+                    return (false, nodeIds);
+                }
             }
             nodeIds[i] = nid;
         }
-
-        bytes calldata blsSignature = signature[off:off + G2_LEN];
-        if (_isG2InfinityCalldata(blsSignature)) return 1;
-
-        bytes memory messagePoint = _hashToG2(hash);
-        if (_isG2InfinityMemory(messagePoint)) return 1;
-
-        bytes memory blsSigMem = blsSignature;
-        bool valid = _validateBLSSignatureMem(nodeIds, blsSigMem, messagePoint);
-        return valid ? 0 : 1;
+        return (true, nodeIds);
     }
 
     /// @dev The base whole-set parse+verify, inlined for the epochLength==0 fallback. Kept byte-identical
