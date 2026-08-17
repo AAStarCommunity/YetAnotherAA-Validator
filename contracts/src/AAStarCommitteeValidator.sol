@@ -148,8 +148,12 @@ contract AAStarCommitteeValidator is AAStarValidator {
             zeros[i + 1] = keccak256(abi.encode(zeros[i], zeros[i]));
         }
         runningRoot = zeros[TREE_DEPTH];
-        oversampleNum = 115;
-        oversampleDen = 100;
+        // oversample = 1.0: DSR's B1 security calc assumes E[committee] = m_e (λ = β*m_e). Any value > 1
+        // inflates the attacker's expected selections and breaks the N>=430 β=1/3 guarantee, so the
+        // default matches the security model exactly. setOversample can raise it (trading the DSR margin
+        // for honest-liveness headroom) but that is an explicit, configVersion-bumping deviation.
+        oversampleNum = 1;
+        oversampleDen = 1;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -313,15 +317,21 @@ contract AAStarCommitteeValidator is AAStarValidator {
 
     /// @dev DSR expected-committee curve over committed pool size n:
     ///      n ≤ 8 → whole set (bootstrap); else m_e = min(110, max(16, n/5)).
-    ///      CAPPED AT n: the expected committee can never exceed the pool. Without this, a pool of
-    ///      9..15 nodes gets m_e = 16 (the floor) and requiredQuorum = ceil(2*16/3) = 11 > n, making
-    ///      every op unsatisfiable (liveness DoS). Capping degrades such pools to the whole set, so
-    ///      requiredQuorum = ceil(2n/3) <= n always holds.
+    ///      DSR-locked curve (CC-98 comment 9a9f47c9, Jason-adjudicated target): m_e(N) = N for N<=8
+    ///      (bootstrap whole set); else clamp(ceil(N/5), 17, 86). Security target: forgery probability
+    ///      ε = P(Poisson(β*m_e) >= ceil(2*m_e/3)) <= 1e-6 per (account, epoch) under the explicit
+    ///      assumption β <= 10% malicious stake. floor 17 hits ε=2.6e-7 @ β=10% (floor 16 was 1.02e-6,
+    ///      just over); cap 86 is the β=1/3 1e-6 point, so pools of N>=430 meet 1e-6 even at worst-case
+    ///      β=1/3 for free. This methodology REQUIRES E[committee] = m_e, i.e. oversample = 1.0 (see the
+    ///      constructor) — any oversample > 1 inflates λ and breaks the N>=430 worst-case guarantee.
+    ///      CAPPED AT n keeps requiredQuorum = ceil(2*m_e/3) <= n for the 9..16 bootstrap band (where the
+    ///      floor 17 would otherwise exceed the pool); airaccount gates committee mode on N >= N0 to keep
+    ///      such small pools off the sampling path (bootstrap-cliff avoidance).
     function expectedCommittee(uint256 n) public pure returns (uint256) {
         if (n <= 8) return n;
-        uint256 m = n / 5;
-        if (m < 16) m = 16;
-        if (m > 110) m = 110;
+        uint256 m = (n + 4) / 5; // ceil(n/5)
+        if (m < 17) m = 17;
+        if (m > 86) m = 86;
         if (m > n) m = n; // never sample more than the pool
         return m;
     }

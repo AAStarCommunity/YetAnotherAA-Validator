@@ -194,15 +194,50 @@ contract AAStarCommitteeValidatorTest is Test {
 
     // ---- committee math ------------------------------------------------------------------------
 
+    // DSR-locked curve (9a9f47c9): m_e = N for N<=8; else clamp(ceil(N/5), 17, 86).
     function test_expectedCommittee_curve() public view {
         assertEq(v.expectedCommittee(3), 3); // bootstrap: whole set
         assertEq(v.expectedCommittee(8), 8);
-        assertEq(v.expectedCommittee(9), 9); // floor-16 capped at n (liveness: never sample > pool)
-        assertEq(v.expectedCommittee(15), 15); // still capped at n
-        assertEq(v.expectedCommittee(16), 16); // floor
-        assertEq(v.expectedCommittee(80), 16); // n/5=16
-        assertEq(v.expectedCommittee(100), 20); // n/5
-        assertEq(v.expectedCommittee(1000), 110); // cap
+        assertEq(v.expectedCommittee(9), 9); // floor 17 > n => capped to n (whole set)
+        assertEq(v.expectedCommittee(16), 16); // still capped at n
+        assertEq(v.expectedCommittee(17), 17); // floor 17
+        assertEq(v.expectedCommittee(20), 17); // ceil(20/5)=4 -> floor 17
+        assertEq(v.expectedCommittee(81), 17); // ceil(81/5)=17
+        assertEq(v.expectedCommittee(100), 20); // ceil(100/5)=20
+        assertEq(v.expectedCommittee(150), 30); // ceil(150/5)=30
+        assertEq(v.expectedCommittee(300), 60); // ceil(300/5)=60
+        assertEq(v.expectedCommittee(430), 86); // ceil(430/5)=86 = cap
+        assertEq(v.expectedCommittee(1000), 86); // cap
+    }
+
+    // pr-daemon B1 discriminators: (a) the on-chain (m_e, requiredQuorum) triple matches DSR's ε table
+    // rows, and (b) m_e is monotonic non-decreasing in N (=> the Poisson tail ε is non-increasing in N,
+    // closing the "security gets worse as the pool grows" finding).
+    function test_B1_curve_matches_DSR_table() public view {
+        // (N, m_e, requiredQuorum=ceil(2*m_e/3)) from DSR 9a9f47c9.
+        uint256[3][6] memory rows = [
+            [uint256(20), 17, 12],
+            [uint256(100), 20, 14],
+            [uint256(150), 30, 20],
+            [uint256(300), 60, 40],
+            [uint256(430), 86, 58],
+            [uint256(2000), 86, 58]
+        ];
+        for (uint256 i = 0; i < rows.length; i++) {
+            uint256 me = v.expectedCommittee(rows[i][0]);
+            assertEq(me, rows[i][1], "m_e mismatch vs DSR table");
+            assertEq((2 * me + 2) / 3, rows[i][2], "requiredQuorum mismatch vs DSR table");
+        }
+    }
+
+    function test_B1_curve_monotonic() public view {
+        uint256 prev = 0;
+        for (uint256 n = 9; n <= 3000; n += 7) {
+            uint256 me = v.expectedCommittee(n);
+            assertGe(me, prev, "m_e must be non-decreasing in N (tail non-increasing)");
+            prev = me;
+        }
+        assertEq(prev, 86, "curve tops out at the cap");
     }
 
     /// @dev Regression for the 9..15 pool liveness DoS: quorum must be satisfiable (<= n).
