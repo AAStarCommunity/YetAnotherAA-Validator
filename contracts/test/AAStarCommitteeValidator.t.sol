@@ -351,50 +351,101 @@ contract AAStarCommitteeValidatorTest is Test {
         assertEq(v.validate(keccak256("op"), payload), 1, "tampered proof must fail");
     }
 
-    function test_validate_rejects_wrong_accountId_committee() public {
-        // With a partial-selection pool, the committee is account-specific: proofs valid but the
-        // sortition draw for a DIFFERENT account excludes these signers => fail. Demonstrates the
-        // account-binding of committee membership.
-        bytes32[] memory ids = _registerNodes(40); // n=40 => m=16, target=ceil(1.15*16)=19 < 40 => partial
+    /// @dev Sortition draw for `account`/`nid` matching the contract exactly.
+    function _draw(address account, bytes32 nid, bytes32 seed) internal pure returns (uint256) {
+        return uint256(keccak256(abi.encode(keccak256("CMT_SELECT"), seed, bytes32(uint256(uint160(account))), nid)));
+    }
+
+    /// @dev Partition a registered pool into ACCOUNT's committee vs the rest, for a partial-sampling pool.
+    function _partition(bytes32[] memory ids, address account, bytes32 seed, uint256 T)
+        internal
+        pure
+        returns (bytes32[] memory sel, bytes32[] memory non)
+    {
+        sel = new bytes32[](ids.length);
+        non = new bytes32[](ids.length);
+        uint256 ns;
+        uint256 nn;
+        for (uint256 i = 0; i < ids.length; i++) {
+            if (_draw(account, ids[i], seed) < T) sel[ns++] = ids[i];
+            else non[nn++] = ids[i];
+        }
+        assembly {
+            mstore(sel, ns)
+            mstore(non, nn)
+        }
+    }
+
+    // pr-daemon round-3: the CORE mechanism must have a discriminating regression test. n=100 => m=30,
+    // T with oversample 1.25 => ~38% selected, a clean partial split. Baseline of `required` committee
+    // members validates; swapping ONE for a non-committee node (still registered + Merkle-valid) must be
+    // rejected BY SORTITION. Deleting the draw check flips the second assert 1->0 (verified by mutation).
+    function test_validate_sortition_rejects_noncommittee_signer() public {
+        bytes32[] memory ids = _registerNodes(100);
         _rollAndSnapshot(1, bytes32(uint256(0xAA)));
         _rollAndSnapshot(2, bytes32(uint256(0xBB)));
-
         bytes32 seed = v.epochSeed(2);
-        uint256 n = v.epochSetCount(1);
-        uint256 m = v.expectedCommittee(n);
-        uint256 T = v.exposedThreshold(n, m);
+        uint256 m = v.expectedCommittee(v.epochSetCount(1));
+        uint256 T = v.exposedThreshold(v.epochSetCount(1), m);
+        uint256 required = (2 * m + 2) / 3;
+        assertLt(T, type(uint256).max, "pool must be in partial-sampling regime");
+
+        (bytes32[] memory sel, bytes32[] memory non) = _partition(ids, ACCOUNT, seed, T);
+        require(sel.length >= required && non.length >= 1, "setup: need selected + a non-selected node");
+
+        // Baseline: `required` committee members validate.
+        bytes32[] memory good = new bytes32[](required);
+        for (uint256 i = 0; i < required; i++) {
+            good[i] = sel[i];
+        }
+        _sortAsc(good);
+        assertEq(v.validate(keccak256("op"), _payload(ACCOUNT, good)), 0, "all-committee signers valid");
+
+        // Discriminator: replace one member with a NON-committee node -> sortition must reject.
+        bytes32[] memory mixed = new bytes32[](required);
+        for (uint256 i = 0; i < required - 1; i++) {
+            mixed[i] = sel[i];
+        }
+        mixed[required - 1] = non[0];
+        _sortAsc(mixed);
+        assertEq(
+            v.validate(keccak256("op"), _payload(ACCOUNT, mixed)),
+            1,
+            "a non-committee signer must be rejected by sortition"
+        );
+    }
+
+    // Account-binding: the SAME committee members that pass for ACCOUNT must be rejected for a different
+    // account (different draw). Asserts unconditionally (the prior version guarded the assert behind an
+    // `if (someExcluded)` that was always false — pr-daemon round-3).
+    function test_validate_committee_is_account_bound() public {
+        bytes32[] memory ids = _registerNodes(100);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32 seed = v.epochSeed(2);
+        uint256 m = v.expectedCommittee(v.epochSetCount(1));
+        uint256 T = v.exposedThreshold(v.epochSetCount(1), m);
         uint256 required = (2 * m + 2) / 3;
 
-        // Collect `required` signers that ARE in ACCOUNT's committee.
+        (bytes32[] memory sel,) = _partition(ids, ACCOUNT, seed, T);
+        require(sel.length >= required, "setup: need enough ACCOUNT committee members");
         bytes32[] memory chosen = new bytes32[](required);
-        uint256 c;
-        for (uint256 i = 0; i < ids.length && c < required; i++) {
-            uint256 draw = uint256(
-                keccak256(abi.encode(keccak256("CMT_SELECT"), seed, bytes32(uint256(uint160(ACCOUNT))), ids[i]))
-            );
-            if (draw < T) {
-                chosen[c++] = ids[i];
-            }
+        for (uint256 i = 0; i < required; i++) {
+            chosen[i] = sel[i];
         }
-        require(c == required, "need enough selected signers for ACCOUNT");
         _sortAsc(chosen);
-        // Valid for ACCOUNT.
-        assertEq(v.validate(keccak256("op"), _payload(ACCOUNT, chosen)), 0, "selected committee valid for its account");
-        // Same signers, DIFFERENT account => at least one is out of that account's committee => fail.
+        assertEq(v.validate(keccak256("op"), _payload(ACCOUNT, chosen)), 0, "valid for its own account");
+
         address other = address(0xB0B);
         vm.prank(other);
-        v.enroll(); // enroll so the rejection below is by committee sortition, not by enrollment
-        // sanity: ensure not all `chosen` are also selected for `other` (else the test is vacuous)
+        v.enroll();
+        // At least one of `chosen` must be outside `other`'s committee (draw >= T) — assert it, don't skip.
         bool someExcluded;
         for (uint256 i = 0; i < chosen.length; i++) {
-            uint256 draw = uint256(
-                keccak256(abi.encode(keccak256("CMT_SELECT"), seed, bytes32(uint256(uint160(other))), chosen[i]))
-            );
-            if (draw >= T) someExcluded = true;
+            if (_draw(other, chosen[i], seed) >= T) someExcluded = true;
         }
-        if (someExcluded) {
-            assertEq(v.validate(keccak256("op"), _payload(other, chosen)), 1, "committee is account-bound");
-        }
+        require(someExcluded, "setup: chosen must not be a full committee for other too");
+        assertEq(v.validate(keccak256("op"), _payload(other, chosen)), 1, "committee is account-bound");
     }
 
     function test_requiredQuorum_view_tracks_lookahead() public {
@@ -496,6 +547,18 @@ contract AAStarCommitteeValidatorTest is Test {
         // An un-enrolled accountId (e.g. a flip-order fabricated prefix) fails closed regardless of the
         // committee/sortition — this blocks the B2 shape-collision path on-chain.
         assertEq(v.validate(keccak256("op"), _payload(address(0xDEAD), signers)), 1, "unenrolled => fail-closed");
+    }
+
+    // pr-daemon round-3 regression: a short signature must fail closed (return 1), NOT revert on an
+    // out-of-bounds calldata slice. Committee mode on, snapshots present so the length guard is reached.
+    function test_validate_short_signature_fails_closed() public {
+        _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        assertEq(v.validate(keccak256("op"), hex""), 1, "empty sig => return 1");
+        assertEq(v.validate(keccak256("op"), hex"01020304"), 1, "4-byte sig => return 1");
+        bytes memory b31 = new bytes(31);
+        assertEq(v.validate(keccak256("op"), b31), 1, "31-byte sig => return 1 (no accountId slice revert)");
     }
 
     // pr-daemon B4: accountId must be canonical (high 96 bits zero). The enrollment gate reads the low

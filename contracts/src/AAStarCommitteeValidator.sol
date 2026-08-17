@@ -408,6 +408,11 @@ contract AAStarCommitteeValidator is AAStarValidator {
         // Committee mode disabled → behave exactly like the base contract (whole-set aggregate verify).
         if (epochLength == 0) return _validateWholeSet(hash, signature);
 
+        // Length guard FIRST — before any calldata slice — so a short signature fails closed (return 1)
+        // instead of reverting on an out-of-bounds slice. Uniform fail-closed is the base contract's
+        // contract (pr-daemon round-3 regression: an earlier accountId slice moved ahead of this check).
+        if (signature.length < 32 + G2_LEN) return 1;
+
         bytes32 seed;
         bytes32 setRoot;
         uint256 committedCount;
@@ -443,8 +448,7 @@ contract AAStarCommitteeValidator is AAStarValidator {
         uint256 T;
         {
             uint256 perSigner = 64 + TREE_DEPTH * 32;
-            if (signature.length < 32 + G2_LEN) return 1;
-            uint256 body = signature.length - 32 - G2_LEN;
+            uint256 body = signature.length - 32 - G2_LEN; // safe: length >= 32 + G2_LEN checked above
             if (body == 0 || body % perSigner != 0) return 1;
             k = body / perSigner;
             if (k > MAX_NODE_COUNT) return 1; // gas-griefing bound (shared with the base cap)
