@@ -49,6 +49,8 @@ contract AAStarCommitteeValidatorTest is Test {
     function setUp() public {
         v = new MockCommitteeValidator();
         v.setEpochLength(EPOCH_LEN);
+        vm.prank(ACCOUNT);
+        v.enroll(); // committee ops require the account to have self-enrolled (B2 defense-in-depth)
 
         DUMMY_KEY = new bytes(128);
         DUMMY_SIG = new bytes(256);
@@ -331,6 +333,8 @@ contract AAStarCommitteeValidatorTest is Test {
         assertEq(v.validate(keccak256("op"), _payload(ACCOUNT, chosen)), 0, "selected committee valid for its account");
         // Same signers, DIFFERENT account => at least one is out of that account's committee => fail.
         address other = address(0xB0B);
+        vm.prank(other);
+        v.enroll(); // enroll so the rejection below is by committee sortition, not by enrollment
         // sanity: ensure not all `chosen` are also selected for `other` (else the test is vacuous)
         bool someExcluded;
         for (uint256 i = 0; i < chosen.length; i++) {
@@ -412,6 +416,37 @@ contract AAStarCommitteeValidatorTest is Test {
             1,
             "post-freeze registrant must not be a valid committee member"
         );
+    }
+
+    // pr-daemon B2 (defense-in-depth): committeeActive view + self-enroll + unenrolled fail-closed.
+    function test_committeeActive_view() public {
+        assertTrue(v.committeeActive(), "epochLength set => active");
+        MockCommitteeValidator w = new MockCommitteeValidator();
+        assertFalse(w.committeeActive(), "epochLength 0 => inactive");
+    }
+
+    function test_enroll_selfproving() public {
+        assertFalse(v.enrolledAccount(address(0xBEEF)));
+        vm.prank(address(0xBEEF));
+        v.enroll();
+        assertTrue(v.enrolledAccount(address(0xBEEF)), "enroll sets caller");
+        vm.prank(address(0xBEEF));
+        v.unenroll();
+        assertFalse(v.enrolledAccount(address(0xBEEF)), "unenroll clears caller");
+    }
+
+    function test_validate_rejects_unenrolled_account() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        // ACCOUNT is enrolled (setUp) -> valid.
+        assertEq(v.validate(keccak256("op"), _payload(ACCOUNT, signers)), 0, "enrolled account valid");
+        // An un-enrolled accountId (e.g. a flip-order fabricated prefix) fails closed regardless of the
+        // committee/sortition — this blocks the B2 shape-collision path on-chain.
+        assertEq(v.validate(keccak256("op"), _payload(address(0xDEAD), signers)), 1, "unenrolled => fail-closed");
     }
 
     // pr-daemon B3: setOversample must bump configVersion so it cannot retroactively relax the

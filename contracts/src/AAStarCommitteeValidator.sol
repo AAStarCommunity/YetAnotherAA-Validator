@@ -128,6 +128,20 @@ contract AAStarCommitteeValidator is AAStarValidator {
     /// @dev Bumped on every epochLength change; namespaces all epoch snapshots to their schedule.
     uint256 public configVersion;
 
+    /// @dev Accounts that have self-enrolled for committee validation. validate() fails closed unless the
+    ///      injected accountId maps to an enrolled account. This is DEFENSE-IN-DEPTH for the accountId
+    ///      trust (pr-daemon B2, agreed with airaccount f444db89): the MANDATORY fix is the account
+    ///      injecting address(this), but enrollment (a) blocks the flip-order shape collision — a
+    ///      legacy-shaped payload's fabricated accountId prefix maps to a non-enrolled address → reject
+    ///      — and (b) turns a FREE offline grind over 2^256 accountIds into a gas-metered grind over
+    ///      addresses the attacker had to enroll (enroll self-proves via msg.sender). It does NOT
+    ///      replace injection: an attacker can still enroll its own accounts, so accountId==address(this)
+    ///      at the account remains the primary guarantee.
+    mapping(address => bool) public enrolledAccount;
+
+    event AccountEnrolled(address indexed account);
+    event AccountUnenrolled(address indexed account);
+
     constructor() AAStarValidator() {
         // Empty-subtree hashes + empty-tree root.
         for (uint256 i = 0; i < TREE_DEPTH; i++) {
@@ -150,6 +164,12 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///      blocks (blockhash availability vs epoch span), so epochLength == 1 is unpinnable and tiny
     ///      values leave a window too small for a keeper; 64 keeps a usable window (pr-daemon Low).
     ///      Bumps configVersion so snapshots taken under a previous schedule are not reused (Codex Low).
+    ///      MIGRATION INTERLOCK (pr-daemon B2, airaccount f444db89): committee mode MUST NOT be enabled
+    ///      before the accountId-injecting v0.30.0 accounts are deployed, mounted, and (defense-in-depth)
+    ///      enrolled. Flipping this on early would fail-close honest legacy traffic while an attacker's
+    ///      legacy-shaped payload parses as a committee op — but enrollment blocks that path on-chain
+    ///      (non-enrolled accountId => reject), so the residual is an owner/Safe process ordering:
+    ///      deploy+mount+enroll accounts first, THEN setEpochLength.
     function setEpochLength(uint256 _epochLength) external onlyOwner {
         require(_epochLength == 0 || _epochLength >= 64, "epochLength must be 0 or >= 64");
         epochLength = _epochLength;
@@ -265,6 +285,28 @@ contract AAStarCommitteeValidator is AAStarValidator {
         return block.number / epochLength;
     }
 
+    /// @notice Whether committee mode is active. The ACCOUNT reads this to choose its signature framing
+    ///         (inject accountId + committee layout) rather than guessing from the payload shape — the
+    ///         shape-collision root of the flip-order attack (pr-daemon B2, airaccount f444db89). Same
+    ///         validator state drives both the validator's parse and the account's framing → no desync.
+    function committeeActive() external view returns (bool) {
+        return epochLength != 0;
+    }
+
+    /// @notice Self-enroll the caller for committee validation. msg.sender IS the account, so enrollment
+    ///         is self-proving — no trusted external input. Required before an account's committee ops
+    ///         validate (defense-in-depth for accountId; see enrolledAccount).
+    function enroll() external {
+        enrolledAccount[msg.sender] = true;
+        emit AccountEnrolled(msg.sender);
+    }
+
+    /// @notice Un-enroll the caller (e.g. before migrating away). Only the account itself can.
+    function unenroll() external {
+        enrolledAccount[msg.sender] = false;
+        emit AccountUnenrolled(msg.sender);
+    }
+
     // ---------------------------------------------------------------------------------------------
     //                          COMMITTEE MATH (m_e curve + threshold)
     // ---------------------------------------------------------------------------------------------
@@ -355,6 +397,10 @@ contract AAStarCommitteeValidator is AAStarValidator {
         uint256 T = _thresholdOf(committedCount, m);
 
         bytes32 accountId = bytes32(signature[0:32]);
+        // Defense-in-depth for the account-injected accountId (pr-daemon B2): the account must have
+        // self-enrolled. A flip-order legacy-shaped payload whose fabricated accountId prefix maps to a
+        // non-enrolled address fails closed here, and grinding accountId now costs an enroll tx per try.
+        if (!enrolledAccount[address(uint160(uint256(accountId)))]) return 1;
 
         bytes32[] memory nodeIds = new bytes32[](k);
         bytes32 prevId = bytes32(0);
