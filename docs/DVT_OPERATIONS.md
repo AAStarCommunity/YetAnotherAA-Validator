@@ -12,11 +12,11 @@
 ## 两种模式（同一验证器，owner 手动开关，非自动）
 | | Legacy（whole-set） | Committee（per-proposal） |
 |---|---|---|
-| 开关 | `epochLength=0`（默认） | `setEpochLength(N≠0)` |
+| 开关 | `epochLength=0`（默认） | `setEpochLength(N≥64)`（约束 `==0 \|\| >=64`，N=1..63 revert） |
 | 签名集 | 提交的 nodeId（账户 tier 定最小数） | per-proposal 抽样委员会 |
 | quorum | 账户 tier 要求 | `requiredQuorum()=⌈2·m_e/3⌉` |
 | 抽样 | 无 | `H(CMT_SELECT, seed, accountId, nodeId) < T` |
-| 前置 | 节点注册 | 节点注册 + 账户 `enrollInCommitteeValidator()` + keeper |
+| 前置 | 节点注册 | 节点注册 + 账户 `enroll()`（airaccount 侧封装 `enrollInCommitteeValidator()`）+ keeper |
 
 **降级规则**：legacy↔committee 手动切；committee 模式**内**委员会大小随 N 自动伸缩（下表）。committee 不需要 17/30 个节点才能用 —— N=3 即可（退化 whole-set）。
 
@@ -36,7 +36,7 @@
 1. validator 合约部署（committee 版 = `#237` AAStarCommitteeValidator）
 2. 账户 router `registerAlgorithm(0x01, validator)`（set-once + finalized，不可改指）
 3. 节点注册到该 validator：`registerWithProof`（生产，质押 30 ETH + PoP）或 `batchRegisterPublicKeys`（bootstrap，owner，仅测试/受信）
-4. committee 模式还需：账户 `enrollInCommitteeValidator()` → **迁移联锁：enroll 必须在 setEpochLength 之前**（否则未 enroll 账户 self-brick）
+4. committee 模式还需：账户 self-enroll 调验证器 `enroll()`（本仓 `AAStarCommitteeValidator.sol:323`，selector `0xe65f2a7e`，msg.sender=账户；airaccount 侧封装为 `enrollInCommitteeValidator()`）→ **迁移联锁：enroll 必须在 setEpochLength 之前**（否则未 enroll 账户 self-brick）
 
 ## 运营
 - **翻转（两步，不可逆治理）**：`setEpochLength(N)` + `snapshotEpoch()`，然后**等跨过一个 epoch 边界**（~N 块）`requiredQuorum()` 才从哨兵 `type(uint256).max` 变真值 → 读回确认非哨兵再宣布可用。回 legacy = `setEpochLength(0)`。
