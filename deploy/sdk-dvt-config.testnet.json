@@ -109,6 +109,53 @@
         }
       }
     },
+    "testnet-local": {
+      "network": "testnet-local",
+      "chainId": 11155111,
+      "status": "LOCAL MIRROR of `sepolia` — same on-chain setup (validator 0x539B, same account, same 3 registered nodeIds), only dvtNodes urls point at a local docker stack (127.0.0.1:3001-3003) so composite-T3 E2E runs even when the dvt1/2/3.aastar.io Cloudflare tunnel is down (HTTP 530). Select via AASTAR_DVT_ENV=testnet-local (do NOT change `active`). Start the stack: docker compose --env-file deploy/.env.testnet -f docker-compose.testnet.yml -f docker-compose.local-mesh.yml up -d dvt-node-1 dvt-node-2 dvt-node-3. Keys = deploy/node{1,2,3}/node_state.json (already registered on 0x539B; NEVER regenerate).",
+      "validator": "0x539B9681aFd5BFbCaa655Fe4c6BdcFe1fa7864bC",
+      "validatorVersion": "YetAnotherAA-Validator AAStarValidator (Plan A v3 stake-bound; validate() algId 0x01 + registerWithProof + on-chain RFC-9380). Mounted in airaccount v0.27.0 ValidatorRouter 0xe68d6A7Bb60DA4caE62ceC2439722fc5eEF87a5c (getAlgorithm(0x01)==this). Supersedes airaccount-contract v0.20.0 AAStarBLSAlgorithm 0xAF525A… for new integrations.",
+      "entryPoint": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+      "entryPointVersion": "v0.7",
+      "e2eAccount": "0x92EA8b02D34A4D5d10f0Db9Ea894e8bC72e292e8",
+      "e2eAccountNote": "airaccount-contract AAStarAirAccountV7 v0.27.0 implementing isValidOwnerAuth->0xa0cf00cf (CC-22). owner = 0xb5600060e6de5E11D3636731964218E53caadf0E (dvt1 operator). Source: airaccount-contract, NOT DVT-owned — see docs/INTERFACES.md §2.",
+      "conventions": {
+        "userOpHash": "EntryPoint.getUserOpHash(PackedUserOp) — node derives it; never send a bare hash",
+        "ownerAuth": "account.isValidOwnerAuth(userOpHash, ownerAuth) eth_call → success magic 0xa0cf00cf, fail 0xffffffff. The account is the single source of truth (k1 ECDSA / P256 passkey / future); DVT forwards ownerAuth verbatim and never verifies locally. ownerAuth = 1-byte tag ‖ payload: 0x01 = owner ECDSA k1 (65-byte personal_sign(userOpHash), EIP-191); 0x02 = owner WebAuthn passkey (authenticatorData‖clientDataJSON‖…). A bare signature with no tag returns 0xffffffff → 403. Requires an account implementing isValidOwnerAuth(bytes32,bytes) (AAStarAirAccountV7).",
+        "proofWire": "EIP-2537 G1/G2 (matches src/utils/bls.util.ts)",
+        "failClosed": "POST /signature/sign returns 403 for every rejected request (never 400)",
+        "mandatoryBlsAccount": "guard-enabled + approvedAlgIds=[0x01] (excludes 0x02 ECDSA)"
+      },
+      "dvtNodes": [
+        {
+          "url": "http://127.0.0.1:3001",
+          "nodeId": "0x1f5e41c69465733eeb19341d95853ee6d9295a9e6698f5398d70e509be8f326d",
+          "pubkey": "0x8067dfd1f98fd1258c0eed3886d234f81eea9371b595a1a278a49c71f8f5eda74639fa043948f7fc0ee3e6b8ec9b8555"
+        },
+        {
+          "url": "http://127.0.0.1:3002",
+          "nodeId": "0xe3a4a3af3973b65bc95dd962e767e17592dfb331f3544209676271b188fd9f80",
+          "pubkey": "0xb2fcf33a6ee467e9945734bbaadfd85574d98bb5a3bb75c9a78e68807290883a1e90d3b75b911b9ebc19db0bd2db9173"
+        },
+        {
+          "url": "http://127.0.0.1:3003",
+          "nodeId": "0x96d64ba8240694153c757707732a11ff175380065ddacb6406094c9d5fa5cfce",
+          "pubkey": "0x89ffc557d29bc3a11caf3bb3ae8fb6bbd17c60a8e26e9b6be6dbaf8b5f33a3ef8a3d29e765a53f436b3b7dddd3ce8fac"
+        }
+      ],
+      "capabilities": {
+        "dvtSigning": {
+          "endpoints": {
+            "sign": "POST {url}/signature/sign  body: {userOp:PackedUserOp(v0.7), ownerAuth} -> {nodeId, signature(EIP-2537), publicKey}",
+            "aggregate": "POST {url}/signature/aggregate",
+            "verify": "POST {url}/signature/verify",
+            "info": "GET {url}/node/info -> {nodeId, publicKey, ...}",
+            "openapi": "GET {url}/api"
+          }
+        },
+        "health": "GET {url}/health -> {status:'ok', capabilities:[{name,enabled}]}"
+      }
+    },
     "mainnet": {
       "network": "mainnet",
       "chainId": 1,

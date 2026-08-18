@@ -1,0 +1,25 @@
+# Local-only overlay — wires the 3 nodes into a gossip mesh over the docker network,
+# so the local stack works for BOTH aggregation models:
+#   • coordinator-driven (SDK collects each /sign, then one node /signature/aggregate) — needs no mesh
+#   • self-discovery (nodes gossip-discover peers) — needs this mesh
+#
+# Tunnel-independent local composite-T3 testing. Use ALONGSIDE docker-compose.testnet.yml:
+#   docker compose --env-file deploy/.env.testnet \
+#     -f docker-compose.testnet.yml -f docker-compose.local-mesh.yml \
+#     up -d dvt-node-1 dvt-node-2 dvt-node-3
+#
+# Each node must ALSO advertise a docker-reachable GOSSIP_PUBLIC_URL (not the default
+# ws://localhost:PORT/ws), or peers exchange localhost endpoints they cannot dial back.
+services:
+  dvt-node-1:
+    environment:
+      GOSSIP_PUBLIC_URL: ws://dvt-node-1:3001/ws
+      GOSSIP_BOOTSTRAP_PEERS: ws://dvt-node-2:3002/ws,ws://dvt-node-3:3003/ws
+  dvt-node-2:
+    environment:
+      GOSSIP_PUBLIC_URL: ws://dvt-node-2:3002/ws
+      GOSSIP_BOOTSTRAP_PEERS: ws://dvt-node-1:3001/ws,ws://dvt-node-3:3003/ws
+  dvt-node-3:
+    environment:
+      GOSSIP_PUBLIC_URL: ws://dvt-node-3:3003/ws
+      GOSSIP_BOOTSTRAP_PEERS: ws://dvt-node-1:3001/ws,ws://dvt-node-2:3002/ws
