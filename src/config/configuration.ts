@@ -107,6 +107,14 @@ export default () => {
     // backend-independent (algorithm/wire is the fixed kernel — see conformance/).
     signerBackend: process.env.SIGNER_BACKEND || "local",
 
+    // RepCredit paper evidence co-signing. This is a separate, structured protocol
+    // path: it never relaxes /signature/sign and it is OFF unless explicitly armed.
+    // The configured slot is checked against the active public key registered in the
+    // production BLSAggregator before every signature and aggregate operation.
+    repCreditExperimentSigning: process.env.REPCREDIT_EXPERIMENT_SIGNING === "true",
+    repCreditBlsAggregatorAddress: process.env.REPCREDIT_BLS_AGGREGATOR_ADDRESS || undefined,
+    repCreditValidatorSlot: parseInt(process.env.REPCREDIT_VALIDATOR_SLOT || "0", 10),
+
     // EIP-2335 keystore passphrase (#5, #50 ④). When node_state.json holds an encrypted
     // keystore, this decrypts it at boot. Supply it from OUTSIDE the machine's disk —
     // an env var injected at boot (systemd LoadCredential, an orchestrator, or typed).

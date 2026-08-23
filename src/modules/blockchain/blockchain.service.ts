@@ -1204,6 +1204,23 @@ export class BlockchainService {
     }
   }
 
+  /** Reputation-consensus threshold enforced by BLSAggregator.verifyAndExecute. */
+  async getBlsDefaultThreshold(blsAggregatorAddress: string): Promise<number> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const contract = new ethers.Contract(
+      blsAggregatorAddress,
+      ["function defaultThreshold() view returns (uint256)"],
+      this.provider
+    );
+    const threshold = Number(await contract.defaultThreshold());
+    if (!Number.isInteger(threshold) || threshold < 1 || threshold > 13) {
+      throw new Error(`invalid on-chain defaultThreshold ${threshold}`);
+    }
+    return threshold;
+  }
+
   /**
    * O(1) own-slot lookup (finding-3): BLSAggregator.getBLSPublicKey(validator) returns the
    * validator's (publicKey, slot, isActive) in a SINGLE read, so a node resolves its OWN registered

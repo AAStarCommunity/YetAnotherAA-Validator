@@ -138,10 +138,29 @@ export class BlsService {
    * error it falls back to Node signing, unless RUST_SIGNER_REQUIRED=true (fail-closed).
    */
   async signDerivedHash(userOpHash: string, node: NodeKeyPair): Promise<SignatureResult> {
+    return this.signAuthorizedHash(userOpHash, node);
+  }
+
+  /**
+   * Sign a RepCredit hash only after RepCreditService has validated the full structured
+   * proposal, recomputed the hash with the local RPC chainId, and bound this node to an
+   * active on-chain validator slot. This is intentionally not exposed as a raw-digest API.
+   */
+  async signRepCreditHash(messageHash: string, node: NodeKeyPair): Promise<SignatureResult> {
+    if (!ethers.isHexString(messageHash, 32)) {
+      throw new Error("RepCredit messageHash must be exactly 32 bytes");
+    }
+    return this.signAuthorizedHash(messageHash, node);
+  }
+
+  private async signAuthorizedHash(
+    messageHash: string,
+    node: NodeKeyPair
+  ): Promise<SignatureResult> {
     const base = this.configService?.get<string>("rustSignerUrl");
     if (base) {
       try {
-        return await this.signViaRust(base, userOpHash, node);
+        return await this.signViaRust(base, messageHash, node);
       } catch (error: any) {
         if (this.configService?.get<boolean>("rustSignerRequired") === true) {
           // Production wants Rust — surface the failure instead of silently degrading.
@@ -153,7 +172,7 @@ export class BlsService {
         );
       }
     }
-    return this.signViaNode(userOpHash, node);
+    return this.signViaNode(messageHash, node);
   }
 
   /** Delegate signing to the local Rust signer. Throws on any transport/HTTP error. */

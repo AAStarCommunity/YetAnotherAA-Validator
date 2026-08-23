@@ -13,6 +13,7 @@ import { RelayModule } from "./modules/relay/relay.module.js";
 import { X402FacilitatorModule } from "./modules/x402-facilitator/x402-facilitator.module.js";
 import { AuditModule } from "./modules/audit/audit.module.js";
 import { HealthModule } from "./modules/health/health.module.js";
+import { RepCreditModule } from "./modules/repcredit/repcredit.module.js";
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { HealthModule } from "./modules/health/health.module.js";
     X402FacilitatorModule,
     AuditModule,
     HealthModule,
+    RepCreditModule,
   ],
 })
 export class AppModule {}
