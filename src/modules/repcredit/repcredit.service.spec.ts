@@ -1,6 +1,32 @@
-import { BadRequestException, ForbiddenException } from "@nestjs/common";
+import { HttpException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import { ERROR_CODE_SCHEMA_VERSION } from "../../common/error-codes.js";
 import { RepCreditService } from "./repcredit.service.js";
+
+/**
+ * CC-49 round-4: every RepCredit refusal carries the versioned {errorCode, category} envelope
+ * that repo:sdk branches on. Assert the CODE and the status, not the exception class — the
+ * class is now the same for every refusal and distinguishes nothing.
+ */
+async function expectRefusal(
+  promise: Promise<unknown>,
+  status: number,
+  errorCode: string
+): Promise<void> {
+  let caught: unknown;
+  try {
+    await promise;
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(HttpException);
+  const httpError = caught as HttpException;
+  expect(httpError.getStatus()).toBe(status);
+  expect(httpError.getResponse()).toMatchObject({
+    errorCode,
+    errorCodeVersion: ERROR_CODE_SCHEMA_VERSION,
+  });
+}
 
 function service(
   config: Record<string, unknown>,
@@ -28,7 +54,7 @@ function armed(config: Record<string, unknown> = {}) {
 
 describe("RepCreditService opt-in gates", () => {
   it("is fail-closed by default before any RPC or signing work", async () => {
-    await expect(service({}).sign({} as any)).rejects.toBeInstanceOf(ForbiddenException);
+    await expectRefusal(service({}).sign({} as any), 403, "REPCREDIT_EXPERIMENT_DISABLED");
   });
 
   it("refuses aggregation below the BLSAggregator on-chain threshold", async () => {
@@ -36,7 +62,11 @@ describe("RepCreditService opt-in gates", () => {
       getChainId: async () => 31337,
       getBlsDefaultThreshold: async () => 3,
     });
-    await expect(instance.aggregate({} as any, [], 2)).rejects.toBeInstanceOf(BadRequestException);
+    await expectRefusal(
+      instance.aggregate({} as any, [], 2),
+      400,
+      "REPCREDIT_THRESHOLD_BELOW_ONCHAIN"
+    );
   });
 });
 
@@ -61,22 +91,28 @@ describe("RepCreditService aggregator config policy (CC-49 BLOCKER-1 / HIGH-A / 
   }
 
   it("refuses to sign against the production audit aggregator (case-insensitive)", async () => {
-    await expect(sameAddress().signSlash({ slashLevel: 1 } as any)).rejects.toBeInstanceOf(
-      ForbiddenException
+    await expectRefusal(
+      sameAddress().signSlash({ slashLevel: 1 } as any),
+      403,
+      "REPCREDIT_AGGREGATOR_POLICY_VIOLATION"
     );
   });
 
   it("refuses to aggregate against the production audit aggregator", async () => {
-    await expect(
-      sameAddress().aggregateSlash({ slashLevel: 1 } as any, [], 3)
-    ).rejects.toBeInstanceOf(ForbiddenException);
+    await expectRefusal(
+      sameAddress().aggregateSlash({ slashLevel: 1 } as any, [], 3),
+      403,
+      "REPCREDIT_AGGREGATOR_POLICY_VIOLATION"
+    );
   });
 
   it("allows an isolated experiment aggregator", async () => {
     const instance = sameAddress({ repCreditBlsAggregatorAddress: EXPERIMENT_AGGREGATOR });
     // Gets past the separation gate; fails later on the (unstubbed) slot binding instead.
-    await expect(instance.aggregateSlash({ slashLevel: 1 } as any, [], 3)).rejects.toBeInstanceOf(
-      BadRequestException
+    await expectRefusal(
+      instance.aggregateSlash({ slashLevel: 1 } as any, [], 3),
+      400,
+      "REPCREDIT_AGGREGATION_INVALID"
     );
   });
 
@@ -446,8 +482,10 @@ describe("RepCreditService slash threshold source (CC-49 MEDIUM-1)", () => {
     const calls: { level?: number; defaultUsed?: boolean } = {};
     const instance = slashService({ 0: 2, 1: 3, 2: 3 }, calls);
     // threshold 3 clears slashThresholds[MINOR]=3 but would fail defaultThreshold=7.
-    await expect(instance.aggregateSlash({ slashLevel: 1 } as any, [], 3)).rejects.toBeInstanceOf(
-      BadRequestException
+    await expectRefusal(
+      instance.aggregateSlash({ slashLevel: 1 } as any, [], 3),
+      400,
+      "REPCREDIT_AGGREGATION_INVALID"
     );
     expect(calls.level).toBe(1);
     expect(calls.defaultUsed).toBeUndefined();
@@ -464,8 +502,10 @@ describe("RepCreditService slash threshold source (CC-49 MEDIUM-1)", () => {
     const calls: { level?: number } = {};
     const instance = slashService({ 0: 2, 1: 3, 2: 3 }, calls);
     for (const slashLevel of [-1, 3, 1.5, "1", undefined]) {
-      await expect(instance.aggregateSlash({ slashLevel } as any, [], 3)).rejects.toBeInstanceOf(
-        BadRequestException
+      await expectRefusal(
+        instance.aggregateSlash({ slashLevel } as any, [], 3),
+        400,
+        "REPCREDIT_SLASH_LEVEL_INVALID"
       );
     }
     expect(calls.level).toBeUndefined();

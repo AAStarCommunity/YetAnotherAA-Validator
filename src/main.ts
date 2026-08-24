@@ -66,7 +66,10 @@ async function bootstrap() {
   console.log(`🌐 WebSocket Gossip endpoint: ws://${host}:${port}/ws`);
   console.log(`📋 Available endpoints:`);
   console.log(`   GET /node/info - Get current node information`);
-  console.log(`   POST /node/register - Register node on-chain`);
+  console.log(
+    `   POST /node/register - Register node on-chain (node-admin gate; ` +
+      `${configService.get<boolean>("nodeAdminEnabled") === true ? "ENABLED" : "disabled by default"})`
+  );
   console.log(`   POST /signature/sign - Sign message with this node`);
   console.log(`   POST /signature/aggregate - Sign and return as aggregate format`);
   console.log(`   GET /admin - Node management admin panel`);

@@ -66,6 +66,28 @@ function signedHeaders(
   });
 }
 
+/** The versioned error envelope the guard now returns (CC-49 round-4). */
+function envelopeOf(fn: () => unknown): {
+  statusCode: number;
+  errorCode: string;
+  category: string;
+} {
+  try {
+    fn();
+  } catch (error) {
+    if (error instanceof HttpException) {
+      return error.getResponse() as { statusCode: number; errorCode: string; category: string };
+    }
+    throw error;
+  }
+  throw new Error("expected the guard to reject, but it admitted the request");
+}
+
+/** White-box view of the single-use cache, so a test can assert WHAT it is keyed on. */
+function seenKeys(instance: RepCreditExperimentGuard): string[] {
+  return Array.from((instance as unknown as { seen: Map<string, number> }).seen.keys());
+}
+
 function statusOf(fn: () => unknown): number {
   try {
     fn();
@@ -387,5 +409,87 @@ describe("RepCreditExperimentGuard replay window (CC-49 MEDIUM-B)", () => {
     expect(statusOf(() => instance.canActivate(context({ headers: signedHeaders(NOW - 3) })))).toBe(
       HttpStatus.SERVICE_UNAVAILABLE
     );
+  });
+});
+
+describe("RepCreditExperimentGuard replay single-use is encoding-independent (CC-49 round-4 MEDIUM-1)", () => {
+  it("rejects every non-canonical spelling of an otherwise valid token", () => {
+    const instance = guard();
+    const headers = signedHeaders();
+    const canonical = headers[HEADER_AUTH];
+    const variants = {
+      uppercase: canonical.toUpperCase(),
+      "mixed case": canonical
+        .split("")
+        .map((c, i) => (i % 2 ? c.toUpperCase() : c))
+        .join(""),
+      "0x-prefixed": `0x${canonical}`,
+      truncated: canonical.slice(0, 62),
+      "over-long": `${canonical}00`,
+      "non-hex": "z".repeat(64),
+    };
+    for (const [name, auth] of Object.entries(variants)) {
+      const envelope = envelopeOf(() =>
+        instance.canActivate(context({ headers: { ...headers, [HEADER_AUTH]: auth } }))
+      );
+      expect([name, envelope.statusCode]).toEqual([name, HttpStatus.UNAUTHORIZED]);
+      expect([name, envelope.errorCode]).toEqual([name, "REPCREDIT_AUTH_TOKEN_MALFORMED"]);
+    }
+    // And none of them consumed a replay slot: a rejected spelling must not be able to fill
+    // the bounded cache (which would fail-close the endpoint into a 503).
+    expect(seenKeys(instance)).toHaveLength(0);
+  });
+
+  it("keys the single-use cache on the VERIFIED digest, not on the header string", () => {
+    const instance = guard();
+    const headers = signedHeaders();
+    expect(instance.canActivate(context({ headers }))).toBe(true);
+    // The recorded key IS the canonical digest this node computed. Before the fix the key was
+    // the raw header, so `AUTH.toUpperCase()` produced a second, unused entry.
+    expect(seenKeys(instance)).toEqual([headers[HEADER_AUTH]]);
+    expect(seenKeys(instance)[0]).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("consumes a token exactly once — verbatim, upper-cased and mixed-case all fail after it", () => {
+    const instance = guard();
+    const headers = signedHeaders();
+    const canonical = headers[HEADER_AUTH];
+    expect(instance.canActivate(context({ headers }))).toBe(true);
+
+    const verbatim = envelopeOf(() => instance.canActivate(context({ headers })));
+    expect(verbatim.statusCode).toBe(HttpStatus.FORBIDDEN);
+    expect(verbatim.errorCode).toBe("REPCREDIT_AUTH_TOKEN_REPLAYED");
+
+    // THE ROUND-4 BUG: these two used to be admitted. `timingSafeEqual` compares decoded
+    // BYTES, so they authenticated; the cache compared header STRINGS, so they looked new.
+    for (const auth of [canonical.toUpperCase(), `0x${canonical}`]) {
+      expect(
+        statusOf(() =>
+          instance.canActivate(context({ headers: { ...headers, [HEADER_AUTH]: auth } }))
+        )
+      ).not.toBe(200);
+    }
+    // Still exactly one slot consumed for the one token.
+    expect(seenKeys(instance)).toHaveLength(1);
+  });
+
+  it("admits exactly one of many interleaved requests mixing canonical and case variants", async () => {
+    const instance = guard();
+    const headers = signedHeaders();
+    const canonical = headers[HEADER_AUTH];
+    const spellings = [canonical, canonical.toUpperCase(), `0x${canonical}`];
+    const outcomes = await Promise.all(
+      Array.from({ length: 96 }, (_, i) =>
+        Promise.resolve().then(() => {
+          const auth = spellings[i % spellings.length];
+          try {
+            return instance.canActivate(context({ headers: { ...headers, [HEADER_AUTH]: auth } }));
+          } catch {
+            return false;
+          }
+        })
+      )
+    );
+    expect(outcomes.filter(Boolean)).toHaveLength(1);
   });
 });

@@ -7,6 +7,8 @@ import { BlsService } from "../bls/bls.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { randomBytes, createHash } from "crypto";
 import { decryptKeystore, isKeystore } from "../../utils/keystore.util.js";
+import { scrubProviderError } from "../../config/redact.js";
+import { nodeError } from "./node-errors.js";
 
 @Injectable()
 export class NodeService implements OnModuleInit {
@@ -141,13 +143,16 @@ export class NodeService implements OnModuleInit {
     txHash?: string;
     message: string;
   }> {
+    // Both preconditions are OPERATOR state, not caller input, so they answer 503 rather than
+    // the bare 500 a plain Error produced before (CC-49 round-4 HIGH-1: "correct 4xx/5xx").
     if (!this.nodeState) {
-      throw new Error("No node state loaded. Create a node first.");
+      throw nodeError("NODE_REGISTER_STATE_MISSING", "no node state loaded; create a node first");
     }
 
     if (!this.blockchainService.isConfigured()) {
-      throw new Error(
-        "Blockchain service not configured. Set ETH_PRIVATE_KEY and ETH_RPC_URL environment variables."
+      throw nodeError(
+        "NODE_REGISTER_BLOCKCHAIN_UNCONFIGURED",
+        "blockchain service is not configured; set ETH_PRIVATE_KEY and ETH_RPC_URL"
       );
     }
 
@@ -220,12 +225,19 @@ export class NodeService implements OnModuleInit {
         message: `Node registered successfully on-chain`,
       };
     } catch (error: any) {
-      this.logger.error(`Failed to register node on-chain: ${error.message}`);
+      // CC-49 round-4 HIGH-1. This catch used to log `error.message` and put it in a 200
+      // response body. On any provider failure (401/429/transport) ethers embeds the full
+      // request URL — i.e. the RPC API key — in that message, so an UNAUTHENTICATED remote
+      // caller could read a live credential straight out of the response. Two changes:
+      // the log goes through `scrubProviderError`, and the response carries NO provider text
+      // at all (the operator reads the scrubbed log). The global ScrubbingExceptionFilter
+      // cannot help here — the error never escapes this frame.
+      this.logger.error(`Failed to register node on-chain: ${scrubProviderError(error)}`);
 
-      return {
-        success: false,
-        message: `Registration failed: ${error.message}`,
-      };
+      throw nodeError(
+        "NODE_REGISTER_UPSTREAM_FAILED",
+        "on-chain registration failed; see the node log for the (scrubbed) provider error"
+      );
     }
   }
 

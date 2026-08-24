@@ -1,5 +1,7 @@
-import { Controller, Get, Post, Body, Param } from "@nestjs/common";
+import { Controller, Get, Post, Body, Param, UseGuards } from "@nestjs/common";
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBody } from "@nestjs/swagger";
+import { scrubProviderError } from "../../config/redact.js";
+import { NodeAdminGuard } from "../../common/node-admin.guard.js";
 import { GossipService } from "./gossip.service.js";
 import { PeerInfo, GossipStats } from "./gossip.interfaces.js";
 
@@ -85,8 +87,13 @@ export class GossipController {
     }
   }
 
+  // STATE-CHANGING ADMIN ENDPOINT (CC-49 round-4 HIGH-1 audit). Writes into the gossip state
+  // this node republishes to its peers, and was unauthenticated on 0.0.0.0. The peer protocol
+  // itself runs over the authenticated WebSocket transport, never this route — it is an
+  // operator/debug affordance, so it takes the same default-off node-admin gate.
+  @UseGuards(NodeAdminGuard)
   @Post("data")
-  @ApiOperation({ summary: "Set gossip data" })
+  @ApiOperation({ summary: "Set gossip data (node-admin only; disabled by default)" })
   @ApiBody({
     type: SetDataDto,
     description: "Key-value pair to set in gossip state",
@@ -123,9 +130,11 @@ export class GossipController {
         message: `Data set for key '${key}'`,
       };
     } catch (error) {
+      // Scrubbed, and never the raw text: this handler swallows its own error, so the global
+      // ScrubbingExceptionFilter never sees it (CC-49 round-4, same shape as /node/register).
       return {
         success: false,
-        message: `Failed to set data: ${error instanceof Error ? error.message : String(error)}`,
+        message: `Failed to set data: ${scrubProviderError(error)}`,
       };
     }
   }

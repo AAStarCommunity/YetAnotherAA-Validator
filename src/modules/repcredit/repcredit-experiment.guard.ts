@@ -1,20 +1,23 @@
-import {
-  CanActivate,
-  ExecutionContext,
-  HttpException,
-  HttpStatus,
-  Injectable,
-  Logger,
-  Optional,
-} from "@nestjs/common";
+import { CanActivate, ExecutionContext, Injectable, Logger, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { createHmac, timingSafeEqual } from "crypto";
 import type { Request } from "express";
+import { repCreditError } from "./repcredit-errors.js";
 
 /** Header carrying the caller's millisecond unix timestamp. */
 export const HEADER_TIMESTAMP = "X-RepCredit-Timestamp";
-/** Header carrying the hex HMAC-SHA256 over {@link buildRepCreditAuthPreimage}. */
+/**
+ * Header carrying the hex HMAC-SHA256 over {@link buildRepCreditAuthPreimage}.
+ *
+ * The CANONICAL encoding is exactly 64 LOWERCASE hex characters — what `digest("hex")`
+ * produces. Anything else is rejected outright (CC-49 round-4 MEDIUM-1): hex is
+ * case-insensitive as a value but case-SENSITIVE as a string, so accepting mixed case gave one
+ * token 2^k distinct spellings, each of which was a fresh key in the single-use cache.
+ */
 export const HEADER_AUTH = "X-RepCredit-Auth";
+
+/** The one accepted spelling of an auth token: 64 lowercase hex characters. */
+const CANONICAL_AUTH_TOKEN = /^[0-9a-f]{64}$/;
 
 /**
  * Wire version of the HMAC preimage. BUMPED to v2 in CC-49 round 3: v1 signed only
@@ -82,9 +85,11 @@ const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
  *                        constant-time HMAC over METHOD, REQUEST-TARGET and the RAW bytes.
  *                        Raw bytes unavailable → reject; never fall back to a re-serialised
  *                        body.
- *   6. replay         — a given auth token is accepted at most once, and the record of it
- *                        outlives the token's own validity (anchored to the SIGNED
- *                        timestamp, not to arrival — CC-49 MEDIUM-B).
+ *   6. replay         — a given auth token is accepted at most once — keyed on the VERIFIED
+ *                        expected digest, so no alternative encoding of the same token buys a
+ *                        second use (CC-49 round-4 MEDIUM-1) — and the record of it outlives
+ *                        the token's own validity (anchored to the SIGNED timestamp, not to
+ *                        arrival — CC-49 MEDIUM-B).
  *
  * PRODUCTION SLASHING DOES NOT USE THIS PATH. The production quorum is
  * `GossipQuorumCoSigner` (peer-authenticated gossip transport, effective operator
@@ -111,9 +116,18 @@ export class RepCreditExperimentGuard implements CanActivate {
   private readonly now: () => number;
 
   /**
-   * auth hex -> the ms after which the token itself is no longer acceptable
-   * (`signedTimestamp + ttlMs`). Anchoring the entry to the SIGNED timestamp rather than to
-   * arrival is what makes the record outlive the token: see `pruneSeen`.
+   * VERIFIED expected digest (canonical lowercase hex) -> the ms after which the token itself
+   * is no longer acceptable (`signedTimestamp + ttlMs`).
+   *
+   * KEYED ON THE SERVER-COMPUTED DIGEST, never on the raw header (CC-49 round-4 MEDIUM-1). The
+   * HMAC comparison decodes both sides to bytes, so it is case-insensitive; keying the cache on
+   * the header string made `ABC…` a different entry from `abc…` and a captured token could be
+   * replayed simply by upper-casing it. The expected digest is the canonical form of whatever
+   * spelling was presented, so every equivalent encoding consumes the same single slot. The
+   * header is additionally required to BE that canonical form, so the two can never diverge.
+   *
+   * Anchoring the entry to the SIGNED timestamp rather than to arrival is what makes the record
+   * outlive the token: see `pruneSeen`.
    */
   private readonly seen = new Map<string, number>();
 
@@ -156,14 +170,14 @@ export class RepCreditExperimentGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     // 1. Not armed → the endpoints do not exist as far as a caller is concerned.
     if (!this.armed) {
-      throw new HttpException("RepCredit experiment signing is disabled", HttpStatus.FORBIDDEN);
+      throw repCreditError("REPCREDIT_NOT_ARMED", "RepCredit experiment signing is disabled");
     }
 
     // 2. Armed but unusable. Reject rather than degrade to no auth.
     if (!this.secret) {
-      throw new HttpException(
-        "RepCredit experiment signing is armed but the server secret is unset",
-        HttpStatus.SERVICE_UNAVAILABLE
+      throw repCreditError(
+        "REPCREDIT_AUTH_SECRET_UNSET",
+        "RepCredit experiment signing is armed but the server secret is unset"
       );
     }
 
@@ -173,9 +187,9 @@ export class RepCreditExperimentGuard implements CanActivate {
     //    express's own json limit so THIS is the binding cap; a body large enough to
     //    escape the check is rejected by express first.
     if (req.rawBody !== undefined && req.rawBody.length > this.maxBodyBytes) {
-      throw new HttpException(
-        `request body exceeds ${this.maxBodyBytes} bytes`,
-        HttpStatus.PAYLOAD_TOO_LARGE
+      throw repCreditError(
+        "REPCREDIT_BODY_TOO_LARGE",
+        `request body exceeds ${this.maxBodyBytes} bytes`
       );
     }
 
@@ -186,9 +200,9 @@ export class RepCreditExperimentGuard implements CanActivate {
       // loopback source by setting a header. The socket peer address cannot be forged.
       const ip: string = (req as any)?.socket?.remoteAddress || (req as any)?.ip || "";
       if (!LOOPBACK.has(ip)) {
-        throw new HttpException(
-          "RepCredit experiment endpoints accept loopback callers only",
-          HttpStatus.FORBIDDEN
+        throw repCreditError(
+          "REPCREDIT_REMOTE_FORBIDDEN",
+          "RepCredit experiment endpoints accept loopback callers only"
         );
       }
     }
@@ -197,16 +211,29 @@ export class RepCreditExperimentGuard implements CanActivate {
     const ts = req.header?.(HEADER_TIMESTAMP);
     const auth = req.header?.(HEADER_AUTH);
     if (!ts || !auth) {
-      throw new HttpException(
-        `missing ${HEADER_TIMESTAMP}/${HEADER_AUTH} headers`,
-        HttpStatus.UNAUTHORIZED
+      throw repCreditError(
+        "REPCREDIT_AUTH_HEADERS_MISSING",
+        `missing ${HEADER_TIMESTAMP}/${HEADER_AUTH} headers`
       );
     }
     const scheme = req.header?.(HEADER_SCHEME);
     if (scheme !== REPCREDIT_AUTH_SCHEME) {
-      throw new HttpException(
-        `${HEADER_SCHEME} must be "${REPCREDIT_AUTH_SCHEME}"`,
-        HttpStatus.UNAUTHORIZED
+      throw repCreditError(
+        "REPCREDIT_AUTH_SCHEME_UNSUPPORTED",
+        `${HEADER_SCHEME} must be "${REPCREDIT_AUTH_SCHEME}"`
+      );
+    }
+
+    // CANONICAL ENCODING (CC-49 round-4 MEDIUM-1). Reject anything that is not exactly the
+    // 64 lowercase hex characters `digest("hex")` emits, BEFORE any comparison. Without this
+    // the byte-level HMAC check accepted `0xAB…`-style case variants of one token, while the
+    // single-use cache — keyed on the header string — saw each variant as a brand-new token:
+    // a captured request could be replayed by upper-casing its auth header, and every variant
+    // also burned its own replay slot (a cheap route to a cache-full 503).
+    if (!CANONICAL_AUTH_TOKEN.test(auth)) {
+      throw repCreditError(
+        "REPCREDIT_AUTH_TOKEN_MALFORMED",
+        `${HEADER_AUTH} must be exactly 64 lowercase hex characters`
       );
     }
 
@@ -218,7 +245,10 @@ export class RepCreditExperimentGuard implements CanActivate {
     // (keyed off arrival) expired after 1x TTL — a client whose clock merely ran fast produced
     // tokens that were replayable after their own replay record had been pruned.
     if (!Number.isFinite(tsNum) || now - tsNum > this.ttlMs || tsNum - now > this.maxFutureSkewMs) {
-      throw new HttpException("auth timestamp outside the allowed window", HttpStatus.UNAUTHORIZED);
+      throw repCreditError(
+        "REPCREDIT_AUTH_TIMESTAMP_OUTSIDE_WINDOW",
+        "auth timestamp outside the allowed window"
+      );
     }
 
     // HARD-FAIL when the raw bytes are unavailable (CC-49 round-2 LOW-F). The previous
@@ -236,9 +266,9 @@ export class RepCreditExperimentGuard implements CanActivate {
             "is set (see main.ts)."
         );
       }
-      throw new HttpException(
-        "raw request body unavailable; cannot verify the request signature",
-        HttpStatus.UNAUTHORIZED
+      throw repCreditError(
+        "REPCREDIT_AUTH_RAW_BODY_UNAVAILABLE",
+        "raw request body unavailable; cannot verify the request signature"
       );
     }
     const rawBody = req.rawBody.toString("utf8");
@@ -257,7 +287,7 @@ export class RepCreditExperimentGuard implements CanActivate {
       )
       .digest("hex");
     if (!safeEqualHex(expected, auth)) {
-      throw new HttpException("HMAC verification failed", HttpStatus.FORBIDDEN);
+      throw repCreditError("REPCREDIT_AUTH_HMAC_MISMATCH", "HMAC verification failed");
     }
 
     // 6. Single-use: a captured request cannot be replayed to farm additional
@@ -266,22 +296,26 @@ export class RepCreditExperimentGuard implements CanActivate {
     //    ATOMICITY: everything from here to the `set` below is synchronous with no `await`,
     //    so on Node's single-threaded event loop the check-then-set cannot interleave with a
     //    concurrent request. Do not introduce an await into this block.
+    //
+    //    The key is `expected` — the digest THIS node computed and just verified — not the
+    //    header. See the `seen` field comment: the header is only ever an encoding of this
+    //    value, and it is the encoding that was replayable.
     this.pruneSeen(now);
-    if (this.seen.has(auth)) {
-      throw new HttpException("auth token already used", HttpStatus.FORBIDDEN);
+    if (this.seen.has(expected)) {
+      throw repCreditError("REPCREDIT_AUTH_TOKEN_REPLAYED", "auth token already used");
     }
     if (this.seen.size >= this.replayCacheMax) {
       // Fail closed. Evicting to make room would silently re-open the replay window; only an
       // already-authenticated caller can get us here.
-      throw new HttpException(
-        "RepCredit replay cache is full; refusing new auth tokens",
-        HttpStatus.SERVICE_UNAVAILABLE
+      throw repCreditError(
+        "REPCREDIT_REPLAY_CACHE_FULL",
+        "RepCredit replay cache is full; refusing new auth tokens"
       );
     }
     // Anchored to the SIGNED timestamp: the entry lives exactly as long as the token it
     // guards. `now + ttl` (the previous value) expired the record while the token was still
     // inside its own acceptance window whenever the caller's clock ran ahead.
-    this.seen.set(auth, tsNum + this.ttlMs);
+    this.seen.set(expected, tsNum + this.ttlMs);
     return true;
   }
 

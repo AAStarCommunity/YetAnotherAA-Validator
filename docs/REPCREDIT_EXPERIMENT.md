@@ -75,10 +75,18 @@ following hold, in this order:
    bytes are unavailable the request is **rejected**; the node never
    authenticates against a re-serialised body.
 
-6. That exact auth token has not been used before within the TTL window (replay
-   defence) — otherwise `403`. The replay cache is bounded
+6. That auth token has not been used before within the TTL window (replay
+   defence) — otherwise `403`. **Single-use is encoding-independent**: the cache
+   is keyed on the digest the node itself computed and verified, and the header
+   must additionally BE that canonical form — exactly 64 lowercase hex
+   characters, else `401`. Up to round 4 the cache was keyed on the raw header
+   string while the HMAC compared decoded BYTES, so upper-casing a captured
+   token produced a "new" token that authenticated and was admitted a second
+   time (CC-49 round-4 MEDIUM-1). The replay cache is bounded
    (`REPCREDIT_REPLAY_CACHE_MAX`); when full it returns `503` rather than
-   evicting, because evicting would silently re-open the window it closes.
+   evicting, because evicting would silently re-open the window it closes. A
+   non-canonical token is rejected _before_ any cache bookkeeping, so rejected
+   spellings cannot be used to fill it.
 
 > The loopback check is defence in depth, not the authenticator. A node behind a
 > local tunnel (`cloudflared → 127.0.0.1:3001`) sees every public request as
@@ -264,6 +272,88 @@ openssl rand -hex 32
    the auth secret. Nodes keep no record of what they signed, so an armed window
    is an unbounded co-signature-harvesting window.
 
+## Error codes (for repo:sdk)
+
+Every `4xx`/`5xx` from `/repcredit/*` carries a stable, machine-readable
+envelope (CC-49 round 4). Before this, the only signal was English prose, so an
+SDK had to match substrings — and every wording change silently reclassified a
+branch.
+
+```json
+{
+  "statusCode": 403,
+  "errorCodeVersion": 1,
+  "errorCode": "REPCREDIT_AUTH_TOKEN_REPLAYED",
+  "category": "auth",
+  "message": "auth token already used"
+}
+```
+
+Contract:
+
+- `errorCode` is stable. Codes are **appended, never renamed or re-purposed**.
+- `errorCodeVersion` covers the ENVELOPE shape only. Adding a code does not bump
+  it, so an unrecognised code MUST fall back to `category`.
+- `category` is exhaustive and never changes meaning.
+- `message` is human-only and always scrubbed. **Do not branch on it.**
+
+| `category`       | Retry?                        | Meaning                                                         |
+| ---------------- | ----------------------------- | --------------------------------------------------------------- |
+| `auth`           | with a fresh token, sometimes | Not admitted                                                    |
+| `prerequisite`   | no                            | Node refuses by policy/config; drop it from the round           |
+| `validation`     | no                            | The request is wrong; fix it (retrying elsewhere fails equally) |
+| `infrastructure` | yes                           | A dependency failed; the same request may succeed later         |
+
+### Guard — `category: "auth"`
+
+| `errorCode`                               | HTTP  | Cause                                               |
+| ----------------------------------------- | ----- | --------------------------------------------------- |
+| `REPCREDIT_NOT_ARMED`                     | `403` | `REPCREDIT_EXPERIMENT_SIGNING` is not `true`        |
+| `REPCREDIT_AUTH_SECRET_UNSET`             | `503` | Armed with an empty secret                          |
+| `REPCREDIT_BODY_TOO_LARGE`                | `413` | Above `REPCREDIT_MAX_BODY_BYTES`                    |
+| `REPCREDIT_REMOTE_FORBIDDEN`              | `403` | Non-loopback source, remote not armed               |
+| `REPCREDIT_AUTH_HEADERS_MISSING`          | `401` | Timestamp and/or auth header absent                 |
+| `REPCREDIT_AUTH_SCHEME_UNSUPPORTED`       | `401` | `X-RepCredit-Scheme` is not `v2`                    |
+| `REPCREDIT_AUTH_TIMESTAMP_OUTSIDE_WINDOW` | `401` | Too old, or too far in the future — re-sign         |
+| `REPCREDIT_AUTH_TOKEN_MALFORMED`          | `401` | Auth header is not 64 lowercase hex chars           |
+| `REPCREDIT_AUTH_RAW_BODY_UNAVAILABLE`     | `401` | Server misconfiguration; nothing can be verified    |
+| `REPCREDIT_AUTH_HMAC_MISMATCH`            | `403` | Signature does not match the v2 preimage            |
+| `REPCREDIT_AUTH_TOKEN_REPLAYED`           | `403` | Token already consumed (in ANY equivalent spelling) |
+| `REPCREDIT_REPLAY_CACHE_FULL`             | `503` | Fail-closed; never evicts                           |
+
+### Service prerequisites — `category: "prerequisite"` (all `403`)
+
+| `errorCode`                             | Cause                                                            |
+| --------------------------------------- | ---------------------------------------------------------------- |
+| `REPCREDIT_EXPERIMENT_DISABLED`         | Service-level arm check failed                                   |
+| `REPCREDIT_AGGREGATOR_POLICY_VIOLATION` | Experiment/audit aggregator config violates the isolation policy |
+| `REPCREDIT_VALIDATOR_SLOT_INVALID`      | `REPCREDIT_VALIDATOR_SLOT` unset or out of range                 |
+| `REPCREDIT_LOCAL_KEY_MALFORMED`         | The node's own BLS public key cannot be encoded                  |
+| `REPCREDIT_SLOT_NOT_ACTIVE`             | No active key at the configured slot                             |
+| `REPCREDIT_SLOT_KEY_MISMATCH`           | A different key occupies the configured slot                     |
+| `REPCREDIT_KEY_NOT_ISOLATED`            | The signing key is also active on a stake-bearing aggregator     |
+| `REPCREDIT_ISOLATION_INDETERMINATE`     | A deny-listed aggregator could not be verified                   |
+| `REPCREDIT_SIGNER_OUTPUT_INVALID`       | The BLS signer returned incomplete material                      |
+
+### Request validation — `category: "validation"` (all `400`)
+
+| `errorCode`                         | Cause                                                   |
+| ----------------------------------- | ------------------------------------------------------- |
+| `REPCREDIT_PROPOSAL_INVALID`        | Structured validation / local hash recomputation failed |
+| `REPCREDIT_SLASH_LEVEL_INVALID`     | `slashLevel` is not an integer in `[0, 2]`              |
+| `REPCREDIT_THRESHOLD_BELOW_ONCHAIN` | Threshold below what the aggregator enforces            |
+| `REPCREDIT_AGGREGATION_INVALID`     | The submitted co-signature set failed validation        |
+
+### Infrastructure — `category: "infrastructure"`
+
+| `errorCode`                 | HTTP  | Cause                                                  |
+| --------------------------- | ----- | ------------------------------------------------------ |
+| `REPCREDIT_RPC_UNAVAILABLE` | `503` | The configured RPC could not be read; refusing to sign |
+
+The table lives in code at `src/modules/repcredit/repcredit-errors.ts`; the
+node-admin endpoints share the same envelope (see
+[node-admin endpoints](./NODE_ADMIN_ENDPOINTS.md)).
+
 ## Auth scheme migration (v1 → v2) — for orchestrator authors
 
 The HMAC preimage changed in CC-49 round 3. There is **no v1 fallback**:
@@ -275,10 +365,14 @@ accepting both would leave the unbound preimage reachable and defeat the change.
 | Headers          | `X-RepCredit-Timestamp`, `X-RepCredit-Auth`    | the same two **plus** `X-RepCredit-Scheme: v2`                            |
 | Helper           | `computeHeaders(secret, timestampMs, rawBody)` | `computeHeaders(secret, { method, requestTarget, timestampMs, rawBody })` |
 | Missing raw body | HMAC over a re-serialised body (warned)        | rejected `401`                                                            |
+| Auth encoding    | any hex case accepted (and separately cached)  | exactly 64 **lowercase** hex chars, else `401` (CC-49 round 4)            |
 
 What a client must change:
 
 - Send `X-RepCredit-Scheme: v2`. Omitting it, or sending `v1`, is `401`.
+- Send `X-RepCredit-Auth` exactly as `digest("hex")` produces it — 64 lowercase
+  hex characters, no `0x` prefix. Anything else is `401`
+  `REPCREDIT_AUTH_TOKEN_MALFORMED`. `computeHeaders` already returns this form.
 - Include the uppercased HTTP method and the request target — the path exactly
   as it appears in the request line, query string included — in the preimage. A
   token minted for `/repcredit/sign` is rejected on `/repcredit/slash/sign`.

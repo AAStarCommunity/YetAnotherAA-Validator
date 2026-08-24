@@ -1,6 +1,7 @@
-import { Controller, Get, Post } from "@nestjs/common";
+import { Controller, Get, Post, UseGuards } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ApiTags, ApiOperation, ApiResponse } from "@nestjs/swagger";
+import { NodeAdminGuard } from "../../common/node-admin.guard.js";
 import { NodeService } from "./node.service.js";
 
 @ApiTags("node")
@@ -41,7 +42,15 @@ export class NodeController {
     return { ...safe, keeperAddress };
   }
 
-  @ApiOperation({ summary: "Register current node on-chain" })
+  // STATE-CHANGING ADMIN ENDPOINT (CC-49 round-4 HIGH-1). This sends an on-chain transaction
+  // from the node's funded account and, before this guard existed, was callable by any
+  // unauthenticated remote caller (the node binds 0.0.0.0 and dvt1/2/3 are publicly tunnelled).
+  // NodeAdminGuard is DISABLED by default; the supported registration path is the operator CLI
+  // scripts/register-node.mjs.
+  @UseGuards(NodeAdminGuard)
+  @ApiOperation({
+    summary: "Register current node on-chain (node-admin only; disabled by default)",
+  })
   @ApiResponse({
     status: 200,
     description: "Node registration result",
@@ -61,14 +70,25 @@ export class NodeController {
       },
     },
   })
+  @ApiResponse({ status: 401, description: "X-Node-Admin-Token missing" })
+  @ApiResponse({ status: 403, description: "Node admin disabled, non-loopback, or bad token" })
+  @ApiResponse({ status: 429, description: "Node admin rate limit exceeded" })
+  @ApiResponse({
+    status: 502,
+    description:
+      "On-chain registration failed upstream. The provider's own error text is NEVER echoed " +
+      "— it carries the RPC credential; read the (scrubbed) node log instead.",
+  })
   @Post("register")
   async registerOnChain() {
-    const nodeState = this.nodeService.getCurrentNode();
+    // registerOnChain FIRST: it owns the "no node state" case and answers a structured 503,
+    // whereas getCurrentNode() throws a bare Error (→ 500) for the same condition.
     const result = await this.nodeService.registerOnChain();
+    const nodeState = this.nodeService.getNodeState();
 
     return {
       ...result,
-      nodeId: nodeState.nodeId,
+      nodeId: nodeState?.nodeId,
     };
   }
 

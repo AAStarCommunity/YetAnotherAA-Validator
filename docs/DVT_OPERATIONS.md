@@ -85,3 +85,9 @@ N<30 走 whole-set BFT 2/3，没有抽样界。cap 86 控 calldata/gas。
   ECDSA 授权（节点自派生 userOpHash 再验 `isValidOwnerAuth`），任何失败一律
   **403**。防未授权调用方，不防 owner 私钥泄露（那靠链上 guard 限额）。
 - 密钥：`node_state.json`（BLS 私钥，git-ignored）或 KMS-TEE 托管（`RUST_SIGNER_URL`）。
+- **改状态的 admin 端点默认关闭**（`POST /node/register`、`POST /dashboard/nodes`、
+  `POST /dashboard/import-node`、`DELETE /dashboard/current-node`、`POST /gossip/data`）。节点监听
+  `0.0.0.0` 且经隧道公网可达，这些端点此前完全无鉴权（CC-49 round-4
+  HIGH-1）。注册请走 CLI `node scripts/register-node.mjs`；确需 HTTP 时按
+  [node-admin 端点说明](./NODE_ADMIN_ENDPOINTS.md) 配 `NODE_ADMIN_ENABLED` +
+  `NODE_ADMIN_TOKEN`（默认仅 loopback，带限流，token 不得复用 RepCredit 实验密钥）。

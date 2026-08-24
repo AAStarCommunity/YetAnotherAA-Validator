@@ -1,10 +1,4 @@
-import {
-  BadRequestException,
-  ForbiddenException,
-  Injectable,
-  Logger,
-  ServiceUnavailableException,
-} from "@nestjs/common";
+import { Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { BlsService } from "../bls/bls.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
@@ -27,6 +21,7 @@ import {
   RepCreditAggregatorPolicyResult,
 } from "./repcredit-isolation.js";
 import { scrubProviderError } from "../../config/redact.js";
+import { repCreditError } from "./repcredit-errors.js";
 
 @Injectable()
 export class RepCreditService {
@@ -46,7 +41,7 @@ export class RepCreditService {
     try {
       messageHash = validateRepCreditProposal(proposal, localChainId);
     } catch (error) {
-      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+      throw repCreditError("REPCREDIT_PROPOSAL_INVALID", messageOf(error));
     }
 
     return this.signValidatedHash(messageHash, localChainId);
@@ -59,7 +54,7 @@ export class RepCreditService {
     try {
       messageHash = validateRepCreditSlashProposal(proposal, localChainId);
     } catch (error) {
-      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+      throw repCreditError("REPCREDIT_PROPOSAL_INVALID", messageOf(error));
     }
     return this.signValidatedHash(messageHash, localChainId);
   }
@@ -76,24 +71,33 @@ export class RepCreditService {
     try {
       localKey = encodeRepCreditPublicKey(node.publicKey);
     } catch {
-      throw new ForbiddenException("local BLS public key is malformed");
+      throw repCreditError("REPCREDIT_LOCAL_KEY_MALFORMED", "local BLS public key is malformed");
     }
 
     // Cheap binding first (2 reads): a misconfigured slot short-circuits before the wider
     // audit-aggregator scan below. Neither check produces a signature on its own.
     const onChainKey = await this.blockchain.getBlsPublicKeyAtSlot(aggregator, slot);
     if (!onChainKey) {
-      throw new ForbiddenException(`configured validator slot ${slot} is not active`);
+      throw repCreditError(
+        "REPCREDIT_SLOT_NOT_ACTIVE",
+        `configured validator slot ${slot} is not active`
+      );
     }
     if (localKey !== onChainKey.toLowerCase()) {
-      throw new ForbiddenException(`local BLS key is not registered at validator slot ${slot}`);
+      throw repCreditError(
+        "REPCREDIT_SLOT_KEY_MISMATCH",
+        `local BLS key is not registered at validator slot ${slot}`
+      );
     }
 
     await this.assertKeyIsolatedFromProductionAggregators(localKey, localChainId);
 
     const signature = await this.blsService.signRepCreditHash(messageHash, node);
     if (!signature.signatureCompact || !signature.publicKey) {
-      throw new ForbiddenException("BLS signer did not return compact signature material");
+      throw repCreditError(
+        "REPCREDIT_SIGNER_OUTPUT_INVALID",
+        "BLS signer did not return compact signature material"
+      );
     }
     return {
       slot,
@@ -118,7 +122,7 @@ export class RepCreditService {
         this.blockchain.getBlsPublicKeyAtSlot(aggregator, slot)
       );
     } catch (error) {
-      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+      throw repCreditError("REPCREDIT_AGGREGATION_INVALID", messageOf(error));
     }
   }
 
@@ -140,7 +144,7 @@ export class RepCreditService {
         slot => this.blockchain.getBlsPublicKeyAtSlot(aggregator, slot)
       );
     } catch (error) {
-      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+      throw repCreditError("REPCREDIT_AGGREGATION_INVALID", messageOf(error));
     }
   }
 
@@ -157,7 +161,8 @@ export class RepCreditService {
       return await this.blockchain.getChainId();
     } catch (error) {
       this.logger.error(`RepCredit: chain id read failed: ${scrubProviderError(error)}`);
-      throw new ServiceUnavailableException(
+      throw repCreditError(
+        "REPCREDIT_RPC_UNAVAILABLE",
         "cannot read the chain id from the configured RPC — refusing to sign or aggregate"
       );
     }
@@ -170,7 +175,10 @@ export class RepCreditService {
    */
   private requireArmed(): void {
     if (this.config.get<boolean>("repCreditExperimentSigning") !== true) {
-      throw new ForbiddenException("RepCredit experiment signing is disabled");
+      throw repCreditError(
+        "REPCREDIT_EXPERIMENT_DISABLED",
+        "RepCredit experiment signing is disabled"
+      );
     }
     this.aggregatorPolicy();
   }
@@ -190,7 +198,7 @@ export class RepCreditService {
       noProductionAggregator: this.config.get<boolean>("repCreditNoProductionAggregator") === true,
     });
     if (!verdict.ok) {
-      throw new ForbiddenException(verdict.reason);
+      throw repCreditError("REPCREDIT_AGGREGATOR_POLICY_VIOLATION", verdict.reason ?? "");
     }
     return verdict;
   }
@@ -231,7 +239,8 @@ export class RepCreditService {
       // Acknowledged devnet. Refuse the acknowledgement itself on any chain that carries real
       // deployments, so the escape cannot be used where the scan actually matters.
       if (CHAINS_WITH_PRODUCTION_STAKE.has(localChainId)) {
-        throw new ForbiddenException(
+        throw repCreditError(
+          "REPCREDIT_AGGREGATOR_POLICY_VIOLATION",
           `REPCREDIT_NO_PRODUCTION_AGGREGATOR is not accepted on chain ${localChainId}, which ` +
             "hosts production deployments — set AUDIT_BLS_AGGREGATOR_ADDRESS (and any " +
             "REPCREDIT_FORBIDDEN_AGGREGATORS) so the signing key can be checked against them"
@@ -264,13 +273,15 @@ export class RepCreditService {
         `RepCredit: getCode on the production aggregator ${aggregator} failed: ` +
           scrubProviderError(error)
       );
-      throw new ForbiddenException(
+      throw repCreditError(
+        "REPCREDIT_ISOLATION_INDETERMINATE",
         `cannot read the production aggregator at ${aggregator} — refusing to sign without a ` +
           "verifiable aggregator to isolate against"
       );
     }
     if (!code || code === "0x") {
-      throw new ForbiddenException(
+      throw repCreditError(
+        "REPCREDIT_ISOLATION_INDETERMINATE",
         `no contract deployed at production aggregator ${aggregator} on this chain — ` +
           "refusing to sign without a verifiable aggregator to isolate against"
       );
@@ -282,7 +293,8 @@ export class RepCreditService {
         `RepCredit: the production aggregator ${aggregator} failed the BLSAggregator interface ` +
           `probe: ${scrubProviderError(error)}`
       );
-      throw new ForbiddenException(
+      throw repCreditError(
+        "REPCREDIT_ISOLATION_INDETERMINATE",
         `production aggregator ${aggregator} does not answer the BLSAggregator interface on ` +
           "this chain"
       );
@@ -307,7 +319,8 @@ export class RepCreditService {
           `RepCredit: aggregator slot ${slot} read failed on ${aggregator}: ` +
             scrubProviderError(read.reason)
         );
-        throw new ForbiddenException(
+        throw repCreditError(
+          "REPCREDIT_ISOLATION_INDETERMINATE",
           `could not determine whether the local BLS key is active at aggregator ${aggregator} ` +
             `slot ${slot} — refusing to sign on an indeterminate isolation check`
         );
@@ -319,7 +332,8 @@ export class RepCreditService {
             `production aggregator ${aggregator}. Experiment keys must be ephemeral and ` +
             "registered on the experiment aggregator only (CC-49 HIGH-A)."
         );
-        throw new ForbiddenException(
+        throw repCreditError(
+          "REPCREDIT_KEY_NOT_ISOLATED",
           `local BLS key is also active at slot ${slot} on production aggregator ${aggregator} ` +
             "— an experiment co-signature made with it would be a byte-valid production slash " +
             "proof; use an ephemeral experiment key"
@@ -335,7 +349,8 @@ export class RepCreditService {
   private async requireOnChainThreshold(aggregator: string, threshold: number): Promise<void> {
     const onChainThreshold = await this.blockchain.getBlsDefaultThreshold(aggregator);
     if (threshold < onChainThreshold) {
-      throw new BadRequestException(
+      throw repCreditError(
+        "REPCREDIT_THRESHOLD_BELOW_ONCHAIN",
         `threshold ${threshold} is below on-chain defaultThreshold ${onChainThreshold}`
       );
     }
@@ -359,12 +374,16 @@ export class RepCreditService {
     // keyed 0..2. The tighter policy (MINOR/MAJOR only) stays in the single authoritative
     // place, normalizedSlashProposalValues, which runs inside the aggregate call below.
     if (!Number.isInteger(slashLevel) || (slashLevel as number) < 0 || (slashLevel as number) > 2) {
-      throw new BadRequestException("slashLevel must be an integer in [0, 2]");
+      throw repCreditError(
+        "REPCREDIT_SLASH_LEVEL_INVALID",
+        "slashLevel must be an integer in [0, 2]"
+      );
     }
     const level = slashLevel as number;
     const onChainThreshold = await this.blockchain.getBlsSlashThreshold(aggregator, level);
     if (threshold < onChainThreshold) {
-      throw new BadRequestException(
+      throw repCreditError(
+        "REPCREDIT_THRESHOLD_BELOW_ONCHAIN",
         `threshold ${threshold} is below on-chain slashThresholds[${level}] ${onChainThreshold}`
       );
     }
@@ -373,7 +392,10 @@ export class RepCreditService {
   private configuredSlot(): number {
     const slot = this.config.get<number>("repCreditValidatorSlot") ?? 0;
     if (!Number.isInteger(slot) || slot < 1 || slot > MAX_VALIDATORS) {
-      throw new ForbiddenException(`REPCREDIT_VALIDATOR_SLOT must be in [1, ${MAX_VALIDATORS}]`);
+      throw repCreditError(
+        "REPCREDIT_VALIDATOR_SLOT_INVALID",
+        `REPCREDIT_VALIDATOR_SLOT must be in [1, ${MAX_VALIDATORS}]`
+      );
     }
     return slot;
   }
@@ -385,4 +407,14 @@ export class RepCreditService {
     this.aggregatorPolicy();
     return this.config.get<string>("repCreditBlsAggregatorAddress") as string;
   }
+}
+
+/**
+ * Render a thrown value's own text for an error body. The result still passes through
+ * `structuredError`'s scrub, so a provider error that reaches here cannot carry a credential
+ * out — but nothing on these paths should be a provider error in the first place: RPC failures
+ * are caught at their own call sites and reported as `REPCREDIT_RPC_UNAVAILABLE`.
+ */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

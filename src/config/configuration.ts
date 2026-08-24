@@ -109,6 +109,22 @@ export default () => {
     rateLimitWindowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10),
     rateLimitMax: parseInt(process.env.RATE_LIMIT_MAX || "30", 10),
 
+    // Node-admin HTTP endpoints (CC-49 round-4 HIGH-1). POST /node/register sends an on-chain
+    // transaction from the node account; the dashboard write endpoints create / import (raw
+    // private key!) / destroy BLS key material; POST /gossip/data writes state this node
+    // republishes. All of them were reachable UNAUTHENTICATED while the node binds 0.0.0.0 and
+    // dvt1/2/3 sit behind a public tunnel. They are DISABLED by default — the supported path is
+    // the operator CLI (scripts/register-node.mjs). When enabled they require a DEDICATED token
+    // (NodeAdminGuard refuses to boot if it equals REPCREDIT_EXPERIMENT_AUTH_SECRET) and stay
+    // loopback-only unless NODE_ADMIN_ALLOW_REMOTE=true is set explicitly.
+    nodeAdminEnabled: process.env.NODE_ADMIN_ENABLED === "true",
+    nodeAdminToken: process.env.NODE_ADMIN_TOKEN || "",
+    nodeAdminAllowRemote: process.env.NODE_ADMIN_ALLOW_REMOTE === "true",
+    // The throttle here is NOT the opt-in RATE_LIMIT_* one: it is always on, because it is
+    // what bounds bearer-token guessing.
+    nodeAdminRateWindowMs: strictIntEnv("NODE_ADMIN_RATE_WINDOW_MS", 60_000, 1_000, 3_600_000),
+    nodeAdminRateMax: strictIntEnv("NODE_ADMIN_RATE_MAX", 10, 1, 1_000),
+
     // BLS key-custody backend (#50; arch #67). "local" (default) = in-process key from
     // node_state.json. Future: "kms"/"hsm" via a BLS-capable HSM. Signing output is
     // backend-independent (algorithm/wire is the fixed kernel — see conformance/).

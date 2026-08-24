@@ -9,12 +9,14 @@ import {
   HttpStatus,
   Render,
   Res,
+  UseGuards,
 } from "@nestjs/common";
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBody } from "@nestjs/swagger";
 import { DashboardService, NodeInfo } from "./dashboard.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { ConfigService } from "@nestjs/config";
 import type { Response } from "express";
+import { NodeAdminGuard } from "../../common/node-admin.guard.js";
 import { CreateNodeDto } from "./dto/create-node.dto.js";
 import { ImportNodeDto } from "./dto/import-node.dto.js";
 
@@ -61,25 +63,39 @@ export class DashboardController {
     return this.dashboardService.getCurrentRunningNode();
   }
 
+  // STATE-CHANGING ADMIN ENDPOINTS (CC-49 round-4 HIGH-1 audit of the same class of route).
+  // These three create, import (a RAW BLS PRIVATE KEY) and destroy this node's key material,
+  // and were reachable unauthenticated on 0.0.0.0 exactly like POST /node/register. Same gate,
+  // same default-off. The read endpoints and the HTML page are unchanged: they expose only
+  // values that are already public on-chain.
+  @UseGuards(NodeAdminGuard)
   @Post("nodes")
-  @ApiOperation({ summary: "Create a new BLS node (writes to node_state.json)" })
+  @ApiOperation({
+    summary: "Create a new BLS node (node-admin only; disabled by default)",
+  })
   @ApiBody({ type: CreateNodeDto })
   @ApiResponse({ status: 201, description: "Node created successfully" })
   async createNode(@Body() dto: CreateNodeDto): Promise<NodeInfo> {
     return this.dashboardService.createNode(dto);
   }
 
+  @UseGuards(NodeAdminGuard)
   @Post("import-node")
-  @ApiOperation({ summary: "Import an existing node state (restore a registered node)" })
+  @ApiOperation({
+    summary: "Import an existing node state (node-admin only; disabled by default)",
+  })
   @ApiBody({ type: ImportNodeDto })
   @ApiResponse({ status: 201, description: "Node imported successfully" })
   async importNode(@Body() dto: ImportNodeDto): Promise<NodeInfo> {
     return this.dashboardService.importNode(dto);
   }
 
+  @UseGuards(NodeAdminGuard)
   @Delete("current-node")
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: "Delete the current running node (only if not registered on-chain)" })
+  @ApiOperation({
+    summary: "Delete the current running node (node-admin only; disabled by default)",
+  })
   @ApiResponse({ status: 200, description: "Node deleted successfully" })
   @ApiResponse({ status: 400, description: "Cannot delete registered node" })
   async deleteCurrentNode(): Promise<{ success: boolean; message: string }> {
@@ -1206,6 +1222,24 @@ export class DashboardController {
       // This will be implemented when staking is ready
     }
 
+    // CC-49 round-4 HIGH-1. The dashboard write actions now go through NodeAdminGuard, so the
+    // browser must present X-Node-Admin-Token. The token is asked for once per tab and kept in
+    // sessionStorage only (never localStorage, never rendered into the page source, and gone
+    // when the tab closes). Read-only views need nothing.
+    function nodeAdminHeaders(extra) {
+      let token = sessionStorage.getItem('dvtNodeAdminToken');
+      if (!token) {
+        token = prompt('Node admin token (NODE_ADMIN_TOKEN) — required for write actions:') || '';
+        if (token) sessionStorage.setItem('dvtNodeAdminToken', token);
+      }
+      return Object.assign({ 'X-Node-Admin-Token': token }, extra || {});
+    }
+
+    // Drop a rejected token so the next attempt re-prompts instead of looping on a stale value.
+    function forgetNodeAdminTokenIfRejected(status) {
+      if (status === 401 || status === 403) sessionStorage.removeItem('dvtNodeAdminToken');
+    }
+
     async function deleteCurrentNode() {
       console.log('deleteCurrentNode called');
 
@@ -1216,7 +1250,10 @@ export class DashboardController {
 
       try {
         console.log('Sending DELETE request...');
-        const response = await fetch('/dashboard/current-node', { method: 'DELETE' });
+        const response = await fetch('/dashboard/current-node', {
+          method: 'DELETE',
+          headers: nodeAdminHeaders()
+        });
         console.log('Response status:', response.status);
 
         const result = await response.json();
@@ -1226,6 +1263,7 @@ export class DashboardController {
           showToast('✅ ' + result.message);
           setTimeout(() => location.reload(), 2000);
         } else {
+          forgetNodeAdminTokenIfRejected(response.status);
           showToast('❌ ' + (result.message || 'Failed to delete node'));
         }
       } catch (error) {
@@ -1266,7 +1304,7 @@ export class DashboardController {
 
         const response = await fetch('/dashboard/nodes', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: nodeAdminHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             nodeName: nodeName || undefined,
             description: description || undefined
@@ -1278,6 +1316,7 @@ export class DashboardController {
           showToast('✅ Node created successfully!');
           setTimeout(() => location.reload(), 1000);
         } else {
+          forgetNodeAdminTokenIfRejected(response.status);
           const error = await response.json();
           showToast('❌ Failed to create node: ' + error.message);
           submitBtn.disabled = false;

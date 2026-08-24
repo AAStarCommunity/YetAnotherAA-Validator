@@ -9,6 +9,7 @@ import { NodeService } from "../node/node.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { bls, sigs } from "../../utils/bls.util.js";
 import { PROOF_SCHEMA_VERSION } from "./proof-archive.js";
+import { scrubProviderError } from "../../config/redact.js";
 import {
   CoSignRequest,
   CoSignVerifier,
@@ -183,9 +184,13 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
         messageHash: localHash,
       };
     } catch (error) {
-      this.logger.warn(
-        `verifyAndSign refused (unexpected error): ${error instanceof Error ? error.message : String(error)}`
-      );
+      // scrubProviderError, not error.message (CC-49 round-4 LOW-1). This catch-all wraps two
+      // on-chain reads (`this.verifier(req)` and `resolveOwnSlot()`), so an ethers failure lands
+      // here with the full RPC URL — i.e. the provider API key — inside its message. Unreachable
+      // today (no active rule supplies a violation verifier, and getRegisteredSlot scrubs its
+      // own errors), but it is the same shape as the /node/register leak and becomes a live one
+      // the moment the slash pipeline is re-armed.
+      this.logger.warn(`verifyAndSign refused (unexpected error): ${scrubProviderError(error)}`);
       return null;
     }
   }
