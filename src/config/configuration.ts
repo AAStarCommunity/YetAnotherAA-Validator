@@ -115,15 +115,35 @@ export default () => {
     // republishes. All of them were reachable UNAUTHENTICATED while the node binds 0.0.0.0 and
     // dvt1/2/3 sit behind a public tunnel. They are DISABLED by default — the supported path is
     // the operator CLI (scripts/register-node.mjs). When enabled they require a DEDICATED token
-    // (NodeAdminGuard refuses to boot if it equals REPCREDIT_EXPERIMENT_AUTH_SECRET) and stay
-    // loopback-only unless NODE_ADMIN_ALLOW_REMOTE=true is set explicitly.
+    // (NodeAdminGuard refuses to boot if it equals REPCREDIT_EXPERIMENT_AUTH_SECRET).
     nodeAdminEnabled: process.env.NODE_ADMIN_ENABLED === "true",
     nodeAdminToken: process.env.NODE_ADMIN_TOKEN || "",
+    // How this node is REACHED — declared by the operator, never inferred (CC-49 round-5
+    // MEDIUM-1). "direct" (default): the listener is the boundary, so a loopback socket peer
+    // is a usable source restriction. "proxied": a reverse proxy / tunnel fronts the node
+    // (dvt1/2/3 -> cloudflared), so EVERY public request also arrives from 127.0.0.1 — the
+    // loopback check is then meaningless and is NOT consulted, the admin token is the only
+    // network barrier, and the endpoints stay closed until NODE_ADMIN_ALLOW_PROXIED=true
+    // acknowledges that. An unrecognised value is a boot failure (see NodeAdminGuard).
+    nodeAdminNetworkMode: process.env.NODE_ADMIN_NETWORK_MODE || "direct",
+    nodeAdminAllowProxied: process.env.NODE_ADMIN_ALLOW_PROXIED === "true",
+    // Only meaningful in "direct" mode: accept non-loopback socket peers.
     nodeAdminAllowRemote: process.env.NODE_ADMIN_ALLOW_REMOTE === "true",
+    // Trusted reverse proxies, for RATE-LIMIT BUCKETING ONLY — never for admission. Both must
+    // be set together (a half-configured topology refuses to boot) and only in proxied mode.
+    // The client address is taken from X-Forwarded-For at exactly HOPS from the right, the
+    // socket peer must be inside one of the CIDRs, and any inconsistency rejects the request.
+    nodeAdminTrustedProxyCidrs: parseAllowlist(process.env.NODE_ADMIN_TRUSTED_PROXY_CIDRS || ""),
+    nodeAdminTrustedProxyHops: strictIntEnv("NODE_ADMIN_TRUSTED_PROXY_HOPS", 0, 0, 8),
     // The throttle here is NOT the opt-in RATE_LIMIT_* one: it is always on, because it is
-    // what bounds bearer-token guessing.
+    // what bounds bearer-token guessing. Unauthenticated and authenticated callers are charged
+    // to SEPARATE ledgers (CC-49 round-5 MEDIUM-2): behind a tunnel every anonymous caller
+    // shares one source key, so a single shared budget let an anonymous flood 429 the operator
+    // out of the admin plane. NODE_ADMIN_RATE_MAX now bounds only unauthenticated attempts.
     nodeAdminRateWindowMs: strictIntEnv("NODE_ADMIN_RATE_WINDOW_MS", 60_000, 1_000, 3_600_000),
     nodeAdminRateMax: strictIntEnv("NODE_ADMIN_RATE_MAX", 10, 1, 1_000),
+    nodeAdminAnonGlobalRateMax: strictIntEnv("NODE_ADMIN_ANON_GLOBAL_RATE_MAX", 60, 1, 10_000),
+    nodeAdminOperatorRateMax: strictIntEnv("NODE_ADMIN_OPERATOR_RATE_MAX", 120, 1, 10_000),
 
     // BLS key-custody backend (#50; arch #67). "local" (default) = in-process key from
     // node_state.json. Future: "kms"/"hsm" via a BLS-capable HSM. Signing output is

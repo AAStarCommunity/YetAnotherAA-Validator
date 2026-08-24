@@ -4,7 +4,7 @@ import { createServer, Server } from "http";
 import { request as httpRequest } from "http";
 import { existsSync, mkdtempSync, rmSync, statSync, readdirSync } from "fs";
 import { networkInterfaces } from "os";
-import { AddressInfo } from "net";
+import { AddressInfo, connect, createServer as createTcpServer, Server as TcpServer } from "net";
 import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import { HEADER_AUTH, RepCreditExperimentGuard } from "../repcredit/repcredit-experiment.guard.js";
@@ -186,6 +186,75 @@ function stopChild(child: ChildProcess): void {
   if (child.exitCode === null) child.kill("SIGKILL");
 }
 
+/**
+ * Start the node and expect it NOT to come up. Returns the exit code and everything it wrote,
+ * so a test can assert that a mis-declared network topology is a BOOT failure and not a
+ * warning the operator scrolls past.
+ */
+async function startNodeExpectingExit(
+  env: Record<string, string>,
+  rpcPort: number
+): Promise<{ code: number | null; log: string }> {
+  const cwd = mkdtempSync(join(REPO_ROOT, "node_modules", ".dvt-realproc-"));
+  execFileSync("node", [join(REPO_ROOT, "scripts", "gen-node-state.mjs"), "realproc"], {
+    cwd,
+    stdio: "ignore",
+  });
+  const port = await freePort();
+  let log = "";
+  const child = spawn("node", [MAIN], {
+    cwd,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      ETH_RPC_URL: `http://127.0.0.1:${rpcPort}`,
+      VALIDATOR_CONTRACT_ADDRESS: "0x1A8Db6390000000000000000000000000000dEaD",
+      GOSSIP_ENABLED: "false",
+      ...env,
+    },
+  });
+  child.stdout.on("data", d => (log += d.toString()));
+  child.stderr.on("data", d => (log += d.toString()));
+  const code = await new Promise<number | null>((done, fail) => {
+    const timer = setTimeout(() => {
+      stopChild(child);
+      fail(new Error(`node did NOT exit within 60s — it booted with a bad config:\n${log}`));
+    }, 60_000);
+    child.on("exit", exitCode => {
+      clearTimeout(timer);
+      done(exitCode);
+    });
+  });
+  rmSync(cwd, { recursive: true, force: true });
+  return { code, log };
+}
+
+/**
+ * A REAL same-host TCP reverse proxy — the shape cloudflared has on dvt1/2/3. It listens on
+ * every interface and back-connects to `127.0.0.1:<node port>`, so the node's socket peer is
+ * loopback for EVERY caller, including one arriving from off-box. This is what made the
+ * round-4 loopback gate inert, and it is why these cases must run against a real process:
+ * no in-process mock reproduces "the peer address is genuinely 127.0.0.1".
+ */
+function sameHostProxy(nodePort: number): Promise<{ server: TcpServer; port: number }> {
+  return new Promise(resolveProxy => {
+    const server = createTcpServer(client => {
+      const upstream = connect(nodePort, "127.0.0.1");
+      client.pipe(upstream);
+      upstream.pipe(client);
+      const drop = () => {
+        client.destroy();
+        upstream.destroy();
+      };
+      client.on("error", drop);
+      upstream.on("error", drop);
+    });
+    server.listen(0, "0.0.0.0", () =>
+      resolveProxy({ server, port: (server.address() as AddressInfo).port })
+    );
+  });
+}
+
 /** The one assertion every single case repeats: no credential fragment, anywhere. */
 function expectNoCredential(text: string, where: string): void {
   for (const fragment of CREDENTIAL_FRAGMENTS) {
@@ -351,6 +420,223 @@ describe("real process: node-admin throttle (CC-49 round-4 HIGH-1)", () => {
     const limited = await attempt();
     expect(limited.status).toBe(429);
     expect(limited.json).toMatchObject({ errorCode: "NODE_ADMIN_RATE_LIMITED" });
+  });
+});
+
+/**
+ * CC-49 round-5 MEDIUM-1 / MEDIUM-2, through a REAL same-host reverse proxy.
+ *
+ * The round-5 reviewer's repro, verbatim: start the built `dist/main.js`, put a same-host TCP
+ * reverse proxy in front of it, and observe that a public caller reaches the node from
+ * 127.0.0.1 — so the "loopback only" gate never fired and the "the token is the only barrier"
+ * warning never printed, on precisely the deployment this repo documents (cloudflared).
+ */
+describe("real process: proxied network mode (CC-49 round-5 MEDIUM-1)", () => {
+  let node: Node;
+  let proxy: { server: TcpServer; port: number };
+
+  afterEach(async () => {
+    node?.stop();
+    if (proxy) await new Promise(done => proxy.server.close(() => done(null)));
+  });
+
+  it("keeps the endpoints CLOSED behind a proxy until NODE_ADMIN_ALLOW_PROXIED is set", async () => {
+    node = await startNode(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "proxied",
+        // NODE_ADMIN_ALLOW_PROXIED deliberately unset.
+      },
+      rpc.port
+    );
+    proxy = await sameHostProxy(node.port);
+
+    for (const host of ["127.0.0.1", localRemoteAddress()].filter(Boolean) as string[]) {
+      const res = await send(
+        proxy.port,
+        "POST",
+        "/node/register",
+        { "X-Node-Admin-Token": ADMIN_TOKEN },
+        host
+      );
+      expect([host, res.status]).toEqual([host, 403]);
+      expect([host, res.json?.errorCode]).toEqual([host, "NODE_ADMIN_PROXIED_NOT_ALLOWED"]);
+    }
+    expect(node.log()).toMatch(/stay DISABLED/);
+    expect(node.log()).toMatch(/NODE_ADMIN_ALLOW_PROXIED=true/);
+  });
+
+  it("warns at boot that the token is the only barrier, and never claims loopback as one", async () => {
+    node = await startNode(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "proxied",
+        NODE_ADMIN_ALLOW_PROXIED: "true",
+        NODE_ADMIN_RATE_MAX: "50",
+      },
+      rpc.port
+    );
+    proxy = await sameHostProxy(node.port);
+
+    // THE WARNING THAT WAS MISSING IN ROUND 4: it fires for the tunnel deployment itself.
+    expect(node.log()).toMatch(/ONLY NETWORK BARRIER/);
+    expect(node.log()).toMatch(/NODE_ADMIN_NETWORK_MODE=proxied/);
+
+    // Anonymous through the proxy: 401, i.e. the token — never 403 "loopback only", which
+    // round 4 would also have answered 401 while CLAIMING the source was checked.
+    const anonymous = await send(proxy.port, "POST", "/node/register");
+    expect(anonymous.status).toBe(401);
+    expect(anonymous.json).toMatchObject({ errorCode: "NODE_ADMIN_TOKEN_MISSING" });
+
+    // Wrong token through the proxy: 403 on the credential, not on the source.
+    const wrong = await send(proxy.port, "POST", "/node/register", {
+      "X-Node-Admin-Token": `${ADMIN_TOKEN}x`,
+    });
+    expect(wrong.json).toMatchObject({ errorCode: "NODE_ADMIN_TOKEN_INVALID" });
+
+    // Correct token through the proxy reaches the handler (502 from the failing fake RPC),
+    // and still leaks no provider credential.
+    const authenticated = await send(proxy.port, "POST", "/node/register", {
+      "X-Node-Admin-Token": ADMIN_TOKEN,
+    });
+    expect(authenticated.status).toBe(502);
+    expect(authenticated.json).toMatchObject({ errorCode: "NODE_REGISTER_UPSTREAM_FAILED" });
+    expectNoCredential(authenticated.body, "proxied authenticated register body");
+    expectNoCredential(node.log(), "node log (proxied run)");
+  });
+
+  it("pins what `direct` mode actually means, which is why the mode must be DECLARED", async () => {
+    // This is the round-5 finding reproduced, and it is NOT a bug in `direct` mode: `direct`
+    // is the operator ASSERTING that no proxy fronts the node. If that assertion is wrong,
+    // the loopback gate is inert — a caller through a same-host proxy reaches the handler on
+    // the token alone. The fix is that the assertion is now explicit and the wrong one
+    // (proxied) is fail-closed, not that `direct` somehow detects a proxy it was told is
+    // absent. Left as an executable statement of the contract so it cannot drift silently.
+    node = await startNode(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "direct",
+        NODE_ADMIN_RATE_MAX: "50",
+      },
+      rpc.port
+    );
+    proxy = await sameHostProxy(node.port);
+
+    // Direct, off-box, no proxy: the loopback gate does its job.
+    const remote = localRemoteAddress();
+    if (remote) {
+      const direct = await send(
+        node.port,
+        "POST",
+        "/node/register",
+        { "X-Node-Admin-Token": ADMIN_TOKEN },
+        remote
+      );
+      expect(direct.status).toBe(403);
+      expect(direct.json).toMatchObject({ errorCode: "NODE_ADMIN_REMOTE_FORBIDDEN" });
+    } else {
+      console.warn("no non-loopback IPv4 on this host — direct off-box case not exercised here");
+    }
+    // Same request through the same-host proxy: the socket peer is 127.0.0.1, so it passes
+    // the source gate and only the token stands. Hence `proxied` must be declared, and when
+    // it is, the node stops pretending the source gate means anything.
+    const throughProxy = await send(proxy.port, "POST", "/node/register", {
+      "X-Node-Admin-Token": ADMIN_TOKEN,
+    });
+    expect(throughProxy.status).toBe(502);
+    expect(throughProxy.json).toMatchObject({ errorCode: "NODE_REGISTER_UPSTREAM_FAILED" });
+  });
+
+  it("refuses to boot on an undeclared mode or a half-declared proxy topology", async () => {
+    const bad = await startNodeExpectingExit(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "tunnel",
+      },
+      rpc.port
+    );
+    expect(bad.code).not.toBe(0);
+    expect(bad.log).toMatch(/NODE_ADMIN_NETWORK_MODE must be one of/);
+
+    const half = await startNodeExpectingExit(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "proxied",
+        NODE_ADMIN_ALLOW_PROXIED: "true",
+        NODE_ADMIN_TRUSTED_PROXY_CIDRS: "127.0.0.0/8",
+        // NODE_ADMIN_TRUSTED_PROXY_HOPS deliberately unset — that would mean keying rate
+        // limits on a header the caller controls.
+      },
+      rpc.port
+    );
+    expect(half.code).not.toBe(0);
+    expect(half.log).toMatch(/must be set TOGETHER/);
+  });
+});
+
+describe("real process: an anonymous flood cannot lock the operator out (CC-49 round-5 MEDIUM-2)", () => {
+  let node: Node;
+  let proxy: { server: TcpServer; port: number };
+
+  beforeAll(async () => {
+    node = await startNode(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "proxied",
+        NODE_ADMIN_ALLOW_PROXIED: "true",
+        // Behind a tunnel every caller shares one source key, so these are the budgets that
+        // an attacker and the operator would have shared before the fix.
+        NODE_ADMIN_RATE_MAX: "5",
+        NODE_ADMIN_ANON_GLOBAL_RATE_MAX: "5",
+        NODE_ADMIN_OPERATOR_RATE_MAX: "20",
+      },
+      rpc.port
+    );
+    proxy = await sameHostProxy(node.port);
+  });
+  afterAll(async () => {
+    node?.stop();
+    if (proxy) await new Promise(done => proxy.server.close(() => done(null)));
+  });
+
+  it("THE REGRESSION: after an anonymous flood spends the brute-force budget, the correct token still reaches the handler", async () => {
+    // 12 unauthenticated requests through the proxy — the round-4 guard needed ~10/min to
+    // hold the admin plane shut for everyone, operator included.
+    const anonymous: number[] = [];
+    for (let i = 0; i < 12; i++) {
+      anonymous.push((await send(proxy.port, "POST", "/node/register")).status);
+    }
+    expect(anonymous.slice(0, 5)).toEqual([401, 401, 401, 401, 401]);
+    expect(anonymous.slice(5)).toEqual(Array(7).fill(429));
+
+    // The anonymous ledger is spent, and a wrong token is bounded WITH it…
+    const guess = await send(proxy.port, "POST", "/node/register", {
+      "X-Node-Admin-Token": "guess",
+    });
+    expect(guess.status).toBe(429);
+    expect(guess.json).toMatchObject({ errorCode: "NODE_ADMIN_RATE_LIMITED" });
+
+    // …while the operator, on the SAME shared proxy source key, is not affected at all.
+    for (let i = 0; i < 3; i++) {
+      const operator = await send(proxy.port, "POST", "/node/register", {
+        "X-Node-Admin-Token": ADMIN_TOKEN,
+      });
+      // 502 = it ran the handler and the fake RPC refused. Anything but 429 is the assertion.
+      expect([i, operator.status]).toEqual([i, 502]);
+      expect([i, operator.json?.errorCode]).toEqual([i, "NODE_REGISTER_UPSTREAM_FAILED"]);
+    }
+  });
+
+  it("never wrote the admin token to the log while rejecting all of that", () => {
+    expect(node.log()).not.toContain(ADMIN_TOKEN);
+    expect(node.log()).not.toContain("guess");
+    expectNoCredential(node.log(), "node log (flood run)");
   });
 });
 

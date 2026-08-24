@@ -90,4 +90,11 @@ N<30 走 whole-set BFT 2/3，没有抽样界。cap 86 控 calldata/gas。
   `0.0.0.0` 且经隧道公网可达，这些端点此前完全无鉴权（CC-49 round-4
   HIGH-1）。注册请走 CLI `node scripts/register-node.mjs`；确需 HTTP 时按
   [node-admin 端点说明](./NODE_ADMIN_ENDPOINTS.md) 配 `NODE_ADMIN_ENABLED` +
-  `NODE_ADMIN_TOKEN`（默认仅 loopback，带限流，token 不得复用 RepCredit 实验密钥）。
+  `NODE_ADMIN_TOKEN`（token 不得复用 RepCredit 实验密钥）。另需显式声明网络形态
+  `NODE_ADMIN_NETWORK_MODE`（CC-49 round-5 MEDIUM-1）： `direct`
+  才可用 loopback 作来源限制；dvt1/2/3 在 cloudflared 之后、回源即
+  `127.0.0.1`，必须声明 `proxied`
+  —— 此时不再把 loopback 当边界，启动必打高亮警告「admin
+  token 是唯一网络屏障」，且在 `NODE_ADMIN_ALLOW_PROXIED=true`
+  之前端点保持关闭。限流分两本账（round-5
+  MEDIUM-2）：匿名/错 token 走 per-source + 全局爆破桶，正确 token 经恒时校验后走独立 operator 桶，匿名洪泛无法把持正确 token 的 operator 锁死。

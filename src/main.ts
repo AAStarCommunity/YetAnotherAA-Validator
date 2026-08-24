@@ -66,9 +66,17 @@ async function bootstrap() {
   console.log(`🌐 WebSocket Gossip endpoint: ws://${host}:${port}/ws`);
   console.log(`📋 Available endpoints:`);
   console.log(`   GET /node/info - Get current node information`);
+  // Report the EFFECTIVE posture, not just the flag: in proxied mode the endpoints stay shut
+  // until NODE_ADMIN_ALLOW_PROXIED acknowledges that every caller there is remote, and a boot
+  // banner saying "ENABLED" while every request 403s is exactly the kind of mismatch CC-49
+  // round-5 MEDIUM-1 was about (see docs/NODE_ADMIN_ENDPOINTS.md).
+  const nodeAdminMode = configService.get<string>("nodeAdminNetworkMode") || "direct";
+  const nodeAdminOpen =
+    configService.get<boolean>("nodeAdminEnabled") === true &&
+    (nodeAdminMode !== "proxied" || configService.get<boolean>("nodeAdminAllowProxied") === true);
   console.log(
-    `   POST /node/register - Register node on-chain (node-admin gate; ` +
-      `${configService.get<boolean>("nodeAdminEnabled") === true ? "ENABLED" : "disabled by default"})`
+    `   POST /node/register - Register node on-chain (node-admin gate; mode=${nodeAdminMode}; ` +
+      `${nodeAdminOpen ? "ENABLED" : "disabled"})`
   );
   console.log(`   POST /signature/sign - Sign message with this node`);
   console.log(`   POST /signature/aggregate - Sign and return as aggregate format`);
