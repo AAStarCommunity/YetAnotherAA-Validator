@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, Injectable } from "@nestjs/common";
+import { BadRequestException, ForbiddenException, Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { BlsService } from "../bls/bls.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
@@ -14,9 +14,13 @@ import {
   validateRepCreditProposal,
   validateRepCreditSlashProposal,
 } from "./repcredit-consensus.js";
+import { MAX_VALIDATORS } from "../audit/slash-consensus.js";
+import { checkRepCreditAggregatorPolicy } from "./repcredit-isolation.js";
 
 @Injectable()
 export class RepCreditService {
+  private readonly logger = new Logger(RepCreditService.name);
+
   constructor(
     private readonly config: ConfigService,
     private readonly blockchain: BlockchainService,
@@ -53,18 +57,25 @@ export class RepCreditService {
     const slot = this.configuredSlot();
     const aggregator = this.aggregatorAddress();
     const node = this.nodeService.getNodeForSigning();
+
+    let localKey: string;
+    try {
+      localKey = encodeRepCreditPublicKey(node.publicKey);
+    } catch {
+      throw new ForbiddenException("local BLS public key is malformed");
+    }
+
+    // Cheap binding first (2 reads): a misconfigured slot short-circuits before the wider
+    // audit-aggregator scan below. Neither check produces a signature on its own.
     const onChainKey = await this.blockchain.getBlsPublicKeyAtSlot(aggregator, slot);
     if (!onChainKey) {
       throw new ForbiddenException(`configured validator slot ${slot} is not active`);
     }
-    try {
-      if (encodeRepCreditPublicKey(node.publicKey) !== onChainKey.toLowerCase()) {
-        throw new ForbiddenException(`local BLS key is not registered at validator slot ${slot}`);
-      }
-    } catch (error) {
-      if (error instanceof ForbiddenException) throw error;
-      throw new ForbiddenException("local BLS public key is malformed");
+    if (localKey !== onChainKey.toLowerCase()) {
+      throw new ForbiddenException(`local BLS key is not registered at validator slot ${slot}`);
     }
+
+    await this.assertKeyIsolatedFromAuditAggregator(localKey);
 
     const signature = await this.blsService.signRepCreditHash(messageHash, node);
     if (!signature.signatureCompact || !signature.publicKey) {
@@ -132,23 +143,117 @@ export class RepCreditService {
   }
 
   /**
-   * Refuse to share a BLSAggregator instance with the production audit/slash path
-   * (CC-49 BLOCKER-1).
-   *
-   * A quorum produced here is byte-identical to a real slash proof, but it is NOT backed by
-   * independent per-node re-verification of the violation. If the experiment ran against the
-   * same BLSAggregator the audit path uses, an experiment co-signature would be directly
-   * executable against production stake. The experiment must target its own isolated
-   * aggregator deployment; production slashing goes through GossipQuorumCoSigner.
+   * Config-layer isolation (CC-49 BLOCKER-1 / HIGH-A / MEDIUM-C). Pure — no RPC — so it
+   * rejects before any caller-supplied field is parsed. Requires an isolated experiment
+   * aggregator AND an explicitly configured audit aggregator; see repcredit-isolation.ts for
+   * why an address comparison alone is not isolation.
    */
   private assertAggregatorIsolation(): void {
-    const address = this.config.get<string>("repCreditBlsAggregatorAddress");
+    const verdict = checkRepCreditAggregatorPolicy({
+      repCreditAggregatorAddress: this.config.get<string>("repCreditBlsAggregatorAddress"),
+      auditAggregatorAddress: this.config.get<string>("auditBlsAggregatorAddress"),
+      auditAggregatorFromEnv: this.config.get<boolean>("auditBlsAggregatorAddressFromEnv") === true,
+    });
+    if (!verdict.ok) {
+      throw new ForbiddenException(verdict.reason);
+    }
+  }
+
+  /**
+   * Chain-layer isolation (CC-49 HIGH-A): refuse to sign with a key that is ALSO active on the
+   * production audit aggregator.
+   *
+   * The signed preimage carries no aggregator address and no domain tag, so a co-signature
+   * produced "for" the experiment aggregator is byte-valid against the production one whenever
+   * the same key sits in the same slot on both. Address separation cannot prevent that — only
+   * refusing to reuse a production-registered key can. Runs on every signature rather than
+   * once at boot, deliberately: a slot can be registered while the node is armed, and a cached
+   * "clean" verdict would be exactly the stale answer that matters.
+   *
+   * Every failure mode is fail-closed:
+   *   - audit aggregator has no code, or does not answer the BLSAggregator ABI → refuse
+   *     (this is also the wrong-chain guard: a Sepolia address on another chain has no code);
+   *   - any slot read fails → refuse (the STRICT reader throws instead of returning `null`,
+   *     so a transient RPC error can never be mistaken for "the key is absent");
+   *   - the key is found active anywhere in [1, maxSlots] → refuse.
+   *
+   * Cost: up to 2 × maxSlots (default 13) `eth_call`s per signature, on an endpoint that is
+   * already HMAC-authenticated and loopback-bound.
+   */
+  private async assertKeyIsolatedFromAuditAggregator(localKey: string): Promise<void> {
     const auditAggregator = this.config.get<string>("auditBlsAggregatorAddress");
-    if (address && auditAggregator && auditAggregator.toLowerCase() === address.toLowerCase()) {
-      throw new ForbiddenException(
-        "REPCREDIT_BLS_AGGREGATOR_ADDRESS must not equal AUDIT_BLS_AGGREGATOR_ADDRESS — " +
-          "the experiment signer may not target the production slash aggregator"
+    if (!auditAggregator) {
+      // Unreachable via requireArmed(), which rejects an unset audit aggregator. Kept so the
+      // invariant holds for any future caller reaching this method directly.
+      throw new ForbiddenException("AUDIT_BLS_AGGREGATOR_ADDRESS is required when armed");
+    }
+
+    // NOTE: the underlying error text is LOGGED, never returned. ethers wraps provider
+    // failures with request detail that can carry the RPC URL, and the RPC URL carries the
+    // provider API key (the redaction finding closed in round 1). The caller gets the fact
+    // of the refusal, nothing more.
+    let code: string;
+    try {
+      code = await this.blockchain.getCode(auditAggregator);
+    } catch (error) {
+      this.logger.error(
+        `RepCredit: getCode on the audit aggregator ${auditAggregator} failed: ${errorText(error)}`
       );
+      throw new ForbiddenException(
+        `cannot read the audit aggregator at ${auditAggregator} — refusing to sign without a ` +
+          "verifiable production aggregator to isolate against"
+      );
+    }
+    if (!code || code === "0x") {
+      throw new ForbiddenException(
+        `no contract deployed at AUDIT_BLS_AGGREGATOR_ADDRESS ${auditAggregator} on this chain — ` +
+          "refusing to sign without a verifiable production aggregator to isolate against"
+      );
+    }
+    try {
+      await this.blockchain.probeBlsAggregator(auditAggregator);
+    } catch (error) {
+      this.logger.error(
+        `RepCredit: the audit aggregator ${auditAggregator} failed the BLSAggregator interface ` +
+          `probe: ${errorText(error)}`
+      );
+      throw new ForbiddenException(
+        `AUDIT_BLS_AGGREGATOR_ADDRESS ${auditAggregator} does not answer the BLSAggregator ` +
+          "interface on this chain"
+      );
+    }
+
+    // FLOORED at the contract's MAX_VALIDATORS, never just AUDIT_MAX_SLOTS: this is a
+    // security scan, and an operator lowering AUDIT_MAX_SLOTS must not be able to shrink it
+    // into missing the slot their key actually sits in. A LARGER configured value is honoured.
+    const configured = this.config.get<number>("auditMaxSlots") ?? MAX_VALIDATORS;
+    const maxSlots = Math.max(MAX_VALIDATORS, Number.isInteger(configured) ? configured : 0);
+    for (let slot = 1; slot <= maxSlots; slot++) {
+      let key: string | null;
+      try {
+        key = await this.blockchain.getBlsPublicKeyAtSlotStrict(auditAggregator, slot);
+      } catch (error) {
+        this.logger.error(
+          `RepCredit: audit-aggregator slot ${slot} read failed on ${auditAggregator}: ` +
+            errorText(error)
+        );
+        throw new ForbiddenException(
+          `could not determine whether the local BLS key is active at audit aggregator slot ` +
+            `${slot} — refusing to sign on an indeterminate isolation check`
+        );
+      }
+      if (key && key.toLowerCase() === localKey) {
+        this.logger.error(
+          `RepCredit refused to sign: the local BLS key is active at slot ${slot} on the ` +
+            `production audit aggregator ${auditAggregator}. Experiment keys must be ephemeral ` +
+            "and registered on the experiment aggregator only (CC-49 HIGH-A)."
+        );
+        throw new ForbiddenException(
+          `local BLS key is also active at slot ${slot} on the production audit aggregator — ` +
+            "an experiment co-signature made with it would be a byte-valid production slash " +
+            "proof; use an ephemeral experiment key"
+        );
+      }
     }
   }
 
@@ -196,20 +301,21 @@ export class RepCreditService {
 
   private configuredSlot(): number {
     const slot = this.config.get<number>("repCreditValidatorSlot") ?? 0;
-    if (!Number.isInteger(slot) || slot < 1 || slot > 13) {
-      throw new ForbiddenException("REPCREDIT_VALIDATOR_SLOT must be in [1, 13]");
+    if (!Number.isInteger(slot) || slot < 1 || slot > MAX_VALIDATORS) {
+      throw new ForbiddenException(`REPCREDIT_VALIDATOR_SLOT must be in [1, ${MAX_VALIDATORS}]`);
     }
     return slot;
   }
 
   private aggregatorAddress(): string {
-    const address = this.config.get<string>("repCreditBlsAggregatorAddress");
-    if (!address) {
-      throw new ForbiddenException("REPCREDIT_BLS_AGGREGATOR_ADDRESS is required");
-    }
     // Re-assert here so the isolation invariant holds for any future caller that
-    // resolves the aggregator without going through requireArmed().
+    // resolves the aggregator without going through requireArmed(). The policy check also
+    // owns the "address is required" case.
     this.assertAggregatorIsolation();
-    return address;
+    return this.config.get<string>("repCreditBlsAggregatorAddress") as string;
   }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

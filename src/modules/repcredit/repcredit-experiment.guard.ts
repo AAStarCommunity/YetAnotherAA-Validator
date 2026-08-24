@@ -22,9 +22,14 @@ const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
  * Mandatory admission gate for the RepCredit experiment endpoints (CC-49 BLOCKER-1).
  *
  * WHY THIS EXISTS. `/repcredit/slash/sign` produces a BLS signature over a preimage that
- * is byte-identical to `BLSAggregator.verifyAndExecute`'s slash-only hash, using the node's
- * PRODUCTION signing key at its registered on-chain slot. A quorum of those signatures is a
- * valid, irreversible slash proof. Unlike the hardened audit path (GossipQuorumCoSigner),
+ * is byte-identical to `BLSAggregator.verifyAndExecute`'s slash-only hash, signed with this
+ * node's local BLS key. That preimage contains no aggregator address and no domain tag, so
+ * the resulting signature is NOT bound to the aggregator instance it was produced for: a
+ * quorum of them is a byte-valid slash proof against ANY aggregator on the same chain where
+ * the same keys occupy the same slots (CC-49 HIGH-A). Address isolation alone therefore does
+ * not make an experiment co-signature unusable against production stake — `RepCreditService`
+ * additionally refuses to sign with a key that is active on the audit aggregator, and the
+ * experiment must use EPHEMERAL keys. Unlike the hardened audit path (GossipQuorumCoSigner),
  * this path does NOT re-derive the violation from chain state — it only agrees on the
  * ENCODING of caller-supplied fields. It must therefore never be reachable by an
  * unauthenticated caller, and the node listens on 0.0.0.0.
@@ -34,8 +39,11 @@ const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
  *   2. secret present — armed without a secret rejects every request (503), never opens.
  *   3. body size      — bounded before any HMAC/parse work (413).
  *   4. source         — loopback only, unless REPCREDIT_ALLOW_REMOTE=true is set explicitly.
- *   5. HMAC           — timestamp within TTL + constant-time HMAC over the RAW bytes.
- *   6. replay         — a given (timestamp, auth) pair is accepted at most once per TTL.
+ *   5. HMAC           — timestamp inside the asymmetric window + constant-time HMAC over
+ *                        the RAW bytes.
+ *   6. replay         — a given auth token is accepted at most once, and the record of it
+ *                        outlives the token's own validity (anchored to the SIGNED
+ *                        timestamp, not to arrival — CC-49 MEDIUM-B).
  *
  * PRODUCTION SLASHING DOES NOT USE THIS PATH. The production quorum is
  * `GossipQuorumCoSigner` (peer-authenticated gossip transport, effective operator
@@ -57,9 +65,15 @@ export class RepCreditExperimentGuard implements CanActivate {
   private readonly ttlMs: number;
   private readonly allowRemote: boolean;
   private readonly maxBodyBytes: number;
+  private readonly maxFutureSkewMs: number;
+  private readonly replayCacheMax: number;
   private readonly now: () => number;
 
-  /** auth hex -> expiry ms. Single-use within the TTL window (replay defence). */
+  /**
+   * auth hex -> the ms after which the token itself is no longer acceptable
+   * (`signedTimestamp + ttlMs`). Anchoring the entry to the SIGNED timestamp rather than to
+   * arrival is what makes the record outlive the token: see `pruneSeen`.
+   */
   private readonly seen = new Map<string, number>();
 
   private rawBodyWarned = false;
@@ -74,6 +88,8 @@ export class RepCreditExperimentGuard implements CanActivate {
     this.ttlMs = config.get<number>("repCreditExperimentAuthTtlMs") ?? 120_000;
     this.allowRemote = config.get<boolean>("repCreditAllowRemote") === true;
     this.maxBodyBytes = config.get<number>("repCreditMaxBodyBytes") ?? 65_536;
+    this.maxFutureSkewMs = config.get<number>("repCreditAuthMaxFutureSkewMs") ?? 5_000;
+    this.replayCacheMax = config.get<number>("repCreditReplayCacheMax") ?? 10_000;
     this.now = now ?? (() => Date.now());
 
     // Surface a dangerous or unusable arm at STARTUP, not on the first request.
@@ -144,7 +160,12 @@ export class RepCreditExperimentGuard implements CanActivate {
 
     const now = this.now();
     const tsNum = Number(ts);
-    if (!Number.isFinite(tsNum) || Math.abs(now - tsNum) > this.ttlMs) {
+    // ASYMMETRIC window (CC-49 MEDIUM-B). Backwards: the full TTL. Forwards: only a small
+    // clock-skew allowance. The previous symmetric `|now - ts| <= ttl` accepted a token
+    // stamped a full TTL into the future, giving it a ~2x TTL lifetime while its replay entry
+    // (keyed off arrival) expired after 1x TTL — a client whose clock merely ran fast produced
+    // tokens that were replayable after their own replay record had been pruned.
+    if (!Number.isFinite(tsNum) || now - tsNum > this.ttlMs || tsNum - now > this.maxFutureSkewMs) {
       throw new HttpException("auth timestamp outside the allowed window", HttpStatus.UNAUTHORIZED);
     }
 
@@ -168,20 +189,42 @@ export class RepCreditExperimentGuard implements CanActivate {
       throw new HttpException("HMAC verification failed", HttpStatus.FORBIDDEN);
     }
 
-    // 6. Single-use within the window: a captured request cannot be replayed to
-    //    farm additional co-signatures for the same proposal.
+    // 6. Single-use: a captured request cannot be replayed to farm additional
+    //    co-signatures for the same proposal.
+    //
+    //    ATOMICITY: everything from here to the `set` below is synchronous with no `await`,
+    //    so on Node's single-threaded event loop the check-then-set cannot interleave with a
+    //    concurrent request. Do not introduce an await into this block.
     this.pruneSeen(now);
     if (this.seen.has(auth)) {
       throw new HttpException("auth token already used", HttpStatus.FORBIDDEN);
     }
-    this.seen.set(auth, now + this.ttlMs);
+    if (this.seen.size >= this.replayCacheMax) {
+      // Fail closed. Evicting to make room would silently re-open the replay window; only an
+      // already-authenticated caller can get us here.
+      throw new HttpException(
+        "RepCredit replay cache is full; refusing new auth tokens",
+        HttpStatus.SERVICE_UNAVAILABLE
+      );
+    }
+    // Anchored to the SIGNED timestamp: the entry lives exactly as long as the token it
+    // guards. `now + ttl` (the previous value) expired the record while the token was still
+    // inside its own acceptance window whenever the caller's clock ran ahead.
+    this.seen.set(auth, tsNum + this.ttlMs);
     return true;
   }
 
-  /** Drop expired replay entries so the map stays bounded by the TTL window. */
+  /**
+   * Drop replay entries whose token is itself no longer acceptable.
+   *
+   * STRICTLY `<`, not `<=` (CC-49 MEDIUM-B boundary case). A token stamped `ts` is still
+   * accepted at exactly `now === ts + ttl` (the staleness test rejects only `now - ts > ttl`),
+   * so its record must survive that instant too. With `<=` both tests took the equality and a
+   * replay slipped through on the boundary tick.
+   */
   private pruneSeen(now: number): void {
     for (const [key, expiry] of this.seen) {
-      if (expiry <= now) this.seen.delete(key);
+      if (expiry < now) this.seen.delete(key);
     }
   }
 

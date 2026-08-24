@@ -2,13 +2,29 @@ import { BadRequestException, ForbiddenException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { RepCreditService } from "./repcredit.service.js";
 
-function service(config: Record<string, unknown>, blockchain: Record<string, unknown> = {}) {
+function service(
+  config: Record<string, unknown>,
+  blockchain: Record<string, unknown> = {},
+  node: Record<string, unknown> = {},
+  bls: Record<string, unknown> = {}
+) {
   const configService = { get: (key: string) => config[key] } as unknown as ConfigService;
-  return new RepCreditService(configService, blockchain as any, {} as any, {} as any);
+  return new RepCreditService(configService, blockchain as any, node as any, bls as any);
 }
 
 const EXPERIMENT_AGGREGATOR = "0x0000000000000000000000000000000000000001";
 const PRODUCTION_AGGREGATOR = "0x00000000000000000000000000000000000000AA";
+
+/** Config that satisfies the pure isolation policy: armed, distinct + EXPLICIT aggregators. */
+function armed(config: Record<string, unknown> = {}) {
+  return {
+    repCreditExperimentSigning: true,
+    repCreditBlsAggregatorAddress: EXPERIMENT_AGGREGATOR,
+    auditBlsAggregatorAddress: PRODUCTION_AGGREGATOR,
+    auditBlsAggregatorAddressFromEnv: true,
+    ...config,
+  };
+}
 
 describe("RepCreditService opt-in gates", () => {
   it("is fail-closed by default before any RPC or signing work", async () => {
@@ -16,21 +32,15 @@ describe("RepCreditService opt-in gates", () => {
   });
 
   it("refuses aggregation below the BLSAggregator on-chain threshold", async () => {
-    const instance = service(
-      {
-        repCreditExperimentSigning: true,
-        repCreditBlsAggregatorAddress: EXPERIMENT_AGGREGATOR,
-      },
-      {
-        getChainId: async () => 31337,
-        getBlsDefaultThreshold: async () => 3,
-      }
-    );
+    const instance = service(armed(), {
+      getChainId: async () => 31337,
+      getBlsDefaultThreshold: async () => 3,
+    });
     await expect(instance.aggregate({} as any, [], 2)).rejects.toBeInstanceOf(BadRequestException);
   });
 });
 
-describe("RepCreditService production-aggregator separation (CC-49 BLOCKER-1)", () => {
+describe("RepCreditService aggregator config policy (CC-49 BLOCKER-1 / HIGH-A / MEDIUM-C)", () => {
   const blockchain = {
     getChainId: async () => 31337,
     getBlsDefaultThreshold: async () => 1,
@@ -40,13 +50,12 @@ describe("RepCreditService production-aggregator separation (CC-49 BLOCKER-1)", 
 
   function sameAddress(config: Record<string, unknown> = {}) {
     return service(
-      {
-        repCreditExperimentSigning: true,
+      armed({
         repCreditValidatorSlot: 1,
         repCreditBlsAggregatorAddress: PRODUCTION_AGGREGATOR,
         auditBlsAggregatorAddress: PRODUCTION_AGGREGATOR.toLowerCase(),
         ...config,
-      },
+      }),
       blockchain
     );
   }
@@ -70,6 +79,183 @@ describe("RepCreditService production-aggregator separation (CC-49 BLOCKER-1)", 
       BadRequestException
     );
   });
+
+  it("refuses to arm when AUDIT_BLS_AGGREGATOR_ADDRESS was not set explicitly (MEDIUM-C)", async () => {
+    // The resolved value always carries the built-in Sepolia default, so an unset env would
+    // otherwise compare the experiment aggregator against a foreign-chain address.
+    const instance = service(armed({ auditBlsAggregatorAddressFromEnv: false }), blockchain);
+    await expect(instance.signSlash({ slashLevel: 1 } as any)).rejects.toThrow(
+      /must be set EXPLICITLY/
+    );
+    await expect(instance.aggregateSlash({ slashLevel: 1 } as any, [], 3)).rejects.toThrow(
+      /must be set EXPLICITLY/
+    );
+  });
+
+  it("refuses to arm without REPCREDIT_BLS_AGGREGATOR_ADDRESS", async () => {
+    const instance = service(armed({ repCreditBlsAggregatorAddress: undefined }), blockchain);
+    await expect(instance.signSlash({ slashLevel: 1 } as any)).rejects.toThrow(
+      /REPCREDIT_BLS_AGGREGATOR_ADDRESS is required/
+    );
+  });
+});
+
+describe("RepCreditService key isolation from the audit aggregator (CC-49 HIGH-A)", () => {
+  // A well-formed compressed G1 point (the generator) — encodeRepCreditPublicKey must parse it.
+  const NODE_PUBLIC_KEY =
+    "0x97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+  const SIGNING_NODE = { nodeId: "node-1", publicKey: NODE_PUBLIC_KEY };
+  const EXPERIMENT_SLOT_KEY = "0x" + "ab".repeat(128);
+
+  function build(
+    overrides: {
+      auditSlotKeys?: (string | null)[];
+      auditSlotThrowsAt?: number;
+      code?: string;
+      probeThrows?: boolean;
+      experimentSlotKey?: string | null;
+      config?: Record<string, unknown>;
+    } = {}
+  ) {
+    const signed: string[] = [];
+    const blockchain = {
+      getChainId: async () => 31337,
+      getBlsPublicKeyAtSlot: async () =>
+        overrides.experimentSlotKey === undefined
+          ? EXPERIMENT_SLOT_KEY
+          : overrides.experimentSlotKey,
+      getCode: async () => overrides.code ?? "0x60006000",
+      probeBlsAggregator: async () => {
+        if (overrides.probeThrows) throw new Error("no such method");
+      },
+      getBlsPublicKeyAtSlotStrict: async (_addr: string, slot: number) => {
+        if (overrides.auditSlotThrowsAt === slot) throw new Error("RPC timeout");
+        return overrides.auditSlotKeys?.[slot - 1] ?? null;
+      },
+    };
+    const instance = service(
+      armed({ repCreditValidatorSlot: 1, auditMaxSlots: 3, ...overrides.config }),
+      blockchain,
+      { getNodeForSigning: () => SIGNING_NODE },
+      {
+        signRepCreditHash: async (hash: string) => {
+          signed.push(hash);
+          return { signatureCompact: "0xdead", publicKey: "0xbeef" };
+        },
+      }
+    );
+    return { instance, signed, blockchain };
+  }
+
+  /** A valid reputation proposal, self-consistent with the production hash builder. */
+  async function proposal() {
+    const { buildRepCreditMessageHash } = await import("./repcredit-consensus.js");
+    const base = {
+      schemaVersion: "repcredit-reputation-v1" as const,
+      proposalId: "1",
+      operator: "0x0000000000000000000000000000000000000000",
+      slashLevel: 0,
+      users: ["0x1111111111111111111111111111111111111111"],
+      scores: ["10"],
+      epoch: "1",
+      chainId: "31337",
+      messageHash: "0x" + "00".repeat(32),
+    };
+    return { ...base, messageHash: buildRepCreditMessageHash(base as any) };
+  }
+
+  /**
+   * Derived through the PRODUCTION encoder so the fixture cannot drift from it: the service
+   * binds the local key to the experiment slot before scanning the audit aggregator, so the
+   * stubbed experiment slot must return exactly what the node itself would produce.
+   */
+  async function encodedLocalKey(): Promise<string> {
+    const { encodeRepCreditPublicKey } = await import("./repcredit-consensus.js");
+    return encodeRepCreditPublicKey(NODE_PUBLIC_KEY);
+  }
+
+  it("signs when the local key is absent from every audit-aggregator slot", async () => {
+    const key = await encodedLocalKey();
+    const { instance, signed } = build({
+      experimentSlotKey: key,
+      auditSlotKeys: [null, "0x" + "cd".repeat(128), null],
+    });
+    await expect(instance.sign((await proposal()) as any)).resolves.toMatchObject({ slot: 1 });
+    expect(signed).toHaveLength(1);
+  });
+
+  it("refuses to sign when the local key is active in ANY audit-aggregator slot", async () => {
+    const key = await encodedLocalKey();
+    for (const slot of [1, 2, 3]) {
+      const auditSlotKeys: (string | null)[] = [null, null, null];
+      auditSlotKeys[slot - 1] = key.toUpperCase().replace("0X", "0x");
+      const { instance, signed } = build({ experimentSlotKey: key, auditSlotKeys });
+      await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
+        new RegExp(`also active at slot ${slot} on the production audit aggregator`)
+      );
+      expect(signed).toHaveLength(0);
+    }
+  });
+
+  it("refuses to sign when a single audit-slot read fails (never reads as 'absent')", async () => {
+    const key = await encodedLocalKey();
+    const { instance, signed } = build({ experimentSlotKey: key, auditSlotThrowsAt: 2 });
+    await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
+      /could not determine whether the local BLS key is active at audit aggregator slot 2/
+    );
+    expect(signed).toHaveLength(0);
+  });
+
+  it("does not echo the underlying RPC error back to the caller", async () => {
+    // ethers wraps provider failures with request detail that can carry the RPC URL, and the
+    // RPC URL carries the provider API key. The refusal is reported; the cause is only logged.
+    const key = await encodedLocalKey();
+    const { instance } = build({ experimentSlotKey: key, auditSlotThrowsAt: 2 });
+    await expect(instance.sign((await proposal()) as any)).rejects.not.toThrow(/RPC timeout/);
+  });
+
+  it("scans at least MAX_VALIDATORS slots even when AUDIT_MAX_SLOTS is lowered", async () => {
+    // A security scan must not be shrinkable by an operator env into missing the slot the
+    // key actually sits in.
+    const key = await encodedLocalKey();
+    const auditSlotKeys: (string | null)[] = new Array(13).fill(null);
+    auditSlotKeys[12] = key;
+    const { instance, signed } = build({
+      experimentSlotKey: key,
+      auditSlotKeys,
+      config: { auditMaxSlots: 3 },
+    });
+    await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
+      /also active at slot 13 on the production audit aggregator/
+    );
+    expect(signed).toHaveLength(0);
+  });
+
+  it("refuses to sign when the audit aggregator has no code on this chain (MEDIUM-C)", async () => {
+    const key = await encodedLocalKey();
+    const { instance, signed } = build({ experimentSlotKey: key, code: "0x" });
+    await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
+      /no contract deployed at/
+    );
+    expect(signed).toHaveLength(0);
+  });
+
+  it("refuses to sign when the audit aggregator does not answer the BLSAggregator ABI", async () => {
+    const key = await encodedLocalKey();
+    const { instance, signed } = build({ experimentSlotKey: key, probeThrows: true });
+    await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
+      /does not answer the BLSAggregator interface/
+    );
+    expect(signed).toHaveLength(0);
+  });
+
+  it("still enforces the experiment-slot binding before the audit scan", async () => {
+    const { instance, signed } = build({ experimentSlotKey: "0x" + "cd".repeat(128) });
+    await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
+      /local BLS key is not registered at validator slot 1/
+    );
+    expect(signed).toHaveLength(0);
+  });
 });
 
 describe("RepCreditService slash threshold source (CC-49 MEDIUM-1)", () => {
@@ -77,23 +263,17 @@ describe("RepCreditService slash threshold source (CC-49 MEDIUM-1)", () => {
     slashThresholds: Record<number, number>,
     calls: { level?: number; defaultUsed?: boolean } = {}
   ) {
-    return service(
-      {
-        repCreditExperimentSigning: true,
-        repCreditBlsAggregatorAddress: EXPERIMENT_AGGREGATOR,
+    return service(armed(), {
+      getChainId: async () => 31337,
+      getBlsDefaultThreshold: async () => {
+        calls.defaultUsed = true;
+        return 7;
       },
-      {
-        getChainId: async () => 31337,
-        getBlsDefaultThreshold: async () => {
-          calls.defaultUsed = true;
-          return 7;
-        },
-        getBlsSlashThreshold: async (_addr: string, level: number) => {
-          calls.level = level;
-          return slashThresholds[level];
-        },
-      }
-    );
+      getBlsSlashThreshold: async (_addr: string, level: number) => {
+        calls.level = level;
+        return slashThresholds[level];
+      },
+    });
   }
 
   it("reads slashThresholds[slashLevel], not the reputation defaultThreshold", async () => {

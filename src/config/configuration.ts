@@ -112,7 +112,9 @@ export default () => {
     // RepCredit paper evidence co-signing. This is a separate, structured protocol
     // path: it never relaxes /signature/sign and it is OFF unless explicitly armed.
     // The configured slot is checked against the active public key registered in the
-    // production BLSAggregator before every signature and aggregate operation.
+    // ISOLATED EXPERIMENT BLSAggregator before every signature and aggregate operation;
+    // arming additionally requires an EXPLICIT AUDIT_BLS_AGGREGATOR_ADDRESS and refuses to
+    // sign with a key that is also active on that production aggregator (CC-49 HIGH-A).
     repCreditExperimentSigning: process.env.REPCREDIT_EXPERIMENT_SIGNING === "true",
     repCreditBlsAggregatorAddress: process.env.REPCREDIT_BLS_AGGREGATOR_ADDRESS || undefined,
     repCreditValidatorSlot: parseInt(process.env.REPCREDIT_VALIDATOR_SLOT || "0", 10),
@@ -127,6 +129,24 @@ export default () => {
     ),
     repCreditAllowRemote: process.env.REPCREDIT_ALLOW_REMOTE === "true",
     repCreditMaxBodyBytes: parseInt(process.env.REPCREDIT_MAX_BODY_BYTES || "65536", 10),
+    // CC-49 MEDIUM-B. The auth window is ASYMMETRIC on purpose. A token is accepted while
+    // `now - ts <= TTL` (staleness) and `ts - now <= MAX_FUTURE_SKEW` (a small allowance for an
+    // orchestrator clock running fast). The old symmetric `|now - ts| <= TTL` test let a client
+    // whose clock ran fast mint future-dated tokens that stayed valid for ~2x TTL while the
+    // replay entry (keyed off ARRIVAL time) expired after 1x TTL — a real replay window. Keep
+    // this small; it is a clock-skew allowance, not a validity extension.
+    repCreditAuthMaxFutureSkewMs: (() => {
+      const parsed = parseInt(process.env.REPCREDIT_AUTH_MAX_FUTURE_SKEW_MS || "5000", 10);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5000;
+    })(),
+    // Hard cap on the single-use replay cache. Entries are only inserted AFTER a successful
+    // HMAC check, so this bounds an AUTHENTICATED caller, not an anonymous one. On overflow the
+    // guard rejects (503) rather than evicting: evicting the oldest entry would silently
+    // re-open the replay window it exists to close.
+    repCreditReplayCacheMax: (() => {
+      const parsed = parseInt(process.env.REPCREDIT_REPLAY_CACHE_MAX || "10000", 10);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 10000;
+    })(),
 
     // EIP-2335 keystore passphrase (#5, #50 ④). When node_state.json holds an encrypted
     // keystore, this decrypts it at boot. Supply it from OUTSIDE the machine's disk —

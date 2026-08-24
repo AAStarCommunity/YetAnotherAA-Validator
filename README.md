@@ -314,10 +314,14 @@ Production slashing runs through the audit path (`GossipQuorumCoSigner`), which
 re-derives every violation from chain state per node.
 
 The slash preimage is byte-identical to a real `BLSAggregator` slash proof and
-is signed with the node's production BLS key, so the path is fail-closed: it
-needs `REPCREDIT_EXPERIMENT_SIGNING=true` **and** a mandatory HMAC secret,
-accepts loopback callers only by default, bounds body size, rejects replays, and
-refuses to arm against the production audit aggregator. See
+carries no aggregator address or domain tag, so a signature made here is valid
+against any aggregator on the same chain holding the same key at the same slot.
+The path is therefore fail-closed on both admission and keys: it needs
+`REPCREDIT_EXPERIMENT_SIGNING=true` **and** a mandatory HMAC secret, accepts
+loopback callers only by default, bounds body size, rejects replays, requires an
+explicitly configured production `AUDIT_BLS_AGGREGATOR_ADDRESS` to isolate
+against, and refuses to sign with a key that is active in any slot on it.
+Experiment keys must be ephemeral. See
 [docs/REPCREDIT_EXPERIMENT.md](docs/REPCREDIT_EXPERIMENT.md) for the runbook.
 
 ### Documentation
@@ -417,8 +421,8 @@ node_*.json             # Dynamic node files (ignored by git)
 - Production deployments should use KMS for key management
 - RPC endpoints are logged host-only (`redactRpcUrl`) — provider API keys in the
   `ETH_RPC_URL` path/query/userinfo never reach stdout or a log shipper
-- The RepCredit endpoints are experiment-only and fail-closed; never arm them on
-  a node whose stake you are not willing to see slashed
+- The RepCredit endpoints are experiment-only and fail-closed; use ephemeral
+  keys only, and never arm them on a node whose BLS key carries stake
 
 ## Signature Aggregation Workflow
 

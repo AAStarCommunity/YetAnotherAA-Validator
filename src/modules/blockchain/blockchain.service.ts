@@ -1204,6 +1204,54 @@ export class BlockchainService {
     }
   }
 
+  /**
+   * STRICT variant of `getBlsPublicKeyAtSlot` for fail-closed *negative* checks (CC-49 HIGH-A).
+   *
+   * `getBlsPublicKeyAtSlot` collapses "slot is empty" and "the read failed" into the same
+   * `null`. That is correct for the audit path, which uses a null as "cannot bind → do not
+   * count this signature" (fail-closed in the negative direction). It is exactly WRONG for a
+   * caller that must prove a key is ABSENT from an aggregator: a transient RPC error would
+   * read as "absent" and let the check pass. This variant THROWS on any read/decode failure
+   * and returns `null` only when the slot is genuinely empty or the key is inactive.
+   *
+   * Deliberately not folded into the lenient method: that one is on the production
+   * audit/slash path and its behaviour must not change (CC-49 zero-regression requirement).
+   */
+  async getBlsPublicKeyAtSlotStrict(
+    blsAggregatorAddress: string,
+    slot: number
+  ): Promise<string | null> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    const slotAbi = ["function validatorAtSlot(uint8 slot) view returns (address)"];
+    const validatorRaw: string = await new ethers.Contract(
+      blsAggregatorAddress,
+      slotAbi,
+      this.provider
+    ).validatorAtSlot(slot);
+    if (!validatorRaw || validatorRaw === ethers.ZeroAddress) return null;
+    const validator = ethers.getAddress(validatorRaw);
+
+    const keyAbi = [
+      "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
+    ];
+    const res = await new ethers.Contract(
+      blsAggregatorAddress,
+      keyAbi,
+      this.provider
+    ).getBLSPublicKey(validator);
+    const pk = res.publicKey ?? res[0];
+    const isActive = res.isActive ?? res[2];
+    if (!isActive) return null;
+    const words = [pk.x_a ?? pk[0], pk.x_b ?? pk[1], pk.y_a ?? pk[2], pk.y_b ?? pk[3]] as string[];
+    if (words.some(w => typeof w !== "string")) {
+      // Decode failure, not an empty slot — must not be reported as "no key here".
+      throw new Error(`malformed BLS public key words at slot ${slot} on ${blsAggregatorAddress}`);
+    }
+    return ("0x" + words.map(w => w.slice(2)).join("")).toLowerCase();
+  }
+
   /** Reputation-consensus threshold enforced by BLSAggregator.verifyAndExecute. */
   async getBlsDefaultThreshold(blsAggregatorAddress: string): Promise<number> {
     if (!this.provider) {
