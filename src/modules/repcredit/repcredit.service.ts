@@ -105,7 +105,7 @@ export class RepCreditService {
     this.requireArmed();
     const localChainId = await this.blockchain.getChainId();
     const aggregator = this.aggregatorAddress();
-    await this.requireOnChainThreshold(aggregator, threshold);
+    await this.requireOnChainSlashThreshold(aggregator, proposal?.slashLevel, threshold);
     try {
       return await aggregateRepCreditSlashResponses(
         proposal,
@@ -119,17 +119,77 @@ export class RepCreditService {
     }
   }
 
+  /**
+   * First gate on every endpoint: armed, and pointed at an aggregator that is NOT the
+   * production slash aggregator. Both are pure config checks, so they reject before any
+   * caller-supplied field is parsed and before any RPC read is spent.
+   */
   private requireArmed(): void {
     if (this.config.get<boolean>("repCreditExperimentSigning") !== true) {
       throw new ForbiddenException("RepCredit experiment signing is disabled");
     }
+    this.assertAggregatorIsolation();
   }
 
+  /**
+   * Refuse to share a BLSAggregator instance with the production audit/slash path
+   * (CC-49 BLOCKER-1).
+   *
+   * A quorum produced here is byte-identical to a real slash proof, but it is NOT backed by
+   * independent per-node re-verification of the violation. If the experiment ran against the
+   * same BLSAggregator the audit path uses, an experiment co-signature would be directly
+   * executable against production stake. The experiment must target its own isolated
+   * aggregator deployment; production slashing goes through GossipQuorumCoSigner.
+   */
+  private assertAggregatorIsolation(): void {
+    const address = this.config.get<string>("repCreditBlsAggregatorAddress");
+    const auditAggregator = this.config.get<string>("auditBlsAggregatorAddress");
+    if (address && auditAggregator && auditAggregator.toLowerCase() === address.toLowerCase()) {
+      throw new ForbiddenException(
+        "REPCREDIT_BLS_AGGREGATOR_ADDRESS must not equal AUDIT_BLS_AGGREGATOR_ADDRESS — " +
+          "the experiment signer may not target the production slash aggregator"
+      );
+    }
+  }
+
+  /**
+   * Reputation path only. `defaultThreshold` is what BLSAggregator.verifyAndExecute
+   * enforces for the reputation branch (contract default 7).
+   */
   private async requireOnChainThreshold(aggregator: string, threshold: number): Promise<void> {
     const onChainThreshold = await this.blockchain.getBlsDefaultThreshold(aggregator);
     if (threshold < onChainThreshold) {
       throw new BadRequestException(
         `threshold ${threshold} is below on-chain defaultThreshold ${onChainThreshold}`
+      );
+    }
+  }
+
+  /**
+   * Slash path (CC-49 MEDIUM-1). The contract's slash-only branch enforces
+   * `slashThresholds[slashLevel]` (bootstrap WARNING 2 / MINOR 3 / MAJOR 3), NOT the flat
+   * `defaultThreshold` used by the reputation branch. Reading the wrong getter made this
+   * service reject legal quorums when defaultThreshold was higher, and pass under-quorum
+   * aggregates through to an on-chain revert when it was lower. Mirrors the severity-keyed
+   * source already used by the production audit path (`auditSlashThresholds`).
+   */
+  private async requireOnChainSlashThreshold(
+    aggregator: string,
+    slashLevel: unknown,
+    threshold: number
+  ): Promise<void> {
+    // Validate before spending an RPC read on caller-supplied input. This bounds the
+    // level only so the on-chain lookup key is well-formed — the contract's mapping is
+    // keyed 0..2. The tighter policy (MINOR/MAJOR only) stays in the single authoritative
+    // place, normalizedSlashProposalValues, which runs inside the aggregate call below.
+    if (!Number.isInteger(slashLevel) || (slashLevel as number) < 0 || (slashLevel as number) > 2) {
+      throw new BadRequestException("slashLevel must be an integer in [0, 2]");
+    }
+    const level = slashLevel as number;
+    const onChainThreshold = await this.blockchain.getBlsSlashThreshold(aggregator, level);
+    if (threshold < onChainThreshold) {
+      throw new BadRequestException(
+        `threshold ${threshold} is below on-chain slashThresholds[${level}] ${onChainThreshold}`
       );
     }
   }
@@ -147,6 +207,9 @@ export class RepCreditService {
     if (!address) {
       throw new ForbiddenException("REPCREDIT_BLS_AGGREGATOR_ADDRESS is required");
     }
+    // Re-assert here so the isolation invariant holds for any future caller that
+    // resolves the aggregator without going through requireArmed().
+    this.assertAggregatorIsolation();
     return address;
   }
 }

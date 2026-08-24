@@ -1222,6 +1222,32 @@ export class BlockchainService {
   }
 
   /**
+   * Severity-specific slash quorum enforced by BLSAggregator's slash-only branch
+   * (`mapping(uint8 => uint8) public slashThresholds`, bootstrap WARNING 2 / MINOR 3 /
+   * MAJOR 3). This is a DIFFERENT getter from `defaultThreshold()`, which governs only the
+   * reputation branch — see CC-49 MEDIUM-1. A zero/out-of-range value is treated as an
+   * error rather than "no quorum required" (fail-closed).
+   */
+  async getBlsSlashThreshold(blsAggregatorAddress: string, slashLevel: number): Promise<number> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    if (!Number.isInteger(slashLevel) || slashLevel < 0 || slashLevel > 2) {
+      throw new Error(`invalid slashLevel ${slashLevel}`);
+    }
+    const contract = new ethers.Contract(
+      blsAggregatorAddress,
+      ["function slashThresholds(uint8) view returns (uint8)"],
+      this.provider
+    );
+    const threshold = Number(await contract.slashThresholds(slashLevel));
+    if (!Number.isInteger(threshold) || threshold < 1 || threshold > 13) {
+      throw new Error(`invalid on-chain slashThresholds[${slashLevel}] ${threshold}`);
+    }
+    return threshold;
+  }
+
+  /**
    * O(1) own-slot lookup (finding-3): BLSAggregator.getBLSPublicKey(validator) returns the
    * validator's (publicKey, slot, isActive) in a SINGLE read, so a node resolves its OWN registered
    * slot directly from its operator EOA — no 1..maxSlots scan. Returns the 1-indexed `slot` when the

@@ -1,3 +1,5 @@
+import { redactRpcUrl } from "./redact.js";
+
 export default () => {
   // Validate required environment variables
   const requiredVars = ["ETH_RPC_URL", "VALIDATOR_CONTRACT_ADDRESS"];
@@ -14,7 +16,7 @@ export default () => {
 
   console.log("✅ Environment configuration validated successfully");
   console.log(`   - Validator Contract: ${process.env.VALIDATOR_CONTRACT_ADDRESS}`);
-  console.log(`   - ETH RPC URL: ${process.env.ETH_RPC_URL}`);
+  console.log(`   - ETH RPC URL: ${redactRpcUrl(process.env.ETH_RPC_URL)}`);
   console.log(`   - Port: ${port}`);
   console.log(`   - Node State File: node_state.json (fixed)`);
 
@@ -114,6 +116,17 @@ export default () => {
     repCreditExperimentSigning: process.env.REPCREDIT_EXPERIMENT_SIGNING === "true",
     repCreditBlsAggregatorAddress: process.env.REPCREDIT_BLS_AGGREGATOR_ADDRESS || undefined,
     repCreditValidatorSlot: parseInt(process.env.REPCREDIT_VALIDATOR_SLOT || "0", 10),
+    // Admission control for the experiment endpoints (CC-49 BLOCKER-1). The secret is
+    // MANDATORY when armed — there is no default and no "auth disabled" mode, because a
+    // quorum on this path is a valid on-chain slash proof. Loopback-only unless the
+    // operator explicitly opts out with REPCREDIT_ALLOW_REMOTE=true.
+    repCreditExperimentAuthSecret: process.env.REPCREDIT_EXPERIMENT_AUTH_SECRET || "",
+    repCreditExperimentAuthTtlMs: parseInt(
+      process.env.REPCREDIT_EXPERIMENT_AUTH_TTL_MS || "120000",
+      10
+    ),
+    repCreditAllowRemote: process.env.REPCREDIT_ALLOW_REMOTE === "true",
+    repCreditMaxBodyBytes: parseInt(process.env.REPCREDIT_MAX_BODY_BYTES || "65536", 10),
 
     // EIP-2335 keystore passphrase (#5, #50 ④). When node_state.json holds an encrypted
     // keystore, this decrypts it at boot. Supply it from OUTSIDE the machine's disk —

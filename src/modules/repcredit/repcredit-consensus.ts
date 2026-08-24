@@ -120,7 +120,11 @@ function normalizedSlashProposalValues(proposal: RepCreditSlashProposal): {
   } catch {
     throw new Error("operator is not an address");
   }
-  if (!Number.isInteger(proposal.slashLevel) || proposal.slashLevel < 1 || proposal.slashLevel > 2) {
+  if (
+    !Number.isInteger(proposal.slashLevel) ||
+    proposal.slashLevel < 1 ||
+    proposal.slashLevel > 2
+  ) {
     throw new Error("slashLevel must be 1 or 2");
   }
   if (!ethers.isHexString(proposal.evidenceHash, 32)) {

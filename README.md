@@ -302,6 +302,24 @@ NODE_STATE_FILE=./node_dev_003.json PORT=3003 npm run start:dev
 - `GET /gossip/stats` - Get gossip network statistics
 - `WS /ws` - WebSocket gossip protocol endpoint
 
+### RepCredit (EXPERIMENT ONLY — disabled by default)
+
+- `POST /repcredit/sign`, `POST /repcredit/aggregate`
+- `POST /repcredit/slash/sign`, `POST /repcredit/slash/aggregate`
+
+These endpoints are an **experiment signer**, not a production validator. Nodes
+agree on the _encoding_ of a caller-supplied structured proposal; they do
+**not** independently verify the underlying contribution or violation facts.
+Production slashing runs through the audit path (`GossipQuorumCoSigner`), which
+re-derives every violation from chain state per node.
+
+The slash preimage is byte-identical to a real `BLSAggregator` slash proof and
+is signed with the node's production BLS key, so the path is fail-closed: it
+needs `REPCREDIT_EXPERIMENT_SIGNING=true` **and** a mandatory HMAC secret,
+accepts loopback callers only by default, bounds body size, rejects replays, and
+refuses to arm against the production audit aggregator. See
+[docs/REPCREDIT_EXPERIMENT.md](docs/REPCREDIT_EXPERIMENT.md) for the runbook.
+
 ### Documentation
 
 - `GET /api` - Swagger API documentation
@@ -397,6 +415,10 @@ node_*.json             # Dynamic node files (ignored by git)
   from git
 - Development node files should be regenerated for your environment
 - Production deployments should use KMS for key management
+- RPC endpoints are logged host-only (`redactRpcUrl`) — provider API keys in the
+  `ETH_RPC_URL` path/query/userinfo never reach stdout or a log shipper
+- The RepCredit endpoints are experiment-only and fail-closed; never arm them on
+  a node whose stake you are not willing to see slashed
 
 ## Signature Aggregation Workflow
 

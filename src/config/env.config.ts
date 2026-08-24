@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import { redactRpcUrl } from "./redact.js";
 
 export interface EnvironmentConfig {
   // Server
@@ -134,7 +135,7 @@ export class EnvConfigService {
 
     console.log("✅ Environment configuration validated successfully");
     console.log(`   - Validator Contract: ${config.validatorContractAddress}`);
-    console.log(`   - ETH RPC URL: ${config.ethRpcUrl}`);
+    console.log(`   - ETH RPC URL: ${redactRpcUrl(config.ethRpcUrl)}`);
     console.log(`   - Port: ${config.port}`);
     if (config.nodeId) {
       console.log(`   - Node ID: ${config.nodeId}`);

@@ -1,6 +1,7 @@
 import { Body, Controller, Post, UseGuards } from "@nestjs/common";
 import { ApiOperation, ApiTags } from "@nestjs/swagger";
 import { ThrottleGuard } from "../../common/throttle.guard.js";
+import { RepCreditExperimentGuard } from "./repcredit-experiment.guard.js";
 import type {
   RepCreditCoSignResponse,
   RepCreditProposal,
@@ -10,7 +11,11 @@ import { RepCreditService } from "./repcredit.service.js";
 
 @ApiTags("repcredit-experiment")
 @Controller("repcredit")
-@UseGuards(ThrottleGuard)
+// RepCreditExperimentGuard is the admission gate (CC-49 BLOCKER-1): armed + mandatory
+// HMAC + loopback-by-default + replay/body bounds. ThrottleGuard stays as opt-in
+// per-IP rate limiting; it is a NO-OP unless RATE_LIMIT_ENABLED=true, so it must
+// never be the only guard here.
+@UseGuards(RepCreditExperimentGuard, ThrottleGuard)
 export class RepCreditController {
   constructor(private readonly service: RepCreditService) {}
 
