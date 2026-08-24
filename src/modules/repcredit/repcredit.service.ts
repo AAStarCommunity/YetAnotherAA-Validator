@@ -5,11 +5,14 @@ import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { NodeService } from "../node/node.service.js";
 import {
   aggregateRepCreditResponses,
+  aggregateRepCreditSlashResponses,
   encodeRepCreditPublicKey,
   RepCreditAggregate,
   RepCreditCoSignResponse,
   RepCreditProposal,
+  RepCreditSlashProposal,
   validateRepCreditProposal,
+  validateRepCreditSlashProposal,
 } from "./repcredit-consensus.js";
 
 @Injectable()
@@ -31,6 +34,22 @@ export class RepCreditService {
       throw new BadRequestException(error instanceof Error ? error.message : String(error));
     }
 
+    return this.signValidatedHash(messageHash);
+  }
+
+  async signSlash(proposal: RepCreditSlashProposal): Promise<RepCreditCoSignResponse> {
+    this.requireArmed();
+    const localChainId = await this.blockchain.getChainId();
+    let messageHash: string;
+    try {
+      messageHash = validateRepCreditSlashProposal(proposal, localChainId);
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+    return this.signValidatedHash(messageHash);
+  }
+
+  private async signValidatedHash(messageHash: string): Promise<RepCreditCoSignResponse> {
     const slot = this.configuredSlot();
     const aggregator = this.aggregatorAddress();
     const node = this.nodeService.getNodeForSigning();
@@ -68,12 +87,7 @@ export class RepCreditService {
     this.requireArmed();
     const localChainId = await this.blockchain.getChainId();
     const aggregator = this.aggregatorAddress();
-    const onChainThreshold = await this.blockchain.getBlsDefaultThreshold(aggregator);
-    if (threshold < onChainThreshold) {
-      throw new BadRequestException(
-        `threshold ${threshold} is below on-chain defaultThreshold ${onChainThreshold}`
-      );
-    }
+    await this.requireOnChainThreshold(aggregator, threshold);
     try {
       return await aggregateRepCreditResponses(proposal, localChainId, responses, threshold, slot =>
         this.blockchain.getBlsPublicKeyAtSlot(aggregator, slot)
@@ -83,9 +97,40 @@ export class RepCreditService {
     }
   }
 
+  async aggregateSlash(
+    proposal: RepCreditSlashProposal,
+    responses: RepCreditCoSignResponse[],
+    threshold: number
+  ): Promise<RepCreditAggregate> {
+    this.requireArmed();
+    const localChainId = await this.blockchain.getChainId();
+    const aggregator = this.aggregatorAddress();
+    await this.requireOnChainThreshold(aggregator, threshold);
+    try {
+      return await aggregateRepCreditSlashResponses(
+        proposal,
+        localChainId,
+        responses,
+        threshold,
+        slot => this.blockchain.getBlsPublicKeyAtSlot(aggregator, slot)
+      );
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   private requireArmed(): void {
     if (this.config.get<boolean>("repCreditExperimentSigning") !== true) {
       throw new ForbiddenException("RepCredit experiment signing is disabled");
+    }
+  }
+
+  private async requireOnChainThreshold(aggregator: string, threshold: number): Promise<void> {
+    const onChainThreshold = await this.blockchain.getBlsDefaultThreshold(aggregator);
+    if (threshold < onChainThreshold) {
+      throw new BadRequestException(
+        `threshold ${threshold} is below on-chain defaultThreshold ${onChainThreshold}`
+      );
     }
   }
 

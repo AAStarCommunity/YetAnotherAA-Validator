@@ -1,7 +1,11 @@
 import { Body, Controller, Post, UseGuards } from "@nestjs/common";
 import { ApiOperation, ApiTags } from "@nestjs/swagger";
 import { ThrottleGuard } from "../../common/throttle.guard.js";
-import type { RepCreditCoSignResponse, RepCreditProposal } from "./repcredit-consensus.js";
+import type {
+  RepCreditCoSignResponse,
+  RepCreditProposal,
+  RepCreditSlashProposal,
+} from "./repcredit-consensus.js";
 import { RepCreditService } from "./repcredit.service.js";
 
 @ApiTags("repcredit-experiment")
@@ -27,5 +31,24 @@ export class RepCreditController {
     }
   ) {
     return this.service.aggregate(body.proposal, body.responses, body.threshold);
+  }
+
+  @Post("slash/sign")
+  @ApiOperation({ summary: "Sign a locally recomputed slash-only RepCredit proposal (opt-in)" })
+  signSlash(@Body() proposal: RepCreditSlashProposal) {
+    return this.service.signSlash(proposal);
+  }
+
+  @Post("slash/aggregate")
+  @ApiOperation({ summary: "Validate and aggregate slash-only RepCredit responses (opt-in)" })
+  aggregateSlash(
+    @Body()
+    body: {
+      proposal: RepCreditSlashProposal;
+      responses: RepCreditCoSignResponse[];
+      threshold: number;
+    }
+  ) {
+    return this.service.aggregateSlash(body.proposal, body.responses, body.threshold);
   }
 }

@@ -25,9 +25,10 @@ pragma solidity ^0.8.19;
  *        ALLOW_UNVERIFIED_AGGREGATOR (optional) must be "true" to deploy when NO canonical/expected
  *                                    address is available yet — a conscious "I verified out-of-band".
  *        EXPECTED_CHAIN_ID           (optional, default 11155111 Sepolia) guards against a wrong RPC.
+ *        DEPLOYER_PRIVATE_KEY         (REQUIRED) broadcast key; kept out of command-line arguments.
  *
- *      AGGREGATOR=0x... forge script script/DeployOverIssueVerifier.s.sol \
- *        --rpc-url <RPC> --private-key <KEY> --broadcast
+ *      AGGREGATOR=0x... DEPLOYER_PRIVATE_KEY=... forge script \
+ *        script/DeployOverIssueVerifier.s.sol --rpc-url <RPC> --broadcast
  */
 
 import "forge-std/Script.sol";
@@ -83,7 +84,9 @@ contract DeployOverIssueVerifier is Script {
             revert("AGGREGATOR is not a BLSAggregator (no validatorAtSlot)");
         }
 
-        vm.startBroadcast();
+        uint256 deployerPrivateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
+        require(deployerPrivateKey != 0, "DEPLOYER_PRIVATE_KEY must be non-zero");
+        vm.startBroadcast(deployerPrivateKey);
         OverIssueFraudProofVerifier verifier = new OverIssueFraudProofVerifier(aggregator);
         vm.stopBroadcast();
 

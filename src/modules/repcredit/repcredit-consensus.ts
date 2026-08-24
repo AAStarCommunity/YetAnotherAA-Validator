@@ -5,6 +5,7 @@ import { buildSignerMask, MAX_VALIDATORS } from "../audit/slash-consensus.js";
 const ABI = ethers.AbiCoder.defaultAbiCoder();
 
 export const REPCREDIT_SCHEMA_VERSION = "repcredit-reputation-v1";
+export const REPCREDIT_SLASH_SCHEMA_VERSION = "repcredit-slash-v1";
 
 /** The exact structured request whose seven on-chain fields are BLS-signed. */
 export interface RepCreditProposal {
@@ -16,6 +17,18 @@ export interface RepCreditProposal {
   scores: string[];
   epoch: string;
   chainId: string;
+  messageHash: string;
+}
+
+/** A slash-only DVT proposal. Its evidenceHash is independently recomputed by the experiment. */
+export interface RepCreditSlashProposal {
+  schemaVersion: typeof REPCREDIT_SLASH_SCHEMA_VERSION;
+  proposalId: string;
+  operator: string;
+  slashLevel: number;
+  epoch: string;
+  chainId: string;
+  evidenceHash: string;
   messageHash: string;
 }
 
@@ -90,6 +103,39 @@ function normalizedProposalValues(proposal: RepCreditProposal): {
   };
 }
 
+function normalizedSlashProposalValues(proposal: RepCreditSlashProposal): {
+  proposalId: bigint;
+  operator: string;
+  slashLevel: number;
+  epoch: bigint;
+  chainId: bigint;
+  evidenceHash: string;
+} {
+  if (!proposal || proposal.schemaVersion !== REPCREDIT_SLASH_SCHEMA_VERSION) {
+    throw new Error(`schemaVersion must equal ${REPCREDIT_SLASH_SCHEMA_VERSION}`);
+  }
+  let operator: string;
+  try {
+    operator = ethers.getAddress(proposal.operator);
+  } catch {
+    throw new Error("operator is not an address");
+  }
+  if (!Number.isInteger(proposal.slashLevel) || proposal.slashLevel < 1 || proposal.slashLevel > 2) {
+    throw new Error("slashLevel must be 1 or 2");
+  }
+  if (!ethers.isHexString(proposal.evidenceHash, 32)) {
+    throw new Error("evidenceHash must be exactly 32 bytes");
+  }
+  return {
+    proposalId: uint256(proposal.proposalId, "proposalId"),
+    operator,
+    slashLevel: proposal.slashLevel,
+    epoch: uint256(proposal.epoch, "epoch"),
+    chainId: uint256(proposal.chainId, "chainId"),
+    evidenceHash: proposal.evidenceHash,
+  };
+}
+
 /** Byte-identical to Registry.batchUpdateGlobalReputation's expected BLS hash. */
 export function buildRepCreditMessageHash(proposal: RepCreditProposal): string {
   const value = normalizedProposalValues(proposal);
@@ -129,6 +175,46 @@ export function validateRepCreditProposal(
   return localHash;
 }
 
+/** Byte-identical to BLSAggregator.verifyAndExecute's slash-only hash preimage. */
+export function buildRepCreditSlashMessageHash(proposal: RepCreditSlashProposal): string {
+  const value = normalizedSlashProposalValues(proposal);
+  return ethers.keccak256(
+    ABI.encode(
+      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256", "bytes32"],
+      [
+        value.proposalId,
+        value.operator,
+        value.slashLevel,
+        [],
+        [],
+        value.epoch,
+        value.chainId,
+        value.evidenceHash,
+      ]
+    )
+  );
+}
+
+/** Validate every slash field and bind chainId to the node's own RPC network. */
+export function validateRepCreditSlashProposal(
+  proposal: RepCreditSlashProposal,
+  localChainId: bigint | number
+): string {
+  const local = BigInt(localChainId);
+  const value = normalizedSlashProposalValues(proposal);
+  if (value.chainId !== local) {
+    throw new Error(`chainId mismatch: request=${value.chainId}, local=${local}`);
+  }
+  if (!ethers.isHexString(proposal.messageHash, 32)) {
+    throw new Error("messageHash must be exactly 32 bytes");
+  }
+  const localHash = buildRepCreditSlashMessageHash(proposal);
+  if (localHash.toLowerCase() !== proposal.messageHash.toLowerCase()) {
+    throw new Error("messageHash does not match the locally recomputed slash proposal hash");
+  }
+  return localHash;
+}
+
 export function encodeRepCreditPublicKey(publicKey: string): string {
   const point = bls.G1.Point.fromHex(publicKey.replace(/^0x/, ""));
   const affine = point.toAffine();
@@ -152,6 +238,27 @@ export async function aggregateRepCreditResponses(
   resolveOnChainKey: (slot: number) => Promise<string | null>
 ): Promise<RepCreditAggregate> {
   const messageHash = validateRepCreditProposal(proposal, localChainId);
+  return aggregateValidatedResponses(messageHash, responses, threshold, resolveOnChainKey);
+}
+
+/** Aggregate a validated slash-only proposal using the same quorum and key-binding rules. */
+export async function aggregateRepCreditSlashResponses(
+  proposal: RepCreditSlashProposal,
+  localChainId: bigint | number,
+  responses: RepCreditCoSignResponse[],
+  threshold: number,
+  resolveOnChainKey: (slot: number) => Promise<string | null>
+): Promise<RepCreditAggregate> {
+  const messageHash = validateRepCreditSlashProposal(proposal, localChainId);
+  return aggregateValidatedResponses(messageHash, responses, threshold, resolveOnChainKey);
+}
+
+async function aggregateValidatedResponses(
+  messageHash: string,
+  responses: RepCreditCoSignResponse[],
+  threshold: number,
+  resolveOnChainKey: (slot: number) => Promise<string | null>
+): Promise<RepCreditAggregate> {
   if (!Number.isInteger(threshold) || threshold < 1 || threshold > MAX_VALIDATORS) {
     throw new Error(`threshold must be an integer in [1, ${MAX_VALIDATORS}]`);
   }
