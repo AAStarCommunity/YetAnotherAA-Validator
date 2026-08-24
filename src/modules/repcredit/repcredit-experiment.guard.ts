@@ -13,8 +13,47 @@ import type { Request } from "express";
 
 /** Header carrying the caller's millisecond unix timestamp. */
 export const HEADER_TIMESTAMP = "X-RepCredit-Timestamp";
-/** Header carrying hex HMAC-SHA256(secret, `${timestamp}.${rawBody}`). */
+/** Header carrying the hex HMAC-SHA256 over {@link buildRepCreditAuthPreimage}. */
 export const HEADER_AUTH = "X-RepCredit-Auth";
+
+/**
+ * Wire version of the HMAC preimage. BUMPED to v2 in CC-49 round 3: v1 signed only
+ * `${timestamp}.${rawBody}`, so a captured token was, in principle, movable between the four
+ * `/repcredit/*` endpoints (in practice the schemas are disjoint and the token is single-use,
+ * which is why this was a LOW). v2 binds the METHOD and the REQUEST TARGET as well, so a
+ * token authorises exactly one call on exactly one endpoint.
+ *
+ * Clients MUST send the version header; there is no v1 fallback — accepting both would leave
+ * the unbound preimage reachable and defeat the change. See docs/REPCREDIT_EXPERIMENT.md for
+ * the migration note handed to repo:sdk.
+ */
+export const REPCREDIT_AUTH_SCHEME = "v2";
+/** Header carrying the preimage scheme version; must equal {@link REPCREDIT_AUTH_SCHEME}. */
+export const HEADER_SCHEME = "X-RepCredit-Scheme";
+
+/**
+ * The exact bytes both sides HMAC. `\n`-joined with the raw body LAST so no field can be
+ * shifted into another by choosing a value containing the separator.
+ *
+ *   v2 \n METHOD \n REQUEST-TARGET \n TIMESTAMP-MS \n RAW-BODY
+ *
+ * REQUEST-TARGET is the path (plus query string, if any) exactly as sent on the wire — i.e.
+ * express's `req.originalUrl`. A client must sign the same string it puts in the request line.
+ */
+export function buildRepCreditAuthPreimage(input: {
+  method: string;
+  requestTarget: string;
+  timestampMs: number | string;
+  rawBody: string;
+}): string {
+  return [
+    REPCREDIT_AUTH_SCHEME,
+    String(input.method).toUpperCase(),
+    input.requestTarget,
+    String(input.timestampMs),
+    input.rawBody,
+  ].join("\n");
+}
 
 const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 
@@ -39,8 +78,10 @@ const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
  *   2. secret present — armed without a secret rejects every request (503), never opens.
  *   3. body size      — bounded before any HMAC/parse work (413).
  *   4. source         — loopback only, unless REPCREDIT_ALLOW_REMOTE=true is set explicitly.
- *   5. HMAC           — timestamp inside the asymmetric window + constant-time HMAC over
- *                        the RAW bytes.
+ *   5. HMAC           — declared scheme version + timestamp inside the asymmetric window +
+ *                        constant-time HMAC over METHOD, REQUEST-TARGET and the RAW bytes.
+ *                        Raw bytes unavailable → reject; never fall back to a re-serialised
+ *                        body.
  *   6. replay         — a given auth token is accepted at most once, and the record of it
  *                        outlives the token's own validity (anchored to the SIGNED
  *                        timestamp, not to arrival — CC-49 MEDIUM-B).
@@ -85,11 +126,15 @@ export class RepCreditExperimentGuard implements CanActivate {
   ) {
     this.armed = config.get<boolean>("repCreditExperimentSigning") === true;
     this.secret = config.get<string>("repCreditExperimentAuthSecret") ?? "";
-    this.ttlMs = config.get<number>("repCreditExperimentAuthTtlMs") ?? 120_000;
+    // SECOND line of defence on the bounds (CC-49 round-3 MEDIUM). `configuration.ts` already
+    // refuses to boot on a non-integer REPCREDIT_* value, but this guard must never run with a
+    // NaN bound whatever hands it a config: `now - ts > NaN` and `len > NaN` are both FALSE,
+    // i.e. a silently disabled staleness check and a silently disabled body cap.
+    this.ttlMs = requireBound(config, "repCreditExperimentAuthTtlMs", 120_000, 1);
     this.allowRemote = config.get<boolean>("repCreditAllowRemote") === true;
-    this.maxBodyBytes = config.get<number>("repCreditMaxBodyBytes") ?? 65_536;
-    this.maxFutureSkewMs = config.get<number>("repCreditAuthMaxFutureSkewMs") ?? 5_000;
-    this.replayCacheMax = config.get<number>("repCreditReplayCacheMax") ?? 10_000;
+    this.maxBodyBytes = requireBound(config, "repCreditMaxBodyBytes", 65_536, 1);
+    this.maxFutureSkewMs = requireBound(config, "repCreditAuthMaxFutureSkewMs", 5_000, 0);
+    this.replayCacheMax = requireBound(config, "repCreditReplayCacheMax", 10_000, 1);
     this.now = now ?? (() => Date.now());
 
     // Surface a dangerous or unusable arm at STARTUP, not on the first request.
@@ -157,6 +202,13 @@ export class RepCreditExperimentGuard implements CanActivate {
         HttpStatus.UNAUTHORIZED
       );
     }
+    const scheme = req.header?.(HEADER_SCHEME);
+    if (scheme !== REPCREDIT_AUTH_SCHEME) {
+      throw new HttpException(
+        `${HEADER_SCHEME} must be "${REPCREDIT_AUTH_SCHEME}"`,
+        HttpStatus.UNAUTHORIZED
+      );
+    }
 
     const now = this.now();
     const tsNum = Number(ts);
@@ -169,22 +221,41 @@ export class RepCreditExperimentGuard implements CanActivate {
       throw new HttpException("auth timestamp outside the allowed window", HttpStatus.UNAUTHORIZED);
     }
 
-    let rawBody: string;
-    if (req.rawBody !== undefined) {
-      rawBody = req.rawBody.toString("utf8");
-    } else {
-      rawBody = JSON.stringify(req.body ?? {});
+    // HARD-FAIL when the raw bytes are unavailable (CC-49 round-2 LOW-F). The previous
+    // fallback re-serialised `req.body` and HMAC'd THAT, i.e. it verified a normalised JSON
+    // rendering (duplicate keys collapsed, whitespace lost) instead of what the caller
+    // actually sent. `NestFactory.create(AppModule, { rawBody: true })` is set in main.ts, so
+    // this branch is unreachable in the real app; making it an error costs nothing and
+    // removes a degraded verification mode from the codebase.
+    if (req.rawBody === undefined) {
       if (!this.rawBodyWarned) {
         this.rawBodyWarned = true;
-        this.logger.warn(
-          "repcredit: req.rawBody unavailable — HMAC computed over a re-serialised body, " +
-            "which may not byte-match the caller. Ensure NestFactory.create(AppModule, " +
-            "{ rawBody: true }) is set (see main.ts)."
+        this.logger.error(
+          "repcredit: req.rawBody unavailable — refusing to authenticate against a " +
+            "re-serialised body. Ensure NestFactory.create(AppModule, { rawBody: true }) " +
+            "is set (see main.ts)."
         );
       }
+      throw new HttpException(
+        "raw request body unavailable; cannot verify the request signature",
+        HttpStatus.UNAUTHORIZED
+      );
     }
+    const rawBody = req.rawBody.toString("utf8");
 
-    const expected = createHmac("sha256", this.secret).update(`${ts}.${rawBody}`).digest("hex");
+    // Bind the verb and the request target too (CC-49 round-3 LOW-D): a token is valid for
+    // one endpoint and one method only.
+    const requestTarget: string = (req as any).originalUrl ?? (req as any).url ?? "";
+    const expected = createHmac("sha256", this.secret)
+      .update(
+        buildRepCreditAuthPreimage({
+          method: req.method ?? "",
+          requestTarget,
+          timestampMs: ts,
+          rawBody,
+        })
+      )
+      .digest("hex");
     if (!safeEqualHex(expected, auth)) {
       throw new HttpException("HMAC verification failed", HttpStatus.FORBIDDEN);
     }
@@ -228,18 +299,41 @@ export class RepCreditExperimentGuard implements CanActivate {
     }
   }
 
-  /** Reference header computation — the exact bytes a client must produce. */
+  /**
+   * Reference header computation — the exact bytes a client must produce.
+   *
+   * BREAKING vs the v1 signature `computeHeaders(secret, timestampMs, rawBody)`: callers must
+   * now pass the method and the request target as well (CC-49 round-3). repo:sdk pins this
+   * function's source, so the change surfaces as a compile/pin failure rather than as an
+   * opaque 403 mid-run.
+   */
   static computeHeaders(
     secret: string,
-    timestampMs: number,
-    rawBody: string
+    input: { method: string; requestTarget: string; timestampMs: number; rawBody: string }
   ): Record<string, string> {
-    const ts = String(timestampMs);
+    const ts = String(input.timestampMs);
     return {
+      [HEADER_SCHEME]: REPCREDIT_AUTH_SCHEME,
       [HEADER_TIMESTAMP]: ts,
-      [HEADER_AUTH]: createHmac("sha256", secret).update(`${ts}.${rawBody}`).digest("hex"),
+      [HEADER_AUTH]: createHmac("sha256", secret)
+        .update(buildRepCreditAuthPreimage({ ...input, timestampMs: ts }))
+        .digest("hex"),
     };
   }
+}
+
+/**
+ * Read a numeric bound that MUST be usable. An absent key takes the documented default; a
+ * present-but-unusable value (NaN, negative, non-integer) is a configuration error and throws
+ * at construction — never silently becomes "no bound".
+ */
+function requireBound(config: ConfigService, key: string, fallback: number, min: number): number {
+  const value = config.get<number>(key);
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min) {
+    throw new Error(`RepCredit guard: ${key} must be an integer >= ${min} (got ${String(value)})`);
+  }
+  return value;
 }
 
 /** Constant-time hex comparison; false on any length/format mismatch. */

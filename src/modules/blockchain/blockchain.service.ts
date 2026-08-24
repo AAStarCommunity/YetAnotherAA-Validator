@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { bumpedFees } from "../../utils/gas.util.js";
 import { KmsEcdsaSigner } from "./kms-ecdsa-signer.js";
+import { scrubProviderError } from "../../config/redact.js";
 
 /**
  * An ethers Signer that also exposes a synchronous `.address` (like ethers.Wallet). Both the
@@ -144,7 +145,7 @@ export class BlockchainService {
         this.wallet = new ethers.Wallet(privateKey, this.provider);
         this.logger.log(`Blockchain service initialized with wallet: ${this.wallet.address}`);
       } catch (error: any) {
-        this.logger.error(`Invalid private key provided: ${error.message}`);
+        this.logger.error(`Invalid private key provided: ${scrubProviderError(error)}`);
         this.logger.warn("Blockchain write operations will be disabled");
       }
     }
@@ -183,7 +184,7 @@ export class BlockchainService {
             this.logger.log(`Keeper signer (KMS-TEE): ${kms.address}`);
           }
         } catch (error: any) {
-          this.logger.error(`Invalid KMS keeper signer config: ${error.message}`);
+          this.logger.error(`Invalid KMS keeper signer config: ${scrubProviderError(error)}`);
         }
       }
     } else if (keeperKey && /^0x[0-9a-fA-F]{64}$/.test(keeperKey)) {
@@ -203,7 +204,7 @@ export class BlockchainService {
           this.logger.log(`Keeper signer (dedicated): ${this.keeperWallet.address}`);
         }
       } catch (error: any) {
-        this.logger.error(`Invalid KEEPER_PRIVATE_KEY: ${error.message}`);
+        this.logger.error(`Invalid KEEPER_PRIVATE_KEY: ${scrubProviderError(error)}`);
       }
     }
   }
@@ -250,7 +251,7 @@ export class BlockchainService {
 
       return tx.hash;
     } catch (error: any) {
-      this.logger.error(`Failed to register node on-chain: ${error.message}`);
+      this.logger.error(`Failed to register node on-chain: ${scrubProviderError(error)}`);
       throw error;
     }
   }
@@ -268,7 +269,7 @@ export class BlockchainService {
       const isRegistered = await contract.isRegistered(nodeId);
       return isRegistered;
     } catch (error: any) {
-      this.logger.error(`Failed to check registration status: ${error.message}`);
+      this.logger.error(`Failed to check registration status: ${scrubProviderError(error)}`);
       throw error;
     }
   }
@@ -286,7 +287,7 @@ export class BlockchainService {
       const count = await contract.getRegisteredNodeCount();
       return Number(count);
     } catch (error: any) {
-      this.logger.error(`Failed to get registered node count: ${error.message}`);
+      this.logger.error(`Failed to get registered node count: ${scrubProviderError(error)}`);
       throw error;
     }
   }
@@ -331,7 +332,7 @@ export class BlockchainService {
 
       return tx.hash;
     } catch (error: any) {
-      this.logger.error(`Failed to revoke node on-chain: ${error.message}`);
+      this.logger.error(`Failed to revoke node on-chain: ${scrubProviderError(error)}`);
       throw error;
     }
   }
@@ -368,7 +369,7 @@ export class BlockchainService {
 
       return tx.hash;
     } catch (error: any) {
-      this.logger.error(`Failed to batch register nodes on-chain: ${error.message}`);
+      this.logger.error(`Failed to batch register nodes on-chain: ${scrubProviderError(error)}`);
       throw error;
     }
   }
@@ -386,7 +387,7 @@ export class BlockchainService {
       const publicKey = await contract.registeredKeys(nodeId);
       return publicKey;
     } catch (error: any) {
-      this.logger.error(`Failed to get node public key: ${error.message}`);
+      this.logger.error(`Failed to get node public key: ${scrubProviderError(error)}`);
       throw error;
     }
   }
@@ -411,7 +412,9 @@ export class BlockchainService {
       const owner: string = await contract.owner();
       return ethers.getAddress(owner);
     } catch (error: any) {
-      this.logger.error(`Failed to read owner() for account ${account}: ${error.message}`);
+      this.logger.error(
+        `Failed to read owner() for account ${account}: ${scrubProviderError(error)}`
+      );
       throw error;
     }
   }
@@ -456,7 +459,7 @@ export class BlockchainService {
       return hash;
     } catch (error: any) {
       this.logger.error(
-        `Failed to derive userOpHash via EntryPoint ${entryPoint}: ${error.message}`
+        `Failed to derive userOpHash via EntryPoint ${entryPoint}: ${scrubProviderError(error)}`
       );
       throw error;
     }
@@ -504,7 +507,7 @@ export class BlockchainService {
       return { decision: Number(decision), remainingDaily: BigInt(remainingDaily) };
     } catch (error: any) {
       this.logger.error(
-        `checkPolicy revert on registry ${registryAddress} for sender ${sender}: ${error.message}`
+        `checkPolicy revert on registry ${registryAddress} for sender ${sender}: ${scrubProviderError(error)}`
       );
       throw error;
     }
@@ -532,7 +535,7 @@ export class BlockchainService {
         publicKeys: result.publicKeys,
       };
     } catch (error: any) {
-      this.logger.error(`Failed to get registered nodes: ${error.message}`);
+      this.logger.error(`Failed to get registered nodes: ${scrubProviderError(error)}`);
       throw error;
     }
   }
@@ -817,7 +820,7 @@ export class BlockchainService {
       await contract.attestLiveness.staticCall(anchorBlock, anchorHash);
     } catch (e: any) {
       throw new Error(
-        `attestLiveness preflight reverted (stale/bad anchor?): ${e?.shortMessage ?? e?.message ?? e}`,
+        `attestLiveness preflight reverted (stale/bad anchor?): ${scrubProviderError(e)}`,
         { cause: e }
       );
     }
@@ -899,7 +902,7 @@ export class BlockchainService {
     const hit = await reconcile();
     if (hit) return hit;
     throw new Error(
-      `attestLiveness not confirmed after ${sends} send(s): ${lastErr?.message ?? lastErr}`
+      `attestLiveness not confirmed after ${sends} send(s): ${scrubProviderError(lastErr)}`
     );
   }
 
@@ -949,7 +952,7 @@ export class BlockchainService {
       latest = await this.provider.getBlockNumber();
     } catch (error: any) {
       this.logger.warn(
-        `getRecentSlashExecuted getBlockNumber failed: ${error.message} — indeterminate`
+        `getRecentSlashExecuted getBlockNumber failed: ${scrubProviderError(error)} — indeterminate`
       );
       return null;
     }
@@ -996,7 +999,7 @@ export class BlockchainService {
         // ("indeterminate") rather than swallowing to a false "no match" — the caller must not read
         // an unreadable chain as "safe to slash" for an irreversible action.
         this.logger.warn(
-          `getRecentSlashExecuted getLogs failed on ${contractAddress} (${f.name}): ${error.message} — indeterminate`
+          `getRecentSlashExecuted getLogs failed on ${contractAddress} (${f.name}): ${scrubProviderError(error)} — indeterminate`
         );
         return null;
       }
@@ -1064,7 +1067,7 @@ export class BlockchainService {
       // isSlashPending function (call reverts), or a TRANSIENT RPC error — and we cannot always tell
       // them apart, so we log at debug (not warn: on a healthy 5.4.2 SP this branch never runs) and
       // fall back to the durable event reconstruction (which has its own fail-closed null on error).
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = scrubProviderError(err);
       this.logger.debug(
         `isSlashPending getter unavailable on ${superPaymasterAddress} (${msg}) — ` +
           `falling back to event reconstruction`
@@ -1089,7 +1092,9 @@ export class BlockchainService {
     try {
       latest = await this.provider.getBlockNumber();
     } catch (error: any) {
-      this.logger.warn(`isSlashPending getBlockNumber failed: ${error.message} — indeterminate`);
+      this.logger.warn(
+        `isSlashPending getBlockNumber failed: ${scrubProviderError(error)} — indeterminate`
+      );
       return null;
     }
     const fromBlock = Math.max(0, latest - Math.max(0, lookbackBlocks));
@@ -1119,7 +1124,7 @@ export class BlockchainService {
     } catch (error: any) {
       // FAIL-CLOSED: an unscannable window is INDETERMINATE, never a silent "not pending".
       this.logger.warn(
-        `isSlashPending getLogs failed on ${superPaymasterAddress}: ${error.message} — indeterminate`
+        `isSlashPending getLogs failed on ${superPaymasterAddress}: ${scrubProviderError(error)} — indeterminate`
       );
       return null;
     }
@@ -1158,7 +1163,7 @@ export class BlockchainService {
       return ethers.getAddress(addr);
     } catch (error: any) {
       this.logger.warn(
-        `validatorAtSlot(${slot}) failed on ${blsAggregatorAddress}: ${error.message}`
+        `validatorAtSlot(${slot}) failed on ${blsAggregatorAddress}: ${scrubProviderError(error)}`
       );
       return null;
     }
@@ -1198,7 +1203,7 @@ export class BlockchainService {
       return hex.toLowerCase();
     } catch (error: any) {
       this.logger.warn(
-        `getBLSPublicKey(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
+        `getBLSPublicKey(${validator}) failed on ${blsAggregatorAddress}: ${scrubProviderError(error)}`
       );
       return null;
     }
@@ -1224,32 +1229,31 @@ export class BlockchainService {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
+    if (!Number.isInteger(slot) || slot < 1 || slot > 255) {
+      throw new Error(`invalid slot ${slot} for a strict BLS public-key read`);
+    }
     const slotAbi = ["function validatorAtSlot(uint8 slot) view returns (address)"];
-    const validatorRaw: string = await new ethers.Contract(
+    const validatorRaw: unknown = await new ethers.Contract(
       blsAggregatorAddress,
       slotAbi,
       this.provider
     ).validatorAtSlot(slot);
-    if (!validatorRaw || validatorRaw === ethers.ZeroAddress) return null;
+    if (typeof validatorRaw !== "string" || !ethers.isAddress(validatorRaw)) {
+      // Decode failure — NOT an empty slot. Must never be reported as "no key here".
+      throw new Error(`malformed validatorAtSlot(${slot}) response on ${blsAggregatorAddress}`);
+    }
+    if (validatorRaw === ethers.ZeroAddress) return null;
     const validator = ethers.getAddress(validatorRaw);
 
     const keyAbi = [
       "function getBLSPublicKey(address validator) view returns (tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b) publicKey, uint8 slot, bool isActive)",
     ];
-    const res = await new ethers.Contract(
+    const res: unknown = await new ethers.Contract(
       blsAggregatorAddress,
       keyAbi,
       this.provider
     ).getBLSPublicKey(validator);
-    const pk = res.publicKey ?? res[0];
-    const isActive = res.isActive ?? res[2];
-    if (!isActive) return null;
-    const words = [pk.x_a ?? pk[0], pk.x_b ?? pk[1], pk.y_a ?? pk[2], pk.y_b ?? pk[3]] as string[];
-    if (words.some(w => typeof w !== "string")) {
-      // Decode failure, not an empty slot — must not be reported as "no key here".
-      throw new Error(`malformed BLS public key words at slot ${slot} on ${blsAggregatorAddress}`);
-    }
-    return ("0x" + words.map(w => w.slice(2)).join("")).toLowerCase();
+    return decodeStrictBlsPublicKey(res, slot, blsAggregatorAddress);
   }
 
   /** Reputation-consensus threshold enforced by BLSAggregator.verifyAndExecute. */
@@ -1328,7 +1332,7 @@ export class BlockchainService {
       return slot;
     } catch (error: any) {
       this.logger.warn(
-        `getRegisteredSlot(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
+        `getRegisteredSlot(${validator}) failed on ${blsAggregatorAddress}: ${scrubProviderError(error)}`
       );
       return null;
     }
@@ -1382,7 +1386,7 @@ export class BlockchainService {
     try {
       return ethers.getAddress(await contract.communityOwner({ blockTag }));
     } catch (error: any) {
-      this.logger.warn(`getCommunityOwner(${xpntsToken}) failed: ${error.message}`);
+      this.logger.warn(`getCommunityOwner(${xpntsToken}) failed: ${scrubProviderError(error)}`);
       return null;
     }
   }
@@ -1429,10 +1433,10 @@ export class BlockchainService {
       // this with an AUTHORITATIVE `null` (inactive/no-slot). null = "definitely not an active
       // validator" (drop the cache); throw = "unknown, keep the last-known nodeId" (Codex Medium).
       this.logger.warn(
-        `getOperatorNodeId(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`
+        `getOperatorNodeId(${validator}) failed on ${blsAggregatorAddress}: ${scrubProviderError(error)}`
       );
       throw new Error(
-        `getOperatorNodeId(${validator}) failed on ${blsAggregatorAddress}: ${error.message}`,
+        `getOperatorNodeId(${validator}) failed on ${blsAggregatorAddress}: ${scrubProviderError(error)}`,
         { cause: error }
       );
     }
@@ -1537,7 +1541,7 @@ export class BlockchainService {
       return BigInt(debt);
     } catch (error: any) {
       this.logger.warn(
-        `getDebt read failed on token ${tokenAddress} for ${operator}: ${error.message}`
+        `getDebt read failed on token ${tokenAddress} for ${operator}: ${scrubProviderError(error)}`
       );
       return null;
     }
@@ -1599,7 +1603,7 @@ export class BlockchainService {
       return BigInt(amount);
     } catch (error: any) {
       this.logger.warn(
-        `roleLocks read failed on ${gtokenStakingAddress} for ${operator}: ${error.message}`
+        `roleLocks read failed on ${gtokenStakingAddress} for ${operator}: ${scrubProviderError(error)}`
       );
       return 0n;
     }
@@ -1681,7 +1685,7 @@ export class BlockchainService {
           continue; // getter succeeded for this role — skip the event scan
         } catch (error: any) {
           this.logger.debug(
-            `getRoleMembers(${roleId}) failed on ${registryAddress} (${error.message}) — event scan`
+            `getRoleMembers(${roleId}) failed on ${registryAddress} (${scrubProviderError(error)}) — event scan`
           );
         }
       }
@@ -1762,7 +1766,7 @@ export class BlockchainService {
         }
         // single block still fails — genuinely unscannable → fail-loud (caller keeps previous set).
         throw new Error(
-          `deriveRoleMembers getLogs failed on ${registryAddress} block ${lo}: ${error.message}`,
+          `deriveRoleMembers getLogs failed on ${registryAddress} block ${lo}: ${scrubProviderError(error)}`,
           { cause: error }
         );
       }
@@ -2001,7 +2005,7 @@ export class BlockchainService {
       try {
         await contract.queueSlashWithProof.staticCall(operator, slashLevel, epoch, proof);
       } catch (err: unknown) {
-        const reason = err instanceof Error ? err.message : String(err);
+        const reason = scrubProviderError(err);
         throw new Error(
           `queueSlashWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`,
           { cause: err }
@@ -2066,7 +2070,7 @@ export class BlockchainService {
       try {
         await contract.executeWithProof.staticCall(id, repUsers, newScores, epoch, proof);
       } catch (err: unknown) {
-        const reason = err instanceof Error ? err.message : String(err);
+        const reason = scrubProviderError(err);
         throw new Error(
           `executeWithProof preflight (staticCall) reverted — NOT broadcasting: ${reason}`,
           { cause: err }
@@ -2131,7 +2135,9 @@ export class BlockchainService {
       const result = await contract.isValidOwnerAuth(userOpHash, ownerAuth);
       return result === OWNER_AUTH_MAGIC;
     } catch (error: any) {
-      this.logger.warn(`isValidOwnerAuth eth_call failed for account ${account}: ${error.message}`);
+      this.logger.warn(
+        `isValidOwnerAuth eth_call failed for account ${account}: ${scrubProviderError(error)}`
+      );
       return false;
     }
   }
@@ -2178,4 +2184,46 @@ export class BlockchainService {
       signer === this.wallet ? await this.enqueueWalletWrite(broadcast) : await broadcast();
     return tx.hash;
   }
+}
+
+/**
+ * Decode a `getBLSPublicKey` result for a STRICT (negative) check — exported so the exact
+ * shapes a misbehaving/decoy contract can return are testable without a chain (CC-49 round-3
+ * MEDIUM).
+ *
+ * Returns `null` ONLY for a genuinely inactive registration. Every other unexpected shape
+ * THROWS: for a caller proving a key is ABSENT, an undecodable answer that reads as `null`
+ * would be indistinguishable from "not registered here" and would let the signature through.
+ */
+export function decodeStrictBlsPublicKey(
+  res: unknown,
+  slot: number,
+  blsAggregatorAddress: string
+): string | null {
+  const tuple = res as Record<string | number, any> | null | undefined;
+  if (tuple === null || tuple === undefined) {
+    throw new Error(`empty getBLSPublicKey response at slot ${slot} on ${blsAggregatorAddress}`);
+  }
+  const pk = tuple.publicKey ?? tuple[0];
+  const isActive = tuple.isActive ?? tuple[2];
+  // STRICT on `isActive`: the lenient reader's `if (!isActive)` folds `undefined` — i.e. a
+  // shape this code failed to decode — into "inactive", which for a NEGATIVE check reads as
+  // "the key is absent". An undecodable response is an error, never an absence.
+  if (typeof isActive !== "boolean") {
+    throw new Error(
+      `malformed getBLSPublicKey isActive flag at slot ${slot} on ${blsAggregatorAddress}`
+    );
+  }
+  if (!isActive) return null;
+  if (pk === null || pk === undefined) {
+    throw new Error(`missing BLS public key words at slot ${slot} on ${blsAggregatorAddress}`);
+  }
+  const words = [pk.x_a ?? pk[0], pk.x_b ?? pk[1], pk.y_a ?? pk[2], pk.y_b ?? pk[3]];
+  // Each word must be a full bytes32. A short/odd/undefined word would otherwise be
+  // concatenated into a wrong-length "key" that can never match any local key — silently
+  // passing a not-registered-here check.
+  if (!words.every(w => typeof w === "string" && /^0x[0-9a-fA-F]{64}$/.test(w))) {
+    throw new Error(`malformed BLS public key words at slot ${slot} on ${blsAggregatorAddress}`);
+  }
+  return ("0x" + (words as string[]).map(w => w.slice(2)).join("")).toLowerCase();
 }

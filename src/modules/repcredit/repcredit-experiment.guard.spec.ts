@@ -1,26 +1,36 @@
 import { ExecutionContext, HttpException, HttpStatus } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { RepCreditExperimentGuard } from "./repcredit-experiment.guard.js";
+import {
+  HEADER_AUTH,
+  HEADER_SCHEME,
+  RepCreditExperimentGuard,
+} from "./repcredit-experiment.guard.js";
 
 const SECRET = "experiment-secret";
 const NOW = 1_800_000_000_000;
 const BODY = '{"proposalId":"42"}';
+const TARGET = "/repcredit/slash/sign";
 
 function context(
   overrides: {
     ip?: string;
     socketIp?: string;
     headers?: Record<string, string>;
-    rawBody?: Buffer;
+    rawBody?: Buffer | null;
     body?: unknown;
+    method?: string;
+    originalUrl?: string;
   } = {}
 ): ExecutionContext {
   const headers = overrides.headers ?? {};
   const req = {
     ip: overrides.ip ?? "127.0.0.1",
     socket: { remoteAddress: overrides.socketIp ?? overrides.ip ?? "127.0.0.1" },
-    rawBody: overrides.rawBody ?? Buffer.from(BODY, "utf8"),
+    rawBody:
+      overrides.rawBody === null ? undefined : (overrides.rawBody ?? Buffer.from(BODY, "utf8")),
     body: overrides.body ?? JSON.parse(BODY),
+    method: overrides.method ?? "POST",
+    originalUrl: overrides.originalUrl ?? TARGET,
     header: (name: string) => headers[name],
   };
   return { switchToHttp: () => ({ getRequest: () => req }) } as unknown as ExecutionContext;
@@ -41,8 +51,19 @@ function guard(config: Record<string, unknown> = {}, now: () => number = () => N
   return new RepCreditExperimentGuard(configService, now);
 }
 
-function signedHeaders(timestampMs = NOW, body = BODY, secret = SECRET) {
-  return RepCreditExperimentGuard.computeHeaders(secret, timestampMs, body);
+function signedHeaders(
+  timestampMs = NOW,
+  body = BODY,
+  secret = SECRET,
+  target = TARGET,
+  method = "POST"
+) {
+  return RepCreditExperimentGuard.computeHeaders(secret, {
+    method,
+    requestTarget: target,
+    timestampMs,
+    rawBody: body,
+  });
 }
 
 function statusOf(fn: () => unknown): number {
@@ -174,6 +195,93 @@ describe("RepCreditExperimentGuard (CC-49 BLOCKER-1)", () => {
     for (const ip of ["::1", "::ffff:127.0.0.1"]) {
       expect(guard().canActivate(context({ ip, headers: signedHeaders() }))).toBe(true);
     }
+  });
+});
+
+/**
+ * CC-49 round-3. v2 of the preimage binds the METHOD and the REQUEST TARGET, so a captured
+ * token authorises exactly one call on exactly one endpoint (round-2 LOW-D), and the raw
+ * bytes are mandatory rather than falling back to a re-serialised body (round-2 LOW-F).
+ */
+describe("RepCreditExperimentGuard preimage v2 (CC-49 round-3 LOW-D / LOW-F)", () => {
+  it("rejects a token minted for a different endpoint", () => {
+    const forOtherEndpoint = signedHeaders(NOW, BODY, SECRET, "/repcredit/sign");
+    expect(
+      statusOf(() =>
+        guard().canActivate(
+          context({ headers: forOtherEndpoint, originalUrl: "/repcredit/slash/sign" })
+        )
+      )
+    ).toBe(HttpStatus.FORBIDDEN);
+  });
+
+  it("rejects a token minted for a different method", () => {
+    const forGet = signedHeaders(NOW, BODY, SECRET, TARGET, "GET");
+    expect(statusOf(() => guard().canActivate(context({ headers: forGet, method: "POST" })))).toBe(
+      HttpStatus.FORBIDDEN
+    );
+  });
+
+  it("rejects a request that omits or misdeclares the scheme version", () => {
+    const headers = signedHeaders();
+    const without = { ...headers };
+    delete (without as Record<string, string>)[HEADER_SCHEME];
+    expect(statusOf(() => guard().canActivate(context({ headers: without })))).toBe(
+      HttpStatus.UNAUTHORIZED
+    );
+    expect(
+      statusOf(() =>
+        guard().canActivate(context({ headers: { ...headers, [HEADER_SCHEME]: "v1" } }))
+      )
+    ).toBe(HttpStatus.UNAUTHORIZED);
+  });
+
+  it("refuses to authenticate against a re-serialised body when rawBody is unavailable", () => {
+    // The v1 fallback HMAC'd JSON.stringify(req.body), i.e. a NORMALISED rendering (duplicate
+    // keys collapsed, whitespace lost) rather than the bytes the caller signed.
+    expect(
+      statusOf(() => guard().canActivate(context({ headers: signedHeaders(), rawBody: null })))
+    ).toBe(HttpStatus.UNAUTHORIZED);
+  });
+
+  it("rejects a non-hex or truncated auth header without throwing", () => {
+    const headers = signedHeaders();
+    for (const bad of ["", "zz", "not-hex-at-all", headers[HEADER_AUTH].slice(0, 32)]) {
+      const status = statusOf(() =>
+        guard().canActivate(context({ headers: { ...headers, [HEADER_AUTH]: bad } }))
+      );
+      expect([HttpStatus.UNAUTHORIZED, HttpStatus.FORBIDDEN]).toContain(status);
+    }
+  });
+});
+
+/**
+ * CC-49 round-3 MEDIUM. `parseInt` yields NaN for a mistyped env value, and EVERY relational
+ * comparison against NaN is false — a NaN TTL disables the staleness check and a NaN body cap
+ * disables the size cap. Both layers must refuse rather than run unbounded.
+ */
+describe("RepCreditExperimentGuard numeric bounds (CC-49 round-3 MEDIUM)", () => {
+  it("refuses to construct with a NaN or non-positive bound instead of running unbounded", () => {
+    for (const key of [
+      "repCreditExperimentAuthTtlMs",
+      "repCreditMaxBodyBytes",
+      "repCreditReplayCacheMax",
+    ]) {
+      for (const value of [NaN, 0, -1, 1.5, "120000"]) {
+        expect(() => guard({ [key]: value })).toThrow(new RegExp(key));
+      }
+    }
+    // The skew allowance may legitimately be zero, but never NaN or negative.
+    expect(() => guard({ repCreditAuthMaxFutureSkewMs: 0 })).not.toThrow();
+    expect(() => guard({ repCreditAuthMaxFutureSkewMs: NaN })).toThrow();
+  });
+
+  it("falls back to the documented default only when the key is absent", () => {
+    const instance = guard({ repCreditExperimentAuthTtlMs: undefined });
+    // Default TTL is 120s: a token 200s old is stale.
+    expect(
+      statusOf(() => instance.canActivate(context({ headers: signedHeaders(NOW - 200_000) })))
+    ).toBe(HttpStatus.UNAUTHORIZED);
   });
 });
 

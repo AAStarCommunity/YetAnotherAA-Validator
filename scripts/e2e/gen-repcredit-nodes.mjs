@@ -69,8 +69,10 @@ for (let index = 0; index < count; index++) {
       null,
       2
     ),
-    // Key material must not be world/group readable even inside a temp dir.
-    { mode: 0o600 }
+    // `wx` makes create-if-absent ATOMIC (CC-49 round-2 LOW-G): the existsSync check above
+    // is advisory only, and `mode` is IGNORED for a file that already exists — a local
+    // attacker who won that race would have had the key written into their own 0644 file.
+    { mode: 0o600, flag: "wx" }
   );
   // nodeId and the public key are safe to print; the private key never is.
   console.log(`node${index + 1}: slot=${index + 1} nodeId=${nodeId}`);

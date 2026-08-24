@@ -1,4 +1,4 @@
-import { redactRpcUrl } from "./redact.js";
+import { redactRpcUrl, registerSensitiveUrl } from "./redact.js";
 
 export default () => {
   // Validate required environment variables
@@ -11,6 +11,11 @@ export default () => {
       `Environment configuration validation failed:\n${missingVars.map(v => `  - ${v} is required`).join("\n")}`
     );
   }
+
+  // Harvest the credential-bearing parts of the RPC URL BEFORE anything can log an
+  // error about it, so a provider failure anywhere in the process is scrubbed
+  // (CC-49 round-3 HIGH — ethers embeds the request URL in error.message).
+  registerSensitiveUrl(process.env.ETH_RPC_URL);
 
   const port = parseInt(process.env.PORT || "3000", 10);
 
@@ -117,36 +122,54 @@ export default () => {
     // sign with a key that is also active on that production aggregator (CC-49 HIGH-A).
     repCreditExperimentSigning: process.env.REPCREDIT_EXPERIMENT_SIGNING === "true",
     repCreditBlsAggregatorAddress: process.env.REPCREDIT_BLS_AGGREGATOR_ADDRESS || undefined,
-    repCreditValidatorSlot: parseInt(process.env.REPCREDIT_VALIDATOR_SLOT || "0", 10),
+    repCreditValidatorSlot: strictIntEnv("REPCREDIT_VALIDATOR_SLOT", 0, 0, 13),
+    // Explicit, operator-declared list of aggregators the experiment key must NOT be
+    // registered on, UNIONed with AUDIT_BLS_AGGREGATOR_ADDRESS (CC-49 round-3 MEDIUM).
+    // A single audit address only catches misconfiguration and can itself be pointed at a
+    // decoy contract; a deny-list lets an operator name every aggregator that guards real
+    // stake on this chain. Every entry is scanned and ANY failure refuses the signature.
+    repCreditForbiddenAggregators: parseAllowlist(
+      process.env.REPCREDIT_FORBIDDEN_AGGREGATORS || ""
+    ),
+    // Explicit acknowledgement that this chain hosts NO production aggregator (local anvil /
+    // throwaway devnet). Lets an operator arm without AUDIT_BLS_AGGREGATOR_ADDRESS — and ONLY
+    // then. The service still refuses it on any chain id that carries real deployments, so it
+    // cannot be used to skip the isolation scan on Sepolia or a mainnet.
+    repCreditNoProductionAggregator: process.env.REPCREDIT_NO_PRODUCTION_AGGREGATOR === "true",
     // Admission control for the experiment endpoints (CC-49 BLOCKER-1). The secret is
     // MANDATORY when armed — there is no default and no "auth disabled" mode, because a
     // quorum on this path is a valid on-chain slash proof. Loopback-only unless the
     // operator explicitly opts out with REPCREDIT_ALLOW_REMOTE=true.
     repCreditExperimentAuthSecret: process.env.REPCREDIT_EXPERIMENT_AUTH_SECRET || "",
-    repCreditExperimentAuthTtlMs: parseInt(
-      process.env.REPCREDIT_EXPERIMENT_AUTH_TTL_MS || "120000",
-      10
+    // STRICT bounds on every numeric knob below (CC-49 round-3 MEDIUM). `parseInt` returns
+    // NaN for "", "abc" or "12abc"-style values, and EVERY comparison against NaN is false —
+    // so a typo in the TTL would have made the staleness test pass unconditionally, and a
+    // typo in the body cap would have removed the cap. These now refuse to boot instead.
+    repCreditExperimentAuthTtlMs: strictIntEnv(
+      "REPCREDIT_EXPERIMENT_AUTH_TTL_MS",
+      120_000,
+      1_000,
+      3_600_000
     ),
     repCreditAllowRemote: process.env.REPCREDIT_ALLOW_REMOTE === "true",
-    repCreditMaxBodyBytes: parseInt(process.env.REPCREDIT_MAX_BODY_BYTES || "65536", 10),
+    repCreditMaxBodyBytes: strictIntEnv("REPCREDIT_MAX_BODY_BYTES", 65_536, 1_024, 1_048_576),
     // CC-49 MEDIUM-B. The auth window is ASYMMETRIC on purpose. A token is accepted while
     // `now - ts <= TTL` (staleness) and `ts - now <= MAX_FUTURE_SKEW` (a small allowance for an
     // orchestrator clock running fast). The old symmetric `|now - ts| <= TTL` test let a client
     // whose clock ran fast mint future-dated tokens that stayed valid for ~2x TTL while the
     // replay entry (keyed off ARRIVAL time) expired after 1x TTL — a real replay window. Keep
     // this small; it is a clock-skew allowance, not a validity extension.
-    repCreditAuthMaxFutureSkewMs: (() => {
-      const parsed = parseInt(process.env.REPCREDIT_AUTH_MAX_FUTURE_SKEW_MS || "5000", 10);
-      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5000;
-    })(),
+    repCreditAuthMaxFutureSkewMs: strictIntEnv(
+      "REPCREDIT_AUTH_MAX_FUTURE_SKEW_MS",
+      5_000,
+      0,
+      60_000
+    ),
     // Hard cap on the single-use replay cache. Entries are only inserted AFTER a successful
     // HMAC check, so this bounds an AUTHENTICATED caller, not an anonymous one. On overflow the
     // guard rejects (503) rather than evicting: evicting the oldest entry would silently
     // re-open the replay window it exists to close.
-    repCreditReplayCacheMax: (() => {
-      const parsed = parseInt(process.env.REPCREDIT_REPLAY_CACHE_MAX || "10000", 10);
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : 10000;
-    })(),
+    repCreditReplayCacheMax: strictIntEnv("REPCREDIT_REPLAY_CACHE_MAX", 10_000, 1, 1_000_000),
 
     // EIP-2335 keystore passphrase (#5, #50 ④). When node_state.json holds an encrypted
     // keystore, this decrypts it at boot. Supply it from OUTSIDE the machine's disk —
@@ -413,6 +436,31 @@ function parseBootstrapPeers(peersString: string): string[] {
     .split(",")
     .map(p => p.trim())
     .filter(p => p.length > 0);
+}
+
+/**
+ * Bounded, fail-at-boot integer env parse (CC-49 round-3 MEDIUM).
+ *
+ * `parseInt(process.env.X || "d", 10)` silently yields NaN for "", "abc" or "12 " and takes a
+ * prefix for "64k" — and every relational comparison against NaN is FALSE, so a mistyped TTL
+ * makes `now - ts > ttl` unconditionally false (no staleness check at all) and a mistyped body
+ * cap makes `len > cap` unconditionally false (no cap at all). Silently substituting the
+ * default is not much better: an operator who meant to tighten a bound would run with the
+ * loose one and never know. So: strict digits, finite, inside an explicit range, or the
+ * process refuses to start.
+ */
+function strictIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const trimmed = raw.trim();
+  const parsed = /^-?[0-9]+$/.test(trimmed) ? Number(trimmed) : NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(
+      `Environment configuration validation failed:\n  - ${name}="${raw}" is not an integer ` +
+        `in [${min}, ${max}]`
+    );
+  }
+  return parsed;
 }
 
 function parseAllowlist(allowlistString: string): string[] {

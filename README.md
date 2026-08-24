@@ -317,11 +317,15 @@ The slash preimage is byte-identical to a real `BLSAggregator` slash proof and
 carries no aggregator address or domain tag, so a signature made here is valid
 against any aggregator on the same chain holding the same key at the same slot.
 The path is therefore fail-closed on both admission and keys: it needs
-`REPCREDIT_EXPERIMENT_SIGNING=true` **and** a mandatory HMAC secret, accepts
-loopback callers only by default, bounds body size, rejects replays, requires an
-explicitly configured production `AUDIT_BLS_AGGREGATOR_ADDRESS` to isolate
-against, and refuses to sign with a key that is active in any slot on it.
-Experiment keys must be ephemeral. See
+`REPCREDIT_EXPERIMENT_SIGNING=true` **and** a mandatory per-request HMAC
+(binding method, path, timestamp and the raw bytes), accepts loopback callers
+only by default, bounds body size, rejects replays, requires an explicitly
+configured production `AUDIT_BLS_AGGREGATOR_ADDRESS` (plus any
+`REPCREDIT_FORBIDDEN_AGGREGATORS`) to isolate against, and refuses to sign with
+a key that is active in any slot on any of them. That address check is a
+**transitional operator guard, not cryptographic isolation** — real domain
+separation (a fixed tag + `address(this)` in the on-chain preimage) is owned by
+repo:sp. Experiment keys must be ephemeral. See
 [docs/REPCREDIT_EXPERIMENT.md](docs/REPCREDIT_EXPERIMENT.md) for the runbook.
 
 ### Documentation
@@ -421,6 +425,9 @@ node_*.json             # Dynamic node files (ignored by git)
 - Production deployments should use KMS for key management
 - RPC endpoints are logged host-only (`redactRpcUrl`) — provider API keys in the
   `ETH_RPC_URL` path/query/userinfo never reach stdout or a log shipper
+- Provider/RPC errors are logged only through `scrubProviderError`: ethers
+  embeds the request URL (and therefore the API key) in an error's message on
+  401/429/transport failures, so the raw text is never logged or returned
 - The RepCredit endpoints are experiment-only and fail-closed; use ephemeral
   keys only, and never arm them on a node whose BLS key carries stake
 

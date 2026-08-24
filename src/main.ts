@@ -1,11 +1,12 @@
 import "reflect-metadata";
 import { createRequire } from "module";
-import { NestFactory } from "@nestjs/core";
+import { HttpAdapterHost, NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module.js";
 import { ValidationPipe } from "@nestjs/common";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import { ConfigService } from "@nestjs/config";
 import { GossipService } from "./modules/gossip/gossip.service.js";
+import { ScrubbingExceptionFilter } from "./common/scrubbing-exception.filter.js";
 
 const require = createRequire(import.meta.url);
 const { version: APP_VERSION } = require("../package.json") as { version: string };
@@ -22,6 +23,12 @@ async function bootstrap() {
       transform: true,
     })
   );
+
+  // Scrub credentials out of anything Nest's own exception handler logs (CC-49 round-3
+  // HIGH). An unhandled ethers error carries the full RPC URL — and therefore the provider
+  // API key — in its message, stack and `info.requestUrl`. Status codes and response bodies
+  // are unchanged; only the log line is.
+  app.useGlobalFilters(new ScrubbingExceptionFilter(app.get(HttpAdapterHost).httpAdapter));
 
   app.enableCors();
 

@@ -191,7 +191,7 @@ describe("RepCreditService key isolation from the audit aggregator (CC-49 HIGH-A
       auditSlotKeys[slot - 1] = key.toUpperCase().replace("0X", "0x");
       const { instance, signed } = build({ experimentSlotKey: key, auditSlotKeys });
       await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
-        new RegExp(`also active at slot ${slot} on the production audit aggregator`)
+        new RegExp(`also active at slot ${slot} on production aggregator`)
       );
       expect(signed).toHaveLength(0);
     }
@@ -201,7 +201,7 @@ describe("RepCreditService key isolation from the audit aggregator (CC-49 HIGH-A
     const key = await encodedLocalKey();
     const { instance, signed } = build({ experimentSlotKey: key, auditSlotThrowsAt: 2 });
     await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
-      /could not determine whether the local BLS key is active at audit aggregator slot 2/
+      /could not determine whether the local BLS key is active at aggregator .* slot 2/
     );
     expect(signed).toHaveLength(0);
   });
@@ -226,7 +226,7 @@ describe("RepCreditService key isolation from the audit aggregator (CC-49 HIGH-A
       config: { auditMaxSlots: 3 },
     });
     await expect(instance.sign((await proposal()) as any)).rejects.toThrow(
-      /also active at slot 13 on the production audit aggregator/
+      /also active at slot 13 on production aggregator/
     );
     expect(signed).toHaveLength(0);
   });
@@ -255,6 +255,172 @@ describe("RepCreditService key isolation from the audit aggregator (CC-49 HIGH-A
       /local BLS key is not registered at validator slot 1/
     );
     expect(signed).toHaveLength(0);
+  });
+});
+
+/**
+ * CC-49 round-3 MEDIUM. The key-reuse scan now covers the audit aggregator AND every
+ * REPCREDIT_FORBIDDEN_AGGREGATORS entry, and the "this devnet has no production aggregator"
+ * escape is refused on any chain that carries real deployments.
+ */
+describe("RepCreditService production-aggregator deny-list (CC-49 round-3 MEDIUM)", () => {
+  const NODE_PUBLIC_KEY =
+    "0x97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+  const SIGNING_NODE = { nodeId: "node-1", publicKey: NODE_PUBLIC_KEY };
+  const SECOND_PRODUCTION = "0x00000000000000000000000000000000000000Bb";
+
+  async function encodedLocalKey(): Promise<string> {
+    const { encodeRepCreditPublicKey } = await import("./repcredit-consensus.js");
+    return encodeRepCreditPublicKey(NODE_PUBLIC_KEY);
+  }
+
+  async function proposal(chainId = 31337) {
+    const { buildRepCreditMessageHash } = await import("./repcredit-consensus.js");
+    const base = {
+      schemaVersion: "repcredit-reputation-v1" as const,
+      proposalId: "1",
+      operator: "0x0000000000000000000000000000000000000000",
+      slashLevel: 0,
+      users: ["0x1111111111111111111111111111111111111111"],
+      scores: ["10"],
+      epoch: "1",
+      chainId: String(chainId),
+      messageHash: "0x" + "00".repeat(32),
+    };
+    return { ...base, messageHash: buildRepCreditMessageHash(base as any) };
+  }
+
+  function build(
+    config: Record<string, unknown>,
+    slots: (aggregator: string, slot: number) => string | null | Error,
+    chainId = 31337,
+    hooks: { codeThrowsOn?: string } = {}
+  ) {
+    const scanned: string[] = [];
+    const signed: string[] = [];
+    const blockchain = {
+      getChainId: async () => chainId,
+      getBlsPublicKeyAtSlot: async () => encodedKey,
+      getCode: async (address: string) => {
+        if (hooks.codeThrowsOn === address) {
+          throw new Error(`server response 401 url="https://rpc.test/v2/SECRET"`);
+        }
+        return "0x60006000";
+      },
+      probeBlsAggregator: async () => undefined,
+      getBlsPublicKeyAtSlotStrict: async (aggregator: string, slot: number) => {
+        scanned.push(`${aggregator}#${slot}`);
+        const out = slots(aggregator, slot);
+        if (out instanceof Error) throw out;
+        return out;
+      },
+    };
+    let encodedKey = "";
+    const instance = service(
+      armed({ repCreditValidatorSlot: 1, auditMaxSlots: 2, ...config }),
+      blockchain,
+      { getNodeForSigning: () => SIGNING_NODE },
+      {
+        signRepCreditHash: async (h: string) => (
+          signed.push(h),
+          { signatureCompact: "0xa", publicKey: "0xb" }
+        ),
+      }
+    );
+    return {
+      instance,
+      scanned,
+      signed,
+      setLocalKey: (key: string) => {
+        encodedKey = key;
+      },
+    };
+  }
+
+  it("scans EVERY listed aggregator, not just the audit one", async () => {
+    const key = await encodedLocalKey();
+    const built = build({ repCreditForbiddenAggregators: [SECOND_PRODUCTION] }, () => null);
+    built.setLocalKey(key);
+    await expect(built.instance.sign((await proposal()) as any)).resolves.toMatchObject({
+      slot: 1,
+    });
+    expect(built.scanned.some(entry => entry.startsWith(PRODUCTION_AGGREGATOR))).toBe(true);
+    expect(built.scanned.some(entry => entry.startsWith(SECOND_PRODUCTION))).toBe(true);
+  });
+
+  it("refuses when the key sits on a deny-listed aggregator the audit address does not cover", async () => {
+    const key = await encodedLocalKey();
+    const built = build(
+      { repCreditForbiddenAggregators: [SECOND_PRODUCTION] },
+      (aggregator, slot) => (aggregator === SECOND_PRODUCTION && slot === 2 ? key : null)
+    );
+    built.setLocalKey(key);
+    await expect(built.instance.sign((await proposal()) as any)).rejects.toThrow(
+      new RegExp(`also active at slot 2 on production aggregator ${SECOND_PRODUCTION}`)
+    );
+    expect(built.signed).toHaveLength(0);
+  });
+
+  it("refuses on ANY read failure across the parallel scan", async () => {
+    const key = await encodedLocalKey();
+    const built = build(
+      { repCreditForbiddenAggregators: [SECOND_PRODUCTION] },
+      (aggregator, slot) =>
+        aggregator === SECOND_PRODUCTION && slot === 5 ? new Error("RPC timeout") : null
+    );
+    built.setLocalKey(key);
+    await expect(built.instance.sign((await proposal()) as any)).rejects.toThrow(
+      /refusing to sign on an indeterminate isolation check/
+    );
+    expect(built.signed).toHaveLength(0);
+  });
+
+  it("never echoes a provider error (which carries the RPC key) back to the caller", async () => {
+    const key = await encodedLocalKey();
+    const built = build({}, () => null, 31337, { codeThrowsOn: PRODUCTION_AGGREGATOR });
+    built.setLocalKey(key);
+    const error = await built.instance.sign((await proposal()) as any).catch(e => e);
+    expect(String(error.message)).not.toContain("SECRET");
+    expect(String(error.message)).not.toContain("rpc.test");
+    expect(String(error.message)).toMatch(/cannot read the production aggregator/);
+  });
+
+  it("accepts the devnet acknowledgement on a throwaway chain", async () => {
+    const key = await encodedLocalKey();
+    const built = build(
+      {
+        auditBlsAggregatorAddress: undefined,
+        auditBlsAggregatorAddressFromEnv: false,
+        repCreditNoProductionAggregator: true,
+      },
+      () => null,
+      31337
+    );
+    built.setLocalKey(key);
+    await expect(built.instance.sign((await proposal()) as any)).resolves.toMatchObject({
+      slot: 1,
+    });
+    expect(built.scanned).toHaveLength(0);
+  });
+
+  it("refuses the devnet acknowledgement on every chain that carries real deployments", async () => {
+    const key = await encodedLocalKey();
+    for (const chainId of [1, 10, 137, 8453, 42161, 11155111]) {
+      const built = build(
+        {
+          auditBlsAggregatorAddress: undefined,
+          auditBlsAggregatorAddressFromEnv: false,
+          repCreditNoProductionAggregator: true,
+        },
+        () => null,
+        chainId
+      );
+      built.setLocalKey(key);
+      await expect(built.instance.sign((await proposal(chainId)) as any)).rejects.toThrow(
+        /REPCREDIT_NO_PRODUCTION_AGGREGATOR is not accepted on chain/
+      );
+      expect(built.signed).toHaveLength(0);
+    }
   });
 });
 
