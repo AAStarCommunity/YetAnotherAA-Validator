@@ -1,4 +1,4 @@
-import { ipInAnyCidr, ipInCidr, parseCidr, parseIp } from "./cidr.js";
+import { intersectsIpv4Mapped, ipInAnyCidr, ipInCidr, parseCidr, parseIp } from "./cidr.js";
 
 const range = (value: string) => {
   const parsed = parseCidr(value);
@@ -86,5 +86,21 @@ describe("cidr (CC-49 round-5 MEDIUM-1 trusted-proxy allow-list)", () => {
   it("ipInAnyCidr matches nothing for an empty list", () => {
     expect(ipInAnyCidr("127.0.0.1", [])).toBe(false);
     expect(ipInAnyCidr("127.0.0.1", [range("10.0.0.0/8"), range("127.0.0.0/8")])).toBe(true);
+  });
+
+  it("flags IPv6 ranges that overlap the IPv4-mapped block (CC-49 round-6 LOW-3)", () => {
+    // These parse and look like "trust the v4 peers too", but a dual-stack peer is normalised
+    // to its 4-byte IPv4 form, so a 16-byte range can never contain one: configuring one is a
+    // node that boots and then rejects every single request. Callers turn this into a boot
+    // failure that names the fix.
+    for (const covering of ["::ffff:0:0/96", "::ffff:0:0/64", "::/0", "::/1"]) {
+      expect([covering, intersectsIpv4Mapped(range(covering))]).toEqual([covering, true]);
+    }
+    // Real IPv6 proxy ranges, loopback and every IPv4 range are untouched.
+    for (const fine of ["2001:db8::/32", "::1/128", "fe80::/10", "127.0.0.0/8", "0.0.0.0/0"]) {
+      expect([fine, intersectsIpv4Mapped(range(fine))]).toEqual([fine, false]);
+    }
+    // `::ffff:127.0.0.1` is parsed AS the IPv4 literal, so it is a usable declaration.
+    expect(intersectsIpv4Mapped(range("::ffff:127.0.0.1"))).toBe(false);
   });
 });

@@ -44,11 +44,20 @@ ETH_RPC_URL=… VALIDATOR_CONTRACT_ADDRESS=0x… OPERATOR_PRIVATE_KEY=0x… \
 loopback socket peer means two completely different things in the two topologies
 (CC-49 round-5 MEDIUM-1):
 
-| Mode               | What a loopback socket peer proves                                                       |
-| ------------------ | ---------------------------------------------------------------------------------------- |
-| `direct` (default) | The listener is the boundary — the peer really is a process on this host.                |
-| `proxied`          | **Nothing.** A same-host reverse proxy / tunnel back-connects from `127.0.0.1`, so every |
-|                    | public request also arrives from loopback.                                               |
+| Mode        | What a loopback socket peer proves                                                        |
+| ----------- | ----------------------------------------------------------------------------------------- |
+| `direct`    | The listener is the boundary — the peer really is a process on this host.                 |
+| `proxied`   | **Nothing.** A same-host reverse proxy / tunnel back-connects from `127.0.0.1`, so every  |
+|             | public request also arrives from loopback.                                                |
+
+There is **no default**: `NODE_ADMIN_NETWORK_MODE` is mandatory whenever
+`NODE_ADMIN_ENABLED=true`, and a missing value is a **boot failure** (CC-49
+round-6 MEDIUM-1). It used to default to `direct`, which meant an operator who
+declared nothing got a node asserting _"loopback callers only"_ in its boot
+banner on their behalf — false, and unwarned, behind the cloudflared tunnel this
+repo documents. That was the round-4 hole, reachable by doing nothing at all.
+While the endpoints are **disabled** there is nothing to reach and nothing to
+declare, so the value stays optional there (`dvt1/2/3` are unaffected).
 
 The reference deployment in this repo is the second one: `dvt1/2/3.aastar.io` →
 cloudflared → `127.0.0.1:3001`. Under round-4's rules that made the "loopback
@@ -66,8 +75,8 @@ So, in `proxied` mode the node:
 - keeps the endpoints **disabled** (`403 NODE_ADMIN_PROXIED_NOT_ALLOWED`) until
   `NODE_ADMIN_ALLOW_PROXIED=true` acknowledges that explicitly.
 
-An unrecognised `NODE_ADMIN_NETWORK_MODE` is a **boot failure**, not a fallback
-to the looser mode. So is `NODE_ADMIN_ALLOW_PROXIED=true` without
+An unrecognised — or missing — `NODE_ADMIN_NETWORK_MODE` is a **boot failure**,
+not a fallback to the looser mode. So is `NODE_ADMIN_ALLOW_PROXIED=true` without
 `NODE_ADMIN_NETWORK_MODE=proxied`: an operator who sets only the former believes
 they declared the tunnel, while the node would still be asserting `direct` and
 applying an inert loopback gate — the round-4 state, reached by accident.
@@ -99,6 +108,23 @@ proxy must still strip or overwrite any client-supplied `X-Forwarded-For`. Left
 unset, every proxied caller simply shares one anonymous bucket — which is what
 the global anonymous ledger below exists for.
 
+Two consequences worth knowing before you declare a proxy:
+
+- **There is no local escape hatch on the HTTP path.** Once the topology is
+  declared, a request made _on this host_ straight to the listener has no
+  `X-Forwarded-For` at the declared hop, so it is answered
+  `403 NODE_ADMIN_FORWARDED_INVALID` — correct token included (CC-49 round-6
+  LOW-1). That is fail-closed on purpose: the alternative is a bypass keyed on
+  something the node cannot verify. If the proxy is down, administer the node
+  with the CLI (`scripts/register-node.mjs`). The node says this at boot.
+- **Write IPv4 CIDRs for IPv4 peers.** A dual-stack listener reports
+  `::ffff:127.0.0.1`, which is normalised to its 4-byte IPv4 form, so an IPv6
+  range can never contain it. `NODE_ADMIN_TRUSTED_PROXY_CIDRS=::ffff:0:0/96` or
+  `::/0` would match nothing at all and reject every request; both are now a
+  **boot failure** naming the fix rather than a node that starts and then 403s
+  forever (CC-49 round-6 LOW-3). Use `127.0.0.0/8`; `::1/128` and real IPv6
+  ranges such as `2001:db8::/32` are accepted as written.
+
 ## Enabling the HTTP path
 
 ```bash
@@ -107,7 +133,7 @@ NODE_ADMIN_ENABLED=true
 # boot on reuse — the two paths have different blast radii).
 NODE_ADMIN_TOKEN="$(openssl rand -hex 32)"
 
-# Network mode — see above. Unrecognised values refuse to boot.
+# Network mode — see above. REQUIRED here; missing or unrecognised values refuse to boot.
 NODE_ADMIN_NETWORK_MODE=direct  # or: proxied
 NODE_ADMIN_ALLOW_PROXIED=false  # proxied mode stays CLOSED until this is true
 
@@ -128,14 +154,18 @@ Gate order — fail-closed, nothing falls through:
 2. `proxied` mode armed with `NODE_ADMIN_ALLOW_PROXIED=true`, else `403`.
 3. `NODE_ADMIN_TOKEN` set — enabled without a token rejects everything (`503`),
    never opens.
-4. **`direct` mode only**: loopback source, unless
-   `NODE_ADMIN_ALLOW_REMOTE=true` — else `403`. The check reads the socket peer
-   address, not `req.ip`, so an `X-Forwarded-For` header cannot claim loopback.
-   Skipped in `proxied` mode, where loopback proves nothing.
-5. Rate-limit bucket key: the socket peer, or the trusted-proxy-derived client
+4. The socket peer address is read, and **only** that: there is no `req.ip`
+   fallback, because `req.ip` is `X-Forwarded-For`-derived once express
+   `trust proxy` is on. A request whose peer cannot be read is
+   `403 NODE_ADMIN_PEER_UNKNOWN`, never admitted on a header-derived address
+   (CC-49 round-6 LOW-2).
+5. **`direct` mode only**: loopback source, unless
+   `NODE_ADMIN_ALLOW_REMOTE=true` — else `403`. Skipped in `proxied` mode,
+   where loopback proves nothing.
+6. Rate-limit bucket key: the socket peer, or the trusted-proxy-derived client
    address. Fail-closed — `403` on any mismatch with the declared topology.
-6. Constant-time token comparison — **before** any budget is charged.
-7. Throttle, on **separate ledgers** — `429`.
+7. Constant-time token comparison — **before** any budget is charged.
+8. Throttle, on **separate ledgers** — `429`.
 
 > Whenever the endpoints are enabled the node says so at boot. In `proxied` mode
 > and with `NODE_ADMIN_ALLOW_REMOTE=true` it says it in a highlighted block: a
@@ -161,9 +191,46 @@ caller are charged to physically separate ledgers:
 Exhausting the anonymous ledgers still bounds token guessing — a wrong token is
 `429`d with the flood — but it can never `429` a correct one. The global ledger
 is what bounds a flood spread across many client addresses, which a per-source
-bound alone would not catch. Both anonymous ledgers are charged on every failed
-attempt (not short-circuited), so an attacker cannot keep the global one clean
-by spending the cheaper per-source one first.
+bound alone would not catch. It is charged **first**, so an attacker cannot keep
+it clean by spending the cheaper per-source one — and once it is spent the node
+short-circuits: no per-source entry is allocated or refreshed for an
+unauthenticated caller (see the next section).
+
+These are **application-level** ledgers, not per-route ones (CC-49 round-6
+MEDIUM-2). `@UseGuards(NodeAdminGuard)` makes Nest build one guard instance per
+_module_, so the state used to be split three ways across `/node`, `/dashboard`
+and `/gossip`: the configured "global" bound was really 3x itself, the
+per-source bound likewise, and the boot banner printed three times. The
+decision and the ledgers now live in a single `NodeAdminPolicy` provider
+(`NodeAdminModule`, `@Global`), so the numbers above are the numbers the node
+enforces, whichever route is called.
+
+### The throttle bounds what the node SPENDS, not just what it answers
+
+A limiter that returns `429` while still allocating a ledger entry per request
+is not a bound. With a declared trusted proxy the bucket key comes from a
+header, so one host forging 25k `X-Forwarded-For` values grew the ledger and the
+`O(n)` table sweep it ran on every insert — on the process that also runs the
+signing hot path (CC-49 round-6 MEDIUM-3). Now:
+
+- the global anonymous budget is charged first and **short-circuits**, so the
+  number of distinct per-source keys a window can create is bounded by that
+  budget (default 60), not by how many headers an attacker forges;
+- every ledger has a **hard key capacity** (1024). Reaching it reclaims keys
+  whose window has fully passed; if they are all still live the ledger refuses
+  the new key rather than forgetting a live budget — evicting one would hand a
+  source a second budget;
+- bookkeeping is `O(1)` amortised: timestamps are pruned only for the key being
+  touched, and reclamation stops at the first live entry;
+- the `brute-force budget spent` log line is itself rate-limited to one per
+  window (with a suppressed count), so a refused flood cannot become 25k log
+  lines on the operator's disk.
+
+`src/modules/node/node-admin.realprocess.spec.ts` runs the 25k-forged-header
+flood against the built `dist/main.js` and against a control process with the
+endpoints disabled (`403` before any bookkeeping), and asserts the gated node
+adds no measurable memory over the control and does not get slower as the number
+of forged keys grows.
 
 Neither the presented token nor the configured one is ever written to a log
 line, a metric or a response body.
@@ -199,6 +266,7 @@ Every rejection carries the versioned envelope described in
 | `NODE_ADMIN_PROXIED_NOT_ALLOWED`        | `403` | `proxied` mode without `NODE_ADMIN_ALLOW_PROXIED`    |
 | `NODE_ADMIN_TOKEN_UNSET`                | `503` | Enabled but `NODE_ADMIN_TOKEN` is empty              |
 | `NODE_ADMIN_REMOTE_FORBIDDEN`           | `403` | `direct` mode, non-loopback source, remote not armed |
+| `NODE_ADMIN_PEER_UNKNOWN`               | `403` | Socket peer address unreadable; no `req.ip` fallback |
 | `NODE_ADMIN_UNTRUSTED_PROXY`            | `403` | Peer outside `NODE_ADMIN_TRUSTED_PROXY_CIDRS`        |
 | `NODE_ADMIN_FORWARDED_INVALID`          | `403` | No client address at the declared hop                |
 | `NODE_ADMIN_RATE_LIMITED`               | `429` | Anonymous or operator throttle ledger spent          |

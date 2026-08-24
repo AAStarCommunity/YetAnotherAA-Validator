@@ -118,3 +118,28 @@ function maskTo(bytes: Uint8Array, prefixBits: number): Uint8Array {
   }
   return out;
 }
+
+/**
+ * The IPv4-mapped IPv6 block `::ffff:0:0/96` — the addresses a dual-stack listener reports as
+ * `::ffff:127.0.0.1`. `parseIp` normalises those to their 4-byte IPv4 form (one address, one
+ * spelling), which means a 16-byte range can NEVER contain one.
+ */
+const IPV4_MAPPED_BLOCK: CidrRange = {
+  bytes: Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0]),
+  prefixBits: 96,
+};
+
+/**
+ * True when `range` is an IPv6 range that overlaps the IPv4-mapped block — i.e. an operator
+ * wrote `::ffff:0:0/96` or `::/0` meaning "trust the v4 peers too". It is a configuration
+ * error rather than a mere no-op: such a range matches nothing at all here, so callers turn
+ * it into a BOOT failure that names the fix, instead of a runtime 403 on every request
+ * (CC-49 round-6 LOW-3).
+ */
+export function intersectsIpv4Mapped(range: CidrRange): boolean {
+  if (range.bytes.length !== 16) return false;
+  const bits = Math.min(range.prefixBits, IPV4_MAPPED_BLOCK.prefixBits);
+  const a = maskTo(range.bytes, bits);
+  const b = maskTo(IPV4_MAPPED_BLOCK.bytes, bits);
+  return a.every((byte, i) => byte === b[i]);
+}

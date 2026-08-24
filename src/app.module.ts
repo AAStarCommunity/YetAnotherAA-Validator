@@ -14,11 +14,13 @@ import { X402FacilitatorModule } from "./modules/x402-facilitator/x402-facilitat
 import { AuditModule } from "./modules/audit/audit.module.js";
 import { HealthModule } from "./modules/health/health.module.js";
 import { RepCreditModule } from "./modules/repcredit/repcredit.module.js";
+import { NodeAdminModule } from "./common/node-admin.module.js";
 
 @Module({
   imports: [
     AppConfigModule, // must be first — validates env vars on startup
     CapabilityModule, // global singleton registry; must load before optional modules
+    NodeAdminModule, // ONE node-admin policy (throttle ledgers) shared by every guarded route
     OpsAlertModule, // global operator-alert push (#100); must load before keeper/relay
     BlsModule,
     NodeModule,

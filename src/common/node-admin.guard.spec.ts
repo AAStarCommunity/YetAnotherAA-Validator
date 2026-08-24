@@ -6,6 +6,7 @@ import {
   HEADER_FORWARDED_FOR,
   HEADER_NODE_ADMIN_TOKEN,
   NodeAdminGuard,
+  NodeAdminPolicy,
 } from "./node-admin.guard.js";
 
 const TOKEN = "example-node-admin-token-32-chars-min";
@@ -39,7 +40,14 @@ function guard(config: Record<string, unknown> = {}, now: () => number = () => N
     ...config,
   } as Record<string, unknown>;
   const configService = { get: (key: string) => base[key] } as unknown as ConfigService;
-  return new NodeAdminGuard(configService, now);
+  // The guard is a shell around ONE application-level policy (CC-49 round-6 MEDIUM-2): Nest
+  // builds a guard instance per module, so every piece of state under test lives here.
+  return new NodeAdminGuard(new NodeAdminPolicy(configService, now));
+}
+
+/** How many distinct keys a ledger is holding — the round-6 MEDIUM-3 memory assertions. */
+function ledgerSize(instance: NodeAdminGuard, ledger: "anonBySource" | "anonGlobal" | "operator") {
+  return ((instance as any).policy[ledger] as { size: number }).size;
 }
 
 function envelopeOf(fn: () => unknown): { statusCode: number; errorCode: string; message: string } {
@@ -182,8 +190,22 @@ describe("NodeAdminGuard network mode (CC-49 round-5 MEDIUM-1)", () => {
   it("refuses to boot on an undeclared network mode instead of defaulting to the loose one", () => {
     expect(() => guard({ nodeAdminNetworkMode: "tunnel" })).toThrow(/NODE_ADMIN_NETWORK_MODE/);
     expect(() => guard({ nodeAdminNetworkMode: "Direct" })).toThrow(/NODE_ADMIN_NETWORK_MODE/);
-    // Absent means the SAFE mode, not "whatever the socket looks like".
-    expect(() => guard({ nodeAdminNetworkMode: undefined })).not.toThrow();
+  });
+
+  it("requires the mode to be DECLARED when enabled — absent is not `direct` (round-6 MEDIUM-1)", () => {
+    // The round-5 hole reached by doing NOTHING: NODE_ADMIN_ENABLED=true with no mode ran in
+    // `direct` and printed "loopback callers only" — an assertion the operator never made, and
+    // a false one behind cloudflared, with no highlighted warning.
+    for (const missing of [undefined, "", "   "]) {
+      expect(() => guard({ nodeAdminNetworkMode: missing })).toThrow(
+        /NODE_ADMIN_NETWORK_MODE must be declared/
+      );
+    }
+    // While the endpoints are DISABLED there is nothing to reach and nothing to declare, so
+    // the existing dvt1/2/3 configs (ENABLED=false) keep booting untouched.
+    expect(() =>
+      guard({ nodeAdminEnabled: false, nodeAdminNetworkMode: undefined })
+    ).not.toThrow();
   });
 
   it("keeps the endpoints DISABLED in proxied mode until NODE_ADMIN_ALLOW_PROXIED is set", () => {
@@ -469,5 +491,181 @@ describe("NodeAdminGuard throttle ledgers (CC-49 round-5 MEDIUM-2)", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe("NodeAdminGuard ledger cost (CC-49 round-6 MEDIUM-3)", () => {
+  // The finding: the throttle bounded the STATUS CODE, not the work. Every anonymous request
+  // — including the ones already being 429'd — allocated or refreshed a per-source entry, and
+  // with a declared trusted proxy the key comes from a header, so one host forging 25k
+  // X-Forwarded-For values grew RSS by 123MB and made each request 3.4x slower, on the same
+  // process that runs the signing hot path.
+  const proxiedWithProxy = (config: Record<string, unknown> = {}) =>
+    guard({
+      nodeAdminNetworkMode: "proxied",
+      nodeAdminAllowProxied: true,
+      nodeAdminTrustedProxyCidrs: ["127.0.0.0/8"],
+      nodeAdminTrustedProxyHops: 1,
+      ...config,
+    });
+
+  /** A distinct, VALID client address per index — an unparseable one is refused earlier. */
+  const forgedIp = (i: number) => `10.${(i >> 16) & 0xff}.${(i >> 8) & 0xff}.${i & 0xff}`;
+
+  const anonymousFrom = (instance: NodeAdminGuard, client: string) =>
+    envelopeOf(() =>
+      instance.canActivate(
+        context({ socketIp: "127.0.0.1", headers: { [HEADER_FORWARDED_FOR]: client } })
+      )
+    ).errorCode;
+
+  it("stops allocating per-source entries once the GLOBAL anonymous budget is spent", () => {
+    const instance = proxiedWithProxy({
+      nodeAdminAnonGlobalRateMax: 3,
+      nodeAdminRateMax: 1_000, // deliberately generous: the global ledger is the bound
+    });
+    for (let i = 0; i < 3; i++) {
+      expect(anonymousFrom(instance, `203.0.113.${i}`)).toBe("NODE_ADMIN_TOKEN_MISSING");
+    }
+    expect(ledgerSize(instance, "anonBySource")).toBe(3);
+
+    // 5,000 forged client addresses AFTER the global budget is gone: all rejected, and not one
+    // of them buys a ledger entry. Before the fix this was 5,000 new keys.
+    for (let i = 0; i < 5_000; i++) {
+      expect(anonymousFrom(instance, forgedIp(i))).toBe("NODE_ADMIN_RATE_LIMITED");
+    }
+    expect(ledgerSize(instance, "anonBySource")).toBe(3);
+
+    // …and the operator is untouched by all of it: separate ledger, and it was never charged.
+    expect(
+      instance.canActivate(
+        context({
+          socketIp: "127.0.0.1",
+          headers: { [HEADER_NODE_ADMIN_TOKEN]: TOKEN, [HEADER_FORWARDED_FOR]: "203.0.113.99" },
+        })
+      )
+    ).toBe(true);
+    expect(ledgerSize(instance, "operator")).toBe(1);
+  });
+
+  it("caps the number of tracked keys and evicts least-recently-used, never sweeping the table", () => {
+    // Global budget raised far above the capacity, so the ONLY thing bounding the table here is
+    // the capacity itself.
+    const instance = proxiedWithProxy({
+      nodeAdminAnonGlobalRateMax: 10_000,
+      nodeAdminRateMax: 1,
+    });
+    for (let i = 0; i < 4_000; i++) {
+      anonymousFrom(instance, forgedIp(i));
+    }
+    const size = ledgerSize(instance, "anonBySource");
+    expect(size).toBeLessThanOrEqual(1_024);
+    // Bounded, and still actually tracking: eviction, not a periodic wipe.
+    expect(size).toBeGreaterThan(0);
+    // The global ledger is one key by construction, whatever the traffic looks like.
+    expect(ledgerSize(instance, "anonGlobal")).toBe(1);
+  });
+
+  it("never forgets a LIVE budget to make room: a full table denies new keys instead", () => {
+    // The bound must not be self-defeating. If reaching capacity evicted a live entry, a source
+    // that had spent its budget could get a fresh one just by pushing enough other keys through
+    // the table — turning the memory fix into a rate-limit bypass.
+    const instance = proxiedWithProxy({
+      nodeAdminAnonGlobalRateMax: 10_000,
+      nodeAdminRateMax: 2,
+    });
+    const attacker = "203.0.113.77";
+    expect(anonymousFrom(instance, attacker)).toBe("NODE_ADMIN_TOKEN_MISSING");
+    expect(anonymousFrom(instance, attacker)).toBe("NODE_ADMIN_TOKEN_MISSING");
+    // Spent. Now push far more than the capacity of OTHER keys through, then come back.
+    for (let i = 0; i < 4_000; i++) {
+      anonymousFrom(instance, forgedIp(i));
+    }
+    expect(anonymousFrom(instance, attacker)).toBe("NODE_ADMIN_RATE_LIMITED");
+    expect(ledgerSize(instance, "anonBySource")).toBeLessThanOrEqual(1_024);
+  });
+
+  it("reclaims keys once their window has passed, so a bounded table is not a permanent one", () => {
+    let clock = NOW;
+    const instance = guard(
+      {
+        nodeAdminNetworkMode: "proxied",
+        nodeAdminAllowProxied: true,
+        nodeAdminTrustedProxyCidrs: ["127.0.0.0/8"],
+        nodeAdminTrustedProxyHops: 1,
+        nodeAdminAnonGlobalRateMax: 10_000,
+        nodeAdminRateMax: 1,
+      },
+      () => clock
+    );
+    for (let i = 0; i < 2_000; i++) anonymousFrom(instance, forgedIp(i));
+    expect(ledgerSize(instance, "anonBySource")).toBeLessThanOrEqual(1_024);
+    clock = NOW + 60_001; // every recorded attempt is now outside the window
+    for (let i = 5_000; i < 5_010; i++) {
+      // Fresh sources get in again — the table reclaimed the expired keys to make room.
+      expect(anonymousFrom(instance, forgedIp(i))).toBe("NODE_ADMIN_TOKEN_MISSING");
+    }
+  });
+
+  it("does not degrade with the number of forged keys — the flood is O(1) per request", () => {
+    const instance = proxiedWithProxy({
+      nodeAdminAnonGlobalRateMax: 10_000,
+      nodeAdminRateMax: 1,
+    });
+    const batch = (offset: number, count: number) => {
+      const started = process.hrtime.bigint();
+      for (let i = offset; i < offset + count; i++) {
+        anonymousFrom(instance, forgedIp(i));
+      }
+      return Number(process.hrtime.bigint() - started) / 1e6;
+    };
+    const first = batch(0, 5_000);
+    const last = batch(20_000, 5_000); // 25k distinct keys seen in total
+    // The old full-table sweep made the last batch ~3.4x the first. The bar is deliberately
+    // loose (CI is noisy); a re-introduced O(n) sweep blows through it by an order of magnitude.
+    expect(last).toBeLessThan(Math.max(first * 4, 250));
+  });
+});
+
+describe("NodeAdminGuard source of truth for the peer address (CC-49 round-6 LOW-2)", () => {
+  it("refuses a request whose socket peer cannot be read instead of falling back to req.ip", () => {
+    // `req.ip` is X-Forwarded-For-derived once express `trust proxy` is on. Nothing in this
+    // repo sets that today, which is why this is LOW — but the fallback was one setting away
+    // from letting a header supply the address the comment calls unforgeable.
+    const req = {
+      ip: "127.0.0.1",
+      socket: {},
+      header: (name: string) => ({ [HEADER_NODE_ADMIN_TOKEN]: TOKEN })[name],
+    };
+    const ctx = { switchToHttp: () => ({ getRequest: () => req }) } as unknown as ExecutionContext;
+    const envelope = envelopeOf(() => guard().canActivate(ctx));
+    expect(envelope.statusCode).toBe(HttpStatus.FORBIDDEN);
+    expect(envelope.errorCode).toBe("NODE_ADMIN_PEER_UNKNOWN");
+  });
+});
+
+describe("NodeAdminGuard IPv4-mapped proxy CIDRs (CC-49 round-6 LOW-3)", () => {
+  const proxied = (cidrs: string[]) =>
+    guard({
+      nodeAdminNetworkMode: "proxied",
+      nodeAdminAllowProxied: true,
+      nodeAdminTrustedProxyCidrs: cidrs,
+      nodeAdminTrustedProxyHops: 1,
+    });
+
+  it("refuses to boot on an IPv6 range that can only ever match nothing", () => {
+    // A dual-stack listener reports `::ffff:127.0.0.1`, which normalises to the 4-byte IPv4
+    // form — so these ranges boot fine and then 403 every single request with no explanation.
+    for (const cidr of ["::ffff:0:0/96", "::/0", "::ffff:0:0/64"]) {
+      expect(() => proxied([cidr])).toThrow(/IPv4-mapped/);
+    }
+  });
+
+  it("still accepts real IPv6 proxy ranges and the IPv4 form the message points at", () => {
+    expect(() => proxied(["2001:db8::/32"])).not.toThrow();
+    expect(() => proxied(["::1/128"])).not.toThrow();
+    expect(() => proxied(["127.0.0.0/8"])).not.toThrow();
+    // `::ffff:127.0.0.1` is parsed as the IPv4 literal it is, so it is a usable declaration.
+    expect(() => proxied(["::ffff:127.0.0.1"])).not.toThrow();
   });
 });

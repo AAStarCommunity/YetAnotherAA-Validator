@@ -119,13 +119,17 @@ export default () => {
     nodeAdminEnabled: process.env.NODE_ADMIN_ENABLED === "true",
     nodeAdminToken: process.env.NODE_ADMIN_TOKEN || "",
     // How this node is REACHED — declared by the operator, never inferred (CC-49 round-5
-    // MEDIUM-1). "direct" (default): the listener is the boundary, so a loopback socket peer
-    // is a usable source restriction. "proxied": a reverse proxy / tunnel fronts the node
-    // (dvt1/2/3 -> cloudflared), so EVERY public request also arrives from 127.0.0.1 — the
-    // loopback check is then meaningless and is NOT consulted, the admin token is the only
-    // network barrier, and the endpoints stay closed until NODE_ADMIN_ALLOW_PROXIED=true
-    // acknowledges that. An unrecognised value is a boot failure (see NodeAdminGuard).
-    nodeAdminNetworkMode: process.env.NODE_ADMIN_NETWORK_MODE || "direct",
+    // MEDIUM-1), and MANDATORY whenever the endpoints are enabled (round-6 MEDIUM-1): there is
+    // deliberately no default here, because defaulting to "direct" made an operator who
+    // declared nothing get a node asserting "loopback callers only" in its boot banner — false,
+    // and unwarned, behind the cloudflared tunnel this repo documents.
+    // "direct": the listener is the boundary, so a loopback socket peer is a usable source
+    // restriction. "proxied": a reverse proxy / tunnel fronts the node (dvt1/2/3 -> cloudflared),
+    // so EVERY public request also arrives from 127.0.0.1 — the loopback check is then
+    // meaningless and is NOT consulted, the admin token is the only network barrier, and the
+    // endpoints stay closed until NODE_ADMIN_ALLOW_PROXIED=true acknowledges that. A missing or
+    // unrecognised value is a boot failure while enabled (see NodeAdminPolicy).
+    nodeAdminNetworkMode: process.env.NODE_ADMIN_NETWORK_MODE || "",
     nodeAdminAllowProxied: process.env.NODE_ADMIN_ALLOW_PROXIED === "true",
     // Only meaningful in "direct" mode: accept non-loopback socket peers.
     nodeAdminAllowRemote: process.env.NODE_ADMIN_ALLOW_REMOTE === "true",

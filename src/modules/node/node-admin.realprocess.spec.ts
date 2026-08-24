@@ -1,7 +1,7 @@
 import { jest } from "@jest/globals";
 import { ChildProcess, execFileSync, spawn } from "child_process";
 import { createServer, Server } from "http";
-import { request as httpRequest } from "http";
+import { Agent, request as httpRequest } from "http";
 import { existsSync, mkdtempSync, rmSync, statSync, readdirSync } from "fs";
 import { networkInterfaces } from "os";
 import { AddressInfo, connect, createServer as createTcpServer, Server as TcpServer } from "net";
@@ -95,6 +95,61 @@ function send(
   });
 }
 
+/** Resident set size of a live pid, in KiB, straight from the OS. */
+function rssKib(pid: number): number {
+  const out = execFileSync("ps", ["-o", "rss=", "-p", String(pid)]).toString().trim();
+  const value = Number(out);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`could not read RSS of ${pid}`);
+  return value;
+}
+
+/**
+ * Fire `count` anonymous requests carrying DISTINCT forged `X-Forwarded-For` values, over
+ * keep-alive connections, and report how long the batch took plus the status histogram.
+ * This is the round-6 MEDIUM-3 attack: one host, one socket, an unbounded supply of bucket keys.
+ */
+async function forgedForwardedBatch(
+  port: number,
+  offset: number,
+  count: number,
+  agent: Agent
+): Promise<{ ms: number; statuses: Record<number, number> }> {
+  const statuses: Record<number, number> = {};
+  const started = process.hrtime.bigint();
+  const CONCURRENCY = 32;
+  let next = offset;
+  const end = offset + count;
+  await Promise.all(
+    Array.from({ length: CONCURRENCY }, async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= end) return;
+        const forged = `10.${(i >> 16) & 0xff}.${(i >> 8) & 0xff}.${i & 0xff}`;
+        const status = await new Promise<number>((done, fail) => {
+          const req = httpRequest(
+            {
+              host: "127.0.0.1",
+              port,
+              method: "POST",
+              path: "/node/register",
+              headers: { "X-Forwarded-For": forged },
+              agent,
+            },
+            res => {
+              res.resume();
+              res.on("end", () => done(res.statusCode ?? 0));
+            }
+          );
+          req.on("error", fail);
+          req.end();
+        });
+        statuses[status] = (statuses[status] ?? 0) + 1;
+      }
+    })
+  );
+  return { ms: Number(process.hrtime.bigint() - started) / 1e6, statuses };
+}
+
 /** A provider that fails every call the way a revoked/rate-limited API key does. */
 function fakeRpc(): Promise<{ server: Server; port: number }> {
   return new Promise(resolveRpc => {
@@ -126,6 +181,8 @@ function newestMtime(dir: string): number {
 
 interface Node {
   port: number;
+  /** OS pid of the spawned node — the round-6 MEDIUM-3 test reads its RSS through `ps`. */
+  pid: number;
   log: () => string;
   stop: () => void;
 }
@@ -174,6 +231,7 @@ async function startNode(env: Record<string, string>, rpcPort: number): Promise<
 
   return {
     port,
+    pid: child.pid ?? -1,
     log: () => log,
     stop: () => {
       stopChild(child);
@@ -340,6 +398,7 @@ describe("real process: node-admin gate when enabled (CC-49 round-4 HIGH-1)", ()
       {
         NODE_ADMIN_ENABLED: "true",
         NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "direct",
         NODE_ADMIN_RATE_MAX: "100",
       },
       rpc.port
@@ -406,7 +465,12 @@ describe("real process: node-admin throttle (CC-49 round-4 HIGH-1)", () => {
 
   beforeAll(async () => {
     node = await startNode(
-      { NODE_ADMIN_ENABLED: "true", NODE_ADMIN_TOKEN: ADMIN_TOKEN, NODE_ADMIN_RATE_MAX: "2" },
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "direct",
+        NODE_ADMIN_RATE_MAX: "2",
+      },
       rpc.port
     );
   });
@@ -550,6 +614,29 @@ describe("real process: proxied network mode (CC-49 round-5 MEDIUM-1)", () => {
     expect(throughProxy.json).toMatchObject({ errorCode: "NODE_REGISTER_UPSTREAM_FAILED" });
   });
 
+  it("refuses to boot when the mode is MISSING, not just when it is wrong (round-6 MEDIUM-1)", async () => {
+    // The round-5 hole reachable by doing nothing at all: NODE_ADMIN_ENABLED=true with no mode
+    // ran in `direct`, printed "loopback callers only" three times, and reached the handler
+    // through a same-host proxy anyway. Declaring the topology is now part of enabling it.
+    const undeclared = await startNodeExpectingExit(
+      { NODE_ADMIN_ENABLED: "true", NODE_ADMIN_TOKEN: ADMIN_TOKEN },
+      rpc.port
+    );
+    expect(undeclared.code).not.toBe(0);
+    expect(undeclared.log).toMatch(/NODE_ADMIN_NETWORK_MODE must be declared/);
+    // …and it never claimed a source restriction on the way out.
+    expect(undeclared.log).not.toMatch(/loopback callers only/);
+
+    // Leaving the endpoints DISABLED still needs no declaration — dvt1/2/3 are untouched.
+    const disabled = await startNode({ NODE_ADMIN_ENABLED: "false" }, rpc.port);
+    try {
+      const res = await send(disabled.port, "POST", "/node/register");
+      expect(res.json).toMatchObject({ errorCode: "NODE_ADMIN_DISABLED" });
+    } finally {
+      disabled.stop();
+    }
+  });
+
   it("refuses to boot on an undeclared mode or a half-declared proxy topology", async () => {
     const bad = await startNodeExpectingExit(
       {
@@ -637,6 +724,233 @@ describe("real process: an anonymous flood cannot lock the operator out (CC-49 r
     expect(node.log()).not.toContain(ADMIN_TOKEN);
     expect(node.log()).not.toContain("guess");
     expectNoCredential(node.log(), "node log (flood run)");
+  });
+});
+
+describe("real process: ONE throttle ledger for every guarded route (CC-49 round-6 MEDIUM-2)", () => {
+  // The finding: `@UseGuards(NodeAdminGuard)` makes Nest build one guard instance per MODULE,
+  // so /node, /dashboard and /gossip each had their own copy of every ledger — the "global"
+  // anonymous budget was really 3x the configured value, and the boot banner printed 3 times.
+  // Every assertion below crosses a module boundary, which is precisely what the 623 in-process
+  // tests could not see: they all exercised a single route.
+  const ROUTES: Array<[string, string]> = [
+    ["POST", "/dashboard/nodes"],
+    ["POST", "/node/register"],
+    ["POST", "/gossip/data"],
+  ];
+
+  it("announces the enabled posture exactly ONCE per process", async () => {
+    const node = await startNode(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "direct",
+      },
+      rpc.port
+    );
+    try {
+      const banners = node.log().match(/Node admin HTTP endpoints are ENABLED/g) ?? [];
+      // Was 3 — one per module-scoped guard instance, which is what gave the ledgers away.
+      expect(banners).toHaveLength(1);
+    } finally {
+      node.stop();
+    }
+  });
+
+  it("spends ONE global anonymous budget across /dashboard, /node and /gossip", async () => {
+    const node = await startNode(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "proxied",
+        NODE_ADMIN_ALLOW_PROXIED: "true",
+        NODE_ADMIN_TRUSTED_PROXY_CIDRS: "127.0.0.0/8",
+        NODE_ADMIN_TRUSTED_PROXY_HOPS: "1",
+        NODE_ADMIN_RATE_MAX: "100", // per-source is generous: the GLOBAL ledger is the bound
+        NODE_ADMIN_ANON_GLOBAL_RATE_MAX: "4",
+      },
+      rpc.port
+    );
+    try {
+      // Four distinct client addresses, spread over all three modules: the global budget is
+      // spent by the fourth wherever it was spent, and the fifth is 429 on a FOURTH route.
+      const statuses: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        const [method, path] = ROUTES[i % ROUTES.length];
+        const res = await send(node.port, method, path, { "X-Forwarded-For": `203.0.113.${i}` });
+        statuses.push(res.status);
+      }
+      expect(statuses).toEqual([401, 401, 401, 401]);
+
+      for (const [method, path] of ROUTES) {
+        const res = await send(node.port, method, path, { "X-Forwarded-For": "198.51.100.9" });
+        // Before the fix: 401 on the two modules that had not spent their own copy yet.
+        expect([path, res.status]).toEqual([path, 429]);
+        expect([path, res.json?.errorCode]).toEqual([path, "NODE_ADMIN_RATE_LIMITED"]);
+      }
+    } finally {
+      node.stop();
+    }
+  });
+
+  it("spends ONE per-source and ONE operator budget across the same three modules", async () => {
+    const node = await startNode(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "proxied",
+        NODE_ADMIN_ALLOW_PROXIED: "true",
+        NODE_ADMIN_TRUSTED_PROXY_CIDRS: "127.0.0.0/8",
+        NODE_ADMIN_TRUSTED_PROXY_HOPS: "1",
+        NODE_ADMIN_RATE_MAX: "2",
+        NODE_ADMIN_ANON_GLOBAL_RATE_MAX: "1000", // per-source is the bound here
+        NODE_ADMIN_OPERATOR_RATE_MAX: "2",
+      },
+      rpc.port
+    );
+    try {
+      const client = { "X-Forwarded-For": "203.0.113.50" };
+      // Per-source: two attempts on /dashboard, and the SAME source is out of budget on /node.
+      expect((await send(node.port, "POST", "/dashboard/nodes", client)).status).toBe(401);
+      expect((await send(node.port, "POST", "/gossip/data", client)).status).toBe(401);
+      const spent = await send(node.port, "POST", "/node/register", client);
+      expect(spent.status).toBe(429);
+      expect(spent.json).toMatchObject({ errorCode: "NODE_ADMIN_RATE_LIMITED" });
+      // A different client still has its own per-source budget (the ledger is shared, not global).
+      expect(
+        (await send(node.port, "POST", "/node/register", { "X-Forwarded-For": "203.0.113.51" }))
+          .status
+      ).toBe(401);
+
+      // Operator: two authenticated requests across two modules, third is 429 on a third module.
+      const auth = { "X-Node-Admin-Token": ADMIN_TOKEN, "X-Forwarded-For": "203.0.113.60" };
+      expect((await send(node.port, "POST", "/node/register", auth)).status).toBe(502);
+      expect((await send(node.port, "POST", "/gossip/data", auth)).status).not.toBe(429);
+      const operatorLimited = await send(node.port, "POST", "/dashboard/nodes", auth);
+      expect(operatorLimited.status).toBe(429);
+      expect(operatorLimited.json).toMatchObject({ errorCode: "NODE_ADMIN_RATE_LIMITED" });
+    } finally {
+      node.stop();
+    }
+  });
+});
+
+describe("real process: a forged-header flood is bounded in memory AND time (CC-49 round-6 MEDIUM-3)", () => {
+  // The finding: the throttle bounded the status code, not the work behind it. With a declared
+  // trusted proxy the bucket key comes from X-Forwarded-For, so 25k forged values from ONE host
+  // pushed the node's ledger (and the O(n) sweep it ran on every insert past 10k keys) without
+  // limit — on the process that also runs the signing hot path. All of it while already 429ing.
+  //
+  // The measurement runs the SAME 25k flood against two real processes: the gated node, and a
+  // control with NODE_ADMIN_ENABLED unset, where the guard answers 403 before any bookkeeping
+  // at all. The control is what "this flood costs nothing but HTTP" looks like on this machine,
+  // so the assertions are about the DELTA the gate adds, not about an absolute RSS number that
+  // is really V8 heap growth under load (a fixed bar there measures the runtime, not this code).
+  const agent = new Agent({ keepAlive: true, maxSockets: 32 });
+  const FLOOD = { warmup: 200, batch: 5_000, middle: 15_000 };
+
+  interface Run {
+    grewMib: number;
+    firstMs: number;
+    lastMs: number;
+    firstStatuses: Record<number, number>;
+    lastStatuses: Record<number, number>;
+  }
+
+  /** 25k distinct forged bucket keys, with RSS sampled around the run. */
+  async function flood(node: Node): Promise<Run> {
+    await forgedForwardedBatch(node.port, 0, FLOOD.warmup, agent); // running, not cold
+    const baseline = rssKib(node.pid);
+    const first = await forgedForwardedBatch(node.port, 1_000, FLOOD.batch, agent);
+    await forgedForwardedBatch(node.port, 10_000, FLOOD.middle, agent);
+    const last = await forgedForwardedBatch(node.port, 40_000, FLOOD.batch, agent);
+    return {
+      grewMib: (rssKib(node.pid) - baseline) / 1024,
+      firstMs: first.ms,
+      lastMs: last.ms,
+      firstStatuses: first.statuses,
+      lastStatuses: last.statuses,
+    };
+  }
+
+  let gated: Node;
+  let control: Node;
+  let gatedRun: Run;
+  let controlRun: Run;
+
+  beforeAll(async () => {
+    gated = await startNode(
+      {
+        NODE_ADMIN_ENABLED: "true",
+        NODE_ADMIN_TOKEN: ADMIN_TOKEN,
+        NODE_ADMIN_NETWORK_MODE: "proxied",
+        NODE_ADMIN_ALLOW_PROXIED: "true",
+        // The documented "my proxy forwards the client address" posture. The proxy is supposed
+        // to strip a client-supplied header; the node cannot verify that it did, which is what
+        // makes the bucket key attacker-controlled in the first place.
+        NODE_ADMIN_TRUSTED_PROXY_CIDRS: "127.0.0.0/8",
+        NODE_ADMIN_TRUSTED_PROXY_HOPS: "1",
+        NODE_ADMIN_RATE_MAX: "10",
+        NODE_ADMIN_ANON_GLOBAL_RATE_MAX: "60",
+        NODE_ADMIN_OPERATOR_RATE_MAX: "120",
+      },
+      rpc.port
+    );
+    control = await startNode({}, rpc.port); // NODE_ADMIN_ENABLED unset: 403 before any state
+    gatedRun = await flood(gated);
+    controlRun = await flood(control);
+  });
+  afterAll(() => {
+    agent.destroy();
+    gated?.stop();
+    control?.stop();
+  });
+
+  it("refuses all 25,000 without allocating: no more memory than the stateless control", () => {
+    // Everything past the global anonymous budget is 429 — and costs the node a bounded amount,
+    // because the global ledger is charged FIRST and short-circuits, so not one of these
+    // allocates or refreshes a per-source entry.
+    expect(Object.keys(gatedRun.firstStatuses)).toEqual(["429"]);
+    expect(Object.keys(gatedRun.lastStatuses)).toEqual(["429"]);
+    expect(Object.keys(controlRun.firstStatuses)).toEqual(["403"]);
+
+    // The gate's own footprint under the flood, over a control that keeps nothing at all. The
+    // ledger is hard-capped at 1024 keys (see node-admin.guard.spec.ts), so this is small and
+    // does not grow with how many headers the attacker forges.
+    expect(gatedRun.grewMib).toBeLessThan(controlRun.grewMib + 24);
+  });
+
+  it("does not get slower as the number of forged keys grows", () => {
+    // Was 3.4x across this shape, from the full-table sweep on every insert past 10k keys.
+    // Measured against the run's own first batch, so a slow machine cannot fail it.
+    expect(gatedRun.lastMs).toBeLessThan(Math.max(gatedRun.firstMs * 2.5, 1_000));
+    // …and no worse than the control's own drift over the identical flood.
+    expect(gatedRun.lastMs / gatedRun.firstMs).toBeLessThan(
+      Math.max((controlRun.lastMs / controlRun.firstMs) * 2, 2.5)
+    );
+  });
+
+  it("keeps the rejection log bounded too — one line per window, not one per request", () => {
+    // 25k refused requests must not become 25k log lines: that is the same unbounded
+    // per-request cost, moved to the operator's disk.
+    // One window's worth of flood => a handful of lines, not 25,000. (The suppressed count is
+    // reported on the next line the ledger emits, i.e. in the following window.)
+    const lines = gated.log().match(/brute-force budget spent/g) ?? [];
+    expect(lines.length).toBeLessThan(10);
+  });
+
+  it("leaves the legitimate operator completely unaffected by that flood", async () => {
+    // Separate ledger, never charged by any of the 25k anonymous attempts above.
+    for (let i = 0; i < 3; i++) {
+      const res = await send(gated.port, "POST", "/node/register", {
+        "X-Node-Admin-Token": ADMIN_TOKEN,
+        "X-Forwarded-For": "203.0.113.200",
+      });
+      expect([i, res.status]).toEqual([i, 502]); // reached the handler; the fake RPC refused
+      expect([i, res.json?.errorCode]).toEqual([i, "NODE_REGISTER_UPSTREAM_FAILED"]);
+    }
+    expect(gated.log()).not.toContain(ADMIN_TOKEN);
+    expectNoCredential(gated.log(), "node log (forged-header flood run)");
   });
 });
 

@@ -98,3 +98,10 @@ N<30 走 whole-set BFT 2/3，没有抽样界。cap 86 控 calldata/gas。
   token 是唯一网络屏障」，且在 `NODE_ADMIN_ALLOW_PROXIED=true`
   之前端点保持关闭。限流分两本账（round-5
   MEDIUM-2）：匿名/错 token 走 per-source + 全局爆破桶，正确 token 经恒时校验后走独立 operator 桶，匿名洪泛无法把持正确 token 的 operator 锁死。
+  round-6 三点补充：① `NODE_ADMIN_ENABLED=true` 时
+  `NODE_ADMIN_NETWORK_MODE` 为**必填**，缺失即拒绝启动（不再默认
+  `direct`，避免节点替 operator 断言「只收 loopback」）；② 三本账是**应用级单例**，
+  `/node`、`/dashboard`、`/gossip` 共用同一套预算（此前按 Nest module 一分为三，实际是配置值的
+  3 倍）；③ 全局匿名桶**先扣且扣爆即短路**，不再为新 source 建账，加上每本账 1024 键的硬容量与
+  O(1) 过期回收，25k 伪造 `X-Forwarded-For` 的内存/延迟均有界。声明可信代理后
+  HTTP 面**没有本机逃生通道**（本机直连无 XFF 一律 403），代理故障时请用 CLI。
