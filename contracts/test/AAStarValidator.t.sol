@@ -8,6 +8,25 @@ import "../src/AAStarValidator.sol";
  * @title AAStarValidator Unit Tests
  * @dev Comprehensive test suite for AA* BLS signature validator
  */
+/// @dev Judge for the `_unbindPubkey` ownership guard (pr-daemon #241 Low). A subclass that skips binding
+///      for SOME registrations is the distinguishing input: the skipped node holds no lock, so revoking it
+///      must not release the lock a DIFFERENT node legitimately holds over the same key. `MockGasValidator`
+///      in AAStarValidatorNScanGas.t.sol is a real "skips binding" subclass — it is uniformly skip-all so it
+///      is harmless, but it shows the shape is reachable, and without this test the guard could be deleted
+///      by any later "this if looks redundant" refactor with the whole suite still green.
+contract MixedBindValidator is AAStarValidator {
+    bool public skipBind;
+
+    function setSkipBind(bool v) external {
+        skipBind = v;
+    }
+
+    function _bindPubkey(bytes memory publicKey, bytes32 nodeId) internal override {
+        if (skipBind) return; // this registration claims no lock
+        super._bindPubkey(publicKey, nodeId);
+    }
+}
+
 contract AAStarValidatorTest is Test {
     AAStarValidator public validator;
 
@@ -479,6 +498,40 @@ contract AAStarValidatorTest is Test {
         assertEq(validator.registeredKeys(NODE_ID_1), PARTICIPANT_KEY_3, "Key should be updated");
 
         assertTrue(true, "Full node-based workflow completed successfully");
+    }
+
+    // =============================================================
+    //        _unbindPubkey OWNERSHIP GUARD (pr-daemon #241 Low)
+    // =============================================================
+
+    /// @dev Revoking a node that holds NO lock must not free the lock another node holds over the same key.
+    ///      Without the `nodeByPubkey[pkh] == nodeId` guard in _unbindPubkey this deletes A's lock, after
+    ///      which the key is registerable again and the "k distinct nodeIds => k distinct keys" invariant
+    ///      that the committee floor rests on is gone. Probe verified both ways: it fails with the guard
+    ///      removed and passes with it in place.
+    function test_UnbindPubkey_DoesNotFreeAnotherNodesLock() public {
+        MixedBindValidator v = new MixedBindValidator();
+        bytes32 nodeA = keccak256("mixed-A");
+        bytes32 nodeB = keccak256("mixed-B");
+        bytes32 pkh = keccak256(PARTICIPANT_KEY_1);
+
+        // A registers normally and takes the lock.
+        v.registerPublicKey(nodeA, PARTICIPANT_KEY_1);
+        assertEq(v.nodeByPubkey(pkh), nodeA, "A must hold the lock");
+
+        // B registers the SAME key with binding skipped, so B claims no lock (A still holds it).
+        v.setSkipBind(true);
+        v.registerPublicKey(nodeB, PARTICIPANT_KEY_1);
+        assertEq(v.nodeByPubkey(pkh), nodeA, "the lock must still be A's after B's unbound registration");
+
+        // Revoking B must not touch a lock B never held.
+        v.revokePublicKey(nodeB);
+        assertEq(v.nodeByPubkey(pkh), nodeA, "revoking B must not free A's lock");
+
+        // And the key must still be unavailable to a third node while A holds it.
+        v.setSkipBind(false);
+        vm.expectRevert(bytes("pubkey already registered"));
+        v.registerPublicKey(keccak256("mixed-C"), PARTICIPANT_KEY_1);
     }
 
     // =============================================================
