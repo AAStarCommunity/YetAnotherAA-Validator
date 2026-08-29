@@ -1,5 +1,9 @@
 import { ethers } from "ethers";
-import { domainSeparator, executeSlashMessageHash, signersCommitment } from "./bls-consensus-domain.js";
+import {
+  domainSeparator,
+  executeSlashMessageHash,
+  signersCommitment,
+} from "./bls-consensus-domain.js";
 
 // The plain-ESM encoding the cc89-cosign.mjs script imports — pinned equal to the TS helper below.
 // Loaded via a variable-path dynamic import so tsc does not pull a file outside `src` into the

@@ -122,7 +122,14 @@ describe("slash-consensus primitives (SP 4.11 BLSAggregator)", () => {
   it("the queue and execute preimages are distinct (path-tag separation holds)", () => {
     const epoch = 1_700_000;
     const queue = buildQueueMessageHash(DOMAIN, OPERATOR, SlashLevel.MINOR, epoch);
-    const exec = buildExecuteMessageHash(DOMAIN, 1n, OPERATOR, SlashLevel.MINOR, epoch, EVIDENCE_HASH);
+    const exec = buildExecuteMessageHash(
+      DOMAIN,
+      1n,
+      OPERATOR,
+      SlashLevel.MINOR,
+      epoch,
+      EVIDENCE_HASH
+    );
     expect(queue).not.toBe(exec);
   });
 

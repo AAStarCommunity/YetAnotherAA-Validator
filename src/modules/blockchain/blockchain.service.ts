@@ -1250,7 +1250,11 @@ export class BlockchainService {
    * Delegates to the shared `attestDomainAgainstAggregator`, which THROWS (fail-closed) on a
    * missing/zero or mismatched Registry, or a `domainSeparator()` that differs from the local one.
    */
-  async attestBlsDomain(blsAggregatorAddress: string, chainId: bigint, registry: string): Promise<void> {
+  async attestBlsDomain(
+    blsAggregatorAddress: string,
+    chainId: bigint,
+    registry: string
+  ): Promise<void> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
