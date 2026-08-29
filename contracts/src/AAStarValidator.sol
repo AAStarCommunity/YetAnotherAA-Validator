@@ -65,6 +65,15 @@ contract AAStarValidator is IAAStarAlgorithm {
     ///      requireStake is turned on (migration boundary — no permanent bypass).
     mapping(bytes32 => bool) public isBootstrap;
 
+    /// @dev Reverse pubkey lock: keccak256(publicKey) → the single active nodeId holding it (0 = free).
+    ///      Enforces one active nodeId per public key across ALL registration paths, so "k distinct
+    ///      nodeIds" in a committee aggregate ⟹ k distinct keys. The staked path already binds
+    ///      nodeId = keccak(pubkey); this closes the BOOTSTRAP path where nodeId ↔ pubkey are unbound
+    ///      (owner could otherwise register one key under two nodeIds and clear a 2-of-3 with one key).
+    ///      Byte-level: the bootstrap path does not curve-validate, so a non-canonical re-encoding of the
+    ///      same point is an owner-misconfig residual (the staked path's PoP + subgroup check moots it there).
+    mapping(bytes32 => bytes32) public nodeByPubkey;
+
     /// @dev SuperPaymaster Registry (stake source of truth). Owner/Safe-settable.
     address public registry;
     /// @dev When true, registerPublicKey is permissionless-but-staked and bootstrap nodes
@@ -839,6 +848,7 @@ contract AAStarValidator is IAAStarAlgorithm {
 
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
+        _bindPubkey(publicKey, nodeId);
         registeredNodes.push(nodeId);
         _onNodeActivated(nodeId);
 
@@ -881,6 +891,9 @@ contract AAStarValidator is IAAStarAlgorithm {
         operatorNode[msg.sender] = nodeId;
         registeredKeys[nodeId] = publicKey;
         isRegistered[nodeId] = true;
+        // nodeId == keccak(publicKey) here, so isRegistered already rejects a dup key; bind anyway so
+        // bootstrap/staked share one uniqueness invariant and deactivate is uniform.
+        _bindPubkey(publicKey, nodeId);
         registeredNodes.push(nodeId);
         _onNodeActivated(nodeId);
 
@@ -941,6 +954,7 @@ contract AAStarValidator is IAAStarAlgorithm {
     function _deactivate(bytes32 nodeId) internal virtual {
         address op = nodeOperator[nodeId];
         isRegistered[nodeId] = false;
+        _unbindPubkey(nodeId); // free the key BEFORE registeredKeys is cleared
         delete registeredKeys[nodeId];
         delete nodeOperator[nodeId];
         delete isBootstrap[nodeId];
@@ -956,19 +970,49 @@ contract AAStarValidator is IAAStarAlgorithm {
     function _onNodeActivated(bytes32 nodeId) internal virtual {}
     function _onNodeDeactivated(bytes32 nodeId) internal virtual {}
 
+    /// @dev Called when an eligibility-affecting config (registry / requireStake / minStake) changes.
+    ///      No-op in the base; a committee subclass overrides it to invalidate frozen snapshots pinned
+    ///      under the old eligibility policy (configVersion bump). Without it, changing minStake or the
+    ///      registry could silently re-qualify/dis-qualify nodes already frozen into an epoch's committee.
+    function _onEligibilityConfigChanged() internal virtual {}
+
+    /// @dev Reverse pubkey lock: claim keccak256(publicKey) for `nodeId`, reverting if the key is already
+    ///      held by a live node (this is the "k distinct nodeIds ⟹ k distinct keys" guarantee). Called on
+    ///      every registration path. `virtual` only so a gas-benchmark mock can reuse one real curve point
+    ///      across many nodes — production MUST NOT override it.
+    function _bindPubkey(bytes memory publicKey, bytes32 nodeId) internal virtual {
+        bytes32 pkh = keccak256(publicKey);
+        require(nodeByPubkey[pkh] == bytes32(0), "pubkey already registered");
+        nodeByPubkey[pkh] = nodeId;
+    }
+
+    /// @dev Release the reverse lock for `nodeId`'s CURRENT key. Must be called BEFORE registeredKeys is
+    ///      cleared (it reads the key to compute the hash). No-op-safe if the key was never bound.
+    /// @dev Releases ONLY a lock this node actually holds. The bind/unbind pairing makes
+    ///      `nodeByPubkey[pkh] != nodeId` unreachable for the production paths, but deleting by hash alone
+    ///      would mean any future subclass that skipped binding for one registration could, on revoking
+    ///      that node, free ANOTHER node's lock and re-open duplicate keys (Codex round-1 Low).
+    function _unbindPubkey(bytes32 nodeId) internal virtual {
+        bytes32 pkh = keccak256(registeredKeys[nodeId]);
+        if (nodeByPubkey[pkh] == nodeId) delete nodeByPubkey[pkh];
+    }
+
     // --- Owner/Safe governance (transfer owner to a Gnosis Safe after init) --------
     function setRegistry(address _registry) external onlyOwner {
         registry = _registry;
+        _onEligibilityConfigChanged(); // registry change re-defines "staked" → invalidate frozen snapshots
         emit RegistrySet(_registry);
     }
 
     function setRequireStake(bool _v) external onlyOwner {
         requireStake = _v;
+        _onEligibilityConfigChanged(); // toggling stake-gating changes the eligible set → invalidate snapshots
         emit RequireStakeSet(_v);
     }
 
     function setMinStake(uint256 _v) external onlyOwner {
         minStake = _v;
+        _onEligibilityConfigChanged(); // min-stake change re-qualifies/dis-qualifies nodes → invalidate snapshots
         emit MinStakeSet(_v);
     }
 
@@ -991,7 +1035,11 @@ contract AAStarValidator is IAAStarAlgorithm {
         require(!_isInfinity(newPublicKey), "pubkey is infinity");
 
         bytes memory oldKey = registeredKeys[nodeId];
+        // Free the old key and claim the new one via the shared reverse-lock seam so it never drifts from
+        // registeredKeys[] (Codex round-1 #7). A no-op re-set of the same key works: unbind then re-bind.
+        _unbindPubkey(nodeId); // reads the OLD key (registeredKeys not yet overwritten)
         registeredKeys[nodeId] = newPublicKey;
+        _bindPubkey(newPublicKey, nodeId);
 
         emit PublicKeyUpdated(nodeId, oldKey, newPublicKey);
     }
@@ -1011,6 +1059,7 @@ contract AAStarValidator is IAAStarAlgorithm {
         if (op != address(0) && operatorNode[op] == nodeId) delete operatorNode[op];
         delete nodeOperator[nodeId];
         delete isBootstrap[nodeId];
+        _unbindPubkey(nodeId); // free the key BEFORE registeredKeys is cleared
         delete registeredKeys[nodeId];
         isRegistered[nodeId] = false;
         _onNodeDeactivated(nodeId);
@@ -1052,6 +1101,8 @@ contract AAStarValidator is IAAStarAlgorithm {
             isBootstrap[nodeIds[i]] = true;
             registeredKeys[nodeIds[i]] = publicKeys[i];
             isRegistered[nodeIds[i]] = true;
+            // Bind inside the loop, so a duplicate key WITHIN this batch is caught on its 2nd occurrence.
+            _bindPubkey(publicKeys[i], nodeIds[i]);
             registeredNodes.push(nodeIds[i]);
             _onNodeActivated(nodeIds[i]);
 
