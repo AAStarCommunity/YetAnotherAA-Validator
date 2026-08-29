@@ -120,10 +120,11 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
     expect(record.claimedSigners).toEqual([S1, S2, S3]);
     expect(record.commitment).toBe(ON_CHAIN_COMMITMENT);
 
-    // C) ASSEMBLER — accuse two of the colluding signers.
-    const assembled = assembleOverIssueFraudProof(record, TOKEN, [S1, S3]);
+    // C) ASSEMBLER — accuse the exact committed signer set. A subset would let a
+    // front-runner consume the one-shot fraudProofId and immunise the omitted signers.
+    const assembled = assembleOverIssueFraudProof(record, TOKEN);
     expect(assembled.fraudProofId).toBe(deriveFraudProofId(PID));
-    expect(assembled.guiltyGuardians).toEqual([S1, S3]);
+    expect(assembled.guiltyGuardians).toEqual([S1, S2, S3]);
 
     // LOAD-BEARING E2E INVARIANT — decode the assembled fraudProof and independently recompute the
     // commitment the on-chain verifier will derive from it; it MUST equal the stored A' commitment.
@@ -147,8 +148,8 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
       [...claimed].map((a: string) => ethers.getAddress(a))
     );
     expect(recomputed).toBe(ON_CHAIN_COMMITMENT); // ⇒ the verifier's commitment check passes
-    // guilty ⊆ claimedSigners (the verifier's innocent-protection check).
-    for (const g of assembled.guiltyGuardians) expect(record.claimedSigners).toContain(g);
+    // SET-EXACT is the verifier's one-shot-id front-run protection.
+    expect(assembled.guiltyGuardians).toEqual(record.claimedSigners);
   });
 
   it("refuses the chain when the disputed token does not bind (token-swap defense)", async () => {
@@ -162,6 +163,6 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
       EXEC_BLOCK
     );
     const wrongToken = ethers.getAddress("0x000000000000000000000000000000000000c0de");
-    expect(() => assembleOverIssueFraudProof(record, wrongToken, [S1])).toThrow(/does not bind/);
+    expect(() => assembleOverIssueFraudProof(record, wrongToken)).toThrow(/does not bind/);
   });
 });

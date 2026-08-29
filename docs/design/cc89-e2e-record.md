@@ -1,5 +1,11 @@
 # CC-89 — over-issue guardian-collusion slash: testnet E2E record (for RepCredit paper)
 
+> **Frozen historical record — not CC-115 route-B evidence.** It predates the SP
+> 4.11 domain-bound verifier and queue/exit-freeze lifecycle. Preserve its
+> receipts for audit, but do not use it to support the RepCredit v16 successor
+> deployment, exact-set, exit-freeze, or production-security claims. Route B
+> requires a new reviewed successor deployment and evidence generation.
+
 > Authoritative record of the CC-89 stage-2 mechanism and its **end-to-end
 > Sepolia run**, for the RepCredit paper (IET Blockchain). Everything below is
 > on-chain-verifiable. Companion: `guardian-collusion-slash.md` (threat model +

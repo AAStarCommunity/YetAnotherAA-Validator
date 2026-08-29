@@ -1,5 +1,12 @@
 # Guardian-Collusion Slashing (CC-89, Protocol B)
 
+> **Historical Stage-0 design.** For CC-115 route B, the current contract seam
+> is `verify(bytes32,uint256,address[],bytes)`, the accused set must equal the
+> committed signer set, and SP 4.11 queues a verifier-approved case before
+> executing it. Use `cc89-e2e-runbook.md` for the current integration path;
+> three-parameter, subset, owner/quorum and direct-execute passages below are
+> retained only to explain the evolution of the threat model.
+
 > Stage-0 design doc. Companion to
 > [`../AUDIT_SLASH_MODEL.md`](../AUDIT_SLASH_MODEL.md), which covers the DVT
 > node auditing **operators**. This doc covers the inverse: slashing the

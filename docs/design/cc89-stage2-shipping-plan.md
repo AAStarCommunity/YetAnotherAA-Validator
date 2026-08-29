@@ -1,5 +1,11 @@
 # CC-89 Stage-2 Shipping Plan — over-issue guardian-collusion slash (DVT half)
 
+> **Historical plan — superseded for route B.** CC-115 now owns the release
+> gate. The current implementation uses the SP 4.11 four-parameter verifier,
+> exact-set attribution, and queue-then-execute lifecycle documented in
+> `cc89-e2e-runbook.md`. Subset and direct-execute statements below record the
+> earlier design and must not be used as current integration instructions.
+
 > **Scope**: testnet-E2E only (no mainnet activation). Ship every remaining DVT
 > dev task agreed on CC-89, each as its own reviewed PR, then run the DVT-side
 > E2E, then hand off to a joint testnet run with SuperPaymaster (SP). This doc
