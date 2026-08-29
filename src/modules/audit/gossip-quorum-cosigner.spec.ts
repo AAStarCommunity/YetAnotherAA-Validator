@@ -71,8 +71,14 @@ function validatorAddr(slot: number): string {
  * now looks its slot up via getRegisteredSlot(operatorEoa), not a BLS-key scan). Omit `ownSlot` to
  * simulate a node with no wallet / no registered slot.
  */
-function makeBlockchain(slotCount = 3, ownSlot?: number) {
+function makeBlockchain(slotCount = 3, ownSlot?: number, attestThrows = false) {
   return {
+    // Fail-closed domain attestation (fix 1): the real cosigner refuses to co-sign until this
+    // resolves. Default: passes (config domain matches the aggregator). `attestThrows` simulates a
+    // misconfigured/hostile aggregator whose on-chain domain disagrees.
+    async attestBlsDomain(_agg: string, _chainId: bigint, _registry: string): Promise<void> {
+      if (attestThrows) throw new Error("attestDomain: local domainSeparator != aggregator");
+    },
     async getValidatorAtSlot(_addr: string, slot: number): Promise<string | null> {
       if (slot >= 1 && slot <= slotCount) return validatorAddr(slot);
       return null;
@@ -216,6 +222,37 @@ describe("GossipQuorumCoSigner", () => {
     const aggPub = PRIVS.map(p => sigs.getPublicKey(privBytes(p))).reduce((acc, pk) => acc.add(pk));
     const msgPoint = await bls.G2.hashToCurve(ethers.getBytes(req.messageHash), { DST: BLS_DST });
     expect(await sigs.verify(expectedAgg, msgPoint, aggPub)).toBe(true);
+  });
+
+  it("domain attestation FAILS → coSign THROWS (never signs over an unverified domain)", async () => {
+    const req = executeReq();
+    const peers = [
+      await peerResponse(PRIVS[1], 2, req.messageHash, "node-2"),
+      await peerResponse(PRIVS[2], 3, req.messageHash, "node-3"),
+    ];
+    const cs = new GossipQuorumCoSigner(
+      makeGossip(peers),
+      blsService,
+      makeNode(PRIVS[0]),
+      makeBlockchain(3, 1, /* attestThrows */ true),
+      makeConfig()
+    );
+    cs.arm(ALWAYS_CONFIRM);
+    await expect(cs.coSign(req)).rejects.toThrow(/domain not attested/);
+  });
+
+  it("domain attestation FAILS → verifyAndSign (responder) REFUSES (returns null)", async () => {
+    const req = executeReq();
+    const cs = new GossipQuorumCoSigner(
+      makeGossip([]),
+      blsService,
+      makeNode(PRIVS[0]),
+      makeBlockchain(3, 1, /* attestThrows */ true),
+      makeConfig()
+    );
+    cs.arm(ALWAYS_CONFIRM);
+    const resp = await cs.verifyAndSign({ ...req, requestId: "r1", requesterNodeId: "peer" });
+    expect(resp).toBeNull();
   });
 
   it("threshold NOT met (MINOR=3, only 2 signers) → THROWS (never aggregates)", async () => {

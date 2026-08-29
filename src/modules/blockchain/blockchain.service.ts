@@ -3,6 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { ethers } from "ethers";
 import { bumpedFees } from "../../utils/gas.util.js";
 import { KmsEcdsaSigner } from "./kms-ecdsa-signer.js";
+import { attestDomainAgainstAggregator } from "../audit/bls-consensus-domain.js";
 
 /**
  * An ethers Signer that also exposes a synchronous `.address` (like ethers.Wallet). Both the
@@ -1241,6 +1242,23 @@ export class BlockchainService {
       );
       return null;
     }
+  }
+
+  /**
+   * Attest — ON-CHAIN — that a node's LOCAL BLS-consensus domain (chainId + aggregator + Registry)
+   * is the exact one the live aggregator reconstructs, BEFORE it co-signs anything over that domain.
+   * Delegates to the shared `attestDomainAgainstAggregator`, which THROWS (fail-closed) on a
+   * missing/zero or mismatched Registry, or a `domainSeparator()` that differs from the local one.
+   */
+  async attestBlsDomain(blsAggregatorAddress: string, chainId: bigint, registry: string): Promise<void> {
+    if (!this.provider) {
+      throw new Error("Blockchain provider not configured");
+    }
+    await attestDomainAgainstAggregator(this.provider, {
+      chainId,
+      aggregator: blsAggregatorAddress,
+      registry,
+    });
   }
 
   /**

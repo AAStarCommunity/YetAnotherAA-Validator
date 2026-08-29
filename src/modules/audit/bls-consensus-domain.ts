@@ -101,7 +101,28 @@ export function reputationMessageHash(
   );
 }
 
-/** A' signer-set commitment (BLSAggregator._computeSignersCommitment :1299). `signers` sorted asc. */
+/**
+ * Assert `signers` is in SP's canonical commitment order: strictly ascending by uint160, non-zero,
+ * no duplicates. SP sorts internally in `_computeSignersCommitment`, so a caller that passes
+ * slot-order (or any unsorted set) would otherwise get a SILENTLY DIFFERENT, always-failing
+ * commitment. Fail loud instead — the caller must pass the SAME sorted array SP committed to.
+ */
+export function assertCanonicalSigners(signers: string[]): void {
+  for (let i = 0; i < signers.length; i++) {
+    if (signers[i] === ethers.ZeroAddress) {
+      throw new Error("signersCommitment: signers contains the zero address");
+    }
+    if (i > 0 && BigInt(signers[i - 1]) >= BigInt(signers[i])) {
+      throw new Error(
+        `signersCommitment: signers not strictly ascending by uint160 at index ${i} (${signers[i]}) — ` +
+          `SP sorts internally; pass the SORTED signer set, not slot order`
+      );
+    }
+  }
+}
+
+/** A' signer-set commitment (BLSAggregator._computeSignersCommitment :1299). `signers` MUST be
+ *  sorted strictly ascending by uint160 (enforced) — byte-identical to SP's committed `sortedSigners`. */
 export function signersCommitment(
   d: BlsConsensusDomain,
   proposalId: bigint,
@@ -109,6 +130,7 @@ export function signersCommitment(
   signerMask: bigint,
   signers: string[]
 ): string {
+  assertCanonicalSigners(signers);
   return ethers.keccak256(
     ABI.encode(
       ["bytes32", "bytes32", "uint256", "bytes32", "uint256", "address[]"],
@@ -129,4 +151,44 @@ export function fraudProofDigest(
       [domainSeparator(d), TAG_FRAUD_PROOF, fraudProofId, guiltyGuardians]
     )
   );
+}
+
+/** The two getters every SP 4.11 BLSAggregator exposes for domain attestation. */
+export const AGGREGATOR_DOMAIN_ABI = [
+  "function REGISTRY() view returns (address)",
+  "function domainSeparator() view returns (bytes32)",
+];
+
+/**
+ * Prove — ON-CHAIN — that a node's LOCAL domain (config chainId+aggregator+Registry) is the exact
+ * one the live aggregator reconstructs, BEFORE the node signs or trusts anything over it. Throws
+ * (fail-closed) if the local Registry is missing/zero, the aggregator's `REGISTRY()` is zero or
+ * disagrees, or the aggregator's `domainSeparator()` differs from the locally computed one. A node
+ * that cannot attest MUST NOT co-sign / record — a signature over an unverified domain could be
+ * valid on a different deployment.
+ */
+export async function attestDomainAgainstAggregator(
+  provider: ethers.Provider,
+  domain: BlsConsensusDomain
+): Promise<void> {
+  if (!domain.registry || domain.registry === ethers.ZeroAddress) {
+    throw new Error("attestDomain: local Registry is missing/zero — refusing (fail-closed)");
+  }
+  const c = new ethers.Contract(domain.aggregator, AGGREGATOR_DOMAIN_ABI, provider);
+  const onchainRegistry: string = await c.REGISTRY();
+  if (!onchainRegistry || onchainRegistry === ethers.ZeroAddress) {
+    throw new Error(`attestDomain: aggregator ${domain.aggregator} REGISTRY() is zero/missing`);
+  }
+  if (ethers.getAddress(onchainRegistry) !== ethers.getAddress(domain.registry)) {
+    throw new Error(
+      `attestDomain: local Registry ${domain.registry} != aggregator.REGISTRY() ${onchainRegistry}`
+    );
+  }
+  const local = domainSeparator(domain);
+  const onchain: string = await c.domainSeparator();
+  if (local.toLowerCase() !== onchain.toLowerCase()) {
+    throw new Error(
+      `attestDomain: local domainSeparator ${local} != aggregator.domainSeparator() ${onchain}`
+    );
+  }
 }

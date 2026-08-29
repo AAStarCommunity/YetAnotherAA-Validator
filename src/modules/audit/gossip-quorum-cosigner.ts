@@ -71,6 +71,9 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
   private ownSlot: number | null = null;
   private ownSlotResolved = false;
 
+  /** Memoized positive result of the on-chain domain attestation (see ensureDomainAttested). */
+  private domainAttested = false;
+
   constructor(
     private readonly gossip: GossipService,
     private readonly blsService: BlsService,
@@ -101,6 +104,10 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
     this.verifier = verifier;
     this.gossip.registerCoSignHandler(payload => this.verifyAndSign(payload));
     this.logger.log("Gossip quorum co-sign responder registered (armed)");
+    // Attest the domain on-chain eagerly so a misconfiguration surfaces at arm time, not only on the
+    // first co-sign. Non-blocking (arm stays sync); the HARD gate is `ensureDomainAttested()` awaited
+    // in verifyAndSign/coSign, so a slow/failed attestation here never lets an unattested sign through.
+    void this.ensureDomainAttested();
   }
 
   /**
@@ -114,6 +121,33 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       aggregator: this.blsAggregatorAddress,
       registry: this.registryAddress,
     };
+  }
+
+  /**
+   * Fail-closed domain attestation gate. Before this node signs ANYTHING it must prove — on-chain —
+   * that its local (chainId, aggregator, Registry) is the exact domain the live aggregator
+   * reconstructs (`domainSeparator()` + non-zero matching `REGISTRY()`). A success is memoized (the
+   * aggregator's domain is immutable); a failure is NOT cached, so a transient RPC error re-checks
+   * next call rather than permanently wedging a correctly-configured node. Returns false on any
+   * failure → the caller refuses to co-sign.
+   */
+  private async ensureDomainAttested(): Promise<boolean> {
+    if (this.domainAttested) return true;
+    try {
+      await this.blockchain.attestBlsDomain(
+        this.blsAggregatorAddress,
+        this.chainId,
+        this.registryAddress
+      );
+      this.domainAttested = true;
+      return true;
+    } catch (e: any) {
+      this.logger.warn(
+        `co-sign domain attestation FAILED — refusing to co-sign over an unverified domain: ` +
+          `${e?.message ?? String(e)}`
+      );
+      return false;
+    }
   }
 
   // ── RESPONDER ───────────────────────────────────────────────────────────────────
@@ -134,6 +168,8 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       // 1. must be armed.
       if (!this.executeSlash) return null;
       if (!this.verifier) return null;
+      // 1a. domain attested on-chain — never sign over an unverified aggregator/Registry/chain.
+      if (!(await this.ensureDomainAttested())) return null;
 
       // 1b. proof-schema version must match (finding-1). A mixed-version fleet computes DIFFERENT
       // proofHashes, so co-signing would silently fail to reach quorum with no clear reason. Refuse
@@ -225,6 +261,11 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
     }
     if (!this.verifier) {
       throw new Error("gossip co-sign: responder/verifier not wired");
+    }
+    if (!(await this.ensureDomainAttested())) {
+      throw new Error(
+        "gossip co-sign: BLS-consensus domain not attested on-chain — refusing (fail-closed)"
+      );
     }
     const node = this.nodeService.getNodeForSigning();
     const ownSlot = await this.resolveOwnSlot();

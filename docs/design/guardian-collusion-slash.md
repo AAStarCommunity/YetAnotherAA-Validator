@@ -181,9 +181,16 @@ before any `revokeBLSPublicKey`, SP persists one word per proposal (reusing the
 (incl. reputation/combined):
 
 ```solidity
+// SP 4.11 domain-separated layout (BLSAggregator.sol:255/1299). The domain separator binds
+// chainId+aggregator+Registry, so the pre-image carries NO raw chainid/aggregator and uses a
+// versioned bytes32 path tag (superseding the pre-4.11 string-tag + raw-chainid encoding).
+bytes32 constant DOMAIN_NAME            = keccak256("SuperPaymaster.BLSConsensus.v1");
+bytes32 constant TAG_SIGNERS_COMMITMENT = keccak256("SuperPaymaster.BLS.SignersCommitment.v1");
+bytes32 domainSeparator = keccak256(abi.encode(DOMAIN_NAME, block.chainid, address(this), address(REGISTRY)));
+
 mapping(uint256 proposalId => bytes32) proposalSignersCommitment;
 commitment = keccak256(abi.encode(
-  "BLS_SIGNERS_COMMITMENT_V1", block.chainid, address(this),
+  domainSeparator, TAG_SIGNERS_COMMITMENT,
   proposalId, expectedMessageHash, signerMask, sortedSigners));  // uint160 strict-asc, no dup/zero, ≤ MAX_VALIDATORS
 ```
 
@@ -246,12 +253,16 @@ caller-supplied message hash. It reconstructs SP's slash-only
 has a **fixed preimage**:
 
 ```
-evidenceHash = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", token, operator, epoch))
-messageHash  = keccak256(abi.encode(proposalId, operator, slashLevel,
-                                    address[](0), uint256[](0),   // repUsers, newScores — see below
-                                    epoch, block.chainid, evidenceHash))
-commitment   = keccak256(abi.encode("BLS_SIGNERS_COMMITMENT_V1", chainid, aggregator,
-                                    proposalId, messageHash, signerMask, claimedSigners))
+// SP 4.11 domain-separated layout (BLSAggregator.sol:255/977/1299). domainSeparator binds
+// chainId+aggregator+Registry; the slash message uses TAG_EXECUTE_SLASH and has NO empty rep arrays
+// and NO raw chainid; the commitment uses TAG_SIGNERS_COMMITMENT (bytes32), not a string tag.
+domainSeparator = keccak256(abi.encode(keccak256("SuperPaymaster.BLSConsensus.v1"),
+                                       chainid, aggregator, registry))
+evidenceHash    = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", token, operator, epoch))
+messageHash     = keccak256(abi.encode(domainSeparator, keccak256("SuperPaymaster.BLS.ExecuteSlash.v1"),
+                                       proposalId, operator, slashLevel, epoch, evidenceHash))
+commitment      = keccak256(abi.encode(domainSeparator, keccak256("SuperPaymaster.BLS.SignersCommitment.v1"),
+                                       proposalId, messageHash, signerMask, claimedSigners))
 ```
 
 **Whoever files an over-issue slash (the E2E filer / the future audit rule)

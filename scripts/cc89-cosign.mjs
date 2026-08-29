@@ -29,14 +29,17 @@
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
 import { ethers } from "ethers";
 import { readFileSync, existsSync } from "fs";
+// SINGLE SOURCE OF TRUTH for the SP 4.11 domain/tag/layout — shared with src/modules/audit/
+// bls-consensus-domain.ts (pinned equal by bls-consensus-encoding.spec.ts). Do NOT re-derive here.
+import {
+  domainSeparator as spDomainSeparator,
+  executeSlashMessageHash as spExecuteSlashMessageHash,
+  overIssueEvidenceHash as spOverIssueEvidenceHash,
+} from "./lib/bls-consensus-encoding.mjs";
 
 const sigs = bls.longSignatures;
 // MUST equal SP BLSAggregator BLS.sol hashToG2 DST + src/utils/bls.util.ts BLS_DST.
 const BLS_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-const OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1"; // cross-repo, must match verifier
-// SP 4.11 BLS-consensus domain constants (BLSAggregator.sol:238/243/255) — keccak of the UTF-8 literal.
-const DOMAIN_NAME = ethers.id("SuperPaymaster.BLSConsensus.v1");
-const TAG_EXECUTE_SLASH = ethers.id("SuperPaymaster.BLS.ExecuteSlash.v1");
 const coder = ethers.AbiCoder.defaultAbiCoder();
 const die = m => {
   console.error("✗ " + m);
@@ -80,7 +83,11 @@ const provider = new ethers.JsonRpcProvider(rpc);
 let messageHash;
 if (selftest) {
   messageHash = ethers.keccak256(ethers.toUtf8Bytes("cc89-cosign-selftest"));
-  console.log("SELF-TEST mode: signing a dummy messageHash to prove the 3-key aggregate verifies.");
+  console.log(
+    "SELF-TEST mode: signing a DUMMY messageHash to prove only that the 3-key aggregate + EIP-2537 " +
+      "encoding verify on-chain. This is NOT a domain-bound message and does NOT prove verifyAndExecute " +
+      "would accept it — the real path (no --selftest) attests domainSeparator vs the aggregator first."
+  );
 } else {
   const proposalId = BigInt(process.env.PROPOSAL_ID || die("PROPOSAL_ID required"));
   const operator = ethers.getAddress(process.env.OPERATOR || die("OPERATOR required"));
@@ -89,12 +96,7 @@ if (selftest) {
   let evidenceHash = process.env.EVIDENCE_HASH;
   if (!evidenceHash) {
     const token = ethers.getAddress(process.env.TOKEN || die("TOKEN or EVIDENCE_HASH required"));
-    evidenceHash = ethers.keccak256(
-      coder.encode(
-        ["string", "address", "address", "uint256"],
-        [OVERISSUE_EVIDENCE_TAG, token, operator, epoch]
-      )
-    );
+    evidenceHash = spOverIssueEvidenceHash(token, operator, epoch);
     console.log(`over-issue evidenceHash(${token}, ${operator}, ${epoch}) = ${evidenceHash}`);
   }
 
@@ -108,29 +110,27 @@ if (selftest) {
     provider
   );
   const registry = await domainProbe.REGISTRY();
-  const domainSeparator = ethers.keccak256(
-    coder.encode(
-      ["bytes32", "uint256", "address", "address"],
-      [DOMAIN_NAME, chainId, aggregator, registry]
-    )
-  );
+  const domain = { chainId, aggregator, registry };
+  const localDomainSeparator = spDomainSeparator(domain);
   // Strengthened self-check: prove the domain we are about to sign is the EXACT one the live
   // contract reconstructs — not merely whatever hash we hand its generic verify(). A mismatch means
   // wrong chainId/aggregator/Registry; signing would produce a proof SP's _checkSignatures rejects.
   const onChainDomain = await domainProbe.domainSeparator();
-  if (onChainDomain.toLowerCase() !== domainSeparator.toLowerCase()) {
+  if (onChainDomain.toLowerCase() !== localDomainSeparator.toLowerCase()) {
     die(
-      `domainSeparator mismatch: local ${domainSeparator} != aggregator.domainSeparator() ${onChainDomain} ` +
+      `domainSeparator mismatch: local ${localDomainSeparator} != aggregator.domainSeparator() ${onChainDomain} ` +
         `(chainId ${chainId} / aggregator ${aggregator} / registry ${registry})`
     );
   }
-  console.log(`domainSeparator (verified vs on-chain): ${domainSeparator}`);
-  // SP 4.11 slash-only expectedMessageHash (BLSAggregator.sol:977).
-  messageHash = ethers.keccak256(
-    coder.encode(
-      ["bytes32", "bytes32", "uint256", "address", "uint8", "uint256", "bytes32"],
-      [domainSeparator, TAG_EXECUTE_SLASH, proposalId, operator, slashLevel, epoch, evidenceHash]
-    )
+  console.log(`domainSeparator (verified vs on-chain): ${localDomainSeparator}`);
+  // SP 4.11 slash-only expectedMessageHash (BLSAggregator.sol:977) — via the shared encoding lib.
+  messageHash = spExecuteSlashMessageHash(
+    domain,
+    proposalId,
+    operator,
+    slashLevel,
+    epoch,
+    evidenceHash
   );
 }
 console.log("messageHash:", messageHash);
