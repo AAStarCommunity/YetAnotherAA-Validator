@@ -9,6 +9,8 @@ import {
   rawSlashMessageHash,
   computeSignersCommitment,
 } from "./guardian-fraud-proof.js";
+import type { BlsConsensusDomain } from "./bls-consensus-domain.js";
+import { domainSeparator } from "./bls-consensus-domain.js";
 import { SLASH_EXECUTED_EVENT } from "./guardian-slash-watcher.core.js";
 
 const coder = ethers.AbiCoder.defaultAbiCoder();
@@ -17,7 +19,9 @@ const S2 = ethers.getAddress("0x0000000000000000000000000000000000002222");
 const S3 = ethers.getAddress("0x0000000000000000000000000000000000003333");
 const OPERATOR = ethers.getAddress("0x000000000000000000000000000000000000abcd");
 const AGG = ethers.getAddress("0x0000000000000000000000000000000000000a99");
+const REG = ethers.getAddress("0x00000000000000000000000000000000000000b5");
 const CHAIN_ID = 11155111n;
+const DOMAIN: BlsConsensusDomain = { chainId: CHAIN_ID, aggregator: AGG, registry: REG };
 const MASK = 0x7n;
 const EPOCH = 1000n;
 const LEVEL = 2;
@@ -27,7 +31,36 @@ const TOPIC = new ethers.Interface([SLASH_EXECUTED_EVENT]).getEvent("SlashExecut
 const va = new ethers.Interface([
   "function validatorAtSlot(uint8 slot) view returns (address)",
   "function proposalSignersCommitment(uint256 proposalId) view returns (bytes32)",
+  "function REGISTRY() view returns (address)",
+  "function domainSeparator() view returns (bytes32)",
 ]);
+
+/** A bootstrap provider whose aggregator answers all four probe reads. `domSepOverride` forges a
+ *  mismatching on-chain domainSeparator to exercise the fail-closed attestation. */
+function bootProvider(domSepOverride?: string): any {
+  return {
+    getCode: async () => "0x60006000fd",
+    getNetwork: async () => ({ chainId: CHAIN_ID }),
+    call: async (tx: { data: string }) => {
+      const sel = tx.data.slice(0, 10);
+      if (sel === va.getFunction("validatorAtSlot")!.selector) {
+        return va.encodeFunctionResult("validatorAtSlot", [ethers.ZeroAddress]);
+      }
+      if (sel === va.getFunction("proposalSignersCommitment")!.selector) {
+        return va.encodeFunctionResult("proposalSignersCommitment", [ethers.ZeroHash]);
+      }
+      if (sel === va.getFunction("REGISTRY")!.selector) {
+        return va.encodeFunctionResult("REGISTRY", [REG]);
+      }
+      if (sel === va.getFunction("domainSeparator")!.selector) {
+        return va.encodeFunctionResult("domainSeparator", [
+          domSepOverride ?? domainSeparator(DOMAIN),
+        ]);
+      }
+      throw new Error(`unexpected selector ${sel}`);
+    },
+  };
+}
 
 function calldataFor(pid: bigint): string {
   const iface = new ethers.Interface([VERIFY_AND_EXECUTE_ABI]);
@@ -43,8 +76,8 @@ function calldataFor(pid: bigint): string {
   ]);
 }
 function commitmentFor(pid: bigint): string {
-  const mh = rawSlashMessageHash(CHAIN_ID, pid, OPERATOR, LEVEL, EPOCH, EVIDENCE);
-  return computeSignersCommitment(AGG, CHAIN_ID, pid, mh, MASK, [S1, S2, S3]);
+  const mh = rawSlashMessageHash(DOMAIN, pid, OPERATOR, LEVEL, EPOCH, EVIDENCE);
+  return computeSignersCommitment(DOMAIN, pid, mh, MASK, [S1, S2, S3]);
 }
 
 interface FakeLog {
@@ -103,6 +136,7 @@ function makeService(store: LocalGuardianSignerStore, provider: MockProvider) {
   (svc as any).provider = provider;
   (svc as any).chainId = CHAIN_ID;
   (svc as any).aggregatorAddress = AGG;
+  (svc as any).registryAddress = REG;
   (svc as any).slashExecutedTopic = TOPIC;
   (svc as any).fromBlock = 0;
   (svc as any).finalityConfirmations = 0;
@@ -277,5 +311,36 @@ describe("GuardianSlashWatcherService (CC-89 stage-2 durability)", () => {
     expect(sawCommitmentProbe).toBe(true); // the second probe method actually fired
     expect((svc as any).timer).toBeNull(); // poller NOT started (fail-closed)
     expect((svc as any).chainId).toBeNull(); // never advanced past the probe
+  });
+
+  it("bootstrap fail-closed: aggregator domainSeparator disagrees with local domain → DISABLED", async () => {
+    // The aggregator answers every probe BUT reports a domainSeparator bound to a different
+    // deployment. The watcher must refuse to start rather than quarantine every future capture.
+    const svc = new GuardianSlashWatcherService(undefined, undefined, store);
+    (svc as any).provider = bootProvider("0x" + "de".repeat(32)); // forged, non-matching
+    (svc as any).aggregatorAddress = AGG;
+    (svc as any).registryAddress = REG;
+    (svc as any).expectedChainId = Number(CHAIN_ID);
+    (svc as any).aggregatorFromEnv = true;
+
+    await (svc as any).bootstrapAndPoll();
+
+    expect((svc as any).timer).toBeNull(); // poller NOT started (fail-closed)
+    expect((svc as any).chainId).toBeNull(); // never advanced past the attestation
+  });
+
+  it("bootstrap OK: matching on-chain domain attests → advances past the probe", async () => {
+    const svc = new GuardianSlashWatcherService(undefined, undefined, store);
+    (svc as any).provider = bootProvider(); // aggregator agrees with the local domain
+    (svc as any).aggregatorAddress = AGG;
+    (svc as any).registryAddress = REG;
+    (svc as any).expectedChainId = Number(CHAIN_ID);
+    (svc as any).aggregatorFromEnv = true;
+    (svc as any).stopping = true; // short-circuit before tick()/timer so we isolate the attestation
+
+    await (svc as any).bootstrapAndPoll();
+
+    expect((svc as any).chainId).toBe(CHAIN_ID); // attestation passed → chainId advanced
+    expect((svc as any).timer).toBeNull(); // stopping short-circuits the poller
   });
 });

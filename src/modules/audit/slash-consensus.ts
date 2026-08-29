@@ -1,4 +1,11 @@
 import { ethers } from "ethers";
+import {
+  BlsConsensusDomain,
+  queueSlashMessageHash,
+  executeSlashMessageHash,
+} from "./bls-consensus-domain.js";
+
+export type { BlsConsensusDomain } from "./bls-consensus-domain.js";
 
 /**
  * DVT Phase 2 (目标2) — slash-consensus primitives, increment 2.
@@ -28,12 +35,6 @@ import { ethers } from "ethers";
 const ABI = new ethers.AbiCoder();
 
 /**
- * Domain-separation tag for the queue-slash preimage. keccak256("QUEUE_SLASH") — the UTF-8
- * bytes of the literal, exactly matching the Solidity `keccak256("QUEUE_SLASH")`.
- */
-export const QUEUE_SLASH_TAG = ethers.id("QUEUE_SLASH");
-
-/**
  * On-chain slash severity enum (SP #329 SlashLevel). The audit's credit-over-limit rule maps
  * to MINOR (see AuditService). WARNING is 2-of-3 quorum in the N=3 bootstrap; MINOR/MAJOR 3-of-3.
  */
@@ -44,42 +45,42 @@ export enum SlashLevel {
 }
 
 /**
- * Step-1 queue preimage — keccak256 over the 5-field encoding with the QUEUE_SLASH domain tag.
- * This is the message the DVT quorum co-signs before queueSlashWithProof.
+ * Step-1 queue preimage — the LIVE SP 4.11 BLSAggregator queue-slash message (:911):
+ * `keccak256(abi.encode(domainSeparator, TAG_QUEUE_SLASH, operator, slashLevel, epoch))`. The
+ * domain (chainId+aggregator+Registry) is the signing node's OWN config — never a wire value — so
+ * a node only ever co-signs a hash valid on the aggregator it is configured for.
  */
 export function buildQueueMessageHash(
+  domain: BlsConsensusDomain,
   operator: string,
   slashLevel: number,
-  epoch: bigint | number,
-  chainId: bigint | number
+  epoch: bigint | number
 ): string {
-  return ethers.keccak256(
-    ABI.encode(
-      ["bytes32", "address", "uint8", "uint256", "uint256"],
-      [QUEUE_SLASH_TAG, operator, slashLevel, epoch, chainId]
-    )
-  );
+  return queueSlashMessageHash(domain, operator, slashLevel, BigInt(epoch));
 }
 
 /**
- * Step-2 execute preimage — keccak256 over the 8-field encoding. repUsers/newScores are empty
- * for a slash-only proposal; evidenceHash binds the on-chain slash to the archived proof
- * (the audit passes proofHash here). This is the message the DVT quorum co-signs before
- * executeWithProof.
+ * Step-2 execute preimage — the LIVE SP 4.11 BLSAggregator execute-slash message (:977):
+ * `keccak256(abi.encode(domainSeparator, TAG_EXECUTE_SLASH, proposalId, operator, slashLevel,
+ * epoch, evidenceHash))`. `evidenceHash` binds the on-chain slash to the archived proof (the audit
+ * passes proofHash here). The obsolete pre-4.11 shape (empty rep arrays + raw chainId, no domain)
+ * is gone — a signature over it would fail SP's `_checkSignatures`.
  */
 export function buildExecuteMessageHash(
+  domain: BlsConsensusDomain,
   proposalId: bigint | number,
   operator: string,
   slashLevel: number,
   epoch: bigint | number,
-  chainId: bigint | number,
   evidenceHash: string
 ): string {
-  return ethers.keccak256(
-    ABI.encode(
-      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256", "bytes32"],
-      [proposalId, operator, slashLevel, [], [], epoch, chainId, evidenceHash]
-    )
+  return executeSlashMessageHash(
+    domain,
+    BigInt(proposalId),
+    operator,
+    slashLevel,
+    BigInt(epoch),
+    evidenceHash
   );
 }
 
@@ -163,10 +164,21 @@ export interface CoSignRequest {
  * requester and every responder use, so a byte-for-byte agreement is structural, not trusted.
  * Dispatches to buildQueueMessageHash (queue) / buildExecuteMessageHash (execute). Throws when
  * the execute step is missing its `proposalId`/`evidenceHash` (a peer then refuses to sign).
+ *
+ * `domain` is the RECOMPUTING node's OWN (chainId, aggregator, Registry) — NEVER taken from the
+ * request — so a responder can only ever produce a signature valid on the aggregator/Registry/chain
+ * it is configured for. As a defence-in-depth, an explicit cross-chain refusal fires when the
+ * request's advertised `chainId` disagrees with the local domain (the message would mismatch
+ * anyway; failing loudly here is clearer than a silent hash divergence).
  */
-export function recomputeMessageHash(req: CoSignRequest): string {
+export function recomputeMessageHash(req: CoSignRequest, domain: BlsConsensusDomain): string {
+  if (BigInt(req.chainId) !== domain.chainId) {
+    throw new Error(
+      `recomputeMessageHash: request chainId ${req.chainId} != local domain chainId ${domain.chainId}`
+    );
+  }
   if (req.step === "queue") {
-    return buildQueueMessageHash(req.operator, req.slashLevel, req.epoch, req.chainId);
+    return buildQueueMessageHash(domain, req.operator, req.slashLevel, req.epoch);
   }
   if (req.step === "execute") {
     if (req.proposalId === undefined || req.proposalId === null || req.proposalId === "") {
@@ -176,11 +188,11 @@ export function recomputeMessageHash(req: CoSignRequest): string {
       throw new Error("recomputeMessageHash: execute step requires an evidenceHash");
     }
     return buildExecuteMessageHash(
+      domain,
       BigInt(req.proposalId),
       req.operator,
       req.slashLevel,
       req.epoch,
-      req.chainId,
       req.evidenceHash
     );
   }

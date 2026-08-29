@@ -12,6 +12,7 @@ import type { IGuardianSignerStore } from "./guardian-signer-store.js";
 import { LocalGuardianSignerStore } from "./guardian-signer-store.js";
 import { SLASH_EXECUTED_EVENT, buildGuardianSignerRecord } from "./guardian-slash-watcher.core.js";
 import { checkAggregatorChainPolicy } from "./aggregator-bootstrap-guard.js";
+import { attestDomainAgainstAggregator } from "./bls-consensus-domain.js";
 
 /**
  * CC-89 stage-2 — guardian-slash WATCHER (the off-chain data-availability half).
@@ -55,6 +56,8 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
   private readonly logger = new Logger(GuardianSlashWatcherService.name);
   private readonly enabled: boolean;
   private readonly aggregatorAddress: string;
+  /** SP Registry — the 4th BLS-consensus domain-separator field; needed to reproduce SP's commitment. */
+  private readonly registryAddress: string;
   /** AUDIT_CHAIN_ID — cross-checked against the RPC's actual chain (shared fail-closed policy). */
   private readonly expectedChainId: number;
   /** Whether AUDIT_BLS_AGGREGATOR_ADDRESS was set explicitly (guards the Sepolia default). */
@@ -80,6 +83,7 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
   ) {
     this.enabled = this.config?.get<boolean>("auditGuardianWatchEnabled") === true;
     this.aggregatorAddress = this.config?.get<string>("auditBlsAggregatorAddress") ?? "";
+    this.registryAddress = this.config?.get<string>("auditRegistryAddress") ?? "";
     this.expectedChainId = this.config?.get<number>("auditChainId") ?? 0;
     this.aggregatorFromEnv = this.config?.get<boolean>("auditBlsAggregatorAddressFromEnv") === true;
     this.rpcUrl = this.config?.get<string>("ethRpcUrl") ?? "";
@@ -99,6 +103,16 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
     if (!/^0x[0-9a-fA-F]{40}$/.test(this.aggregatorAddress)) {
       this.logger.warn(
         "AUDIT_GUARDIAN_WATCH_ENABLED but AUDIT_BLS_AGGREGATOR_ADDRESS is missing/invalid — watcher DISABLED"
+      );
+      return;
+    }
+    // The Registry is the 4th BLS-consensus domain-separator field; without it the watcher cannot
+    // reproduce SP's commitment (and ethers.getAddress("") would throw per-event, dead-lettering
+    // every capture). Reject a missing/invalid Registry up front (fail-closed) — the on-chain
+    // Registry parity is then attested against the aggregator in bootstrapAndPoll.
+    if (!/^0x[0-9a-fA-F]{40}$/.test(this.registryAddress)) {
+      this.logger.warn(
+        "AUDIT_GUARDIAN_WATCH_ENABLED but AUDIT_REGISTRY_ADDRESS is missing/invalid — watcher DISABLED"
       );
       return;
     }
@@ -176,6 +190,17 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
       );
       await probe.validatorAtSlot(1);
       await probe.proposalSignersCommitment(0);
+
+      // Domain attestation (fail-closed): the commitment the watcher recomputes binds
+      // chainId+aggregator+Registry. A missing/zero or wrong-but-valid Registry would make EVERY
+      // commitment mismatch (silently quarantining every capture as commitmentVerified:false).
+      // Prove the on-chain aggregator agrees with our LOCAL (chainId, aggregator, Registry) BEFORE
+      // polling; a mismatch throws → DISABLED here, not silently dead-lettered per-event.
+      await attestDomainAgainstAggregator(this.provider!, {
+        chainId: net.chainId,
+        aggregator: this.aggregatorAddress,
+        registry: this.registryAddress,
+      });
       this.chainId = net.chainId;
     } catch (e: any) {
       this.logger.warn(`watcher bootstrap read failed — DISABLED: ${e?.message ?? String(e)}`);
@@ -258,6 +283,7 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
       const record = await buildGuardianSignerRecord(
         this.provider!,
         this.aggregatorAddress,
+        this.registryAddress,
         this.chainId!,
         proposalId,
         txHash,

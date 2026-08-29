@@ -25,8 +25,10 @@ const S2 = ethers.getAddress("0x0000000000000000000000000000000000002222");
 const S3 = ethers.getAddress("0x0000000000000000000000000000000000003333");
 const OPERATOR = ethers.getAddress("0x000000000000000000000000000000000000abcd");
 const AGG = ethers.getAddress("0x0000000000000000000000000000000000000a99");
+const REG = ethers.getAddress("0x00000000000000000000000000000000000000b5");
 const TOKEN = ethers.getAddress("0x000000000000000000000000000000000000beef");
 const CHAIN_ID = 11155111n;
+const DOMAIN = { chainId: CHAIN_ID, aggregator: AGG, registry: REG };
 const PID = 42n;
 const LEVEL = 2;
 const EPOCH = 1000n;
@@ -39,10 +41,11 @@ const EVIDENCE = overIssueEvidenceHash(TOKEN, OPERATOR, EPOCH);
 // The commitment SP would store for this slash — a HARDCODED golden literal (NOT computed via the
 // production helper), so the E2E's ground truth is independent of a shared TS-helper drift; a helper
 // or convention change that alters this value fails the pin-check below AND the chain assertions.
-// Params: chainId=11155111, agg=0x…0a99, pid=42, op=…abcd, level=2, epoch=1000, token=…beef,
-// mask=0x7, signers=[S1,S2,S3]. (The TS↔Solidity byte-alignment itself is pinned by the golden
-// vector shared between guardian-fraud-proof.spec.ts and OverIssueFraudProofVerifier.t.sol.)
-const ON_CHAIN_COMMITMENT = "0x9aa1e972757e23b4f909d5d16ea0f2b551c12462dfeaaac2001ebf9a92174752";
+// Params: SP 4.11 domain {chainId=11155111, agg=0x…0a99, registry=0x…00b5}, pid=42, op=…abcd,
+// level=2, epoch=1000, token=…beef, mask=0x7, signers=[S1,S2,S3]. (The TS↔Solidity byte-alignment
+// itself is pinned by the golden vector shared between guardian-fraud-proof.spec.ts and
+// OverIssueFraudProofVerifier.t.sol.)
+const ON_CHAIN_COMMITMENT = "0x6861ffee36303335eaf09555377d293f8ce39694b34e1badb56da95ed112fe8a";
 
 const va = new ethers.Interface([
   "function validatorAtSlot(uint8 slot) view returns (address)",
@@ -94,10 +97,9 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
     // fails here (loudly) rather than silently moving the ground truth with the code under test.
     expect(
       computeSignersCommitment(
-        AGG,
-        CHAIN_ID,
+        DOMAIN,
         PID,
-        overIssueSlashMessageHash(CHAIN_ID, PID, OPERATOR, LEVEL, EPOCH, TOKEN),
+        overIssueSlashMessageHash(DOMAIN, PID, OPERATOR, LEVEL, EPOCH, TOKEN),
         MASK,
         [S1, S2, S3]
       )
@@ -111,6 +113,7 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
     const record = await buildGuardianSignerRecord(
       provider,
       AGG,
+      REG,
       CHAIN_ID,
       PID,
       TX_HASH,
@@ -120,10 +123,11 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
     expect(record.claimedSigners).toEqual([S1, S2, S3]);
     expect(record.commitment).toBe(ON_CHAIN_COMMITMENT);
 
-    // C) ASSEMBLER — accuse two of the colluding signers.
-    const assembled = assembleOverIssueFraudProof(record, TOKEN, [S1, S3]);
+    // C) ASSEMBLER — accuse the exact committed signer set. A subset would let a
+    // front-runner consume the one-shot fraudProofId and immunise the omitted signers.
+    const assembled = assembleOverIssueFraudProof(record, TOKEN);
     expect(assembled.fraudProofId).toBe(deriveFraudProofId(PID));
-    expect(assembled.guiltyGuardians).toEqual([S1, S3]);
+    expect(assembled.guiltyGuardians).toEqual([S1, S2, S3]);
 
     // LOAD-BEARING E2E INVARIANT — decode the assembled fraudProof and independently recompute the
     // commitment the on-chain verifier will derive from it; it MUST equal the stored A' commitment.
@@ -132,11 +136,10 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
       assembled.fraudProof
     );
     const recomputed = computeSignersCommitment(
-      AGG,
-      CHAIN_ID,
+      DOMAIN,
       BigInt(pid),
       overIssueSlashMessageHash(
-        CHAIN_ID,
+        DOMAIN,
         BigInt(pid),
         ethers.getAddress(op),
         Number(level),
@@ -147,8 +150,8 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
       [...claimed].map((a: string) => ethers.getAddress(a))
     );
     expect(recomputed).toBe(ON_CHAIN_COMMITMENT); // ⇒ the verifier's commitment check passes
-    // guilty ⊆ claimedSigners (the verifier's innocent-protection check).
-    for (const g of assembled.guiltyGuardians) expect(record.claimedSigners).toContain(g);
+    // SET-EXACT is the verifier's one-shot-id front-run protection.
+    expect(assembled.guiltyGuardians).toEqual(record.claimedSigners);
   });
 
   it("refuses the chain when the disputed token does not bind (token-swap defense)", async () => {
@@ -156,12 +159,13 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
     const record = await buildGuardianSignerRecord(
       provider,
       AGG,
+      REG,
       CHAIN_ID,
       PID,
       TX_HASH,
       EXEC_BLOCK
     );
     const wrongToken = ethers.getAddress("0x000000000000000000000000000000000000c0de");
-    expect(() => assembleOverIssueFraudProof(record, wrongToken, [S1])).toThrow(/does not bind/);
+    expect(() => assembleOverIssueFraudProof(record, wrongToken)).toThrow(/does not bind/);
   });
 });

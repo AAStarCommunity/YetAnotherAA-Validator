@@ -6,6 +6,7 @@ import {
   repSlashMessageHash,
   computeSignersCommitment,
 } from "./guardian-fraud-proof.js";
+import { BlsConsensusDomain } from "./bls-consensus-domain.js";
 import { GuardianSignerRecord } from "./guardian-signer-store.js";
 
 /**
@@ -41,11 +42,20 @@ export class WatcherRecordError extends Error {}
 export async function buildGuardianSignerRecord(
   provider: ethers.Provider,
   aggregatorAddress: string,
+  registryAddress: string,
   chainId: bigint,
   eventProposalId: bigint,
   txHash: string,
   executionBlock: number
 ): Promise<GuardianSignerRecord> {
+  // The node-local BLS-consensus domain (chainId+aggregator+Registry). MUST be this deployment's
+  // real Registry, or every reconstructed messageHash/commitment differs from SP's and the capture
+  // is (correctly) flagged commitmentVerified:false.
+  const domain: BlsConsensusDomain = {
+    chainId,
+    aggregator: aggregatorAddress,
+    registry: registryAddress,
+  };
   const tx = await provider.getTransaction(txHash);
   if (!tx) throw new WatcherRecordError(`tx ${txHash} not found`);
 
@@ -77,7 +87,7 @@ export async function buildGuardianSignerRecord(
   const messageHash =
     args.repUsers.length === 0
       ? rawSlashMessageHash(
-          chainId,
+          domain,
           args.proposalId,
           args.operator,
           args.slashLevel,
@@ -85,7 +95,7 @@ export async function buildGuardianSignerRecord(
           args.evidenceHash
         )
       : repSlashMessageHash(
-          chainId,
+          domain,
           args.proposalId,
           args.operator,
           args.slashLevel,
@@ -95,8 +105,7 @@ export async function buildGuardianSignerRecord(
         );
 
   const localCommitment = computeSignersCommitment(
-    aggregatorAddress,
-    chainId,
+    domain,
     args.proposalId,
     messageHash,
     args.signerMask,
