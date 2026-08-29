@@ -410,7 +410,8 @@ contract OverIssueFraudProofVerifierTest is Test {
 // =====================================================================
 
 /// @dev Runs the DVT verifier against BOTH release gates of SuperPaymaster's real conformance
-///      fixture (documented port in test/helpers/FraudProofVerifierConformance.sol):
+///      fixture — a byte-for-byte copy (SHA-256 220bfa18…, body identical modulo header+pragma) in
+///      test/helpers/FraudProofVerifierConformance.sol:
 ///        - assertDomainBound: accepts its own domain, rejects a foreign aggregator's and an
 ///          arbitrary digest.
 ///        - assertSetBound:    accepts the exact committed set, rejects every strict subset, the
