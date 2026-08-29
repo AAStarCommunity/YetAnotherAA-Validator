@@ -69,7 +69,7 @@ contract AAStarCommitteeValidatorTest is Test {
         ids = new bytes32[](n);
         for (uint256 i = 0; i < n; i++) {
             bytes32 nid = keccak256(abi.encode("node", i));
-            v.registerPublicKey(nid, DUMMY_KEY);
+            v.registerPublicKey(nid, _keyFor(nid));
             ids[i] = nid;
         }
         _sortAsc(ids);
@@ -81,6 +81,24 @@ contract AAStarCommitteeValidatorTest is Test {
                 if (a[j] < a[i]) (a[i], a[j]) = (a[j], a[i]);
             }
         }
+    }
+
+    /// @dev A distinct, valid-length, non-infinity G1 key per nodeId. BLS is mocked in these tests, so the
+    ///      key CONTENT is irrelevant to validation — only the reverse-lock uniqueness (one key per node,
+    ///      CC-97 P4) matters, which the shared DUMMY_KEY used to violate. Deterministic in nid.
+    function _keyFor(bytes32 nid) internal pure returns (bytes memory k) {
+        k = new bytes(128);
+        bytes32 a = keccak256(abi.encode("k1", nid));
+        bytes32 b = keccak256(abi.encode("k2", nid));
+        bytes32 c = keccak256(abi.encode("k3", nid));
+        bytes32 d = keccak256(abi.encode("k4", nid));
+        for (uint256 i = 0; i < 32; i++) {
+            k[i] = a[i];
+            k[32 + i] = b[i];
+            k[64 + i] = c[i];
+            k[96 + i] = d[i];
+        }
+        k[0] = 0x01; // guarantee non-infinity (leading byte non-zero)
     }
 
     /// @dev Advance to the first block of `epoch`, set its blockhash, and pin it.
@@ -131,7 +149,7 @@ contract AAStarCommitteeValidatorTest is Test {
         assertEq(v.slotPlusOne(ids[1]), 0, "revoked node loses its slot");
         // New registration reuses the freed slot.
         bytes32 fresh = keccak256("fresh");
-        v.registerPublicKey(fresh, DUMMY_KEY);
+        v.registerPublicKey(fresh, _keyFor(fresh));
         assertEq(v.slotPlusOne(fresh) - 1, slot1, "freed slot is recycled");
         assertEq(v.activeCount(), 3);
     }
@@ -153,7 +171,7 @@ contract AAStarCommitteeValidatorTest is Test {
         // Slot is recycled on the next activation.
         v.setRequireStake(false);
         bytes32 fresh = keccak256("fresh-after-sync");
-        v.registerPublicKey(fresh, DUMMY_KEY);
+        v.registerPublicKey(fresh, _keyFor(fresh));
         assertEq(v.slotPlusOne(fresh) - 1, slot, "freed slot recycled after syncNode");
     }
 
@@ -460,7 +478,7 @@ contract AAStarCommitteeValidatorTest is Test {
         MockCommitteeValidator w = new MockCommitteeValidator();
         // epochLength stays 0 => legacy whole-set path.
         bytes32 nid = keccak256(abi.encode("node", uint256(0)));
-        w.registerPublicKey(nid, DUMMY_KEY);
+        w.registerPublicKey(nid, _keyFor(nid));
         bytes32[] memory one = new bytes32[](1);
         one[0] = nid;
         // legacy format: [nodeId][blsSig]
@@ -499,7 +517,7 @@ contract AAStarCommitteeValidatorTest is Test {
         // Register a 4th node AFTER the freeze: it enters the live tree (root changes) but NOT setRoot[1].
         vm.roll(EPOCH_LEN + 5);
         bytes32 late = keccak256("late-node");
-        v.registerPublicKey(late, DUMMY_KEY);
+        v.registerPublicKey(late, _keyFor(late));
         _rollAndSnapshot(2, bytes32(uint256(0xBB))); // seed[2]; epoch-2 committees use setRoot[1]
 
         // The pre-captured frozen payload still validates (setRoot[1] is immutable).
@@ -635,7 +653,7 @@ contract AAStarCommitteeValidatorTest is Test {
         bytes32 rootBefore = v.runningRoot();
         vm.roll(EPOCH_LEN + 1);
         vm.setBlockhash(EPOCH_LEN, bytes32(uint256(0xAA)));
-        v.registerPublicKey(keccak256("same-block"), DUMMY_KEY); // mutate in the freeze block
+        v.registerPublicKey(keccak256("same-block"), _keyFor(keccak256("same-block"))); // mutate in the freeze block
         v.snapshotEpoch(); // must NOT revert
         assertEq(v.epochSetCount(1), 3, "freezes pre-mutation (block-start) count, not 4");
         assertEq(v.epochSetRoot(1), rootBefore, "freezes pre-mutation root");
@@ -645,7 +663,7 @@ contract AAStarCommitteeValidatorTest is Test {
     function test_snapshot_includes_prior_block_mutation() public {
         _registerNodes(3);
         vm.roll(EPOCH_LEN - 1);
-        v.registerPublicKey(keccak256("prior-block"), DUMMY_KEY); // 4th node, earlier block
+        v.registerPublicKey(keccak256("prior-block"), _keyFor(keccak256("prior-block"))); // 4th node, earlier block
         vm.roll(EPOCH_LEN + 1);
         vm.setBlockhash(EPOCH_LEN, bytes32(uint256(0xAA)));
         v.snapshotEpoch();
@@ -732,5 +750,148 @@ contract AAStarCommitteeValidatorTest is Test {
         for (uint256 i = 0; i < len; i++) {
             out[i] = data[start + i];
         }
+    }
+
+    // ============================================================================================
+    //   CC-97 hardening — P1 minCommittee floor / P4 pubkey uniqueness / P5 eligibility-config bump
+    // ============================================================================================
+
+    // --- P1: minimum committee floor over the FROZEN pool ----------------------------------------
+
+    function test_floor_requiredQuorum_sentinel_below_min() public {
+        _registerNodes(2); // N=2 < minCommittee(3)
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        assertEq(v.requiredQuorum(), type(uint256).max, "N<min => unsatisfiable sentinel");
+    }
+
+    function test_floor_requiredQuorum_at_min() public {
+        _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        assertEq(v.requiredQuorum(), 2, "N=3 => ceil(2*3/3)=2");
+    }
+
+    /// @dev Decisive floor test: N=2 with BOTH nodes signing (k=2 == ceil(2*2/3)=2) satisfies the RATIO,
+    ///      so it passes WITHOUT the floor; the floor must reject it. Pair with
+    ///      test_floor_validate_passes_at_min, whose only difference is the pool size.
+    /// @dev Precisely: the two cases are not byte-identical — a third registered node changes the SMT root
+    ///      and every Merkle proof, so the payload is rebuilt (Codex round-1). What is held constant is the
+    ///      cryptographic verdict (BLS is mocked in this suite) and the quorum arithmetic: both cases carry
+    ///      k == requiredQuorum for their own pool. The only thing that decides them is the floor.
+    function test_floor_validate_rejects_below_min_even_at_full_quorum() public {
+        bytes32[] memory ids = _registerNodes(2);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        assertEq(v.validate(keccak256("op"), _payload(ACCOUNT, signers)), 1, "N<min fails even at full quorum");
+    }
+
+    function test_floor_validate_passes_at_min() public {
+        bytes32[] memory ids = _registerNodes(3); // only N differs vs the test above
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        assertEq(v.validate(keccak256("op"), _payload(ACCOUNT, signers)), 0, "N=min passes at quorum");
+    }
+
+    // --- P1: setMinCommittee governance ----------------------------------------------------------
+
+    function test_setMinCommittee_floor_is_three() public {
+        vm.expectRevert(bytes("minCommittee floor is 3"));
+        v.setMinCommittee(2);
+    }
+
+    function test_setMinCommittee_raise_bumps_configVersion_and_gates() public {
+        uint256 cvBefore = v.configVersion();
+        v.setMinCommittee(4);
+        assertEq(v.minCommittee(), 4, "min raised to 4");
+        assertEq(v.configVersion(), cvBefore + 1, "raising min bumps configVersion");
+        _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        assertEq(v.requiredQuorum(), type(uint256).max, "N=3 < raised min(4) => sentinel");
+    }
+
+    // --- P5: eligibility-config changes invalidate frozen snapshots ------------------------------
+
+    function test_setRequireStake_bumps_configVersion_and_failscloses_snapshot() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        bytes memory payload = _payload(ACCOUNT, signers);
+        assertEq(v.validate(keccak256("op"), payload), 0, "baseline valid");
+
+        uint256 cvBefore = v.configVersion();
+        v.setRequireStake(true);
+        assertEq(v.configVersion(), cvBefore + 1, "setRequireStake bumps configVersion (P5)");
+        assertEq(v.validate(keccak256("op"), payload), 1, "snapshot pinned under old eligibility policy is fail-closed");
+    }
+
+    function test_setMinStake_and_setRegistry_bump_configVersion() public {
+        uint256 cv0 = v.configVersion();
+        v.setMinStake(123);
+        assertEq(v.configVersion(), cv0 + 1, "setMinStake bumps configVersion (P5)");
+        v.setRegistry(address(0xBEEF));
+        assertEq(v.configVersion(), cv0 + 2, "setRegistry bumps configVersion (P5)");
+    }
+
+    // --- P4: pubkey uniqueness (reverse lock across all key-state transitions) --------------------
+
+    function test_pubkey_uniqueness_rejects_duplicate_register() public {
+        bytes memory shared = _keyFor(keccak256("shared-key"));
+        v.registerPublicKey(keccak256("na"), shared);
+        vm.expectRevert(bytes("pubkey already registered"));
+        v.registerPublicKey(keccak256("nb"), shared);
+    }
+
+    function test_pubkey_uniqueness_rejects_intra_batch_duplicate() public {
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = keccak256("b0");
+        ids[1] = keccak256("b1");
+        bytes[] memory keys = new bytes[](2);
+        keys[0] = _keyFor(keccak256("batch-shared"));
+        keys[1] = _keyFor(keccak256("batch-shared")); // same key twice in one batch
+        vm.expectRevert(bytes("pubkey already registered"));
+        v.batchRegisterPublicKeys(ids, keys);
+    }
+
+    function test_pubkey_uniqueness_freed_on_revoke() public {
+        bytes memory k = _keyFor(keccak256("reusable"));
+        v.registerPublicKey(keccak256("ra"), k);
+        v.revokePublicKey(keccak256("ra"));
+        v.registerPublicKey(keccak256("rb"), k); // freed => allowed
+        assertEq(v.nodeByPubkey(keccak256(k)), keccak256("rb"), "revoked key reusable by another node");
+    }
+
+    function test_pubkey_uniqueness_freed_on_syncNode_deactivate() public {
+        bytes memory k = _keyFor(keccak256("sync-key"));
+        v.registerPublicKey(keccak256("sa"), k);
+        v.setRequireStake(true); // bootstrap node now stale
+        v.syncNode(keccak256("sa")); // permissionless deactivate -> must free the key via _unbindPubkey
+        v.setRequireStake(false);
+        v.registerPublicKey(keccak256("sb"), k); // freed => reusable
+        assertEq(v.nodeByPubkey(keccak256(k)), keccak256("sb"), "syncNode deactivate frees the key");
+    }
+
+    function test_pubkey_uniqueness_update_rejects_live_then_allows_freed() public {
+        bytes memory ka = _keyFor(keccak256("ua-key"));
+        bytes memory kb = _keyFor(keccak256("ub-key"));
+        v.registerPublicKey(keccak256("ua"), ka);
+        v.registerPublicKey(keccak256("ub"), kb);
+        vm.expectRevert(bytes("pubkey already registered"));
+        v.updatePublicKey(keccak256("ua"), kb); // kb held by ub
+        v.revokePublicKey(keccak256("ub")); // frees kb
+        v.updatePublicKey(keccak256("ua"), kb);
+        assertEq(v.registeredKeys(keccak256("ua")), kb, "ua now holds the freed key");
+        assertEq(v.nodeByPubkey(keccak256(kb)), keccak256("ua"), "reverse lock points to ua");
+        assertEq(v.nodeByPubkey(keccak256(ka)), bytes32(0), "ua's old key is freed");
     }
 }

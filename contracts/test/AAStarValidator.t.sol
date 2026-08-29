@@ -468,14 +468,15 @@ contract AAStarValidatorTest is Test {
             console.log("Expected precompile error:", reason);
             assertTrue(true, "Precompile unavailable in test environment");
         }
-        // 4. Update a node's public key
-        validator.updatePublicKey(NODE_ID_1, PARTICIPANT_KEY_3);
-        assertEq(validator.registeredKeys(NODE_ID_1), PARTICIPANT_KEY_3, "Key should be updated");
-
-        // 5. Revoke a node
+        // 4. Revoke a node first — this frees its public key from the reverse lock (CC-97 P4).
         validator.revokePublicKey(NODE_ID_3);
         assertEq(validator.getRegisteredNodeCount(), 2, "Should have 2 nodes after revocation");
         assertFalse(validator.isRegistered(NODE_ID_3), "NODE_ID_3 should not be registered");
+
+        // 5. Update a node's public key to the now-freed KEY_3 — the reverse lock released it on revoke,
+        //    so the reuse is allowed (before revocation P4 would reject it: one key per live node).
+        validator.updatePublicKey(NODE_ID_1, PARTICIPANT_KEY_3);
+        assertEq(validator.registeredKeys(NODE_ID_1), PARTICIPANT_KEY_3, "Key should be updated");
 
         assertTrue(true, "Full node-based workflow completed successfully");
     }

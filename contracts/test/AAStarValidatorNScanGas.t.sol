@@ -18,6 +18,14 @@ import "../src/AAStarValidator.sol";
 ///         result is known). Δgas / Δn isolates the per-signer marginal.
 ///
 ///         Run: forge test --match-test test_validate_nscan -vv
+/// @dev Gas-benchmark seam ONLY: this scan intentionally registers many nodes under the SAME real G1
+///      generator so real G1 aggregation runs. Production forbids duplicate keys (CC-97 P4 reverse lock);
+///      the lock lives at REGISTRATION and never touches the measured validate() path, so skipping it here
+///      does not distort the per-signer marginal. MUST NOT be used outside gas benchmarks.
+contract MockGasValidator is AAStarValidator {
+    function _bindPubkey(bytes memory, bytes32) internal override {}
+}
+
 contract AAStarValidatorNScanGas is Test {
     AAStarValidator validator;
 
@@ -43,9 +51,9 @@ contract AAStarValidatorNScanGas is Test {
     bytes32[] ids5;
 
     function setUp() public {
-        v2 = new AAStarValidator();
-        v3 = new AAStarValidator();
-        v5 = new AAStarValidator();
+        v2 = new MockGasValidator();
+        v3 = new MockGasValidator();
+        v5 = new MockGasValidator();
         ids2 = _register(v2, 2);
         ids3 = _register(v3, 3);
         ids5 = _register(v5, 5);

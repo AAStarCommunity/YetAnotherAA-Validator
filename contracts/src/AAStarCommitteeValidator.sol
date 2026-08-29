@@ -131,6 +131,14 @@ contract AAStarCommitteeValidator is AAStarValidator {
     /// @dev Bumped on every epochLength change; namespaces all epoch snapshots to their schedule.
     uint256 public configVersion;
 
+    /// @dev Minimum FROZEN committee pool size (epochSetCount[e-1]) for committee mode to accept a
+    ///      tier-2/3 op. Below it, requiredQuorum() returns the unsatisfiable sentinel and validate()
+    ///      fails closed — the ⌈2m/3⌉ ratio alone is meaningless at tiny N (N=1 ⇒ quorum 1, a single
+    ///      node passes). Restores the agreed floor (CC-97) lost when the global-N model was rewritten
+    ///      per-proposal (#237). Owner-adjustable via setMinCommittee but with a HARD FLOOR of 3 (it may be
+///      raised above 3 and lowered back down to 3, never below); a change bumps configVersion.
+    uint256 public minCommittee;
+
     /// @dev Accounts that have self-enrolled for committee validation. validate() fails closed unless the
     ///      injected accountId maps to an enrolled account. This is DEFENSE-IN-DEPTH for the accountId
     ///      trust (pr-daemon B2, agreed with airaccount f444db89): the MANDATORY fix is the account
@@ -158,6 +166,9 @@ contract AAStarCommitteeValidator is AAStarValidator {
         // "free gift" (out of scope under the β<=10% assumption). Pinned by test_constructor_oversample.
         oversampleNum = 5;
         oversampleDen = 4;
+        // CC-97 floor: a committee of fewer than 3 nodes cannot carry BFT security; the ⌈2m/3⌉ ratio
+        // degenerates at tiny N (N=1 ⇒ quorum 1). Owner may raise it; the hard floor 3 is not settable away.
+        minCommittee = 3;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -183,6 +194,27 @@ contract AAStarCommitteeValidator is AAStarValidator {
         epochLength = _epochLength;
         configVersion += 1;
         emit EpochLengthSet(_epochLength);
+    }
+
+    event MinCommitteeSet(uint256 minCommittee);
+
+    /// @dev Committee floor with a HARD MINIMUM of 3 (the agreed CC-97 floor). The owner may raise it and
+    ///      may lower it back to — but never below — 3; keeping the lower bound settable back to 3 is the
+    ///      escape hatch for an over-raised floor (an accidental setMinCommittee(30) would otherwise halt
+    ///      tier-2/3 until the pool grew that large). Bumps configVersion so snapshots frozen under a
+    ///      different floor are not reused (same rationale as setEpochLength).
+    function setMinCommittee(uint256 _minCommittee) external onlyOwner {
+        require(_minCommittee >= 3, "minCommittee floor is 3");
+        minCommittee = _minCommittee;
+        configVersion += 1;
+        emit MinCommitteeSet(_minCommittee);
+    }
+
+    /// @dev requireStake / registry / minStake all change which frozen nodes still qualify as eligible
+    ///      signers. Bump configVersion so a snapshot pinned under the old eligibility policy is not reused
+    ///      under a new one (fails closed until re-pinned) — same rationale as setEpochLength/setOversample.
+    function _onEligibilityConfigChanged() internal override {
+        configVersion += 1;
     }
 
     /// @dev The threshold `oversample` scales the OTHER half of the committee definition, so — exactly
@@ -388,9 +420,14 @@ contract AAStarCommitteeValidator is AAStarValidator {
         // and consistent with validate()'s "return 1" for the same state (pr-daemon Medium).
         if (epochLength == 0) return type(uint256).max;
         uint256 e = block.number / epochLength;
-        if (e == 0 || !_epochUsable(e - 1)) return type(uint256).max;
-        uint256 m = expectedCommittee(epochSetCount[e - 1]);
-        return _quorumOf(m);
+        // Mirror validate()'s readiness exactly: it needs seed[e] AND setRoot[e-1]. Checking only e-1 here
+        // made the view report a satisfiable quorum right after an epoch boundary while every payload was
+        // still rejected for the missing current seed — unreliable for the account-side mirror and for
+        // monitoring (Codex round-1 Low). Fail-closed either way; this only aligns the two answers.
+        if (e == 0 || !_epochUsable(e) || !_epochUsable(e - 1)) return type(uint256).max;
+        uint256 n = epochSetCount[e - 1];
+        if (n < minCommittee) return type(uint256).max; // below floor ⇒ unsatisfiable (mirrors validate)
+        return _quorumOf(expectedCommittee(n));
     }
 
     /// @dev An epoch's snapshot is usable only if it was pinned AND under the current epoch schedule
@@ -426,6 +463,10 @@ contract AAStarCommitteeValidator is AAStarValidator {
             setRoot = epochSetRoot[e - 1];
             committedCount = epochSetCount[e - 1];
         }
+
+        // CC-97 FLOOR: a frozen pool below minCommittee can never carry committee security (the ⌈2m/3⌉
+        // ratio degenerates at tiny N). Fail closed, consistent with requiredQuorum()'s sentinel.
+        if (committedCount < minCommittee) return 1;
 
         bytes32 accountId = bytes32(signature[0:32]);
         // accountId MUST be the canonical zero-extension of a 160-bit address. The enrollment gate below
