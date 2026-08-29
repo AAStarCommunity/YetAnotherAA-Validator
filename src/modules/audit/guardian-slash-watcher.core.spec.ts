@@ -5,6 +5,7 @@ import {
   rawSlashMessageHash,
   computeSignersCommitment,
 } from "./guardian-fraud-proof.js";
+import type { BlsConsensusDomain } from "./bls-consensus-domain.js";
 
 const coder = ethers.AbiCoder.defaultAbiCoder();
 
@@ -13,8 +14,10 @@ const S2 = ethers.getAddress("0x0000000000000000000000000000000000002222");
 const S3 = ethers.getAddress("0x0000000000000000000000000000000000003333");
 const OPERATOR = ethers.getAddress("0x000000000000000000000000000000000000abcd");
 const AGG = ethers.getAddress("0x0000000000000000000000000000000000000a99");
+const REG = ethers.getAddress("0x00000000000000000000000000000000000000b5");
 
 const CHAIN_ID = 11155111n;
+const DOMAIN: BlsConsensusDomain = { chainId: CHAIN_ID, aggregator: AGG, registry: REG };
 const PID = 42n;
 const LEVEL = 2;
 const EPOCH = 1000n;
@@ -88,8 +91,8 @@ function verifyAndExecuteCalldata(evidenceHash = EVIDENCE): string {
 
 /** The commitment SP would store for this slash (what the watcher must reproduce). */
 function correctCommitment(): string {
-  const mh = rawSlashMessageHash(CHAIN_ID, PID, OPERATOR, LEVEL, EPOCH, EVIDENCE);
-  return computeSignersCommitment(AGG, CHAIN_ID, PID, mh, MASK, [S1, S2, S3]);
+  const mh = rawSlashMessageHash(DOMAIN, PID, OPERATOR, LEVEL, EPOCH, EVIDENCE);
+  return computeSignersCommitment(DOMAIN, PID, mh, MASK, [S1, S2, S3]);
 }
 
 describe("buildGuardianSignerRecord (CC-89 stage-2 watcher core)", () => {
@@ -105,6 +108,7 @@ describe("buildGuardianSignerRecord (CC-89 stage-2 watcher core)", () => {
     const rec = await buildGuardianSignerRecord(
       provider as unknown as ethers.Provider,
       AGG,
+      REG,
       CHAIN_ID,
       PID,
       TX_HASH,
@@ -125,6 +129,7 @@ describe("buildGuardianSignerRecord (CC-89 stage-2 watcher core)", () => {
     const rec = await buildGuardianSignerRecord(
       provider as unknown as ethers.Provider,
       AGG,
+      REG,
       CHAIN_ID,
       PID,
       TX_HASH,
@@ -143,6 +148,7 @@ describe("buildGuardianSignerRecord (CC-89 stage-2 watcher core)", () => {
     const rec = await buildGuardianSignerRecord(
       provider as unknown as ethers.Provider,
       AGG,
+      REG,
       CHAIN_ID,
       PID,
       TX_HASH,
@@ -161,6 +167,7 @@ describe("buildGuardianSignerRecord (CC-89 stage-2 watcher core)", () => {
       buildGuardianSignerRecord(
         provider as unknown as ethers.Provider,
         AGG,
+        REG,
         CHAIN_ID,
         99n, // event says 99, calldata says 42
         TX_HASH,
@@ -179,6 +186,7 @@ describe("buildGuardianSignerRecord (CC-89 stage-2 watcher core)", () => {
       buildGuardianSignerRecord(
         provider as unknown as ethers.Provider,
         AGG,
+        REG,
         CHAIN_ID,
         PID,
         TX_HASH,

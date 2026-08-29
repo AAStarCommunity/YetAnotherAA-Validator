@@ -18,6 +18,7 @@ import {
   buildSignerMask,
   recomputeMessageHash,
 } from "./slash-consensus.js";
+import type { BlsConsensusDomain } from "./bls-consensus-domain.js";
 
 /**
  * DVT Phase 2 (目标2, inc-2 live) — the REAL gossip-based BLS quorum co-signer.
@@ -42,6 +43,9 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
   private readonly logger = new Logger(GossipQuorumCoSigner.name);
 
   private readonly blsAggregatorAddress: string;
+  /** SP Registry + chainId — the other two BLS-consensus domain-separator fields (node-local). */
+  private readonly registryAddress: string;
+  private readonly chainId: bigint;
   private readonly maxSlots: number;
   private readonly timeoutMs: number;
   private readonly slashThresholds: { WARNING: number; MINOR: number; MAJOR: number };
@@ -75,6 +79,8 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
     config: ConfigService
   ) {
     this.blsAggregatorAddress = config.get<string>("auditBlsAggregatorAddress") ?? "";
+    this.registryAddress = config.get<string>("auditRegistryAddress") ?? "";
+    this.chainId = BigInt(config.get<number>("auditChainId") ?? 11155111);
     const maxSlots = config.get<number>("auditMaxSlots") ?? MAX_VALIDATORS;
     this.maxSlots =
       Number.isInteger(maxSlots) && maxSlots > 0 && maxSlots <= MAX_VALIDATORS
@@ -95,6 +101,19 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
     this.verifier = verifier;
     this.gossip.registerCoSignHandler(payload => this.verifyAndSign(payload));
     this.logger.log("Gossip quorum co-sign responder registered (armed)");
+  }
+
+  /**
+   * This node's OWN BLS-consensus domain. Used for EVERY messageHash recompute (both roles), so a
+   * signature is only ever produced for the aggregator/Registry/chain this node is configured for —
+   * the domain is NEVER taken from the (untrusted) request.
+   */
+  private blsDomain(): BlsConsensusDomain {
+    return {
+      chainId: this.chainId,
+      aggregator: this.blsAggregatorAddress,
+      registry: this.registryAddress,
+    };
   }
 
   // ── RESPONDER ───────────────────────────────────────────────────────────────────
@@ -141,7 +160,7 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       // 3. recompute the messageHash from first principles; NEVER trust req.messageHash.
       let localHash: string;
       try {
-        localHash = recomputeMessageHash(req);
+        localHash = recomputeMessageHash(req, this.blsDomain());
       } catch {
         return null;
       }
@@ -310,7 +329,7 @@ export class GossipQuorumCoSigner implements IQuorumCoSigner {
       }
 
       // The response MUST commit to the exact hash we recompute — never the requester's copy.
-      const expected = recomputeMessageHash(req);
+      const expected = recomputeMessageHash(req, this.blsDomain());
       if (String(resp.messageHash).toLowerCase() !== expected.toLowerCase()) return false;
 
       // Cryptographic verification of the compact G2 signature over hashToCurve(messageHash).

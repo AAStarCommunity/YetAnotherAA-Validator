@@ -23,6 +23,7 @@ import {
   buildExecuteMessageHash,
   encodeProof,
 } from "./slash-consensus.js";
+import type { BlsConsensusDomain } from "./bls-consensus-domain.js";
 
 /**
  * DVT Phase 2 (目标2) — autonomous audit of SuperPaymaster operators, increment 1.
@@ -1333,11 +1334,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       onchainProposalId !== null ? onchainProposalId.toString() : null;
     if (onchainProposalId !== null) {
       const executePreimage = buildExecuteMessageHash(
+        this.blsDomain(),
         onchainProposalId,
         v.operator,
         v.slashLevel,
         epoch,
-        this.chainId,
         proofHash
       );
       if (executeTx !== null) {
@@ -1546,6 +1547,19 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
    * signatures over the messageHash, build the signerMask bitmap by SP-assigned validator slot,
    * aggregate into sigG2 — lands once SP hands out slots via registerBLSPublicKey.
    */
+  /**
+   * This node's OWN BLS-consensus domain (chainId + aggregator + Registry) — the single value every
+   * slash-message/commitment recompute here binds to. Sourced only from local config, never a wire
+   * request, so a co-sign can only ever be valid on the aggregator this node is configured for.
+   */
+  private blsDomain(): BlsConsensusDomain {
+    return {
+      chainId: BigInt(this.chainId),
+      aggregator: this.blsAggregatorAddress,
+      registry: this.registryAddress,
+    };
+  }
+
   async coordinateQuorumCoSign(
     args: {
       operator: string;
@@ -1642,7 +1656,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       );
     } else if (armed) {
       try {
-        queueMessageHash = buildQueueMessageHash(operator, slashLevel, epoch, this.chainId);
+        queueMessageHash = buildQueueMessageHash(this.blsDomain(), operator, slashLevel, epoch);
         const cosign = await this.coSigner.coSign({
           proofSchemaVersion: PROOF_SCHEMA_VERSION,
           step: "queue",
@@ -1750,11 +1764,11 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
       } else {
         try {
           const execMsgHash = buildExecuteMessageHash(
+            this.blsDomain(),
             proposalId,
             operator,
             slashLevel,
             epoch,
-            this.chainId,
             evidenceHash
           );
           const cosign = await this.coSigner.coSign({

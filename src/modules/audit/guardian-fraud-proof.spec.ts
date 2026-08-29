@@ -23,6 +23,13 @@ const S3 = ethers.getAddress("0x0000000000000000000000000000000000003333");
 const OPERATOR = ethers.getAddress("0x000000000000000000000000000000000000abcd");
 const TOKEN = ethers.getAddress("0x000000000000000000000000000000000000beef");
 
+// Fixed BLS-consensus domain for the golden vector (mirrored in the Foundry test).
+const DOMAIN = {
+  chainId: 11155111n,
+  aggregator: ethers.getAddress("0x00000000000000000000000000000000000000a9"),
+  registry: ethers.getAddress("0x00000000000000000000000000000000000000b5"),
+};
+
 describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
   it("decodeSignerMaskFromBlsProof reads the first word of abi.encode(mask, sigG2)", () => {
     const proof = coder.encode(["uint256", "bytes"], [0x7n, "0xdeadbeef"]);
@@ -80,14 +87,14 @@ describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
 
   it("overIssueSlashMessageHash == rawSlashMessageHash with the fixed-preimage evidenceHash", () => {
     const raw = rawSlashMessageHash(
-      1n,
+      DOMAIN,
       42n,
       OPERATOR,
       2,
       1000n,
       overIssueEvidenceHash(TOKEN, OPERATOR, 1000n)
     );
-    expect(overIssueSlashMessageHash(1n, 42n, OPERATOR, 2, 1000n, TOKEN)).toBe(raw);
+    expect(overIssueSlashMessageHash(DOMAIN, 42n, OPERATOR, 2, 1000n, TOKEN)).toBe(raw);
   });
 
   describe("decodeVerifyAndExecuteCalldata (watcher calldata decode)", () => {
@@ -149,15 +156,16 @@ describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
     });
   });
 
-  it("computeSignersCommitment matches a golden vector (TS↔Solidity byte-alignment)", () => {
-    // Same fixed vector asserted in the Foundry test (OverIssueFraudProofVerifier.t.sol golden test):
-    // chainId=1, aggregator=0x…0A99, proposalId=42, operator=…abcd, slashLevel=2, epoch=1000,
-    // token=…beef, signerMask=0x7, claimedSigners=[S1,S2,S3]. If ethers and Solidity abi.encode
-    // ever diverge for these types, this hex changes and both suites break.
-    const AGG = ethers.getAddress("0x0000000000000000000000000000000000000a99");
-    const mh = overIssueSlashMessageHash(1n, 42n, OPERATOR, 2, 1000n, TOKEN);
-    const commitment = computeSignersCommitment(AGG, 1n, 42n, mh, 0x7n, [S1, S2, S3]);
-    expect(mh).toBe("0x593a53c8408d4f89674782c8cf0d3d2b3def99ac442ee6431f64e05965c50a46");
-    expect(commitment).toBe("0x8c38195124813c84cddbf33daca3efbb3f4718ba43167e6b30550229693f6588");
+  it("SP 4.11 slash message + signers commitment match a cross-language golden (TS↔Solidity)", () => {
+    // CROSS-LANGUAGE PIN. The SAME fixed vector is asserted in the Foundry test
+    // `test_Golden_CrossLanguage_SPLayout` (OverIssueFraudProofVerifier.t.sol): domain
+    // {chainId=11155111, aggregator=0x…00A9, registry=0x…00B5}, proposalId=42, operator=…abcd,
+    // slashLevel=2, epoch=1000, token=…beef, signerMask=0x7, claimedSigners=[S1,S2,S3]. If ethers
+    // and Solidity abi.encode ever diverge for the SP 4.11 domain layout, this hex changes and BOTH
+    // suites break — the contract↔TS drift guard the obsolete-format cutover had removed.
+    const mh = overIssueSlashMessageHash(DOMAIN, 42n, OPERATOR, 2, 1000n, TOKEN);
+    const commitment = computeSignersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3]);
+    expect(mh).toBe("0x7e794aa98ce38cd7e22a456963f67a1a7de057e15ee261a62373af7516cb820d");
+    expect(commitment).toBe("0xb35d1e5b965d5a628e796f584596cf57080b6b00f9c566226adf70990db15ad4");
   });
 });

@@ -478,6 +478,39 @@ contract OverIssueFraudProofVerifierTest is Test {
         );
     }
 
+    /// CROSS-LANGUAGE GOLDEN. The SAME fixed vector is asserted in the TS suite
+    /// (guardian-fraud-proof.spec.ts "SP 4.11 slash message + signers commitment ..."). A fresh
+    /// verifier is deployed with a FIXED domain (aggregator 0x…00A9, registry 0x…00B5, chainId
+    /// 11155111) so the domain separator is deterministic; the resulting slash message + A' commitment
+    /// must equal the hex the TS helper produces. If ethers and Solidity abi.encode ever drift for the
+    /// SP 4.11 layout, this and the TS assertion break together — the contract↔TS drift guard.
+    function test_Golden_CrossLanguage_SPLayout() public {
+        vm.chainId(11155111);
+        address goldenAgg = address(0xA9);
+        address goldenReg = address(0xB5);
+        OverIssueFraudProofVerifier gv = new OverIssueFraudProofVerifier(goldenAgg, goldenReg);
+        address goldenToken = address(0xBEEF);
+
+        bytes32 mh = gv.slashMessageHash(42, OPERATOR, 2, 1000, goldenToken);
+        assertEq(mh, bytes32(0x7e794aa98ce38cd7e22a456963f67a1a7de057e15ee261a62373af7516cb820d), "messageHash");
+
+        address[] memory signers = new address[](3);
+        signers[0] = S1;
+        signers[1] = S2;
+        signers[2] = S3;
+        bytes32 commitment = keccak256(
+            abi.encode(
+                gv.domainSeparator(),
+                keccak256("SuperPaymaster.BLS.SignersCommitment.v1"),
+                uint256(42),
+                mh,
+                uint256(0x7),
+                signers
+            )
+        );
+        assertEq(commitment, bytes32(0xb35d1e5b965d5a628e796f584596cf57080b6b00f9c566226adf70990db15ad4), "commitment");
+    }
+
     // ---- (CRITICAL #2 disclosure) current-token-state limitation, documented as a test ----
 
     /// NOT a desirable property — a DISCLOSURE. `isOverIssued()` is read at proof time, so the SAME
@@ -491,11 +524,11 @@ contract OverIssueFraudProofVerifierTest is Test {
         bytes32 d = _digest(_fpid(), guilty);
         bytes memory p = _proof(_claimed(), address(token));
 
-        token.setOver(false); // not over-issued now ⇒ "fraud proven"
+        token.setOver(false); // NOT over-issued now ⇒ the over-issue slash looks fraudulent ⇒ accepted
         assertTrue(verifier.verify(d, _fpid(), guilty, p), "accepted while not over-issued");
-        token.setOver(true); // supply repaired / manipulated ⇒ same proof now rejected
+        token.setOver(true); // over-issued now (slash looks justified, or an adversarial toggle) ⇒ rejected
         assertFalse(verifier.verify(d, _fpid(), guilty, p), "same proof rejected after state flip");
-        token.setOver(false); // ...and back again — verdict tracks CURRENT state, not the disputed epoch
+        token.setOver(false); // back to not-over-issued — verdict tracks CURRENT state, not the disputed epoch
         assertTrue(verifier.verify(d, _fpid(), guilty, p), "accepted again after flip back");
     }
 

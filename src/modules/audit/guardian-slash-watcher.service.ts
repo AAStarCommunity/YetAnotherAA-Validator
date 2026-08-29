@@ -55,6 +55,8 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
   private readonly logger = new Logger(GuardianSlashWatcherService.name);
   private readonly enabled: boolean;
   private readonly aggregatorAddress: string;
+  /** SP Registry — the 4th BLS-consensus domain-separator field; needed to reproduce SP's commitment. */
+  private readonly registryAddress: string;
   /** AUDIT_CHAIN_ID — cross-checked against the RPC's actual chain (shared fail-closed policy). */
   private readonly expectedChainId: number;
   /** Whether AUDIT_BLS_AGGREGATOR_ADDRESS was set explicitly (guards the Sepolia default). */
@@ -80,6 +82,7 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
   ) {
     this.enabled = this.config?.get<boolean>("auditGuardianWatchEnabled") === true;
     this.aggregatorAddress = this.config?.get<string>("auditBlsAggregatorAddress") ?? "";
+    this.registryAddress = this.config?.get<string>("auditRegistryAddress") ?? "";
     this.expectedChainId = this.config?.get<number>("auditChainId") ?? 0;
     this.aggregatorFromEnv = this.config?.get<boolean>("auditBlsAggregatorAddressFromEnv") === true;
     this.rpcUrl = this.config?.get<string>("ethRpcUrl") ?? "";
@@ -258,6 +261,7 @@ export class GuardianSlashWatcherService implements OnApplicationBootstrap, OnAp
       const record = await buildGuardianSignerRecord(
         this.provider!,
         this.aggregatorAddress,
+        this.registryAddress,
         this.chainId!,
         proposalId,
         txHash,

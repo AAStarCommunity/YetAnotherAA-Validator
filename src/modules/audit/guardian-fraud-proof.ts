@@ -1,4 +1,10 @@
 import { ethers } from "ethers";
+import {
+  BlsConsensusDomain,
+  executeSlashMessageHash,
+  reputationMessageHash,
+  signersCommitment,
+} from "./bls-consensus-domain.js";
 
 /**
  * CC-89 stage-2 (over-issue class) — the off-chain half that feeds
@@ -23,7 +29,6 @@ import { ethers } from "ethers";
 /** Domain tags — MUST match OverIssueFraudProofVerifier.sol exactly. */
 export const FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1";
 export const OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1";
-export const SIGNERS_COMMITMENT_TAG = "BLS_SIGNERS_COMMITMENT_V1";
 /** BLSAggregator.MAX_VALIDATORS. */
 export const MAX_VALIDATORS = 13;
 
@@ -160,58 +165,50 @@ export function encodeOverIssueFraudProof(i: OverIssueFraudProofInputs): string 
 }
 
 /**
- * Reconstruct SP's slash-only `expectedMessageHash` from a RAW evidenceHash (byte-identical to
- * BLSAggregator.verifyAndExecute's slash-only branch: `repUsers`/`newScores` empty, commits
- * `evidenceHash` + chainId). The watcher uses this with the evidenceHash it read from the
+ * Reconstruct SP's slash-only `expectedMessageHash` from a RAW evidenceHash — byte-identical to the
+ * LIVE BLSAggregator execute-slash branch (:977): `keccak256(abi.encode(domainSeparator,
+ * TAG_EXECUTE_SLASH, proposalId, operator, slashLevel, epoch, evidenceHash))`. The domain separator
+ * binds chainId+aggregator+Registry, so there is no raw chainId field and no empty rep arrays (the
+ * obsolete pre-4.11 shape). The watcher uses this with the evidenceHash it read from the
  * verifyAndExecute calldata — it does NOT need to know which token the slash cited.
  */
 export function rawSlashMessageHash(
-  chainId: bigint,
+  domain: BlsConsensusDomain,
   proposalId: bigint,
   operator: string,
   slashLevel: number,
   epoch: bigint,
   evidenceHash: string
 ): string {
-  return ethers.keccak256(
-    ethers.AbiCoder.defaultAbiCoder().encode(
-      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256", "bytes32"],
-      [proposalId, operator, slashLevel, [], [], epoch, chainId, evidenceHash]
-    )
-  );
+  return executeSlashMessageHash(domain, proposalId, operator, slashLevel, epoch, evidenceHash);
 }
 
 /**
- * Reconstruct SP's reputation/combined-path `expectedMessageHash` (7-field encoding, no
- * evidenceHash — BLSAggregator.verifyAndExecute's `repUsers.length > 0` branch). The watcher
- * needs this to self-check the commitment for combined proposals (operator slashed AND rep
- * updated); over-issue fraud proofs themselves only target the slash-only branch.
+ * Reconstruct SP's reputation/combined-path `expectedMessageHash` — byte-identical to the LIVE
+ * BLSAggregator reputation branch (:1330): `keccak256(abi.encode(domainSeparator, TAG_REPUTATION,
+ * proposalId, users, newScores, epoch))`. The watcher needs this to self-check the commitment for
+ * combined proposals; over-issue fraud proofs themselves only target the slash-only branch.
  */
 export function repSlashMessageHash(
-  chainId: bigint,
+  domain: BlsConsensusDomain,
   proposalId: bigint,
-  operator: string,
-  slashLevel: number,
+  _operator: string,
+  _slashLevel: number,
   repUsers: string[],
   newScores: bigint[],
   epoch: bigint
 ): string {
-  return ethers.keccak256(
-    ethers.AbiCoder.defaultAbiCoder().encode(
-      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256"],
-      [proposalId, operator, slashLevel, repUsers, newScores, epoch, chainId]
-    )
-  );
+  return reputationMessageHash(domain, proposalId, repUsers, newScores, epoch);
 }
 
 /**
- * Reconstruct SP's slash-only `expectedMessageHash` for the OVER-ISSUE class (binds the
- * disputed token via the fixed-preimage evidenceHash). Byte-identical to
- * `verifier.slashMessageHash` — this is what the fraud-proof ASSEMBLER uses when it knows the
- * token; the watcher uses `rawSlashMessageHash` with the on-chain evidenceHash instead.
+ * Reconstruct SP's slash-only `expectedMessageHash` for the OVER-ISSUE class (binds the disputed
+ * token via the fixed-preimage evidenceHash). Byte-identical to `verifier.slashMessageHash` — this
+ * is what the fraud-proof ASSEMBLER uses when it knows the token; the watcher uses
+ * `rawSlashMessageHash` with the on-chain evidenceHash instead.
  */
 export function overIssueSlashMessageHash(
-  chainId: bigint,
+  domain: BlsConsensusDomain,
   proposalId: bigint,
   operator: string,
   slashLevel: number,
@@ -219,7 +216,7 @@ export function overIssueSlashMessageHash(
   disputedToken: string
 ): string {
   return rawSlashMessageHash(
-    chainId,
+    domain,
     proposalId,
     operator,
     slashLevel,
@@ -273,30 +270,17 @@ export function decodeVerifyAndExecuteCalldata(data: string): VerifyAndExecuteAr
 }
 
 /**
- * Recompute SP's A' `proposalSignersCommitment` (byte-identical to `_computeSignersCommitment`).
- * The watcher can self-check that its assembled proof WILL pass on-chain before submitting.
- * `messageHash` must be built with the SAME chainId as `overIssueSlashMessageHash` used.
+ * Recompute SP's A' `proposalSignersCommitment` — byte-identical to the LIVE
+ * `_computeSignersCommitment` (:1299): `keccak256(abi.encode(domainSeparator, TAG_SIGNERS_COMMITMENT,
+ * proposalId, messageHash, signerMask, signers))`. The watcher can self-check that its assembled
+ * proof WILL pass on-chain before submitting. `messageHash` MUST be built with the SAME `domain`.
  */
 export function computeSignersCommitment(
-  aggregator: string,
-  chainId: bigint,
+  domain: BlsConsensusDomain,
   proposalId: bigint,
   messageHash: string,
   signerMask: bigint,
   claimedSigners: string[]
 ): string {
-  return ethers.keccak256(
-    ethers.AbiCoder.defaultAbiCoder().encode(
-      ["string", "uint256", "address", "uint256", "bytes32", "uint256", "address[]"],
-      [
-        SIGNERS_COMMITMENT_TAG,
-        chainId,
-        aggregator,
-        proposalId,
-        messageHash,
-        signerMask,
-        claimedSigners,
-      ]
-    )
-  );
+  return signersCommitment(domain, proposalId, messageHash, signerMask, claimedSigners);
 }

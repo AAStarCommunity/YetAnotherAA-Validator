@@ -23,6 +23,9 @@ import { bls, sigs, BLS_DST } from "../../utils/bls.util.js";
 const OPERATOR = ethers.getAddress("0x" + "12".repeat(20));
 const CHAIN_ID = 11155111;
 const BLS_AGG = ethers.getAddress("0x" + "aa".repeat(20));
+const BLS_REG = ethers.getAddress("0x" + "b5".repeat(20));
+// The node-local domain the cosigner recomputes with — MUST equal the config passed to makeConfig().
+const DOMAIN = { chainId: BigInt(CHAIN_ID), aggregator: BLS_AGG, registry: BLS_REG };
 const EPOCH = 12_345;
 const PROPOSAL_ID = "7";
 
@@ -109,6 +112,8 @@ function makeNode(privHex: string, nodeId = "node-1") {
 function makeConfig(overrides: Record<string, unknown> = {}) {
   const cfg: Record<string, unknown> = {
     auditBlsAggregatorAddress: BLS_AGG,
+    auditRegistryAddress: BLS_REG,
+    auditChainId: CHAIN_ID,
     auditMaxSlots: 13,
     auditCoSignTimeoutMs: 1000,
     auditSlashThresholds: { WARNING: 2, MINOR: 3, MAJOR: 3 },
@@ -153,11 +158,11 @@ function executeReq(overrides: Partial<CoSignRequest> = {}): CoSignRequest {
     proposalId: PROPOSAL_ID,
     evidenceHash,
     messageHash: buildExecuteMessageHash(
+      DOMAIN,
       BigInt(PROPOSAL_ID),
       OPERATOR,
       SlashLevel.MINOR,
       EPOCH,
-      CHAIN_ID,
       evidenceHash
     ),
     ...overrides,
@@ -246,7 +251,7 @@ describe("GossipQuorumCoSigner", () => {
     const forged = await peerResponse(PRIVS[1], 2, req.messageHash, "node-2");
     forged.signatureCompact = await signOver(
       PRIVS[1],
-      buildQueueMessageHash(OPERATOR, 1, EPOCH, CHAIN_ID)
+      buildQueueMessageHash(DOMAIN, OPERATOR, 1, EPOCH)
     );
     const good = await peerResponse(PRIVS[2], 3, req.messageHash, "node-3");
     const cs = new GossipQuorumCoSigner(
@@ -351,11 +356,11 @@ describe("GossipQuorumCoSigner", () => {
     const req = executeReq({
       slashLevel: SlashLevel.WARNING,
       messageHash: buildExecuteMessageHash(
+        DOMAIN,
         BigInt(PROPOSAL_ID),
         OPERATOR,
         SlashLevel.WARNING,
         EPOCH,
-        CHAIN_ID,
         "0x" + "ee".repeat(32)
       ),
     });
@@ -536,7 +541,7 @@ describe("GossipQuorumCoSigner", () => {
       // The queue request now CARRIES evidenceHash (the on-chain 5-field preimage still excludes it;
       // this only makes a queue quorum form when every signer agrees on the same evidence).
       evidenceHash: queueEvidence,
-      messageHash: buildQueueMessageHash(OPERATOR, SlashLevel.MINOR, EPOCH, CHAIN_ID),
+      messageHash: buildQueueMessageHash(DOMAIN, OPERATOR, SlashLevel.MINOR, EPOCH),
     };
     const cs = new GossipQuorumCoSigner(
       makeGossip([]),
@@ -560,7 +565,7 @@ describe("GossipQuorumCoSigner", () => {
       epoch: EPOCH,
       chainId: CHAIN_ID,
       evidenceHash: "0x" + "cc".repeat(32), // attacker-attached bogus evidence
-      messageHash: buildQueueMessageHash(OPERATOR, SlashLevel.MINOR, EPOCH, CHAIN_ID),
+      messageHash: buildQueueMessageHash(DOMAIN, OPERATOR, SlashLevel.MINOR, EPOCH),
     };
     const cs = new GossipQuorumCoSigner(
       makeGossip([]),
@@ -583,7 +588,7 @@ describe("GossipQuorumCoSigner", () => {
       slashLevel: SlashLevel.MINOR,
       epoch: EPOCH,
       chainId: CHAIN_ID,
-      messageHash: buildQueueMessageHash(OPERATOR, SlashLevel.MINOR, EPOCH, CHAIN_ID),
+      messageHash: buildQueueMessageHash(DOMAIN, OPERATOR, SlashLevel.MINOR, EPOCH),
     };
     const cs = new GossipQuorumCoSigner(
       makeGossip([]),
@@ -599,11 +604,11 @@ describe("GossipQuorumCoSigner", () => {
   // ── sigG2 aggregate round-trip (256B, re-verifies) ──────────────────────────────
   it("sigG2 aggregate round-trips: 3 real sigs → EIP-2537 256B → re-verifies", async () => {
     const messageHash = buildExecuteMessageHash(
+      DOMAIN,
       1n,
       OPERATOR,
       SlashLevel.MINOR,
       EPOCH,
-      CHAIN_ID,
       "0x" + "ee".repeat(32)
     );
     const msgPoint = await bls.G2.hashToCurve(ethers.getBytes(messageHash), { DST: BLS_DST });

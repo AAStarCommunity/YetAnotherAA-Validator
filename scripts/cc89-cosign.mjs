@@ -8,9 +8,14 @@
 // It just signs with the 3 LOCAL guardian keys (node_dev_00{1,2,3}.json) instead of over gossip —
 // which is correct for the testnet E2E where all 3 keys are on this machine (CLAUDE.md dev nodes).
 //
-// The messageHash is SP's slash-only expectedMessageHash:
-//   keccak256(abi.encode(proposalId, operator, slashLevel, [], [], epoch, chainId, evidenceHash))
+// The messageHash is SP 4.11's slash-only expectedMessageHash (BLSAggregator.sol:977):
+//   domainSeparator = keccak256(abi.encode(DOMAIN_NAME, chainId, aggregator, registry))
+//   messageHash     = keccak256(abi.encode(domainSeparator, TAG_EXECUTE_SLASH,
+//                                          proposalId, operator, slashLevel, epoch, evidenceHash))
 // and each key signs hashToCurve(messageHash, DST) — byte-identical to BLSAggregator._checkSignatures.
+// The Registry (4th domain field) is read from the aggregator on-chain and the locally-derived
+// domainSeparator is asserted == aggregator.domainSeparator() BEFORE signing — so the hash we sign is
+// provably the one the live contract reconstructs, not one we invented.
 //
 // Usage (real run — fields from SP):
 //   PROPOSAL_ID=42 OPERATOR=0x.. SLASH_LEVEL=1 EPOCH=100 \
@@ -29,6 +34,9 @@ const sigs = bls.longSignatures;
 // MUST equal SP BLSAggregator BLS.sol hashToG2 DST + src/utils/bls.util.ts BLS_DST.
 const BLS_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 const OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1"; // cross-repo, must match verifier
+// SP 4.11 BLS-consensus domain constants (BLSAggregator.sol:238/243/255) — keccak of the UTF-8 literal.
+const DOMAIN_NAME = ethers.id("SuperPaymaster.BLSConsensus.v1");
+const TAG_EXECUTE_SLASH = ethers.id("SuperPaymaster.BLS.ExecuteSlash.v1");
 const coder = ethers.AbiCoder.defaultAbiCoder();
 const die = m => {
   console.error("✗ " + m);
@@ -66,6 +74,8 @@ const aggregator = process.env.AGGREGATOR || die("AGGREGATOR required");
 const rpc =
   process.env.SEPOLIA_RPC_URL || process.env.ETH_RPC_URL || die("SEPOLIA_RPC_URL required");
 
+const provider = new ethers.JsonRpcProvider(rpc);
+
 // ---- 1. messageHash ---------------------------------------------------------
 let messageHash;
 if (selftest) {
@@ -87,11 +97,39 @@ if (selftest) {
     );
     console.log(`over-issue evidenceHash(${token}, ${operator}, ${epoch}) = ${evidenceHash}`);
   }
-  // SP slash-only expectedMessageHash (repUsers/newScores empty).
+
+  // Read the Registry (4th domain field) from the aggregator itself — authoritative, no hand-entry.
+  const domainProbe = new ethers.Contract(
+    aggregator,
+    [
+      "function REGISTRY() view returns (address)",
+      "function domainSeparator() view returns (bytes32)",
+    ],
+    provider
+  );
+  const registry = await domainProbe.REGISTRY();
+  const domainSeparator = ethers.keccak256(
+    coder.encode(
+      ["bytes32", "uint256", "address", "address"],
+      [DOMAIN_NAME, chainId, aggregator, registry]
+    )
+  );
+  // Strengthened self-check: prove the domain we are about to sign is the EXACT one the live
+  // contract reconstructs — not merely whatever hash we hand its generic verify(). A mismatch means
+  // wrong chainId/aggregator/Registry; signing would produce a proof SP's _checkSignatures rejects.
+  const onChainDomain = await domainProbe.domainSeparator();
+  if (onChainDomain.toLowerCase() !== domainSeparator.toLowerCase()) {
+    die(
+      `domainSeparator mismatch: local ${domainSeparator} != aggregator.domainSeparator() ${onChainDomain} ` +
+        `(chainId ${chainId} / aggregator ${aggregator} / registry ${registry})`
+    );
+  }
+  console.log(`domainSeparator (verified vs on-chain): ${domainSeparator}`);
+  // SP 4.11 slash-only expectedMessageHash (BLSAggregator.sol:977).
   messageHash = ethers.keccak256(
     coder.encode(
-      ["uint256", "address", "uint8", "address[]", "uint256[]", "uint256", "uint256", "bytes32"],
-      [proposalId, operator, slashLevel, [], [], epoch, chainId, evidenceHash]
+      ["bytes32", "bytes32", "uint256", "address", "uint8", "uint256", "bytes32"],
+      [domainSeparator, TAG_EXECUTE_SLASH, proposalId, operator, slashLevel, epoch, evidenceHash]
     )
   );
 }
@@ -106,7 +144,6 @@ const signerMask = 0x7n; // slots 1,2,3
 const proof = coder.encode(["uint256", "bytes"], [signerMask, sigG2]);
 
 // ---- 3. on-chain self-verify (definitive: passes ⇒ verifyAndExecute will accept) -----
-const provider = new ethers.JsonRpcProvider(rpc);
 const agg = new ethers.Contract(
   aggregator,
   ["function verify(bytes32,uint256,uint256,bytes) view returns (bool)"],

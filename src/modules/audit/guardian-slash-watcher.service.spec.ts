@@ -9,6 +9,7 @@ import {
   rawSlashMessageHash,
   computeSignersCommitment,
 } from "./guardian-fraud-proof.js";
+import type { BlsConsensusDomain } from "./bls-consensus-domain.js";
 import { SLASH_EXECUTED_EVENT } from "./guardian-slash-watcher.core.js";
 
 const coder = ethers.AbiCoder.defaultAbiCoder();
@@ -17,7 +18,9 @@ const S2 = ethers.getAddress("0x0000000000000000000000000000000000002222");
 const S3 = ethers.getAddress("0x0000000000000000000000000000000000003333");
 const OPERATOR = ethers.getAddress("0x000000000000000000000000000000000000abcd");
 const AGG = ethers.getAddress("0x0000000000000000000000000000000000000a99");
+const REG = ethers.getAddress("0x00000000000000000000000000000000000000b5");
 const CHAIN_ID = 11155111n;
+const DOMAIN: BlsConsensusDomain = { chainId: CHAIN_ID, aggregator: AGG, registry: REG };
 const MASK = 0x7n;
 const EPOCH = 1000n;
 const LEVEL = 2;
@@ -43,8 +46,8 @@ function calldataFor(pid: bigint): string {
   ]);
 }
 function commitmentFor(pid: bigint): string {
-  const mh = rawSlashMessageHash(CHAIN_ID, pid, OPERATOR, LEVEL, EPOCH, EVIDENCE);
-  return computeSignersCommitment(AGG, CHAIN_ID, pid, mh, MASK, [S1, S2, S3]);
+  const mh = rawSlashMessageHash(DOMAIN, pid, OPERATOR, LEVEL, EPOCH, EVIDENCE);
+  return computeSignersCommitment(DOMAIN, pid, mh, MASK, [S1, S2, S3]);
 }
 
 interface FakeLog {
@@ -103,6 +106,7 @@ function makeService(store: LocalGuardianSignerStore, provider: MockProvider) {
   (svc as any).provider = provider;
   (svc as any).chainId = CHAIN_ID;
   (svc as any).aggregatorAddress = AGG;
+  (svc as any).registryAddress = REG;
   (svc as any).slashExecutedTopic = TOPIC;
   (svc as any).fromBlock = 0;
   (svc as any).finalityConfirmations = 0;
