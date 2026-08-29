@@ -16,10 +16,15 @@ interface IOverIssuable {
 /**
  * @title OverIssueFraudProofVerifier
  * @notice CC-89 stage-2, over-issue class. Proves a guardian-collusion slash was fraudulent so
- *         `BLSAggregator.executeGuardianSlash` (SP PR #370) can slash the colluding guardians'
- *         ROLE_DVT stake. SP trusts only this verifier's boolean and never judges fraud itself.
+ *         `BLSAggregator.queueGuardianSlash / executeGuardianSlash` (SP PR #370, ABI ≥ 4.7.0) can
+ *         slash the colluding guardians' ROLE_DVT stake. SP trusts only this verifier's boolean and
+ *         never judges fraud itself.
  *
  * A fraud proof is accepted iff ALL hold (fail-closed → returns `false`, NEVER reverts):
+ *   0. `domainDigest` equals SP's canonical `fraudProofDigest(fraudProofId, guiltyGuardians)` recomputed
+ *      from THIS verifier's bound (block.chainid, AGGREGATOR, REGISTRY). This is the CC-115 B1 anti-replay
+ *      gate: a proof built for another chain / aggregator / Registry produces a different digest and is
+ *      refused, closing cross-contract replay from the DVT side (SuperPaymaster BLSAggregator §domain).
  *   1. `fraudProofId` is the canonical derivation of the disputed `proposalId` (content-bound).
  *   2. `claimedSigners` is canonical: strictly ascending by uint160, non-zero, bounded.
  *   3. The FULL disputed slash message is reconstructed from the proof's slash fields and matches
@@ -27,9 +32,19 @@ interface IOverIssuable {
  *      the recomputed `evidenceHash → messageHash → commitment` chain, so an attacker cannot take a
  *      real proposal's signer set and point it at an unrelated not-over-issued token to slash the
  *      honest guardians who signed it (the CC-89 Codex-review Critical).
- *   4. `guiltyGuardians ⊆ claimedSigners` — the commitment proves the SET, not that the accused are
- *      in it; without this a valid commitment could slash an innocent address.
+ *   4. `guiltyGuardians == claimedSigners` EXACTLY (not merely a subset). See SET-EXACT note below.
  *   5. the over-issue the slash cited is FALSE — the token is not over-issued → the slash was unjust.
+ *
+ * @dev SET-EXACT (CC-115 B1, supersedes the earlier `⊆` rule). The accused set must equal the committed
+ *      signer set, because the fraudProof is entirely CALLER-supplied: the only set an attacker cannot
+ *      forge is `claimedSigners` (it must reproduce SP's A' commitment). A subset-lenient verifier is
+ *      the CC-48 round-5 vector — a colluder front-runs an honest watcher's
+ *      `queueGuardianSlash(id, {A,B,C}, proof)` with `queueGuardianSlash(id, {A}, proof)`; the case opens
+ *      on {A}, burns the single-use `fraudProofId` FOR EVER, and B,C become permanently immune with an
+ *      on-chain record saying the matter was adjudicated. For the over-issue class this is also the
+ *      correct semantics: an UNJUST slash's ENTIRE signer set colluded, so the guilty set IS the signer
+ *      set. This is why the verifier passes SP's `FraudProofVerifierConformance.assertSetBound` (a
+ *      documented release gate), which the pre-existing `⊆` implementation would have failed.
  *
  * @dev EVIDENCE STRUCTURE (cross-repo alignment). The disputed slash's `evidenceHash` (opaque to SP,
  *      supplied by the slash filer) MUST be `keccak256(abi.encode(OVERISSUE_EVIDENCE_TAG, token,
@@ -48,14 +63,45 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
     string internal constant OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1";
     uint256 internal constant MAX_SIGNERS = 13; // == BLSAggregator.MAX_VALIDATORS
 
+    /// @notice SP's BLS-consensus domain-separator constants. Byte-for-byte identical to
+    ///         BLSAggregator.DOMAIN_NAME / TAG_FRAUD_PROOF — see SuperPaymaster
+    ///         contracts/src/modules/monitoring/BLSAggregator.sol:238,248,255,265.
+    bytes32 internal constant DOMAIN_NAME = keccak256("SuperPaymaster.BLSConsensus.v1");
+    bytes32 internal constant TAG_FRAUD_PROOF = keccak256("SuperPaymaster.BLS.FraudProof.v1");
+
     /// @notice The BLSAggregator whose commitment we read AND whose address SP bound into the
-    ///         commitment (`address(this)` in `_computeSignersCommitment`). The recompute only
-    ///         matches when this equals the aggregator that stored the commitment.
+    ///         commitment (`address(this)` in `_computeSignersCommitment`) and into the domain
+    ///         separator. The recompute only matches when this equals the aggregator that stored
+    ///         the commitment / computed `domainDigest`.
     address public immutable AGGREGATOR;
 
-    constructor(address aggregator) {
+    /// @notice SP's Registry, the fourth field of the BLS-consensus domain separator
+    ///         (`keccak256(abi.encode(DOMAIN_NAME, chainid, aggregator, REGISTRY))`). Bound here so the
+    ///         verifier reconstructs `domainDigest` byte-for-byte and refuses a proof issued for an
+    ///         aggregator wired to a different Registry.
+    address public immutable REGISTRY;
+
+    constructor(address aggregator, address registry) {
         require(aggregator != address(0), "aggregator=0");
+        require(registry != address(0), "registry=0");
         AGGREGATOR = aggregator;
+        REGISTRY = registry;
+    }
+
+    /// @notice SP's BLS-consensus domain separator for THIS (chain, aggregator, Registry).
+    ///         Mirrors BLSAggregator.domainSeparator().
+    function domainSeparator() public view returns (bytes32) {
+        return keccak256(abi.encode(DOMAIN_NAME, block.chainid, AGGREGATOR, REGISTRY));
+    }
+
+    /// @notice SP's canonical `fraudProofDigest` — the value SP passes as `domainDigest`.
+    ///         Mirrors BLSAggregator.fraudProofDigest(fraudProofId, guiltyGuardians) byte-for-byte.
+    function expectedFraudProofDigest(uint256 fraudProofId, address[] memory guiltyGuardians)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(domainSeparator(), TAG_FRAUD_PROOF, fraudProofId, guiltyGuardians));
     }
 
     /// @notice Canonical fraudProofId for a disputed proposal (callers derive the same value).
@@ -97,13 +143,13 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
      *      Wraps the real check in a self-staticcall so a malformed proof or a malicious
      *      `disputedToken` that reverts can only make verify return false — never revert.
      */
-    function verify(uint256 fraudProofId, address[] calldata guiltyGuardians, bytes calldata fraudProof)
-        external
-        view
-        override
-        returns (bool)
-    {
-        try this.check(fraudProofId, guiltyGuardians, fraudProof) returns (bool ok) {
+    function verify(
+        bytes32 domainDigest,
+        uint256 fraudProofId,
+        address[] calldata guiltyGuardians,
+        bytes calldata fraudProof
+    ) external view override returns (bool) {
+        try this.check(domainDigest, fraudProofId, guiltyGuardians, fraudProof) returns (bool ok) {
             return ok;
         } catch {
             return false; // fail-closed: decode revert, missing commitment call, or token revert
@@ -111,12 +157,19 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
     }
 
     /// @dev The real verification. External only so `verify` can try/catch it; self-call-gated.
-    function check(uint256 fraudProofId, address[] calldata guiltyGuardians, bytes calldata fraudProof)
-        external
-        view
-        returns (bool)
-    {
+    function check(
+        bytes32 domainDigest,
+        uint256 fraudProofId,
+        address[] calldata guiltyGuardians,
+        bytes calldata fraudProof
+    ) external view returns (bool) {
         require(msg.sender == address(this), "self only");
+
+        // 0. DOMAIN BINDING (CC-115 B1). The digest SP handed us MUST be the canonical
+        //    fraudProofDigest for THIS (chain, aggregator, Registry) over (fraudProofId, guiltyGuardians).
+        //    A proof built for another chain / aggregator / Registry yields a different digest → refused.
+        //    Checked BEFORE decoding so a wrong-domain proof is rejected regardless of its payload.
+        if (domainDigest != expectedFraudProofDigest(fraudProofId, guiltyGuardians)) return false;
 
         (
             uint256 proposalId,
@@ -136,13 +189,14 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
 
         // 3. Commitment check with disputedToken bound in via evidenceHash → messageHash (an
         //    attacker can't swap disputedToken without breaking evidenceHash → messageHash → commitment).
-        //    Extracted into a helper to keep this frame's local count low (coverage compiles without viaIR).
         if (!_commitmentMatches(proposalId, operator, slashLevel, epoch, disputedToken, signerMask, claimedSigners)) {
             return false;
         }
 
-        // 4. Subset: guiltyGuardians ⊆ claimedSigners (both strictly ascending → single merge pass).
-        if (!_isSubset(guiltyGuardians, claimedSigners)) return false;
+        // 4. SET-EXACT: guiltyGuardians == claimedSigners. `claimedSigners` is the only forgery-proof
+        //    set (it must reproduce SP's A' commitment); requiring exact equality blocks the CC-48
+        //    round-5 front-run-and-shrink vector and rejects any superset / reordering / duplicate.
+        if (!_isEqualSet(guiltyGuardians, claimedSigners)) return false;
 
         // 5. Over-issue evidence (E2E current-state variant; see contract @dev). A revert here bubbles
         //    to verify's catch → false (fail-closed). `false` ⇒ not over-issued ⇒ slash was fraudulent.
@@ -183,21 +237,15 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         return recomputed == anchor;
     }
 
-    /// @dev `sub ⊆ set` where BOTH are strictly ascending by uint160. Requires ≥1 accused.
-    function _isSubset(address[] calldata sub, address[] memory set) internal pure returns (bool) {
-        uint256 m = sub.length;
-        if (m == 0) return false;
-        uint256 j = 0;
-        uint256 len = set.length;
-        for (uint256 i = 0; i < m; i++) {
-            if (sub[i] == address(0)) return false;
-            if (i > 0 && uint160(sub[i - 1]) >= uint160(sub[i])) return false; // sub not canonical
-            while (j < len && uint160(set[j]) < uint160(sub[i])) {
-                unchecked {
-                    j++;
-                }
-            }
-            if (j >= len || set[j] != sub[i]) return false; // sub[i] not present in set
+    /// @dev Exact set equality: `a == b` element-wise. Because `b` (claimedSigners) is already
+    ///      verified canonical (ascending, non-zero), equality forces `a` to be canonical too — so a
+    ///      superset (different length), a reordering (element mismatch) and a duplicate (mismatch or
+    ///      non-canonical) all return false without a separate canonical pass over `a`.
+    function _isEqualSet(address[] calldata a, address[] memory b) internal pure returns (bool) {
+        uint256 n = b.length;
+        if (a.length != n) return false;
+        for (uint256 i = 0; i < n; i++) {
+            if (a[i] != b[i]) return false;
         }
         return true;
     }

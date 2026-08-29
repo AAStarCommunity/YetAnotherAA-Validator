@@ -3,26 +3,50 @@ pragma solidity ^0.8.19;
 
 /**
  * @title IFraudProofVerifier
- * @notice The seam BLSAggregator.executeGuardianSlash (SuperPaymaster PR #370) plugs into.
- *         SP trusts only an owner-set verifier and never judges fraud itself: it slashes the
- *         addresses in `guiltyGuardians` iff `verify(...)` returns true. Correctness of "are
- *         these guardians truly guilty" is entirely the verifier's job (CC-89 A').
+ * @notice The seam BLSAggregator.queueGuardianSlash (SuperPaymaster BLSAggregator ≥ 4.7.0, ABI
+ *         frozen through 4.11.0) plugs into. SP trusts only an owner-set verifier and never judges
+ *         fraud itself: it slashes the addresses in `guiltyGuardians` iff `verify(...)` returns true.
+ *         Correctness of "are these guardians truly guilty" is entirely the verifier's job (CC-89 A').
+ *
+ * @dev    CC-115 B1 — 4-parameter, DOMAIN-BOUND ABI. The selector is
+ *         `verify(bytes32,uint256,address[],bytes)` == 0x61077735 (unchanged since SP 4.7.0; the
+ *         4.9.0 bump is the aggregator's own ABI, not this seam's). SP invokes it as
+ *
+ *             verify(fraudProofDigest(fraudProofId, guiltyGuardians), fraudProofId,
+ *                    guiltyGuardians, fraudProof)
+ *
+ *         where `fraudProofDigest` binds (DOMAIN_NAME, block.chainid, aggregator, Registry) via the
+ *         BLS-consensus domain separator plus the fraud-proof path tag, `fraudProofId` and
+ *         `guiltyGuardians`. A conformant verifier MUST bind `domainDigest` INTO its accept/reject
+ *         decision (recompute the canonical digest and require byte equality) — merely accepting the
+ *         argument and ignoring it re-opens, from the DVT side, exactly the cross-contract / cross-chain
+ *         / cross-Registry replay the aggregator's domain separation closed. A comment is not a gate;
+ *         SP's `FraudProofVerifierConformance` fixture is.
  *
  * @dev    `view` — the fraud proof must reduce to on-chain-checkable facts (see
  *         docs/design/guardian-collusion-slash.md §4b). MUST fail-closed: any malformed input,
- *         missing/mismatched signer-set commitment, non-subset accusation, or unproven fraud
- *         returns `false` (never revert on a rejected proof — a revert would let the caller
- *         distinguish rejection reasons and grief the permissionless entry).
+ *         wrong domain, missing/mismatched signer-set commitment, non-canonical accusation, or
+ *         unproven fraud returns `false` (never revert on a rejected proof — a revert would let the
+ *         caller distinguish rejection reasons and grief the permissionless entry).
  */
 interface IFraudProofVerifier {
+    /// @param domainDigest    SP's canonical `fraudProofDigest(fraudProofId, guiltyGuardians)` — the
+    ///                        anti-replay domain separator binding (chainId, aggregator, Registry) +
+    ///                        the fraud-proof path tag + (fraudProofId, guiltyGuardians). The verifier
+    ///                        MUST recompute this from its own bound (aggregator, Registry) and reject
+    ///                        any mismatch, so a proof valid in one (chain, aggregator, Registry)
+    ///                        context cannot be replayed in another.
     /// @param fraudProofId    Replay-guard key (SP-side, per (proof,guardian)); the verifier binds it
     ///                        to the disputed content so a valid proof can't be filed under an unrelated id.
-    /// @param guiltyGuardians Addresses the caller wants slashed — the verifier MUST prove
-    ///                        `guiltyGuardians ⊆ claimedSigners` or a valid commitment could slash innocents.
+    /// @param guiltyGuardians Addresses the caller wants slashed — the verifier MUST prove the accused
+    ///                        set is EXACTLY the committed signer set (see OverIssueFraudProofVerifier),
+    ///                        so a caller cannot shrink the blame to a subset and permanently burn the id.
     /// @param fraudProof      Opaque proof bytes, decoded and interpreted solely by the verifier.
     /// @return ok             true iff the slash of `guiltyGuardians` is proven fraudulent-collusion.
-    function verify(uint256 fraudProofId, address[] calldata guiltyGuardians, bytes calldata fraudProof)
-        external
-        view
-        returns (bool ok);
+    function verify(
+        bytes32 domainDigest,
+        uint256 fraudProofId,
+        address[] calldata guiltyGuardians,
+        bytes calldata fraudProof
+    ) external view returns (bool ok);
 }

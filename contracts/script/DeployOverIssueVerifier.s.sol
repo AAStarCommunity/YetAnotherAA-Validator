@@ -33,10 +33,16 @@ pragma solidity ^0.8.19;
 import "forge-std/Script.sol";
 import "../src/verifiers/OverIssueFraudProofVerifier.sol";
 
-/// @dev Positive-identity probe: getters only a real A' BLSAggregator exposes.
+/// @dev Positive-identity probe: getters only a real A' BLSAggregator exposes, plus the
+///      domain-separator inputs CC-115 B1 binds into the verifier.
 interface IAggregatorProbe {
     function proposalSignersCommitment(uint256 proposalId) external view returns (bytes32);
     function validatorAtSlot(uint8 slot) external view returns (address);
+    function REGISTRY() external view returns (address);
+    function fraudProofDigest(uint256 fraudProofId, address[] calldata guiltyGuardians)
+        external
+        view
+        returns (bytes32);
 }
 
 contract DeployOverIssueVerifier is Script {
@@ -83,14 +89,41 @@ contract DeployOverIssueVerifier is Script {
             revert("AGGREGATOR is not a BLSAggregator (no validatorAtSlot)");
         }
 
+        // CC-115 B1: the verifier reconstructs SP's domain digest from (chainid, aggregator, REGISTRY),
+        // so REGISTRY must be the SAME Registry the aggregator is wired to. Read it from the aggregator
+        // itself (authoritative) rather than taking it as a hand-entered env — a mismatched Registry
+        // would silently make every domain digest differ and reject all proofs.
+        address registry;
+        try IAggregatorProbe(aggregator).REGISTRY() returns (address r) {
+            registry = r;
+        } catch {
+            revert("AGGREGATOR is not a domain-bound BLSAggregator (no REGISTRY)");
+        }
+        require(registry != address(0), "AGGREGATOR.REGISTRY() == 0");
+
         vm.startBroadcast();
-        OverIssueFraudProofVerifier verifier = new OverIssueFraudProofVerifier(aggregator);
+        OverIssueFraudProofVerifier verifier = new OverIssueFraudProofVerifier(aggregator, registry);
         vm.stopBroadcast();
 
-        console.log("=== CC-89 OverIssueFraudProofVerifier deployed ===");
+        // Byte-for-byte domain-conformance gate: the verifier's reconstructed digest MUST equal the
+        // aggregator's own `fraudProofDigest` for a probe (id, guardians). If SP's schema and the
+        // verifier's constants ever diverge, this fails HERE (post-deploy, pre-handoff) instead of
+        // silently rejecting every real proof on-chain.
+        address[] memory probeGuardians = new address[](2);
+        probeGuardians[0] = address(0x1111);
+        probeGuardians[1] = address(0x2222);
+        uint256 probeId = 42;
+        require(
+            verifier.expectedFraudProofDigest(probeId, probeGuardians)
+                == IAggregatorProbe(aggregator).fraudProofDigest(probeId, probeGuardians),
+            "domain digest mismatch: verifier not conformant with aggregator fraudProofDigest"
+        );
+
+        console.log("=== CC-89 / CC-115 B1 OverIssueFraudProofVerifier deployed ===");
         console.log("chainId:   ", block.chainid);
         console.log("verifier:  ", address(verifier));
         console.log("aggregator:", aggregator);
+        console.log("registry:  ", registry);
         console.log("Next: SP calls setFraudProofVerifier(", address(verifier), ")");
     }
 }
