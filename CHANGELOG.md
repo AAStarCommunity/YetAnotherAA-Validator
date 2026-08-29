@@ -4,6 +4,105 @@ All notable changes to YetAnotherAA-Validator (the DVT BLS signer node) are
 documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [1.15.0] — 2026-08-29 — CC-115 B1 domain-bound fraud-proof verifier + CC-97 committee floor
+
+Two security changes landed on master today (PRs #240, #241). Both are
+**source-level**: the contracts are non-upgradeable, so neither is live until a
+new validator is deployed and the router re-mounted. The deployed committee
+validator `0x1A8Db639…` still has **no** minimum-committee floor and still
+carries the pre-4.11 fraud-proof ABI.
+
+### Added — CC-115 B1: domain-bound 4-parameter fraud-proof verifier (#240)
+
+- `IFraudProofVerifier` / `OverIssueFraudProofVerifier` upgraded from
+  `verify(uint256,address[],bytes)` to SuperPaymaster 4.11's
+  **`verify(bytes32,uint256,address[],bytes)`** (selector **`0x61077735`**).
+  `domainDigest` is **recomputed and byte-compared** against the verifier's own
+  `(chainid, AGGREGATOR, REGISTRY, tag)` — it is bound, not merely accepted —
+  closing cross-chain / cross-aggregator / cross-Registry replay from the DVT
+  side. `REGISTRY` is now an immutable constructor argument.
+- Guilty-set rule tightened from `⊆ claimedSigners` to **SET-EXACT**, which SP's
+  `assertSetBound` release gate requires and which closes the
+  front-run-and-shrink vector (filing `(id,{A})` first burns the single-use
+  `fraudProofId` and leaves B and C permanently immune). SP confirmed from the
+  authoritative side that the verifier is the **only** enforcement point for
+  this property.
+- SP's `FraudProofVerifierConformance` fixture imported as a **byte-for-byte
+  verbatim copy** (SHA-256 `220bfa18…`; only deviations are an additive
+  provenance header and the pragma), and both release gates are run.
+
+### Fixed — CC-115 B1: inner commitment layout was pre-4.11 (#240)
+
+- `slashMessageHash` / the signers-commitment recompute used the obsolete
+  encoding (empty reputation arrays, a string tag, raw chainid). Live SP
+  commitments could therefore **never** verify, so genuine guardian fraud could
+  never be slashed. Both now match `BLSAggregator` byte-for-byte
+  (`domainSeparator() + TAG_EXECUTE_SLASH` / `+ TAG_SIGNERS_COMMITMENT`). The
+  previous tests missed this because the mock reproduced the verifier's own
+  format and drew its message hash from the verifier — circular; the suite is
+  now de-circularised with a decisive current-layout-accepted /
+  obsolete-layout-rejected pair.
+- The off-chain path had the same drift: the guardian co-signer, the fraud-proof
+  watcher, the filer and `cc89-cosign.mjs` all signed or verified the old hash,
+  so the slash path was broken end to end. All of them now route through one
+  shared source of truth, **`src/modules/audit/bls-consensus-domain.ts`**
+  (mirrored for plain ESM in `scripts/lib/bls-consensus-encoding.mjs`), and a
+  **cross-language golden** pins the same vector on both the TypeScript and
+  Foundry sides.
+
+### Added — CC-115 B1: fail-closed domain attestation (#240)
+
+- The gossip quorum co-signer and the guardian slash watcher now verify on-chain
+  that the locally configured domain equals `aggregator.domainSeparator()` (and
+  that the Registry matches) **before** co-signing or polling; a mismatch
+  refuses to arm / disables the watcher rather than mis-signing. **Armed nodes
+  must set `AUDIT_REGISTRY_ADDRESS` to the aggregator's real Registry.**
+- The shared commitment helper enforces canonical (strictly ascending, non-zero,
+  duplicate-free) signer order instead of silently hashing a wrong set.
+
+### Added — CC-97: committee minimum-size floor (#241)
+
+- `AAStarCommitteeValidator.minCommittee` (constructor `3`; `setMinCommittee` is
+  owner-only with a **hard floor of 3** and bumps `configVersion`). `validate()`
+  fails closed and `requiredQuorum()` returns the unsatisfiable sentinel when
+  the **frozen** pool is below it. Restores the floor agreed on 2026-08-16 that
+  was lost when the global-N model was scrapped for the per-proposal rewrite:
+  without it `ceil(2N/3)` degenerates at tiny N, so **N=1 gave quorum 1** and a
+  single staked node cleared tier-2/3.
+- **Pubkey uniqueness** (`nodeByPubkey` reverse lock) maintained through a
+  shared bind/unbind seam on every key-state transition, including intra-batch
+  duplicates. Without it the floor is satisfiable with fewer real keys than
+  nodes — the bootstrap path previously allowed one key under two nodeIds.
+- `setRegistry` / `setRequireStake` / `setMinStake` bump `configVersion` via a
+  new `_onEligibilityConfigChanged` hook, so a snapshot pinned under one
+  eligibility policy is not reused under another.
+
+### Known limitations (unchanged by this release)
+
+- **The floor is over the frozen REGISTERED pool, not a stake-verified one.**
+  The configVersion bump invalidates old snapshots; it does not make the next
+  one stake-clean, since nodes stay registered until `syncNode` evicts them.
+  Closing that needs eligible-set accounting + "currently staked", blocked on
+  the SuperPaymaster unbonding semantics (CC-112).
+- **With committee mode off (`epochLength == 0`) the legacy whole-set path still
+  has no floor and no quorum** — pre-existing behaviour, and the deploy script
+  ships committee mode off deliberately. Giving that fallback a quorum would
+  re-introduce the unscalable global-N model, so the alternative (an
+  account-side gate before committee activation) is open with
+  `airaccount-contract`.
+- The over-issue verifier still adjudicates against the token's **current**
+  `isOverIssued()` state, so a repaired supply can flip a once-justified slash.
+  It remains testnet/E2E-only and **must not be wired to a slash-capable
+  production deployment**.
+
+## [1.14.0] — 2026-08-18 — CC-98 per-proposal committee BLS validator (retroactive entry)
+
+Recorded here after the fact: `v1.14.0` was tagged and released on GitHub
+without a changelog entry. Content is the CC-98 per-proposal random-committee
+validator (`AAStarCommitteeValidator`, Sepolia
+`0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64`) plus the snapshot keeper and the
+aggregator Merkle proof generator (PRs #236–#239).
+
 ## [1.13.1] — 2026-08-15 — CC-89 follow-up: aggregator-default alignment + audit/watcher bootstrap fail-closure
 
 Backward-compatible hardening patch (raised on CC-90 by the KMS工兵: the DVT
