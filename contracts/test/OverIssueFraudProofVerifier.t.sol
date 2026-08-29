@@ -6,11 +6,14 @@ import {OverIssueFraudProofVerifier} from "../src/verifiers/OverIssueFraudProofV
 import {IFraudProofVerifier} from "../src/interfaces/IFraudProofVerifier.sol";
 import {FraudProofVerifierConformance as Conformance} from "./helpers/FraudProofVerifierConformance.sol";
 
-/// @dev Mirrors SuperPaymaster BLSAggregator (ABI ≥ 4.7.0) for the two things the DVT verifier reads:
-///      (a) the A' signer-set commitment (PR #371), and (b) the CC-48 domain-separated
-///      `fraudProofDigest` SP passes as `domainDigest`. Both encodings are byte-for-byte copies of
-///      SuperPaymaster contracts/src/modules/monitoring/BLSAggregator.sol (lines 238,248,255,265 +
-///      _computeSignersCommitment). `signers` MUST be pre-sorted ascending by uint160.
+/// @dev Independent re-implementation of the LIVE SuperPaymaster BLSAggregator encodings the DVT
+///      verifier must match — computed HERE from SP's published layout, NEVER by calling the verifier's
+///      helpers, so a format regression in the verifier cannot be masked (Codex MEDIUM #3). All
+///      encodings are byte-for-byte copies of SuperPaymaster
+///      contracts/src/modules/monitoring/BLSAggregator.sol: DOMAIN_NAME :238, TAG_EXECUTE_SLASH :243,
+///      TAG_SIGNERS_COMMITMENT :247, TAG_FRAUD_PROOF :248, domainSeparator() :255, fraudProofDigest()
+///      :265, execute-slash message :977, _computeSignersCommitment :1299.
+///      `signers` MUST be pre-sorted ascending by uint160.
 contract MockAggregator {
     mapping(uint256 => bytes32) public proposalSignersCommitment;
 
@@ -21,25 +24,11 @@ contract MockAggregator {
 
     bytes32 internal constant DOMAIN_NAME = keccak256("SuperPaymaster.BLSConsensus.v1");
     bytes32 internal constant TAG_FRAUD_PROOF = keccak256("SuperPaymaster.BLS.FraudProof.v1");
+    bytes32 internal constant TAG_EXECUTE_SLASH = keccak256("SuperPaymaster.BLS.ExecuteSlash.v1");
+    bytes32 internal constant TAG_SIGNERS_COMMITMENT = keccak256("SuperPaymaster.BLS.SignersCommitment.v1");
 
     constructor(address registry) {
         REGISTRY = registry;
-    }
-
-    function record(uint256 proposalId, bytes32 messageHash, uint256 signerMask, address[] memory sortedSigners)
-        external
-    {
-        proposalSignersCommitment[proposalId] = keccak256(
-            abi.encode(
-                "BLS_SIGNERS_COMMITMENT_V1",
-                block.chainid,
-                address(this),
-                proposalId,
-                messageHash,
-                signerMask,
-                sortedSigners
-            )
-        );
     }
 
     function domainSeparator() public view returns (bytes32) {
@@ -53,6 +42,46 @@ contract MockAggregator {
         returns (bytes32)
     {
         return keccak256(abi.encode(domainSeparator(), TAG_FRAUD_PROOF, fraudProofId, guiltyGuardians));
+    }
+
+    /// @notice SP execute-slash message pre-image (BLSAggregator.sol:977). `evidenceHash` is opaque to
+    ///         SP (the filer supplies it) — passed in raw here, exactly as SP treats it.
+    function slashMessage(uint256 proposalId, address operator, uint8 slashLevel, uint256 epoch, bytes32 evidenceHash)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encode(domainSeparator(), TAG_EXECUTE_SLASH, proposalId, operator, slashLevel, epoch, evidenceHash)
+        );
+    }
+
+    /// @notice Record an A' commitment in the CURRENT SP layout (BLSAggregator.sol:1299).
+    function recordSP(uint256 proposalId, bytes32 messageHash, uint256 signerMask, address[] memory sortedSigners)
+        external
+    {
+        proposalSignersCommitment[proposalId] = keccak256(
+            abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, sortedSigners)
+        );
+    }
+
+    /// @notice Record an A' commitment in the OBSOLETE pre-4.11 layout (string tag + raw
+    ///         chainid/aggregator). Exists ONLY to prove the verifier REJECTS stale commitments — the
+    ///         exact shape the pre-fix verifier reconstructed (Codex CRITICAL #1 anti-regression).
+    function recordOldFormat(uint256 proposalId, bytes32 oldMessageHash, uint256 signerMask, address[] memory sortedSigners)
+        external
+    {
+        proposalSignersCommitment[proposalId] = keccak256(
+            abi.encode(
+                "BLS_SIGNERS_COMMITMENT_V1",
+                block.chainid,
+                address(this),
+                proposalId,
+                oldMessageHash,
+                signerMask,
+                sortedSigners
+            )
+        );
     }
 }
 
@@ -106,11 +135,38 @@ contract OverIssueFraudProofVerifierTest is Test {
         a[2] = S3;
     }
 
-    /// records the commitment for a slash over `disputedToken`, using the verifier's own messageHash
-    /// reconstruction (so test + contract are guaranteed consistent).
+    /// The DVT over-issue evidence convention (keccak256(abi.encode(TAG, token, operator, epoch))).
+    /// Computed inline — a genuinely SHARED cross-repo value both filer and verifier must agree on —
+    /// so the mock never calls the verifier to obtain it (Codex MEDIUM #3 independence).
+    function _evidenceHash(address disputedToken) internal pure returns (bytes32) {
+        return keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", disputedToken, OPERATOR, EPOCH));
+    }
+
+    /// SP execute-slash messageHash (current 4.11 layout), built independently via the mock.
+    function _spMessageHash(address disputedToken) internal view returns (bytes32) {
+        return agg.slashMessage(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, _evidenceHash(disputedToken));
+    }
+
+    /// The OBSOLETE pre-4.11 execute-slash messageHash (raw chainid + empty rep arrays, no domain/tag).
+    function _oldMessageHash(address disputedToken) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                PROPOSAL_ID,
+                OPERATOR,
+                SLASH_LEVEL,
+                new address[](0),
+                new uint256[](0),
+                EPOCH,
+                block.chainid,
+                _evidenceHash(disputedToken)
+            )
+        );
+    }
+
+    /// records the commitment for a slash over `disputedToken` in the CURRENT SP layout, computed by
+    /// the mock independently of the verifier (so a verifier format regression is NOT masked).
     function _record(address[] memory signers, address disputedToken) internal {
-        bytes32 mh = verifier.slashMessageHash(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, disputedToken);
-        agg.record(PROPOSAL_ID, mh, SIGNER_MASK, signers);
+        agg.recordSP(PROPOSAL_ID, _spMessageHash(disputedToken), SIGNER_MASK, signers);
     }
 
     function _proof(address[] memory claimedSigners, address disputedToken) internal pure returns (bytes memory) {
@@ -375,24 +431,72 @@ contract OverIssueFraudProofVerifierTest is Test {
         assertFalse(ok, "old 3-param verify must not be callable");
     }
 
-    // ---- golden vector: Solidity commitment == the TS watcher's (byte-alignment) ----
+    // ---- (CRITICAL #1) inner reconstruction must match the LIVE SP 4.11 layout ----
 
-    function test_Golden_CommitmentByteAlignment_MatchesTS() public {
-        // Same fixed vector asserted in src/modules/audit/guardian-fraud-proof.spec.ts.
-        vm.chainId(1);
-        address AGG = address(0x0A99);
-        address goldToken = address(0xBEEF);
-        bytes32 mh = verifier.slashMessageHash(42, OPERATOR, 2, 1000, goldToken);
-        assertEq(mh, bytes32(0x593a53c8408d4f89674782c8cf0d3d2b3def99ac442ee6431f64e05965c50a46), "messageHash");
+    /// The decisive anti-regression test. A commitment stored in the CURRENT SP layout is accepted;
+    /// the SAME logical slash stored in the OBSOLETE pre-4.11 layout is rejected. The pre-fix verifier
+    /// reconstructed the obsolete layout, so real SP commitments could NEVER have verified — this pair
+    /// fails if the verifier's inner reconstruction regresses to either extreme.
+    function test_SPLayoutCommitment_Accepted() public {
+        _record(_claimed(), address(token)); // current 4.11 layout
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        assertTrue(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, _proof(_claimed(), address(token))));
+    }
 
-        address[] memory signers = new address[](3);
-        signers[0] = S1;
-        signers[1] = S2;
-        signers[2] = S3;
-        bytes32 commitment = keccak256(
-            abi.encode("BLS_SIGNERS_COMMITMENT_V1", block.chainid, AGG, uint256(42), mh, uint256(0x7), signers)
+    function test_OldFormatCommitment_Rejected() public {
+        // Obsolete pre-4.11 commitment (string tag + raw chainid/aggregator, old empty-array message).
+        agg.recordOldFormat(PROPOSAL_ID, _oldMessageHash(address(token)), SIGNER_MASK, _claimed());
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, _proof(_claimed(), address(token))));
+    }
+
+    /// `slashMessageHash` must equal SP's execute-slash pre-image (BLSAggregator.sol:977),
+    /// reconstructed INLINE here (not via any verifier state beyond its public domainSeparator).
+    function test_SlashMessageHash_MatchesSPExecuteSlashLayout() public view {
+        bytes32 expected = keccak256(
+            abi.encode(
+                verifier.domainSeparator(),
+                keccak256("SuperPaymaster.BLS.ExecuteSlash.v1"),
+                PROPOSAL_ID,
+                OPERATOR,
+                SLASH_LEVEL,
+                EPOCH,
+                _evidenceHash(address(token))
+            )
         );
-        assertEq(commitment, bytes32(0x8c38195124813c84cddbf33daca3efbb3f4718ba43167e6b30550229693f6588), "commitment");
+        assertEq(verifier.slashMessageHash(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token)), expected);
+    }
+
+    /// ...and it is NOT the obsolete layout — guards against a silent revert to the old encoding.
+    function test_SlashMessageHash_IsNotObsoleteLayout() public view {
+        assertTrue(
+            verifier.slashMessageHash(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token))
+                != _oldMessageHash(address(token)),
+            "slashMessageHash must not equal the pre-4.11 encoding"
+        );
+    }
+
+    // ---- (CRITICAL #2 disclosure) current-token-state limitation, documented as a test ----
+
+    /// NOT a desirable property — a DISCLOSURE. `isOverIssued()` is read at proof time, so the SAME
+    /// proof flips verdict with the token's current supply state (a later repair, or an adversarial
+    /// mutable token, re-slashes honest guardians). This test pins the limitation so it cannot regress
+    /// silently. See the contract-level "NOT PRODUCTION-SAFE" NatSpec: this verifier must not back a
+    /// slash-capable deployment until historical-state adjudication (§4b) lands.
+    function test_Disclosure_MutableTokenState_FlipsVerdict() public {
+        _record(_claimed(), address(token));
+        address[] memory guilty = _claimed();
+        bytes32 d = _digest(_fpid(), guilty);
+        bytes memory p = _proof(_claimed(), address(token));
+
+        token.setOver(false); // not over-issued now ⇒ "fraud proven"
+        assertTrue(verifier.verify(d, _fpid(), guilty, p), "accepted while not over-issued");
+        token.setOver(true); // supply repaired / manipulated ⇒ same proof now rejected
+        assertFalse(verifier.verify(d, _fpid(), guilty, p), "same proof rejected after state flip");
+        token.setOver(false); // ...and back again — verdict tracks CURRENT state, not the disputed epoch
+        assertTrue(verifier.verify(d, _fpid(), guilty, p), "accepted again after flip back");
     }
 
     function test_Check_NotSelfCallable() public {
@@ -439,9 +543,11 @@ contract OverIssueFraudProofVerifierConformanceTest is Test {
         token.setOver(false); // not over-issued ⇒ the disputed slash was fraudulent
         verifier = new OverIssueFraudProofVerifier(address(aggA), REGISTRY);
 
-        // Record the A' commitment on aggA for the exact claimed signer set.
-        bytes32 mh = verifier.slashMessageHash(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token));
-        aggA.record(PROPOSAL_ID, mh, SIGNER_MASK, _claimed());
+        // Record the A' commitment on aggA for the exact claimed signer set, in the CURRENT SP layout,
+        // built independently of the verifier (Codex MEDIUM #3).
+        bytes32 evidence = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", address(token), OPERATOR, EPOCH));
+        bytes32 mh = aggA.slashMessage(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, evidence);
+        aggA.recordSP(PROPOSAL_ID, mh, SIGNER_MASK, _claimed());
     }
 
     function _claimed() internal pure returns (address[] memory a) {

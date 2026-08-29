@@ -109,6 +109,13 @@ contract DeployOverIssueVerifier is Script {
         // aggregator's own `fraudProofDigest` for a probe (id, guardians). If SP's schema and the
         // verifier's constants ever diverge, this fails HERE (post-deploy, pre-handoff) instead of
         // silently rejecting every real proof on-chain.
+        //
+        // LOW-4 (config-control, not an on-chain exploit): the probes above and this parity check
+        // prove the target EXPOSES the expected getters and AGREES on the domain-digest schema — they
+        // do NOT prove it is the genuine, honest SP aggregator. A malicious contract can implement all
+        // these getters and return conformant values. The aggregator address AND its Registry MUST be
+        // pinned to canonical, source-verified deployments out-of-band (CANONICAL_AGGREGATOR /
+        // EXPECTED_AGGREGATOR above); do not treat passing these checks as identity proof.
         address[] memory probeGuardians = new address[](2);
         probeGuardians[0] = address(0x1111);
         probeGuardians[1] = address(0x2222);

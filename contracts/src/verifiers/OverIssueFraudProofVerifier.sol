@@ -51,22 +51,34 @@ interface IOverIssuable {
  *      operator, epoch))`. The E2E slash filer must file with exactly this — else the message
  *      reconstruction won't match and every proof is rejected.
  *
- * @dev STAGE / SCOPE. Step 5 reads the disputed token's CURRENT `isOverIssued()`. This is the
- *      **testnet-E2E variant**, sound ONLY while the token's over-issue state is held constant
- *      between the disputed slash and this proof. PRODUCTION must recompute against the disputed
- *      epoch-block state (BLOCKHASH + storage proof, bounded challenge window) — the historical-state
- *      gap in docs/design/guardian-collusion-slash.md §4b. NOT mainnet-ready as-is.
+ * @dev ⚠️ SECURITY — NOT PRODUCTION-SAFE / DO NOT WIRE TO A SLASH-CAPABLE DEPLOYMENT.
+ *      Step 5 reads the disputed token's CURRENT `isOverIssued()`. This is the **testnet-E2E variant**,
+ *      sound ONLY while the token's over-issue state is held constant between the disputed slash and
+ *      this proof. Because the read is current-state, the verdict is NOT bound to the disputed epoch:
+ *        • a token whose supply is later repaired (over-issue → fixed) flips a once-JUSTIFIED slash
+ *          into a "provable fraud", letting the colluders' victims be re-slashed — i.e. honest
+ *          guardians who correctly slashed a truly over-issuing token can themselves be slashed later;
+ *        • an adversarial MUTABLE token can return whatever `isOverIssued()` value serves the caller
+ *          at proof time.
+ *      This is the historical-state gap in docs/design/guardian-collusion-slash.md §4b. PRODUCTION
+ *      MUST recompute against the disputed epoch-block state (BLOCKHASH + storage proof, bounded
+ *      challenge window) before this verifier is set as an aggregator's `fraudProofVerifier` on any
+ *      deployment where `executeGuardianSlash` moves real stake. Test/E2E use only until that lands.
  */
 contract OverIssueFraudProofVerifier is IFraudProofVerifier {
-    string internal constant FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1";
-    string internal constant SIGNERS_COMMITMENT_TAG = "BLS_SIGNERS_COMMITMENT_V1"; // must match SP PR #371
-    string internal constant OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1";
+    string internal constant FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1"; // DVT-internal fraudProofId derivation
+    string internal constant OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1"; // DVT evidence convention
     uint256 internal constant MAX_SIGNERS = 13; // == BLSAggregator.MAX_VALIDATORS
 
-    /// @notice SP's BLS-consensus domain-separator constants. Byte-for-byte identical to
-    ///         BLSAggregator.DOMAIN_NAME / TAG_FRAUD_PROOF — see SuperPaymaster
-    ///         contracts/src/modules/monitoring/BLSAggregator.sol:238,248,255,265.
+    /// @notice SP's BLS-consensus domain-separator + path-tag constants, byte-for-byte identical to
+    ///         SuperPaymaster contracts/src/modules/monitoring/BLSAggregator.sol
+    ///         (DOMAIN_NAME :238, TAG_EXECUTE_SLASH :243, TAG_SIGNERS_COMMITMENT :247,
+    ///         TAG_FRAUD_PROOF :248, domainSeparator() :255, slash message :977, commitment :1299).
+    ///         These MUST match the LIVE aggregator or every recompute misses — the pre-4.11 layout
+    ///         (string tag + raw chainid/aggregator, empty rep arrays in the slash message) is gone.
     bytes32 internal constant DOMAIN_NAME = keccak256("SuperPaymaster.BLSConsensus.v1");
+    bytes32 internal constant TAG_EXECUTE_SLASH = keccak256("SuperPaymaster.BLS.ExecuteSlash.v1");
+    bytes32 internal constant TAG_SIGNERS_COMMITMENT = keccak256("SuperPaymaster.BLS.SignersCommitment.v1");
     bytes32 internal constant TAG_FRAUD_PROOF = keccak256("SuperPaymaster.BLS.FraudProof.v1");
 
     /// @notice The BLSAggregator whose commitment we read AND whose address SP bound into the
@@ -114,8 +126,13 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         return keccak256(abi.encode(OVERISSUE_EVIDENCE_TAG, disputedToken, operator, epoch));
     }
 
-    /// @notice Reconstruct SP's slash-only `expectedMessageHash` (byte-identical to
-    ///         BLSAggregator.verifyAndExecute's slash-path encoding: repUsers/newScores empty).
+    /// @notice Reconstruct SP's slash-only `expectedMessageHash`, byte-identical to the LIVE
+    ///         BLSAggregator execute-slash encoding (BLSAggregator.sol:977):
+    ///         keccak256(abi.encode(domainSeparator(), TAG_EXECUTE_SLASH, proposalId, operator,
+    ///                              slashLevel, epoch, evidenceHash)).
+    ///         `domainSeparator()` already binds chainid+aggregator+Registry, so there is no raw
+    ///         chainid field and no empty reputation arrays (that was the obsolete pre-4.11 shape).
+    ///         `evidenceHash` is the DVT-defined convention the slash filer MUST match.
     function slashMessageHash(uint256 proposalId, address operator, uint8 slashLevel, uint256 epoch, address disputedToken)
         public
         view
@@ -123,13 +140,12 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
     {
         return keccak256(
             abi.encode(
+                domainSeparator(),
+                TAG_EXECUTE_SLASH,
                 proposalId,
                 operator,
                 slashLevel,
-                new address[](0),
-                new uint256[](0),
                 epoch,
-                block.chainid,
                 evidenceHash(disputedToken, operator, epoch)
             )
         );
@@ -229,9 +245,13 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         bytes32 anchor = IBLSAggregatorCommitment(AGGREGATOR).proposalSignersCommitment(proposalId);
         if (anchor == bytes32(0)) return false; // not a recorded proposal
         bytes32 messageHash = slashMessageHash(proposalId, operator, slashLevel, epoch, disputedToken);
+        // Byte-identical to BLSAggregator._computeSignersCommitment (BLSAggregator.sol:1299):
+        // keccak256(abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash,
+        //                      signerMask, signers)). domainSeparator() binds chainid+aggregator+
+        // Registry, replacing the obsolete pre-4.11 `string tag + raw chainid + raw aggregator` shape.
         bytes32 recomputed = keccak256(
             abi.encode(
-                SIGNERS_COMMITMENT_TAG, block.chainid, AGGREGATOR, proposalId, messageHash, signerMask, claimedSigners
+                domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, claimedSigners
             )
         );
         return recomputed == anchor;
