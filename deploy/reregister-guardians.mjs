@@ -29,16 +29,20 @@
 // ------------------------------------
 // Every gate below runs for ALL nodes before ANY transaction is sent, and a single failure aborts the
 // whole run (no partial registration):
-//   1. aggregator has code, and `version()` equals the pinned expectation (override: --expect-version)
-//   2. `owner()` == the signer -> otherwise abort (see AUTHORIZATION)
-//   3. the private key in each node file actually owns the public key in that same file
+//   1. the connected chainId is printed, and must equal --chain-id when that is passed
+//   2. aggregator has code, and `version()` equals the pinned expectation (override: --expect-version)
+//   3. `owner()` == the signer -> otherwise abort (see AUTHORIZATION)
+//   4. `keccak(abi.encode(DOMAIN_NAME, chainid, address(this), REGISTRY))` reproduces the contract's
+//      own `domainSeparator()` — proves the PoP domain is bound to THIS aggregator (a PoP cannot be
+//      lifted from the old one) and that our view of the domain layout still matches SP's
+//   5. the private key in each node file actually owns the public key in that same file
 //      (derived pubkey must byte-match `publicKeyEip2537`) — catches a mixed-up/rotated key file
-//   4. the PoP verifies locally under the pairing check before it is ever submitted
-//   5. locally recomputed `popDigest` byte-matches the aggregator's own `popDigest()` view — this is
+//   6. the PoP verifies locally under the pairing check before it is ever submitted
+//   7. locally recomputed `popDigest` byte-matches the aggregator's own `popDigest()` view — this is
 //      what catches an abi.encode layout drift between SP's contract and this script
-//   6. `validatorAtSlot(slot)` is free or already this validator; `blsKeyOwner(keyHash)` is unset or
+//   8. `validatorAtSlot(slot)` is free or already this validator; `blsKeyOwner(keyHash)` is unset or
 //      already this validator (SP rejects one key under two addresses: DuplicatePublicKey)
-//   7. an eth_call dry-run of the real registration
+//   9. an eth_call dry-run of the real registration
 //
 // Dry-run is the DEFAULT. Nothing is broadcast without --broadcast.
 //
@@ -57,6 +61,7 @@
 //   node deploy/reregister-guardians.mjs --aggregator 0x... --env <path> --broadcast
 //   optional: --nodes node_dev_001.json,node_dev_002.json,node_dev_003.json
 //             --expect-version "BLSAggregator-4.11.0"   (only after re-verifying the new release)
+//             --chain-id 11155111                        (abort unless connected to this network)
 import { ethers } from "ethers";
 import { readFileSync } from "fs";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
@@ -75,6 +80,7 @@ const AGGREGATOR = flag("--aggregator") || process.env.BLS_AGGREGATOR_ADDRESS;
 const ENV_FILE = flag("--env") || process.env.DVT_ENV_FILE || ".env.sepolia";
 const NODE_FILES = (flag("--nodes") || DEFAULT_NODES.join(",")).split(",").map(s => s.trim()).filter(Boolean);
 const EXPECT_VERSION = flag("--expect-version") || DEFAULT_VERSION;
+const EXPECT_CHAIN_ID = flag("--chain-id") ? Number(flag("--chain-id")) : undefined;
 
 const die = msg => {
   console.error(`\n✗ ${msg}`);
@@ -100,16 +106,28 @@ try {
   die(`cannot read env file ${ENV_FILE}: ${e.message}\n  Sepolia credentials live in SuperPaymaster/.env.sepolia — pass --env <path>.`);
 }
 
-const RPC = process.env.SEPOLIA_RPC_URL || env.SEPOLIA_RPC_URL || env.ETH_RPC_URL || env.RPC_URL;
-const KEY = process.env.OWNER_PRIVATE_KEY || env.OWNER_PRIVATE_KEY || env.DEPLOYER_PRIVATE_KEY || env.PRIVATE_KEY;
+// THE ENV FILE WINS over ambient process.env. This is deliberate and was learned the hard way: an
+// exported SEPOLIA_RPC_URL left over in the shell silently overrode an explicitly-passed --env that
+// pointed at a local fork, so the script connected to REAL Sepolia while the operator believed it was
+// on the fork. It got worse: the fork deployment had landed on the same CREATE address as a real
+// deployment from the same account/nonce, so the address looked right too. Only the version() gate
+// caught it. `--env <path>` is an explicit instruction; ambient variables are the fallback, never the
+// override — this script signs transactions, so the quiet direction must be the safe one.
+const RPC = env.SEPOLIA_RPC_URL || env.ETH_RPC_URL || env.RPC_URL || process.env.SEPOLIA_RPC_URL;
+const KEY = env.OWNER_PRIVATE_KEY || env.DEPLOYER_PRIVATE_KEY || env.PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY;
 if (!RPC) die(`no RPC url in ${ENV_FILE} (SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL)`);
 if (!KEY) die(`no signing key in ${ENV_FILE} (OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY)`);
+if (process.env.SEPOLIA_RPC_URL && process.env.SEPOLIA_RPC_URL !== RPC) {
+  console.warn(`! ignoring ambient SEPOLIA_RPC_URL; ${ENV_FILE} wins (see the note above this check)`);
+}
 
 const ABI = [
   "function version() view returns (string)",
   "function owner() view returns (address)",
   "function domainSeparator() view returns (bytes32)",
   "function TAG_POP() view returns (bytes32)",
+  "function DOMAIN_NAME() view returns (bytes32)",
+  "function REGISTRY() view returns (address)",
   "function MAX_VALIDATORS() view returns (uint256)",
   "function validatorAtSlot(uint8) view returns (address)",
   "function blsKeyOwner(bytes32) view returns (address)",
@@ -155,10 +173,21 @@ async function main() {
   const wallet = new ethers.Wallet(KEY, provider);
   const agg = new ethers.Contract(AGGREGATOR, ABI, wallet);
 
+  // Print the network before anything else. The address alone is NOT enough to tell you which chain
+  // you are on: a CREATE from the same account at the same nonce lands on the same address on every
+  // chain, so a fork and its parent can host different contracts at one address.
+  const net = await provider.getNetwork();
+  const chainId = Number(net.chainId);
+  console.log(`rpc        : ${RPC.replace(/\/[^/]{16,}$/, "/<redacted>")}`);
+  console.log(`chainId    : ${chainId}${EXPECT_CHAIN_ID ? ` (expected ${EXPECT_CHAIN_ID})` : ""}`);
+  console.log(`block      : ${await provider.getBlockNumber()}`);
   console.log(`aggregator : ${AGGREGATOR}`);
   console.log(`signer     : ${wallet.address}`);
   console.log(`env file   : ${ENV_FILE}`);
   console.log(`mode       : ${BROADCAST ? "BROADCAST" : "dry-run (pass --broadcast to send)"}\n`);
+  if (EXPECT_CHAIN_ID && chainId !== EXPECT_CHAIN_ID) {
+    die(`wrong network: connected to chainId ${chainId}, expected ${EXPECT_CHAIN_ID}`);
+  }
 
   // ---- gate 1: the contract is the release we expect -------------------------------------------
   if ((await provider.getCode(AGGREGATOR)) === "0x") die(`no code at ${AGGREGATOR} on this chain`);
@@ -203,6 +232,26 @@ async function main() {
   const domainSep = await read("domainSeparator()", () => agg.domainSeparator());
   const tagPop = await read("TAG_POP()", () => agg.TAG_POP());
   const maxValidators = await read("MAX_VALIDATORS()", () => agg.MAX_VALIDATORS());
+  const domainName = await read("DOMAIN_NAME()", () => agg.DOMAIN_NAME());
+  const registryAddr = await read("REGISTRY()", () => agg.REGISTRY());
+
+  // Recompute the domain from its four inputs. This proves two things a bare read cannot: that the
+  // PoP domain really is bound to THIS aggregator address (so a PoP cannot be lifted from the old
+  // contract), and that this script's understanding of the domain layout still matches SP's.
+  const localDomain = ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["bytes32", "uint256", "address", "address"],
+      [domainName, chainId, AGGREGATOR, registryAddr]
+    )
+  );
+  if (localDomain.toLowerCase() !== domainSep.toLowerCase()) {
+    die(
+      `domainSeparator layout drift.\n` +
+        `  on-chain : ${domainSep}\n` +
+        `  local    : ${localDomain}\n` +
+        `  keccak(abi.encode(DOMAIN_NAME, chainid, address(this), REGISTRY)) no longer reproduces it.`
+    );
+  }
   console.log(`domainSep  : ${domainSep}`);
   console.log(`MAX_VALIDATORS: ${maxValidators}\n`);
 
@@ -299,9 +348,15 @@ async function main() {
   }
 
   console.log(`\nBroadcasting ${plans.length} registrations…`);
+  // Drive the nonce ourselves. Letting ethers infer it per call fails here: sending back-to-back from
+  // one wallet, the node can still answer eth_getTransactionCount with a pre-inclusion value even
+  // after `wait()` returned, and the next tx is rejected `nonce too low` — observed on the fork run,
+  // where slots 1 and 2 landed and slot 3 was rejected. An explicit counter is deterministic and
+  // makes the failure mode "this tx reverted", never "the tooling raced itself".
+  let nonce = await provider.getTransactionCount(wallet.address, "pending");
   const receipts = [];
   for (const p of plans) {
-    const tx = await agg.registerBLSPublicKey(p.validator, p.pkWords, p.slot, p.popWords);
+    const tx = await agg.registerBLSPublicKey(p.validator, p.pkWords, p.slot, p.popWords, { nonce: nonce++ });
     const rc = await tx.wait();
     if (rc.status !== 1) die(`${p.label}: tx ${tx.hash} reverted on-chain`);
     console.log(`✓ ${p.label}  slot ${p.slot}  tx ${tx.hash}  block ${rc.blockNumber}`);
