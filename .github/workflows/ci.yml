@@ -135,12 +135,19 @@ jobs:
         with:
           submodules: recursive
 
-      # PINNED, not `nightly`. An unpinned toolchain already cost this ecosystem real time:
-      # foundry stable moved to 1.8.1 on 2026-08-28 and broke airaccount-contract's whole suite
-      # (revm behaviour change — P256+BLS verified but cumulative/weighted tiers parsed as 0), which
-      # blocked CC-116 PR #208 until it pinned 1.7.1 in its own PR #209. `nightly` means the toolchain
-      # can move under a PR that changed nothing, and the failure looks like the PR's fault.
-      # 1.7.1 is the version this repo's suite is developed and verified against.
+      # PINNED, not `nightly`. `nightly` means the toolchain can move under a PR that changed
+      # nothing, and the resulting failure looks like that PR's fault. That already cost this
+      # ecosystem real time: foundry 1.8.x runs each top-level call inside a test as its own
+      # transaction, so EIP-1153 transient storage is cleared BETWEEN top-level calls. That broke
+      # airaccount-contract's suite, which passes algId from validateUserOp to execute() through a
+      # content-keyed transient slot (AAStarAirAccountBase.sol `tstore`/`tload`) — the slot read
+      # back as 0, surfacing as InsufficientTier(x, 0). It blocked CC-116 PR #208 until PR #209
+      # pinned 1.7.1 there.
+      #
+      # THIS repo is not exposed to that mechanism: its suite is green on BOTH 1.7.1 and 1.8.1
+      # (verified by pr-daemon on #247, same tree, binary swapped). The pin is preventive — it
+      # stops a future toolchain bump from landing silently on an unrelated PR. 1.7.1 is the
+      # version this repo's suite is developed against locally.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
