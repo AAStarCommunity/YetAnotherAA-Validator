@@ -201,16 +201,26 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///      deploy+mount+enroll accounts first, THEN setEpochLength.
     function setEpochLength(uint256 _epochLength) external onlyOwner {
         require(_epochLength == 0 || _epochLength >= 64, "epochLength must be 0 or >= 64");
-        // NOTE: there is deliberately NO block-count bound here. An earlier revision required
-        // `2 * epochLength * MIN_BLOCK_SECONDS <= GUARDIAN_EXIT_DELAY` and called 1s/block "the
-        // conservative direction". That reasoning was BACKWARDS: bounding how long 2L blocks take
-        // needs an UPPER bound on block time, and a lower one proves nothing. At 12s/block the same
-        // L=86400 spans ~24 days, during which a guardian can complete exitRole and withdraw while the
-        // old root is still serving committees — exactly the invariant this pillar claims to hold.
+        // TWO DIRECTIONS, and only one of them was wrong. An earlier revision required
+        // `2*L*MIN_BLOCK_SECONDS <= GUARDIAN_EXIT_DELAY`, calling 1s/block conservative; that proved
+        // nothing, because bounding how long 2L blocks TAKE needs an upper bound on block time. It was
+        // removed and SAFETY moved onto the clock (epochSetValidUntil, below).
         //
-        // The bond is enforced on the clock instead: every snapshot records `epochSetValidUntil` and
-        // `_epochUsable` fails closed past it, so the guarantee holds at any block time, and survives
-        // a chain halt.
+        // But LIVENESS needs the same inequality with the direction fixed, and deleting the broken
+        // bound deleted that too. `validate` requires BOTH `_epochUsable(e)` and `_epochUsable(e-1)`,
+        // so setRoot[e-1] must still be unexpired throughout e. If one epoch's wall-clock length
+        // approaches the bond window, the look-ahead set is already expired every time it is needed
+        // and committee mode fails closed FOREVER — from a governance call that looks legitimate, on
+        // a contract that cannot be upgraded.
+        //
+        // Here OVER-estimating block time is the conservative direction: it makes the accepted
+        // epochLength SHORTER. 24s allows for sustained missed slots at Ethereum's 12s cadence, and
+        // caps L at 3599 (~12h per epoch at 12s). Being wrong about it costs liveness, which fails
+        // closed and is visible — never a silent relaxation, which is how the previous bound failed.
+        require(
+            _epochLength == 0 || 2 * _epochLength * MAX_BLOCK_SECONDS < GUARDIAN_EXIT_DELAY,
+            "epochLength too long: setRoot[e-1] would expire during e"
+        );
         epochLength = _epochLength;
         configVersion += 1;
         emit EpochLengthSet(_epochLength);
@@ -220,6 +230,10 @@ contract AAStarCommitteeValidator is AAStarValidator {
 
     /// @notice SP's BLSAggregator, read at snapshot time for each operator's ROLE_DVT exit notice.
     address public blsAggregator;
+
+    /// @dev Upper bound on block time, used ONLY to bound epochLength for liveness. Note the
+    ///      direction — a MINIMUM here proves nothing, which is why the earlier bound was removed.
+    uint256 internal constant MAX_BLOCK_SECONDS = 24;
 
     /// @dev SP's `GUARDIAN_EXIT_DELAY` (BLSAggregator.sol:387) — a constant, not governable. A frozen
     ///      set stays usable for exactly this long, which is the window inside which SP guarantees a
@@ -347,6 +361,19 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///         within the 256-block window after the epoch's first block (blockhash availability), once.
     /// @dev The seed source is a FIXED past block (the epoch's first block), so no caller can grind it by
     ///      choosing when to call — only the block proposer has the standard bounded ~1-bit RANDAO bias.
+    /// @dev KNOWN OPERATIONAL CEILING, measured rather than assumed. This call is linear in the
+    ///      active-set size and the set has no on-chain cap: TREE_DEPTH = 14 allows 16,384 slots.
+    ///      Measured on the bootstrap path (a LOWER bound — it makes no external calls):
+    ///      N=10 -> 153,738 gas; 50 -> 202,109; 100 -> 263,163; 200 -> 387,231, i.e. ~1,229 gas/node.
+    ///      The staked path additionally makes two external view calls per node, so its slope is
+    ///      materially steeper (estimated 8-15k/node; NOT measured). At that slope a few thousand
+    ///      nodes push the pin past a 30M block limit — and a pin that cannot land fails the whole
+    ///      network closed for that epoch.
+    ///
+    ///      No N cap is imposed here on purpose: the committee curve is designed for pools up to
+    ///      20,000, so a hard limit would contradict the sizing this validator exists to implement.
+    ///      The real fix is a batched snapshot, which is future work. Until then this is an operating
+    ///      limit to be watched, not a guarantee — see docs/DVT_OPERATIONS.md.
     /// @param activeNodeIds The COMPLETE current active set, strictly increasing by nodeId. Supplying
     ///        it lets the snapshot verify eligibility for every member; the contract proves the list is
     ///        complete rather than trusting the caller (see below).

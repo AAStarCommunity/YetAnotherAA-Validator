@@ -82,6 +82,22 @@ N<30 走 whole-set BFT 2/3，没有抽样界。cap 86 控 calldata/gas。
       `syncNode` 会报 `Node still active`：SP 在整个 2 天通知期内**保留**
       role 和 stake，所以 stake 判据看它仍然健康。没有这条路径，一次**正常退出**就能让快照卡死两天。两个都是 permissionless。
   - `aggregator stale: re-run setBlsAggregator` → SP 轮换了 aggregator，见下。
+- **⚠️ 快照 gas 的运营上限（实测，非保证）**：`snapshotEpoch`
+  对活跃集大小线性，且链上**没有** N 上限（`TREE_DEPTH=14` ⇒
+  16,384 个槽位）。bootstrap 路径实测（**下界**，不含外部调用）：N=10 → 153,738
+  gas；50 → 202,109；100 → 263,163；200 → 387,231，约 **1,229
+  gas/节点**。质押路径每节点多两次外部 view 调用，斜率明显更陡（估 8–15k/节点，**未实测**）。按该斜率，**几千个节点**就会把 pin 推过 30M 区块上限 —— 而
+  **pin 不上等于该 epoch 全网 fail-close**。刻意不加硬上限：委员会曲线是按池规模到 20,000 设计的，硬限会与本验证器要实现的取值自相矛盾。根本解法是**分批快照**（未来工作）。在那之前请**监控活跃集规模**，并在接近前用
+  `syncNode`/`syncExitNotice` 清理失格节点。
+- **⚠️ `epochLength`
+  上界**：`2 · epochLength · 24s < GUARDIAN_EXIT_DELAY(2 days)` ⇒ **L ≤
+  3599**（12 秒出块 ≈ 12 小时/epoch）。这是 **liveness** 约束不是安全约束：
+  `validate` 同时需要 `_epochUsable(e)` 与
+  `_epochUsable(e-1)`，若一个 epoch 的墙钟时长逼近 2 天，`setRoot[e-1]` 在 `e`
+  里就已过期 →
+  committee 模式**永久 fail-close**。24 秒是出块时间的**上界**假设（允许持续 missed
+  slot）；高估是保守方向，猜错的代价是过度保守（fail-closed 可见），不是静默放松。
+- **⚠️ 链停摆超过 2 天**：所有已 pin 的快照按时钟过期，committee 模式 fail-close 直到 keeper 重新 pin。这是刻意的 —— 过期意味着「冻结时质押 ⟹ 仍可罚没」不再成立。
 - **⚠️ aggregator 轮换的迁移顺序（会短暂停摆，属预期）**：SP 先
   `Registry.setBLSAggregator(successor)`。此后本验证器的快照立即 fail-closed（宁可停也不能拿旧 ledger 判断——旧的对新 aggregator 上申报的通知一律返回「无通知」，那是静默 fail-open）。owner 随后
   `setBlsAggregator(successor)`，这会 **bump

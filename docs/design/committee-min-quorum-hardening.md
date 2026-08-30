@@ -317,9 +317,27 @@ still serving committees — precisely the invariant this pillar claims.
 
 Replaced with a wall-clock deadline: each snapshot records
 `epochSetValidUntil[e] = block.timestamp + GUARDIAN_EXIT_DELAY`, and
-`_epochUsable` fails closed past it. The guarantee then holds at any block time
-and survives a chain halt, and `setEpochLength` carries no block-count ceiling
-at all.
+`_epochUsable` fails closed past it (strictly — SP admits an exit at
+`block.timestamp == readyAt`). The guarantee then holds at any block time and
+survives a chain halt.
+
+**But deleting the broken bound deleted a correct one with it.** Safety no
+longer depends on block time; **liveness still does**. `validate` requires both
+`_epochUsable(e)` and `_epochUsable(e-1)`, so `setRoot[e-1]` must remain
+unexpired throughout `e`. If one epoch's wall-clock length approaches the bond
+window, the look-ahead set is already expired every time it is needed and
+committee mode fails closed **permanently** — from a governance call that looks
+legitimate, on a contract that cannot be upgraded. An intermediate revision of
+this branch even had a test _blessing_ `L = 200000` (~27.8 days per epoch at
+12s).
+
+`setEpochLength` therefore carries the same inequality with the direction fixed:
+`2 * epochLength * MAX_BLOCK_SECONDS < GUARDIAN_EXIT_DELAY`, with
+`MAX_BLOCK_SECONDS = 24` (sustained missed slots at Ethereum's 12s cadence),
+capping `L` at 3599 — about 12 hours per epoch at 12s. Here **over**-estimating
+block time is the conservative direction: it shortens the accepted epoch. Being
+wrong costs liveness, which fails closed and is visible — never the silent
+relaxation the previous bound would have produced.
 
 ### A ROLE_DVT exit notice needs its own permissionless eviction
 

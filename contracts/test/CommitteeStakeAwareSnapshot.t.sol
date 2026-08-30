@@ -485,16 +485,62 @@ contract CommitteeStakeAwareSnapshotTest is Test {
         assertFalse(v.exposedEpochUsable(2), "both snapshots expire on the clock");
     }
 
-    /// @notice The removed bound must NOT come back: a large epochLength is accepted, because safety no
-    ///         longer depends on how many blocks fit in two days.
-    function test_setEpochLength_no_longer_imposes_a_block_count_bound() public {
+    /// @notice ① An epochLength whose wall-clock length approaches the bond window must be REFUSED.
+    ///         An earlier revision of this test blessed L=200000 (~27.8 days per epoch at 12s), which
+    ///         would have made setRoot[e-1] expired every time `validate` needed it — committee mode
+    ///         permanently fail-closed, from a governance call that looks legitimate, on a contract
+    ///         that cannot be upgraded.
+    ///
+    ///         Deleting the old (wrongly-directed) bound deleted this one with it. Safety belongs on
+    ///         the clock; LIVENESS still needs the block-count inequality, with an UPPER bound on
+    ///         block time rather than a lower one.
+    function test_setEpochLength_refuses_an_epoch_that_outlives_the_bond_window() public {
+        vm.expectRevert("epochLength too long: setRoot[e-1] would expire during e");
         v.setEpochLength(200000);
-        assertEq(v.epochLength(), 200000, "no block-count ceiling");
+        // The boundary itself: 2 * L * MAX_BLOCK_SECONDS must be strictly under GUARDIAN_EXIT_DELAY.
+        uint256 maxOk = 2 days / (2 * 24) - 1; // 3599
+        v.setEpochLength(maxOk);
+        assertEq(v.epochLength(), maxOk, "the largest sound epochLength is accepted");
+        vm.expectRevert("epochLength too long: setRoot[e-1] would expire during e");
+        v.setEpochLength(maxOk + 1);
+    }
+
+    /// @notice ② The control: an ordinary epochLength still works, so the bound is not just "reject
+    ///         everything".
+    function test_setEpochLength_still_accepts_the_floor() public {
+        v.setEpochLength(64);
+        assertEq(v.epochLength(), 64, "the floor is unaffected");
+    }
+
+    /// @notice ③ THE PROPERTY the bound exists for, at the largest epochLength still accepted: pin
+    ///         e-1, advance a full epoch of wall-clock at the assumed WORST-CASE block time, pin e,
+    ///         and the look-ahead snapshot must still be usable. If this fails, committee mode is
+    ///         dead at that configuration no matter what the keeper does.
+    function test_look_ahead_survives_a_full_epoch_at_the_largest_accepted_length() public {
+        uint256 L = 2 days / (2 * 24) - 1; // 3599
+        v.setEpochLength(L);
+        reg.setBLSAggregator(address(agg));
+        v.setBlsAggregator(address(agg));
+
+        // Pin e-1 = 1.
+        vm.roll(L + 1);
+        vm.warp(block.timestamp + 24); // one block at worst-case cadence
+        vm.setBlockhash(L, bytes32(uint256(0xC1)));
+        v.snapshotEpoch(v.activeNodeIdsSorted());
+
+        // Advance a WHOLE epoch of wall clock at the worst-case block time, then pin e = 2.
+        vm.roll(2 * L + 1);
+        vm.warp(block.timestamp + L * 24);
+        vm.setBlockhash(2 * L, bytes32(uint256(0xC2)));
+        v.snapshotEpoch(v.activeNodeIdsSorted());
+
+        assertTrue(v.exposedEpochUsable(1), "the look-ahead set must survive the epoch that uses it");
+        assertTrue(v.exposedEpochUsable(2), "and the current epoch's seed is usable too");
     }
 
     function test_setEpochLength_still_allows_disabling_and_the_floor() public {
         v.setEpochLength(0);
-        assertEq(v.epochLength(), 0, "committee mode can still be switched off");
+        assertEq(v.epochLength(), 0, "committee mode can still be switched off (bound skips L==0)");
         vm.expectRevert("epochLength must be 0 or >= 64");
         v.setEpochLength(63);
     }
