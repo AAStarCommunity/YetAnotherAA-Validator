@@ -7,6 +7,9 @@
 //
 // While epochLength == 0 (committee mode OFF) snapshotEpoch reverts and this keeper idles.
 //
+// Works against BOTH validator generations: it selects `snapshotEpoch(bytes32[])` (CC-112 D2, #244) or
+// the pre-D2 `snapshotEpoch()` by looking for the selector in the deployed bytecode.
+//
 // env (.env.sepolia): SEPOLIA_RPC_URL, KEEPER_PRIVATE_KEY (or PRIVATE_KEY), COMMITTEE_VALIDATOR
 // Usage: node deploy/committee-keeper.mjs            (one pass)
 //        node deploy/committee-keeper.mjs --watch    (loop every ~30s)
@@ -23,6 +26,8 @@ const RPC = env.SEPOLIA_RPC_URL || env.ETH_RPC_URL;
 const KEY = env.KEEPER_PRIVATE_KEY || env.PRIVATE_KEY;
 const VALIDATOR = process.env.COMMITTEE_VALIDATOR || env.COMMITTEE_VALIDATOR || "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
 const WATCH = process.argv.includes("--watch");
+// keccak("snapshotEpoch(bytes32[])")[0:4], the D2 stake-aware form.
+const D2_SNAPSHOT_SELECTOR = "1ed58d67";
 
 const ABI = [
   "function epochLength() view returns(uint256)",
@@ -30,6 +35,9 @@ const ABI = [
   "function epochConfigVersion(uint256) view returns(uint256)",
   "function configVersion() view returns(uint256)",
   "function snapshotEpoch(bytes32[] activeNodeIds)",
+  // Pre-D2 validators (deployed before #244) expose the no-argument form. The live Sepolia validator
+  // 0x1A8Db639 is one of them, so a keeper that only knows the D2 shape cannot pin production at all.
+  "function snapshotEpoch()",
   "function isEligibleForSnapshot(bytes32) view returns(bool)",
   "function activeCount() view returns(uint256)",
   "event SlotAssigned(bytes32 indexed nodeId, uint256 slot)",
@@ -114,8 +122,18 @@ async function tick() {
     // Rebuilt from events rather than the contract's `activeNodeIdsSorted()` helper: that helper scans
     // the unbounded `registeredNodes` array and de-duplicates in O(n^2), which is fine for a local call
     // but is exactly what its own NatSpec tells production keepers not to rely on.
-    const activeIds = await activeSetFromEvents(v, provider);
-    const tx = await v.snapshotEpoch(activeIds);
+    // Pick the snapshotEpoch the DEPLOYED validator actually implements. #244 (CC-112 D2) changed the
+    // signature to take the complete active set; validators deployed before it only have the
+    // no-argument form. Selecting on the contract's own bytecode rather than assuming keeps one keeper
+    // able to operate both — without this, master's keeper silently could not pin the live validator,
+    // which is how epochs went unpinned and requiredQuorum() sat at the unsatisfiable sentinel while
+    // committeeActive() still read true (the worst intermediate state).
+    const code = await provider.getCode(VALIDATOR);
+    const hasStakeAware = code.includes(D2_SNAPSHOT_SELECTOR);
+    const tx = hasStakeAware
+      ? await v["snapshotEpoch(bytes32[])"](await activeSetFromEvents(v, provider))
+      : await v["snapshotEpoch()"]();
+    if (!hasStakeAware) console.log("  (pre-D2 validator: using the no-argument snapshotEpoch)");
     console.log("  snapshotEpoch tx:", tx.hash);
     const r = await tx.wait(1, 120000); // 120s timeout so a mispriced tx doesn't hang forever
     if (!r) { console.warn("  pin tx not mined within timeout — retry next tick"); return "timeout"; }
