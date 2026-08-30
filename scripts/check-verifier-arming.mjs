@@ -48,7 +48,20 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const SCAN_DIRS = ["contracts/script", "contracts/src", "docs", "scripts"];
+// Directories scanned recursively. `deploy/` was the gap pr-daemon found: it holds 21 files matching
+// SCAN_EXTS — dvt-testnet.sh, COMMUNITY_OPERATORS.md, TESTNET-TO-MAINNET.md and friends — i.e. exactly
+// the material an operator follows, and a real `cast send "$AGG" "setFraudProofVerifier(address)"`
+// placed there passed silently. `conformance/` and `signer/` are included for the same reason.
+const SCAN_DIRS = [
+  "contracts/script",
+  "contracts/src",
+  "docs",
+  "scripts",
+  "deploy",
+  "conformance",
+  "signer",
+  "src", // the signer service: a bare-name encodeFunctionData("setFraudProofVerifier", …) lives here
+];
 const SCAN_EXTS = [".sol", ".md", ".mjs", ".js", ".ts", ".sh", ".json"];
 const SELF = "scripts/check-verifier-arming.mjs";
 
@@ -265,6 +278,13 @@ const CALL_RE = /(?<![A-Za-z0-9_$])setFraudProofVerifier\s*\(/g;
 const ENCODED_RE =
   /setFraudProofVerifier\s*\(\s*address\s*\)|setFraudProofVerifier\s*\.\s*selector/g;
 
+/// @dev viem/ethers take the function NAME as a bare string: `encodeFunctionData("setFraudProofVerifier", [v])`.
+///      Matched only inside single/double-quoted literals and only in JS/TS sources — NatSpec and
+///      Markdown quote the name with BACKTICKS, which is how this repo's own prose refers to the
+///      removed setter, so restricting the quote characters keeps that prose legal.
+const BARE_NAME_RE = /(['"])setFraudProofVerifier\1/g;
+const JS_EXTS = [".mjs", ".js", ".ts"];
+
 const NAME_PATTERNS = [
   [CALL_RE, "direct call"],
   [ENCODED_RE, "encoded signature / selector"],
@@ -360,13 +380,32 @@ function scanView(view, original, kindSuffix, hits) {
   let n;
   while ((n = NUMERIC_RE.exec(view)) !== null) {
     // A denomination scales the literal, so apply it rather than ignore the literal.
-    const suffix = DENOMINATION_RE.exec(view.slice(n.index + n[0].length));
+    //
+    // BOTH lookups here are BOUNDED, and that is load-bearing rather than tidiness. They used to be
+    // `view.slice(n.index + len)` and `view.slice(0, n.index)`, which copy the entire suffix and
+    // prefix once PER NUMERAL — quadratic on its own — and the prefix was then matched against
+    // `(?:\s*-)*\s*$`, a nested quantifier anchored at the end. The code view is mostly runs of
+    // spaces (comments and string bodies are blanked), so that pattern backtracked catastrophically:
+    // one 39KB Solidity file took 12.4 of the checker's 23 seconds.
+    const LOOKAHEAD = 16; // longest denomination is "seconds" plus separating whitespace
+    const after = view.substr(n.index + n[0].length, LOOKAHEAD);
+    const suffix = DENOMINATION_RE.exec(after);
     const factor = suffix ? DENOMINATIONS[suffix[1]] : 1n;
     // An ODD number of leading minus signs makes the operand negative — never the selector. An even
-    // number (`- -x`) leaves it positive. Whitespace between them is skipped, so a minus on the
-    // previous line no longer produces a false positive.
-    const before = view.slice(0, n.index);
-    const minuses = (/(?:\s*-)*\s*$/.exec(before)?.[0].match(/-/g) || []).length;
+    // number (`- -x`) leaves it positive. Scanned backwards over a bounded window, stopping at the
+    // first character that is neither a sign nor whitespace.
+    const LOOKBEHIND = 64;
+    let minuses = 0;
+    for (let k = n.index - 1; k >= 0 && k >= n.index - LOOKBEHIND; k--) {
+      const ch = view[k];
+      if (ch === "-") {
+        minuses++;
+      } else if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+        continue;
+      } else {
+        break;
+      }
+    }
     if (minuses % 2 === 1) continue;
     if (isSelectorNumeral(n[0], factor)) {
       hits.push({
@@ -393,7 +432,7 @@ function scanHexLiterals(text, hits) {
  * @returns {{line:number, kind:string}[]} every place that INVOKES the removed setter.
  * @param isSolidity when true, `function setFraudProofVerifier(` declarations in CODE are exempt.
  */
-export function findSetterCalls(text, isSolidity = false) {
+export function findSetterCalls(text, isSolidity = false, isJs = false) {
   const hits = [];
   if (isSolidity) {
     const { code, comments, literals } = splitSolidity(text);
@@ -420,6 +459,13 @@ export function findSetterCalls(text, isSolidity = false) {
     scanView(text, text, "", hits);
   }
   scanHexLiterals(text, hits);
+  if (isJs) {
+    BARE_NAME_RE.lastIndex = 0;
+    let b;
+    while ((b = BARE_NAME_RE.exec(text)) !== null) {
+      hits.push({ line: lineOf(text, b.index), kind: "bare function name in a JS/TS string" });
+    }
+  }
   return hits.sort((a, b) => a.line - b.line);
 }
 
@@ -906,6 +952,23 @@ function selfTest() {
   for (const [name, src, sol] of mustNot) {
     if (findSetterCalls(src, sol).length !== 0)
       failures.push(`detector FALSE-POSITIVE: ${name} -> ${JSON.stringify(src)}`);
+  }
+
+  // Performance regression. The numeral scan used to slice the whole prefix and suffix per numeral and
+  // match the prefix against a nested quantifier, which made a single 39KB Solidity file take 12.4s.
+  // A real source file is the fixture, because the pathological input is ordinary blanked-out code.
+  {
+    const solidityLike =
+      "// a comment line that gets blanked to spaces\n".repeat(400) +
+      "contract C { uint256 a = 1; uint256 b = 2; uint256 c = 0x1234; }\n".repeat(200);
+    const started = Date.now();
+    findSetterCalls(solidityLike, true);
+    const elapsed = Date.now() - started;
+    if (elapsed > 1000) {
+      failures.push(
+        `numeral scanning is superlinear: ${elapsed}ms on a ${solidityLike.length}-char source`
+      );
+    }
   }
 
   // ReDoS regression (CodeQL high-severity finding on the first push). The literal-gap test used to
@@ -1420,7 +1483,17 @@ function runbookSelfTest() {
 // Generated / vendored trees only. Deliberately does NOT skip directories named `lib`: `scripts/lib`
 // is first-party code that must be scanned, and the forge submodule tree `contracts/lib` is already
 // out of reach because SCAN_DIRS names `contracts/script` and `contracts/src` rather than `contracts`.
-const SKIP_DIRS = new Set(["node_modules", "out", "cache", "broadcast", "artifacts"]);
+const SKIP_DIRS = new Set([
+  "node_modules",
+  "out",
+  "cache",
+  "broadcast",
+  "artifacts",
+  "target", // Rust build output under signer/ — 171 matching files, and 36s of scan time
+  "dist",
+  "coverage",
+  ".git",
+]);
 
 function walk(dir, out = []) {
   let entries;
@@ -1451,10 +1524,23 @@ errors.push(...selfTest());
 
 if (!process.argv.includes("--self-test-only")) {
   // --- Gate 1: nothing may INVOKE the removed setter ---------------------------------------------
-  for (const file of SCAN_DIRS.flatMap(d => walk(join(ROOT, d)))) {
+  // Repository-root files are scanned NON-recursively: adding "." to SCAN_DIRS walks the whole tree
+  // (node_modules, contracts/lib, out/) and times out, so the root is handled as a flat list. README.md
+  // and the other top-level operator-facing docs live here.
+  const rootFiles = readdirSync(ROOT)
+    .map(n => join(ROOT, n))
+    .filter(f => {
+      try {
+        return statSync(f).isFile() && SCAN_EXTS.some(e => f.endsWith(e));
+      } catch {
+        return false;
+      }
+    });
+  for (const file of [...SCAN_DIRS.flatMap(d => walk(join(ROOT, d))), ...rootFiles]) {
     const rel = relative(ROOT, file);
     if (rel === SELF) continue;
-    for (const hit of findSetterCalls(readFileSync(file, "utf8"), rel.endsWith(".sol"))) {
+    const isJs = JS_EXTS.some(e => rel.endsWith(e));
+    for (const hit of findSetterCalls(readFileSync(file, "utf8"), rel.endsWith(".sol"), isJs)) {
       errors.push(
         `${rel}:${hit.line}: invokes the removed setter \`setFraudProofVerifier\` (${hit.kind}). ` +
           `Use proposeFraudProofVerifier -> full VERIFIER_ROTATION_DELAY (4 days) -> applyFraudProofVerifier.`
