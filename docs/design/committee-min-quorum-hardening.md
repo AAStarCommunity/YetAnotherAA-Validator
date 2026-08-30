@@ -192,7 +192,12 @@ Note the deliberate separation of **pool `n`** / **nominal target `m`** /
   non-zero `aggregator()` cannot route around it. pr-daemon verified each gate
   with two-directional mutation (delete a gate → its test reddens; move the
   triple gate after the deferral without deleting it → only the ordering test
-  reddens), and Codex independently confirmed there is no fourth BLS path.
+  reddens), and **enumerated the `_blsAlgMode()` / `_verifyAgg` call sites** to
+  establish there is no fourth BLS path. Codex independently confirmed three
+  adjacent properties — the owner-direct and executor paths force ECDSA, the
+  fallback exposes no execution entry point, and `executeUserOp` refills the
+  session context before the delegatecall. It is the two together that close "no
+  fourth path"; neither does it alone.
 
   **The DVT-side precondition this relies on, verified here:**
   `committeeActive()` returns `epochLength != 0`
