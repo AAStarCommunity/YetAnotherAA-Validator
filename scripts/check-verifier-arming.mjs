@@ -38,6 +38,10 @@
  *    concluded no bounded rule existed. Its residue — a shortcut naming no arming object — is a
  *    fixtured, documented limit.
  *  - `.mjs` is outside this repo's Prettier glob, so this file's formatting is not CI-enforced.
+ *  - This checker does NOT verify that ci.yml keeps its `timeout-minutes` bounds. They are what makes
+ *    a hanging regression fail in minutes rather than after GitHub's 360-minute default, but a job
+ *    added without one passes here. Enforcing it would mean this gate policing unrelated CI config;
+ *    it belongs in a separate check, and until one exists the bound is a convention, not a guarantee.
  *  - A bare function name passed in a JS/TS TEMPLATE literal is NOT detected:
  *    `encodeFunctionData(\`setFraudProofVerifier\`, [v])` passes, while the same line with double
  *    quotes is caught. Backticks are excluded on purpose — this repo's own prose and NatSpec quote
@@ -972,9 +976,14 @@ function selfTest() {
   // `findSetterCalls` returns, and on this input the old code never does. The message below is
   // therefore a diagnostic for a MILD regression; a severe one hangs.
   //
-  // "A hang is still a failure" is only true because CI bounds it: every job in ci.yml carries an
-  // explicit `timeout-minutes`. Without one GitHub's default is 360, so the same regression would
-  // have burned a runner for six hours and failed with nothing in the log explaining why.
+  // "A hang is still a failure" is only true because CI bounds it. AS OF THIS COMMIT every job in
+  // ci.yml carries an explicit `timeout-minutes`; without one GitHub's default is 360, so the same
+  // regression would burn a runner for six hours and fail with nothing in the log explaining why.
+  //
+  // That is a STATEMENT ABOUT TODAY, not an invariant — nothing here enforces it, and a ninth job
+  // added without a bound passes this checker. Deliberately not enforced HERE: this file is the
+  // arming gate, and having it police unrelated CI configuration is the kind of scope drift that
+  // makes a checker nobody can reason about. Pinning it properly belongs in its own check.
   {
     const solidityLike =
       "// a comment line that gets blanked to spaces\n".repeat(400) +
