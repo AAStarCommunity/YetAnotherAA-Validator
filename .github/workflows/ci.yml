@@ -147,7 +147,8 @@ jobs:
       # THIS repo is not exposed to that mechanism: its suite is green on BOTH 1.7.1 and 1.8.1
       # (verified by pr-daemon on #247, same tree, binary swapped). The pin is preventive — it
       # stops a future toolchain bump from landing silently on an unrelated PR. 1.7.1 is the
-      # version this repo's suite is developed against locally.
+      # version this repo's suite is developed against locally; CI ran `nightly` until this PR,
+      # so 1.7.1 was never CI-verified here before it.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
