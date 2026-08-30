@@ -89,7 +89,12 @@ export async function reconstructFrozenTree(provider, validator, epoch) {
   if (frozenRoot === ethers.ZeroHash) throw new Error(`epoch ${epoch} not snapshotted (epochSetRoot==0)`);
   const snapEvents = await c.queryFilter(c.filters.EpochSnapshotted(epoch));
   if (!snapEvents.length) throw new Error(`no EpochSnapshotted event for epoch ${epoch}`);
-  const snapBlock = snapEvents[snapEvents.length - 1].blockNumber;
+  const snapEvent = snapEvents[snapEvents.length - 1];
+  const snapBlock = snapEvent.blockNumber;
+  // Exact LOG POSITION of the pin, not just its block. The contract freezes the live set at the moment
+  // snapshotEpoch executes, and can say nothing about mutations that land LATER IN THE SAME BLOCK — so
+  // a block-granular cutoff would replay those too and rebuild a root the chain never froze.
+  const snapPos = [snapBlock, snapEvent.transactionIndex, snapEvent.index];
 
   // Chunked eth_getLogs from the deploy block (not 0): the log set only grows and RPCs cap by result
   // count (~10k). fromBlock defaults to DEPLOY_BLOCK env, else 0 with a warning.
@@ -111,18 +116,21 @@ export async function reconstructFrozenTree(provider, validator, epoch) {
   const mutations = [...assigned.map(e => ({ ...e, kind: "assign" })), ...cleared.map(e => ({ ...e, kind: "clear" }))]
     .sort((a, b) => a.blockNumber - b.blockNumber || a.transactionIndex - b.transactionIndex || a.index - b.index);
 
-  // Contract semantics: snapshotEpoch freezes the state as of the END of snapBlock-1 (the block-start
-  // latch value; mutations in snapBlock itself are excluded). So the cutoff is strictly < snapBlock.
+  // Contract semantics (CC-112 D2): snapshotEpoch freezes the LIVE set at the instant it executes.
+  // Mutations EARLIER in the same block are therefore included, and mutations LATER in the same block
+  // are not — which a block-number cutoff cannot express in either direction. Compare full log order.
   const leafMap = new Map(); // slot(bigint) -> nodeId
   for (const m of mutations) {
-    if (m.blockNumber >= snapBlock) continue;
+    const pos = [m.blockNumber, m.transactionIndex, m.index];
+    if (pos[0] > snapPos[0]) continue;
+    if (pos[0] === snapPos[0] && (pos[1] > snapPos[1] || (pos[1] === snapPos[1] && pos[2] > snapPos[2]))) continue;
     const slot = BigInt(m.args.slot);
     if (m.kind === "assign") leafMap.set(slot, m.args.nodeId);
     else leafMap.delete(slot);
   }
   const tree = buildTree(leafMap);
   if (tree.root.toLowerCase() !== frozenRoot.toLowerCase()) {
-    const tail = mutations.filter(m => m.blockNumber < snapBlock).slice(-5)
+    const tail = mutations.filter(m => m.blockNumber <= snapBlock).slice(-5)
       .map(m => `${m.kind}(slot ${m.args.slot} @blk ${m.blockNumber})`).join(", ");
     throw new Error(`reconstructed root ${tree.root} != on-chain setRoot[${epoch}] ${frozenRoot} (${leafMap.size} leaves; last: ${tail})`);
   }

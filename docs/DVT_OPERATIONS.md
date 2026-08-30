@@ -58,13 +58,34 @@ N<30 走 whole-set BFT 2/3，没有抽样界。cap 86 控 calldata/gas。
 
 ## 运营
 
+- **前置：`setBlsAggregator(...)`（质押模式必须）**。CC-112
+  D2 起，快照会读每个 operator 的 ROLE_DVT 退出通知，地址必须等于 SP
+  `Registry.blsAggregator()`
+  发布的那个（合约会强制比对）。没设或与 Registry 不一致 → 每次快照
+  `aggregator stale: re-run setBlsAggregator`
+  fail-closed。纯 bootstrap 集合不需要。
 - **翻转（两步，不可逆治理）**：`setEpochLength(N)` +
-  `snapshotEpoch()`，然后**等跨过一个 epoch 边界**（~N 块）`requiredQuorum()`
-  才从哨兵 `type(uint256).max` 变真值 → 读回确认非哨兵再宣布可用。回 legacy =
-  `setEpochLength(0)`。
+  `snapshotEpoch(activeNodeIds)`，然后**等跨过一个 epoch 边界**（~N 块）
+  `requiredQuorum()` 才从哨兵 `type(uint256).max`
+  变真值 → 读回确认非哨兵再宣布可用。回 legacy = `setEpochLength(0)`。
 - **keeper**（`deploy/committee-keeper.mjs --watch`）：committee
-  ON 时**必须常驻**，每 epoch 在首块后 256 块窗口内 `snapshotEpoch()`
-  pin。漏 pin → 该 epoch + 下个 fail-close，自愈。permissionless，建议 ≥2 冗余。
+  ON 时**必须常驻**，每 epoch 在首块后 256 块窗口内
+  `snapshotEpoch(activeNodeIds)` pin。漏 pin
+  → 该 epoch + 下个 fail-close，自愈。permissionless，建议 ≥2 冗余。keeper 从
+  `SlotAssigned`/`SlotCleared` 事件重建活跃集并与 `activeCount()`
+  对账，不用链上 O(n²) 的 `activeNodeIdsSorted()` helper（那个只供本地调用）。
+- **快照被拒时怎么办**：`snapshotEpoch`
+  要求集合中每个成员都合格，拒绝时按原因分流：
+  - `ineligible node in set` → 用 `isEligibleForSnapshot(nodeId)` 找出是谁，然后
+    - 掉质押 / 失去 ROLE_DVT → **`syncNode(nodeId)`**
+    - 有在途 ROLE_DVT 退出通知 → **`syncExitNotice(nodeId)`**。⚠️ 这种情况
+      `syncNode` 会报 `Node still active`：SP 在整个 2 天通知期内**保留**
+      role 和 stake，所以 stake 判据看它仍然健康。没有这条路径，一次**正常退出**就能让快照卡死两天。两个都是 permissionless。
+  - `aggregator stale: re-run setBlsAggregator` → SP 轮换了 aggregator，见下。
+- **⚠️ aggregator 轮换的迁移顺序（会短暂停摆，属预期）**：SP 先
+  `Registry.setBLSAggregator(successor)`。此后本验证器的快照立即 fail-closed（宁可停也不能拿旧 ledger 判断——旧的对新 aggregator 上申报的通知一律返回「无通知」，那是静默 fail-open）。owner 随后
+  `setBlsAggregator(successor)`，这会 **bump
+  `configVersion`**，使**所有已 pin 的快照失效**。后果：当前 epoch 必然停摆；若轮换发生在 pin 窗口之外，下一个 epoch 也停。因此**轮换应安排在维护窗口**，并在轮换后立刻让 keeper 重新 pin。已冻结但尚未过期的快照不会被「偷偷继续用」——这是刻意的 fail-closed。
 - **proofgen**（`deploy/committee-proofgen.mjs`）：aggregator 对冻结树
   `setRoot[e-1]` 重建 per-signer Merkle 证明。
 - ⚠️

@@ -271,6 +271,124 @@ Note the deliberate separation of **pool `n`** / **nominal target `m`** /
 
 ---
 
+## 2.9 D2 as built (CC-112 answered; P3 + P8 implemented)
+
+SuperPaymaster answered the two blocking questions (CC-112 `49ffcae0`), and DSR
+confirmed both follow-ups with source evidence (`b726b6a0`). Option **B** is
+implemented:
+
+**Eligibility is decided in the permissionless keeper's `snapshotEpoch`, never
+in `validate()`** — so the validation phase still reads only this contract's own
+storage and stays inside ERC-7562. The predicate is:
+
+1. `hasRole(ROLE_DVT, op)` and `getEffectiveStake(op, ROLE_DVT) >= minStake`
+   (i.e. the existing `_isStaked`, so eligibility cannot drift from `syncNode`);
+2. `blsAggregator.guardianExitRequests(op).readyAt == 0`;
+3. bootstrap nodes: `!requireStake` — the exact mirror of `syncNode`'s
+   predicate.
+
+`snapshotEpoch(bytes32[] activeNodeIds)` now takes the complete active set and
+**proves** completeness rather than trusting it: strictly increasing (no
+duplicates) + every entry currently holds a slot + exactly `activeCount` entries
+⟹ the list is precisely the active set. Any omission would need a duplicate or a
+non-member to pad it, and both are rejected.
+
+### Why `readyAt == 0` is stricter than SP suggested
+
+SP proposed `readyAt == 0 || readyAt > snapshotTime + epochLength`. We take only
+the first disjunct. `readyAt` is **seconds**; `epochLength` is **blocks**.
+Writing SP's condition on-chain would weld a block-time assumption into a
+**non-upgradeable** validator, and a block-time change would loosen it
+_silently_ instead of failing closed. The stricter rule needs no conversion, is
+a subset of SP's, and matches SP's own look-ahead accounting, which already
+excludes any guardian with `readyAt != 0`. Cost: a guardian that filed and then
+cancelled an exit rejoins at the next snapshot — SP already imposes a 1-day
+cancel cooldown, so this adds nothing material.
+
+### The bond is enforced on the CLOCK, not on a block count
+
+An earlier draft bounded `epochLength` so that
+`2 * epochLength * 1s <= GUARDIAN_EXIT_DELAY`, calling 1s/block "the
+conservative direction". **That reasoning was backwards.** Bounding how long
+`2L` blocks take needs an _upper_ bound on block time; a lower bound proves
+nothing. At a real ~12s/block the accepted `L = 86400` spans ~24 days, during
+which a guardian can complete `exitRole` and withdraw while the old root is
+still serving committees — precisely the invariant this pillar claims.
+
+Replaced with a wall-clock deadline: each snapshot records
+`epochSetValidUntil[e] = block.timestamp + GUARDIAN_EXIT_DELAY`, and
+`_epochUsable` fails closed past it. The guarantee then holds at any block time
+and survives a chain halt, and `setEpochLength` carries no block-count ceiling
+at all.
+
+### A ROLE_DVT exit notice needs its own permissionless eviction
+
+`snapshotEpoch` refuses a set containing a node with `readyAt != 0`, but
+`syncNode` only knows about role/stake/bootstrap — and SP deliberately keeps
+**both** role and stake intact for the whole 2-day notice. So `syncNode` reverts
+`Node still active` while `snapshotEpoch` reverts `ineligible node`, and no
+permissionless action breaks the tie: **one ordinary exit would halt committee
+mode for two days.**
+
+`syncExitNotice(nodeId)` closes that. Its predicate is deliberately narrow — an
+in-flight exit notice, nothing else — rather than `!_isEligibleForSnapshot`,
+which would let anyone empty the whole set whenever `blsAggregator` is unset.
+
+### The aggregator is bound to the Registry, not configured by hand
+
+SP exposes `Registry.setBLSAggregator` and `queueBLSAggregator`/
+`applyBLSAggregator`, and CC-115 B3 is explicitly a _successor_ deployment, so
+the address **will** change within this validator's lifetime.
+
+`setBlsAggregator` therefore requires the address to equal
+`Registry.blsAggregator()`, and `snapshotEpoch` re-checks that equality whenever
+the set contains a staked node. An ABI-surface probe alone is not identity: any
+contract with a fallback returning 64 zero bytes passes it. Without the Registry
+check, a rotation would leave the validator reading the OLD ledger, which
+reports "no notice" for one filed on the new aggregator — a silent fail-open.
+
+A change **bumps `configVersion`**, failing every already-pinned snapshot
+closed. Rotation therefore causes a deliberate, documented outage of at least
+the current epoch; the migration order is in `docs/DVT_OPERATIONS.md`.
+
+### Same-block mutations are included, not rejected
+
+The block-start latch is gone. It existed so a permissionless `syncNode` could
+not be atomically composed with the freeze to depress `epochSetCount`; that
+defence is obsolete, because eviction can only remove a node the Registry itself
+judges stale, so depressing the count is now the _correct_ outcome.
+
+An intermediate revision reverted on **any** same-block mutation instead. That
+was both unnecessary and harmful: the real pin window is
+`min(256, epochLength - 1)` blocks — only 63 at `L = 64`, not 256 — so an
+attacker holding that many staked operators could register one per block and
+deny every keeper for the whole window (stake is locked, not spent). A list
+captured before a same-block mutation is rejected on its own terms by the
+completeness check, not by a block-number guard.
+
+### Boundary 2 (in-epoch slash): an EXPLICIT NON-CLAIM
+
+- **Claimed.** Every frozen signer held bonded, slashable stake at freeze time
+  and cannot have withdrawn it while the snapshot is still usable (the bond
+  window is enforced on the clock, above). "Misbehaviour has a cost" holds.
+- **NOT claimed.** That every signer stays `>= minStake` for the whole epoch. A
+  mid-epoch `slashByDVT` breaks it without any exit flow.
+- **Liveness semantics (CORRECTED).** An earlier draft claimed a slashed node
+  "stays in the frozen set and keeps signing". **That is false.** Slashing makes
+  it `syncNode`-able immediately, and `_deactivate` clears `isRegistered`, which
+  `_verifyCommitteeSigners` reads live — so it stops being able to sign at once.
+  What survives is the frozen **denominator**: `epochSetCount` is immutable once
+  pinned. That makes an in-epoch slash a **liveness** cost — the quorum still
+  asks for ⌈2m/3⌉ of the frozen population while the signable population has
+  shrunk — rather than a safety one. The next snapshot excludes it.
+
+Pinned at the `validate` level by
+`test_a_node_removed_mid_epoch_cannot_sign_while_the_frozen_denominator_stays`
+(AAStarCommitteeValidator.t.sol), and at the snapshot level by
+`test_in_epoch_slash_evicts_the_node_but_never_rewrites_the_frozen_set`.
+
+---
+
 ## 3. Redeploy analysis — batch or not
 
 `AAStarCommitteeValidator` is **non-upgradeable**: any `.sol` change ⇒ new

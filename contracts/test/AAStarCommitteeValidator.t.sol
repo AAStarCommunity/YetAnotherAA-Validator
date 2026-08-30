@@ -106,7 +106,7 @@ contract AAStarCommitteeValidatorTest is Test {
         uint256 startBlock = epoch * EPOCH_LEN;
         vm.roll(startBlock + 1);
         vm.setBlockhash(startBlock, bh);
-        v.snapshotEpoch();
+        v.snapshotEpoch(v.activeNodeIdsSorted());
     }
 
     /// @dev Build the committee payload: accountId || [nodeId || proof]... || blsSig.
@@ -190,14 +190,16 @@ contract AAStarCommitteeValidatorTest is Test {
     function test_snapshot_rejects_double_pin() public {
         _rollAndSnapshot(1, bytes32(uint256(1)));
         vm.setBlockhash(EPOCH_LEN, bytes32(uint256(1)));
+        bytes32[] memory ids = v.activeNodeIdsSorted();
         vm.expectRevert("epoch already pinned");
-        v.snapshotEpoch();
+        v.snapshotEpoch(ids);
     }
 
     function test_snapshot_rejects_before_start_block() public {
         vm.roll(EPOCH_LEN); // exactly the start block -- blockhash(startBlock) not yet available
+        bytes32[] memory ids = v.activeNodeIdsSorted();
         vm.expectRevert("wait for epoch start block");
-        v.snapshotEpoch();
+        v.snapshotEpoch(ids);
     }
 
     function test_snapshot_rejects_after_window() public {
@@ -206,8 +208,9 @@ contract AAStarCommitteeValidatorTest is Test {
         MockCommitteeValidator w = new MockCommitteeValidator();
         w.setEpochLength(300);
         vm.roll(300 + 257); // epoch 1, startBlock 300, block 557 > 300+256 => window elapsed
+        bytes32[] memory ids = w.activeNodeIdsSorted();
         vm.expectRevert("pin window elapsed");
-        w.snapshotEpoch();
+        w.snapshotEpoch(ids);
     }
 
     // ---- committee math ------------------------------------------------------------------------
@@ -648,15 +651,73 @@ contract AAStarCommitteeValidatorTest is Test {
     // a migration-boundary DoS). Instead it freezes the BLOCK-START state, so an atomic evict-then-freeze
     // cannot depress epochSetCount. Here: 3 nodes, then a same-block registration, then freeze in that
     // block -> the snapshot must pin count 3 (pre-mutation), not 4, and NOT revert.
-    function test_snapshot_freezes_block_start_state() public {
+    /// @notice CC-112 D2 SEMANTIC CHANGE, asserted deliberately. The freeze used to pin the
+    ///         PRE-mutation root/count when the set changed in the same block, so that a permissionless
+    ///         syncNode could not be atomically composed with the freeze to depress epochSetCount. That
+    ///         defence is obsolete: eviction can only remove a node the Registry itself judges stale,
+    ///         so depressing the count is now the CORRECT outcome — the frozen set is meant to be the
+    ///         eligible set. The live set is frozen as it stands when the transaction executes.
+    function test_snapshot_freezes_the_live_set_including_a_same_block_mutation() public {
         _registerNodes(3);
-        bytes32 rootBefore = v.runningRoot();
         vm.roll(EPOCH_LEN + 1);
         vm.setBlockhash(EPOCH_LEN, bytes32(uint256(0xAA)));
-        v.registerPublicKey(keccak256("same-block"), _keyFor(keccak256("same-block"))); // mutate in the freeze block
-        v.snapshotEpoch(); // must NOT revert
-        assertEq(v.epochSetCount(1), 3, "freezes pre-mutation (block-start) count, not 4");
-        assertEq(v.epochSetRoot(1), rootBefore, "freezes pre-mutation root");
+        v.registerPublicKey(keccak256("same-block"), _keyFor(keccak256("same-block")));
+        v.snapshotEpoch(v.activeNodeIdsSorted()); // must NOT revert
+        assertEq(v.epochSetCount(1), 4, "pins the live post-mutation count, not the block-start one");
+        assertEq(v.epochSetRoot(1), v.runningRoot(), "pins the live post-mutation root");
+    }
+
+    /// @notice CC-112 D2 boundary 2, asserted at the `validate` level. An earlier revision of the
+    ///         design doc claimed a node removed mid-epoch "stays in the frozen set and keeps signing".
+    ///         That is FALSE: `_deactivate` clears `isRegistered` and `registeredKeys`, and
+    ///         `_verifyCommitteeSigners` reads `isRegistered` live — so the node stops being able to
+    ///         sign immediately. What genuinely does not change is the frozen DENOMINATOR
+    ///         (`epochSetCount`), which is what makes this a LIVENESS cost rather than a safety one:
+    ///         the quorum still asks for ⌈2m/3⌉ of the frozen population while the signable population
+    ///         has shrunk.
+    ///
+    ///         Exercised here through `revokePublicKey` because a 3-node fixture is needed for the
+    ///         minCommittee floor and only two staked PoP vectors exist; it is the SAME `_deactivate`
+    ///         path a slash followed by `syncNode` takes in staked mode.
+    function test_a_node_removed_mid_epoch_cannot_sign_while_the_frozen_denominator_stays() public {
+        bytes32[] memory ids = _registerNodes(3);
+        _rollAndSnapshot(1, bytes32(uint256(0xAA)));
+        _rollAndSnapshot(2, bytes32(uint256(0xBB)));
+
+        bytes32[] memory signers = new bytes32[](2);
+        signers[0] = ids[0];
+        signers[1] = ids[1];
+        bytes memory payload = _payload(ACCOUNT, signers);
+        assertEq(v.validate(keccak256("op"), payload), 0, "valid while both signers are active");
+
+        uint256 frozenBefore = v.epochSetCount(1);
+        bytes32 frozenRootBefore = v.epochSetRoot(1);
+        v.revokePublicKey(ids[1]);
+
+        assertEq(v.epochSetCount(1), frozenBefore, "the FROZEN denominator is unchanged");
+        assertEq(v.epochSetRoot(1), frozenRootBefore, "the frozen root is immutable once pinned");
+        assertTrue(v.runningRoot() != frozenRootBefore, "...while the LIVE root has moved on");
+        assertEq(
+            v.validate(keccak256("op"), payload),
+            1,
+            "but the removed node can no longer sign: validate reads isRegistered live"
+        );
+    }
+
+    /// @notice An intermediate revision reverted on ANY same-block mutation. That was both unnecessary
+    ///         and harmful: the real pin window is min(256, epochLength - 1) blocks — 63 at L=64, not
+    ///         256 — so an attacker holding that many staked operators could register one per block and
+    ///         deny every keeper for the whole window (stake is locked, not spent). What actually keeps
+    ///         the list honest is the completeness check: a list captured before the mutation no longer
+    ///         describes the set and is rejected on its own terms.
+    function test_snapshot_rejects_a_list_made_stale_by_a_same_block_mutation() public {
+        _registerNodes(3);
+        vm.roll(EPOCH_LEN + 1);
+        vm.setBlockhash(EPOCH_LEN, bytes32(uint256(0xAA)));
+        bytes32[] memory stale = v.activeNodeIdsSorted(); // 3 entries
+        v.registerPublicKey(keccak256("same-block"), _keyFor(keccak256("same-block"))); // now 4
+        vm.expectRevert("activeNodeIds length != activeCount");
+        v.snapshotEpoch(stale);
     }
 
     // A mutation in an EARLIER block than the freeze is included normally (block-start == current).
@@ -666,7 +727,7 @@ contract AAStarCommitteeValidatorTest is Test {
         v.registerPublicKey(keccak256("prior-block"), _keyFor(keccak256("prior-block"))); // 4th node, earlier block
         vm.roll(EPOCH_LEN + 1);
         vm.setBlockhash(EPOCH_LEN, bytes32(uint256(0xAA)));
-        v.snapshotEpoch();
+        v.snapshotEpoch(v.activeNodeIdsSorted());
         assertEq(v.epochSetCount(1), 4, "prior-block mutation included");
     }
 
@@ -718,12 +779,12 @@ contract AAStarCommitteeValidatorTest is Test {
         _registerNodes(3);
         vm.roll(3 * EPOCH_LEN + 1);
         vm.setBlockhash(3 * EPOCH_LEN, bytes32(uint256(0xCC)));
-        v.snapshotEpoch(); // pinned under configVersion 1
+        v.snapshotEpoch(v.activeNodeIdsSorted()); // pinned under configVersion 1
         assertEq(v.epochConfigVersion(3), 1);
 
         v.setEpochLength(EPOCH_LEN); // configVersion -> 2
         // Same epoch/block: the stale pin must be replaceable, not rejected as "already pinned".
-        v.snapshotEpoch();
+        v.snapshotEpoch(v.activeNodeIdsSorted());
         assertEq(v.epochConfigVersion(3), 2, "epoch re-pinned under new configVersion");
     }
 
