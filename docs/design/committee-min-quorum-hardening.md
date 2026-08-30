@@ -169,14 +169,48 @@ Note the deliberate separation of **pool `n`** / **nominal target `m`** /
 - Do **not** `require(setCount>=min)` in `snapshotEpoch()` (reintroduces the
   round-2-High pinning DoS). Min lives on the read side (P1). Activation-floor
   semantics then come for free **without** bricking future epochs.
-- **NEW (Codex #5):** `epochLength == 0` falls back to `_validateWholeSet`
-  (`AAStarCommitteeValidator.sol:407,531`) which has **no floor and no quorum**
-  — one registered node passes. The cutover (deploy legacy → enroll → flip)
-  leaves a window where a tier-2/3 account mounted on this validator in legacy
-  mode has 1-of-N security. Decide: (i) the account enrollment/`committeeActive`
-  gate must make tier-2/3 unreachable until committee mode is on, or (ii) give
-  the whole-set fallback its own floor/quorum. Make this explicit in the cutover
-  runbook.
+- **RESOLVED (CC-116) — enforced at the ACCOUNT layer, option (i).**
+  `epochLength == 0` still falls back to `_validateWholeSet`, which has no floor
+  and no quorum. That is unchanged and deliberate: giving the fallback its own
+  quorum is exactly the non-scaling global-⌈2N/3⌉ model CC-97 rejected
+  (registration is unbounded, so the quorum eventually exceeds `MAX_NODE_COUNT`
+  and fails the whole network closed).
+
+  The floor for that window lives on the account side instead, and is now a
+  merged on-chain guarantee rather than a runbook promise (`airaccount-contract`
+  #208, merged `72d2311`, v0.32.0). `_blsAlgMode()` distinguishes **three**
+  states where the old code collapsed two:
+
+  | `committeeActive()` | validator state                                      | account behaviour                             |
+  | ------------------- | ---------------------------------------------------- | --------------------------------------------- |
+  | `true`              | armed (`epochLength != 0`)                           | accountId injection + `requiredQuorum` mirror |
+  | `false`             | mounted but NOT armed                                | **tier-2/3 fails closed**                     |
+  | reverts             | a true legacy validator (`0x539B`, no such function) | whole-set passthrough, long-term coexistence  |
+
+  Gated at all three BLS entry points, and in `_validateTripleSignature` the
+  gate sits **before** the aggregator deferral so a validator exposing a
+  non-zero `aggregator()` cannot route around it. pr-daemon verified each gate
+  with two-directional mutation (delete a gate → its test reddens; move the
+  triple gate after the deferral without deleting it → only the ordering test
+  reddens), and **enumerated the `_blsAlgMode()` / `_verifyAgg` call sites** to
+  establish there is no fourth BLS path. Codex independently confirmed three
+  adjacent properties — the owner-direct and executor paths force ECDSA, the
+  fallback exposes no execution entry point, and `executeUserOp` refills the
+  session context before the delegatecall. It is the two together that close "no
+  fourth path"; neither does it alone.
+
+  **The DVT-side precondition this relies on, verified here:**
+  `committeeActive()` returns `epochLength != 0`
+  (`AAStarCommitteeValidator.sol`), so an unarmed committee validator returns
+  `false` rather than reverting; and the base `AAStarValidator` does not declare
+  the function at all, so a true legacy validator reverts. The three account
+  states therefore map onto three genuinely distinct validator states.
+
+  Consequence for the cutover: during enroll → flip, tier-2/3 on this validator
+  is **unavailable**, not unprotected. That unavailability is the intended
+  fail-closed posture, not a downside — an earlier round of this discussion had
+  it backwards and treated it as a cost to be mitigated by operational
+  discipline.
 
 ### P3 — eligible-set accounting: SAFETY-critical, not liveness-only (Codex High #3)
 
@@ -451,29 +485,12 @@ rather than implied-closed:
 - **High — P5 permits a stale "new-policy" snapshot.** See the note in P5 above.
   Deferred to P3/P8, blocked on CC-112. Action taken: framing corrected
   everywhere (commit, PR, this doc); no claim that eligibility is closed.
-- **High — `epochLength == 0` keeps the original single-signer path.**
-  `validate()` routes to `_validateWholeSet()`, which has no floor and no
-  quorum, so in the default committee-off state one registered node clears
-  tier-2/3 (and the deploy script deliberately ships committee mode off).
-  Codex's point stands: _a runbook is not an enforcement boundary_. Closing it
-  means either giving the legacy fallback its own floor/quorum — which
-  re-introduces the global-N model that was scrapped for not scaling — or
-  proving an on-chain account/router gate makes tier-2/3 unreachable until
-  committee activation. **This is a product decision affecting live legacy
-  accounts and is escalated, not silently deferred.** Related consequence:
-  `requiredQuorum()` returns the sentinel while `validate()` can accept through
-  the fallback; that disagreement is inherent to the fallback, not to P1.
-- **Low (fixed)** — `requiredQuorum()` only checked `_epochUsable(e-1)` while
-  `validate()` needs `e` too, so right after an epoch boundary the view
-  advertised a satisfiable quorum while every payload was rejected. Now mirrors
-  `validate()`.
-- **Low (fixed)** — `_unbindPubkey` deleted by key hash without checking the
-  lock belonged to that node. Unreachable today, but a future subclass skipping
-  a bind could have freed another node's lock. Now ownership-conditioned.
-- **Test framing (fixed)** — the floor test called itself "only N varies /
-  byte-identical"; a third leaf changes the SMT root and proofs. Comment now
-  states precisely what is held constant (mocked BLS verdict,
-  `k == requiredQuorum` in both arms) and what differs.
+- **High — `epochLength == 0` keeps the original single-signer path.** RESOLVED
+  by CC-116 at the account layer (see P2 above): `airaccount-contract` #208
+  (merged `72d2311`, v0.32.0) fails tier-2/3 closed whenever the mounted
+  validator reports `committeeActive() == false`. The whole-set fallback in this
+  contract is unchanged, because giving it a quorum is the non-scaling model
+  CC-97 rejected.
 
 Codex confirmed solid: no bypass of the floor with committee mode active;
 correct bind/unbind ordering on every key transition (revoke, `syncNode`,
