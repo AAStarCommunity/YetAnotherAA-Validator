@@ -135,10 +135,16 @@ jobs:
         with:
           submodules: recursive
 
+      # PINNED, not `nightly`. An unpinned toolchain already cost this ecosystem real time:
+      # foundry stable moved to 1.8.1 on 2026-08-28 and broke airaccount-contract's whole suite
+      # (revm behaviour change — P256+BLS verified but cumulative/weighted tiers parsed as 0), which
+      # blocked CC-116 PR #208 until it pinned 1.7.1 in its own PR #209. `nightly` means the toolchain
+      # can move under a PR that changed nothing, and the failure looks like the PR's fault.
+      # 1.7.1 is the version this repo's suite is developed and verified against.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: nightly
+          version: "1.7.1"
 
       - name: Build contracts
         run: forge build
