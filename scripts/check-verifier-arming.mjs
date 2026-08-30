@@ -198,6 +198,39 @@ function splitSolidity(text) {
 ///      string and compiles to the forbidden selector. Scanning literals individually misses that, so
 ///      group runs separated by nothing but whitespace or comments and scan each run's joined content.
 ///      A lone literal is simply a run of one, so this subsumes the single-literal scan.
+/// @dev Whether `gap` contains ONLY whitespace, comments, and literal-kind prefixes — i.e. whether the
+///      literals on either side are one concatenated Solidity string.
+///
+///      Written as a scan rather than a regex on purpose. The obvious pattern
+///      `^(?:\s|unicode|hex|//[^\n]*\n|/\*[\s\S]*?\*/)*$` nests a lazy quantifier inside a
+///      quantified alternation, which backtracks exponentially on input like `/*` followed by many
+///      `*//*` repetitions — CodeQL flagged it as a high-severity ReDoS. This consumes each construct
+///      once, in linear time, with no backtracking at all.
+function isLiteralGap(gap) {
+  let i = 0;
+  while (i < gap.length) {
+    const c = gap[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v") {
+      i++;
+    } else if (gap.startsWith("unicode", i)) {
+      i += 7;
+    } else if (gap.startsWith("hex", i)) {
+      i += 3;
+    } else if (gap.startsWith("//", i)) {
+      const nl = gap.indexOf("\n", i);
+      if (nl === -1) return false; // an unterminated line comment cannot be followed by a literal
+      i = nl + 1;
+    } else if (gap.startsWith("/*", i)) {
+      const end = gap.indexOf("*/", i + 2);
+      if (end === -1) return false;
+      i = end + 2;
+    } else {
+      return false; // any other syntax (comma, operator, semicolon) separates the expressions
+    }
+  }
+  return true;
+}
+
 export function stringRuns(text, literals) {
   const runs = [];
   let cur = null;
@@ -206,8 +239,7 @@ export function stringRuns(text, literals) {
     // `unicode"a" unicode"b"` and `hex"aa" hex"bb"` also concatenate, so the literal-kind prefix is
     // part of a legal gap — without it the run splits and each fragment scans clean.
     const gap = cur ? text.slice(cur.end, lit.start) : null;
-    const adjacent =
-      cur !== null && /^(?:\s|unicode|hex|\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)*$/.test(gap);
+    const adjacent = cur !== null && isLiteralGap(gap);
     if (adjacent) {
       cur.content += lit.content;
       cur.end = lit.end;
@@ -874,6 +906,21 @@ function selfTest() {
   for (const [name, src, sol] of mustNot) {
     if (findSetterCalls(src, sol).length !== 0)
       failures.push(`detector FALSE-POSITIVE: ${name} -> ${JSON.stringify(src)}`);
+  }
+
+  // ReDoS regression (CodeQL high-severity finding on the first push). The literal-gap test used to
+  // be a regex nesting a lazy quantifier inside a quantified alternation, which backtracks
+  // exponentially on `/*` followed by many `*//*` repetitions. Assert it stays linear.
+  {
+    const evil = 'f("a" ' + "/*" + "*//*".repeat(2000) + ' "b")';
+    const started = Date.now();
+    findSetterCalls(evil, true);
+    const elapsed = Date.now() - started;
+    if (elapsed > 1000) {
+      failures.push(
+        `literal-gap scanning is superlinear: ${elapsed}ms on a ${evil.length}-char input`
+      );
+    }
   }
 
   // Line numbers must survive the code/comment split and the length-preserving blanking.
