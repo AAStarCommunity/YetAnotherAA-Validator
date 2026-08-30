@@ -29,7 +29,7 @@
 // ------------------------------------
 // Every gate below runs for ALL nodes before ANY transaction is sent, and a single failure aborts the
 // whole run (no partial registration):
-//   1. the connected chainId is printed, and must equal --chain-id when that is passed
+//   1. the connected chainId must equal 11155111 (Sepolia) unless --chain-id overrides it
 //   2. aggregator has code, and `version()` equals the pinned expectation (override: --expect-version)
 //   3. `owner()` == the signer -> otherwise abort (see AUTHORIZATION)
 //   4. `keccak(abi.encode(DOMAIN_NAME, chainid, address(this), REGISTRY))` reproduces the contract's
@@ -43,6 +43,11 @@
 //   8. `validatorAtSlot(slot)` is free or already this validator; `blsKeyOwner(keyHash)` is unset or
 //      already this validator (SP rejects one key under two addresses: DuplicatePublicKey)
 //   9. an eth_call dry-run of the real registration
+//  10. no two plans in the batch claim the same slot, validator, or BLS key — every gate above reads
+//      CHAIN state, so a collision between two PENDING plans is invisible to all of them
+//
+// Post-broadcast it reads back both `validatorAtSlot` AND `getBLSPublicKey`: the first answers "is
+// anyone in this slot", the second answers "is the key I just registered the one sitting there".
 //
 // Dry-run is the DEFAULT. Nothing is broadcast without --broadcast.
 //
@@ -61,7 +66,7 @@
 //   node deploy/reregister-guardians.mjs --aggregator 0x... --env <path> --broadcast
 //   optional: --nodes node_dev_001.json,node_dev_002.json,node_dev_003.json
 //             --expect-version "BLSAggregator-4.11.0"   (only after re-verifying the new release)
-//             --chain-id 11155111                        (abort unless connected to this network)
+//             --chain-id <n>                             (default 11155111; override for a fork)
 import { ethers } from "ethers";
 import { readFileSync } from "fs";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
@@ -80,7 +85,11 @@ const AGGREGATOR = flag("--aggregator") || process.env.BLS_AGGREGATOR_ADDRESS;
 const ENV_FILE = flag("--env") || process.env.DVT_ENV_FILE || ".env.sepolia";
 const NODE_FILES = (flag("--nodes") || DEFAULT_NODES.join(",")).split(",").map(s => s.trim()).filter(Boolean);
 const EXPECT_VERSION = flag("--expect-version") || DEFAULT_VERSION;
-const EXPECT_CHAIN_ID = flag("--chain-id") ? Number(flag("--chain-id")) : undefined;
+// Defaults to Sepolia, overridable, same shape as --expect-version. NOT opt-in: a fork of Sepolia
+// shares its bytecode, version() and owner(), and can even host a contract at the same CREATE
+// address, so every other gate reads identically on both. The chain is the one thing only this
+// check can tell you.
+const EXPECT_CHAIN_ID = Number(flag("--chain-id") ?? 11155111);
 
 const die = msg => {
   console.error(`\n✗ ${msg}`);
@@ -131,6 +140,7 @@ const ABI = [
   "function MAX_VALIDATORS() view returns (uint256)",
   "function validatorAtSlot(uint8) view returns (address)",
   "function blsKeyOwner(bytes32) view returns (address)",
+  "function getBLSPublicKey(address) view returns ((bytes32,bytes32,bytes32,bytes32))",
   "function popDigest(address validator, (bytes32,bytes32,bytes32,bytes32) publicKey) view returns (bytes32)",
   "function registerBLSPublicKey(address validator, (bytes32,bytes32,bytes32,bytes32) publicKey, uint8 slot, (bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32) popSignature)",
 ];
@@ -275,8 +285,16 @@ async function main() {
     if (!node.publicKeyEip2537) die(`${label}: missing "publicKeyEip2537"`);
     if (!node.privateKey) die(`${label}: missing "privateKey"`);
 
-    // ---- gate 3: this private key really owns this public key ----------------------------------
-    const sk = ethers.getBytes(node.privateKey);
+    // ---- gate 5: this private key really owns this public key ----------------------------------
+    // Parse inside a try so a corrupt key is never echoed: ethers puts the offending value straight
+    // into the message, and that would sit in terminal scrollback. Only a BROKEN key can throw here,
+    // but naming the file is enough to fix it and leaks nothing.
+    let sk;
+    try {
+      sk = ethers.getBytes(node.privateKey);
+    } catch {
+      die(`${label}: "privateKey" is not a valid hex byte string (value withheld) — fix the node file`);
+    }
     const pkPoint = bls.longSignatures.getPublicKey(sk);
     const derived = encodeG1(pkPoint);
     if (derived.toLowerCase() !== node.publicKeyEip2537.toLowerCase()) {
@@ -290,7 +308,7 @@ async function main() {
     const pkWords = toWords(node.publicKeyEip2537, 128);
 
     // ---- gate 5a: our understanding of popDigest must match the contract's ---------------------
-    const onchainDigest = await agg.popDigest(validator, pkWords);
+    const onchainDigest = await read(`popDigest() for ${label}`, () => agg.popDigest(validator, pkWords));
     const localDigest = ethers.keccak256(
       coder.encode(
         ["bytes32", "bytes32", "address", "bytes32", "bytes32", "bytes32", "bytes32"],
@@ -341,6 +359,32 @@ async function main() {
     plans.push({ label, validator, slot, pkWords, popWords });
   }
 
+  // ---- gate 10: the plans must not collide with EACH OTHER ---------------------------------------
+  // Every gate above reads CHAIN state, so two pending plans that clash are invisible to all of them:
+  // three copies of one node file each pass individually, then land as ONE guardian while the run
+  // reports three. Threshold is 3, so quorum stays unreachable while the operator holds "evidence"
+  // saying otherwise. Found by pr-daemon on #248, with all three shapes reproduced on-chain.
+  const seenSlot = new Map(),
+    seenValidator = new Map(),
+    seenKey = new Map();
+  for (const p of plans) {
+    const kh = ethers.keccak256(coder.encode(["bytes32", "bytes32", "bytes32", "bytes32"], p.pkWords));
+    for (const [m, k, what] of [
+      [seenSlot, p.slot, `slot ${p.slot}`],
+      [seenValidator, p.validator.toLowerCase(), `validator ${p.validator}`],
+      [seenKey, kh, `BLS key ${kh}`],
+    ]) {
+      if (m.has(k)) {
+        die(
+          `${m.get(k)} and ${p.label} both claim ${what}.\n` +
+            `  Every gate above reads CHAIN state, so a collision between two pending plans is\n` +
+            `  invisible to all of them. Fix the --nodes list.`
+        );
+      }
+      m.set(k, p.label);
+    }
+  }
+
   if (!BROADCAST) {
     console.log(`\nAll ${plans.length} registrations passed every pre-flight gate. Nothing was sent.`);
     console.log("Re-run with --broadcast to submit.");
@@ -364,16 +408,30 @@ async function main() {
   }
 
   // Read the state back rather than trusting the receipts: a status-1 receipt only proves the tx was
-  // mined, not that the slot now points where we intended.
+  // mined. And read the KEY, not just the slot occupant: `validatorAtSlot` answers "is anyone in this
+  // slot", while the question is "is the key I just registered the one sitting there now". A stale
+  // node file re-binding a live guardian's slot to the wrong key satisfies the first and fails the
+  // second — SP accepts it (different keyHash is a fresh blsKeyOwner binding, and existing.index ==
+  // slot so SlotAlreadyTaken never fires), and that guardian can then never sign for its own slot.
   console.log("\nPost-verify (read back from chain):");
   let bad = 0;
   for (const p of receipts) {
     const holder = await agg.validatorAtSlot(p.slot);
-    const ok = holder.toLowerCase() === p.validator.toLowerCase();
-    if (!ok) bad++;
-    console.log(`  slot ${p.slot} -> ${holder} ${ok ? "✓" : `✗ expected ${p.validator}`}`);
+    const slotOk = holder.toLowerCase() === p.validator.toLowerCase();
+    let keyOk = false;
+    let onchainKey = "<unreadable>";
+    try {
+      const k = await agg.getBLSPublicKey(p.validator);
+      onchainKey = ethers.concat([k[0], k[1], k[2], k[3]]);
+      keyOk = onchainKey.toLowerCase() === ethers.concat(p.pkWords).toLowerCase();
+    } catch (e) {
+      onchainKey = `<read failed: ${e.shortMessage ?? e.message}>`;
+    }
+    if (!slotOk || !keyOk) bad++;
+    console.log(`  slot ${p.slot} -> ${holder} ${slotOk ? "✓" : `✗ expected ${p.validator}`}`);
+    console.log(`    key      ${keyOk ? "✓ matches the key this run registered" : `✗ on-chain ${onchainKey}`}`);
   }
-  if (bad) die(`${bad} slot(s) did not read back as expected`);
+  if (bad) die(`${bad} registration(s) did not read back as expected`);
   console.log("\nAll slots verified. Hand these tx hashes back to the B3 manifest:");
   for (const p of receipts) console.log(`  slot ${p.slot}  ${p.validator}  ${p.hash}`);
 }
