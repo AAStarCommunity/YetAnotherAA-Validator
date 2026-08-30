@@ -47,6 +47,14 @@ contract DeployCommitteeValidator is Script {
         validator.setRegistry(registry);
         validator.setMinStake(minStake);
         if (requireStake) validator.setRequireStake(true);
+        // CC-112 D2: a stake-aware snapshot reads each operator's ROLE_DVT exit notice from SP's
+        // BLSAggregator, so a staked deployment MUST be pointed at it or every snapshot fails closed.
+        // The validator binds to whatever the Registry publishes, so pass nothing and read it here.
+        if (requireStake) {
+            address agg = IRegistryAggregator(registry).blsAggregator();
+            require(agg != address(0), "Registry publishes no blsAggregator: cannot arm a staked deployment");
+            validator.setBlsAggregator(agg);
+        }
         // NOTE: epochLength is deliberately left at 0 (committee mode OFF). See the migration interlock.
         // Ownership transfer LAST — after the onlyOwner config above — so it doesn't strand those calls.
         if (newOwner != address(0)) validator.transferOwnership(newOwner);
@@ -58,6 +66,7 @@ contract DeployCommitteeValidator is Script {
         console.log("registry:      ", registry);
         console.log("minStake:      ", minStake);
         console.log("requireStake:  ", requireStake);
+        console.log("blsAggregator: ", validator.blsAggregator());
         console.log("epochLength:   ", validator.epochLength(), "(0 = committee mode OFF)");
         console.log("committeeActive:", validator.committeeActive());
         console.log("oversample:    ", validator.oversampleNum(), "/", validator.oversampleDen());

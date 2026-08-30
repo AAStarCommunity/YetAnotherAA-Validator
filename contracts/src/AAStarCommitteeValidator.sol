@@ -3,6 +3,18 @@ pragma solidity ^0.8.19;
 
 import "./AAStarValidator.sol";
 
+/// @dev SuperPaymaster BLSAggregator's ROLE_DVT exit-notice ledger (public mapping getter).
+///      Read ONLY from the permissionless keeper's snapshot tx — never from validate(), which must stay
+///      within ERC-7562 validation-phase storage rules.
+/// @dev SP Registry's authoritative pointer to the live BLSAggregator (Registry.sol:33).
+interface IRegistryAggregator {
+    function blsAggregator() external view returns (address);
+}
+
+interface IGuardianExitSource {
+    function guardianExitRequests(address guardian) external view returns (uint64 readyAt, uint64 expiresAt);
+}
+
 /// @title AAStarCommitteeValidator — CC-98 per-proposal random-committee BLS validator (production)
 /// @notice Replaces CC-97's global ⌈2N/3⌉ (which does not scale: registry unbounded ⇒ quorum exceeds
 ///         the single-call node cap ⇒ network-wide fail-close). Each operation is validated against a
@@ -95,14 +107,6 @@ contract AAStarCommitteeValidator is AAStarValidator {
     uint256[] public freeSlots;
     /// @dev Count of currently active leaves (slots occupied). Feeds the m_e curve.
     uint256 public activeCount;
-    /// @dev Block of the current block's first set mutation, plus the root/count captured just BEFORE it.
-    ///      snapshotEpoch freezes these block-start values when the set was mutated in its own block, so a
-    ///      permissionless syncNode eviction cannot be atomically composed with the freeze to depress
-    ///      epochSetCount — without snapshotEpoch reverting (pr-daemon round-2 High). See _latchBlockStart.
-    uint256 public lastSetMutationBlock;
-    bytes32 public rootAtBlockStart;
-    uint256 public countAtBlockStart;
-
     /// @dev SMT internal nodes: node[level][index]. Level 0 = leaves (leaf = nodeId, or 0 if empty).
     ///      Unset entries read as the empty-subtree hash `zeros[level]`.
     mapping(uint256 => mapping(uint256 => bytes32)) internal smt;
@@ -130,6 +134,12 @@ contract AAStarCommitteeValidator is AAStarValidator {
     mapping(uint256 => uint256) public epochConfigVersion;
     /// @dev Bumped on every epochLength change; namespaces all epoch snapshots to their schedule.
     uint256 public configVersion;
+    /// @dev epoch → wall-clock deadline past which its snapshot is no longer usable. Set at freeze to
+    ///      `block.timestamp + GUARDIAN_EXIT_DELAY`: SP guarantees a member staked at freeze time
+    ///      cannot have withdrawn within that window, so this is exactly how long "frozen ⟹ still
+    ///      bonded" holds. Enforcing it on the CLOCK rather than on a block count makes the guarantee
+    ///      independent of block time and safe across a chain halt.
+    mapping(uint256 => uint64) public epochSetValidUntil;
 
     /// @dev Minimum FROZEN committee pool size (epochSetCount[e-1]) for committee mode to accept a
     ///      tier-2/3 op. Below it, requiredQuorum() returns the unsatisfiable sentinel and validate()
@@ -191,9 +201,67 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///      deploy+mount+enroll accounts first, THEN setEpochLength.
     function setEpochLength(uint256 _epochLength) external onlyOwner {
         require(_epochLength == 0 || _epochLength >= 64, "epochLength must be 0 or >= 64");
+        // TWO DIRECTIONS, and only one of them was wrong. An earlier revision required
+        // `2*L*MIN_BLOCK_SECONDS <= GUARDIAN_EXIT_DELAY`, calling 1s/block conservative; that proved
+        // nothing, because bounding how long 2L blocks TAKE needs an upper bound on block time. It was
+        // removed and SAFETY moved onto the clock (epochSetValidUntil, below).
+        //
+        // But LIVENESS needs the same inequality with the direction fixed, and deleting the broken
+        // bound deleted that too. `validate` requires BOTH `_epochUsable(e)` and `_epochUsable(e-1)`,
+        // so setRoot[e-1] must still be unexpired throughout e. If one epoch's wall-clock length
+        // approaches the bond window, the look-ahead set is already expired every time it is needed
+        // and committee mode fails closed FOREVER — from a governance call that looks legitimate, on
+        // a contract that cannot be upgraded.
+        //
+        // Here OVER-estimating block time is the conservative direction: it makes the accepted
+        // epochLength SHORTER. 24s allows for sustained missed slots at Ethereum's 12s cadence, and
+        // caps L at 3599 (~12h per epoch at 12s). Being wrong about it costs liveness, which fails
+        // closed and is visible — never a silent relaxation, which is how the previous bound failed.
+        require(
+            _epochLength == 0 || 2 * _epochLength * MAX_BLOCK_SECONDS < GUARDIAN_EXIT_DELAY,
+            "epochLength too long: setRoot[e-1] would expire during e"
+        );
         epochLength = _epochLength;
         configVersion += 1;
         emit EpochLengthSet(_epochLength);
+    }
+
+    event BlsAggregatorSet(address indexed aggregator);
+
+    /// @notice SP's BLSAggregator, read at snapshot time for each operator's ROLE_DVT exit notice.
+    address public blsAggregator;
+
+    /// @dev Upper bound on block time, used ONLY to bound epochLength for liveness. Note the
+    ///      direction — a MINIMUM here proves nothing, which is why the earlier bound was removed.
+    uint256 internal constant MAX_BLOCK_SECONDS = 24;
+
+    /// @dev SP's `GUARDIAN_EXIT_DELAY` (BLSAggregator.sol:387) — a constant, not governable. A frozen
+    ///      set stays usable for exactly this long, which is the window inside which SP guarantees a
+    ///      member that was staked at freeze time still has stake that can be slashed.
+    uint256 internal constant GUARDIAN_EXIT_DELAY = 2 days;
+
+    /// @notice Point the validator at SP's BLSAggregator.
+    /// @dev Rotatable BY DESIGN: SP exposes `Registry.setBLSAggregator` and
+    ///      `queueBLSAggregator`/`applyBLSAggregator`, and CC-115 B3 is explicitly a SUCCESSOR
+    ///      deployment — so the address WILL change within this validator's lifetime (dsr b726b6a0).
+    ///      A change bumps configVersion, which fails every already-pinned snapshot closed: a set whose
+    ///      exit notices were judged against the OLD aggregator must not keep serving committees.
+    function setBlsAggregator(address _aggregator) external onlyOwner {
+        require(_aggregator != address(0), "aggregator must be non-zero");
+        require(_aggregator.code.length > 0, "aggregator has no code");
+        // POSITIVE IDENTITY, not a surface probe. An earlier revision only try/catch'd
+        // `guardianExitRequests(address)`, which any contract with a fallback returning 64 zero bytes
+        // passes while implementing none of the ledger semantics. The Registry publishes the live
+        // aggregator, so bind to that instead and let the ABI probe be a mere sanity check.
+        require(_aggregator == _registryAggregator(), "aggregator != Registry.blsAggregator()");
+        try IGuardianExitSource(_aggregator).guardianExitRequests(address(0)) returns (uint64, uint64) {
+            // ok — ABI sanity only; identity comes from the Registry check above.
+        } catch {
+            revert("aggregator has no guardianExitRequests(address)");
+        }
+        blsAggregator = _aggregator;
+        configVersion += 1;
+        emit BlsAggregatorSet(_aggregator);
     }
 
     event MinCommitteeSet(uint256 minCommittee);
@@ -240,7 +308,6 @@ contract AAStarCommitteeValidator is AAStarValidator {
     function _onNodeActivated(bytes32 nodeId) internal override {
         // base already guaranteed !isRegistered before this; defensively no-op on a double-activate.
         if (slotPlusOne[nodeId] != 0) return;
-        _latchBlockStart();
         uint256 slot;
         uint256 free = freeSlots.length;
         if (free != 0) {
@@ -260,7 +327,6 @@ contract AAStarCommitteeValidator is AAStarValidator {
     function _onNodeDeactivated(bytes32 nodeId) internal override {
         uint256 sp = slotPlusOne[nodeId];
         if (sp == 0) return; // defensive: never activated in committee accounting
-        _latchBlockStart();
         uint256 slot = sp - 1;
         delete slotPlusOne[nodeId];
         freeSlots.push(slot);
@@ -269,19 +335,6 @@ contract AAStarCommitteeValidator is AAStarValidator {
         emit SlotCleared(nodeId, slot);
     }
 
-    /// @dev On the FIRST set mutation of a block, capture the pre-mutation (block-start) root + count.
-    ///      snapshotEpoch freezes those when the set was mutated in its own block, so an atomic
-    ///      "evict-then-freeze" cannot depress epochSetCount, WITHOUT snapshotEpoch having to revert
-    ///      (the revert was a zero-capital migration-boundary DoS: setRequireStake(true) makes every
-    ///      bootstrap node permissionlessly syncNode-able, and a forced same-block collision could block
-    ///      pinning for a whole epoch — pr-daemon round-2 High). This keeps snapshotEpoch unconditional.
-    function _latchBlockStart() internal {
-        if (block.number != lastSetMutationBlock) {
-            rootAtBlockStart = runningRoot;
-            countAtBlockStart = activeCount;
-            lastSetMutationBlock = block.number;
-        }
-    }
 
     /// @dev Set leaf `slot` to `leaf` and fold the change up to the root: O(TREE_DEPTH) hashes + SSTOREs.
     function _smtSet(uint256 slot, bytes32 leaf) internal {
@@ -308,7 +361,23 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///         within the 256-block window after the epoch's first block (blockhash availability), once.
     /// @dev The seed source is a FIXED past block (the epoch's first block), so no caller can grind it by
     ///      choosing when to call — only the block proposer has the standard bounded ~1-bit RANDAO bias.
-    function snapshotEpoch() external {
+    /// @dev KNOWN OPERATIONAL CEILING, measured rather than assumed. This call is linear in the
+    ///      active-set size and the set has no on-chain cap: TREE_DEPTH = 14 allows 16,384 slots.
+    ///      Measured on the bootstrap path (a LOWER bound — it makes no external calls):
+    ///      N=10 -> 153,738 gas; 50 -> 202,109; 100 -> 263,163; 200 -> 387,231, i.e. ~1,229 gas/node.
+    ///      The staked path additionally makes two external view calls per node, so its slope is
+    ///      materially steeper (estimated 8-15k/node; NOT measured). At that slope a few thousand
+    ///      nodes push the pin past a 30M block limit — and a pin that cannot land fails the whole
+    ///      network closed for that epoch.
+    ///
+    ///      No N cap is imposed here on purpose: the committee curve is designed for pools up to
+    ///      20,000, so a hard limit would contradict the sizing this validator exists to implement.
+    ///      The real fix is a batched snapshot, which is future work. Until then this is an operating
+    ///      limit to be watched, not a guarantee — see docs/DVT_OPERATIONS.md.
+    /// @param activeNodeIds The COMPLETE current active set, strictly increasing by nodeId. Supplying
+    ///        it lets the snapshot verify eligibility for every member; the contract proves the list is
+    ///        complete rather than trusting the caller (see below).
+    function snapshotEpoch(bytes32[] calldata activeNodeIds) external {
         require(epochLength != 0, "committee mode off");
         uint256 e = block.number / epochLength;
         // Re-pinning is allowed only when the existing pin belongs to a PREVIOUS epoch schedule
@@ -321,19 +390,166 @@ contract AAStarCommitteeValidator is AAStarValidator {
         require(block.number <= startBlock + 256, "pin window elapsed");
         bytes32 bh = blockhash(startBlock);
         require(bh != bytes32(0), "blockhash unavailable");
-        // Freeze the block-START set state: if the set was mutated in THIS block, use the pre-mutation
-        // root/count so a permissionless syncNode eviction cannot be atomically composed with the freeze
-        // to depress epochSetCount. Unconditional (no revert) → no forced-collision DoS (round-2 High).
-        bool mutatedThisBlock = lastSetMutationBlock == block.number;
-        bytes32 setRoot = mutatedThisBlock ? rootAtBlockStart : runningRoot;
-        uint256 setCount = mutatedThisBlock ? countAtBlockStart : activeCount;
+
+        // CC-112 D2 (P3+P8). The frozen set must be the ELIGIBLE set, not merely the registered one:
+        // the CC-97 floor and the ⌈2m/3⌉ denominator are both computed over epochSetCount, so counting a
+        // node whose operator has no stake defeats the minimum-population predicate outright.
+        //
+        // WHY THE BLOCK-START LATCH IS GONE. The freeze used to pin the PRE-mutation root/count when
+        // the set changed in the same block, so a permissionless syncNode could not be atomically
+        // composed with the freeze to depress epochSetCount. That defence is obsolete: eviction can
+        // only remove a node the Registry itself judges stale, so depressing the count is now the
+        // CORRECT outcome, not an attack — the frozen set is supposed to be the eligible set.
+        //
+        // An earlier revision of this pillar reverted on any same-block mutation instead. That was
+        // both unnecessary and harmful: the real pin window is min(256, epochLength - 1) blocks — only
+        // 63 at L=64, not 256 — so an attacker holding that many staked operators could register one
+        // per block and deny every keeper for the whole window. Stake is locked, not spent, so the
+        // "ammunition is finite" argument did not hold either. The set is simply frozen as it stands
+        // when the transaction executes, and the completeness check below rejects any list that no
+        // longer matches it.
+        uint256 n = activeCount;
+        require(activeNodeIds.length == n, "activeNodeIds length != activeCount");
+
+        // COMPLETENESS PROOF, not trust. Strictly increasing (so no duplicates) + every entry currently
+        // holds a slot + exactly `activeCount` entries ⟹ the list is precisely the active set. Any
+        // omission would have to be replaced by a duplicate or a non-member, and both are rejected.
+        bytes32 prev = bytes32(0);
+        bool aggregatorChecked;
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 nid = activeNodeIds[i];
+            require(i == 0 || nid > prev, "activeNodeIds must be strictly increasing");
+            prev = nid;
+            require(slotPlusOne[nid] != 0, "activeNodeIds contains a non-member");
+            // Only a STAKED node has an exit notice to read, so an all-bootstrap set needs no
+            // aggregator at all. Checked once, on first encountering one, so bootstrap-only
+            // deployments are unaffected and the Registry read is not repeated per node.
+            //
+            // SP can rotate its aggregator (Registry.setBLSAggregator; CC-115 B3 is a successor
+            // deployment). Without this the validator keeps reading the OLD ledger, which reports no
+            // notice for one filed on the new one — a SILENT fail-open that admits a guardian on its
+            // way out. Fail closed until the owner re-points the validator.
+            if (!isBootstrap[nid] && !aggregatorChecked) {
+                require(blsAggregator == _registryAggregator(), "aggregator stale: re-run setBlsAggregator");
+                aggregatorChecked = true;
+            }
+            require(_isEligibleForSnapshot(nid), "ineligible node in set: syncNode it first");
+        }
 
         epochSeed[e] = bh;
-        epochSetRoot[e] = setRoot;
-        epochSetCount[e] = setCount;
+        epochSetRoot[e] = runningRoot;
+        epochSetCount[e] = n;
         epochConfigVersion[e] = configVersion;
+        epochSetValidUntil[e] = uint64(block.timestamp + GUARDIAN_EXIT_DELAY);
         epochPinned[e] = true;
-        emit EpochSnapshotted(e, bh, setRoot, setCount);
+        emit EpochSnapshotted(e, bh, runningRoot, n);
+    }
+
+    /// @dev Eligibility AT FREEZE TIME. Mirrors `syncNode`'s predicate exactly for the registered/staked
+    ///      halves — inventing a second notion of "eligible" is how the two drift apart — and adds SP's
+    ///      exit-notice condition on top.
+    ///
+    ///      WHY `readyAt == 0` AND NOT SP's SUGGESTED `readyAt > snapshotTime + epochLength`. `readyAt`
+    ///      is SECONDS; `epochLength` is BLOCKS. Writing SP's condition on-chain would weld a block-time
+    ///      assumption into a NON-UPGRADEABLE validator, and a block-time change would loosen it
+    ///      SILENTLY rather than fail closed. The stricter rule needs no conversion and is a subset of
+    ///      SP's. It also matches SP's own look-ahead accounting, which already excludes any guardian
+    ///      with `readyAt != 0` (dsr b726b6a0). Cost, accepted and documented: a guardian that filed and
+    ///      then cancelled an exit waits for the next snapshot to rejoin — and SP already imposes a
+    ///      1-day cooldown on that cancel, so this adds nothing material.
+    function _isEligibleForSnapshot(bytes32 nodeId) internal view returns (bool) {
+        // Bootstrap nodes carry no stake by construction; `requireStake` is what retires them.
+        if (isBootstrap[nodeId]) return !requireStake;
+        address op = nodeOperator[nodeId];
+        if (!_isStaked(op)) return false;
+        address agg = blsAggregator;
+        // Fail-closed rather than "skip the check when unset": a silent downgrade would turn a security
+        // predicate into an optional one exactly when it is most needed.
+        if (agg == address(0)) return false;
+        (uint64 readyAt,) = IGuardianExitSource(agg).guardianExitRequests(op);
+        return readyAt == 0;
+    }
+
+    /// @dev The Registry's current aggregator. Fails closed if the Registry does not publish one:
+    ///      without it there is no authority to bind to, and guessing is what this replaced.
+    function _registryAggregator() internal view returns (address) {
+        require(registry != address(0), "registry not set");
+        try IRegistryAggregator(registry).blsAggregator() returns (address a) {
+            require(a != address(0), "Registry.blsAggregator() == 0");
+            return a;
+        } catch {
+            revert("registry does not publish blsAggregator()");
+        }
+    }
+
+    /// @notice The complete active set, sorted ascending — exactly the argument `snapshotEpoch` wants.
+    /// @dev    OFF-CHAIN CONVENIENCE ONLY (keepers, tests). It scans `registeredNodes` (which retains
+    ///         stale ids by design) and insertion-sorts, so it is O(n^2) and must never be called from
+    ///         a transaction. A production keeper should rebuild the set from SlotAssigned/SlotCleared
+    ///         events instead; this exists so that doing the simple thing is still correct.
+    function activeNodeIdsSorted() public view returns (bytes32[] memory out) {
+        uint256 total = registeredNodes.length;
+        out = new bytes32[](activeCount);
+        uint256 k;
+        for (uint256 i = 0; i < total && k < out.length; i++) {
+            bytes32 id = registeredNodes[i];
+            if (slotPlusOne[id] == 0) continue;
+            // `registeredNodes` can hold the same id twice (revoke then re-register), so de-duplicate.
+            bool seen;
+            for (uint256 j = 0; j < k; j++) {
+                if (out[j] == id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            // Insertion sort in place: snapshotEpoch requires strictly increasing ids.
+            uint256 pos = k;
+            while (pos > 0 && out[pos - 1] > id) {
+                out[pos] = out[pos - 1];
+                pos--;
+            }
+            out[pos] = id;
+            k++;
+        }
+    }
+
+    event NodeExitNoticeSynced(bytes32 indexed nodeId, address indexed operator, uint64 readyAt);
+
+    /// @notice Permissionlessly retire a node whose operator has filed a ROLE_DVT exit notice.
+    /// @dev    WITHOUT THIS THE SNAPSHOT DEADLOCKS. `snapshotEpoch` refuses a set containing a node
+    ///         with `readyAt != 0`, but the base `syncNode` only knows about role/stake/bootstrap — and
+    ///         SP deliberately keeps BOTH role and stake intact for the whole 2-day notice. So
+    ///         `syncNode` reverts "Node still active" while `snapshotEpoch` reverts "ineligible node",
+    ///         and no permissionless action can break the tie: every pin fails until the guardian
+    ///         cancels or two days elapse. A single ORDINARY exit would halt committee mode.
+    ///
+    ///         The predicate is deliberately NARROW — an in-flight exit notice, nothing else — rather
+    ///         than `!_isEligibleForSnapshot`. Reusing the snapshot predicate would let anyone empty
+    ///         the whole set whenever `blsAggregator` is unset, since it returns false for every staked
+    ///         node in that state.
+    function syncExitNotice(bytes32 nodeId) external {
+        require(isRegistered[nodeId], "Node not registered");
+        require(!isBootstrap[nodeId], "Bootstrap node: use syncNode");
+        address agg = blsAggregator;
+        require(agg != address(0), "bls aggregator not set");
+        // Same authority binding as snapshotEpoch. Without it, during a Registry rotation a LEFTOVER
+        // notice on the OLD ledger — which no longer governs `Registry.exitRole` — would let anyone
+        // evict a node that still holds its role and stake, dropping it from the frozen committee it
+        // is currently serving.
+        require(agg == _registryAggregator(), "aggregator stale: re-run setBlsAggregator");
+        address op = nodeOperator[nodeId];
+        (uint64 readyAt,) = IGuardianExitSource(agg).guardianExitRequests(op);
+        require(readyAt != 0, "No exit notice filed");
+        _deactivate(nodeId);
+        emit NodeExitNoticeSynced(nodeId, op, readyAt);
+        emit NodeDeactivated(nodeId, op);
+    }
+
+    /// @notice Whether `nodeId` would be accepted into the next snapshot. For keepers: call this to find
+    ///         which nodes need `syncNode` before `snapshotEpoch` will succeed.
+    function isEligibleForSnapshot(bytes32 nodeId) external view returns (bool) {
+        return _isEligibleForSnapshot(nodeId);
     }
 
     function currentEpoch() public view returns (uint256) {
@@ -434,7 +650,14 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///      (configVersion). This makes a post-reconfiguration seed/root fail-closed rather than being
     ///      combined across incompatible schedules.
     function _epochUsable(uint256 e) internal view returns (bool) {
-        return epochPinned[e] && epochConfigVersion[e] == configVersion;
+        return epochPinned[e] && epochConfigVersion[e] == configVersion
+        // STRICTLY less than, not <=. SP's `consumeGuardianExit` admits an exit at
+        // `block.timestamp == readyAt` (BLSAggregator.sol:1803). A node that was clean at freeze time
+        // (readyAt == 0 is required) and filed in that same second matures at exactly
+        // freezeTime + GUARDIAN_EXIT_DELAY == epochSetValidUntil — so at that instant it can already
+        // have withdrawn, while `validate` never re-reads the Registry. Reads only this contract's own
+        // storage, so validate() stays ERC-7562 clean.
+        && block.timestamp < epochSetValidUntil[e];
     }
 
     // ---------------------------------------------------------------------------------------------
