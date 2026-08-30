@@ -76,18 +76,73 @@ shared with `OverIssueFraudProofVerifier.t.sol`.
 Run:
 `NODE_OPTIONS=--experimental-vm-modules npx jest src/modules/audit/guardian-slash-e2e.spec.ts`
 
+<!-- arming-section:begin -->
+
 ## Joint successor-Sepolia run (CC-115 B0/B3)
 
-1. **SP**: deploy `BLSAggregator-4.11.0` to Sepolia with
-   `fraudProofVerifier == address(0)` (dormant); wire it into Registry before
-   arming, authorize it as the staking slasher, and register N guardians with
-   ROLE_DVT locks at minStake. Deploy `OverIssueFraudProofVerifier` bound to
-   this exact aggregator and Registry, then have the aggregator owner call
-   `proposeFraudProofVerifier(verifier)`. Record the proposal receipt and
-   `pendingFraudProofVerifierReadyAt`, wait the on-chain
-   `VERIFIER_ROTATION_DELAY` (**4 days**), and call the permissionless
-   `applyFraudProofVerifier()`. There is deliberately no direct setter or
-   deployment-time bypass in SP 4.11.
+### Arming procedure (authoritative)
+
+<!-- arming-block:begin -->
+
+This block is asserted VERBATIM by `scripts/check-verifier-arming.mjs`, and the
+operational arming calls must appear nowhere else in this section. Changing the
+procedure therefore means changing the checker's pinned copy in the same commit
+— deliberate friction on a security-critical sequence, and the reason a stale
+duplicate or a quietly weakened wait cannot survive review.
+
+1. The aggregator owner (a Safe M-of-N) calls
+   `proposeFraudProofVerifier(verifier)`. Record the transaction hash and the
+   emitted `pendingFraudProofVerifierReadyAt`.
+2. Wait the FULL on-chain `VERIFIER_ROTATION_DELAY` — **4 days**.
+   `applyFraudProofVerifier()` reverts `VerifierRotationNotReady(readyAt)`
+   before then. Those four days of public visibility ARE the security property
+   (CC-48 MEDIUM-1); they are not a formality and must not be shortened.
+3. Anyone may then call the permissionless `applyFraudProofVerifier()` — the
+   decision was already taken by the owner and has served its full delay, so
+   keeping it owner-only would hand the owner a second veto. Record that receipt
+   too.
+
+There is no direct setter and no deployment-time bypass in this release.
+Disarming is the only immediate direction (`emergencyDisarmFraudProofVerifier`,
+owner-only).
+
+<!-- arming-block:end -->
+
+### Run steps
+
+1. **Stand up a dormant aggregator, then arm the verifier through the procedure
+   above.**
+   - **SP**: deploy `BLSAggregator-4.11.0` to Sepolia with
+     `fraudProofVerifier == address(0)` (dormant); wire it into Registry before
+     arming, authorize it as the staking slasher, and register N guardians with
+     ROLE_DVT locks at minStake.
+   - **DVT**: deploy `OverIssueFraudProofVerifier` bound to this exact
+     aggregator and Registry with
+     `contracts/script/DeployOverIssueVerifier.s.sol`. The script reads
+     `REGISTRY()` from the aggregator itself (never a hand-entered env) and runs
+     three independent pre-broadcast gates: (a) `version()` must EQUAL the
+     pinned `SUPPORTED_AGGREGATOR_VERSION` (`BLSAggregator-4.11.0`, the release
+     CC-115 B1 was conformance-verified against) — override only via
+     `EXPECTED_AGGREGATOR_VERSION`, after re-verifying that the new release
+     still speaks the four-parameter fraud-proof ABI and still has no direct
+     setter; (b) `VERIFIER_ROTATION_DELAY` must be at least **4 days**; (c) the
+     aggregator's `fraudProofDigest` must byte-match the freshly deployed
+     verifier's recomputation. It then prints the arming handoff, plus the
+     aggregator's `version()`, current `fraudProofVerifier` and
+     `pendingFraudProofVerifierReadyAt` for the B3 manifest.
+
+     Why `version()` and not "does it expose `VERIFIER_ROTATION_DELAY`": the
+     direct setter was removed and the four-parameter ABI introduced in the
+     **same** SuperPaymaster change (the release reporting
+     `BLSAggregator-4.10.0`), and that release already exposed the full
+     propose/apply surface. Presence of the rotation constant is therefore not a
+     release predicate, and a hybrid contract can expose it while keeping an
+     instant setter. None of these gates is an identity proof — `version()` is a
+     string any contract can return — so the aggregator address itself must
+     still be pinned to a canonical, source-verified deployment out of band.
+
+   - **SP + anyone**: run the authoritative arming procedure above, and record
+     all three receipts for the B3 manifest.
 2. **SP**: craft a fraudulent over-issue slash — call `verifyAndExecute` with
    the evidence convention above over a token that is **not** actually
    over-issued (`isOverIssued() == false`), holding that state constant through
@@ -106,6 +161,8 @@ Run:
    whose mask includes a slashed guardian reverts in `_reconstructPkAgg`
    (auto-eject). Mirrors SP's `GuardianSlashE2E.t.sol` (swap its `MockVerifier`
    for the real one).
+
+<!-- arming-section:end -->
 
 ## Acceptance checklist (joint — tracked in issue #222)
 

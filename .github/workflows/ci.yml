@@ -71,6 +71,12 @@ jobs:
       - name: Run linter
         run: npm run lint
 
+      # CC-115 B3 / PR-D1: deploy scripts and runbooks must not instruct the removed SP 4.11
+      # `setFraudProofVerifier` setter, and must keep the propose -> 4 days -> apply handoff intact.
+      # Not compile-checkable (we never build against SP), so it is asserted statically.
+      - name: Check fraud-proof verifier arming instructions
+        run: npm run check:arming
+
   # Job 3: Build project
   build:
     name: Build
