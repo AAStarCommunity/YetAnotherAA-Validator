@@ -58,6 +58,14 @@ N<30 走 whole-set BFT 2/3，没有抽样界。cap 86 控 calldata/gas。
 
 ## 运营
 
+- **committee-off 窗口（部署 → enroll → 翻
+  `setEpochLength`）**：账户侧**链上强制** tier-2/3 fail-closed ——
+  `airaccount-contract` #208（merged `72d2311`, v0.32.0）的 `_blsAlgMode()`
+  三态：`committeeActive()` 返回 `false`（本验证器已挂载但未武装）⇒
+  tier-2/3 直接拒；返回 `true` ⇒ 正常 committee；**revert** （真 legacy
+  `0x539B`，没有该函数）⇒
+  whole-set 直通，长期共存不受影响。⚠️ 所以 cutover 期间 tier-2/3 是**不可用**，不是**不受保护**
+  —— 这是刻意的 fail-closed 姿态。**不再需要**「cutover 期间不挂 tier-2/3 账户」这条运维纪律，它已被链上边界取代。
 - **前置：`setBlsAggregator(...)`（质押模式必须）**。CC-112
   D2 起，快照会读每个 operator 的 ROLE_DVT 退出通知，地址必须等于 SP
   `Registry.blsAggregator()`
