@@ -26,8 +26,13 @@ const RPC = env.SEPOLIA_RPC_URL || env.ETH_RPC_URL;
 const KEY = env.KEEPER_PRIVATE_KEY || env.PRIVATE_KEY;
 const VALIDATOR = process.env.COMMITTEE_VALIDATOR || env.COMMITTEE_VALIDATOR || "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
 const WATCH = process.argv.includes("--watch");
-// keccak("snapshotEpoch(bytes32[])")[0:4], the D2 stake-aware form.
-const D2_SNAPSHOT_SELECTOR = "1ed58d67";
+// keccak("snapshotEpoch(bytes32[])")[0:4] = 1ed58d67, the D2 stake-aware form, with the PUSH4 opcode
+// (0x63) solc always emits in front of a dispatcher selector. Matching the bare four bytes searches the
+// hex string at ANY nibble offset, including positions not on a byte boundary at all. No false hit
+// exists in either real contract -- pr-daemon scanned ~86k hex chars of both and found none -- so this
+// is free hardening rather than a fix, but the selector scan decides which ABI we call, and a scan that
+// can drift off byte alignment is not the thing to leave loose.
+const D2_SNAPSHOT_SELECTOR = "631ed58d67";
 
 const ABI = [
   "function epochLength() view returns(uint256)",
