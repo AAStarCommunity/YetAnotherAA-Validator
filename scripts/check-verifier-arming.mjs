@@ -38,6 +38,14 @@
  *    concluded no bounded rule existed. Its residue — a shortcut naming no arming object — is a
  *    fixtured, documented limit.
  *  - `.mjs` is outside this repo's Prettier glob, so this file's formatting is not CI-enforced.
+ *  - A bare function name passed in a JS/TS TEMPLATE literal is NOT detected:
+ *    `encodeFunctionData(\`setFraudProofVerifier\`, [v])` passes, while the same line with double
+ *    quotes is caught. Backticks are excluded on purpose — this repo's own prose and NatSpec quote
+ *    the removed setter's name with backticks, and matching them produced false positives on the
+ *    deploy script's own documentation. The trade buys legal prose at the cost of template literals,
+ *    which are a legitimate way to pass the name. Closing it properly means stripping comments from
+ *    JS/TS first (as `splitSolidity` does for Solidity) and then allowing all three quote styles;
+ *    that is not done here because it has not been verified false-positive-free on this repository.
  *
  * Run: npm run check:arming      (also runs the detector's own adversarial self-tests)
  *      node scripts/check-verifier-arming.mjs --self-test-only
@@ -957,6 +965,12 @@ function selfTest() {
   // Performance regression. The numeral scan used to slice the whole prefix and suffix per numeral and
   // match the prefix against a nested quantifier, which made a single 39KB Solidity file take 12.4s.
   // A real source file is the fixture, because the pathological input is ordinary blanked-out code.
+  //
+  // HOW THIS ACTUALLY FAILS, measured rather than assumed: pr-daemon restored the old implementation
+  // verbatim and ran `--self-test-only` — it did not return within TEN MINUTES. So on a regression the
+  // symptom is a CI TIMEOUT, not this assertion firing: `elapsed > 1000` is evaluated only after
+  // `findSetterCalls` returns, and on this input the old code never does. The message below is
+  // therefore a diagnostic for a MILD regression; a severe one hangs, and that is still a failure.
   {
     const solidityLike =
       "// a comment line that gets blanked to spaces\n".repeat(400) +
