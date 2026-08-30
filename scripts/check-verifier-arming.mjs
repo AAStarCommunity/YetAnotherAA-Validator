@@ -970,7 +970,11 @@ function selfTest() {
   // verbatim and ran `--self-test-only` — it did not return within TEN MINUTES. So on a regression the
   // symptom is a CI TIMEOUT, not this assertion firing: `elapsed > 1000` is evaluated only after
   // `findSetterCalls` returns, and on this input the old code never does. The message below is
-  // therefore a diagnostic for a MILD regression; a severe one hangs, and that is still a failure.
+  // therefore a diagnostic for a MILD regression; a severe one hangs.
+  //
+  // "A hang is still a failure" is only true because CI bounds it: every job in ci.yml carries an
+  // explicit `timeout-minutes`. Without one GitHub's default is 360, so the same regression would
+  // have burned a runner for six hours and failed with nothing in the log explaining why.
   {
     const solidityLike =
       "// a comment line that gets blanked to spaces\n".repeat(400) +
