@@ -180,8 +180,15 @@ async function tick() {
     // so that path is routine; letting it print FAILED every time is how a real failure gets lost in
     // noise -- the same alert-fatigue shape as the outage this keeper is recovering from. Ask the chain
     // what actually happened instead of parsing prose.
+    // Must match the CONTRACT's guard, not a weaker proxy of it. snapshotEpoch rejects with
+    // "epoch already pinned" only when `epochPinned[e] && epochConfigVersion[e] == configVersion`
+    // (:387), and epochPinned is never cleared -- so after a configVersion bump an epoch stays
+    // `pinned == true` while remaining legitimately re-pinnable. Checking pinned alone would report a
+    // genuine failure in that window as "benign; verified on-chain" and return ok, blinding this
+    // keeper's own --watch loop for up to an epoch.
     const nowPinned = await v.epochPinned(e).catch(() => false);
-    if (nowPinned) { console.log("  another keeper pinned it first (benign; verified on-chain)"); return "ok"; }
+    const nowUsable = nowPinned && (await v.epochConfigVersion(e).catch(() => -1n)) === (await v.configVersion().catch(() => -2n));
+    if (nowUsable) { console.log("  another keeper pinned it first (benign; verified on-chain)"); return "ok"; }
     if (/already pinned/i.test(msg)) { console.log("  another keeper pinned it first (benign):", msg); return "ok"; }
     // A set change between the event replay and the transaction makes the list stale; the contract's
     // completeness check rejects it and the next tick rebuilds from a fresh head.

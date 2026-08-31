@@ -1,0 +1,54 @@
+# Scheduled committee liveness check.
+#
+# The tool this runs (deploy/committee-health.mjs, #250) was written because tier-2/3 went down for
+# ten hours and nothing noticed. A checker nobody schedules would have changed exactly nothing about
+# that outage, so this workflow is the half that makes it real.
+#
+# Deliberately runs HERE and not on the box that runs the keeper: the keeper's machine going away is
+# one of the failure modes being watched for, and a watchdog sharing its fate is not a watchdog.
+#
+# A non-zero exit fails the job, and a failing scheduled workflow is what notifies. Exit 2
+# ("could not determine") fails too, on purpose -- a monitor that cannot see is not healthy, and
+# treating 2 as OK is how a dead RPC becomes ten more hours of silence.
+name: Committee Health
+
+on:
+  schedule:
+    # Every 15 minutes. The sentinel appears about one epoch (~13 min at epochLength 64) after the
+    # last successful pin, so this is roughly the finest granularity that is not just noise.
+    # GitHub delays or drops scheduled runs under load -- treat this as best-effort, not a guarantee.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      validator:
+        description: "Validator address to check (defaults to the live committee validator)"
+        required: false
+
+# A run in flight must not be cancelled by the next tick, or a slow RPC could silently skip checks.
+concurrency:
+  group: committee-health
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      # Just the one dependency, rather than a full `npm ci`: this runs 96 times a day and only needs
+      # an RPC client. Pinned to the same major the repo uses.
+      - name: Install ethers
+        run: npm install --no-save --no-audit --no-fund ethers@^6
+
+      - name: Check committee liveness
+        env:
+          # Falls back to a public endpoint so this works without repo secrets. Set the secret to use a
+          # dedicated provider; the script accepts SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL.
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com' }}
+          COMMITTEE_VALIDATOR: ${{ inputs.validator }}
+        run: node deploy/committee-health.mjs --json

@@ -66,7 +66,11 @@ const flag = n => {
   if (i === -1) return undefined;
   const v = argv[i + 1];
   if (v === undefined || v.startsWith("--")) {
-    console.error(`\n✗ ${n} requires a value`);
+    // --json is an invariant of EVERY exit path, including this one. It is checked directly off argv
+    // rather than via JSON_OUT because this guard can run before that binding is initialised.
+    const msg = `${n} requires a value`;
+    if (argv.includes("--json")) process.stdout.write(JSON.stringify({ status: "UNKNOWN", summary: msg }) + "\n");
+    else console.error(`\n✗ ${msg}`);
     process.exit(2);
   }
   return v;
@@ -204,6 +208,12 @@ async function main() {
   }
 
   const e = bn / epochLength;
+  if (e === 0n) {
+    // The contract returns the sentinel for e == 0 too, but this script reads epoch e-1 first, and
+    // -1 does not encode as uint256 -- it would throw before reaching that. Only possible below block
+    // `epochLength`, i.e. a fresh devnet.
+    emit("UNKNOWN", 2, `chain height ${bn} is inside epoch 0; requiredQuorum() is the sentinel by definition and there is no epoch e-1 to read`, { block: blockTag, epoch: 0 });
+  }
   const start = e * epochLength;
   // The pin deadline is NOT start+256. `snapshotEpoch` requires block.number <= start + 256 AND
   // recomputes e = block.number / epochLength, so it stops accepting the moment the epoch ends:
@@ -239,10 +249,14 @@ async function main() {
   const usablePrev = usable(pinnedPrev, cfgPrev, validUntilPrev);
   const floorOk = !isD2 || setCountPrev >= minC.value;
 
+  // The e-side conjuncts exist ONLY in D2's requiredQuorum (:643 checks _epochUsable(e) AND (e-1));
+  // pre-D2 consults e-1 alone. Listing "epoch e is not pinned" against the pre-D2 contract that is
+  // actually deployed would name a term that generation's formula does not contain -- and attribution
+  // is the entire point of reading the conjuncts instead of just the sentinel.
   const why = [];
-  if (!pinnedE) why.push(`epoch ${e} is not pinned`);
-  if (pinnedE && cfgE !== configVersion) why.push(`epoch ${e} was pinned under configVersion ${cfgE}, now ${configVersion}`);
-  if (pinnedE && validUntilE.present && now >= BigInt(validUntilE.value)) why.push(`epoch ${e}'s snapshot expired at ${validUntilE.value}`);
+  if (isD2 && !pinnedE) why.push(`epoch ${e} is not pinned`);
+  if (isD2 && pinnedE && cfgE !== configVersion) why.push(`epoch ${e} was pinned under configVersion ${cfgE}, now ${configVersion}`);
+  if (isD2 && pinnedE && validUntilE.present && now >= BigInt(validUntilE.value)) why.push(`epoch ${e}'s snapshot expired at ${validUntilE.value}`);
   if (!pinnedPrev) why.push(`epoch ${e - 1n} is not pinned`);
   if (pinnedPrev && cfgPrev !== configVersion) why.push(`epoch ${e - 1n} was pinned under configVersion ${cfgPrev}, now ${configVersion}`);
   if (pinnedPrev && validUntilPrev.present && now >= BigInt(validUntilPrev.value)) why.push(`epoch ${e - 1n}'s snapshot expired at ${validUntilPrev.value}`);
@@ -277,7 +291,10 @@ async function main() {
     // The one benign sentinel: on D2 the current epoch simply has not been pinned yet and is still
     // inside its window, while e-1 still serves every payload. That is the keeper's normal latency
     // (~4-5 blocks in 64), not an incident. Paging on it would be a 7% duty cycle.
-    const onlyPendingPin = !usableE && usablePrev && floorOk && !pinnedE && !beforeWindow && !pastWindow;
+    // Gated on isD2 to match its own argument: the exemption exists because D2 requires _epochUsable(e),
+    // so an unpinned current epoch alone turns the sentinel on. Pre-D2 never produces a sentinel from
+    // that state (verified on the live contract: it returns 2), so a sentinel there is never benign.
+    const onlyPendingPin = isD2 && !usableE && usablePrev && floorOk && !pinnedE && !beforeWindow && !pastWindow;
     if (onlyPendingPin) {
       emit("WARN", 0, `epoch ${e} is not pinned yet but is still inside its window (pinnable through ${deadline}); epoch ${e - 1n} still serves. Normal keeper latency.`, detail);
     }
