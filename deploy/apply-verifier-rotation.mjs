@@ -52,7 +52,10 @@ const ENV_FILE = ENV_EXPLICIT || resolve(HERE, "..", ".env.sepolia");
 const AGGREGATOR = flag("--aggregator") || "0xEaeC2F512eA50708211fa95533e4dBb60e3d2E5D";
 // The verifier this rotation is EXPECTED to install. Checked against the chain before broadcasting:
 // applying a rotation is not the moment to discover someone proposed a different contract.
-const EXPECTED = flag("--expect-verifier") || "0xa1346F1668cBf8D031Cc5D72eDA45F5788CA1cd3";
+const EXPECTED =
+  flag("--expect-verifier") ||
+  process.env.APPLY_EXPECTED_VERIFIER ||
+  "0xa1346F1668cBf8D031Cc5D72eDA45F5788CA1cd3";
 
 const strip = s => s.replace(/^["']|["']$/g, "");
 let env = {};
@@ -70,7 +73,8 @@ try {
   /* optional when the environment supplies the RPC */
 }
 // Explicit beats implicit, symmetric: with --env the file wins, without it the environment does.
-const pick = (...n) => n.map(k => (ENV_EXPLICIT ? env[k] || process.env[k] : process.env[k] || env[k])).find(Boolean);
+const pick = (...n) =>
+  n.map(k => (ENV_EXPLICIT ? env[k] || process.env[k] : process.env[k] || env[k])).find(Boolean);
 const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
 const KEY = pick("KEEPER_PRIVATE_KEY", "PRIVATE_KEY", "OWNER_PRIVATE_KEY", "DEPLOYER_PRIVATE_KEY");
 
@@ -110,13 +114,20 @@ async function main() {
     // reaches this state on every tick AFTER it succeeds, and reporting that as a failure would train
     // whoever watches it to ignore the job -- the alert fatigue this repo keeps circling.
     if (active.toLowerCase() === EXPECTED.toLowerCase()) {
-      console.log(`\nAlready applied: fraudProofVerifier is ${active} and no rotation is pending. Nothing to do.`);
+      console.log(
+        `\nAlready applied: fraudProofVerifier is ${active} and no rotation is pending. Nothing to do.`
+      );
       return;
     }
     die(
       `no rotation is pending, and the active verifier is ${active}, not the expected ${EXPECTED}.\n` +
-        `  Either the rotation was disarmed (emergencyDisarmFraudProofVerifier is owner-only and\n` +
-        `  immediate), or a different verifier was applied. This is not a no-op — investigate.`
+        `  Three causes, and the third is NOT a fault:\n` +
+        `    1. the rotation was disarmed (emergencyDisarmFraudProofVerifier is owner-only, immediate);\n` +
+        `    2. a different verifier was applied;\n` +
+        `    3. a LATER legitimate rotation has since completed, and this script is still pinned to the\n` +
+        `       verifier of the previous one. EXPECTED is a constant here; after any future rotation set\n` +
+        `       APPLY_EXPECTED_VERIFIER (or --expect-verifier) to the new address, or this job goes red\n` +
+        `       every day for a correct chain state.`
     );
   }
   if (pending.toLowerCase() !== EXPECTED.toLowerCase()) {
@@ -128,12 +139,22 @@ async function main() {
   }
   if (now < readyAt) {
     const left = Number(readyAt - now);
-    die(
-      `the delay has not matured: ${left}s left (~${(left / 86400).toFixed(2)} days), ready at ` +
+    // NOT a failure. A daily runner sits in this state for the WHOLE four-day delay by design, and
+    // exiting non-zero here would paint the job red for four consecutive days before the one day it
+    // matters -- at which point a real failure (no RPC, missing key, revert) is indistinguishable
+    // from the four that preceded it. That is the same alert fatigue this script's readyAt==0 branch
+    // was written to avoid, on the other side of the window: not silent, but SHAPED LIKE A FAULT.
+    // Green plus a countdown says just as much and keeps a red exit meaningful.
+    console.log(
+      `\nWaiting: the delay has not matured. ${left}s left (~${(left / 86400).toFixed(2)} days), ready at ` +
         `${new Date(Number(readyAt) * 1000).toISOString()}.\n` +
         `  This wait IS the security property (CC-48 MEDIUM-1) -- a public window in which anyone can\n` +
-        `  see which verifier is about to become authoritative. Nothing here can or should shorten it.`
+        `  see which verifier is about to become authoritative. Nothing here can or should shorten it.\n` +
+        `  Nothing to do; this run is a success.`
     );
+    // MUST return. die() terminated; console.log does not -- without this the run would fall through
+    // to the broadcast and send a transaction the contract is guaranteed to revert.
+    return;
   }
 
   if (!BROADCAST) {
@@ -157,10 +178,17 @@ async function main() {
     ro.pendingFraudProofVerifierReadyAt(after),
   ]);
   console.log(`\nFinal readback:`);
-  console.log(`  fraudProofVerifier              : ${nowActive} ${nowActive.toLowerCase() === EXPECTED.toLowerCase() ? "✓" : "✗ UNEXPECTED"}`);
-  console.log(`  pendingFraudProofVerifier       : ${nowPending} ${nowPending === ethers.ZeroAddress ? "✓ cleared" : "✗"}`);
-  console.log(`  pendingFraudProofVerifierReadyAt: ${nowReady} ${nowReady === 0n ? "✓ cleared" : "✗"}`);
-  if (nowActive.toLowerCase() !== EXPECTED.toLowerCase()) die("the active verifier is not the one this rotation proposed");
+  console.log(
+    `  fraudProofVerifier              : ${nowActive} ${nowActive.toLowerCase() === EXPECTED.toLowerCase() ? "✓" : "✗ UNEXPECTED"}`
+  );
+  console.log(
+    `  pendingFraudProofVerifier       : ${nowPending} ${nowPending === ethers.ZeroAddress ? "✓ cleared" : "✗"}`
+  );
+  console.log(
+    `  pendingFraudProofVerifierReadyAt: ${nowReady} ${nowReady === 0n ? "✓ cleared" : "✗"}`
+  );
+  if (nowActive.toLowerCase() !== EXPECTED.toLowerCase())
+    die("the active verifier is not the one this rotation proposed");
   console.log(`\nRecords 6 and 7 of docs/evidence/cc115-b3-arming-sepolia.md are now available.`);
 }
 

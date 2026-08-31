@@ -19,13 +19,35 @@
 #
 # Idempotent by design: after it succeeds, every later run reports "already applied" and exits 0. It
 # is NOT self-disabling, because a job that turns itself off cannot tell you it stopped.
+#
+# ############################################################################################
+# ACCEPTED GAP -- MEASURED, NOT ASSUMED: the `schedule` trigger below is UNPROVEN IN THIS REPO.
+#
+#   committee-health.yml sat on the default branch for 6h33m (2026-08-31T03:44Z -> 10:17Z) with
+#   `cron: "7,22,37,52 * * * *"`. Expected ticks: 26. Scheduled runs that actually fired: ZERO.
+#   Everything else checked out -- the `on:` block parses to a valid schedule, the GitHub API
+#   reported `state=active`, the repo was neither archived nor disabled, `pushed_at` showed pushes
+#   throughout, and `workflow_dispatch` on the same workflow was green. So the job can run; only
+#   nobody presses it. An earlier 53-minute observation on `*/15` was the same result, and
+#   airaccount-contract measured 0 ticks on offset minutes too -- offsetting the cron is NOT the fix,
+#   which is what that earlier measurement was wrongly read to mean.
+#
+#   Therefore: DO NOT TREAT THE 2026-09-04 APPLY AS AUTOMATED. This workflow is a best-effort
+#   attempt, not a guarantee. The guarantee is the manual fallback, which is exercised and green:
+#
+#       node deploy/apply-verifier-rotation.mjs --env <env-with-a-funded-key> --broadcast
+#
+#   or `workflow_dispatch` on this workflow, which is the ONLY trigger observed to work here.
+# ############################################################################################
 name: Apply Verifier Rotation
 
 on:
   schedule:
     # Daily, offset off the hour. readyAt is 2026-09-04T05:36:24Z, so the first run that can succeed
-    # is that morning; before then every run exits 1 with the remaining time, which is honest rather
-    # than silent. The pending proposal does NOT expire, so a missed day costs nothing.
+    # is that morning. Before then every run exits 0 with the remaining time: waiting out the delay
+    # is the DESIGNED state for four consecutive days, and painting those red would make a real
+    # failure on the fifth indistinguishable from them. The pending proposal does NOT expire, so a
+    # missed day costs nothing -- which is also why a constant concurrency group is right here.
     - cron: "41 6 * * *"
   workflow_dispatch:
 

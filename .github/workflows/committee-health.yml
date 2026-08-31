@@ -48,6 +48,15 @@ on:
     # public non-fork repo, manual dispatch green. GitHub simply delays and drops scheduled runs under
     # load, and the top-of-hour slots are where that load is.
     #
+    # FOLLOW-UP MEASUREMENT (2026-08-31), which CONTRADICTS the reading that offsetting is a fix:
+    # with the offset cron below, on the default branch, this workflow went 6h33m / 26 expected ticks
+    # with ZERO scheduled runs. The `on:` block parses to a valid schedule, the API reports
+    # state=active, the repo is neither archived nor disabled, pushes happened throughout, and
+    # workflow_dispatch is green. airaccount-contract measured the same on its own offset cron.
+    # So the offset is kept only because it costs nothing -- it is NOT what makes this work, and
+    # NOTHING here has yet been observed to make it work. This monitor's capability is verified;
+    # its trigger is not. Treat scheduled coverage as UNPROVEN and dispatch manually when it matters.
+    #
     # So "every 15 minutes" is a REQUEST, never a guarantee. That is the second half of the ACCEPTED
     # GAP below: the scheduler can be switched off after 60 days, and even while on it can silently
     # skip. Both need the same external heartbeat to detect, and neither is visible from inside.
