@@ -241,22 +241,34 @@ case "$MODE" in
 
   check)
     # For a human, and for anything that wants to verify the monitor rather than trust it.
+    #
+    # DISTINCT EXIT CODES, because "never installed" and "installed and has stopped firing" call for
+    # different actions and collapsing them makes the number stop being read. Same reason the checker
+    # this wraps separates 1 (found a problem) from 2 (could not reach a conclusion): a column of
+    # non-zeros that all mean "something" means nothing within a week.
+    #   0 both heartbeats fresh
+    #   1 at least one is STALE -- the agent is loaded but its interval is not firing
+    #   3 at least one has NEVER RUN -- not installed, or bootstrap failed
+    # (3, not 2: 2 is the checker's "undetermined" and this is not that.)
     rc=0
+    never=0
     for m in health apply; do
       f="$RUN_DIR/heartbeat-$m.txt"
       if [ ! -f "$f" ]; then
-        echo "$m: NEVER RAN (no $f)"; rc=1; continue
+        echo "$m: NEVER RAN (no $f) -- not installed, or bootstrap failed"; never=1; continue
       fi
       last=$(cat "$f")
       age=$(( $(date -u +%s) - $(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$last" +%s 2>/dev/null || echo 0) ))
       # health every 15 min, apply daily; allow 3x before calling it stale.
       limit=$([ "$m" = health ] && echo 2700 || echo 259200)
       if [ "$age" -gt "$limit" ]; then
-        echo "$m: STALE -- last ran $last (${age}s ago, limit ${limit}s)"; rc=1
+        echo "$m: STALE -- last ran $last (${age}s ago, limit ${limit}s) -- loaded but not firing"; rc=1
       else
         echo "$m: ok -- last ran $last (${age}s ago)"
       fi
     done
+    # NEVER RAN outranks STALE: it is the more actionable of the two.
+    [ "$never" -eq 1 ] && exit 3
     exit "$rc"
     ;;
 
