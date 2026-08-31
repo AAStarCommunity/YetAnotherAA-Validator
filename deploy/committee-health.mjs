@@ -72,7 +72,8 @@ const flag = n => {
     // --json is an invariant of EVERY exit path, including this one. It is checked directly off argv
     // rather than via JSON_OUT because this guard can run before that binding is initialised.
     const msg = `${n} requires a value`;
-    if (argv.includes("--json")) process.stdout.write(JSON.stringify({ status: "UNKNOWN", summary: msg }) + "\n");
+    if (argv.includes("--json"))
+      process.stdout.write(JSON.stringify({ status: "UNKNOWN", summary: msg }) + "\n");
     else console.error(`\n✗ ${msg}`);
     process.exit(2);
   }
@@ -121,7 +122,9 @@ const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
 // Opt-in: assert that this validator is supposed to have committee mode ON. See the epochLength == 0
 // branch for why the default cannot be "always expect armed" -- an unmounted candidate legitimately
 // sits at 0.
-const expectArmed = argv.includes("--expect-armed") || /^(1|true|yes)$/i.test(process.env.EXPECT_COMMITTEE_ACTIVE || "");
+const expectArmed =
+  argv.includes("--expect-armed") ||
+  /^(1|true|yes)$/i.test(process.env.EXPECT_COMMITTEE_ACTIVE || "");
 // Prefer naming the STACK, not the address. A router's algId 0x01 is what actually decides which
 // validator an account stack uses, so deriving from it means the check can never end up watching a
 // contract the stack does not use -- the failure this file's own header predicted ("mount a different
@@ -138,7 +141,9 @@ const ROUTER = flag("--router") || process.env.COMMITTEE_ROUTER || env.COMMITTEE
 // see, because the router would appear configured.
 const VALIDATOR_FROM_FILE = env.COMMITTEE_VALIDATOR;
 const VALIDATOR_EXPLICIT =
-  flag("--validator") || process.env.COMMITTEE_VALIDATOR || (ROUTER ? undefined : VALIDATOR_FROM_FILE);
+  flag("--validator") ||
+  process.env.COMMITTEE_VALIDATOR ||
+  (ROUTER ? undefined : VALIDATOR_FROM_FILE);
 let VALIDATOR = VALIDATOR_EXPLICIT || "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
 
 const ABI = [
@@ -193,7 +198,11 @@ async function optional(call) {
 
 async function main() {
   if (!RPC) {
-    emit("UNKNOWN", 2, `no RPC url (looked for SEPOLIA_RPC_URL/ETH_RPC_URL/RPC_URL in ${ENV_FILE} and the environment)`);
+    emit(
+      "UNKNOWN",
+      2,
+      `no RPC url (looked for SEPOLIA_RPC_URL/ETH_RPC_URL/RPC_URL in ${ENV_FILE} and the environment)`
+    );
   }
   const provider = new ethers.JsonRpcProvider(RPC);
 
@@ -204,9 +213,14 @@ async function main() {
   // version watched the wrong contract but SAID SO, and that honest label is how the drift was
   // spotted at all.
   if (ROUTER && !VALIDATOR_EXPLICIT) {
-    if (!ethers.isAddress(ROUTER)) emit("UNKNOWN", 2, `COMMITTEE_ROUTER is not an address: ${ROUTER}`);
+    if (!ethers.isAddress(ROUTER))
+      emit("UNKNOWN", 2, `COMMITTEE_ROUTER is not an address: ${ROUTER}`);
     try {
-      const r = new ethers.Contract(ROUTER, ["function getAlgorithm(uint8) view returns (address)"], provider);
+      const r = new ethers.Contract(
+        ROUTER,
+        ["function getAlgorithm(uint8) view returns (address)"],
+        provider
+      );
       const derived = await r.getAlgorithm(1);
       if (derived === ethers.ZeroAddress) {
         emit("UNKNOWN", 2, `router ${ROUTER} has no algorithm mounted at 0x01 — nothing to watch`);
@@ -214,12 +228,18 @@ async function main() {
       VALIDATOR = derived;
       say(`router     ${ROUTER}  ->  algId 0x01`);
     } catch (e) {
-      emit("UNKNOWN", 2, `could not read getAlgorithm(0x01) from router ${ROUTER}: ${e?.shortMessage ?? e?.message ?? String(e)}`);
+      emit(
+        "UNKNOWN",
+        2,
+        `could not read getAlgorithm(0x01) from router ${ROUTER}: ${e?.shortMessage ?? e?.message ?? String(e)}`
+      );
     }
   } else if (ROUTER && VALIDATOR_EXPLICIT) {
     say(`router     ${ROUTER} ignored — an explicit validator was given`);
     if (VALIDATOR_FROM_FILE && VALIDATOR_FROM_FILE !== VALIDATOR_EXPLICIT) {
-      say(`           (${ENV_FILE} also sets COMMITTEE_VALIDATOR=${VALIDATOR_FROM_FILE}; it lost to the explicit one)`);
+      say(
+        `           (${ENV_FILE} also sets COMMITTEE_VALIDATOR=${VALIDATOR_FROM_FILE}; it lost to the explicit one)`
+      );
     }
   }
 
@@ -227,7 +247,8 @@ async function main() {
   // "what it says" cannot diverge.
   const v = new ethers.Contract(VALIDATOR, ABI, provider);
 
-  if ((await provider.getCode(VALIDATOR)) === "0x") emit("UNKNOWN", 2, `no code at ${VALIDATOR} on this chain`);
+  if ((await provider.getCode(VALIDATOR)) === "0x")
+    emit("UNKNOWN", 2, `no code at ${VALIDATOR} on this chain`);
 
   // Pin EVERY read to one block. Sampling `requiredQuorum()` at block N and `epochPinned` at N+1 can
   // straddle a pin and produce a self-contradictory report — precisely at the boundary this tool is
@@ -260,12 +281,17 @@ async function main() {
     // workflow_dispatch at another address explicitly does not, since that address may be a candidate
     // that is meant to sit at 0.
     if (expectArmed) {
-      emit("CRITICAL", 1, "committee mode is OFF (epochLength == 0) on a validator expected to be ARMED — every account mounted here has tier-2/3 failing closed", {
-        block: blockTag,
-        committeeActive: active,
-        epochLength: 0,
-        expectArmed: true,
-      });
+      emit(
+        "CRITICAL",
+        1,
+        "committee mode is OFF (epochLength == 0) on a validator expected to be ARMED — every account mounted here has tier-2/3 failing closed",
+        {
+          block: blockTag,
+          committeeActive: active,
+          epochLength: 0,
+          expectArmed: true,
+        }
+      );
     }
     emit("OK", 0, "committee mode is OFF (epochLength == 0) — nothing is being served", {
       block: blockTag,
@@ -280,13 +306,19 @@ async function main() {
     // The contract returns the sentinel for e == 0 too, but this script reads epoch e-1 first, and
     // -1 does not encode as uint256 -- it would throw before reaching that. Only possible below block
     // `epochLength`, i.e. a fresh devnet.
-    emit("UNKNOWN", 2, `chain height ${bn} is inside epoch 0; requiredQuorum() is the sentinel by definition and there is no epoch e-1 to read`, { block: blockTag, epoch: 0 });
+    emit(
+      "UNKNOWN",
+      2,
+      `chain height ${bn} is inside epoch 0; requiredQuorum() is the sentinel by definition and there is no epoch e-1 to read`,
+      { block: blockTag, epoch: 0 }
+    );
   }
   const start = e * epochLength;
   // The pin deadline is NOT start+256. `snapshotEpoch` requires block.number <= start + 256 AND
   // recomputes e = block.number / epochLength, so it stops accepting the moment the epoch ends:
   // start + min(256, epochLength - 1). Matches the contract's own note at :192.
-  const deadline = start + (epochLength - 1n < BLOCKHASH_WINDOW ? epochLength - 1n : BLOCKHASH_WINDOW);
+  const deadline =
+    start + (epochLength - 1n < BLOCKHASH_WINDOW ? epochLength - 1n : BLOCKHASH_WINDOW);
   // Three states, not two. At the epoch's FIRST block the window has not opened yet (the guard is
   // `bn > start`); conflating that with having missed it fires a false CRITICAL every epoch boundary.
   // pastWindow needs epochLength >= 258 to be reachable at all (inside epoch e, bn <= start+L-1), so
@@ -328,16 +360,25 @@ async function main() {
   // is the entire point of reading the conjuncts instead of just the sentinel.
   const why = [];
   if (isD2 && !pinnedE) why.push(`epoch ${e} is not pinned`);
-  if (isD2 && pinnedE && cfgE !== configVersion) why.push(`epoch ${e} was pinned under configVersion ${cfgE}, now ${configVersion}`);
-  if (isD2 && pinnedE && validUntilE.present && now >= BigInt(validUntilE.value)) why.push(`epoch ${e}'s snapshot expired at ${validUntilE.value}`);
+  if (isD2 && pinnedE && cfgE !== configVersion)
+    why.push(`epoch ${e} was pinned under configVersion ${cfgE}, now ${configVersion}`);
+  if (isD2 && pinnedE && validUntilE.present && now >= BigInt(validUntilE.value))
+    why.push(`epoch ${e}'s snapshot expired at ${validUntilE.value}`);
   if (!pinnedPrev) why.push(`epoch ${e - 1n} is not pinned`);
-  if (pinnedPrev && cfgPrev !== configVersion) why.push(`epoch ${e - 1n} was pinned under configVersion ${cfgPrev}, now ${configVersion}`);
-  if (pinnedPrev && validUntilPrev.present && now >= BigInt(validUntilPrev.value)) why.push(`epoch ${e - 1n}'s snapshot expired at ${validUntilPrev.value}`);
-  if (!floorOk) why.push(`frozen set of epoch ${e - 1n} is ${setCountPrev}, below minCommittee ${minC.value}`);
+  if (pinnedPrev && cfgPrev !== configVersion)
+    why.push(`epoch ${e - 1n} was pinned under configVersion ${cfgPrev}, now ${configVersion}`);
+  if (pinnedPrev && validUntilPrev.present && now >= BigInt(validUntilPrev.value))
+    why.push(`epoch ${e - 1n}'s snapshot expired at ${validUntilPrev.value}`);
+  if (!floorOk)
+    why.push(`frozen set of epoch ${e - 1n} is ${setCountPrev}, below minCommittee ${minC.value}`);
 
   say(`epoch           ${e}  (starts ${start}, pinnable through ${deadline})`);
-  say(`  epoch ${e}     pinned=${pinnedE} cfg=${cfgE}${validUntilE.present ? ` validUntil=${validUntilE.value}` : ""} usable=${usableE}`);
-  say(`  epoch ${e - 1n} pinned=${pinnedPrev} cfg=${cfgPrev}${validUntilPrev.present ? ` validUntil=${validUntilPrev.value}` : ""} usable=${usablePrev} setCount=${setCountPrev}`);
+  say(
+    `  epoch ${e}     pinned=${pinnedE} cfg=${cfgE}${validUntilE.present ? ` validUntil=${validUntilE.value}` : ""} usable=${usableE}`
+  );
+  say(
+    `  epoch ${e - 1n} pinned=${pinnedPrev} cfg=${cfgPrev}${validUntilPrev.present ? ` validUntil=${validUntilPrev.value}` : ""} usable=${usablePrev} setCount=${setCountPrev}`
+  );
   say(`configVersion   ${configVersion}`);
   say(`minCommittee    ${isD2 ? minC.value : "n/a (pre-D2 validator: no CC-97 floor)"}`);
   say(`requiredQuorum  ${quorum === SENTINEL ? "SENTINEL (unsatisfiable)" : quorum}`);
@@ -367,22 +408,53 @@ async function main() {
     // Gated on isD2 to match its own argument: the exemption exists because D2 requires _epochUsable(e),
     // so an unpinned current epoch alone turns the sentinel on. Pre-D2 never produces a sentinel from
     // that state (verified on the live contract: it returns 2), so a sentinel there is never benign.
-    const onlyPendingPin = isD2 && !usableE && usablePrev && floorOk && !pinnedE && !beforeWindow && !pastWindow;
+    const onlyPendingPin =
+      isD2 && !usableE && usablePrev && floorOk && !pinnedE && !beforeWindow && !pastWindow;
     if (onlyPendingPin) {
-      emit("WARN", 0, `epoch ${e} is not pinned yet but is still inside its window (pinnable through ${deadline}); epoch ${e - 1n} still serves. Normal keeper latency.`, detail);
+      emit(
+        "WARN",
+        0,
+        `epoch ${e} is not pinned yet but is still inside its window (pinnable through ${deadline}); epoch ${e - 1n} still serves. Normal keeper latency.`,
+        detail
+      );
     }
-    emit("CRITICAL", 1, `committee is ACTIVE but requiredQuorum() is the unsatisfiable sentinel — tier-2/3 is failing closed right now on every account stack mounted here. Failing: ${why.join("; ") || "unknown (all conjuncts read as satisfied — re-check against the contract)"}`, detail);
+    emit(
+      "CRITICAL",
+      1,
+      `committee is ACTIVE but requiredQuorum() is the unsatisfiable sentinel — tier-2/3 is failing closed right now on every account stack mounted here. Failing: ${why.join("; ") || "unknown (all conjuncts read as satisfied — re-check against the contract)"}`,
+      detail
+    );
   }
   if (!pinnedE && pastWindow) {
-    emit("CRITICAL", 1, `epoch ${e} is unpinned and block ${bn} is past its pin deadline ${deadline} — it can no longer be pinned. The keeper missed this window.`, detail);
+    emit(
+      "CRITICAL",
+      1,
+      `epoch ${e} is unpinned and block ${bn} is past its pin deadline ${deadline} — it can no longer be pinned. The keeper missed this window.`,
+      detail
+    );
   }
   if (!pinnedE && beforeWindow) {
-    emit("OK", 0, `epoch ${e} just started at block ${start}; its pin window opens at ${start + 1n}`, detail);
+    emit(
+      "OK",
+      0,
+      `epoch ${e} just started at block ${start}; its pin window opens at ${start + 1n}`,
+      detail
+    );
   }
   if (!pinnedE) {
-    emit("WARN", 0, `epoch ${e} is not pinned yet, but block ${bn} is still inside the pin window`, detail);
+    emit(
+      "WARN",
+      0,
+      `epoch ${e} is not pinned yet, but block ${bn} is still inside the pin window`,
+      detail
+    );
   }
-  emit("OK", 0, `committee armed and satisfiable: requiredQuorum ${quorum} over ${activeCount} active nodes`, detail);
+  emit(
+    "OK",
+    0,
+    `committee armed and satisfiable: requiredQuorum ${quorum} over ${activeCount} active nodes`,
+    detail
+  );
 }
 
 main().catch(e => {
