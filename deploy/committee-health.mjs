@@ -239,6 +239,11 @@ async function main() {
   ]);
   const [pinnedE, pinnedPrev, cfgE, cfgPrev, setCountPrev, validUntilE, validUntilPrev] = rest;
   const now = BigInt((await provider.getBlock(blockTag)).timestamp);
+  // Two DIFFERENT probes, deliberately not one. `isD2` asks a GENERATION question -- does this
+  // contract's requiredQuorum consult epoch e as well as e-1 -- and answers it via minCommittee()'s
+  // presence. `usable()` below asks a FIELD question about epochSetValidUntil and probes that field
+  // directly. Neither implies the other, and a future contract could carry one without the other, so
+  // do not collapse them into a single "is this D2" flag.
   const isD2 = minC.present;
 
   // Rebuild _epochUsable locally so the failing conjunct can be named. D2-only terms are simply true

@@ -7,21 +7,55 @@
 # Deliberately runs HERE and not on the box that runs the keeper: the keeper's machine going away is
 # one of the failure modes being watched for, and a watchdog sharing its fate is not a watchdog.
 #
-# A non-zero exit fails the job, and a failing scheduled workflow is what notifies. Exit 2
-# ("could not determine") fails too, on purpose -- a monitor that cannot see is not healthy, and
-# treating 2 as OK is how a dead RPC becomes ten more hours of silence.
+# HOW THIS ACTUALLY NOTIFIES -- a decision, not an assumption, and each layer of it was wrong once:
+#
+#   1. "a failing scheduled workflow notifies someone" is false on its own. GitHub mails a `schedule`
+#      failure to ONE account -- whoever last edited the cron -- and only if they have Actions
+#      notifications on.
+#   2. So a failure opens a tracking issue. But an issue opened by github-actions[bot] with no
+#      assignee notifies NOBODY: the default subscription is "Participating and @mentions", so only
+#      watchers set to All Activity would ever see it. Visible is not notified.
+#   3. Therefore the issue is ASSIGNED. Assignment always notifies, and the assignee is the sink --
+#      change `vars.COMMITTEE_HEALTH_ASSIGNEE` to move it, do not remove it.
+#
+# ACCEPTED GAP, named so nobody mistakes it for covered. Two ways this stops running, both invisible
+# from inside:
+#
+#   a. GitHub DISABLES scheduled workflows after 60 days of repository inactivity. A repo that watches
+#      a deployed system can plausibly go quiet that long while the system keeps running.
+#   b. GitHub delays and DROPS scheduled runs under load. This is not theoretical here: measured on
+#      this repo, `*/15` produced zero runs across four expected ticks in 53 minutes while every other
+#      trigger worked. The cron above uses offset minutes because of that, which improves the odds and
+#      guarantees nothing.
+#
+# In both cases the silence is identical to "all healthy" -- nothing inside this repo can detect that
+# its own scheduler stopped. Closing it needs an EXTERNAL heartbeat ("alert if no run appeared in 30
+# minutes"), which does not exist yet and is NOT tracked anywhere else.
+#
+# This workflow covers "the check ran and failed", never "the check ran at all". That sentence is the
+# whole of the coverage claim.
 name: Committee Health
 
 on:
   schedule:
-    # Every 15 minutes. The sentinel appears about one epoch (~13 min at epochLength 64) after the
-    # last successful pin, so this is roughly the finest granularity that is not just noise.
-    # GitHub delays or drops scheduled runs under load -- treat this as best-effort, not a guarantee.
-    - cron: "*/15 * * * *"
+    # Roughly every 15 minutes -- the sentinel appears about one epoch (~13 min at epochLength 64)
+    # after the last successful pin, so that is the finest granularity that is not just noise.
+    #
+    # OFFSET MINUTES ON PURPOSE, not */15. Measured on this repo: with `*/15` (i.e. :00/:15/:30/:45,
+    # the slots every other cron in the world also picks) NOT ONE scheduled run fired in 53 minutes
+    # across four expected ticks, while push- and pull_request-triggered runs went through normally
+    # the whole time. The configuration was correct -- cron on the default branch, workflow active,
+    # public non-fork repo, manual dispatch green. GitHub simply delays and drops scheduled runs under
+    # load, and the top-of-hour slots are where that load is.
+    #
+    # So "every 15 minutes" is a REQUEST, never a guarantee. That is the second half of the ACCEPTED
+    # GAP below: the scheduler can be switched off after 60 days, and even while on it can silently
+    # skip. Both need the same external heartbeat to detect, and neither is visible from inside.
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       validator:
-        description: "Validator address to check (defaults to the live committee validator)"
+        description: "Validator address to check (defaults to the COMMITTEE_VALIDATOR repo variable)"
         required: false
 
 # A run in flight must not be cancelled by the next tick, or a slow RPC could silently skip checks.
@@ -29,10 +63,28 @@ concurrency:
   group: committee-health
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      # Lets the alert job tell "the committee is unhealthy" apart from "the runner could not get far
+      # enough to ask". All three are empty when the job was cancelled before the step resolved, which
+      # the alert job treats as infrastructure -- never as a committee verdict.
+      #
+      # `outcome` alone is NOT enough: the script deliberately separates exit 1 ("the committee cannot
+      # serve") from exit 2 ("could not determine"), and `outcome` flattens both to "failure". Branching
+      # on it would tell an operator the committee is unhealthy when the truth is that nothing could be
+      # read -- and the very next paragraph of that issue body explains the two codes, contradicting
+      # itself. So the code itself is carried across.
+      liveness: ${{ steps.liveness.outcome }}
+      exit_code: ${{ steps.liveness.outputs.exit_code }}
+      status: ${{ steps.liveness.outputs.status }}
     steps:
       - uses: actions/checkout@v7
 
@@ -40,15 +92,133 @@ jobs:
         with:
           node-version: "20"
 
-      # Just the one dependency, rather than a full `npm ci`: this runs 96 times a day and only needs
-      # an RPC client. Pinned to the same major the repo uses.
+      # An empty validator is a HARD FAILURE, not a fallback. committee-health.mjs carries a hard-coded
+      # default for local use; letting the schedule path reach it means that after the pending v0.32.0
+      # -> v0.33.0 stack migration this workflow would keep reporting green about a contract nobody
+      # uses. A green run against the wrong contract is worse than no run.
+      - name: Require an explicit validator
+        env:
+          COMMITTEE_VALIDATOR: ${{ inputs.validator || vars.COMMITTEE_VALIDATOR }}
+        run: |
+          if [ -z "$COMMITTEE_VALIDATOR" ]; then
+            echo "::error::COMMITTEE_VALIDATOR is empty. Set the repository variable (Settings > Secrets and variables > Actions > Variables) to the committee validator this repo should watch. Refusing to fall back to the address compiled into committee-health.mjs." >&2
+            exit 2
+          fi
+          echo "watching $COMMITTEE_VALIDATOR"
+
+      # Pinned exactly (not a range) and installed with --ignore-scripts. This runs on the alerting
+      # path 96 times a day: a range means a bad patch or a registry blip exits non-zero, and without
+      # the per-step outcome below the only downstream signal would be "Committee Health failed" --
+      # indistinguishable from tier-2/3 actually being down. 6.17.0 is what package-lock.json already
+      # resolves for the repo's ^6.17.0.
       - name: Install ethers
-        run: npm install --no-save --no-audit --no-fund ethers@^6
+        run: npm install --no-save --no-audit --no-fund --ignore-scripts ethers@6.17.0
 
       - name: Check committee liveness
+        id: liveness
         env:
           # Falls back to a public endpoint so this works without repo secrets. Set the secret to use a
           # dedicated provider; the script accepts SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL.
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com' }}
-          COMMITTEE_VALIDATOR: ${{ inputs.validator }}
-        run: node deploy/committee-health.mjs --json
+          COMMITTEE_VALIDATOR: ${{ inputs.validator || vars.COMMITTEE_VALIDATOR }}
+        run: |
+          set +e
+          out=$(node deploy/committee-health.mjs --json)
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          {
+            echo "exit_code=$code"
+            echo "status=$(printf '%s' "$out" | tail -1 | jq -r '.status // ""' 2>/dev/null || true)"
+          } >> "$GITHUB_OUTPUT"
+          exit $code
+
+  # A SEPARATE job on purpose. `if: failure()` inside `check` would not run when `check` is CANCELLED,
+  # and `timeout-minutes: 5` cancels it -- so the most likely way for a monitor to go blind (a hung
+  # RPC, a hung install) would have produced no alert at all. An in-job `|| cancelled()` does not fix
+  # that either: the enclosing job's budget is already spent. This job has its own budget, needs no
+  # checkout, and fires on every non-success result including cancelled and skipped.
+  alert:
+    needs: check
+    if: ${{ always() && needs.check.result != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Raise a tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh resolves the target repo from the checked-out git remote, and this job has no checkout
+          # BY DESIGN. Without this, `gh issue create` fails outright -- an alert path that disappears
+          # exactly when infrastructure is what broke.
+          GH_REPO: ${{ github.repository }}
+          RESULT: ${{ needs.check.result }}
+          LIVENESS: ${{ needs.check.outputs.liveness }}
+          EXIT_CODE: ${{ needs.check.outputs.exit_code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ASSIGNEE: ${{ vars.COMMITTEE_HEALTH_ASSIGNEE || 'jhfnetboy' }}
+        run: |
+          set -euo pipefail
+
+          # The gate is job-wide, so it also covers checkout, setup-node and npm install. Three
+          # categories, not two: the script separates "cannot serve" (1) from "could not determine" (2),
+          # and collapsing them would make this issue assert something the run never established.
+          case "${EXIT_CODE:-}" in
+            1) cat=failing
+               title="Committee health check is failing"
+               summary="The liveness check ran and reported the committee UNABLE TO SERVE (exit 1)."
+               detail="The run log has one line of JSON with a \`failingConjuncts\` list naming which part of \`requiredQuorum()\` is unsatisfied." ;;
+            2) cat=undetermined
+               title="Committee health check could not determine the state"
+               summary="The liveness check ran but could not read the state (exit 2) -- RPC, config, or an unexpected contract shape."
+               detail="This is NOT a verdict on the committee: it means the check could not see. It is still not healthy -- a monitor that cannot see is the failure mode this workflow exists to end." ;;
+            *) cat=infrastructure
+               title="Committee health check could not run"
+               summary="The workflow failed BEFORE the liveness check produced a verdict (job result: ${RESULT}, liveness step: ${LIVENESS:-did not run})."
+               detail="This says nothing about the committee. Likely causes: the job hit its 5-minute timeout (a hung RPC or install), checkout/setup failed, or the pinned ethers install could not be fetched." ;;
+          esac
+          catlabel="committee-health-${cat}"
+
+          # Dedup is keyed on the CATEGORY, not just on `committee-health`. With a single key, one open
+          # "could not run" issue -- say an unset COMMITTEE_VALIDATOR, which exits 2 every tick forever
+          # -- would permanently suppress the real "is failing" alert this whole chain exists to
+          # deliver.
+          #
+          # --author takes `github-actions[bot]`, NOT the `app/github-actions` that `--json author`
+          # PRINTS. Verified against gh issue list itself (the command that actually runs here) on a
+          # repo with bot-authored issues: `app/github-actions` matched 0, `github-actions[bot]`
+          # matched 8. With the wrong string the query never matches, so every failed run would open a
+          # NEW assigned issue -- ~96 notifications a day into the one sink this file just built, which
+          # is how a person learns to mute the label. Without the author filter at all, one human
+          # labelling an unrelated issue would silently suppress every future alert.
+          existing=$(gh issue list --state open --label committee-health --label "$catlabel" \
+                       --author 'github-actions[bot]' --json number -q '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            echo "issue #${existing} is already open for category '${cat}' -- not commenting. Per-run history is in the Actions tab."
+            exit 0
+          fi
+
+          gh label create committee-health --description "Automated committee liveness alerts" --color B60205 2>/dev/null || true
+          gh label create "$catlabel" --description "Committee liveness alert category: ${cat}" --color D93F0B 2>/dev/null || true
+
+          # Create FIRST, assign SECOND. `gh issue create --assignee` resolves the login before it
+          # creates anything, so an unresolvable handle -- a typo in the very variable the header invites
+          # people to change -- would fail the whole command under `set -e` and produce NO issue at all,
+          # with no way for this job to alert about its own failure. A missing assignee costs a
+          # notification; a failed create costs the entire alert.
+          url=$(gh issue create \
+            --title "$title" \
+            --label committee-health --label "$catlabel" \
+            --body "$(printf '%s\n' \
+              "$summary" \
+              "" \
+              "Run: ${RUN_URL}" \
+              "" \
+              "$detail" \
+              "" \
+              "This issue is created once per category and stays quiet while open, so an ongoing outage does not post every 15 minutes. Close it when resolved.")")
+          echo "opened ${url}"
+          num="${url##*/}"
+          gh issue edit "$num" --add-assignee "$ASSIGNEE" \
+            || echo "::warning::issue ${num} was created but assignee '${ASSIGNEE}' could not be set -- it will notify nobody until someone is assigned"
