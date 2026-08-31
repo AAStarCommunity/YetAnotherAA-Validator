@@ -161,7 +161,9 @@ async function roleCost() {
     const roleId = process.env.SP_ROLE_ID || ethers.keccak256(ethers.toUtf8Bytes("DVT"));
     const r = await Promise.race([
       c.getRoleConfig(roleId),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("live read timed out after 8s")), 8000).unref()),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("live read timed out after 8s")), 8000).unref()
+      ),
     ]);
     // A live read needs a validity test, or "read nothing" is indistinguishable from "read zero".
     // A wrong registry, a wrong chain or a changed role id all return an ALL-ZERO struct, and without
