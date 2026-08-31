@@ -178,15 +178,15 @@ DVT side:
 SP/DVT joint gate:
 
 - [~] A'-commitment BLSAggregator + real verifier wired on Sepolia. Aggregator
-      `0xEaeC2F51…` (BLSAggregator-4.11.0) and verifier
-      `0xa1346F1668cBf8D031Cc5D72eDA45F5788CA1cd3` are deployed and the rotation
-      is PROPOSED; not yet wired, because the delay has not matured.
+  `0xEaeC2F51…` (BLSAggregator-4.11.0) and verifier
+  `0xa1346F1668cBf8D031Cc5D72eDA45F5788CA1cd3` are deployed and the rotation is
+  PROPOSED; not yet wired, because the delay has not matured.
 - [~] Verifier arming evidence: five of six records are FINAL — dormant at
-      deploy, deploy tx, proposal receipt, `readyAt` (2026-09-04T05:36:24Z), and
-      the negative controls. The apply receipt and final active address cannot
-      exist before the delay matures, which is the security property rather than
-      a missing step. Collected in `docs/evidence/cc115-b3-arming-sepolia.md`;
-      finish with `deploy/apply-verifier-rotation.mjs --broadcast`.
+  deploy, deploy tx, proposal receipt, `readyAt` (2026-09-04T05:36:24Z), and the
+  negative controls. The apply receipt and final active address cannot exist
+  before the delay matures, which is the security property rather than a missing
+  step. Collected in `docs/evidence/cc115-b3-arming-sepolia.md`; finish with
+  `deploy/apply-verifier-rotation.mjs --broadcast`.
 - [ ] Fraudulent over-issue slash crafted (evidence convention; over-issue state
       held constant).
 - [ ] Four-parameter preflight, queue, frozen-exit, execute, full-lock slash and
