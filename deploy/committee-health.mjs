@@ -213,6 +213,13 @@ async function main() {
   // version watched the wrong contract but SAID SO, and that honest label is how the drift was
   // spotted at all.
   if (ROUTER && !VALIDATOR_EXPLICIT) {
+    // Drop the fallback BEFORE anything can fail. Every emit() below stamps the current VALIDATOR
+    // into its report, and until the router actually resolves, that value is the hard-coded default
+    // -- which is 0x1A8Db639, the RETIRED pre-D2 validator. An alert that says
+    // `"validator":"0x1A8Db639…"` when the router read failed is a monitor lying about its own
+    // observation target: a reader would conclude this heartbeat is pointed at the retired stack. The
+    // default exists for the no-router case and must not survive into a router failure.
+    VALIDATOR = null;
     if (!ethers.isAddress(ROUTER))
       emit("UNKNOWN", 2, `COMMITTEE_ROUTER is not an address: ${ROUTER}`);
     try {

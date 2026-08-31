@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Committee health heartbeat. This is the trigger that actually fires: GitHub Actions `schedule`
+     does not run in this repository (26 expected ticks, 0 runs, measured 2026-08-31 -- see
+     deploy/local-heartbeat.sh for the full exclusion list). The Actions workflow stays as redundancy.
+
+     StartInterval MUST BE A TOP-LEVEL KEY. The sibling io.aastar.dvt-testnet.plist on this machine
+     has it nested inside <EnvironmentVariables>, where `plutil -lint` still says OK and launchd
+     simply never sees it -- so its comment promises a 120s self-heal that has never once happened.
+     Verify with `plutil -convert json -o - <plist>` and read the TOP-LEVEL keys, not with -lint.
+
+     Install and verify: deploy/README-heartbeat.md -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.aastar.dvt-committee-health</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/local-heartbeat.sh</string>
+    <string>health</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/jason/.nvm/versions/node/v22.22.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/jason</string>
+  </dict>
+
+  <!-- Every 15 minutes: the sentinel appears about one epoch (~13 min at epochLength 64) after the
+       last successful pin, so finer granularity is noise. launchd runs a missed StartInterval once
+       on wake rather than replaying every skipped tick, which is the behaviour we want. -->
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/.run/launchd-committee-health.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/.run/launchd-committee-health.log</string>
+</dict>
+</plist>
