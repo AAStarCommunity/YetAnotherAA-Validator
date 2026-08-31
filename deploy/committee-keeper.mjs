@@ -191,15 +191,26 @@ async function tick() {
     // (a false mismatch over-reports FAILED, it can never fabricate a benign), but committee-health.mjs
     // states the opposite invariant explicitly -- "Pin EVERY read to one block" -- and two files in the
     // same directory should not disagree about whether that matters.
-    const at = { blockTag: await provider.getBlockNumber().catch(() => "latest") };
-    const nowPinned = await v.epochPinned(e, at).catch(() => false);
-    const nowUsable = nowPinned && (await v.epochConfigVersion(e, at).catch(() => -1n)) === (await v.configVersion(at).catch(() => -2n));
-    if (nowUsable) { console.log("  another keeper pinned it first (benign; verified on-chain)"); return "ok"; }
-    // Second chance for a revert the state check could not attribute: if the chain says this epoch is
-    // not usable, the tx did NOT lose a pin race, yet the node may still have told us in words that it
-    // did. Kept deliberately AFTER the on-chain check, never instead of it -- the comment above is
-    // about which of the two decides, not about deleting this one.
-    if (/already pinned/i.test(msg)) { console.log("  another keeper pinned it first (benign):", msg); return "ok"; }
+    // Pinned to ONE block. If the height itself cannot be read, DO NOT fall back to "latest" per call:
+    // three independent `latest` reads are exactly the straddle this line exists to prevent, dressed up
+    // as a pin. Skip the on-chain check instead, and record that it was skipped.
+    let stateKnown = false;
+    let nowUsable = false;
+    try {
+      const at = { blockTag: await provider.getBlockNumber() };
+      const [p0, c0, cv] = await Promise.all([v.epochPinned(e, at), v.epochConfigVersion(e, at), v.configVersion(at)]);
+      stateKnown = true;
+      nowUsable = p0 && c0 === cv;
+    } catch {
+      console.log("  (could not read pin state at a fixed block — falling through to the revert text)");
+    }
+    if (stateKnown && nowUsable) { console.log("  another keeper pinned it first (benign; verified on-chain)"); return "ok"; }
+    // Second chance ONLY when the chain could not be read. If the reads succeeded the chain already
+    // answered definitively, and the revert text must not override it: an epoch pinned under a STALE
+    // configVersion is legitimately re-pinnable, the contract's guard cannot produce "already pinned"
+    // there (:387), so a node that says so would otherwise turn a genuine failure into `ok`. Gated on
+    // READ FAILURE, not on !nowUsable -- the previous comment reconciled the ordering, not this.
+    if (!stateKnown && /already pinned/i.test(msg)) { console.log("  another keeper pinned it first (benign; from revert text, chain unreadable):", msg); return "ok"; }
     // A set change between the event replay and the transaction makes the list stale; the contract's
     // completeness check rejects it and the next tick rebuilds from a fresh head.
     if (/activeNodeIds length != activeCount|contains a non-member/i.test(msg)) {
