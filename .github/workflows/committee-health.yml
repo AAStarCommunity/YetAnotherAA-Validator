@@ -55,9 +55,17 @@ jobs:
       contents: read
     outputs:
       # Lets the alert job tell "the committee is unhealthy" apart from "the runner could not get far
-      # enough to ask". Empty when the job was cancelled before this step resolved, which the alert
-      # job treats as infrastructure -- never as a committee verdict.
+      # enough to ask". All three are empty when the job was cancelled before the step resolved, which
+      # the alert job treats as infrastructure -- never as a committee verdict.
+      #
+      # `outcome` alone is NOT enough: the script deliberately separates exit 1 ("the committee cannot
+      # serve") from exit 2 ("could not determine"), and `outcome` flattens both to "failure". Branching
+      # on it would tell an operator the committee is unhealthy when the truth is that nothing could be
+      # read -- and the very next paragraph of that issue body explains the two codes, contradicting
+      # itself. So the code itself is carried across.
       liveness: ${{ steps.liveness.outcome }}
+      exit_code: ${{ steps.liveness.outputs.exit_code }}
+      status: ${{ steps.liveness.outputs.status }}
     steps:
       - uses: actions/checkout@v7
 
@@ -94,7 +102,17 @@ jobs:
           # dedicated provider; the script accepts SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL.
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com' }}
           COMMITTEE_VALIDATOR: ${{ inputs.validator || vars.COMMITTEE_VALIDATOR }}
-        run: node deploy/committee-health.mjs --json
+        run: |
+          set +e
+          out=$(node deploy/committee-health.mjs --json)
+          code=$?
+          set -e
+          printf '%s\n' "$out"
+          {
+            echo "exit_code=$code"
+            echo "status=$(printf '%s' "$out" | tail -1 | jq -r '.status // ""' 2>/dev/null || true)"
+          } >> "$GITHUB_OUTPUT"
+          exit $code
 
   # A SEPARATE job on purpose. `if: failure()` inside `check` would not run when `check` is CANCELLED,
   # and `timeout-minutes: 5` cancels it -- so the most likely way for a monitor to go blind (a hung
@@ -118,37 +136,61 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RESULT: ${{ needs.check.result }}
           LIVENESS: ${{ needs.check.outputs.liveness }}
+          EXIT_CODE: ${{ needs.check.outputs.exit_code }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ASSIGNEE: ${{ vars.COMMITTEE_HEALTH_ASSIGNEE || 'jhfnetboy' }}
         run: |
           set -euo pipefail
 
-          # The gate above is job-wide, so it also covers checkout, setup-node and npm install. Saying
-          # "the committee is unhealthy" for a registry blip is the exact conflation the pinned install
-          # exists to prevent, so the body branches on which STEP decided.
-          if [ "$LIVENESS" = "failure" ]; then
-            title="Committee health check is failing"
-            summary="The liveness check ran and reported the committee unhealthy."
-            detail="The job prints one line of JSON with a \`failingConjuncts\` list naming which part of \`requiredQuorum()\` is unsatisfied. Exit 1 means the committee genuinely cannot serve; exit 2 means the check could not determine the state (RPC, config) -- which is also not healthy."
-          else
-            title="Committee health check could not run"
-            summary="The workflow failed BEFORE the liveness check produced a verdict (job result: ${RESULT}, liveness step: ${LIVENESS:-did not run})."
-            detail="This says nothing about the committee. Likely causes: the job hit its 5-minute timeout (a hung RPC or install), checkout/setup failed, or the pinned ethers install could not be fetched. Check the run log before assuming anything about tier-2/3."
-          fi
+          # The gate is job-wide, so it also covers checkout, setup-node and npm install. Three
+          # categories, not two: the script separates "cannot serve" (1) from "could not determine" (2),
+          # and collapsing them would make this issue assert something the run never established.
+          case "${EXIT_CODE:-}" in
+            1) cat=failing
+               title="Committee health check is failing"
+               summary="The liveness check ran and reported the committee UNABLE TO SERVE (exit 1)."
+               detail="The run log has one line of JSON with a \`failingConjuncts\` list naming which part of \`requiredQuorum()\` is unsatisfied." ;;
+            2) cat=undetermined
+               title="Committee health check could not determine the state"
+               summary="The liveness check ran but could not read the state (exit 2) -- RPC, config, or an unexpected contract shape."
+               detail="This is NOT a verdict on the committee: it means the check could not see. It is still not healthy -- a monitor that cannot see is the failure mode this workflow exists to end." ;;
+            *) cat=infrastructure
+               title="Committee health check could not run"
+               summary="The workflow failed BEFORE the liveness check produced a verdict (job result: ${RESULT}, liveness step: ${LIVENESS:-did not run})."
+               detail="This says nothing about the committee. Likely causes: the job hit its 5-minute timeout (a hung RPC or install), checkout/setup failed, or the pinned ethers install could not be fetched." ;;
+          esac
+          catlabel="committee-health-${cat}"
 
-          # --author filter: without it, one person labelling an unrelated issue committee-health would
-          # silently suppress every future alert -- another quiet failure in the alerting path itself.
-          existing=$(gh issue list --state open --label committee-health --author app/github-actions --json number -q '.[0].number' 2>/dev/null || true)
+          # Dedup is keyed on the CATEGORY, not just on `committee-health`. With a single key, one open
+          # "could not run" issue -- say an unset COMMITTEE_VALIDATOR, which exits 2 every tick forever
+          # -- would permanently suppress the real "is failing" alert this whole chain exists to
+          # deliver.
+          #
+          # --author takes `github-actions[bot]`, NOT the `app/github-actions` that `--json author`
+          # PRINTS. Verified against gh issue list itself (the command that actually runs here) on a
+          # repo with bot-authored issues: `app/github-actions` matched 0, `github-actions[bot]`
+          # matched 8. With the wrong string the query never matches, so every failed run would open a
+          # NEW assigned issue -- ~96 notifications a day into the one sink this file just built, which
+          # is how a person learns to mute the label. Without the author filter at all, one human
+          # labelling an unrelated issue would silently suppress every future alert.
+          existing=$(gh issue list --state open --label committee-health --label "$catlabel" \
+                       --author 'github-actions[bot]' --json number -q '.[0].number' 2>/dev/null || true)
           if [ -n "$existing" ]; then
-            echo "issue #${existing} is already open -- not commenting. Per-run history is in the Actions tab."
+            echo "issue #${existing} is already open for category '${cat}' -- not commenting. Per-run history is in the Actions tab."
             exit 0
           fi
 
           gh label create committee-health --description "Automated committee liveness alerts" --color B60205 2>/dev/null || true
-          gh issue create \
+          gh label create "$catlabel" --description "Committee liveness alert category: ${cat}" --color D93F0B 2>/dev/null || true
+
+          # Create FIRST, assign SECOND. `gh issue create --assignee` resolves the login before it
+          # creates anything, so an unresolvable handle -- a typo in the very variable the header invites
+          # people to change -- would fail the whole command under `set -e` and produce NO issue at all,
+          # with no way for this job to alert about its own failure. A missing assignee costs a
+          # notification; a failed create costs the entire alert.
+          url=$(gh issue create \
             --title "$title" \
-            --label committee-health \
-            --assignee "$ASSIGNEE" \
+            --label committee-health --label "$catlabel" \
             --body "$(printf '%s\n' \
               "$summary" \
               "" \
@@ -156,4 +198,8 @@ jobs:
               "" \
               "$detail" \
               "" \
-              "This issue is created once and stays quiet while open, so an ongoing outage does not post every 15 minutes. Close it when resolved.")"
+              "This issue is created once per category and stays quiet while open, so an ongoing outage does not post every 15 minutes. Close it when resolved.")")
+          echo "opened ${url}"
+          num="${url##*/}"
+          gh issue edit "$num" --add-assignee "$ASSIGNEE" \
+            || echo "::warning::issue ${num} was created but assignee '${ASSIGNEE}' could not be set -- it will notify nobody until someone is assigned"
