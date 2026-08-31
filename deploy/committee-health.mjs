@@ -131,8 +131,14 @@ const expectArmed = argv.includes("--expect-armed") || /^(1|true|yes)$/i.test(pr
 //
 // An explicit --validator still wins, for probing a candidate that no stack mounts yet.
 const ROUTER = flag("--router") || process.env.COMMITTEE_ROUTER || env.COMMITTEE_ROUTER;
+// A validator from the COMMAND or the ENVIRONMENT is a deliberate act and outranks a router. One
+// left behind in an env FILE is not: deleting the repository variable does not reach a stale
+// .env.sepolia sitting next to a developer, and letting that silently win would reintroduce exactly
+// the "pinned to an address nobody mounts" failure this change exists to remove -- only harder to
+// see, because the router would appear configured.
+const VALIDATOR_FROM_FILE = env.COMMITTEE_VALIDATOR;
 const VALIDATOR_EXPLICIT =
-  flag("--validator") || process.env.COMMITTEE_VALIDATOR || env.COMMITTEE_VALIDATOR;
+  flag("--validator") || process.env.COMMITTEE_VALIDATOR || (ROUTER ? undefined : VALIDATOR_FROM_FILE);
 let VALIDATOR = VALIDATOR_EXPLICIT || "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
 
 const ABI = [
@@ -190,9 +196,13 @@ async function main() {
     emit("UNKNOWN", 2, `no RPC url (looked for SEPOLIA_RPC_URL/ETH_RPC_URL/RPC_URL in ${ENV_FILE} and the environment)`);
   }
   const provider = new ethers.JsonRpcProvider(RPC);
-  const v = new ethers.Contract(VALIDATOR, ABI, provider);
 
-  // Resolve the router BEFORE anything else reads VALIDATOR.
+  // Resolve the router BEFORE the validator contract is bound. Binding first and reassigning
+  // VALIDATOR afterwards changes only the STRING -- an ethers.Contract keeps the address it was
+  // constructed with -- so every read would still hit the old hard-coded address while getCode and
+  // the printed output showed the new one. That is worse than the drift this PR fixes: the previous
+  // version watched the wrong contract but SAID SO, and that honest label is how the drift was
+  // spotted at all.
   if (ROUTER && !VALIDATOR_EXPLICIT) {
     if (!ethers.isAddress(ROUTER)) emit("UNKNOWN", 2, `COMMITTEE_ROUTER is not an address: ${ROUTER}`);
     try {
@@ -208,7 +218,14 @@ async function main() {
     }
   } else if (ROUTER && VALIDATOR_EXPLICIT) {
     say(`router     ${ROUTER} ignored — an explicit validator was given`);
+    if (VALIDATOR_FROM_FILE && VALIDATOR_FROM_FILE !== VALIDATOR_EXPLICIT) {
+      say(`           (${ENV_FILE} also sets COMMITTEE_VALIDATOR=${VALIDATOR_FROM_FILE}; it lost to the explicit one)`);
+    }
   }
+
+  // Bound AFTER resolution, and from the same variable that gets reported, so "what it reads" and
+  // "what it says" cannot diverge.
+  const v = new ethers.Contract(VALIDATOR, ABI, provider);
 
   if ((await provider.getCode(VALIDATOR)) === "0x") emit("UNKNOWN", 2, `no code at ${VALIDATOR} on this chain`);
 
