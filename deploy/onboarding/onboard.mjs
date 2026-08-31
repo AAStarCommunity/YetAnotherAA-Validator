@@ -127,6 +127,43 @@ function keygen() {
 
 // --- staked path: produce the BLS proof-of-possession + registerWithProof params.
 // Usage: onboard.mjs pop <operatorAddress>   (the EOA/Safe that stakes + registers)
+/// The stake and ticket are ON-CHAIN CONFIG and they drift, so read them when we can. `pop` is
+/// otherwise a purely offline key operation and must stay usable with no network, so this is
+/// best-effort: with ETH_RPC_URL set it reports live values, without it it reports the last
+/// OBSERVED values and says when they were observed rather than stating them as current.
+///
+/// Printing a hard-coded number in a file whose whole point is "do not trust stale claims" is the
+/// same failure it documents. There is a precedent one repo over: a SuperPaymaster Registry comment
+/// says "level 1 = 1000" where the live read is 300e18.
+async function roleCost() {
+  const OBSERVED = "minStake 30e18 + ticketPrice 3e18 = 33e18 (observed on Sepolia 2026-08-31)";
+  const rpc = process.env.ETH_RPC_URL || process.env.SEPOLIA_RPC_URL;
+  const registry = process.env.SP_REGISTRY || "0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71";
+  if (!rpc) return `${OBSERVED}. Set ETH_RPC_URL to read the live values instead of these.`;
+  // destroy() in a finally, and a bounded race. An unreachable RPC leaves JsonRpcProvider retrying
+  // network detection on a live timer, so the process prints its answer and then NEVER EXITS -- an
+  // offline-capable key tool that hangs on a bad URL is worse than one that cannot read the value.
+  let provider;
+  try {
+    provider = new ethers.JsonRpcProvider(rpc);
+    const c = new ethers.Contract(
+      registry,
+      ["function getRoleConfig(bytes32) view returns (bool isActive, uint256 minStake, uint256 ticketPrice, uint256 unused)"],
+      provider
+    );
+    const r = await Promise.race([
+      c.getRoleConfig(ethers.keccak256(ethers.toUtf8Bytes("DVT"))),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("live read timed out after 8s")), 8000).unref()),
+    ]);
+    const f = v => `${ethers.formatUnits(v, 18)}e18`;
+    return `live from ${registry}: minStake ${f(r.minStake)} + ticketPrice ${f(r.ticketPrice)} = ${f(r.minStake + r.ticketPrice)}`;
+  } catch (e) {
+    return `${OBSERVED}. (Live read failed: ${e?.shortMessage ?? e?.message ?? String(e)})`;
+  } finally {
+    provider?.destroy();
+  }
+}
+
 async function pop() {
   const s = loadState() || die("no key yet — run `keygen` first");
   const operator =
@@ -155,10 +192,11 @@ async function pop() {
   );
   console.log(
     "\nThen, FROM THE OPERATOR EOA/SAFE ITSELF (Registry.registerRole requires msg.sender == user):\n" +
-      "  1. approve GToken to GTOKEN_STAKING for minStake + ticketPrice -- NOT just minStake.\n" +
-      "     On Sepolia today that is 30e18 + 3e18 = 33e18. Approving 30e18 fails with\n" +
-      "     ERC20InsufficientAllowance(spender, 30e18, 33e18), which names the stake but not the\n" +
-      "     ticket, so the shortfall is easy to misread.\n" +
+      `  1. approve GToken to GTOKEN_STAKING for minStake + ticketPrice -- NOT just minStake.\n` +
+      `     ${await roleCost()}\n` +
+      "     Approving only minStake fails ERC20InsufficientAllowance(spender, minStake, total),\n" +
+      "     which names the stake but not the ticket, so the shortfall reads like your own\n" +
+      "     arithmetic error.\n" +
       "  2. Registry.registerRole(ROLE_DVT, <self>, abi.encode(uint256 stakeAmount))\n" +
       "  3. AAStarValidator.registerWithProof(publicKey, popPoint, popSig)\n" +
       "\nTWO THINGS THAT WILL COST YOU AN HOUR IF NOBODY TELLS YOU:\n" +
