@@ -96,6 +96,18 @@ const die = msg => {
   process.exit(1);
 };
 
+/// Last-resort rendering for something thrown that is not an Error. String(e) on a plain object
+/// gives "[object Object]", which is useless but still better than "undefined"; try JSON first.
+function describe(e) {
+  try {
+    const j = JSON.stringify(e);
+    if (j && j !== "{}") return j;
+  } catch {
+    /* circular or non-serialisable — fall through */
+  }
+  return String(e);
+}
+
 if (!AGGREGATOR) die("missing --aggregator <address> (the NEW BLSAggregator, from SP's B3 handoff)");
 if (!ethers.isAddress(AGGREGATOR)) die(`--aggregator is not an address: ${AGGREGATOR}`);
 
@@ -436,4 +448,7 @@ async function main() {
   for (const p of receipts) console.log(`  slot ${p.slot}  ${p.validator}  ${p.hash}`);
 }
 
-main().catch(e => die(e.stack ?? e.message));
+// A non-Error throw (a bare string, a rejected object) has neither .stack nor .message, so
+// `e.stack ?? e.message` printed literally "✗ undefined" and swallowed the only clue there was.
+// Verified: `Promise.reject("boom").catch(e => die(e.stack ?? e.message))` prints "✗ undefined".
+main().catch(e => die(e?.stack ?? e?.message ?? describe(e)));

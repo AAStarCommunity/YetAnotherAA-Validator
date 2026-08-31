@@ -10,10 +10,21 @@
 //   node deploy/onboarding/onboard.mjs verify https://dvt.you.org   # steps 4/5: is the path up?
 //   node deploy/onboarding/onboard.mjs all  https://dvt.you.org     # run the guided flow
 //
-// Step 2 (on-chain registration) is owner-coordinated today (registerPublicKey is
-// onlyOwner on the deployed validator). This tool generates the request + polls until
-// AAStar registers you. When the permissionless PNT-staking path is wired, a `stake`
-// subcommand will make step 2 fully self-service too.
+// Step 2 (on-chain registration) depends on which validator you are joining:
+//   requireStake == false  -> owner-coordinated: registerPublicKey is onlyOwner. Use
+//                             `register-request` + `wait-register`. NOTE the nodeId on this path
+//                             is CHOSEN by the caller, not derived -- AAStarValidator.sol:835 takes
+//                             it as a parameter. The three ids registered on Sepolia happen to equal
+//                             keccak256(pubkey) because whoever registered them used that, not
+//                             because the path enforces it. Do not assume a bootstrap id equals the
+//                             staked-path id; check.
+//   requireStake == true   -> SELF-SERVICE, and this is no longer hypothetical: it was
+//                             exercised end to end on Sepolia 2026-08-31 against validator
+//                             0x7ac7E9d4…, three operators, three registerWithProof calls.
+//                             Use `pop <operatorAddress>` and follow the printed sequence.
+// The old note here said a `stake` subcommand would arrive "when the permissionless PNT-staking
+// path is wired". That path is wired; what was missing was not a subcommand but the three
+// non-obvious facts the `pop` output now prints.
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { randomBytes } from "crypto";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
@@ -143,8 +154,24 @@ async function pop() {
     )
   );
   console.log(
-    "\nThen (from the operator EOA/Safe): (1) stake GToken + Registry.registerRole(ROLE_DVT)\n" +
-      "on SuperPaymaster, (2) AAStarValidator.registerWithProof(publicKey, popPoint, popSig)."
+    "\nThen, FROM THE OPERATOR EOA/SAFE ITSELF (Registry.registerRole requires msg.sender == user):\n" +
+      "  1. approve GToken to GTOKEN_STAKING for minStake + ticketPrice -- NOT just minStake.\n" +
+      "     On Sepolia today that is 30e18 + 3e18 = 33e18. Approving 30e18 fails with\n" +
+      "     ERC20InsufficientAllowance(spender, 30e18, 33e18), which names the stake but not the\n" +
+      "     ticket, so the shortfall is easy to misread.\n" +
+      "  2. Registry.registerRole(ROLE_DVT, <self>, abi.encode(uint256 stakeAmount))\n" +
+      "  3. AAStarValidator.registerWithProof(publicKey, popPoint, popSig)\n" +
+      "\nTWO THINGS THAT WILL COST YOU AN HOUR IF NOBODY TELLS YOU:\n" +
+      "  * hasRole(ROLE_DVT) == true DOES NOT MEAN STAKED. An address can hold the role with\n" +
+      "    effectiveStake 0. The validator checks BOTH (hasRole && getEffectiveStake >= minStake),\n" +
+      "    so read getEffectiveStake -- never infer staking from the role.\n" +
+      "  * AN ADDRESS THAT ALREADY HOLDS ROLE_DVT CANNOT TOP UP. registerRole reverts\n" +
+      "    RoleAlreadyGranted for any role except ROLE_ENDUSER, and its top-up branch is\n" +
+      "    unreachable for ROLE_DVT. Fixing a role=true/stake=0 address means exitRole first,\n" +
+      "    which for ROLE_DVT goes through the aggregator's 2-day guardian exit notice. If you are\n" +
+      "    staking fresh, use an address that does not already hold the role.\n" +
+      "\nOne operator backs exactly ONE node (operatorNode is a 1:1 anti-Sybil lock), so N nodes\n" +
+      "needs N separately staked EOAs."
   );
 }
 
