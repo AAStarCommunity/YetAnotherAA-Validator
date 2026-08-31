@@ -7,9 +7,22 @@
 # Deliberately runs HERE and not on the box that runs the keeper: the keeper's machine going away is
 # one of the failure modes being watched for, and a watchdog sharing its fate is not a watchdog.
 #
-# A non-zero exit fails the job, and a failing scheduled workflow is what notifies. Exit 2
-# ("could not determine") fails too, on purpose -- a monitor that cannot see is not healthy, and
-# treating 2 as OK is how a dead RPC becomes ten more hours of silence.
+# A non-zero exit fails the job. Exit 2 ("could not determine") fails too, on purpose -- a monitor
+# that cannot see is not healthy, and treating 2 as OK is how a dead RPC becomes ten more hours of
+# silence.
+#
+# HOW THIS ACTUALLY NOTIFIES, stated as a decision rather than left as an assumption. "A failing
+# scheduled workflow notifies someone" is not true by itself: GitHub mails a `schedule` failure to
+# ONE account -- whoever last edited the cron -- and only if they have Actions notifications on. So a
+# failed run opens a tracking issue instead (below), which is visible to everyone and independent of
+# any individual's notification settings.
+#
+# ACCEPTED GAP, named so nobody mistakes it for covered: GitHub DISABLES scheduled workflows after 60
+# days of repository inactivity. A repo that watches a deployed system can plausibly go quiet for 60
+# days while the system keeps running, and nothing inside this repo can detect that its own scheduler
+# was switched off -- by construction, the silence looks identical to "all healthy". Closing it needs
+# an EXTERNAL heartbeat ("alert if no run appeared in 30 minutes). Until that exists, this workflow
+# covers "the check ran and failed", not "the check stopped running".
 name: Committee Health
 
 on:
@@ -29,10 +42,16 @@ concurrency:
   group: committee-health
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v7
 
@@ -42,13 +61,50 @@ jobs:
 
       # Just the one dependency, rather than a full `npm ci`: this runs 96 times a day and only needs
       # an RPC client. Pinned to the same major the repo uses.
+      # Pinned, and --ignore-scripts. This runs on the alerting path 96 times a day: an unpinned range
+      # means a bad 6.x patch or a registry blip exits non-zero, and the only signal downstream is
+      # "Committee Health failed" -- indistinguishable from tier-2/3 actually being down. That is the
+      # same conflation this tool exists to avoid, so the version is fixed to what the repo itself
+      # resolves and only bumped deliberately.
       - name: Install ethers
-        run: npm install --no-save --no-audit --no-fund ethers@^6
+        run: npm install --no-save --no-audit --no-fund --ignore-scripts ethers@6.17.0
 
       - name: Check committee liveness
         env:
           # Falls back to a public endpoint so this works without repo secrets. Set the secret to use a
           # dedicated provider; the script accepts SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL.
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com' }}
-          COMMITTEE_VALIDATOR: ${{ inputs.validator }}
+          # `inputs.validator` is empty on the schedule path, so without the repository variable every
+          # scheduled run falls through to a HARD-CODED address in committee-health.mjs. Mount a
+          # different committee validator -- which is exactly what the pending v0.33.0 account-stack
+          # migration does -- and this workflow would keep reporting green about the contract nobody
+          # uses any more. Set the `COMMITTEE_VALIDATOR` repository variable when that happens.
+          COMMITTEE_VALIDATOR: ${{ inputs.validator || vars.COMMITTEE_VALIDATOR }}
         run: node deploy/committee-health.mjs --json
+
+      # Create ONCE and stay quiet until it is closed. Commenting on every failed run would post every
+      # 15 minutes through an outage, which is the alert fatigue this whole line of work is about; the
+      # Actions tab already holds the per-run history.
+      - name: Raise a tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "Committee health check is failing"
+        run: |
+          existing=$(gh issue list --state open --label committee-health --json number -q '.[0].number' || true)
+          if [ -n "$existing" ]; then
+            echo "issue #$existing is already open — not commenting (see the Actions tab for per-run history)"
+            exit 0
+          fi
+          gh label create committee-health --description "Automated committee liveness alerts" --color B60205 2>/dev/null || true
+          gh issue create --title "$TITLE" --label committee-health --body "$(printf '%s\n' \
+            "The scheduled committee liveness check failed." \
+            "" \
+            "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "" \
+            "The job prints one line of JSON with a \`failingConjuncts\` list naming which part of" \
+            "\`requiredQuorum()\` is unsatisfied. Exit 1 means the committee is genuinely unable to" \
+            "serve; exit 2 means the check could not determine the state (RPC, config) — which is also" \
+            "not healthy." \
+            "" \
+            "This issue is created once and stays quiet while open. Close it when resolved.")"

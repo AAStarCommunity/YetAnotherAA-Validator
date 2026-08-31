@@ -186,9 +186,19 @@ async function tick() {
     // `pinned == true` while remaining legitimately re-pinnable. Checking pinned alone would report a
     // genuine failure in that window as "benign; verified on-chain" and return ok, blinding this
     // keeper's own --watch loop for up to an epoch.
-    const nowPinned = await v.epochPinned(e).catch(() => false);
-    const nowUsable = nowPinned && (await v.epochConfigVersion(e).catch(() => -1n)) === (await v.configVersion().catch(() => -2n));
+    // Both reads pinned to ONE block. Sequential unpinned reads can straddle a configVersion bump and
+    // manufacture a mismatch that never existed at any single height. The direction is safe either way
+    // (a false mismatch over-reports FAILED, it can never fabricate a benign), but committee-health.mjs
+    // states the opposite invariant explicitly -- "Pin EVERY read to one block" -- and two files in the
+    // same directory should not disagree about whether that matters.
+    const at = { blockTag: await provider.getBlockNumber().catch(() => "latest") };
+    const nowPinned = await v.epochPinned(e, at).catch(() => false);
+    const nowUsable = nowPinned && (await v.epochConfigVersion(e, at).catch(() => -1n)) === (await v.configVersion(at).catch(() => -2n));
     if (nowUsable) { console.log("  another keeper pinned it first (benign; verified on-chain)"); return "ok"; }
+    // Second chance for a revert the state check could not attribute: if the chain says this epoch is
+    // not usable, the tx did NOT lose a pin race, yet the node may still have told us in words that it
+    // did. Kept deliberately AFTER the on-chain check, never instead of it -- the comment above is
+    // about which of the two decides, not about deleting this one.
     if (/already pinned/i.test(msg)) { console.log("  another keeper pinned it first (benign):", msg); return "ok"; }
     // A set change between the event replay and the transaction makes the list stale; the contract's
     // completeness check rejects it and the next tick rebuilds from a fresh head.
