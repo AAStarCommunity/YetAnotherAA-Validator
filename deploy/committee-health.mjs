@@ -49,6 +49,8 @@
 //   node deploy/committee-health.mjs
 //   node deploy/committee-health.mjs --json          (one line of JSON, on EVERY path including errors)
 //   node deploy/committee-health.mjs --validator 0x… --env ../SuperPaymaster/.env.sepolia
+//   node deploy/committee-health.mjs --expect-armed   (epochLength == 0 becomes CRITICAL, not OK;
+//                                                      also via EXPECT_COMMITTEE_ACTIVE=true)
 import { ethers } from "ethers";
 import { readFileSync } from "fs";
 import { dirname, resolve } from "path";
@@ -115,6 +117,10 @@ const pick = (...names) =>
     .map(n => (ENV_FILE_EXPLICIT ? env[n] || process.env[n] : process.env[n] || env[n]))
     .find(Boolean);
 const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
+// Opt-in: assert that this validator is supposed to have committee mode ON. See the epochLength == 0
+// branch for why the default cannot be "always expect armed" -- an unmounted candidate legitimately
+// sits at 0.
+const expectArmed = argv.includes("--expect-armed") || /^(1|true|yes)$/i.test(process.env.EXPECT_COMMITTEE_ACTIVE || "");
 const VALIDATOR =
   flag("--validator") ||
   process.env.COMMITTEE_VALIDATOR ||
@@ -200,10 +206,27 @@ async function main() {
   say(`activeCount     ${activeCount}`);
 
   if (epochLength === 0n) {
+    // Whether this is fine depends entirely on whether this validator is SUPPOSED to be armed, and
+    // only the caller knows that. Reporting OK unconditionally means that if committee mode is ever
+    // switched off by mistake on a mounted validator, this checker goes quiet -- while the account
+    // layer's CC-116 gate makes tier-2/3 fail closed for every account on it. Silence identical to
+    // health, one level below the one the header already names.
+    //
+    // Default stays OK so an unmounted candidate (epochLength 0 by design) is not a false alarm; the
+    // scheduled runner sets EXPECT_COMMITTEE_ACTIVE because the validator it watches IS armed.
+    if (expectArmed) {
+      emit("CRITICAL", 1, "committee mode is OFF (epochLength == 0) on a validator expected to be ARMED — every account mounted here has tier-2/3 failing closed", {
+        block: blockTag,
+        committeeActive: active,
+        epochLength: 0,
+        expectArmed: true,
+      });
+    }
     emit("OK", 0, "committee mode is OFF (epochLength == 0) — nothing is being served", {
       block: blockTag,
       committeeActive: active,
       epochLength: 0,
+      expectArmed: false,
     });
   }
 
