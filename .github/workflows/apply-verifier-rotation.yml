@@ -1,0 +1,66 @@
+# CC-115 B3 — finalise the verifier rotation once its delay matures.
+#
+# The four-day wait is the security property (CC-48 MEDIUM-1): a public window in which anyone can
+# see which verifier is about to become authoritative. Nothing here shortens it. What this removes is
+# a different risk -- that the last step simply never happens because the person who knew about it
+# was not around on the day.
+#
+# WHY IT IS SAFE TO RUN THIS UNATTENDED, stated rather than assumed:
+#
+#   * applyFraudProofVerifier() is PERMISSIONLESS and takes no arguments. It cannot choose a verifier;
+#     it can only finalise the one the aggregator owner already proposed and that has already served
+#     its full delay. There is no decision left to make, which is exactly why SP made it
+#     permissionless -- keeping it owner-only would hand the owner a second, unbounded veto.
+#   * The key in APPLY_KEEPER_KEY is a DEDICATED throwaway with no rights anywhere, funded with a
+#     small amount purely to pay this gas. Losing it costs that gas and nothing else.
+#   * deploy/apply-verifier-rotation.mjs refuses to act before readyAt, and checks that the pending
+#     verifier is the one expected before broadcasting -- applying a rotation is not the moment to
+#     discover a different contract was proposed.
+#
+# Idempotent by design: after it succeeds, every later run reports "already applied" and exits 0. It
+# is NOT self-disabling, because a job that turns itself off cannot tell you it stopped.
+name: Apply Verifier Rotation
+
+on:
+  schedule:
+    # Daily, offset off the hour. readyAt is 2026-09-04T05:36:24Z, so the first run that can succeed
+    # is that morning; before then every run exits 1 with the remaining time, which is honest rather
+    # than silent. The pending proposal does NOT expire, so a missed day costs nothing.
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: apply-verifier-rotation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      # Pinned exactly, same reasoning as the health check: this is a broadcasting path, and an
+      # unpinned range means a bad patch turns into a failed governance step.
+      - name: Install ethers
+        run: npm install --no-save --no-audit --no-fund --ignore-scripts ethers@6.17.0
+
+      - name: Apply the matured rotation
+        env:
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com' }}
+          KEEPER_PRIVATE_KEY: ${{ secrets.APPLY_KEEPER_KEY }}
+        run: |
+          if [ -z "$KEEPER_PRIVATE_KEY" ]; then
+            echo "::error::APPLY_KEEPER_KEY is not set — this workflow cannot broadcast. Set the secret to a funded throwaway key (applyFraudProofVerifier is permissionless, so it needs no rights)." >&2
+            exit 2
+          fi
+          node deploy/apply-verifier-rotation.mjs --broadcast

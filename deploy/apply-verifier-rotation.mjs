@@ -105,7 +105,20 @@ async function main() {
   console.log(`readyAt    : ${readyAt}  (${new Date(Number(readyAt) * 1000).toISOString()})`);
   console.log(`delay      : ${delay}s`);
 
-  if (readyAt === 0n) die("no rotation is pending — nothing to apply (it may already have been applied, or disarmed)");
+  if (readyAt === 0n) {
+    // Distinguish "already done" from "nothing to do and something is wrong". A scheduled runner
+    // reaches this state on every tick AFTER it succeeds, and reporting that as a failure would train
+    // whoever watches it to ignore the job -- the alert fatigue this repo keeps circling.
+    if (active.toLowerCase() === EXPECTED.toLowerCase()) {
+      console.log(`\nAlready applied: fraudProofVerifier is ${active} and no rotation is pending. Nothing to do.`);
+      return;
+    }
+    die(
+      `no rotation is pending, and the active verifier is ${active}, not the expected ${EXPECTED}.\n` +
+        `  Either the rotation was disarmed (emergencyDisarmFraudProofVerifier is owner-only and\n` +
+        `  immediate), or a different verifier was applied. This is not a no-op — investigate.`
+    );
+  }
   if (pending.toLowerCase() !== EXPECTED.toLowerCase()) {
     die(
       `pending verifier is ${pending}, expected ${EXPECTED}.\n` +
