@@ -95,7 +95,17 @@ async function activeSetFromEvents(v, provider) {
   // Configurable because providers cap eth_getLogs very differently: Alchemy's free tier allows a
   // TEN block range and rejects anything wider with a 400, which surfaced as ethers' opaque
   // "could not coalesce error" and left the keeper unable to pin at all on that plan.
-  const CHUNK = Number(process.env.LOGS_CHUNK || 9000);
+  // Validated, not just parsed. Number() turns three plausible mistakes into values that DO NOT
+  // THROW, so the fallback below -- which only catches thrown errors -- never sees them:
+  //   0    -> one block per request, scanning from the deploy block to head: millions of calls, hangs
+  //   -5   -> the range walks backwards and matches nothing
+  //   abc  -> NaN, so the loop runs once with toBlock NaN
+  // "event replay is unavailable" therefore has shapes that route AROUND the recovery built for it.
+  const rawChunk = Number(process.env.LOGS_CHUNK ?? "");
+  const CHUNK = Number.isInteger(rawChunk) && rawChunk > 0 ? rawChunk : 9000;
+  if (process.env.LOGS_CHUNK && CHUNK !== rawChunk) {
+    console.warn(`  LOGS_CHUNK=${JSON.stringify(process.env.LOGS_CHUNK)} is not a positive integer — using ${CHUNK}`);
+  }
   const getLogsChunked = async filter => {
     const out = [];
     for (let from = fromBlock; from <= head; from += CHUNK + 1) {
