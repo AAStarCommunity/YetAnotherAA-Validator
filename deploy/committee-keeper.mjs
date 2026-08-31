@@ -52,6 +52,7 @@ const ABI = [
   "function snapshotEpoch()",
   "function isEligibleForSnapshot(bytes32) view returns(bool)",
   "function activeCount() view returns(uint256)",
+  "function activeNodeIdsSorted() view returns(bytes32[])",
   "event SlotAssigned(bytes32 indexed nodeId, uint256 slot)",
   "event SlotCleared(bytes32 indexed nodeId, uint256 slot)",
 ];
@@ -64,13 +65,47 @@ const ABI = [
 /// ~10k-log RPC cap and throws EVERY tick — the keeper would then miss its pin window entirely, and
 /// the activeCount cross-check cannot save a request that never returns. Both filters are read at the
 /// SAME head so the reconstruction and the cross-check describe one consistent state.
+/// Event replay FIRST, contract helper as the fallback -- and the fallback is not a compromise here.
+/// `snapshotEpoch` proves the submitted list complete against the contract's OWN storage before it
+/// pins anything, so this list is a convenience input, never a trusted one: a wrong list fails the
+/// transaction, it cannot produce a wrong pin. That is what makes falling back safe.
+///
+/// It exists because event replay is not always available. Alchemy's free tier caps eth_getLogs at a
+/// TEN block range; the keeper's 9000-block chunks were rejected with a 400, ethers reported the
+/// opaque "could not coalesce error", and the keeper could not pin AT ALL -- every epoch re-entered
+/// the armed-but-unsatisfiable state that this whole line of work exists to prevent. A keeper that
+/// refuses an O(n^2) helper and therefore pins nothing is strictly worse than one that uses it.
+async function activeSet(v, provider) {
+  try {
+    return await activeSetFromEvents(v, provider);
+  } catch (err) {
+    const msg = err?.info?.responseBody || err?.shortMessage || err?.message || String(err);
+    console.warn("  event replay unavailable, falling back to activeNodeIdsSorted():", String(msg).slice(0, 160));
+    const ids = await v.activeNodeIdsSorted();
+    return [...ids];
+  }
+}
+
 async function activeSetFromEvents(v, provider) {
   const head = await provider.getBlockNumber();
   const fromBlock = Number(process.env.DEPLOY_BLOCK ?? 0);
   if (!process.env.DEPLOY_BLOCK) {
     console.warn("  keeper: DEPLOY_BLOCK unset — scanning from block 0 (set it to the validator's creation block)");
   }
-  const CHUNK = 9000;
+  // Configurable because providers cap eth_getLogs very differently: Alchemy's free tier allows a
+  // TEN block range and rejects anything wider with a 400, which surfaced as ethers' opaque
+  // "could not coalesce error" and left the keeper unable to pin at all on that plan.
+  // Validated, not just parsed. Number() turns three plausible mistakes into values that DO NOT
+  // THROW, so the fallback below -- which only catches thrown errors -- never sees them:
+  //   0    -> one block per request, scanning from the deploy block to head: millions of calls, hangs
+  //   -5   -> the range walks backwards and matches nothing
+  //   abc  -> NaN, so the loop runs once with toBlock NaN
+  // "event replay is unavailable" therefore has shapes that route AROUND the recovery built for it.
+  const rawChunk = Number(process.env.LOGS_CHUNK ?? "");
+  const CHUNK = Number.isInteger(rawChunk) && rawChunk > 0 ? rawChunk : 9000;
+  if (process.env.LOGS_CHUNK && CHUNK !== rawChunk) {
+    console.warn(`  LOGS_CHUNK=${JSON.stringify(process.env.LOGS_CHUNK)} is not a positive integer — using ${CHUNK}`);
+  }
   const getLogsChunked = async filter => {
     const out = [];
     for (let from = fromBlock; from <= head; from += CHUNK + 1) {
@@ -163,7 +198,7 @@ async function tick() {
       );
     }
     const tx = hasStakeAware
-      ? await v["snapshotEpoch(bytes32[])"](await activeSetFromEvents(v, provider))
+      ? await v["snapshotEpoch(bytes32[])"](await activeSet(v, provider))
       : await v["snapshotEpoch()"]();
     if (!hasStakeAware) console.log("  (pre-D2 validator: using the no-argument snapshotEpoch)");
     console.log("  snapshotEpoch tx:", tx.hash);
@@ -219,7 +254,7 @@ async function tick() {
     }
     // An ineligible member must be evicted first; syncNode is permissionless, so name the offenders.
     if (/ineligible node in set/i.test(msg)) {
-      const ids = await activeSetFromEvents(v, provider).catch(() => []);
+      const ids = await activeSet(v, provider).catch(() => []);
       const bad = [];
       for (const id of ids) { if (!(await v.isEligibleForSnapshot(id).catch(() => true))) bad.push(id); }
       // syncNode handles role/stake staleness; an in-flight ROLE_DVT exit notice needs syncExitNotice,
