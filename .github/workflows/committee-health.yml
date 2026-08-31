@@ -95,15 +95,20 @@ jobs:
       # default for local use; letting the schedule path reach it means that after the pending v0.32.0
       # -> v0.33.0 stack migration this workflow would keep reporting green about a contract nobody
       # uses. A green run against the wrong contract is worse than no run.
-      - name: Require an explicit validator
+      # Name the STACK, not the validator. algId 0x01 on a stack's router is what decides which
+      # validator that stack actually uses, so deriving from it means this can never watch a contract
+      # nobody uses -- which is not hypothetical: it happened the day v0.33.0 shipped, while this
+      # workflow was still pinned by a repository variable to the previous stack's validator.
+      - name: Require a stack to watch
         env:
-          COMMITTEE_VALIDATOR: ${{ inputs.validator || vars.COMMITTEE_VALIDATOR }}
+          COMMITTEE_ROUTER: ${{ vars.COMMITTEE_ROUTER }}
+          COMMITTEE_VALIDATOR: ${{ inputs.validator }}
         run: |
-          if [ -z "$COMMITTEE_VALIDATOR" ]; then
-            echo "::error::COMMITTEE_VALIDATOR is empty. Set the repository variable (Settings > Secrets and variables > Actions > Variables) to the committee validator this repo should watch. Refusing to fall back to the address compiled into committee-health.mjs." >&2
+          if [ -z "$COMMITTEE_VALIDATOR" ] && [ -z "$COMMITTEE_ROUTER" ]; then
+            echo "::error::Set the COMMITTEE_ROUTER repository variable to the account stack's ValidatorRouter (Settings > Secrets and variables > Actions > Variables). Refusing to fall back to the address compiled into committee-health.mjs." >&2
             exit 2
           fi
-          echo "watching $COMMITTEE_VALIDATOR"
+          echo "watching ${COMMITTEE_VALIDATOR:-stack at router $COMMITTEE_ROUTER}"
 
       # Pinned exactly (not a range) and installed with --ignore-scripts. This runs on the alerting
       # path 96 times a day: a range means a bad patch or a registry blip exits non-zero, and without
@@ -119,7 +124,8 @@ jobs:
           # Falls back to a public endpoint so this works without repo secrets. Set the secret to use a
           # dedicated provider; the script accepts SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL.
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com' }}
-          COMMITTEE_VALIDATOR: ${{ inputs.validator || vars.COMMITTEE_VALIDATOR }}
+          COMMITTEE_ROUTER: ${{ vars.COMMITTEE_ROUTER }}
+          COMMITTEE_VALIDATOR: ${{ inputs.validator }}
           # The validator this workflow watches is mounted and armed, so epochLength == 0 is an
           # incident here, not a resting state. Without this the checker would report OK while every
           # account on that validator had tier-2/3 failing closed under the CC-116 account-side gate.
@@ -169,7 +175,7 @@ jobs:
           LIVENESS: ${{ needs.check.outputs.liveness }}
           EXIT_CODE: ${{ needs.check.outputs.exit_code }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          WATCHED: ${{ vars.COMMITTEE_VALIDATOR }}
+          WATCHED: ${{ vars.COMMITTEE_ROUTER }}
           ASSIGNEE: ${{ vars.COMMITTEE_HEALTH_ASSIGNEE || 'jhfnetboy' }}
         run: |
           set -euo pipefail
@@ -247,7 +253,7 @@ jobs:
             --body "$(printf '%s\n' \
               "$summary" \
               "" \
-              "Validator: ${WATCHED:-unknown}" \
+              "Stack router: ${WATCHED:-unknown} (the validator is whatever algId 0x01 resolves to)" \
               "Run: ${RUN_URL}" \
               "" \
               "$detail" \

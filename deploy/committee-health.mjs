@@ -48,6 +48,7 @@
 // Usage:
 //   node deploy/committee-health.mjs
 //   node deploy/committee-health.mjs --json          (one line of JSON, on EVERY path including errors)
+//   node deploy/committee-health.mjs --router 0x…      (derive the validator from algId 0x01)
 //   node deploy/committee-health.mjs --validator 0x… --env ../SuperPaymaster/.env.sepolia
 //   node deploy/committee-health.mjs --expect-armed   (epochLength == 0 becomes CRITICAL, not OK;
 //                                                      also via EXPECT_COMMITTEE_ACTIVE=true)
@@ -121,11 +122,18 @@ const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
 // branch for why the default cannot be "always expect armed" -- an unmounted candidate legitimately
 // sits at 0.
 const expectArmed = argv.includes("--expect-armed") || /^(1|true|yes)$/i.test(process.env.EXPECT_COMMITTEE_ACTIVE || "");
-const VALIDATOR =
-  flag("--validator") ||
-  process.env.COMMITTEE_VALIDATOR ||
-  env.COMMITTEE_VALIDATOR ||
-  "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
+// Prefer naming the STACK, not the address. A router's algId 0x01 is what actually decides which
+// validator an account stack uses, so deriving from it means the check can never end up watching a
+// contract the stack does not use -- the failure this file's own header predicted ("mount a different
+// committee validator and this workflow keeps reporting green about a contract nobody uses") and
+// which came true the day v0.33.0 shipped: the scheduled run was still pinned to the previous stack's
+// validator by a repository variable nobody remembered to move.
+//
+// An explicit --validator still wins, for probing a candidate that no stack mounts yet.
+const ROUTER = flag("--router") || process.env.COMMITTEE_ROUTER || env.COMMITTEE_ROUTER;
+const VALIDATOR_EXPLICIT =
+  flag("--validator") || process.env.COMMITTEE_VALIDATOR || env.COMMITTEE_VALIDATOR;
+let VALIDATOR = VALIDATOR_EXPLICIT || "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
 
 const ABI = [
   "function epochLength() view returns (uint256)",
@@ -183,6 +191,24 @@ async function main() {
   }
   const provider = new ethers.JsonRpcProvider(RPC);
   const v = new ethers.Contract(VALIDATOR, ABI, provider);
+
+  // Resolve the router BEFORE anything else reads VALIDATOR.
+  if (ROUTER && !VALIDATOR_EXPLICIT) {
+    if (!ethers.isAddress(ROUTER)) emit("UNKNOWN", 2, `COMMITTEE_ROUTER is not an address: ${ROUTER}`);
+    try {
+      const r = new ethers.Contract(ROUTER, ["function getAlgorithm(uint8) view returns (address)"], provider);
+      const derived = await r.getAlgorithm(1);
+      if (derived === ethers.ZeroAddress) {
+        emit("UNKNOWN", 2, `router ${ROUTER} has no algorithm mounted at 0x01 — nothing to watch`);
+      }
+      VALIDATOR = derived;
+      say(`router     ${ROUTER}  ->  algId 0x01`);
+    } catch (e) {
+      emit("UNKNOWN", 2, `could not read getAlgorithm(0x01) from router ${ROUTER}: ${e?.shortMessage ?? e?.message ?? String(e)}`);
+    }
+  } else if (ROUTER && VALIDATOR_EXPLICIT) {
+    say(`router     ${ROUTER} ignored — an explicit validator was given`);
+  }
 
   if ((await provider.getCode(VALIDATOR)) === "0x") emit("UNKNOWN", 2, `no code at ${VALIDATOR} on this chain`);
 
