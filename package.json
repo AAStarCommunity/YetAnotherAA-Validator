@@ -36,7 +36,7 @@
     "release:patch": "npm version patch --no-git-tag-version && npm run build && echo '✅ Bumped to '$(jq -r .version package.json)"
   },
   "dependencies": {
-    "@nestjs/common": "^11.1.27",
+    "@nestjs/common": "^11.1.28",
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.1.27",
     "@nestjs/platform-express": "^11.1.28",
