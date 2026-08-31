@@ -10,10 +10,21 @@
 //   node deploy/onboarding/onboard.mjs verify https://dvt.you.org   # steps 4/5: is the path up?
 //   node deploy/onboarding/onboard.mjs all  https://dvt.you.org     # run the guided flow
 //
-// Step 2 (on-chain registration) is owner-coordinated today (registerPublicKey is
-// onlyOwner on the deployed validator). This tool generates the request + polls until
-// AAStar registers you. When the permissionless PNT-staking path is wired, a `stake`
-// subcommand will make step 2 fully self-service too.
+// Step 2 (on-chain registration) depends on which validator you are joining:
+//   requireStake == false  -> owner-coordinated: registerPublicKey is onlyOwner. Use
+//                             `register-request` + `wait-register`. NOTE the nodeId on this path
+//                             is CHOSEN by the caller, not derived -- AAStarValidator.sol:835 takes
+//                             it as a parameter. The three ids registered on Sepolia happen to equal
+//                             keccak256(pubkey) because whoever registered them used that, not
+//                             because the path enforces it. Do not assume a bootstrap id equals the
+//                             staked-path id; check.
+//   requireStake == true   -> SELF-SERVICE, and this is no longer hypothetical: it was
+//                             exercised end to end on Sepolia 2026-08-31 against validator
+//                             0x7ac7E9d4…, three operators, three registerWithProof calls.
+//                             Use `pop <operatorAddress>` and follow the printed sequence.
+// The old note here said a `stake` subcommand would arrive "when the permissionless PNT-staking
+// path is wired". That path is wired; what was missing was not a subcommand but the three
+// non-obvious facts the `pop` output now prints.
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { randomBytes } from "crypto";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
@@ -116,6 +127,62 @@ function keygen() {
 
 // --- staked path: produce the BLS proof-of-possession + registerWithProof params.
 // Usage: onboard.mjs pop <operatorAddress>   (the EOA/Safe that stakes + registers)
+/// The stake and ticket are ON-CHAIN CONFIG and they drift, so read them when we can. `pop` is
+/// otherwise a purely offline key operation and must stay usable with no network, so this is
+/// best-effort: with ETH_RPC_URL set it reports live values, without it it reports the last
+/// OBSERVED values and says when they were observed rather than stating them as current.
+///
+/// Printing a hard-coded number in a file whose whole point is "do not trust stale claims" is the
+/// same failure it documents. There is a precedent one repo over: a SuperPaymaster Registry comment
+/// says "level 1 = 1000" where the live read is 300e18.
+async function roleCost() {
+  const OBSERVED = "minStake 30e18 + ticketPrice 3e18 = 33e18 (observed on Sepolia 2026-08-31)";
+  const rpc = process.env.ETH_RPC_URL || process.env.SEPOLIA_RPC_URL;
+  const registry = process.env.SP_REGISTRY || "0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71";
+  if (!rpc) return `${OBSERVED}. Set ETH_RPC_URL to read the live values instead of these.`;
+  // destroy() in a finally, and a bounded race. An unreachable RPC leaves JsonRpcProvider retrying
+  // network detection on a live timer, so the process prints its answer and then NEVER EXITS -- an
+  // offline-capable key tool that hangs on a bad URL is worse than one that cannot read the value.
+  let provider;
+  try {
+    provider = new ethers.JsonRpcProvider(rpc);
+    // getRoleConfig returns ONE struct, and because RoleConfig carries a `string description` it is a
+    // DYNAMIC type: returndata word 0 is the offset 0x20, not a field. Declaring four flat return
+    // values decodes one word off -- the offset lands in `isActive` (so it reads true forever) and
+    // shifts everything after it, which is the only reason the two numbers came out right. Declare
+    // the struct. Field order is IRegistry.sol:43-60; isActive is index 7, not 0.
+    const c = new ethers.Contract(
+      registry,
+      [
+        "function getRoleConfig(bytes32) view returns ((uint256 minStake, uint256 ticketPrice, uint32 slashThreshold, uint32 slashBase, uint32 slashInc, uint32 slashMax, uint16 exitFeePercent, bool isActive, uint256 minExitFee, string description, address owner, uint256 roleLockDuration))",
+      ],
+      provider
+    );
+    const roleId = process.env.SP_ROLE_ID || ethers.keccak256(ethers.toUtf8Bytes("DVT"));
+    const r = await Promise.race([
+      c.getRoleConfig(roleId),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("live read timed out after 8s")), 8000).unref()
+      ),
+    ]);
+    // A live read needs a validity test, or "read nothing" is indistinguishable from "read zero".
+    // A wrong registry, a wrong chain or a changed role id all return an ALL-ZERO struct, and without
+    // this the tool would print "live ... minStake 0.0e18 + ticketPrice 0.0e18" and tell an operator
+    // to approve nothing -- worse than the hard-coded value it replaced, which at least carried the
+    // date it was observed. The gate that should have caught it is the real isActive, which in the
+    // broken ABI was the offset word and could never be false.
+    if (!r.isActive || r.minStake === 0n) {
+      return `${OBSERVED}. (Live read reached ${registry} but role ${roleId.slice(0, 10)}… is not configured there: isActive=${r.isActive}, minStake=${r.minStake}. Wrong registry, wrong chain, or a changed role id.)`;
+    }
+    const f = v => `${ethers.formatUnits(v, 18)}e18`;
+    return `live from ${registry}: minStake ${f(r.minStake)} + ticketPrice ${f(r.ticketPrice)} = ${f(r.minStake + r.ticketPrice)}`;
+  } catch (e) {
+    return `${OBSERVED}. (Live read failed: ${e?.shortMessage ?? e?.message ?? String(e)})`;
+  } finally {
+    provider?.destroy();
+  }
+}
+
 async function pop() {
   const s = loadState() || die("no key yet — run `keygen` first");
   const operator =
@@ -143,8 +210,25 @@ async function pop() {
     )
   );
   console.log(
-    "\nThen (from the operator EOA/Safe): (1) stake GToken + Registry.registerRole(ROLE_DVT)\n" +
-      "on SuperPaymaster, (2) AAStarValidator.registerWithProof(publicKey, popPoint, popSig)."
+    "\nThen, FROM THE OPERATOR EOA/SAFE ITSELF (Registry.registerRole requires msg.sender == user):\n" +
+      `  1. approve GToken to GTOKEN_STAKING for minStake + ticketPrice -- NOT just minStake.\n` +
+      `     ${await roleCost()}\n` +
+      "     Approving only minStake fails ERC20InsufficientAllowance(spender, minStake, total),\n" +
+      "     which names the stake but not the ticket, so the shortfall reads like your own\n" +
+      "     arithmetic error.\n" +
+      "  2. Registry.registerRole(ROLE_DVT, <self>, abi.encode(uint256 stakeAmount))\n" +
+      "  3. AAStarValidator.registerWithProof(publicKey, popPoint, popSig)\n" +
+      "\nTWO THINGS THAT WILL COST YOU AN HOUR IF NOBODY TELLS YOU:\n" +
+      "  * hasRole(ROLE_DVT) == true DOES NOT MEAN STAKED. An address can hold the role with\n" +
+      "    effectiveStake 0. The validator checks BOTH (hasRole && getEffectiveStake >= minStake),\n" +
+      "    so read getEffectiveStake -- never infer staking from the role.\n" +
+      "  * AN ADDRESS THAT ALREADY HOLDS ROLE_DVT CANNOT TOP UP. registerRole reverts\n" +
+      "    RoleAlreadyGranted for any role except ROLE_ENDUSER, and its top-up branch is\n" +
+      "    unreachable for ROLE_DVT. Fixing a role=true/stake=0 address means exitRole first,\n" +
+      "    which for ROLE_DVT goes through the aggregator's 2-day guardian exit notice. If you are\n" +
+      "    staking fresh, use an address that does not already hold the role.\n" +
+      "\nOne operator backs exactly ONE node (operatorNode is a 1:1 anti-Sybil lock), so N nodes\n" +
+      "needs N separately staked EOAs."
   );
 }
 
