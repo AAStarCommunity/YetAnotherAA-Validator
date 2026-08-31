@@ -18,21 +18,40 @@
 #   3. Therefore the issue is ASSIGNED. Assignment always notifies, and the assignee is the sink --
 #      change `vars.COMMITTEE_HEALTH_ASSIGNEE` to move it, do not remove it.
 #
-# ACCEPTED GAP, named so nobody mistakes it for covered: GitHub DISABLES scheduled workflows after 60
-# days of repository inactivity. A repo that watches a deployed system can plausibly go quiet for 60
-# days while the system keeps running, and nothing inside this repo can detect that its own scheduler
-# was switched off -- by construction that silence is identical to "all healthy". Closing it needs an
-# EXTERNAL heartbeat ("alert if no run appeared in 30 minutes"), which does not exist yet and is NOT
-# tracked anywhere else. This workflow covers "the check ran and failed", never "the check stopped
-# running". That sentence is the whole of the coverage claim.
+# ACCEPTED GAP, named so nobody mistakes it for covered. Two ways this stops running, both invisible
+# from inside:
+#
+#   a. GitHub DISABLES scheduled workflows after 60 days of repository inactivity. A repo that watches
+#      a deployed system can plausibly go quiet that long while the system keeps running.
+#   b. GitHub delays and DROPS scheduled runs under load. This is not theoretical here: measured on
+#      this repo, `*/15` produced zero runs across four expected ticks in 53 minutes while every other
+#      trigger worked. The cron above uses offset minutes because of that, which improves the odds and
+#      guarantees nothing.
+#
+# In both cases the silence is identical to "all healthy" -- nothing inside this repo can detect that
+# its own scheduler stopped. Closing it needs an EXTERNAL heartbeat ("alert if no run appeared in 30
+# minutes"), which does not exist yet and is NOT tracked anywhere else.
+#
+# This workflow covers "the check ran and failed", never "the check ran at all". That sentence is the
+# whole of the coverage claim.
 name: Committee Health
 
 on:
   schedule:
-    # Every 15 minutes. The sentinel appears about one epoch (~13 min at epochLength 64) after the
-    # last successful pin, so this is roughly the finest granularity that is not just noise.
-    # GitHub delays or drops scheduled runs under load -- treat this as best-effort, not a guarantee.
-    - cron: "*/15 * * * *"
+    # Roughly every 15 minutes -- the sentinel appears about one epoch (~13 min at epochLength 64)
+    # after the last successful pin, so that is the finest granularity that is not just noise.
+    #
+    # OFFSET MINUTES ON PURPOSE, not */15. Measured on this repo: with `*/15` (i.e. :00/:15/:30/:45,
+    # the slots every other cron in the world also picks) NOT ONE scheduled run fired in 53 minutes
+    # across four expected ticks, while push- and pull_request-triggered runs went through normally
+    # the whole time. The configuration was correct -- cron on the default branch, workflow active,
+    # public non-fork repo, manual dispatch green. GitHub simply delays and drops scheduled runs under
+    # load, and the top-of-hour slots are where that load is.
+    #
+    # So "every 15 minutes" is a REQUEST, never a guarantee. That is the second half of the ACCEPTED
+    # GAP below: the scheduler can be switched off after 60 days, and even while on it can silently
+    # skip. Both need the same external heartbeat to detect, and neither is visible from inside.
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       validator:
