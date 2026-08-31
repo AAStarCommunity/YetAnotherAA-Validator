@@ -213,7 +213,9 @@ async function main() {
     // health, one level below the one the header already names.
     //
     // Default stays OK so an unmounted candidate (epochLength 0 by design) is not a false alarm; the
-    // scheduled runner sets EXPECT_COMMITTEE_ACTIVE because the validator it watches IS armed.
+    // scheduled watch sets EXPECT_COMMITTEE_ACTIVE because the validator it watches IS armed; a
+    // workflow_dispatch at another address explicitly does not, since that address may be a candidate
+    // that is meant to sit at 0.
     if (expectArmed) {
       emit("CRITICAL", 1, "committee mode is OFF (epochLength == 0) on a validator expected to be ARMED — every account mounted here has tier-2/3 failing closed", {
         block: blockTag,
