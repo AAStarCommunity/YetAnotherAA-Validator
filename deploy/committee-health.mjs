@@ -227,6 +227,16 @@ async function main() {
       }
       VALIDATOR = derived;
       say(`router     ${ROUTER}  ->  algId 0x01`);
+      // Say it HERE, not in the branch below. This is the path where an env-file COMMITTEE_VALIDATOR
+      // actually loses -- VALIDATOR_EXPLICIT already excluded it once ROUTER exists, so the message
+      // in the else-if can never be reached for this case. The whole thread this change comes from is
+      // "a silent precedence change misled someone"; leaving the mitigation in an unreachable branch
+      // would have kept one silence in the fix for the silence.
+      if (VALIDATOR_FROM_FILE) {
+        say(
+          `           (${ENV_FILE} sets COMMITTEE_VALIDATOR=${VALIDATOR_FROM_FILE}; the router won)`
+        );
+      }
     } catch (e) {
       emit(
         "UNKNOWN",
