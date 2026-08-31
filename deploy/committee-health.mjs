@@ -144,7 +144,14 @@ const VALIDATOR_EXPLICIT =
   flag("--validator") ||
   process.env.COMMITTEE_VALIDATOR ||
   (ROUTER ? undefined : VALIDATOR_FROM_FILE);
-let VALIDATOR = VALIDATOR_EXPLICIT || "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
+// The default applies ONLY when no router was asked for. Every emit() stamps the current VALIDATOR
+// into its report, and that default is 0x1A8Db639 -- the RETIRED pre-D2 validator. If a router was
+// requested, the honest value until it resolves is "unknown": an alert reading
+// `"validator":"0x1A8Db639…"` next to a summary saying the router could not be read tells the reader
+// this heartbeat is watching the retired stack, which is a monitor lying about its own observation
+// target. Cleared HERE rather than inside the router branch, because failures BEFORE that branch --
+// "no RPC url" is the common one -- emit too, and the earlier fix only covered the later path.
+let VALIDATOR = VALIDATOR_EXPLICIT || (ROUTER ? null : "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64");
 
 const ABI = [
   "function epochLength() view returns (uint256)",
@@ -213,13 +220,8 @@ async function main() {
   // version watched the wrong contract but SAID SO, and that honest label is how the drift was
   // spotted at all.
   if (ROUTER && !VALIDATOR_EXPLICIT) {
-    // Drop the fallback BEFORE anything can fail. Every emit() below stamps the current VALIDATOR
-    // into its report, and until the router actually resolves, that value is the hard-coded default
-    // -- which is 0x1A8Db639, the RETIRED pre-D2 validator. An alert that says
-    // `"validator":"0x1A8Db639…"` when the router read failed is a monitor lying about its own
-    // observation target: a reader would conclude this heartbeat is pointed at the retired stack. The
-    // default exists for the no-router case and must not survive into a router failure.
-    VALIDATOR = null;
+    // VALIDATOR is already null here (see its declaration): with a router requested, the default is
+    // never adopted in the first place.
     if (!ethers.isAddress(ROUTER))
       emit("UNKNOWN", 2, `COMMITTEE_ROUTER is not an address: ${ROUTER}`);
     try {
@@ -425,13 +427,24 @@ async function main() {
     // Gated on isD2 to match its own argument: the exemption exists because D2 requires _epochUsable(e),
     // so an unpinned current epoch alone turns the sentinel on. Pre-D2 never produces a sentinel from
     // that state (verified on the live contract: it returns 2), so a sentinel there is never benign.
-    const onlyPendingPin =
-      isD2 && !usableE && usablePrev && floorOk && !pinnedE && !beforeWindow && !pastWindow;
+    // `!beforeWindow` USED TO BE A CONJUNCT HERE, and dropping it is a fix, not a loosening.
+    // beforeWindow means bn == start: the epoch's very FIRST block, where the contract's own guard is
+    // `bn > start`, so epoch e cannot have been pinned by anyone. The sentinel there is structurally
+    // unavoidable, nobody can act on it, and it clears in one block (~12s). Excluding that state from
+    // the exemption paged CRITICAL once per epoch boundary -- 1 block in 64, so roughly one false page
+    // every few hours at a 15-minute sampling interval, which is the alert fatigue this whole file is
+    // built to avoid. The comment on `beforeWindow` above already made exactly this argument
+    // ("conflating that with having missed it fires a false CRITICAL every epoch boundary"); it was
+    // applied to the pastWindow branch and not to this one, so the boundary still paged, just from a
+    // different branch. Observed live: block 11605312 == epoch 181333 * 64, pinned five blocks later.
+    const onlyPendingPin = isD2 && !usableE && usablePrev && floorOk && !pinnedE && !pastWindow;
     if (onlyPendingPin) {
       emit(
         "WARN",
         0,
-        `epoch ${e} is not pinned yet but is still inside its window (pinnable through ${deadline}); epoch ${e - 1n} still serves. Normal keeper latency.`,
+        beforeWindow
+          ? `epoch ${e} cannot be pinned yet: block ${bn} is the epoch's first block and snapshotEpoch requires bn > ${start}. The window opens next block and closes at ${deadline}; epoch ${e - 1n} still serves. Structural, not an incident.`
+          : `epoch ${e} is not pinned yet but is still inside its window (pinnable through ${deadline}); epoch ${e - 1n} still serves. Normal keeper latency.`,
         detail
       );
     }

@@ -61,6 +61,10 @@ monitor.
 ## Install
 
 ```bash
+# .run MUST exist first: launchd opens StandardOutPath/StandardErrorPath BEFORE the wrapper runs, so
+# its own `mkdir -p` is too late and a clean checkout can fail to start at all.
+install -d -m 700 deploy/.run
+
 cp deploy/launchd/io.aastar.dvt-*.plist ~/Library/LaunchAgents/
 for L in io.aastar.dvt-committee-health io.aastar.dvt-apply-rotation; do
   launchctl bootout    gui/$(id -u)/$L 2>/dev/null

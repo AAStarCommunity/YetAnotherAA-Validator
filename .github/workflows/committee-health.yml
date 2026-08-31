@@ -207,6 +207,10 @@ jobs:
                detail="This says nothing about the committee. Likely causes, MOST PERSISTENT FIRST: COMMITTEE_VALIDATOR is unset or empty, so the guard step failed and the liveness check never ran (that one repeats every tick until someone sets the repository variable); the job hit its 5-minute timeout (a hung RPC or install); checkout/setup failed; or the pinned ethers install could not be fetched." ;;
           esac
           catlabel="committee-health-${cat}"
+          # Shared with deploy/local-heartbeat.sh. Two monitors watch this stack now -- this workflow
+          # and the local launchd heartbeat -- and they MUST find each other's issue or each opens its
+          # own for the same fault. The marker, not the author, is what makes an issue monitor-owned.
+          marker="<!-- committee-health-alert-v1:${catlabel} -->"
 
           # Dedup is keyed on the CATEGORY, not just on `committee-health`. With a single key, one open
           # issue would permanently suppress the real "is failing" alert this chain exists to deliver.
@@ -220,22 +224,28 @@ jobs:
           # condition clears either -- a category stays quiet until a person closes it, which is what
           # "Close it when resolved" in the body is asking for.
           #
-          # --author takes `github-actions[bot]`, NOT the `app/github-actions` that `--json author`
-          # PRINTS. Verified against gh issue list itself (the command that actually runs here) on a
-          # repo with bot-authored issues: `app/github-actions` matched 0, `github-actions[bot]`
-          # matched 8. With the wrong string the query never matches, so every failed run would open a
-          # NEW assigned issue -- ~96 notifications a day into the one sink this file just built, which
-          # is how a person learns to mute the label. Without the author filter at all, one human
-          # labelling an unrelated issue would silently suppress every future alert.
+          # THE AUTHOR FILTER IS GONE, replaced by the marker. It took `github-actions[bot]`, not the
+          # `app/github-actions` that `--json author` PRINTS -- verified here, 0 matches vs 8 -- and
+          # that was correct as far as it went. What it could not do is see the LOCAL heartbeat's
+          # issues, which are authored by a person: with two monitors on one stack, filtering by
+          # author means each is blind to the other and both file for the same fault. The filter's
+          # real job was to stop a human-labelled issue from silently suppressing every future alert,
+          # and the marker does that strictly better: it is owned by the monitors, not by an identity.
           existing=$(gh issue list --state open --label committee-health --label "$catlabel" \
-                       --author 'github-actions[bot]' --json number -q '.[0].number' 2>/dev/null || true)
+                       --json number -q '.[].number' 2>/dev/null || true)
+          for n in $existing; do
+            if gh issue view "$n" --json body -q .body 2>/dev/null | grep -qF "$marker"; then
+              existing="$n"; break
+            fi
+            existing=""
+          done
           # Fall back to the TITLE when the label query finds nothing. If `--add-label` ever failed,
           # the dedup key is exactly the metadata that did not get attached, and the cause (a swallowed
           # `gh label create`) is persistent -- so without this the next tick opens another assigned
           # issue, and the next, every 15 minutes, with nothing to self-heal. Titles are fixed strings
           # chosen per category above, so this is an exact match, not a heuristic.
           if [ -z "$existing" ]; then
-            existing=$(gh issue list --state open --author 'github-actions[bot]' --json number,title \
+            existing=$(gh issue list --state open --json number,title \
                          -q "[.[]|select(.title==\"${title}\")]|.[0].number" 2>/dev/null || true)
             [ -n "$existing" ] && echo "::warning::found issue #${existing} by title, not by label -- its labels are missing, so dedup is degraded"
           fi
@@ -260,6 +270,8 @@ jobs:
           url=$(gh issue create \
             --title "$title" \
             --body "$(printf '%s\n' \
+              "$marker" \
+              "" \
               "$summary" \
               "" \
               "Stack router: ${WATCHED:-unknown} (the validator is whatever algId 0x01 resolves to)" \
@@ -267,7 +279,9 @@ jobs:
               "" \
               "$detail" \
               "" \
-              "This issue is created once per category and stays quiet while open, so an ongoing outage does not post every 15 minutes. Close it when resolved.")")
+              "This issue is created once per category and stays quiet while open, so an ongoing outage does not post every 15 minutes." \
+              "" \
+              "The LOCAL heartbeat (deploy/local-heartbeat.sh) closes marker-bearing issues automatically when the stack recovers; this workflow does not close anything itself. If the local heartbeat is not running on the monitor host, close this by hand when resolved.")")
           echo "opened ${url}"
           num="${url##*/}"
           gh issue edit "$num" --add-label committee-health --add-label "$catlabel" \

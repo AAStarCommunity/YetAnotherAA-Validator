@@ -34,8 +34,15 @@
   </dict>
 
   <!-- Every 15 minutes: the sentinel appears about one epoch (~13 min at epochLength 64) after the
-       last successful pin, so finer granularity is noise. launchd runs a missed StartInterval once
-       on wake rather than replaying every skipped tick, which is the behaviour we want. -->
+       last successful pin, so finer granularity is noise.
+
+       SLEEP: a StartInterval firing that falls while the machine is asleep is SKIPPED, not caught up
+       on wake -- the wake-up/coalescing behaviour documented for launchd applies to
+       StartCalendarInterval, not to StartInterval. So after a sleep the first check can be up to a
+       full interval late. That is accepted here (the apply job's proposal does not expire and the
+       health check is a sampler, not a ledger); if catch-up on wake is ever required, this must
+       become top-level StartCalendarInterval entries. An earlier version of this comment asserted
+       the opposite and was simply wrong. -->
   <key>StartInterval</key>
   <integer>900</integer>
 
