@@ -123,15 +123,20 @@ jobs:
           # The validator this workflow watches is mounted and armed, so epochLength == 0 is an
           # incident here, not a resting state. Without this the checker would report OK while every
           # account on that validator had tier-2/3 failing closed under the CC-116 account-side gate.
-          EXPECT_COMMITTEE_ACTIVE: "true"
+          # TRUE only when this is the scheduled watch of the repo's own validator. A
+          # workflow_dispatch aimed at some other address -- an unmounted candidate, say -- must not be
+          # judged against the expectation that it is armed. The previous version set this
+          # unconditionally, which its own comment in committee-health.mjs denied.
+          EXPECT_COMMITTEE_ACTIVE: ${{ inputs.validator && 'false' || 'true' }}
         run: |
-          # tee, not command substitution. Capturing into a variable buffers everything until the
-          # script returns, so a hung script killed by the 5-minute timeout dies BEFORE anything is
-          # printed and the whole stdout is lost from the run log -- on precisely the path this alert
-          # job exists for. Streaming means the log has whatever it managed to say.
+          # Straight to stdout -- no capture, no pipe. Capturing into a variable buffered everything
+          # until the script returned, so a hung script killed by the 5-minute timeout died BEFORE
+          # printing and the whole stdout was lost from the run log, on precisely the path the alert
+          # job exists for. The tee that replaced it wrote a file nobody read, and PIPESTATUS was only
+          # needed because of the pipe. Under `set +e`, plain `$?` is the whole answer.
           set +e
-          node deploy/committee-health.mjs --json | tee /tmp/liveness.json
-          code=${PIPESTATUS[0]}
+          node deploy/committee-health.mjs --json
+          code=$?
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit $code
@@ -143,7 +148,11 @@ jobs:
   # checkout, and fires on every non-success result including cancelled and skipped.
   alert:
     needs: check
-    if: ${{ always() && needs.check.result != 'success' }}
+    # Never alert for an ad-hoc dispatch at another address. Its verdict is about a different
+    # contract, but the issue it would open lands in the SAME dedup namespace -- an unmounted
+    # candidate files `failing`, a typo'd address files `undetermined` -- and then suppresses the
+    # real alert for that category. `inputs` is falsy on the schedule path, so the watch is unaffected.
+    if: ${{ always() && needs.check.result != 'success' && !inputs.validator }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -160,6 +169,7 @@ jobs:
           LIVENESS: ${{ needs.check.outputs.liveness }}
           EXIT_CODE: ${{ needs.check.outputs.exit_code }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WATCHED: ${{ vars.COMMITTEE_VALIDATOR }}
           ASSIGNEE: ${{ vars.COMMITTEE_HEALTH_ASSIGNEE || 'jhfnetboy' }}
         run: |
           set -euo pipefail
@@ -204,6 +214,16 @@ jobs:
           # labelling an unrelated issue would silently suppress every future alert.
           existing=$(gh issue list --state open --label committee-health --label "$catlabel" \
                        --author 'github-actions[bot]' --json number -q '.[0].number' 2>/dev/null || true)
+          # Fall back to the TITLE when the label query finds nothing. If `--add-label` ever failed,
+          # the dedup key is exactly the metadata that did not get attached, and the cause (a swallowed
+          # `gh label create`) is persistent -- so without this the next tick opens another assigned
+          # issue, and the next, every 15 minutes, with nothing to self-heal. Titles are fixed strings
+          # chosen per category above, so this is an exact match, not a heuristic.
+          if [ -z "$existing" ]; then
+            existing=$(gh issue list --state open --author 'github-actions[bot]' --json number,title \
+                         -q "[.[]|select(.title==\"${title}\")]|.[0].number" 2>/dev/null || true)
+            [ -n "$existing" ] && echo "::warning::found issue #${existing} by title, not by label -- its labels are missing, so dedup is degraded"
+          fi
           if [ -n "$existing" ]; then
             echo "issue #${existing} is already open for category '${cat}' -- not commenting. Per-run history is in the Actions tab."
             exit 0
@@ -227,6 +247,7 @@ jobs:
             --body "$(printf '%s\n' \
               "$summary" \
               "" \
+              "Validator: ${WATCHED:-unknown}" \
               "Run: ${RUN_URL}" \
               "" \
               "$detail" \
