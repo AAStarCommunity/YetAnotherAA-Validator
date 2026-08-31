@@ -146,15 +146,32 @@ async function roleCost() {
   let provider;
   try {
     provider = new ethers.JsonRpcProvider(rpc);
+    // getRoleConfig returns ONE struct, and because RoleConfig carries a `string description` it is a
+    // DYNAMIC type: returndata word 0 is the offset 0x20, not a field. Declaring four flat return
+    // values decodes one word off -- the offset lands in `isActive` (so it reads true forever) and
+    // shifts everything after it, which is the only reason the two numbers came out right. Declare
+    // the struct. Field order is IRegistry.sol:43-60; isActive is index 7, not 0.
     const c = new ethers.Contract(
       registry,
-      ["function getRoleConfig(bytes32) view returns (bool isActive, uint256 minStake, uint256 ticketPrice, uint256 unused)"],
+      [
+        "function getRoleConfig(bytes32) view returns ((uint256 minStake, uint256 ticketPrice, uint32 slashThreshold, uint32 slashBase, uint32 slashInc, uint32 slashMax, uint16 exitFeePercent, bool isActive, uint256 minExitFee, string description, address owner, uint256 roleLockDuration))",
+      ],
       provider
     );
+    const roleId = process.env.SP_ROLE_ID || ethers.keccak256(ethers.toUtf8Bytes("DVT"));
     const r = await Promise.race([
-      c.getRoleConfig(ethers.keccak256(ethers.toUtf8Bytes("DVT"))),
+      c.getRoleConfig(roleId),
       new Promise((_, rej) => setTimeout(() => rej(new Error("live read timed out after 8s")), 8000).unref()),
     ]);
+    // A live read needs a validity test, or "read nothing" is indistinguishable from "read zero".
+    // A wrong registry, a wrong chain or a changed role id all return an ALL-ZERO struct, and without
+    // this the tool would print "live ... minStake 0.0e18 + ticketPrice 0.0e18" and tell an operator
+    // to approve nothing -- worse than the hard-coded value it replaced, which at least carried the
+    // date it was observed. The gate that should have caught it is the real isActive, which in the
+    // broken ABI was the offset word and could never be false.
+    if (!r.isActive || r.minStake === 0n) {
+      return `${OBSERVED}. (Live read reached ${registry} but role ${roleId.slice(0, 10)}… is not configured there: isActive=${r.isActive}, minStake=${r.minStake}. Wrong registry, wrong chain, or a changed role id.)`;
+    }
     const f = v => `${ethers.formatUnits(v, 18)}e18`;
     return `live from ${registry}: minStake ${f(r.minStake)} + ticketPrice ${f(r.ticketPrice)} = ${f(r.minStake + r.ticketPrice)}`;
   } catch (e) {
