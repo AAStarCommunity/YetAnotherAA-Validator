@@ -154,8 +154,14 @@ load_secrets() {
     line=$(trim "$line")
     case "$line" in \#*|"") continue;; esac
     # PARSE PARITY WITH THE NODE SIDE, and the reason it matters is above: a form this misses but the
-    # Node parser accepts is a secret that reaches a public issue. `export FOO=…`, spaces around `=`,
-    # and quotes that only appear after trimming are all accepted there and were all missed here.
+    # Node parser accepts is a secret that reaches a public issue. Spaces around `=` and quotes that
+    # only appear after trimming are accepted there and were missed here.
+    #
+    # `export FOO=…` is handled too, but NOT for parity: the Node side parses that into the key
+    # "export FOO", which nothing ever looks up, so such a line is never USED as a credential there.
+    # Stripping it here is strictly-wider capture, which is the safe direction for a redactor. An
+    # earlier version of this comment claimed the Node parser accepts `export`; it does not, and
+    # asserting a false fact in support of a true conclusion is still a false fact.
     line="${line#export }"
     line=$(trim "$line")
     case "$line" in *=*) ;; *) continue;; esac
@@ -173,6 +179,17 @@ load_secrets() {
         SECRETS+=("$val") ;;
       *)
         case "$val" in
+          # A 32-byte hex value in an env file is a private key whatever it is named. Selecting by
+          # SHAPE HERE is not the thing rejected above: that argument was against deleting by shape
+          # from the OUTPUT, where 64 hex is indistinguishable from a transaction hash. Inside the
+          # env file there are no transaction hashes, and contract addresses are 42 characters, not
+          # 66 -- verified against the live file: 7 key-shaped values selected, all 20 addresses
+          # untouched. Without this, coverage rests on ANOTHER repository's naming discipline: a
+          # `SIGNER_A=0x…` added to SuperPaymaster tomorrow is simply not redacted, with no error and
+          # no missing log line. Raised by pr-daemon.
+          0x????????????????????????????????????????????????????????????????|\
+          ????????????????????????????????????????????????????????????????)
+            SECRETS+=("$val") ;;
           http*://*@*|http*://*/v2/*|http*://*/v3/*|*apikey=*|*api_key=*|*"?key="*|*"&key="*)
             SECRETS+=("$val") ;;
         esac ;;
@@ -206,6 +223,30 @@ redact() {
     text="${text//"$sec"/[REDACTED]}"
   done
   printf '%s' "$text"
+}
+
+# ONE gate, applied where $out is PRODUCED rather than where it is consumed. The previous version
+# threaded safe_block through the alert call sites and reached exactly one of five -- and it was the
+# 124 branch, whose $out is a short string the watchdog assembles itself. The four carrying the
+# checker's raw output, which is the whole reason the gate exists, were bare. Part of that raw output
+# is error text from a PUBLIC RPC NODE: not input this repo controls, on a path that publishes to a
+# public repository. Caught by pr-daemon, who quoted this PR's own sentence back at me -- "a correct
+# argument in the wrong place is harder to find than no argument at all" -- which is precisely the
+# beforeWindow bug this same PR fixes, committed again two files away.
+#
+# Producing-side is the structural fix: a call site added later cannot forget it.
+#
+# ORDER IS LOad-BEARING: redact BEFORE truncate. Truncating first can cut a secret in half, and half
+# a secret no longer matches the exact-value substitution, so it would survive into the issue.
+sanitise() {
+  local raw="$1" red
+  red=$(redact "$raw")
+  if [ -n "$raw" ] && [ -z "$red" ]; then
+    log "redact() produced empty output from non-empty input -- publishing a placeholder, NOT the raw text"
+    printf '%s' "(diagnostics withheld: redaction failed, and unredacted output must not be published to a public issue)"
+    return
+  fi
+  safe_block "$red"
 }
 
 # One open issue per category, deduped on LABELS and deliberately NOT on author: the Actions
@@ -339,16 +380,15 @@ case "$MODE" in
     # one outcome that must not reach an issue -- a normal-looking alert carrying nothing is worse
     # than a noisy one. Keep the unredacted text only if redaction produced nothing from non-empty
     # input, and say so, rather than publishing silence.
-    _red=$(redact "$out")
-    if [ -n "$out" ] && [ -z "$_red" ]; then
-      log "redact() produced empty output from non-empty input -- publishing a placeholder, NOT the raw text"
-      out="(diagnostics withheld: redaction failed, and unredacted output must not be published to a public issue)"
-    else
-      out="$_red"
-    fi
+    out=$(sanitise "$out")
     echo "[$(stamp)] rc=$rc $out" >> "$LOG"
     case "$rc" in
-      0) resolve committee-health-failing committee-health-undetermined committee-health-hung ;;   # healthy (or a WARN already judged benign)
+      # committee-health-infrastructure is in this list even though THIS script never opens it: the
+      # workflow does, and the workflow closes nothing (its recovery path only runs on a trigger that
+      # does not fire here). Left out, an infrastructure issue stays open forever, which by this
+      # file's own argument is the same as not alerting.
+      0) resolve committee-health-failing committee-health-undetermined committee-health-hung \
+                 committee-health-infrastructure ;;   # healthy (or a WARN already judged benign)
       1) alert "committee-health-failing" \
            "Committee validator is failing checks (local heartbeat)" \
            $'The local launchd heartbeat ran `committee-health.mjs` and it exited 1 -- the committee stack is not serving.\n\n```\n'"$out"$'\n```\n\nRouter: `'"$ROUTER"$'`\nSource: local launchd `io.aastar.dvt-committee-health` (GitHub Actions `schedule` does not fire in this repo -- see deploy/local-heartbeat.sh).' ;;
@@ -357,7 +397,7 @@ case "$MODE" in
            $'`committee-health.mjs` exited 2: it could not reach a conclusion (RPC, config, or wrong directory). That is NOT benign -- it reports nothing, which is the silence this monitor exists to end.\n\n```\n'"$out"$'\n```' ;;
       124) alert "committee-health-hung" \
            "Committee health check HUNG and was killed (local heartbeat)" \
-           $'The checker did not return within '"$WATCHDOG_SECS"$'s and was killed. This is NOT a verdict on the committee: while a child hangs, launchd will not start the next interval, so the monitor is retired for as long as it lasts. Deliberately its own category -- "it hung" and "the committee is down" need different responses.\n\n```\n'"$(safe_block "$out")"$'\n```' ;;
+           $'The checker did not return within '"$WATCHDOG_SECS"$'s and was killed. This is NOT a verdict on the committee: while a child hangs, launchd will not start the next interval, so the monitor is retired for as long as it lasts. Deliberately its own category -- "it hung" and "the committee is down" need different responses.\n\n```\n'"$out"$'\n```' ;;
       *) alert "committee-health-undetermined" \
            "Committee health exited $rc (local heartbeat)" \
            $'Unexpected exit code '"$rc"$'.\n\n```\n'"$out"$'\n```' ;;
@@ -373,13 +413,7 @@ case "$MODE" in
     # one outcome that must not reach an issue -- a normal-looking alert carrying nothing is worse
     # than a noisy one. Keep the unredacted text only if redaction produced nothing from non-empty
     # input, and say so, rather than publishing silence.
-    _red=$(redact "$out")
-    if [ -n "$out" ] && [ -z "$_red" ]; then
-      log "redact() produced empty output from non-empty input -- publishing a placeholder, NOT the raw text"
-      out="(diagnostics withheld: redaction failed, and unredacted output must not be published to a public issue)"
-    else
-      out="$_red"
-    fi
+    out=$(sanitise "$out")
     echo "[$(stamp)] rc=$rc" >> "$LOG"
     echo "$out" >> "$LOG"
     # Waiting out the delay exits 0 and says so; only a real problem is non-zero.

@@ -31,9 +31,10 @@
     "config:check": "node scripts/sync-dvt-config.mjs --check",
     "config:sync": "node scripts/sync-dvt-config.mjs",
     "conformance": "node conformance/reference.mjs --check conformance/vectors.json",
-    "release:major": "npm version major --no-git-tag-version && npm run build && echo '✅ Bumped to '$(jq -r .version package.json)",
-    "release:minor": "npm version minor --no-git-tag-version && npm run build && echo '✅ Bumped to '$(jq -r .version package.json)",
-    "release:patch": "npm version patch --no-git-tag-version && npm run build && echo '✅ Bumped to '$(jq -r .version package.json)"
+    "release:major": "npm version major --no-git-tag-version && npm run build && echo '\u2705 Bumped to '$(jq -r .version package.json)",
+    "release:minor": "npm version minor --no-git-tag-version && npm run build && echo '\u2705 Bumped to '$(jq -r .version package.json)",
+    "release:patch": "npm version patch --no-git-tag-version && npm run build && echo '\u2705 Bumped to '$(jq -r .version package.json)",
+    "check:classify": "node scripts/check-quorum-classify.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.28",

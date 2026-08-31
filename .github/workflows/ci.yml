@@ -79,6 +79,15 @@ jobs:
       - name: Check fraud-proof verifier arming instructions
         run: npm run check:arming
 
+      # The sentinel exemption decides whether an unsatisfiable requiredQuorum() pages or is shrugged
+      # off. It has been wrong once (excluding beforeWindow paged CRITICAL at every epoch boundary on
+      # a healthy stack), and the fix WIDENED a "do not alert" predicate -- the change most able to
+      # swallow a real outage silently. Its safety conjunct (usablePrev) cannot be exercised against
+      # a live chain: the decisive state needs archive data and cannot be provoked on demand. Six
+      # synthetic cells, and a guard that both answers actually occur.
+      - name: Check the sentinel benign-state classifier
+        run: npm run check:classify
+
   # Job 3: Build project
   build:
     name: Build

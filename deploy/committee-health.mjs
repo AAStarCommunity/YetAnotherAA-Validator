@@ -53,6 +53,7 @@
 //   node deploy/committee-health.mjs --expect-armed   (epochLength == 0 becomes CRITICAL, not OK;
 //                                                      also via EXPECT_COMMITTEE_ACTIVE=true)
 import { ethers } from "ethers";
+import { isBenignPendingPin } from "./lib/quorum-classify.mjs";
 import { readFileSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
@@ -437,7 +438,14 @@ async function main() {
     // ("conflating that with having missed it fires a false CRITICAL every epoch boundary"); it was
     // applied to the pastWindow branch and not to this one, so the boundary still paged, just from a
     // different branch. Observed live: block 11605312 == epoch 181333 * 64, pinned five blocks later.
-    const onlyPendingPin = isD2 && !usableE && usablePrev && floorOk && !pinnedE && !pastWindow;
+    const onlyPendingPin = isBenignPendingPin({
+      isD2,
+      usableE,
+      usablePrev,
+      floorOk,
+      pinnedE,
+      pastWindow,
+    });
     if (onlyPendingPin) {
       emit(
         "WARN",
