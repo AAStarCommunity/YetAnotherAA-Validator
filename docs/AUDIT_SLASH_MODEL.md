@@ -38,9 +38,10 @@ The two are independent. Credit/spending limits are a **sign-gate** concern
 >
 > ⚠️ **Jail has NO teeth today — it is not implemented anywhere.** Committee
 > eligibility checks stake, role and guardian-exit state and **never reads
-> `isOffline`** (`AAStarCommitteeValidator.sol:460-469`); `LivenessRegistry`
-> advertises "zero SuperPaymaster-core coupling" (`:13`). There is no auto-jail
-> in either repo — only a deployed signal with no consumer.
+> `isOffline`** (`AAStarCommitteeValidator.sol:460-469`, local);
+> `@repo:sp LivenessRegistry` advertises "zero SuperPaymaster-core coupling"
+> (`:13`). There is no auto-jail in either repo — only a deployed signal with no
+> consumer.
 >
 > ⚠️ **Do not over-read that lesson.** It disqualifies **gossip absence** as
 > evidence, not **liveness** as an offence. CC-29's on-chain `isOffline(op)`
@@ -60,8 +61,8 @@ The two are independent. Credit/spending limits are a **sign-gate** concern
 >
 > ⚠️ And do not over-read _this_ correction either: `isOffline` proves only that
 > the operator's key sent a transaction recently. It explicitly does **not**
-> prove the DVT stack is online (`LivenessRegistry.sol:21,28`), so an operator
-> that attests while refusing to co-sign is invisible to it.
+> prove the DVT stack is online (`@repo:sp LivenessRegistry.sol:21,28`), so an
+> operator that attests while refusing to co-sign is invisible to it.
 
 ## 3. The four rules — final handling
 
@@ -130,19 +131,19 @@ Five things are missing before this can be specified, let alone armed:
    **on-chain governance values with versioned activation blocks, or snapshotted
    into the outage episode**. On-chain alone is NOT sufficient: `livenessWindow`
    and any tier value are mutable with immediate effect (the registry stores
-   only the _current_ window in a single slot, `LivenessRegistry.sol:67`, read
-   back by `livenessWindow()` at `:136`; the governance note at `:33` states
-   that a change re-partitions the live set immediately), so if governance moves
-   a parameter between the outage and its settlement, **the caller's timing
-   selects which parameter set applies** — the very caller-dependence the leak
-   exists to avoid. The requirement is not "on-chain", it is **"reconstructible
-   for the epoch being charged"**. And not because a quorum has to agree on a
-   message (there is no quorum here), but because a permissionless settlement
-   whose result depends on who calls it is not a settlement. Today DVT's only
-   offline threshold is the hard-coded, version-bound
-   `OFFLINE_THRESHOLD_MS = 600_000` (`audit.service.ts:66`) — a gossip
-   wall-clock number that deliberately enters the proofHash of the _voted_
-   pipeline. It is **not** a candidate tier source.
+   only the _current_ window in a single slot,
+   `@repo:sp LivenessRegistry.sol:68`, read back by `livenessWindow()` at
+   `:136`; the governance note at `:33` states that a change re-partitions the
+   live set immediately), so if governance moves a parameter between the outage
+   and its settlement, **the caller's timing selects which parameter set
+   applies** — the very caller-dependence the leak exists to avoid. The
+   requirement is not "on-chain", it is **"reconstructible for the epoch being
+   charged"**. And not because a quorum has to agree on a message (there is no
+   quorum here), but because a permissionless settlement whose result depends on
+   who calls it is not a settlement. Today DVT's only offline threshold is the
+   hard-coded, version-bound `OFFLINE_THRESHOLD_MS = 600_000`
+   (`audit.service.ts:66`) — a gossip wall-clock number that deliberately enters
+   the proofHash of the _voted_ pipeline. It is **not** a candidate tier source.
 3. **The asset is decided — GToken (Jason, 2026-09-02) — and that is what makes
    the margin load-bearing.** The two deployed burn paths hit different assets:
    DVT-originated operator slashing burns SP-held **aPNTs** (capped at 30%,

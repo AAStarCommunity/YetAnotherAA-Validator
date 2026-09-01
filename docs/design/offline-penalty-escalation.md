@@ -17,6 +17,14 @@
 > with a mathematical claim that is false. Both are corrected below and the
 > errors are kept visible rather than silently patched.
 
+> **Cross-repo citations.** Files named `LivenessRegistry.sol`, `Registry.sol`,
+> `GTokenStaking.sol`, `IRegistry.sol`, `BLSAggregator.sol`,
+> `SuperPaymaster.sol` and `xPNTsToken.sol` live in **`@repo:sp`**
+> (`SuperPaymaster`, `contracts/src/…`), not in this repository — a `find .`
+> here returns an empty set for them. Files named `AAStarValidator.sol`,
+> `AAStarCommitteeValidator.sol`, `audit.service.ts`,
+> `liveness-keeper.service.ts` and `configuration.ts` are local.
+
 ## 1. What Jason asked for
 
 > 借鉴信标链的罚没过程。如果你离线可能超过多久,我就开始 slash 你。但离线超过一段时间,我就把你放进 jail,不让你参与线上的投票,直到你重新上线。……如果我放进jail 之后你持续没有上线,比如说一年没上线,我肯定不能一直等你。比如说超过一个月没上线,那就开始 slash。我是希望一个逐步升级的过程。所以 jail 和 slash 它并存。
@@ -210,8 +218,9 @@ leak starts.)
 first draft claimed the leak is "a pure function of `lastLive`,
 `livenessWindow`, `block.number`". Those three inputs are enough to answer _"is
 this operator offline right now?"_ They are **not** enough to settle money.
-Concretely, with today's `LivenessRegistry` (`_lastLive` is a single slot,
-overwritten on every attestation, `:67,:101`):
+Concretely, with today's `LivenessRegistry` (`_lastLive` is a single mapping
+slot declared at `:71` and overwritten on every attestation at `:101`, keeping
+no history):
 
 | gap                                                               | consequence if built anyway                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -227,7 +236,7 @@ overwritten on every attestation, `:67,:101`):
 **Mutable parameters break settlement too — this is a state requirement, not a
 governance nicety.** `livenessWindow` (and any tier value) can be changed with
 immediate effect, and the registry stores only the _current_ window (the window
-lives in a single slot, `LivenessRegistry.sol:67`, read back by
+lives in a single slot, `LivenessRegistry.sol:68`, read back by
 `livenessWindow()` at `:136`; the governance note at `:33` spells out that a
 change re-partitions the live set immediately. SP's `Registry.configureRole`
 overwrites a whole role config the same way — `roleConfigs[roleId] = config` at
