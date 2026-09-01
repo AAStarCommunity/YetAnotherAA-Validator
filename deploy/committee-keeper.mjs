@@ -33,8 +33,20 @@ const env = Object.fromEntries(
 const pick = (...names) => names.map(n => process.env[n] || env[n]).find(Boolean);
 const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
 const KEY = pick("KEEPER_PRIVATE_KEY", "PRIVATE_KEY");
-const VALIDATOR_EXPLICIT = pick("COMMITTEE_VALIDATOR");
+// PRECEDENCE, copied from committee-health.mjs:138-147 rather than approximated. A validator from
+// the ENVIRONMENT is a deliberate act and outranks a router; one left behind in an env FILE is not.
+// Deleting the repository variable does not reach a stale .env.sepolia sitting next to a developer,
+// and letting that silently win reintroduces the very "pinned to an address nobody mounts" failure
+// this file exists to remove -- only harder to see, because the router would look configured.
+//
+// The first version of this change treated the file as explicit and let it beat the router, while
+// claiming in the same breath to mirror the health check. Measured with a stale file value and a
+// router set: keeper resolved the stale address, health resolved the router's. The tool that follows
+// the stale value is the one that SENDS TRANSACTIONS.
 const ROUTER = pick("COMMITTEE_ROUTER");
+const VALIDATOR_FROM_FILE = env.COMMITTEE_VALIDATOR;
+const VALIDATOR_EXPLICIT =
+  process.env.COMMITTEE_VALIDATOR || (ROUTER ? undefined : VALIDATOR_FROM_FILE);
 const WATCH = process.argv.includes("--watch");
 // keccak("snapshotEpoch(bytes32[])")[0:4] = 1ed58d67, the D2 stake-aware form, with the PUSH4 opcode
 // (0x63) solc always emits in front of a dispatcher selector. Matching the bare four bytes searches the
@@ -51,15 +63,23 @@ const WATCH = process.argv.includes("--watch");
 // when it was written; that is exactly the problem with a hard-coded copy of a fact that lives
 // somewhere else -- it does not fail when it goes stale, it just goes on being confidently wrong.
 // Same derivation as deploy/committee-health.mjs so the two never disagree about what is being watched.
+/// A configuration problem, as opposed to a transient one. The distinction matters in --watch: an RPC
+/// blip is temporary and retrying is the right answer, while a missing or wrong COMMITTEE_ROUTER is
+/// permanent and no amount of retrying fixes it. Until this existed both took the same path, so a
+/// keeper restarted with the wrong configuration logged `tick err` every 30s FOREVER instead of
+/// dying -- and the restart is exactly the case this file's no-default change is meant to protect.
+class FatalConfigError extends Error {}
+
 async function resolveValidator(provider, explicit, router) {
   if (explicit) return ethers.getAddress(explicit);
   if (!router) {
-    throw new Error(
+    throw new FatalConfigError(
       "no validator: set COMMITTEE_VALIDATOR, or COMMITTEE_ROUTER to derive it from algId 0x01.\n" +
         "  There is no default on purpose -- the previous one is now the retired validator."
     );
   }
-  if (!ethers.isAddress(router)) throw new Error(`COMMITTEE_ROUTER is not an address: ${router}`);
+  if (!ethers.isAddress(router))
+    throw new FatalConfigError(`COMMITTEE_ROUTER is not an address: ${router}`);
   const r = new ethers.Contract(
     router,
     ["function getAlgorithm(uint8) view returns (address)"],
@@ -67,7 +87,9 @@ async function resolveValidator(provider, explicit, router) {
   );
   const derived = await r.getAlgorithm(1);
   if (derived === ethers.ZeroAddress) {
-    throw new Error(`router ${router} has no algorithm mounted at 0x01 -- nothing to watch`);
+    throw new FatalConfigError(
+      `router ${router} has no algorithm mounted at 0x01 -- nothing to watch`
+    );
   }
   return derived;
 }
@@ -370,6 +392,12 @@ if (WATCH) {
     try {
       await tick();
     } catch (e) {
+      if (e instanceof FatalConfigError) {
+        // Permanent. Exit so a supervisor restarts it (and fails visibly) rather than logging the
+        // same line every 30s while nothing is being pinned.
+        console.error("FATAL config error — not retrying:", e.message);
+        process.exit(1);
+      }
       console.error("tick err", e.shortMessage || e.message);
     }
     setTimeout(loop, 30000);

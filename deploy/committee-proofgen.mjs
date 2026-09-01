@@ -230,10 +230,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const env = loadEnv();
   const provider = new ethers.JsonRpcProvider(env.SEPOLIA_RPC_URL);
   // No hard-coded default: the previous one is the RETIRED validator (see committee-keeper.mjs).
+  // Same precedence as committee-keeper.mjs and committee-health.mjs: an env-FILE validator does not
+  // outrank a configured router (see the note in committee-keeper.mjs).
+  const router = process.env.COMMITTEE_ROUTER || env.COMMITTEE_ROUTER;
   const validator = await resolveValidatorCli(
     provider,
-    process.env.COMMITTEE_VALIDATOR || env.COMMITTEE_VALIDATOR,
-    process.env.COMMITTEE_ROUTER || env.COMMITTEE_ROUTER
+    process.env.COMMITTEE_VALIDATOR || (router ? undefined : env.COMMITTEE_VALIDATOR),
+    router
   );
   const epoch = BigInt(process.argv[2] ?? "0");
   const nodeId = process.argv[3];

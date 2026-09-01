@@ -152,7 +152,17 @@ const VALIDATOR_EXPLICIT =
 // this heartbeat is watching the retired stack, which is a monitor lying about its own observation
 // target. Cleared HERE rather than inside the router branch, because failures BEFORE that branch --
 // "no RPC url" is the common one -- emit too, and the earlier fix only covered the later path.
-let VALIDATOR = VALIDATOR_EXPLICIT || (ROUTER ? null : "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64");
+// NO retired-address default. This used to fall back to 0x1A8Db639…cd64, which is now the retired
+// pre-D2 validator, so `node committee-health.mjs` with no arguments reported CRITICAL about a stack
+// nobody runs -- a false alarm that looks exactly like a real one. Same removal as the keeper and
+// proofgen; found while verifying that change rather than reported with it.
+let VALIDATOR = VALIDATOR_EXPLICIT || null;
+// Without this the bare run reaches ethers as `new Contract(null, …)` and reports
+// "invalid value for Contract target" -- technically an exit 2, but it names the symptom instead of
+// the cause and sends the reader into ethers rather than into their configuration.
+const NO_TARGET_HINT =
+  "no validator to check: pass --validator, or --router / COMMITTEE_ROUTER to derive it from " +
+  "algId 0x01. There is no default on purpose -- the previous one is the retired pre-D2 validator.";
 
 const ABI = [
   "function epochLength() view returns (uint256)",
@@ -220,6 +230,7 @@ async function main() {
   // the printed output showed the new one. That is worse than the drift this PR fixes: the previous
   // version watched the wrong contract but SAID SO, and that honest label is how the drift was
   // spotted at all.
+  if (!ROUTER && !VALIDATOR_EXPLICIT) emit("UNKNOWN", 2, NO_TARGET_HINT);
   if (ROUTER && !VALIDATOR_EXPLICIT) {
     // VALIDATOR is already null here (see its declaration): with a router requested, the default is
     // never adopted in the first place.
