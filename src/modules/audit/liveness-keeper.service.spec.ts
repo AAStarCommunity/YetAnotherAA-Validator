@@ -19,6 +19,8 @@ function chain(over: Partial<Record<string, any>> = {}): any {
     // 100-block span, 12s blocks → 1200s apart. Keeps the default 300-block window at ~60min.
     getBlockNumber: jest.fn(async () => 1000),
     getBlockTimestamp: jest.fn(async (n: number) => 1_700_000_000 + n * 12),
+    // head 1000, window 300 → budget 100 blocks. lastLive 950 = 50 spent: inside budget.
+    getLastLive: jest.fn(async () => 950n),
     ...over,
   };
 }
@@ -147,85 +149,124 @@ describe("LivenessKeeperService", () => {
 });
 
 /**
- * CC-29 cadence budget. `livenessWindow` is SP-governed, in BLOCKS, changeable with immediate
- * effect; the attest interval is ours, wall-clock, per-node. Nothing linked them, so a legal config
- * could leave a healthy node permanently reading `isOffline == true` with no error anywhere.
+ * CC-29 liveness watchdog.
+ *
+ * The first version of this feature STOPPED the keeper when the configured cadence was too slow for
+ * the on-chain window, and called that fail-closed. It was inverted: not attesting is precisely how a
+ * node gets jailed, so "protecting" it that way guaranteed the harm and removed every recovery path.
+ * These tests pin the corrected direction — the keeper never stops for a configuration reason, and
+ * liveness is decided from observed on-chain state rather than from an extrapolated block time.
  */
-describe("LivenessKeeperService — on-chain cadence budget", () => {
-  afterEach(() => {
-    jest.clearAllMocks();
-  });
+describe("LivenessKeeperService — CC-29 watchdog", () => {
+  afterEach(() => jest.clearAllMocks());
 
-  it("STOPS the keeper when the interval exceeds livenessWindow/3 (fail-closed)", async () => {
+  it("NEVER stops attesting because the cadence is too slow — it alerts and covers", async () => {
     const bc = chain();
     const alerts = { alert: jest.fn() };
-    // window 300 blocks x 12s = 60min; safe max = 20min. 2h is the misconfiguration that used to
-    // pass every check and silently jail a healthy node.
+    // window 300 x 12s = 60min, budget 20min; 2h is the misconfiguration that used to stop the keeper.
     const k = await boot(bc, 7_200_000, alerts);
-    expect((k as any).timer).toBeNull();
+    await (k as any).watchdogCycle();
+
+    expect((k as any).timer).not.toBeNull(); // the whole point
     const [level, msg] = (alerts.alert as any).mock.calls[0];
     expect(level).toBe("critical");
-    expect(msg).toContain("OFFLINE");
+    expect(msg).toContain("FIX THE SETTING");
     k.onApplicationShutdown();
   });
 
-  it("KEEPS RUNNING at a safe cadence, and records the check", async () => {
-    const bc = chain();
-    const k = await boot(bc, 600_000); // 10min vs a 20min budget
-    expect((k as any).timer).not.toBeNull();
-    expect((k as any).lastWindowCheckMs).toBeGreaterThan(0);
+  it("attests EARLY when the on-chain block budget is spent, whatever the nominal cadence", async () => {
+    // head 1000, lastLive 800 → 200 blocks spent of a 100-block budget (window 300 / 3).
+    const bc = chain({ getLastLive: jest.fn(async () => 800n) });
+    const k = await boot(bc, 21_600_000, undefined); // nominal cadence 6h
+    (bc.attestLiveness as any).mockClear();
+    await (k as any).watchdogCycle();
+    expect(bc.attestLiveness).toHaveBeenCalledTimes(1);
     k.onApplicationShutdown();
   });
 
-  it("KEEPS RUNNING when the window cannot be READ — unknown is not unsafe", async () => {
-    // Stopping on an unreadable window would itself make the node look offline: the exact harm the
-    // budget exists to prevent. The two failure directions are deliberately opposite.
+  it("does NOT attest early while inside the budget", async () => {
+    const bc = chain(); // lastLive 950 → 50 of 100 spent
+    const k = await boot(bc, 600_000);
+    (bc.attestLiveness as any).mockClear();
+    await (k as any).watchdogCycle();
+    expect(bc.attestLiveness).not.toHaveBeenCalled();
+    k.onApplicationShutdown();
+  });
+
+  it("treats never-attested (lastLive == 0) as already offline and attests at once", async () => {
+    const bc = chain({ getLastLive: jest.fn(async () => 0n) });
+    const k = await boot(bc, 600_000);
+    (bc.attestLiveness as any).mockClear();
+    await (k as any).watchdogCycle();
+    expect(bc.attestLiveness).toHaveBeenCalledTimes(1);
+    k.onApplicationShutdown();
+  });
+
+  it("keeps attesting when the window cannot be READ — unknown is not unsafe, and never a stop", async () => {
     const bc = chain({
       getLivenessWindow: jest.fn(async () => {
         throw new Error("RPC 503");
       }),
     });
     const alerts = { alert: jest.fn() };
-    const k = await boot(bc, 7_200_000, alerts); // would be unsafe IF the window were readable
+    const k = await boot(bc, 7_200_000, alerts);
+    await (k as any).watchdogCycle();
     expect((k as any).timer).not.toBeNull();
-    expect((k as any).lastWindowCheckMs).toBe(0); // unverified, so it will retry
     expect(alerts.alert).not.toHaveBeenCalled();
     k.onApplicationShutdown();
   });
 
-  it("KEEPS RUNNING on an implausible reading rather than acting on it", async () => {
-    const bc = chain({ getLivenessWindow: jest.fn(async () => 0n) });
-    const k = await boot(bc, 7_200_000);
-    expect((k as any).timer).not.toBeNull();
-    k.onApplicationShutdown();
-  });
-
-  it("measures block time from chain, so a fast-block chain shrinks the budget", async () => {
-    // 2s blocks (an L2): the same 300-block window is only 10min, so a 10min cadence is now unsafe
-    // even though it is safe on a 12s chain. This is why block time is measured, not configured.
-    const bc = chain({
-      getBlockTimestamp: jest.fn(async (n: number) => 1_700_000_000 + n * 2),
-    });
-    const k = await boot(bc, 600_000);
-    expect((k as any).timer).toBeNull();
-    k.onApplicationShutdown();
-  });
-
-  it("STOPS when governance SHRINKS the window after boot (a boot-only check is not enough)", async () => {
+  it("covers a governance SHRINK to the on-chain minimum window (100 blocks)", async () => {
+    // 60 blocks is below MIN_LIVENESS_WINDOW (LivenessRegistry.sol:51) and cannot occur — an earlier
+    // version of this test used it and therefore proved nothing. 100 is the real floor.
     const bc = chain();
-    const alerts = { alert: jest.fn() };
-    const k = await boot(bc, 600_000, alerts); // safe at boot: 10min vs a 20min budget
+    const k = await boot(bc, 600_000);
+    (bc.attestLiveness as any).mockClear();
+    bc.getLivenessWindow = jest.fn(async () => 100n); // budget now 33 blocks; 50 already spent
+    await (k as any).watchdogCycle();
+    expect(bc.attestLiveness).toHaveBeenCalledTimes(1);
     expect((k as any).timer).not.toBeNull();
-
-    // SP lowers livenessWindow 300 -> 60 blocks in one transaction. Nothing in OUR config changed.
-    bc.getLivenessWindow = jest.fn(async () => 60n); // 60 x 12s = 12min; budget now 4min
-    (k as any).lastWindowCheckMs = Date.now() - 7_200_000; // force the re-check window open
-    await k.tick();
-    await new Promise(r => setImmediate(r)); // the re-check runs fire-and-forget after the attest
-    await new Promise(r => setImmediate(r));
-
-    expect((k as any).timer).toBeNull();
-    expect((alerts.alert as any).mock.calls[0][0]).toBe("critical");
     k.onApplicationShutdown();
+  });
+
+  it("rejects a zero/backward block-time sample instead of acting on it", async () => {
+    // A reorg between the two timestamp reads can produce this. It must not drive any decision.
+    const bc = chain({ getBlockTimestamp: jest.fn(async () => 1_700_000_000) });
+    const alerts = { alert: jest.fn() };
+    const k = await boot(bc, 7_200_000, alerts);
+    await (k as any).watchdogCycle();
+    expect((k as any).timer).not.toBeNull();
+    expect(alerts.alert).not.toHaveBeenCalled(); // unverified, so no cadence verdict
+    k.onApplicationShutdown();
+  });
+
+  it("does not request block -1 near genesis", async () => {
+    const bc = chain({ getBlockNumber: jest.fn(async () => 0) });
+    const k = await boot(bc, 600_000);
+    await (k as any).watchdogCycle();
+    const asked = (bc.getBlockTimestamp as any).mock.calls.map((c: any[]) => c[0]);
+    expect(asked.every((n: number) => n >= 0)).toBe(true);
+    k.onApplicationShutdown();
+  });
+
+  it("does not run two watchdog cycles concurrently", async () => {
+    const bc = chain();
+    const k = await boot(bc, 600_000);
+    (k as any).watchdogInFlight = true;
+    (bc.getLivenessWindow as any).mockClear();
+    await (k as any).watchdogCycle();
+    expect(bc.getLivenessWindow).not.toHaveBeenCalled();
+    (k as any).watchdogInFlight = false;
+    k.onApplicationShutdown();
+  });
+
+  it("does no work after shutdown", async () => {
+    const bc = chain();
+    const k = await boot(bc, 600_000);
+    k.onApplicationShutdown();
+    (bc.getLivenessWindow as any).mockClear();
+    await (k as any).watchdogCycle();
+    expect(bc.getLivenessWindow).not.toHaveBeenCalled();
+    expect((k as any).watchdog).toBeNull();
   });
 });
