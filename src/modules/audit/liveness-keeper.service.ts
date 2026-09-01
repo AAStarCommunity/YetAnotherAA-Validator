@@ -120,16 +120,35 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
 
   onApplicationBootstrap(): void {
     if (!this.enabled) return;
+
+    // The two branches below STOP the keeper, and stopping is correct in both: there is no safe
+    // substitute for a missing wallet, and an address cannot be clamped. What was wrong is that they
+    // stopped SILENTLY, on a `warn`, while the branch that keeps the node ALIVE (a malformed
+    // interval, clamped below) raised a critical alert. The signal strength was inverted against the
+    // consequence.
+    //
+    // That matters here more than it usually would. A disabled keeper never attests, so the operator
+    // is judged offline on-chain — and per the graduated-penalty design that is no longer only a lost
+    // slot. It is the same shape as the three revisions this file already killed, arriving through a
+    // different door: the config path causes the harm the setting exists to prevent, quietly. v1's
+    // damage was never that it stopped; it was that nobody found out until the timer was gone.
+    //
+    // Both `return`s predate this change. They are fixed here because this is the change that went
+    // looking for this class in this file, and it had stopped one branch short.
     if (!/^0x[0-9a-fA-F]{40}$/.test(this.registryAddress)) {
-      this.logger.warn(
-        "AUDIT_ATTEST_ENABLED but AUDIT_LIVENESS_REGISTRY_ADDRESS is missing/invalid — attest keeper DISABLED"
-      );
+      const msg =
+        "AUDIT_ATTEST_ENABLED but AUDIT_LIVENESS_REGISTRY_ADDRESS is missing/invalid — attest keeper " +
+        "DISABLED. This node will never attest and will be judged OFFLINE on-chain.";
+      this.logger.error(msg);
+      this.opsAlert?.alert("critical", `🛑 DVT liveness attest keeper disabled. ${msg}`);
       return;
     }
     if (!this.blockchain.getWalletAddress()) {
-      this.logger.warn(
-        "AUDIT_ATTEST_ENABLED but no operator wallet (ETH_PRIVATE_KEY) — attest keeper DISABLED"
-      );
+      const msg =
+        "AUDIT_ATTEST_ENABLED but no operator wallet (ETH_PRIVATE_KEY) — attest keeper DISABLED. " +
+        "This node will never attest and will be judged OFFLINE on-chain.";
+      this.logger.error(msg);
+      this.opsAlert?.alert("critical", `🛑 DVT liveness attest keeper disabled. ${msg}`);
       return;
     }
     // CLAMP a malformed cadence; do NOT disable on it.
@@ -341,6 +360,11 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
         // for liveness and a slightly weaker anti-grief bound — the trade I want, but not the one I
         // originally described. Exact would be the receipt's block, and even that is only
         // 1-confirmation deep, so a reorg can still strand it.
+        //
+        // The weakening is bounded and small: it is exactly `L - head` blocks, the gap between
+        // reading the head and the attest landing — normally 1-3 — against a budget of
+        // `windowBlocks / 3`, which is 100 blocks on the 300-block Sepolia window. A few percent, in
+        // the direction that keeps the node out of jail.
         if (confirmed) {
           this.confirmedAtBlock = head;
         } else {

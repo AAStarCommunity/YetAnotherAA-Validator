@@ -531,3 +531,59 @@ describe("LivenessKeeperService — the watchdog scheduler itself", () => {
     expect((bc.getLivenessWindow as any).mock.calls.length).toBe(after);
   });
 });
+
+/**
+ * B1 from the #288 review: the two branches that DISABLE the keeper were the two with the weakest
+ * signal, while the branch that keeps it alive raised a critical alert — the signal strength was
+ * inverted against the consequence. Stopping is right in both (a missing wallet has no safe
+ * substitute; an address cannot be clamped); stopping SILENTLY is not, because a disabled keeper
+ * never attests and the node is judged offline on-chain.
+ */
+describe("LivenessKeeperService — a disabled keeper must be LOUD", () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it.each([
+    ["an invalid registry address", { auditLivenessRegistryAddress: "not-an-address" }, chain()],
+    [
+      "no operator wallet",
+      { auditLivenessRegistryAddress: REGISTRY },
+      chain({ getWalletAddress: () => null }),
+    ],
+  ])("alerts CRITICAL when disabled for %s", (_label, over, bc) => {
+    const alert = jest.fn();
+    const k = new LivenessKeeperService(
+      bc,
+      cfg({ auditAttestEnabled: true, auditAttestIntervalMs: 600_000, ...over }),
+      { alert } as any
+    );
+    k.onApplicationBootstrap();
+    expect((k as any).timer).toBeNull(); // stopping is still correct here
+    expect(alert).toHaveBeenCalledWith("critical", expect.stringContaining("judged OFFLINE"));
+  });
+
+  /**
+   * CONTROL, specified by the reviewer. The malformed-interval branch must keep behaving the OTHER
+   * way — exactly one critical alert AND the keeper still running. If someone "fixes" the address
+   * branch by clamping it too, this control goes red, and clamping an address is the wrong direction.
+   */
+  it("control: a malformed INTERVAL still clamps, still runs, still alerts exactly once", () => {
+    const bc = chain();
+    const alert = jest.fn();
+    const k = new LivenessKeeperService(
+      bc,
+      cfg({
+        auditAttestEnabled: true,
+        auditLivenessRegistryAddress: REGISTRY,
+        auditAttestIntervalMs: NaN,
+      }),
+      { alert } as any
+    );
+    k.onApplicationBootstrap();
+    expect((k as any).timer).not.toBeNull();
+    expect((k as any).intervalMs).toBe(600_000);
+    const criticals = (alert as any).mock.calls.filter((c: any[]) => c[0] === "critical");
+    expect(criticals).toHaveLength(1);
+    expect(criticals[0][1]).toContain("misconfigured");
+    k.onApplicationShutdown();
+  });
+});
