@@ -178,6 +178,10 @@ describe("LivenessKeeperService — CC-29 watchdog", () => {
     // head 1000, lastLive 800 → 200 blocks spent of a 100-block budget (window 300 / 3).
     const bc = chain({ getLastLive: jest.fn(async () => 800n) });
     const k = await boot(bc, 21_600_000, undefined); // nominal cadence 6h
+    // boot arms the watchdog at 0ms, so a cycle has already run and recorded confirmedAtBlock=1000.
+    // Advance the head so the anti-grief bound is satisfied — that is the real sequence, and testing
+    // it against a frozen head would only prove the suppression, not the trigger.
+    bc.getBlockNumber = jest.fn(async () => 1200);
     (bc.attestLiveness as any).mockClear();
     await (k as any).watchdogCycle();
     expect(bc.attestLiveness).toHaveBeenCalledTimes(1);
@@ -268,5 +272,87 @@ describe("LivenessKeeperService — CC-29 watchdog", () => {
     await (k as any).watchdogCycle();
     expect(bc.getLivenessWindow).not.toHaveBeenCalled();
     expect((k as any).watchdog).toBeNull();
+  });
+});
+
+/**
+ * Round-2 review findings. Each of these is a defect that shipped in a previous commit of this
+ * feature and was found by adversarial review, not by me.
+ */
+describe("LivenessKeeperService — watchdog hardening", () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it("REARMS even when the cycle body never settles (a hung RPC must not kill the loop)", async () => {
+    // The first version armed the next timer only in `finally`, so one unsettled promise left
+    // watchdogInFlight true with no timer pending — the safety loop died silently.
+    const bc = chain({ getBlockNumber: jest.fn(() => new Promise(() => {})) });
+    const k = await boot(bc, 600_000);
+    const before = (k as any).watchdog;
+    void (k as any).watchdogCycle();
+    await new Promise(r => setImmediate(r));
+    expect((k as any).watchdog).not.toBeNull();
+    expect((k as any).watchdog).not.toBe(before); // a NEW timer was armed before the await
+    k.onApplicationShutdown();
+  });
+
+  it("ignores a window outside the registry's [100, 10_000_000] bounds", async () => {
+    // `> 0` was not enough: a tiny positive window made every cycle pay for an attest.
+    const bc = chain({
+      getLivenessWindow: jest.fn(async () => 3n),
+      getLastLive: jest.fn(async () => 1n),
+    });
+    const k = await boot(bc, 600_000);
+    (bc.attestLiveness as any).mockClear();
+    await (k as any).watchdogCycle();
+    expect(bc.attestLiveness).not.toHaveBeenCalled();
+    k.onApplicationShutdown();
+  });
+
+  it("rejects an incoherent sample where lastLive is ahead of the head", async () => {
+    const bc = chain({ getLastLive: jest.fn(async () => 5000n) });
+    const k = await boot(bc, 600_000);
+    (bc.attestLiveness as any).mockClear();
+    await (k as any).watchdogCycle();
+    expect(bc.attestLiveness).not.toHaveBeenCalled();
+    k.onApplicationShutdown();
+  });
+
+  it("does not pay for a repeat attest when lastLive stays stale (gas-grief bound)", async () => {
+    // A stale or hostile lastLive used to make EVERY cycle conclude the budget was spent.
+    const bc = chain({ getLastLive: jest.fn(async () => 800n) }); // 200 spent of a 100 budget
+    const k = await boot(bc, 600_000);
+    (bc.attestLiveness as any).mockClear();
+    await (k as any).watchdogCycle(); // first: allowed, records confirmedAtBlock = 1000
+    await (k as any).watchdogCycle(); // second: head has not advanced — suppressed
+    await (k as any).watchdogCycle();
+    expect(bc.attestLiveness).toHaveBeenCalledTimes(1);
+    k.onApplicationShutdown();
+  });
+
+  it("alerts CRITICAL when the chain's block rate makes the window unserveable at all", async () => {
+    // 100-block window on a 0.2s chain = 20s total, ~6.6s budget; one attest needs longer than that.
+    // No cadence can fix it, so the keeper must say so rather than report a healthy cadence.
+    const bc = chain({
+      getLivenessWindow: jest.fn(async () => 100n),
+      getBlockTimestamp: jest.fn(async (n: number) => 1_700_000_000 + Math.floor(n / 5)),
+    });
+    const alerts = { alert: jest.fn() };
+    const k = await boot(bc, 600_000, alerts);
+    await (k as any).watchdogCycle();
+    const call = (alerts.alert as any).mock.calls.find((c: any[]) => c[1].includes("infeasible"));
+    expect(call).toBeDefined();
+    expect(call[0]).toBe("critical");
+    k.onApplicationShutdown();
+  });
+
+  it("pins the sample: window and lastLive are read AT the observed head", async () => {
+    const bc = chain();
+    const k = await boot(bc, 600_000);
+    (bc.getLivenessWindow as any).mockClear();
+    (bc.getLastLive as any).mockClear();
+    await (k as any).watchdogCycle();
+    expect((bc.getLivenessWindow as any).mock.calls[0][1]).toBe(1000);
+    expect((bc.getLastLive as any).mock.calls[0][2]).toBe(1000);
+    k.onApplicationShutdown();
   });
 });

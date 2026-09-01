@@ -56,6 +56,13 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
   private static readonly WATCHDOG_MIN_MS = 5_000;
   private static readonly WATCHDOG_MAX_MS = 60_000;
   private static readonly WATCHDOG_FALLBACK_MS = 30_000;
+  /** Hard deadline on every watchdog RPC. Without it an unsettled promise freezes the safety loop. */
+  private static readonly RPC_TIMEOUT_MS = 15_000;
+  /** `LivenessRegistry.MIN_LIVENESS_WINDOW` / `MAX_LIVENESS_WINDOW` — a reading outside is not real. */
+  private static readonly MIN_ONCHAIN_WINDOW = 100n;
+  private static readonly MAX_ONCHAIN_WINDOW = 10_000_000n;
+  /** Worst-case wall-clock for one attest to be included, used for the feasibility check. */
+  private static readonly INCLUSION_ALLOWANCE_MS = 60_000;
 
   private readonly logger = new Logger(LivenessKeeperService.name);
   private readonly enabled: boolean;
@@ -73,6 +80,13 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
   private watchdogInFlight = false;
   /** Latched so the "cadence too slow" alert fires once per transition, not every cycle. */
   private cadenceUnsafe = false;
+  /** Latched: this chain's block rate vs the on-chain window cannot be served safely at all. */
+  private infeasibleWarned = false;
+  /**
+   * Head at our last LOCALLY CONFIRMED attest. Anti-grief: a stale or adversarial `lastLive` would
+   * otherwise make every cycle conclude the budget is spent and pay for another transaction for ever.
+   */
+  private confirmedAtBlock = 0;
   /** Last successful block-time estimate (ms). Advisory: tunes the watchdog period only. */
   private lastBlockTimeMs = 0;
 
@@ -134,7 +148,7 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
     void this.tick();
     this.timer = setInterval(() => void this.tick(), this.intervalMs);
     // Independent of the attest interval ON PURPOSE: a 6h cadence must not mean a 6h blind spot.
-    this.armWatchdog(LivenessKeeperService.WATCHDOG_FALLBACK_MS);
+    this.armWatchdog(0); // immediately: a 100-block window on a fast chain can expire inside 30s
   }
 
   onApplicationShutdown(): void {
@@ -204,40 +218,98 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
     this.watchdog = setTimeout(() => void this.watchdogCycle(), delayMs);
   }
 
+  /** Every watchdog RPC carries a deadline — an unsettled promise must never freeze the safety loop. */
+  private withDeadline<T>(p: Promise<T>, what: string): Promise<T> {
+    return Promise.race([
+      p,
+      new Promise<T>((_, rej) =>
+        setTimeout(
+          () => rej(new Error(`${what} exceeded ${LivenessKeeperService.RPC_TIMEOUT_MS}ms`)),
+          LivenessKeeperService.RPC_TIMEOUT_MS
+        )
+      ),
+    ]);
+  }
+
   private async watchdogCycle(): Promise<void> {
-    if (this.stopping || this.watchdogInFlight) return;
+    if (this.stopping) return;
+    // A cycle already running is not a reason to drop the loop — rearm and come back.
+    if (this.watchdogInFlight) {
+      this.armWatchdog(LivenessKeeperService.WATCHDOG_FALLBACK_MS);
+      return;
+    }
     this.watchdogInFlight = true;
+    // Pre-arm BEFORE any await. The previous version armed only in `finally`, so a single RPC that
+    // never settled left watchdogInFlight true with no timer pending — the safety loop died silently
+    // and the nominal cadence (up to 6h) became the only protection. Deadlines below make the body
+    // always settle; this pre-arm is the second line of defence.
+    this.armWatchdog(LivenessKeeperService.WATCHDOG_FALLBACK_MS);
+
     let next = LivenessKeeperService.WATCHDOG_FALLBACK_MS;
     try {
       const op = this.blockchain.getWalletAddress();
       if (!op) return;
-      const [windowBlocks, head, lastLive] = await Promise.all([
-        this.blockchain.getLivenessWindow(this.registryAddress),
-        this.blockchain.getBlockNumber(),
-        this.blockchain.getLastLive(this.registryAddress, op),
+
+      // PIN the sample. Read the head first, then both registry values AT that head, so the three
+      // numbers describe one block. Reading them concurrently at implicit `latest` allowed a stale
+      // `lastLive` + fresh head (a paid attest for nothing) or a fresh `lastLive` + stale head
+      // (negative `spent`, silently read as "inside budget").
+      const head = await this.withDeadline(this.blockchain.getBlockNumber(), "getBlockNumber");
+      if (this.stopping) return;
+      const [windowBlocks, lastLive] = await Promise.all([
+        this.withDeadline(
+          this.blockchain.getLivenessWindow(this.registryAddress, head),
+          "getLivenessWindow"
+        ),
+        this.withDeadline(
+          this.blockchain.getLastLive(this.registryAddress, op, head),
+          "getLastLive"
+        ),
       ]);
       if (this.stopping) return;
-      if (windowBlocks <= 0n) return; // implausible — leave the nominal cadence alone
+
+      // Validate against the CONTRACT's own bounds, not just `> 0`. An artificially small window was
+      // otherwise enough to make every cycle pay for an attest.
+      if (
+        windowBlocks < LivenessKeeperService.MIN_ONCHAIN_WINDOW ||
+        windowBlocks > LivenessKeeperService.MAX_ONCHAIN_WINDOW
+      ) {
+        this.logger.warn(
+          `livenessWindow ${windowBlocks} is outside the registry's [100, 10000000] — ignoring this sample`
+        );
+        return;
+      }
+      if (lastLive > BigInt(head)) {
+        this.logger.warn(`lastLive ${lastLive} > head ${head} — incoherent sample, ignoring`);
+        return;
+      }
 
       const budgetBlocks = windowBlocks / BigInt(LivenessKeeperService.WINDOW_SAFETY_DIVISOR);
       // lastLive == 0 means never attested: on-chain that is already offline, so attest at once.
       const spent = lastLive === 0n ? budgetBlocks + 1n : BigInt(head) - lastLive;
-      if (spent > budgetBlocks) {
+
+      // Anti-grief: only act once the chain has actually moved past our own last confirmed attest by
+      // the budget. A stale or hostile `lastLive` can no longer drive an unbounded stream of paid
+      // transactions, because this bound comes from a block WE saw our attest confirmed at.
+      const progressed = BigInt(head) - BigInt(this.confirmedAtBlock) > budgetBlocks;
+      if (spent > budgetBlocks && (this.confirmedAtBlock === 0 || progressed)) {
         this.logger.warn(
           `liveness budget spent (${spent}/${budgetBlocks} blocks of a ${windowBlocks}-block window) ` +
             `— attesting now, ahead of the ${this.intervalMs}ms nominal cadence`
         );
-        await this.tick();
+        await this.withDeadline(this.tick(), "watchdog attest");
+        if (this.stopping) return;
+        this.confirmedAtBlock = head;
+      } else if (spent > budgetBlocks) {
+        this.logger.warn(
+          `budget reads as spent (${spent}/${budgetBlocks}) but the head has not advanced past our ` +
+            `last confirmed attest at ${this.confirmedAtBlock} — suppressing a repeat attest (stale read?)`
+        );
       }
 
-      // Advisory only: warn if the CONFIGURED cadence cannot meet the budget on its own. The watchdog
-      // above already keeps the node live either way, so this never changes behaviour — it tells the
-      // operator their setting is wrong instead of silently carrying them.
       await this.warnIfCadenceTooSlow(windowBlocks);
       next = this.watchdogPeriodMs(windowBlocks);
     } catch (e: any) {
-      // Unknown is not unsafe, and it is certainly not a reason to stop attesting. Keep the nominal
-      // cadence, retry soon (fallback period, NOT the attest interval), and say so.
       this.logger.warn(
         `liveness watchdog cycle failed (${e?.shortMessage ?? e?.message ?? String(e)}) — ` +
           `nominal cadence continues, retrying in ${LivenessKeeperService.WATCHDOG_FALLBACK_MS}ms`
@@ -264,9 +336,11 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
    * rather than every cycle. NEVER stops the keeper — see the class note on the corrected direction.
    */
   private async warnIfCadenceTooSlow(windowBlocks: bigint): Promise<void> {
+    if (this.stopping) return;
     let blockTimeMs: number;
     try {
-      blockTimeMs = await this.measureBlockTimeMs();
+      blockTimeMs = await this.withDeadline(this.measureBlockTimeMs(), "measureBlockTime");
+      if (this.stopping) return;
     } catch {
       return; // unverified; the watchdog is the thing keeping us live, not this warning
     }
@@ -275,6 +349,32 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
 
     const windowMs = Number(windowBlocks) * blockTimeMs;
     const maxSafeMs = Math.floor(windowMs / LivenessKeeperService.WINDOW_SAFETY_DIVISOR);
+
+    // FEASIBILITY, checked before the cadence verdict. On a fast chain the whole window can be
+    // shorter than one attest takes to land: the registry floor is 100 blocks, so at ~0.2s/block the
+    // window is ~20s and the budget ~6.6s, while the watchdog cannot poll faster than 5s and
+    // inclusion needs longer still. No cadence — and no watchdog — can serve that combination. Say
+    // so loudly instead of reporting a green cadence the node cannot actually meet.
+    const needMs =
+      LivenessKeeperService.WATCHDOG_MIN_MS + LivenessKeeperService.INCLUSION_ALLOWANCE_MS;
+    if (maxSafeMs < needMs) {
+      if (!this.infeasibleWarned) {
+        const msg =
+          `this chain and window CANNOT be served safely: livenessWindow ${windowBlocks} blocks at ` +
+          `~${Math.round(blockTimeMs)}ms/block leaves a ${maxSafeMs}ms budget, but one attest needs ` +
+          `~${needMs}ms (${LivenessKeeperService.WATCHDOG_MIN_MS}ms minimum poll + ` +
+          `${LivenessKeeperService.INCLUSION_ALLOWANCE_MS}ms inclusion allowance). The node will be ` +
+          `intermittently offline no matter how the cadence is set — the window must be raised ` +
+          `on-chain, or this chain is out of scope for the keeper.`;
+        this.logger.error(msg);
+        this.opsAlert?.alert("critical", `🛑 DVT liveness window infeasible on this chain. ${msg}`);
+        this.infeasibleWarned = true;
+      }
+      this.cadenceUnsafe = true;
+      return;
+    }
+    this.infeasibleWarned = false;
+
     const unsafe = this.intervalMs > maxSafeMs;
 
     if (unsafe && !this.cadenceUnsafe) {
