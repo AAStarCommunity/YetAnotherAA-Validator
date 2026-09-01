@@ -83,10 +83,19 @@ describe("the aPNTs divergence is PINNED, not assumed away", () => {
    * the seller — it could be an address nobody guessed — so it narrows the question rather than
    * settling it.
    *
-   * (I tried to find the seller from `Approval(_, buyHelper)` logs and could not: this RPC rejects
-   * `eth_getLogs` outright with HTTP 400 / -32600, which a positive control caught before it became
-   * a reported "no approvals exist". Guessing the buyHelper's getters is equally uninformative —
-   * every wrong selector reverts identically to a getter that does not exist.)
+   * One further reading, verified here rather than relayed. `cast storage` on the buyHelper works and
+   * proves itself live by returning non-zero: slot 0 = `0xb5600060…`, the deployer EOA — almost
+   * certainly `owner`, NOT necessarily "the seller". Its allowance to the buyHelper is 0 on both
+   * tokens, so **the address actually configured inside the buyHelper has approved neither.**
+   *
+   * (I first tried to find the seller from `Approval(_, buyHelper)` logs and could not. The root
+   * cause, diagnosed by repo:superpaymaster: this RPC's free tier caps `eth_getLogs` at a TEN-block
+   * range and answers HTTP 400 / -32600, which `cast` surfaces as no output — so a rejected query
+   * and a clean empty result read identically. Confirmed here: a 10-block window returns without the
+   * error, a 500-block one does not. A positive control caught it before it became a reported "no
+   * approvals exist". The cap also means the workaround cannot scan history, so this route is closed
+   * without a different endpoint. Guessing the buyHelper's getters is uninformative for the same
+   * reason: a wrong selector and a missing function revert identically.)
    *
    * So this test does the honest thing: it FREEZES the current pair. Resolving the split is a
    * deliberate decision by whoever owns the sale, and when they make it this test fails and forces
