@@ -166,57 +166,90 @@ async function main() {
   console.log(`\nsigner     : ${wallet.address}  (permissionless — no owner rights needed)`);
   const tx = await new ethers.Contract(AGGREGATOR, ABI, wallet).applyFraudProofVerifier();
   const rc = await tx.wait();
-  if (rc.status !== 1) die(`tx ${tx.hash} reverted`);
   console.log(`apply tx   : ${tx.hash}  block ${rc.blockNumber}`);
+
+  // WRITE THE ARTIFACT BEFORE ANY ASSERTION.
+  //
+  // The first version wrote it at the very end, after four things that can `die()`: a reverted
+  // receipt, an RPC hiccup on the three reads, the EXPECTED mismatch, and getNetwork(). Since `die()`
+  // is process.exit(1), each of those made the step red AND left no file, so the workflow's
+  // `if: success() && hashFiles(...)` guard never even got a chance.
+  //
+  // The mismatch path is the one that matters: the transaction has ALREADY LANDED. The rotation
+  // happened, on a verifier that is not the one proposed. That is the single most important thing
+  // this run could ever have to say, and the old shape said nothing but "a step failed" — leaving
+  // whoever arrives on 09-04 to reconstruct chain state by hand. Which is the exact situation this
+  // file exists to prevent, one step later. (Review B1 on PR #287.)
+  //
+  // So: read what can be read, record a STATUS, publish always, and only then assert. A red job AND
+  // a published artifact is the right combination — not one or the other.
+  const readback = {
+    task: "CC-115 B3",
+    records: "6 and 7",
+    status: "unknown",
+    appliedAtBlock: rc.blockNumber,
+    applyTxHash: tx.hash,
+    receiptStatus: rc.status,
+    aggregator: AGGREGATOR,
+    expectedVerifier: EXPECTED,
+    appliedAtUtc: new Date().toISOString(),
+  };
+  const out = resolve(HERE, "..", "rotation-readback.json");
+  const flush = () => {
+    writeFileSync(out, JSON.stringify(readback, null, 2) + "\n");
+    console.log(`\nReadback artifact written (${readback.status}): ${out}`);
+  };
+
+  if (rc.status !== 1) {
+    readback.status = "reverted";
+    flush();
+    die(`tx ${tx.hash} reverted`);
+  }
 
   // Read back rather than trusting the receipt: status 1 proves the tx was mined, not that the
   // verifier is now the active one.
   const after = { blockTag: rc.blockNumber };
-  const [nowActive, nowPending, nowReady] = await Promise.all([
-    ro.fraudProofVerifier(after),
-    ro.pendingFraudProofVerifier(after),
-    ro.pendingFraudProofVerifierReadyAt(after),
-  ]);
+  try {
+    const [nowActive, nowPending, nowReady] = await Promise.all([
+      ro.fraudProofVerifier(after),
+      ro.pendingFraudProofVerifier(after),
+      ro.pendingFraudProofVerifierReadyAt(after),
+    ]);
+    readback.fraudProofVerifier = nowActive;
+    readback.pendingFraudProofVerifier = nowPending;
+    readback.pendingFraudProofVerifierReadyAt = nowReady.toString();
+  } catch (e) {
+    readback.status = "readback-failed";
+    readback.error = describe(e);
+    flush();
+    die(`post-apply readback failed: ${describe(e)}`);
+  }
+  try {
+    readback.chainId = Number((await provider.getNetwork()).chainId);
+  } catch {
+    // Non-fatal: chainId is context, not evidence. Everything above is already recorded.
+  }
+
   console.log(`\nFinal readback:`);
   console.log(
-    `  fraudProofVerifier              : ${nowActive} ${nowActive.toLowerCase() === EXPECTED.toLowerCase() ? "✓" : "✗ UNEXPECTED"}`
+    `  fraudProofVerifier              : ${readback.fraudProofVerifier} ${readback.fraudProofVerifier.toLowerCase() === EXPECTED.toLowerCase() ? "✓" : "✗ UNEXPECTED"}`
   );
   console.log(
-    `  pendingFraudProofVerifier       : ${nowPending} ${nowPending === ethers.ZeroAddress ? "✓ cleared" : "✗"}`
+    `  pendingFraudProofVerifier       : ${readback.pendingFraudProofVerifier} ${readback.pendingFraudProofVerifier === ethers.ZeroAddress ? "✓ cleared" : "✗"}`
   );
   console.log(
-    `  pendingFraudProofVerifierReadyAt: ${nowReady} ${nowReady === 0n ? "✓ cleared" : "✗"}`
+    `  pendingFraudProofVerifierReadyAt: ${readback.pendingFraudProofVerifierReadyAt} ${readback.pendingFraudProofVerifierReadyAt === "0" ? "✓ cleared" : "✗"}`
   );
-  if (nowActive.toLowerCase() !== EXPECTED.toLowerCase())
-    die("the active verifier is not the one this rotation proposed");
-  console.log(`\nRecords 6 and 7 of docs/evidence/cc115-b3-arming-sepolia.md are now available.`);
 
-  // Emit the readback as a FILE, not just as log output.
-  //
-  // The apply itself was automated twice over (launchd hourly + this workflow daily), but the thing
-  // downstream actually waits on -- CC-115 records 6/7 going back to @repo:dsr so the B3 manifest can
-  // freeze -- was still a step someone had to remember to do. An audit on 2026-09-02 found it as the
-  // single outstanding DVT obligation to the paper effort. Automating the action while leaving the
-  // report-back manual is the same shape as a monitor whose trigger never fires: the capability is
-  // there and the outcome still does not happen.
-  //
-  // So the run now leaves behind a machine-readable artifact the workflow turns into a GitHub issue.
-  // Nobody has to be present on the day, and nobody has to remember what the four values were.
-  const readback = {
-    task: "CC-115 B3",
-    records: "6 and 7",
-    chainId: Number((await provider.getNetwork()).chainId),
-    appliedAtBlock: rc.blockNumber,
-    applyTxHash: tx.hash,
-    aggregator: AGGREGATOR,
-    fraudProofVerifier: nowActive,
-    pendingFraudProofVerifier: nowPending,
-    pendingFraudProofVerifierReadyAt: nowReady.toString(),
-    appliedAtUtc: new Date().toISOString(),
-  };
-  const out = resolve(HERE, "..", "rotation-readback.json");
-  writeFileSync(out, JSON.stringify(readback, null, 2) + "\n");
-  console.log(`\nReadback artifact written: ${out}`);
+  if (readback.fraudProofVerifier.toLowerCase() !== EXPECTED.toLowerCase()) {
+    readback.status = "mismatch";
+    flush();
+    die("the active verifier is not the one this rotation proposed");
+  }
+
+  readback.status = "ok";
+  flush();
+  console.log(`\nRecords 6 and 7 of docs/evidence/cc115-b3-arming-sepolia.md are now available.`);
 }
 
 // A non-Error throw (a bare string, a rejected object) has neither .stack nor .message, so

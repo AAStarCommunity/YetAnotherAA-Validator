@@ -102,36 +102,55 @@ jobs:
           fi
           node deploy/apply-verifier-rotation.mjs --broadcast
 
-      # Only fires on the run that actually applies. Later runs report "already applied" and write no
-      # artifact, so this does not reopen an issue every day.
+      # ALWAYS, not on success. The run that most needs an artifact is the one that failed AFTER the
+      # transaction landed — a mismatch means the rotation happened onto a verifier nobody proposed,
+      # and the old `success()` guard published nothing in exactly that case. A red job AND a
+      # published artifact is the right combination. Later runs report "already applied" and write no
+      # artifact, so this still does not reopen an issue every day. (Review B1 on PR #287.)
       - name: Publish the readback
-        if: success() && hashFiles('rotation-readback.json') != ''
+        if: always() && hashFiles('rotation-readback.json') != ''
         uses: actions/github-script@v7
         with:
           script: |
             const rb = JSON.parse(require('fs').readFileSync('rotation-readback.json', 'utf8'));
+            const ok = rb.status === 'ok';
+            const head = ok
+              ? '**CC-115 B3 — records 6 and 7 are now available.**'
+              : '🔴 **CC-115 B3 — the apply transaction LANDED but the run did not end clean (status: `'
+                + rb.status + '`).** Read the table before acting; do not assume the rotation is good.';
             const body = [
-              '**CC-115 B3 — records 6 and 7 are now available.** Posted automatically by the run that',
-              'applied the rotation, so the readback does not depend on anyone being present on the day.',
+              head,
+              'Posted automatically by the run that applied the rotation, so the readback does not',
+              'depend on anyone being present on the day — and it is posted whether or not the run',
+              'succeeded, because a landed transaction with a bad outcome is the case most worth',
+              'reporting.',
               '',
               '| field | value |',
               '| --- | --- |',
-              '| chainId | `' + rb.chainId + '` |',
+              '| status | `' + rb.status + '` |',
+              '| chainId | `' + (rb.chainId ?? 'unread') + '` |',
               '| aggregator | `' + rb.aggregator + '` |',
               '| apply tx | `' + rb.applyTxHash + '` |',
               '| applied at block | `' + rb.appliedAtBlock + '` |',
-              '| `fraudProofVerifier` | `' + rb.fraudProofVerifier + '` |',
-              '| `pendingFraudProofVerifier` | `' + rb.pendingFraudProofVerifier + '` (cleared) |',
-              '| `pendingFraudProofVerifierReadyAt` | `' + rb.pendingFraudProofVerifierReadyAt + '` (cleared) |',
+              '| expected verifier | `' + rb.expectedVerifier + '` |',
+              '| `fraudProofVerifier` | `' + (rb.fraudProofVerifier ?? 'unread') + '`' + (ok ? '' : ' ⚠️') + ' |',
+              '| `pendingFraudProofVerifier` | `' + (rb.pendingFraudProofVerifier ?? 'unread') + '` |',
+              '| `pendingFraudProofVerifierReadyAt` | `' + (rb.pendingFraudProofVerifierReadyAt ?? 'unread') + '` |',
               '| applied at (UTC) | `' + rb.appliedAtUtc + '` |',
               '',
-              '**Next action:** paste the table into CC-115 for `@repo:dsr`, who is blocked on it to',
-              'freeze the B3 manifest; SP is separately waiting for a non-zero `fraudProofVerifier`',
-              'before running its 09-04 step.',
+              '',
+              ok
+                ? '**Next action:** paste the table into CC-115 for `@repo:dsr`, who is blocked on it to '
+                  + 'freeze the B3 manifest; SP is separately waiting for a non-zero `fraudProofVerifier` '
+                  + 'before running its 09-04 step.'
+                : '**Next action:** do NOT report this as a clean arming. Investigate first — the '
+                  + 'transaction is on chain either way, so the aggregator state above is what it is.',
             ].join('\n');
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: 'CC-115 B3 readback — verifier rotation applied',
+              title: ok
+                ? 'CC-115 B3 readback — verifier rotation applied'
+                : 'CC-115 B3 readback — rotation applied with status: ' + rb.status,
               body,
             });
