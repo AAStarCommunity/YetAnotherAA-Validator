@@ -12,8 +12,15 @@
 
 ## 1. Why the gate exists: at N=3 one slash stops the whole network
 
-Verified on-chain 2026-09-01 (`AAStarCommitteeValidator`
-`0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9`):
+Verified on-chain 2026-09-01 (Sepolia, chainId 11155111,
+`AAStarCommitteeValidator` `0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9`; getters
+`minStake()`, `minCommittee()`, `requiredQuorum()`,
+`activeNodeIdsSorted().length`, and `Registry.getEffectiveStake(op, ROLE_DVT)`
+per operator).
+
+> ⚠️ **Deployment values drift and this record pins no block number.** Re-read
+> them with the recipe in §5 before acting on them; treat the numbers below as
+> the state on that date, not as a standing fact.
 
 ```
 minStake        30e18        every operator's effectiveStake   30e18   ← margin 0
@@ -162,15 +169,20 @@ a policy promise:
 does not exist, and the fourth was deliberately closed. The origination path for
 a slash is therefore empty today even if both flags were flipped.**
 
-> ⚠️ **Do not read that as "this architecture has nothing worth slashing."**
+> ⚠️ **Do not read that as "this architecture has nothing worth punishing."**
 > Jason ruled the opposite on 2026-09-01:
 > _"存活时间就是最典型的可罚行为…但可以设定不同的时限、slash 不同的额度,这一定要有"_
-> — liveness **is** the archetypal slashable offence, tiered by outage duration,
-> with jail as the execution and self-heal path. Rule ② is therefore an **open
-> design item**, not a closed question. The empty origination path above is a
-> statement about today's capability (no CC-29 registry, no tier table, no stake
-> buffer), not about intent. See
-> [`AUDIT_SLASH_MODEL.md` §3.2](./AUDIT_SLASH_MODEL.md).
+> — liveness **is** the archetypal punishable behaviour, tiered by outage
+> duration, with jail as the execution and self-heal path. Rule ② is therefore
+> an **open design item**, not a closed question. The empty origination path
+> above is a statement about today's capability, not about intent.
+>
+> Note the shape, though: the adopted design settles that penalty **by
+> computation, with no quorum vote** — so it would not travel this origination
+> path at all. It is a **leak**, not a slash, and
+> [`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md)
+> is authoritative on it. What blocks it today is the settlement state described
+> in its §5, not the flags in this table.
 >
 > The same correction applies to the framing of **stake itself**. Stake is an
 > anti-sybil admission cost — Jason: _"废话,这还用说吗?肯定是反女巫有成本的"_ —
@@ -299,9 +311,9 @@ try IGTokenStakingSlash(address(staking)).slashByDVT(
 
 The penalty argument **is** the whole remaining lock. So `lock.amount == 0` is
 reached **by construction on every successful guardian slash**, which fires
-`GTokenStaking._removeUserRole` (`GTokenStaking.sol:523-525`) — the guardian
-does not fall below `minStake`, it **loses ROLE_DVT outright, in the transaction
-that punishes it**. There is no partial-guardian-slash case to reason about; the
+`GTokenStaking._removeUserRole` (`GTokenStaking.sol:526`) — the guardian does
+not fall below `minStake`, it **loses ROLE_DVT outright, in the transaction that
+punishes it**. There is no partial-guardian-slash case to reason about; the
 contract cannot express one.
 
 ### A second dead configuration: the tier table is already declared
@@ -344,15 +356,15 @@ actually lower what `getEffectiveStake` returns are:
 **The gate recommendation is unchanged, for two reasons that survive the
 correction.** First, zero margin means _any_ of paths 1–4 halts the stack at N=3
 — the fragility is a property of the margin, not of which path exercises it.
-Second, arming rule ② would **create a new burn path**, and which asset it burns
-is a design decision nobody has made yet; if it burns GToken (the quantity the
-committee gate reads) it walks straight into the zero margin, and if it burns
-aPNTs under the 30% cap it does not touch committee eligibility at all — in
-which case an offline node keeps its committee seat and the penalty does not
-achieve what §3.2 says it is for.
+Second, arming rule ② would **create a new burn path**. Jason decided on
+2026-09-02 that it burns **GToken** — the very quantity the committee gate reads
+— so it lands squarely on the zero margin rather than beside it. (The rejected
+alternative is instructive: burning capped aPNTs would not touch committee
+eligibility at all, leaving an offline node its seat and the penalty toothless.)
 
-**That question — which asset does an offline slash burn — is now the first
-thing rule ②'s design has to answer.**
+**Because GToken was chosen, the margin is the load-bearing part of the design,
+and §7's Plan A becomes a precondition of rule ② rather than a companion to
+it.**
 
 ### Why the guardian counterexample settles how stake is described
 

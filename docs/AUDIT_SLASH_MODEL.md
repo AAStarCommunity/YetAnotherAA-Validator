@@ -37,23 +37,33 @@ The two are independent. Credit/spending limits are a **sign-gate** concern
 > from the active set / quorum denominator**.
 >
 > ⚠️ **Do not over-read that lesson.** It disqualifies **gossip absence** as
-> evidence, not **liveness** as an offence. CC-29's on-chain
-> `isOffline(op) ⇔ block.number > lastLive + window` clears the same evidence
-> bar as any economic rule — objective, attributable, globally verifiable at a
-> pinned block. So SLASH and JAIL are **not alternatives** for liveness: jail is
-> how the penalty is _executed and unwound_, and a duration-tiered stake burn is
-> the penalty itself. See §3.2.
+> evidence, not **liveness** as an offence. CC-29's on-chain `isOffline(op)`
+> (`block.number - lastLive > window`, with never-attested ⇒ `true`) is a far
+> better signal than a heartbeat. So stake loss and JAIL are **not
+> alternatives** for liveness: jail is how the penalty is _executed and
+> unwound_, and a duration-tiered stake burn is the penalty itself.
+>
+> **Terminology:** that burn is a **leak**, not a slash — it is settled by
+> computation, not by a quorum vote, so none of the voted-slash machinery
+> applies.
+> [`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md)
+> is authoritative on this rule; §3.2 below is a summary that defers to it.
+>
+> ⚠️ And do not over-read _this_ correction either: `isOffline` proves only that
+> the operator's key sent a transaction recently. It explicitly does **not**
+> prove the DVT stack is online (`LivenessRegistry.sol:21,28`), so an operator
+> that attests while refusing to co-sign is invisible to it.
 
 ## 3. The four rules — final handling
 
 | #   | Rule              | Handling                                                      | Why                                                                                                                                                                           |
 | --- | ----------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ①   | credit-over-limit | **sign-gate REFUSE** (not slash)                              | an individual over their limit is refused at sign time; slashing an _operator's_ stake for a member's credit is wrong                                                         |
-| ②   | offline           | **tiered stake-slash + jail** — DESIGN ITEM, see §3.2         | liveness is the archetypal punishable behaviour (Jason, 2026-09-01); jail is the execution/recovery path, not a substitute for the penalty. Unbuilt: needs CC-29 + the N gate |
+| ②   | offline           | **tiered LEAK + jail** — DESIGN SKETCH, see §3.2              | liveness is the archetypal punishable behaviour (Jason, 2026-09-01); jail is the execution/recovery path, not a substitute for the penalty. Unbuilt: needs CC-29 + the N gate |
 | ③   | over-issue        | **on-chain credibility score** (not slash, not DVT-disclosed) | `credibilityScore()`/`isOverIssued()` are auto-computed on-chain views; consumers read them directly                                                                          |
 | ④   | proof-forgery     | **not done**                                                  | co-sign re-verification + on-chain aggregate rejection already block forged slashes; residual spam → reputation                                                               |
 
-### ② offline — tiered slash + jail (DESIGN ITEM, not built)
+### ② offline — tiered leak + jail (DESIGN SKETCH, not built, not yet specifiable)
 
 **Corrected 2026-09-01.** This document previously said liveness is "jail
 (fee-stop), **not** stake-slash". That is wrong as a statement of intent. Jason,
@@ -73,7 +83,7 @@ So the intended shape is:
 | execution | jail: fee stopped + excluded from the active set                                   |
 | recovery  | self-healing — attest liveness again and the node re-enters the set                |
 
-Four things are missing before this can be specified, let alone armed:
+Five things are missing before this can be specified, let alone armed:
 
 1. **The evidence source IS deployed — this document previously said it was not,
    and that was wrong.** `LivenessRegistry-1.0.0` is live on Sepolia at
@@ -86,7 +96,7 @@ Four things are missing before this can be specified, let alone armed:
    What is actually missing is smaller and fixable: the address is not in any
    node's env, and **no operator has ever attested** (`lastLive == 0` fleet-wide
    ⇒ `isOffline == true` for everyone). DVT already holds the locked read ABI
-   (`blockchain.service.ts:652-655`) and the attest keeper
+   (`blockchain.service.ts:653-657`) and the attest keeper
    (`liveness-keeper.service.ts`); pointing them at that address is a config
    change, not a build.
 
@@ -107,21 +117,28 @@ Four things are missing before this can be specified, let alone armed:
    `OFFLINE_THRESHOLD_MS = 600_000` (`audit.service.ts:66`) — a gossip
    wall-clock number that deliberately enters the proofHash. It is **not** a
    candidate tier source.
-3. **Which asset an offline slash burns is undecided, and the answer decides
-   whether the penalty works at all.** The two deployed burn paths hit different
-   assets: DVT-originated operator slashing burns SP-held **aPNTs** (capped at
-   30%, `SuperPaymaster.sol:986`), while committee eligibility reads the
-   **GToken** role lock (`Registry.getEffectiveStake` → `getLockedStake`). Burn
-   GToken and you walk into the zero margin measured in
-   [`SLASH_ROLLOUT_GATE.md` §1](./SLASH_ROLLOUT_GATE.md) — every tier collapses
-   to "disqualified". Burn capped aPNTs and the offline node **keeps its
-   committee seat**, so the penalty does not do what this section says it is
-   for. Pick deliberately; see §6 there.
-4. **Half the tier table already exists as dead config.**
-   `IRegistry.RoleConfig.slashBase / slashInc / slashMax` carry live ROLE_DVT
-   values on-chain (`2 / 1 / 10` — "base 2%, +1% each, cap 10%") and are read by
-   **no** code in SP's `contracts/src/`. Reuse it or retire it, but do not leave
-   a configured-looking escalation policy that nothing honours.
+3. **The asset is decided — GToken (Jason, 2026-09-02) — and that is what makes
+   the margin load-bearing.** The two deployed burn paths hit different assets:
+   DVT-originated operator slashing burns SP-held **aPNTs** (capped at 30%,
+   `SuperPaymaster.sol:986`), while committee eligibility reads the **GToken**
+   role lock (`Registry.getEffectiveStake` → `getLockedStake`). Burning GToken
+   is the choice that actually reaches eligibility — and therefore the choice
+   that walks straight into the zero margin measured in
+   [`SLASH_ROLLOUT_GATE.md` §1](./SLASH_ROLLOUT_GATE.md), which is why Plan A
+   (§7 there) is a precondition rather than a companion.
+4. **Half the tier table LOOKS like it exists as dead config — but its units are
+   undefined.** `IRegistry.RoleConfig.slashBase / slashInc / slashMax` carry
+   live ROLE_DVT values on-chain (`2 / 1 / 10`) and are read by **no** code in
+   SP's `contracts/src/`. The interface calls them slash _amount_ / _increment_
+   / _maximum_ — **not** percentages — so reading `2` as "2%" is archaeology,
+   not a citation. Reuse the fields if the units are defined explicitly (basis
+   points), bounds-validated and migrated deliberately; but do not leave a
+   configured-looking escalation policy that nothing honours.
+5. **The settlement state the leak needs does not exist.** `lastLive` is a
+   single overwritten slot, so an operator can erase weeks of downtime with one
+   attestation before settlement; there is no idempotency checkpoint, no episode
+   start, and no stored registration stake. This is the blocking item — see
+   [`design/offline-penalty-escalation.md` §5](./design/offline-penalty-escalation.md).
 
 Until those are settled, "offline cannot slash today" remains a true statement
 about **capability**. It is not a statement about **design intent**, and this
@@ -145,8 +162,14 @@ isOverIssued     = issuedValueUSD > effectiveCapUSD  (or issuanceCap breach; ren
 - Baseline is per-industry, factory-governed (default ~$10k; e.g. foreign-trade
   higher), adjusted via the community multisig — a community can't self-pick a
   high baseline (category is `onlyOwner` factory governance).
-- **Consumers read it directly** on-chain: SuperPaymaster (sponsorship
-  decisions), wallets/dapps (token trust), users, AgentStore. DVT does nothing.
+- **Consumers are INTENDED to read it directly** on-chain: SuperPaymaster
+  (sponsorship decisions), wallets/dapps (token trust), users, AgentStore. DVT
+  does nothing. ⚠️ As of 2026-09-02 **there are no actual consumers yet** — grep
+  finds no call to `credibilityScore()` or `isOverIssued()` anywhere in SP's
+  `contracts/src/` outside the token itself. That is good news for the open
+  question of where the serviceability cutoff lives (CC-118 discussion):
+  unifying it on-chain now costs no migration, because nothing has hard-coded a
+  threshold yet.
 
 > **When may it be turned on?** See
 > [`SLASH_ROLLOUT_GATE.md`](./SLASH_ROLLOUT_GATE.md) — at N=3 one slash halts
@@ -234,7 +257,14 @@ waking a slash never needs new execution contracts, only (sometimes) a new
 - Every rejected/indeterminate read must **fail-safe** (no proposal), never
   fail-open.
 
-### Worked example — offline-duration tiered slash (a FUTURE rule)
+### Worked example — offline-duration tiered penalty (SUPERSEDED, kept as an illustration of the playbook)
+
+> ⚠️ **This worked example predates the 2026-09-02 design and no longer
+> describes the intended rule.** It frames offline as a quorum-voted DVT slash;
+> the adopted shape is a **permissionlessly-settled leak with no quorum at all**
+> ([`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md)).
+> It survives here only to show how the generic playbook is applied — the
+> on-chain-state analysis below happens to remain accurate and understated.
 
 Goal: 1 day offline → 10% slash; 3 days → 30% + permanent-offline until stake
 top-up.
