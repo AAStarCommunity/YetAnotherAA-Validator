@@ -35,15 +35,97 @@ The two are independent. Credit/spending limits are a **sign-gate** concern
 > JAIL at most. `fee` today is a reserved semantic (the infra fee/profit-sharing
 > layer isn't live yet); the concrete teeth of jail right now is **exclusion
 > from the active set / quorum denominator**.
+>
+> ⚠️ **Do not over-read that lesson.** It disqualifies **gossip absence** as
+> evidence, not **liveness** as an offence. CC-29's on-chain
+> `isOffline(op) ⇔ block.number > lastLive + window` clears the same evidence
+> bar as any economic rule — objective, attributable, globally verifiable at a
+> pinned block. So SLASH and JAIL are **not alternatives** for liveness: jail is
+> how the penalty is _executed and unwound_, and a duration-tiered stake burn is
+> the penalty itself. See §3.2.
 
 ## 3. The four rules — final handling
 
-| #   | Rule              | Handling                                                      | Why                                                                                                                   |
-| --- | ----------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| ①   | credit-over-limit | **sign-gate REFUSE** (not slash)                              | an individual over their limit is refused at sign time; slashing an _operator's_ stake for a member's credit is wrong |
-| ②   | offline           | **auto-jail** (SP `LivenessRegistry`) + gossip soft signal    | liveness is an objective on-chain fact (`block.number > lastLive + window`); jail (fee-stop), not stake-slash         |
-| ③   | over-issue        | **on-chain credibility score** (not slash, not DVT-disclosed) | `credibilityScore()`/`isOverIssued()` are auto-computed on-chain views; consumers read them directly                  |
-| ④   | proof-forgery     | **not done**                                                  | co-sign re-verification + on-chain aggregate rejection already block forged slashes; residual spam → reputation       |
+| #   | Rule              | Handling                                                      | Why                                                                                                                                                                           |
+| --- | ----------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ①   | credit-over-limit | **sign-gate REFUSE** (not slash)                              | an individual over their limit is refused at sign time; slashing an _operator's_ stake for a member's credit is wrong                                                         |
+| ②   | offline           | **tiered stake-slash + jail** — DESIGN ITEM, see §3.2         | liveness is the archetypal punishable behaviour (Jason, 2026-09-01); jail is the execution/recovery path, not a substitute for the penalty. Unbuilt: needs CC-29 + the N gate |
+| ③   | over-issue        | **on-chain credibility score** (not slash, not DVT-disclosed) | `credibilityScore()`/`isOverIssued()` are auto-computed on-chain views; consumers read them directly                                                                          |
+| ④   | proof-forgery     | **not done**                                                  | co-sign re-verification + on-chain aggregate rejection already block forged slashes; residual spam → reputation                                                               |
+
+### ② offline — tiered slash + jail (DESIGN ITEM, not built)
+
+**Corrected 2026-09-01.** This document previously said liveness is "jail
+(fee-stop), **not** stake-slash". That is wrong as a statement of intent. Jason,
+asked directly:
+
+> 存活时间就是最典型的可罚行为。如果存活时间低于多少小时,就要 slash
+> —— 这是网络稳定的保障。slash 的方式是先 put in
+> jail,恢复了就上线。**但可以设定不同的时限、slash 不同的额度**,这一定要有,否则都掉线了,网络就宕机了,还提供什么整体service。
+
+So the intended shape is:
+
+| element   | intent                                                                             |
+| --------- | ---------------------------------------------------------------------------------- |
+| offence   | cumulative downtime beyond a threshold, measured on-chain                          |
+| evidence  | CC-29 `LivenessRegistry.isOffline(op)` at a pinned block — objective, attributable |
+| penalty   | **stake burn, amount tiered by outage duration** (longer out ⇒ larger burn)        |
+| execution | jail: fee stopped + excluded from the active set                                   |
+| recovery  | self-healing — attest liveness again and the node re-enters the set                |
+
+Four things are missing before this can be specified, let alone armed:
+
+1. **The evidence source IS deployed — this document previously said it was not,
+   and that was wrong.** `LivenessRegistry-1.0.0` is live on Sepolia at
+   `0x02d841F7905aFb4424DBA71680D27C0F75d36BE7` with `livenessWindow() = 300`.
+   The error came from reading a config default
+   (`AUDIT_LIVENESS_REGISTRY_ADDRESS` defaults to `""`,
+   `src/config/configuration.ts:346`) as evidence about the chain. **An unset
+   client config is not an absent contract.**
+
+   What is actually missing is smaller and fixable: the address is not in any
+   node's env, and **no operator has ever attested** (`lastLive == 0` fleet-wide
+   ⇒ `isOffline == true` for everyone). DVT already holds the locked read ABI
+   (`blockchain.service.ts:652-655`) and the attest keeper
+   (`liveness-keeper.service.ts`); pointing them at that address is a config
+   change, not a build.
+
+   **Unit is BLOCKS**, confirmed at source, not inferred:
+   `_lastLive[msg.sender] = block.number` and
+   `isOffline ⇔ block.number - last > _livenessWindow`
+   (`LivenessRegistry.sol:101,123`). DVT's existing assumption (blocks) is
+   correct. 300 blocks ≈ 60 min on Sepolia.
+
+   Until an operator attests, the only liveness signal DVT actually has is the
+   gossip heartbeat — which §2 correctly forbids as slash evidence.
+
+2. **The tier table does not exist.** "不同的时限、不同的额度" needs concrete
+   (duration → bps-of-stake) rows, and they must be **on-chain governance
+   values**, not a DVT constant: the burn amount enters the slash message every
+   node re-verifies, so a node-local number forks the quorum. Today DVT's only
+   offline threshold is the hard-coded, version-bound
+   `OFFLINE_THRESHOLD_MS = 600_000` (`audit.service.ts:66`) — a gossip
+   wall-clock number that deliberately enters the proofHash. It is **not** a
+   candidate tier source.
+3. **Which asset an offline slash burns is undecided, and the answer decides
+   whether the penalty works at all.** The two deployed burn paths hit different
+   assets: DVT-originated operator slashing burns SP-held **aPNTs** (capped at
+   30%, `SuperPaymaster.sol:986`), while committee eligibility reads the
+   **GToken** role lock (`Registry.getEffectiveStake` → `getLockedStake`). Burn
+   GToken and you walk into the zero margin measured in
+   [`SLASH_ROLLOUT_GATE.md` §1](./SLASH_ROLLOUT_GATE.md) — every tier collapses
+   to "disqualified". Burn capped aPNTs and the offline node **keeps its
+   committee seat**, so the penalty does not do what this section says it is
+   for. Pick deliberately; see §6 there.
+4. **Half the tier table already exists as dead config.**
+   `IRegistry.RoleConfig.slashBase / slashInc / slashMax` carry live ROLE_DVT
+   values on-chain (`2 / 1 / 10` — "base 2%, +1% each, cap 10%") and are read by
+   **no** code in SP's `contracts/src/`. Reuse it or retire it, but do not leave
+   a configured-looking escalation policy that nothing honours.
+
+Until those are settled, "offline cannot slash today" remains a true statement
+about **capability**. It is not a statement about **design intent**, and this
+document should never again be read as saying liveness is not worth punishing.
 
 ### ③ economic credibility — an on-chain view (CC-28, SP-side)
 
@@ -99,7 +181,9 @@ enumerate targets → pin ONE finalized block → RULE predicate (deterministic)
 
 - Objective + attributable + globally-verifiable economic fraud → **SLASH**
   (this playbook).
-- Liveness / availability → **JAIL** (SP LivenessRegistry, not this pipeline).
+- Liveness / availability → **tiered SLASH executed as JAIL** (§3.2) — a design
+  item blocked on CC-29, not a decision that liveness goes unpunished. It does
+  not route through this playbook's origination path today.
 - Informational → **REPUTATION** (on-chain view; DVT doesn't act).
 
 Only build a slash rule for the first case.
