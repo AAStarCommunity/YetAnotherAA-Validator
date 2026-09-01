@@ -130,7 +130,9 @@ Five things are missing before this can be specified, let alone armed:
    **on-chain governance values with versioned activation blocks, or snapshotted
    into the outage episode**. On-chain alone is NOT sufficient: `livenessWindow`
    and any tier value are mutable with immediate effect (the registry stores
-   only the _current_ window, `LivenessRegistry.sol:33`), so if governance moves
+   only the _current_ window in a single slot, `LivenessRegistry.sol:67`, read
+   back by `livenessWindow()` at `:136`; the governance note at `:33` states
+   that a change re-partitions the live set immediately), so if governance moves
    a parameter between the outage and its settlement, **the caller's timing
    selects which parameter set applies** — the very caller-dependence the leak
    exists to avoid. The requirement is not "on-chain", it is **"reconstructible

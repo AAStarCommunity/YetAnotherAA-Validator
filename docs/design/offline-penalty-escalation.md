@@ -230,13 +230,13 @@ immediate effect, and the registry stores only the _current_ window (the window
 lives in a single slot, `LivenessRegistry.sol:67`, read back by
 `livenessWindow()` at `:136`; the governance note at `:33` spells out that a
 change re-partitions the live set immediately. SP's `Registry.configureRole`
-`:453` replaces a whole role config the same way, retaining no history). If a
-parameter moves between the outage and its settlement, **the caller's timing
-decides which parameter set is applied** — the exact caller-dependence a
-computed settlement is supposed to eliminate. Storing the tiers "on-chain" is
-therefore not sufficient; they must be **versioned with activation blocks, or
-snapshotted into the episode when it opens**, so the charge is reconstructible
-for the epoch being charged.
+overwrites a whole role config the same way — `roleConfigs[roleId] = config` at
+`Registry.sol:462`, retaining no history). If a parameter moves between the
+outage and its settlement, **the caller's timing decides which parameter set is
+applied** — the exact caller-dependence a computed settlement is supposed to
+eliminate. Storing the tiers "on-chain" is therefore not sufficient; they must
+be **versioned with activation blocks, or snapshotted into the episode when it
+opens**, so the charge is reconstructible for the epoch being charged.
 
 **Minimum additional state before this is specifiable:**
 `offlineSinceBlock(op)`, `lastSettledPeriod(op)` or a cumulative penalty debt, a
@@ -275,11 +275,11 @@ registration (`:887`) and continued eligibility (`:940`,
 `AAStarCommitteeValidator.sol:464`), and the predicate is `>= minStake`. Nothing
 stops a new operator joining at exactly `minStake` with zero margin. With
 `requireStake = false` registration is owner-only and checks no stake at all
-(`:844`). So "everyone stakes 50" is an **onboarding convention**, enforceable
-only while registration stays owner-gated. Making it a mechanism needs
-**separate entry and ejection thresholds** in the contract — the Beacon Chain
-shape — and the validator is **not upgradeable**, so that lands with the next
-redeploy.
+(`:844-845` — `require(!requireStake)` then `require(msg.sender == owner)`). So
+"everyone stakes 50" is an **onboarding convention**, enforceable only while
+registration stays owner-gated. Making it a mechanism needs **separate entry and
+ejection thresholds** in the contract — the Beacon Chain shape — and the
+validator is **not upgradeable**, so that lands with the next redeploy.
 
 ## 7. The `2 / 1 / 10` numbers are NOT yet a parameter table
 
