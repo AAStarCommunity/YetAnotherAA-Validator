@@ -48,14 +48,25 @@ on:
     # public non-fork repo, manual dispatch green. GitHub simply delays and drops scheduled runs under
     # load, and the top-of-hour slots are where that load is.
     #
-    # FOLLOW-UP MEASUREMENT (2026-08-31), which CONTRADICTS the reading that offsetting is a fix:
-    # with the offset cron below, on the default branch, this workflow went 6h33m / 26 expected ticks
-    # with ZERO scheduled runs. The `on:` block parses to a valid schedule, the API reports
-    # state=active, the repo is neither archived nor disabled, pushes happened throughout, and
-    # workflow_dispatch is green. airaccount-contract measured the same on its own offset cron.
-    # So the offset is kept only because it costs nothing -- it is NOT what makes this work, and
-    # NOTHING here has yet been observed to make it work. This monitor's capability is verified;
-    # its trigger is not. Treat scheduled coverage as UNPROVEN and dispatch manually when it matters.
+    # GitHub Actions `schedule` DOES fire here -- sparsely. An earlier version of this text said it never
+    # does, measured over 6h33m with 26 expected ticks and 0 runs. That window sat ENTIRELY INSIDE a
+    # registration delay: the workflow landed on master at 03:44Z and first fired at 11:10Z, 53 minutes
+    # AFTER the window closed. Corrected measurements, four repos, same org:
+    #
+    #   15-min cron, dvt                  3 scheduled runs TOTAL in 20.9h vs 84 slots = 3.6%; the first of
+    #                                   those came 7.4h after the workflow landed on master
+    #   15-min cron, airaccount-contract  fires, similarly sparse
+    #   daily cron, aastar-sdk            76 runs / 76 distinct days = 100% delivery; median 2.1h late
+    #                                   (p25 1.1, p75 2.9, max 11.7 -- a ~47x spread, not a fixed offset)
+    #   daily cron, SuperPaymaster        fires, 5-8h late
+    #
+    # So: DAILY schedules are delivered (hours late); SUB-HOURLY ones are mostly dropped; and a newly
+    # added workflow does not fire for several hours. None of the documented causes applied -- not
+    # archived or disabled, not a fork, file on the default branch, `gh workflow list` and the API both
+    # reporting state=active.
+    #
+    # The local heartbeat is still the right primary trigger, but for the corrected reason: 3.6% delivery
+    # cannot monitor a 12-minute outage, NOT that nothing ever runs.
     #
     # So "every 15 minutes" is a REQUEST, never a guarantee. That is the second half of the ACCEPTED
     # GAP below: the scheduler can be switched off after 60 days, and even while on it can silently

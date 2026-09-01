@@ -1,17 +1,31 @@
 #!/bin/bash
 # Local heartbeat for the committee stack -- the trigger that actually fires.
 #
-# WHY THIS EXISTS, measured rather than assumed. GitHub Actions `schedule` does not run in this
-# repository. committee-health.yml sat on the default branch for 6h33m on 2026-08-31 with
-# `cron: "7,22,37,52 * * * *"`: 26 expected ticks, ZERO scheduled runs, while the `on:` block parsed
-# to a valid schedule, the API reported state=active, the repo was neither archived nor disabled,
-# pushes happened throughout, and workflow_dispatch on the same workflow was green. The job could
-# run; nothing pressed it. airaccount-contract measured the same on its own offset cron, which
-# retires the earlier reading that offsetting the minutes is the fix.
+# WHY THIS EXISTS, measured -- and corrected after the first measurement was too short.
 #
-# So the monitor's CAPABILITY was verified and its TRIGGER was not, and "monitoring is switched to
-# the v0.33.0 router" was an empty claim for as long as that went unnoticed. This script is the
-# trigger. The Actions workflows stay as redundancy: they cost nothing and might fire.
+# GitHub Actions `schedule` DOES fire here -- sparsely. An earlier version of this text said it never
+# does, measured over 6h33m with 26 expected ticks and 0 runs. That window sat ENTIRELY INSIDE a
+# registration delay: the workflow landed on master at 03:44Z and first fired at 11:10Z, 53 minutes
+# AFTER the window closed. Corrected measurements, four repos, same org:
+#
+#   15-min cron, dvt                  3 scheduled runs TOTAL in 20.9h vs 84 slots = 3.6%; the first of
+#                                   those came 7.4h after the workflow landed on master
+#   15-min cron, airaccount-contract  fires, similarly sparse
+#   daily cron, aastar-sdk            76 runs / 76 distinct days = 100% delivery; median 2.1h late
+#                                   (p25 1.1, p75 2.9, max 11.7 -- a ~47x spread, not a fixed offset)
+#   daily cron, SuperPaymaster        fires, 5-8h late
+#
+# So: DAILY schedules are delivered (hours late); SUB-HOURLY ones are mostly dropped; and a newly
+# added workflow does not fire for several hours. None of the documented causes applied -- not
+# archived or disabled, not a fork, file on the default branch, `gh workflow list` and the API both
+# reporting state=active.
+#
+# The local heartbeat is still the right primary trigger, but for the corrected reason: 3.6% delivery
+# cannot monitor a 12-minute outage, NOT that nothing ever runs.
+#
+# The claim that offsetting the cron minutes is a fix was ALSO mine and also wrong; it was
+# extrapolated from a 53-minute observation and stated to airaccount-contract as fact rather than
+# inference, reaching that repo's committed comments before being checked.
 #
 # TWO PROPERTIES THIS FILE EXISTS TO HAVE, both learned the hard way today:
 #

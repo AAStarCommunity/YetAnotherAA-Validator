@@ -2,37 +2,56 @@
 
 ## Why this exists
 
-GitHub Actions `schedule` **does not run in this repository.** Measured, not
-assumed:
+GitHub Actions `schedule` fires here **sparsely**, not never. Measured across
+four repos in the same org:
 
-| cron                 | repo                | window     | expected ticks | scheduled runs |
-| -------------------- | ------------------- | ---------- | -------------- | -------------- |
-| `*/15 * * * *`       | dvt                 | 53 min     | 4              | **0**          |
-| `7,22,37,52 * * * *` | dvt                 | 6 h 33 min | 26             | **0**          |
-| `7,22,37,52 * * * *` | airaccount-contract | 83 min     | 5              | **0**          |
+| cron         | repo                | outcome                                                                                                           |
+| ------------ | ------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| 15 min       | dvt                 | **3 scheduled runs TOTAL** in 20.9 h vs **84** slots = **3.6%**; the first came **7.4 h** after landing on master |
+| 15 min       | airaccount-contract | fires, similarly sparse                                                                                           |
+| daily `0 6`  | aastar-sdk          | **76 runs / 76 distinct days = 100% delivery**; median **2.1 h** late (p25 1.1, p75 2.9, **max 11.7**)            |
+| daily `37 6` | SuperPaymaster      | fires, 5–8 h late                                                                                                 |
 
-Everything else checked out, so this is not a configuration problem:
+**Daily schedules are delivered (hours late); sub-hourly ones are mostly
+dropped; a newly added workflow does not fire for several hours.** None of the
+documented causes apply — not archived or disabled, not a fork, file on the
+default branch, `gh workflow list` and the API both reporting `state=active`.
 
-- the `on:` block parses to a valid schedule (checked by parsing, not by eye);
-- the API reports `state=active`;
-- the repo is neither archived nor disabled, and `pushed_at` shows pushes
-  throughout the window, so it is not the 60-day inactivity auto-disable;
-- `workflow_dispatch` on the same workflow is green.
+**3.6% delivery cannot monitor a 12-minute outage.** That is the reason this
+heartbeat exists.
 
-The job **can** run. Nothing presses it.
-
-Offsetting the cron minutes is **not** the fix. That claim originated here,
-extrapolated from the 53-minute `*/15` observation and stated to
-airaccount-contract as fact rather than as inference; it then propagated into
-that repo's comments. Both repos have since measured offset crons at zero and
-corrected the text. Recorded because the failure was in how an inference was
-transmitted, not in the measurement.
-
-The consequence worth naming: for as long as this went unnoticed, "monitoring is
-switched to the v0.33.0 router" was an **empty claim**. The workflow existed,
-the checker was correct and tested, and nothing ever ran it. A monitor's
-capability and a monitor's trigger are separate things, and only one of them was
-ever verified.
+> ### An earlier version of this file said `schedule` NEVER fires. That was wrong.
+>
+> It was measured over 6h33m — 26 expected ticks, 0 runs — and that window sat
+> **entirely inside the registration delay**: first fire came at 11:10Z, **53
+> minutes after the window closed**. airaccount-contract had proposed exactly
+> that alternative and set a 4-hour disproof threshold; 4 hours was too short,
+> and crossing it was treated as settling the question. aastar-sdk's
+> counter-evidence — same org, same platform, 76/76 — is what forced the
+> recheck.
+>
+> The claim that offsetting the cron minutes is a fix was also wrong, also mine,
+> and was stated to a sibling repo as fact rather than inference; it reached
+> that repo's committed comments.
+>
+> **And the corollary, which the first version of this very file got wrong:** a
+> handful of observations is not a distribution. That version said aastar-sdk
+> was "consistently ~6 h late". The median is **2.1 h**; only 13% of runs were
+> even 4 h late, and the spread runs 0.25–11.7 h — a ~47× range. "~6" is exactly
+> the mean of the three most recent runs (5.8 / 4.8 / 5.9): a window smaller
+> than the phenomenon, reported with a confidence word ("consistently") the
+> sample cannot carry — the same shape as the error this file exists to retract,
+> committed two paragraphs below the retraction. Caught by pr-daemon, which
+> measured all 76.
+>
+> **The variance is the finding, not the delay.** `schedule` cannot be a
+> deadline — not because it is reliably late by six hours, but because it is
+> late by anywhere from 15 minutes to 12 hours with no way to know which in
+> advance.
+>
+> **A window in which nothing happened is not a rate of zero.** Size the window
+> to the expected time-to-first-event — for a new scheduled workflow that is >12
+> hours, not 4.
 
 ## What is installed
 
