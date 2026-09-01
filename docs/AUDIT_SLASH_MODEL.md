@@ -66,6 +66,11 @@ isOverIssued     = issuedValueUSD > effectiveCapUSD  (or issuanceCap breach; ren
 - **Consumers read it directly** on-chain: SuperPaymaster (sponsorship
   decisions), wallets/dapps (token trust), users, AgentStore. DVT does nothing.
 
+> **When may it be turned on?** See
+> [`SLASH_ROLLOUT_GATE.md`](./SLASH_ROLLOUT_GATE.md) — at N=3 one slash halts
+> the whole stack, so the gate is a NODE-COUNT question, not a code-readiness
+> question.
+
 ## 4. The slash pipeline is DORMANT (kept for the future)
 
 There is **no active rule feeding the stake-slash pipeline** — at the 3-node
