@@ -204,15 +204,23 @@ export function buildCommitteePayload(reconstructed, accountId, signers, blsSig)
 // when it was written; that is exactly the problem with a hard-coded copy of a fact that lives
 // somewhere else -- it does not fail when it goes stale, it just goes on being confidently wrong.
 // Same derivation as deploy/committee-health.mjs so the two never disagree about what is being watched.
+/// Same class as committee-keeper.mjs. proofgen is a one-shot CLI, so a plain Error would also exit
+/// non-zero and nothing here loops to swallow it -- the class is not load-bearing HERE. It is copied
+/// anyway because these two resolvers were byte-identical one commit ago and this PR's own argument is
+/// that copies drift without anything reporting it. An asymmetry that is harmless today is exactly the
+/// kind that gets inherited by whoever adds the third caller.
+class FatalConfigError extends Error {}
+
 async function resolveValidatorCli(provider, explicit, router) {
   if (explicit) return ethers.getAddress(explicit);
   if (!router) {
-    throw new Error(
+    throw new FatalConfigError(
       "no validator: set COMMITTEE_VALIDATOR, or COMMITTEE_ROUTER to derive it from algId 0x01.\n" +
         "  There is no default on purpose -- the previous one is now the retired validator."
     );
   }
-  if (!ethers.isAddress(router)) throw new Error(`COMMITTEE_ROUTER is not an address: ${router}`);
+  if (!ethers.isAddress(router))
+    throw new FatalConfigError(`COMMITTEE_ROUTER is not an address: ${router}`);
   const r = new ethers.Contract(
     router,
     ["function getAlgorithm(uint8) view returns (address)"],
@@ -220,7 +228,9 @@ async function resolveValidatorCli(provider, explicit, router) {
   );
   const derived = await r.getAlgorithm(1);
   if (derived === ethers.ZeroAddress) {
-    throw new Error(`router ${router} has no algorithm mounted at 0x01 -- nothing to watch`);
+    throw new FatalConfigError(
+      `router ${router} has no algorithm mounted at 0x01 -- nothing to watch`
+    );
   }
   return derived;
 }

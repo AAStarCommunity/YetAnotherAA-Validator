@@ -227,6 +227,14 @@ async function tick() {
         ? "(explicit COMMITTEE_VALIDATOR)"
         : `(derived from router ${ROUTER} algId 0x01)`
     );
+    if (ROUTER && VALIDATOR_FROM_FILE && !process.env.COMMITTEE_VALIDATOR) {
+      // Say it. A value being quietly ignored is how someone spends an hour wondering why their
+      // .env.sepolia has no effect -- and the whole point of the precedence rule is that the stale
+      // one loses, which is only useful if the person holding the stale file finds out.
+      console.log(
+        `           (${VALIDATOR_FROM_FILE} in the env file lost to the router — set COMMITTEE_VALIDATOR in the ENVIRONMENT to override)`
+      );
+    }
   }
   const v = new ethers.Contract(VALIDATOR, ABI, wallet);
 
