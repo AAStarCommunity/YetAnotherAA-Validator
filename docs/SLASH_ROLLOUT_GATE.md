@@ -69,10 +69,27 @@ Three distinct thresholds, often confused:
 
 1. **N ≥ 4 — mechanical survival.** One slash no longer halts the stack. This is
    the bare minimum and it is _fragile_: at N=4 a second slash halts it again.
-2. **N ≥ 31 — sampling actually begins.** Below this the committee IS the whole
-   set (`m > n ⇒ m = n`), so sortition buys nothing: an attacker knows exactly
-   who is on the committee, because everyone is. **31 is the first N where the
-   committee is a strict subset of the pool.**
+2. **N ≥ 39 — sampling actually begins.** Membership is NOT decided by `m`; it
+   is decided by the **oversampled target** in `_thresholdOf` (`:625-626`):
+
+   ```solidity
+   uint256 target = (oversampleNum * m + oversampleDen - 1) / oversampleDen; // ceil(1.25*m)
+   if (target >= n) return type(uint256).max;   // whole set - the draw is SKIPPED
+   ```
+
+   With floor `m = 30` and oversample 1.25, `target = ceil(37.5) = 38`, so
+   `target >= n` holds for **every n <= 38**: the per-signer draw is skipped and
+   every active node is admitted. **The committee is literally the whole set up
+   to N = 38; n = 39 is the first N that samples.** The contract says so itself
+   at `:606` — _"on N >= N0 (>= ~39, where sampling begins)"_.
+
+   > Footnote, because it is a true statement about a different quantity and it
+   > is exactly what an earlier version of this section wrongly used: **31** is
+   > the first N where `expectedCommittee(n) < n`. That is a property of the
+   > parameter `m`, not of membership — at N = 31 the committee is still the
+   > whole set. Reading `m < n` as "sampling has begun" is the error; the
+   > oversampled target is the gate.
+
 3. **N ≥ 30 — the ε≤1e-6 forgery bound becomes meaningful.** The bound is a
    property of _m_, not of N: `P(Poisson(β·1.25·m) ≥ ceil(2m/3)) ≤ 1e-6` for β ≤
    10% holds at m = 30 with ~4.4e-9 headroom. At m = 3 (quorum 2) it does not
@@ -95,11 +112,24 @@ economics: the three nodes are known and are not expected to misbehave.
 This is recorded as an accepted risk, including for mainnet — see the
 release-notes framing in CC-115 / CC-46. It is _accepted_, not _unnoticed_.
 
-**Recommended gate: N ≥ 30.** Rationale: it is the first point where the
-deployed security argument (the ε bound) actually holds AND the committee stops
-being the whole set. N ≥ 4 is survivable but not defensible; anything between 4
-and 30 buys tolerance without buying the security property the design is built
-on.
+**Recommended gate: N ≥ 39.** It is the first point where **both** halves of the
+deployed security argument hold at once:
+
+|         N | ε≤1e-6 bound (needs m = 30) | sortition unpredictability (needs a strict subset) |
+| --------: | :-------------------------- | :------------------------------------------------- |
+|      4–29 | ❌ m < 30                   | ❌ whole set                                       |
+| **30–38** | ✅ m = 30                   | ❌ **still the whole set** (`target 38 >= n`)      |
+|   **39+** | ✅                          | ✅                                                 |
+
+**N = 30 buys only the first half**, and it is worth being precise about what
+that half is: with a whole-set committee, safety does not come from an attacker
+being unable to predict who is drawn — everyone is drawn. It comes from the
+classical requirement that they corrupt ⌈2m/3⌉ = 20 of the 30. That is a real
+property, but it is **BFT, not sortition**, and the ε argument the design rests
+on is about sortition.
+
+N ≥ 4 is survivable but not defensible. Anything from 4 to 38 buys tolerance
+(the `N−3` column) without buying the unpredictability the ε argument needs.
 
 Node growth is a function of community and governance, not of engineering — it
 cannot be bought. The levers that _are_ held today (raising stake above
