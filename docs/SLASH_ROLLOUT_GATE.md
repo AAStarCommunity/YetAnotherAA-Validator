@@ -3,28 +3,33 @@
 > **Status: slashing is OFF, and that is a deliberate decision, not an
 > oversight.**
 >
-> This document records the state **as observed on 2026-09-01** and the
-> node-count thresholds that govern when it may be turned on. The deployment
-> readings here are recorded observations, **not pinned reproducible evidence**
-> (no block numbers were captured — see the warning in §1); the threshold
-> arithmetic, which is derived from source, is. For _how_ each rule works and
-> why it was classified the way it was, see
+> This document records the state of the deployment at **Sepolia block
+> 11611286** and the node-count thresholds that govern when slashing may be
+> turned on. Every deployment number below is a pinned `cast call` that anyone
+> can re-derive; the threshold arithmetic is derived from source. For _how_ each
+> rule works and why it was classified the way it was, see
 > [`AUDIT_SLASH_MODEL.md`](./AUDIT_SLASH_MODEL.md). This file answers a
 > different question: **at what network size does slashing stop being
 > self-destructive?**
 
 ## 1. Why the gate exists: at N=3 one slash stops the whole network
 
-Read on 2026-09-01 (Sepolia, chainId 11155111, `AAStarCommitteeValidator`
-`0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9`; getters `minStake()`,
-`minCommittee()`, `requiredQuorum()`, `activeNodeIdsSorted().length`, and
-`Registry.getEffectiveStake(op, ROLE_DVT)` per operator).
+**Pinned read — Sepolia, chainId 11155111, block 11611286**, validator
+`0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9`
+(`cast call <addr> "<getter>" --block 11611286`):
 
-> ⚠️ **This is a recorded observation, NOT reproducible evidence.** No block
-> number or transaction hash was captured, so nothing below can be independently
-> re-derived, and deployment values drift. **Do not treat these numbers as a
-> standing fact or as an audit record** — re-read them with the recipe in §5
-> before acting, and capture a block number when you do.
+| getter                  | value                |
+| ----------------------- | -------------------- |
+| `minCommittee()`        | 3                    |
+| `requiredQuorum()`      | 2                    |
+| `minStake()`            | 30000000000000000000 |
+| `committeeActive()`     | true                 |
+| `requireStake()`        | true                 |
+| `activeNodeIdsSorted()` | 3 entries            |
+
+> An earlier revision recorded these with no block number and had to label
+> itself "not reproducible evidence". It now pins one. **Values still drift** —
+> re-read with §5 before acting, and pin a block when you do.
 
 ```
 minStake        30e18        every operator's effectiveStake   30e18   ← margin 0
@@ -209,18 +214,31 @@ The gates above cover **DVT originating a slash**. They do **not** cover:
   so slashing any one of them takes SP's slash consensus below its own
   threshold.
 
-  > Do not generalise that to "all thresholds are 3". Read on 2026-09-01
-  > (unpinned — no block number captured, same caveat as §1) on **both**
-  > aggregators: `slashThresholds[0,1,2] = 2,3,3` but `defaultThreshold = 7`,
-  > with only **3** validators registered (slots 1-3; 4+ are zero).
-  > `defaultThreshold` governs the non-slash paths, so **the reputation-batch
-  > and generic-proposal paths cannot execute at all today** —
-  > `_checkSignatures` reverts `InvalidSignatureCount(3, 7)` before any
-  > signature is examined. Pre-existing configuration, not a result of the
-  > aggregator rotation. It does not affect DVT (the committee validator does
-  > its own BLS verification via the EIP-2537 precompiles and never routes
-  > through SP's threshold), and it does not change the slash-path conclusion
-  > above.
+  > Do not generalise that to "all thresholds are 3". Pinned read at block
+  > 11611286 on aggregator `0xEaeC2F512eA50708211fa95533e4dBb60e3d2E5D`:
+  > `slashThresholds[0,1,2] = 2,3,3`, **`defaultThreshold = 2`**,
+  > `validatorAtSlot(1..3)` = `0x5D870E13…` / `0x40F0b121…` / `0xD904A706…`,
+  > `validatorAtSlot(4) = 0x0` — **exactly three** guardians, measured not
+  > assumed.
+  >
+  > ⚠️ **Superseded.** An earlier revision read `defaultThreshold = 7` against 3
+  > registered validators and concluded the **reputation-batch and
+  > generic-proposal paths could not execute at all** (`_checkSignatures`
+  > reverting `InvalidSignatureCount(3, 7)`). **No longer true** — SP lowered it
+  > to 2 to unblock the reputation path, so those paths execute at 2-of-3 today.
+  > The operational consequence flips with it: guardian keys online is a
+  > requirement **now**, not one owner transaction away.
+  >
+  > None of this touches DVT's own path — the committee validator does its own
+  > BLS verification via the EIP-2537 precompiles and never routes through SP's
+  > threshold. The slash-path conclusion above is unchanged.
+  >
+  > 📌 **The lesson that outlives the number:** a bare `cast call` to a
+  > _parameterised_ getter reverts on the wrong argument type, and that revert
+  > is indistinguishable from "the value does not exist". `validatorAtSlot` is
+  > `mapping(uint8 => address)`; calling it as `(uint256)` reverts on all four
+  > slots, which reads exactly like "no guardians registered". Slots 1-3
+  > returning real addresses is the control that proves the call shape works.
 
 - **A guardian's duties are broader than "sign slash proposals"** — which is
   what makes the note above load-bearing rather than trivia. `BLSAggregator` has
