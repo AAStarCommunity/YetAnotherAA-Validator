@@ -70,6 +70,24 @@ describe("the aPNTs divergence is PINNED, not assumed away", () => {
    * seller rather than holding stock, so "which token" depends on which sale is live and who funds
    * it — facts that are not on chain.
    *
+   * A follow-up probe by repo:superpaymaster narrows it usefully. `allowance` reads DO work on the
+   * buyHelper (positive control: `allowance(0xb5600060 -> SuperPaymaster)` on `0x696A7370` returns
+   * uint256 max), so these are real zeros rather than a dead instrument:
+   *
+   *   allowance(owner-of-0x9e66B457 -> buyHelper) on both tokens  = 0
+   *   allowance(owner-of-0x696A7370 -> buyHelper) on both tokens  = 0
+   *   allowance(CC-31 Safe          -> buyHelper) on both tokens  = 0
+   *
+   * ⇒ **no sale is currently armed on either token**, so whenever the answer arrives from
+   * launch#27, the constant can be changed WITHOUT a migration window. It still does not identify
+   * the seller — it could be an address nobody guessed — so it narrows the question rather than
+   * settling it.
+   *
+   * (I tried to find the seller from `Approval(_, buyHelper)` logs and could not: this RPC rejects
+   * `eth_getLogs` outright with HTTP 400 / -32600, which a positive control caught before it became
+   * a reported "no approvals exist". Guessing the buyHelper's getters is equally uninformative —
+   * every wrong selector reverts identically to a getter that does not exist.)
+   *
    * So this test does the honest thing: it FREEZES the current pair. Resolving the split is a
    * deliberate decision by whoever owns the sale, and when they make it this test fails and forces
    * the config, the constants and this comment to be updated together.
