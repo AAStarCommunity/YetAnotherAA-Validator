@@ -21,23 +21,30 @@
 # is NOT self-disabling, because a job that turns itself off cannot tell you it stopped.
 #
 # ############################################################################################
-# ACCEPTED GAP -- MEASURED, NOT ASSUMED: the `schedule` trigger below is UNPROVEN IN THIS REPO.
+# THE SCHEDULE BELOW IS DAILY, AND DAILY SCHEDULES DO GET DELIVERED -- hours late.
 #
-#   committee-health.yml sat on the default branch for 6h33m (2026-08-31T03:44Z -> 10:17Z) with
-#   `cron: "7,22,37,52 * * * *"`. Expected ticks: 26. Scheduled runs that actually fired: ZERO.
-#   Everything else checked out -- the `on:` block parses to a valid schedule, the GitHub API
-#   reported `state=active`, the repo was neither archived nor disabled, `pushed_at` showed pushes
-#   throughout, and `workflow_dispatch` on the same workflow was green. So the job can run; only
-#   nobody presses it. An earlier 53-minute observation on `*/15` was the same result, and
-#   airaccount-contract measured 0 ticks on offset minutes too -- offsetting the cron is NOT the fix,
-#   which is what that earlier measurement was wrongly read to mean.
+# GitHub Actions `schedule` DOES fire here -- sparsely. An earlier version of this text said it never
+# does, measured over 6h33m with 26 expected ticks and 0 runs. That window sat ENTIRELY INSIDE a
+# registration delay: the workflow landed on master at 03:44Z and first fired at 11:10Z, 53 minutes
+# AFTER the window closed. Corrected measurements, four repos, same org:
 #
-#   Therefore: DO NOT TREAT THE 2026-09-04 APPLY AS AUTOMATED. This workflow is a best-effort
-#   attempt, not a guarantee. The guarantee is the manual fallback, which is exercised and green:
+#   15-min cron, dvt                  first run 7.4h after landing; then 3 runs / 20.9h vs 83 expected = 3.6%
+#   15-min cron, airaccount-contract  fires, similarly sparse
+#   daily cron, aastar-sdk            76 runs over 75 days ~= 100%, but consistently ~6h late
+#   daily cron, SuperPaymaster        fires, 5-8h late
 #
-#       node deploy/apply-verifier-rotation.mjs --env <env-with-a-funded-key> --broadcast
+# So: DAILY schedules are delivered (hours late); SUB-HOURLY ones are mostly dropped; and a newly
+# added workflow does not fire for several hours. None of the documented causes applied -- not
+# archived or disabled, not a fork, file on the default branch, `gh workflow list` and the API both
+# reporting state=active.
 #
-#   or `workflow_dispatch` on this workflow, which is the ONLY trigger observed to work here.
+# The local heartbeat is still the right primary trigger, but for the corrected reason: 3.6% delivery
+# cannot monitor a 12-minute outage, NOT that nothing ever runs.
+#
+# So this workflow is a genuine second path to the 2026-09-04 apply, not a decorative one. It is
+# still not the guarantee: the local launchd job `io.aastar.dvt-apply-rotation` runs hourly and
+# its trigger is verified (`launchctl print` reports `run interval = 3600 seconds`). Belt and
+# braces, and the proposal does not expire, so a duplicate attempt costs nothing.
 # ############################################################################################
 name: Apply Verifier Rotation
 
