@@ -16,7 +16,7 @@
 //   node deploy/apply-verifier-rotation.mjs --broadcast
 //   env: SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL, and a key for --broadcast
 import { ethers } from "ethers";
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
@@ -190,6 +190,33 @@ async function main() {
   if (nowActive.toLowerCase() !== EXPECTED.toLowerCase())
     die("the active verifier is not the one this rotation proposed");
   console.log(`\nRecords 6 and 7 of docs/evidence/cc115-b3-arming-sepolia.md are now available.`);
+
+  // Emit the readback as a FILE, not just as log output.
+  //
+  // The apply itself was automated twice over (launchd hourly + this workflow daily), but the thing
+  // downstream actually waits on -- CC-115 records 6/7 going back to @repo:dsr so the B3 manifest can
+  // freeze -- was still a step someone had to remember to do. An audit on 2026-09-02 found it as the
+  // single outstanding DVT obligation to the paper effort. Automating the action while leaving the
+  // report-back manual is the same shape as a monitor whose trigger never fires: the capability is
+  // there and the outcome still does not happen.
+  //
+  // So the run now leaves behind a machine-readable artifact the workflow turns into a GitHub issue.
+  // Nobody has to be present on the day, and nobody has to remember what the four values were.
+  const readback = {
+    task: "CC-115 B3",
+    records: "6 and 7",
+    chainId: Number((await provider.getNetwork()).chainId),
+    appliedAtBlock: rc.blockNumber,
+    applyTxHash: tx.hash,
+    aggregator: AGGREGATOR,
+    fraudProofVerifier: nowActive,
+    pendingFraudProofVerifier: nowPending,
+    pendingFraudProofVerifierReadyAt: nowReady.toString(),
+    appliedAtUtc: new Date().toISOString(),
+  };
+  const out = resolve(HERE, "..", "rotation-readback.json");
+  writeFileSync(out, JSON.stringify(readback, null, 2) + "\n");
+  console.log(`\nReadback artifact written: ${out}`);
 }
 
 // A non-Error throw (a bare string, a rejected object) has neither .stack nor .message, so

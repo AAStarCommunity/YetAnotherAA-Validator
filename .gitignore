@@ -69,3 +69,6 @@ contracts/broadcast/
 
 # CC-89 production guardian operator EOA keys (NEVER commit)
 guardian-operators.json
+
+# Emitted by deploy/apply-verifier-rotation.mjs on a successful apply; consumed by the workflow.
+rotation-readback.json
