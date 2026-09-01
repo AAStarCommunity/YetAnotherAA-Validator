@@ -74,18 +74,31 @@ describe("LivenessKeeperService", () => {
     expect((k as any).timer).toBeNull();
   });
 
-  it("DISABLES on a non-finite interval", () => {
+  // CONTRACT CHANGE. This used to assert the keeper DISABLES on a malformed interval, and that was
+  // the same inversion that was removed from the window check: not attesting is how a node gets
+  // jailed, so refusing to run because an env var is wrong causes the exact harm the setting exists
+  // to prevent. Fixing only the window branch left this one intact.
+  it.each([
+    ["non-finite", NaN],
+    ["below the floor", 1_000],
+    ["above the ceiling", 99_999_999],
+  ])("CLAMPS a %s interval and keeps running (never disables on config)", (_label, value) => {
     const bc = chain();
+    const alert = jest.fn();
     const k = new LivenessKeeperService(
       bc,
       cfg({
         auditAttestEnabled: true,
         auditLivenessRegistryAddress: REGISTRY,
-        auditAttestIntervalMs: NaN,
-      })
+        auditAttestIntervalMs: value,
+      }),
+      { alert } as any
     );
     k.onApplicationBootstrap();
-    expect((k as any).timer).toBeNull();
+    expect((k as any).timer).not.toBeNull();
+    expect((k as any).intervalMs).toBe(600_000);
+    expect(alert).toHaveBeenCalledWith("critical", expect.stringContaining("misconfigured"));
+    k.onApplicationShutdown();
   });
 
   it("when enabled+configured: boot-attests immediately and arms the interval timer", async () => {
@@ -202,6 +215,9 @@ describe("LivenessKeeperService — CC-29 watchdog", () => {
   it("treats never-attested (lastLive == 0) as already offline and attests at once", async () => {
     const bc = chain({ getLastLive: jest.fn(async () => 0n) });
     const k = await boot(bc, 600_000);
+    // boot's own cycle already attested and recorded confirmedAtBlock=1000; advance the head so the
+    // anti-grief bound is satisfied, which is the real sequence a still-unattested node would see.
+    bc.getBlockNumber = jest.fn(async () => 1200);
     (bc.attestLiveness as any).mockClear();
     await (k as any).watchdogCycle();
     expect(bc.attestLiveness).toHaveBeenCalledTimes(1);
@@ -409,5 +425,109 @@ describe("LivenessKeeperService — suppression must follow CONFIRMATION, not at
     const k2 = await boot(bad, 600_000);
     await expect(k2.tick()).resolves.toBe(false);
     k2.onApplicationShutdown();
+  });
+});
+
+/**
+ * The SCHEDULER, driven for real.
+ *
+ * Every other watchdog test calls `watchdogCycle()` by hand, so all of them would still pass if the
+ * automatic watchdog never fired, never rearmed, or always waited the fallback period. Review
+ * flagged that; I first declined to write these, reasoning that fake timers would test jest rather
+ * than the code. That was a rationalisation — the initial delay, the rails and the self-tuning are
+ * all decisions THIS file makes, and they are exactly where the residual risk lives.
+ */
+describe("LivenessKeeperService — the watchdog scheduler itself", () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.clearAllMocks();
+  });
+
+  /** Boot without the real-timer `boot()` helper, so the fake clock owns every timer. */
+  function bootFake(bc: any, intervalMs: number) {
+    const k = new LivenessKeeperService(
+      bc,
+      cfg({
+        auditAttestEnabled: true,
+        auditLivenessRegistryAddress: REGISTRY,
+        auditAttestIntervalMs: intervalMs,
+      })
+    );
+    k.onApplicationBootstrap();
+    return k;
+  }
+
+  it("runs its first cycle immediately, not after the fallback delay", async () => {
+    // A 100-block window on a fast chain can expire inside 30s, so a 30s first look is too late.
+    const bc = chain();
+    const k = bootFake(bc, 600_000);
+    expect(bc.getLivenessWindow).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(bc.getLivenessWindow).toHaveBeenCalled();
+    k.onApplicationShutdown();
+  });
+
+  it("REARMS after a cycle — the loop keeps going without being poked", async () => {
+    const bc = chain();
+    const k = bootFake(bc, 600_000);
+    await jest.advanceTimersByTimeAsync(1);
+    const first = (bc.getLivenessWindow as any).mock.calls.length;
+    // window 300 x 12s = 3.6e6ms; /6 = 600000 → clamped to the 60s ceiling.
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect((bc.getLivenessWindow as any).mock.calls.length).toBeGreaterThan(first);
+    k.onApplicationShutdown();
+  });
+
+  it("self-tunes to the CEILING on a slow chain (a big window must not mean rare checks forever)", async () => {
+    const bc = chain(); // windowMs/6 = 600000, well above the 60s cap
+    const k = bootFake(bc, 600_000);
+    await jest.advanceTimersByTimeAsync(1);
+    const after = (bc.getLivenessWindow as any).mock.calls.length;
+    await jest.advanceTimersByTimeAsync(59_000); // just under the cap: no new cycle
+    expect((bc.getLivenessWindow as any).mock.calls.length).toBe(after);
+    await jest.advanceTimersByTimeAsync(2_000); // past it: a cycle
+    expect((bc.getLivenessWindow as any).mock.calls.length).toBeGreaterThan(after);
+    k.onApplicationShutdown();
+  });
+
+  it("self-tunes to the FLOOR on a fast chain rather than polling unboundedly often", async () => {
+    // 100-block window at 200ms/block = 20000ms; /6 = 3333ms, below the 5s floor.
+    const bc = chain({
+      getLivenessWindow: jest.fn(async () => 100n),
+      getBlockTimestamp: jest.fn(async (n: number) => 1_700_000_000 + Math.floor(n / 5)),
+    });
+    const k = bootFake(bc, 600_000);
+    await jest.advanceTimersByTimeAsync(1);
+    const after = (bc.getLivenessWindow as any).mock.calls.length;
+    await jest.advanceTimersByTimeAsync(4_000); // inside the floor: no new cycle
+    expect((bc.getLivenessWindow as any).mock.calls.length).toBe(after);
+    await jest.advanceTimersByTimeAsync(1_500); // past it
+    expect((bc.getLivenessWindow as any).mock.calls.length).toBeGreaterThan(after);
+    k.onApplicationShutdown();
+  });
+
+  it("keeps firing when a cycle THROWS — an error must not end the loop", async () => {
+    const bc = chain({
+      getBlockNumber: jest.fn(async () => {
+        throw new Error("RPC down");
+      }),
+    });
+    const k = bootFake(bc, 600_000);
+    await jest.advanceTimersByTimeAsync(1);
+    const after = (bc.getBlockNumber as any).mock.calls.length;
+    await jest.advanceTimersByTimeAsync(31_000); // fallback period
+    expect((bc.getBlockNumber as any).mock.calls.length).toBeGreaterThan(after);
+    k.onApplicationShutdown();
+  });
+
+  it("stops firing after shutdown", async () => {
+    const bc = chain();
+    const k = bootFake(bc, 600_000);
+    await jest.advanceTimersByTimeAsync(1);
+    k.onApplicationShutdown();
+    const after = (bc.getLivenessWindow as any).mock.calls.length;
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect((bc.getLivenessWindow as any).mock.calls.length).toBe(after);
   });
 });

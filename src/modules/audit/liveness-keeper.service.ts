@@ -56,6 +56,10 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
   private static readonly WATCHDOG_MIN_MS = 5_000;
   private static readonly WATCHDOG_MAX_MS = 60_000;
   private static readonly WATCHDOG_FALLBACK_MS = 30_000;
+  /** Substituted when the configured cadence is unusable — never "disabled". */
+  private static readonly DEFAULT_INTERVAL_MS = 600_000;
+  /** Consecutive watchdog failures before alerting: the safety net itself has gone quiet. */
+  private static readonly WATCHDOG_FAIL_ALERT_AFTER = 3;
   /** Hard deadline on every watchdog RPC. Without it an unsettled promise freezes the safety loop. */
   private static readonly RPC_TIMEOUT_MS = 15_000;
   /** `LivenessRegistry.MIN_LIVENESS_WINDOW` / `MAX_LIVENESS_WINDOW` — a reading outside is not real. */
@@ -67,7 +71,8 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
   private readonly logger = new Logger(LivenessKeeperService.name);
   private readonly enabled: boolean;
   private readonly registryAddress: string;
-  private readonly intervalMs: number;
+  /** Mutable: a malformed value is clamped at bootstrap rather than disabling the keeper. */
+  private intervalMs: number;
   private readonly anchorDepth: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Guards against overlapping ticks if one attest runs longer than the interval. */
@@ -87,6 +92,8 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
    * otherwise make every cycle conclude the budget is spent and pay for another transaction for ever.
    */
   private confirmedAtBlock = 0;
+  /** Consecutive watchdog cycle failures — a silent safety net is worth an alert of its own. */
+  private watchdogFailures = 0;
   /** Last successful block-time estimate (ms). Advisory: tunes the watchdog period only. */
   private lastBlockTimeMs = 0;
 
@@ -125,19 +132,31 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
       );
       return;
     }
-    // Bound the interval to an operationally-safe range [30s, 6h]. Too small floods RPC/gas; too
-    // large (or NaN/Infinity from bad env) can wrap Node's timer range to a near-immediate fire.
-    // Fail-CLOSED (disable) rather than fail-open on a misconfigured cadence.
+    // CLAMP a malformed cadence; do NOT disable on it.
+    //
+    // This branch used to `return`, i.e. no attest timer and no watchdog, and called that
+    // fail-closed. It is the same inversion that was already removed from the window check: a keeper
+    // that does not attest is a node that gets jailed, so refusing to run because an env var is
+    // wrong causes the exact harm the setting exists to avoid. Fixing only the window branch left
+    // this one doing it — a malformed AUDIT_ATTEST_INTERVAL_MS (NaN/Infinity from a bad env, or a
+    // value outside [30s, 6h]) still silently took the node offline.
+    //
+    // Now: substitute the default, alert loudly, and keep running. The value still has to be bounded
+    // — a non-finite one wraps Node's timer range into a near-immediate fire — but bounding it is
+    // clamping, not refusing.
     if (
       !Number.isFinite(this.intervalMs) ||
       this.intervalMs < LivenessKeeperService.MIN_INTERVAL_MS ||
       this.intervalMs > LivenessKeeperService.MAX_INTERVAL_MS
     ) {
-      this.logger.warn(
-        `AUDIT_ATTEST_INTERVAL_MS (${this.intervalMs}) out of [${LivenessKeeperService.MIN_INTERVAL_MS}, ` +
-          `${LivenessKeeperService.MAX_INTERVAL_MS}] — attest keeper DISABLED`
-      );
-      return;
+      const bad = this.intervalMs;
+      this.intervalMs = LivenessKeeperService.DEFAULT_INTERVAL_MS;
+      const msg =
+        `AUDIT_ATTEST_INTERVAL_MS (${bad}) is outside [${LivenessKeeperService.MIN_INTERVAL_MS}, ` +
+        `${LivenessKeeperService.MAX_INTERVAL_MS}] — clamped to the ${this.intervalMs}ms default and ` +
+        `CONTINUING. Fix the setting: the node stays live on the default, but nobody chose it.`;
+      this.logger.error(msg);
+      this.opsAlert?.alert("critical", `🛑 DVT attest interval misconfigured. ${msg}`);
     }
 
     this.logger.log(
@@ -231,15 +250,17 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
 
   /** Every watchdog RPC carries a deadline — an unsettled promise must never freeze the safety loop. */
   private withDeadline<T>(p: Promise<T>, what: string): Promise<T> {
-    return Promise.race([
-      p,
-      new Promise<T>((_, rej) =>
-        setTimeout(
-          () => rej(new Error(`${what} exceeded ${LivenessKeeperService.RPC_TIMEOUT_MS}ms`)),
-          LivenessKeeperService.RPC_TIMEOUT_MS
-        )
-      ),
-    ]);
+    let timer: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_, rej) => {
+      timer = setTimeout(
+        () => rej(new Error(`${what} exceeded ${LivenessKeeperService.RPC_TIMEOUT_MS}ms`)),
+        LivenessKeeperService.RPC_TIMEOUT_MS
+      );
+    });
+    // Clear on settle: a race that the work wins otherwise leaves the timer pending for the full
+    // deadline. NOTE this bounds the WAIT, not the operation — the underlying RPC keeps running, and
+    // for a broadcast that is unavoidable: abandoning the promise cannot un-send a transaction.
+    return Promise.race([p, deadline]).finally(() => clearTimeout(timer));
   }
 
   private async watchdogCycle(): Promise<void> {
@@ -312,6 +333,14 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
         if (this.stopping) return;
         // ONLY on a confirmed attest. Recording it unconditionally would let a failed or skipped
         // attempt arm the suppression below and silence the very retry we need.
+        //
+        // `head` was read BEFORE the attest, so it is EARLIER than the block the attest actually
+        // landed in. An earlier baseline makes `head - confirmedAtBlock` larger, so suppression
+        // lifts SOONER, not later. (An earlier revision of this comment claimed the opposite; the
+        // inequality runs the other way.) That errs toward attesting, which is the right direction
+        // for liveness and a slightly weaker anti-grief bound — the trade I want, but not the one I
+        // originally described. Exact would be the receipt's block, and even that is only
+        // 1-confirmation deep, so a reorg can still strand it.
         if (confirmed) {
           this.confirmedAtBlock = head;
         } else {
@@ -328,11 +357,29 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
 
       await this.warnIfCadenceTooSlow(windowBlocks);
       next = this.watchdogPeriodMs(windowBlocks);
+      if (this.watchdogFailures >= LivenessKeeperService.WATCHDOG_FAIL_ALERT_AFTER) {
+        this.logger.log(`liveness watchdog recovered after ${this.watchdogFailures} failed cycles`);
+        this.opsAlert?.alert("info", "✅ DVT liveness watchdog recovered");
+      }
+      this.watchdogFailures = 0;
     } catch (e: any) {
+      this.watchdogFailures += 1;
+      const detail = e?.shortMessage ?? e?.message ?? String(e);
       this.logger.warn(
-        `liveness watchdog cycle failed (${e?.shortMessage ?? e?.message ?? String(e)}) — ` +
-          `nominal cadence continues, retrying in ${LivenessKeeperService.WATCHDOG_FALLBACK_MS}ms`
+        `liveness watchdog cycle failed (${detail}) — nominal cadence continues, ` +
+          `retrying in ${LivenessKeeperService.WATCHDOG_FALLBACK_MS}ms ` +
+          `(consecutive failures: ${this.watchdogFailures})`
       );
+      // A safety net that has gone quiet is worth its own alert: the nominal cadence may be the very
+      // thing the watchdog was covering for, so "the watchdog is down" is not a log-only event.
+      // Alerts once at the threshold, not every cycle.
+      if (this.watchdogFailures === LivenessKeeperService.WATCHDOG_FAIL_ALERT_AFTER) {
+        this.opsAlert?.alert(
+          "critical",
+          `🛑 DVT liveness watchdog has failed ${this.watchdogFailures} consecutive cycles ` +
+            `(${detail}) — the node is running on its nominal cadence with no safety net.`
+        );
+      }
     } finally {
       this.watchdogInFlight = false;
       this.armWatchdog(next);
@@ -379,12 +426,14 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
     if (maxSafeMs < needMs) {
       if (!this.infeasibleWarned) {
         const msg =
-          `this chain and window CANNOT be served safely: livenessWindow ${windowBlocks} blocks at ` +
+          `observed liveness margin is below the allowance: livenessWindow ${windowBlocks} blocks at ` +
           `~${Math.round(blockTimeMs)}ms/block leaves a ${maxSafeMs}ms budget, but one attest needs ` +
           `~${needMs}ms (${LivenessKeeperService.WATCHDOG_MIN_MS}ms minimum poll + ` +
-          `${LivenessKeeperService.INCLUSION_ALLOWANCE_MS}ms inclusion allowance). The node will be ` +
-          `intermittently offline no matter how the cadence is set — the window must be raised ` +
-          `on-chain, or this chain is out of scope for the keeper.`;
+          `${LivenessKeeperService.INCLUSION_ALLOWANCE_MS}ms inclusion allowance). Both sides are ` +
+          `EMPIRICAL — the block time is a recent average, not a guaranteed bound, and the allowance ` +
+          `does not cover preflight/nonce/fee work outside the receipt wait — so treat this as a ` +
+          `measured margin, not a proof. On these numbers the node is likely to be intermittently ` +
+          `offline whatever the cadence: raise the window on-chain, or take this chain out of scope.`;
         this.logger.error(msg);
         this.opsAlert?.alert("critical", `🛑 DVT liveness window infeasible on this chain. ${msg}`);
         this.infeasibleWarned = true;
