@@ -84,13 +84,13 @@ asked directly:
 
 So the intended shape is:
 
-| element   | intent                                                                                                                                                                         |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| offence   | **continuous** downtime past the liveness window, counted in escalation periods, the escalation level decaying during uptime (design doc §4) — NOT a lifetime cumulative total |
-| evidence  | CC-29 `LivenessRegistry` — but see §5 of the design doc: the registry's **current state is not sufficient** to settle money                                                    |
-| penalty   | **a LEAK — a stake burn tiered by outage duration**, settled by computation, **not** by a BLS-quorum vote                                                                      |
-| execution | jail: fee stopped + excluded from the active set (both unbuilt)                                                                                                                |
-| recovery  | self-healing — attest liveness again and the node re-enters the set                                                                                                            |
+| element    | intent                                                                                                                                                                         |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| offence    | **continuous** downtime past the liveness window, counted in escalation periods, the escalation level decaying during uptime (design doc §4) — NOT a lifetime cumulative total |
+| evidence   | CC-29 `LivenessRegistry` — but see §5 of the design doc: the registry's **current state is not sufficient** to settle money                                                    |
+| penalty    | **a LEAK — a stake burn tiered by outage duration**, intended to settle by computation rather than by a BLS-quorum vote (no settlement mechanism exists yet)                   |
+| jail layer | runs in parallel over the same interval — fee stopped + excluded from the active set. Does NOT carry out the burn, and the burn does not carry out it (both unbuilt)           |
+| recovery   | self-healing — attest liveness again and the node re-enters the set                                                                                                            |
 
 > **This rule does NOT travel the §5 playbook.** It files no proposal, gathers
 > no co-signatures and produces no slash message. Everything below about pinned
@@ -228,10 +228,11 @@ enumerate targets → pin ONE finalized block → RULE predicate (deterministic)
 
 - Objective + attributable + globally-verifiable economic fraud → **SLASH**
   (this playbook).
-- Liveness / availability → **a tiered LEAK executed as JAIL** (§3.2). **Not
-  this playbook.** A leak is settled by computation with no proposal, no
-  co-signing and no quorum, so none of the steps below apply to it. It is a
-  design sketch, not a decision that liveness goes unpunished — see
+- Liveness / availability → **a tiered LEAK, with JAIL as a parallel layer over
+  the same interval** (§3.2). **Not this playbook.** A leak would settle by
+  computation with no proposal, no co-signing and no quorum, so none of the
+  steps below apply to it. It is a design sketch, not a decision that liveness
+  goes unpunished — see
   [`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md).
 - Informational → **REPUTATION** (on-chain view; DVT doesn't act).
 

@@ -226,13 +226,17 @@ overwritten on every attestation, `:67,:101`):
 
 **Mutable parameters break settlement too — this is a state requirement, not a
 governance nicety.** `livenessWindow` (and any tier value) can be changed with
-immediate effect, and the registry stores only the _current_ window
-(`LivenessRegistry.sol:33,135`). If a parameter moves between the outage and its
-settlement, **the caller's timing decides which parameter set is applied** — the
-exact caller-dependence a computed settlement is supposed to eliminate. Storing
-the tiers "on-chain" is therefore not sufficient; they must be **versioned with
-activation blocks, or snapshotted into the episode when it opens**, so the
-charge is reconstructible for the epoch being charged.
+immediate effect, and the registry stores only the _current_ window (the window
+lives in a single slot, `LivenessRegistry.sol:67`, read back by
+`livenessWindow()` at `:136`; the governance note at `:33` spells out that a
+change re-partitions the live set immediately. SP's `Registry.configureRole`
+`:453` replaces a whole role config the same way, retaining no history). If a
+parameter moves between the outage and its settlement, **the caller's timing
+decides which parameter set is applied** — the exact caller-dependence a
+computed settlement is supposed to eliminate. Storing the tiers "on-chain" is
+therefore not sufficient; they must be **versioned with activation blocks, or
+snapshotted into the episode when it opens**, so the charge is reconstructible
+for the epoch being charged.
 
 **Minimum additional state before this is specifiable:**
 `offlineSinceBlock(op)`, `lastSettledPeriod(op)` or a cumulative penalty debt, a

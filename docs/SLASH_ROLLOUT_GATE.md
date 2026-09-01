@@ -170,17 +170,19 @@ a policy promise:
 | rule ④ proof-forgery        | closed as non-slashing                                                                                                                                                                                                                                                                                                                                                                                                                     | prevented, not punished                                                                |
 
 **Two of the four rules were retired, one has no origination path in this
-pipeline at all (rule ② is a leak — settled by computation, filing no proposal),
-and the fourth was deliberately closed. The origination path for a voted slash
-is therefore empty today even if both flags were flipped.**
+pipeline at all (rule ② is intended as a leak — settled by computation and
+filing no proposal, though no settlement mechanism has been built), and the
+fourth was deliberately closed. The origination path for a voted slash is
+therefore empty today even if both flags were flipped.**
 
 > ⚠️ **Do not read that as "this architecture has nothing worth punishing."**
 > Jason ruled the opposite on 2026-09-01:
 > _"存活时间就是最典型的可罚行为…但可以设定不同的时限、slash 不同的额度,这一定要有"_
 > — liveness **is** the archetypal punishable behaviour, tiered by outage
-> duration, with jail as the execution and self-heal path. Rule ② is therefore
-> an **open design item**, not a closed question. The empty origination path
-> above is a statement about today's capability, not about intent.
+> duration, with jail running as a parallel layer over the same interval and
+> providing the self-heal path. Rule ② is therefore an **open design item**, not
+> a closed question. The empty origination path above is a statement about
+> today's capability, not about intent.
 >
 > Note the shape, though: the intended design would settle that penalty **by
 > computation, with no quorum vote**, so it would not travel this origination
