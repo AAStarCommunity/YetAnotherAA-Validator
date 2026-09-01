@@ -122,7 +122,9 @@ describe("LivenessKeeperService", () => {
       cfg({ auditAttestEnabled: true, auditLivenessRegistryAddress: REGISTRY }),
       { alert } as any
     );
-    await expect(k.tick()).resolves.toBeUndefined();
+    // tick() now reports whether an attest CONFIRMED (false here — it threw and was swallowed).
+    // The watchdog's suppression bound depends on this distinction; see the confirmation suite below.
+    await expect(k.tick()).resolves.toBe(false);
     expect(alert).toHaveBeenCalledWith("warn", expect.stringContaining("StaleAnchor"));
   });
 
@@ -354,5 +356,58 @@ describe("LivenessKeeperService — watchdog hardening", () => {
     expect((bc.getLivenessWindow as any).mock.calls[0][1]).toBe(1000);
     expect((bc.getLastLive as any).mock.calls[0][2]).toBe(1000);
     k.onApplicationShutdown();
+  });
+});
+
+/**
+ * The anti-grief bound must never suppress an attest we actually needed — that is the same harm as
+ * the v1 bug that stopped the keeper. `tick()` swallows attest errors by design, so awaiting it is
+ * not evidence that anything confirmed.
+ */
+describe("LivenessKeeperService — suppression must follow CONFIRMATION, not attempts", () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it("does not arm suppression when the attest FAILS — the retry still happens", async () => {
+    const bc = chain({
+      getLastLive: jest.fn(async () => 800n), // 200 spent of a 100 budget → attest wanted
+      attestLiveness: jest.fn(async () => {
+        throw new Error("reverted");
+      }),
+    });
+    const k = await boot(bc, 21_600_000);
+    (bc.attestLiveness as any).mockClear();
+    await (k as any).watchdogCycle();
+    await (k as any).watchdogCycle();
+    // Both cycles must try: a failed attempt must not look like a confirmation.
+    expect((bc.attestLiveness as any).mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect((k as any).confirmedAtBlock).toBe(0);
+    k.onApplicationShutdown();
+  });
+
+  it("does not arm suppression when the tick is SKIPPED as already in-flight", async () => {
+    const bc = chain({ getLastLive: jest.fn(async () => 800n) });
+    const k = await boot(bc, 21_600_000);
+    (k as any).confirmedAtBlock = 0;
+    (k as any).inFlight = true; // a nominal attest is running: this tick returns without attesting
+    await (k as any).watchdogCycle();
+    expect((k as any).confirmedAtBlock).toBe(0);
+    (k as any).inFlight = false;
+    k.onApplicationShutdown();
+  });
+
+  it("tick() reports true only on a confirmed attest", async () => {
+    const ok = chain();
+    const k1 = await boot(ok, 600_000);
+    await expect(k1.tick()).resolves.toBe(true);
+    k1.onApplicationShutdown();
+
+    const bad = chain({
+      attestLiveness: jest.fn(async () => {
+        throw new Error("not confirmed");
+      }),
+    });
+    const k2 = await boot(bad, 600_000);
+    await expect(k2.tick()).resolves.toBe(false);
+    k2.onApplicationShutdown();
   });
 });

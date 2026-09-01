@@ -163,27 +163,38 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
     }
   }
 
-  /** One attest cycle: read a fresh anchor, send attestLiveness. Never throws. */
-  async tick(): Promise<void> {
-    if (this.stopping) return; // no new work during shutdown
+  /**
+   * One attest cycle: read a fresh anchor, send attestLiveness. Never throws.
+   *
+   * Returns **true only when an attestation actually confirmed on-chain**. That distinction is
+   * load-bearing for the watchdog's anti-grief bound: `blockchain.attestLiveness` does wait for
+   * inclusion and throws unless `receipt.status === 1`, but this method deliberately swallows that
+   * error — so a caller awaiting `tick()` alone cannot tell a confirmed attest from a failed one,
+   * and would record a confirmation that never happened. That would then SUPPRESS the retry the node
+   * actually needed, which is the same harm as the v1 bug that stopped the keeper outright.
+   */
+  async tick(): Promise<boolean> {
+    if (this.stopping) return false; // no new work during shutdown
     if (this.inFlight) {
       this.logger.debug("attest tick skipped — previous still in-flight");
-      return;
+      return false; // skipped is NOT confirmed
     }
     this.inFlight = true;
     try {
       const anchor = await this.blockchain.getAttestAnchor(this.anchorDepth);
-      if (this.stopping) return; // shutdown began during the anchor read — do not start a write
+      if (this.stopping) return false; // shutdown began during the anchor read — no write
       const txHash = await this.blockchain.attestLiveness(
         this.registryAddress,
         anchor.number,
         anchor.hash
       );
       this.logger.log(`liveness attested @ anchor ${anchor.number}: ${txHash}`);
+      return true;
     } catch (e: any) {
       const msg = e?.shortMessage ?? e?.message ?? String(e);
       this.logger.warn(`attest failed (will retry next tick): ${msg}`);
       this.opsAlert?.alert("warn", `⚠️ DVT liveness attest failed: ${msg}`);
+      return false;
     } finally {
       this.inFlight = false;
     }
@@ -297,9 +308,17 @@ export class LivenessKeeperService implements OnApplicationBootstrap, OnApplicat
           `liveness budget spent (${spent}/${budgetBlocks} blocks of a ${windowBlocks}-block window) ` +
             `— attesting now, ahead of the ${this.intervalMs}ms nominal cadence`
         );
-        await this.withDeadline(this.tick(), "watchdog attest");
+        const confirmed = await this.withDeadline(this.tick(), "watchdog attest");
         if (this.stopping) return;
-        this.confirmedAtBlock = head;
+        // ONLY on a confirmed attest. Recording it unconditionally would let a failed or skipped
+        // attempt arm the suppression below and silence the very retry we need.
+        if (confirmed) {
+          this.confirmedAtBlock = head;
+        } else {
+          this.logger.warn(
+            "watchdog attest did not confirm — not recording it; will retry next cycle"
+          );
+        }
       } else if (spent > budgetBlocks) {
         this.logger.warn(
           `budget reads as spent (${spent}/${budgetBlocks}) but the head has not advanced past our ` +
