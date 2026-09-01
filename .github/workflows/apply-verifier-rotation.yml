@@ -28,9 +28,11 @@
 # registration delay: the workflow landed on master at 03:44Z and first fired at 11:10Z, 53 minutes
 # AFTER the window closed. Corrected measurements, four repos, same org:
 #
-#   15-min cron, dvt                  first run 7.4h after landing; then 3 runs / 20.9h vs 83 expected = 3.6%
+#   15-min cron, dvt                  3 scheduled runs TOTAL in 20.9h vs 84 slots = 3.6%; the first of
+#                                   those came 7.4h after the workflow landed on master
 #   15-min cron, airaccount-contract  fires, similarly sparse
-#   daily cron, aastar-sdk            76 runs over 75 days ~= 100%, but consistently ~6h late
+#   daily cron, aastar-sdk            76 runs / 76 distinct days = 100% delivery; median 2.1h late
+#                                   (p25 1.1, p75 2.9, max 11.7 -- a ~47x spread, not a fixed offset)
 #   daily cron, SuperPaymaster        fires, 5-8h late
 #
 # So: DAILY schedules are delivered (hours late); SUB-HOURLY ones are mostly dropped; and a newly

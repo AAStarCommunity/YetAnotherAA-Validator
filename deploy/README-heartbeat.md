@@ -5,12 +5,12 @@
 GitHub Actions `schedule` fires here **sparsely**, not never. Measured across
 four repos in the same org:
 
-| cron         | repo                | outcome                                                                                     |
-| ------------ | ------------------- | ------------------------------------------------------------------------------------------- |
-| 15 min       | dvt                 | first run **7.4 h** after landing on master; then **3 runs / 20.9 h vs 83 expected = 3.6%** |
-| 15 min       | airaccount-contract | fires, similarly sparse                                                                     |
-| daily `0 6`  | aastar-sdk          | **76 runs over 75 days ≈ 100%**, consistently ~6 h late                                     |
-| daily `37 6` | SuperPaymaster      | fires, 5–8 h late                                                                           |
+| cron         | repo                | outcome                                                                                                           |
+| ------------ | ------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| 15 min       | dvt                 | **3 scheduled runs TOTAL** in 20.9 h vs **84** slots = **3.6%**; the first came **7.4 h** after landing on master |
+| 15 min       | airaccount-contract | fires, similarly sparse                                                                                           |
+| daily `0 6`  | aastar-sdk          | **76 runs / 76 distinct days = 100% delivery**; median **2.1 h** late (p25 1.1, p75 2.9, **max 11.7**)            |
+| daily `37 6` | SuperPaymaster      | fires, 5–8 h late                                                                                                 |
 
 **Daily schedules are delivered (hours late); sub-hourly ones are mostly
 dropped; a newly added workflow does not fire for several hours.** None of the
@@ -33,6 +33,21 @@ heartbeat exists.
 > The claim that offsetting the cron minutes is a fix was also wrong, also mine,
 > and was stated to a sibling repo as fact rather than inference; it reached
 > that repo's committed comments.
+>
+> **And the corollary, which the first version of this very file got wrong:** a
+> handful of observations is not a distribution. That version said aastar-sdk
+> was "consistently ~6 h late". The median is **2.1 h**; only 13% of runs were
+> even 4 h late, and the spread runs 0.25–11.7 h — a ~47× range. "~6" is exactly
+> the mean of the three most recent runs (5.8 / 4.8 / 5.9): a window smaller
+> than the phenomenon, reported with a confidence word ("consistently") the
+> sample cannot carry — the same shape as the error this file exists to retract,
+> committed two paragraphs below the retraction. Caught by pr-daemon, which
+> measured all 76.
+>
+> **The variance is the finding, not the delay.** `schedule` cannot be a
+> deadline — not because it is reliably late by six hours, but because it is
+> late by anywhere from 15 minutes to 12 hours with no way to know which in
+> advance.
 >
 > **A window in which nothing happened is not a rate of zero.** Size the window
 > to the expected time-to-first-event — for a new scheduled workflow that is >12
