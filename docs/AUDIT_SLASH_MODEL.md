@@ -23,18 +23,24 @@ The two are independent. Credit/spending limits are a **sign-gate** concern
 
 ## 2. Three penalty types — never conflate them
 
-| Penalty        | What                                                       | Evidence bar                                            | Decision                     |
-| -------------- | ---------------------------------------------------------- | ------------------------------------------------------- | ---------------------------- |
-| **SLASH**      | burn the operator's **stake** (irreversible)               | OBJECTIVE + ATTRIBUTABLE + globally-verifiable on-chain | BLS-quorum consensus         |
-| **JAIL**       | stop **fee** + exclude from the active set (self-heals)    | objective on-chain liveness                             | deterministic auto-jail (SP) |
-| **REPUTATION** | a public **credibility score** (no penalty, informational) | on-chain economic facts                                 | on-chain view (auto)         |
+| Penalty        | What                                                       | Evidence bar                                            | Decision                                                                  |
+| -------------- | ---------------------------------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **SLASH**      | burn the operator's **stake** (irreversible)               | OBJECTIVE + ATTRIBUTABLE + globally-verifiable on-chain | BLS-quorum consensus                                                      |
+| **JAIL**       | stop **fee** + exclude from the active set (self-heals)    | objective on-chain liveness                             | deterministic, no quorum vote — **but see the ⚠️ below: not wired today** |
+| **REPUTATION** | a public **credibility score** (no penalty, informational) | on-chain economic facts                                 | on-chain view (auto)                                                      |
 
 > Lesson (#202): a DVT node is only **slashed** for
 > objective+attributable+globally-verifiable evidence. Subjective /
 > absence-based signals (e.g. gossip heartbeat absence) must NOT slash — they
 > JAIL at most. `fee` today is a reserved semantic (the infra fee/profit-sharing
-> layer isn't live yet); the concrete teeth of jail right now is **exclusion
-> from the active set / quorum denominator**.
+> layer isn't live yet); the intended teeth of jail are **exclusion from the
+> active set / quorum denominator**.
+>
+> ⚠️ **Jail has NO teeth today — it is not implemented anywhere.** Committee
+> eligibility checks stake, role and guardian-exit state and **never reads
+> `isOffline`** (`AAStarCommitteeValidator.sol:460-469`); `LivenessRegistry`
+> advertises "zero SuperPaymaster-core coupling" (`:13`). There is no auto-jail
+> in either repo — only a deployed signal with no consumer.
 >
 > ⚠️ **Do not over-read that lesson.** It disqualifies **gossip absence** as
 > evidence, not **liveness** as an offence. CC-29's on-chain `isOffline(op)`
@@ -75,13 +81,18 @@ asked directly:
 
 So the intended shape is:
 
-| element   | intent                                                                             |
-| --------- | ---------------------------------------------------------------------------------- |
-| offence   | cumulative downtime beyond a threshold, measured on-chain                          |
-| evidence  | CC-29 `LivenessRegistry.isOffline(op)` at a pinned block — objective, attributable |
-| penalty   | **stake burn, amount tiered by outage duration** (longer out ⇒ larger burn)        |
-| execution | jail: fee stopped + excluded from the active set                                   |
-| recovery  | self-healing — attest liveness again and the node re-enters the set                |
+| element   | intent                                                                                                                      |
+| --------- | --------------------------------------------------------------------------------------------------------------------------- |
+| offence   | cumulative downtime beyond a threshold, measured on-chain                                                                   |
+| evidence  | CC-29 `LivenessRegistry` — but see §5 of the design doc: the registry's **current state is not sufficient** to settle money |
+| penalty   | **a LEAK — a stake burn tiered by outage duration**, settled by computation, **not** by a BLS-quorum vote                   |
+| execution | jail: fee stopped + excluded from the active set (both unbuilt)                                                             |
+| recovery  | self-healing — attest liveness again and the node re-enters the set                                                         |
+
+> **This rule does NOT travel the §5 playbook.** It files no proposal, gathers
+> no co-signatures and produces no slash message. Everything below about pinned
+> blocks, proofHashes and quorum re-verification applies to _voted_ rules and
+> **not** to this one.
 
 Five things are missing before this can be specified, let alone armed:
 
@@ -90,7 +101,7 @@ Five things are missing before this can be specified, let alone armed:
    `0x02d841F7905aFb4424DBA71680D27C0F75d36BE7` with `livenessWindow() = 300`.
    The error came from reading a config default
    (`AUDIT_LIVENESS_REGISTRY_ADDRESS` defaults to `""`,
-   `src/config/configuration.ts:346`) as evidence about the chain. **An unset
+   `src/config/configuration.ts:350`) as evidence about the chain. **An unset
    client config is not an absent contract.**
 
    What is actually missing is smaller and fixable: the address is not in any
@@ -98,7 +109,9 @@ Five things are missing before this can be specified, let alone armed:
    ⇒ `isOffline == true` for everyone). DVT already holds the locked read ABI
    (`blockchain.service.ts:653-657`) and the attest keeper
    (`liveness-keeper.service.ts`); pointing them at that address is a config
-   change, not a build.
+   change, not a build — **but that only enables the nodes to ATTEST.** It
+   builds no jail, no exclusion and no penalty; those consumers do not exist
+   (see the ⚠️ in §2).
 
    **Unit is BLOCKS**, confirmed at source, not inferred:
    `_lastLive[msg.sender] = block.number` and
@@ -110,13 +123,14 @@ Five things are missing before this can be specified, let alone armed:
    gossip heartbeat — which §2 correctly forbids as slash evidence.
 
 2. **The tier table does not exist.** "不同的时限、不同的额度" needs concrete
-   (duration → bps-of-stake) rows, and they must be **on-chain governance
-   values**, not a DVT constant: the burn amount enters the slash message every
-   node re-verifies, so a node-local number forks the quorum. Today DVT's only
-   offline threshold is the hard-coded, version-bound
-   `OFFLINE_THRESHOLD_MS = 600_000` (`audit.service.ts:66`) — a gossip
-   wall-clock number that deliberately enters the proofHash. It is **not** a
-   candidate tier source.
+   (duration → burn) rows with **explicitly defined units**, and they must be
+   **on-chain governance values** so that every observer recomputes the same
+   settlement — not because a quorum has to agree on a message (there is no
+   quorum here), but because a permissionless settlement whose result depends on
+   who calls it is not a settlement. Today DVT's only offline threshold is the
+   hard-coded, version-bound `OFFLINE_THRESHOLD_MS = 600_000`
+   (`audit.service.ts:66`) — a gossip wall-clock number that deliberately enters
+   the proofHash of the _voted_ pipeline. It is **not** a candidate tier source.
 3. **The asset is decided — GToken (Jason, 2026-09-02) — and that is what makes
    the margin load-bearing.** The two deployed burn paths hit different assets:
    DVT-originated operator slashing burns SP-held **aPNTs** (capped at 30%,
@@ -204,9 +218,11 @@ enumerate targets → pin ONE finalized block → RULE predicate (deterministic)
 
 - Objective + attributable + globally-verifiable economic fraud → **SLASH**
   (this playbook).
-- Liveness / availability → **tiered SLASH executed as JAIL** (§3.2) — a design
-  item blocked on CC-29, not a decision that liveness goes unpunished. It does
-  not route through this playbook's origination path today.
+- Liveness / availability → **a tiered LEAK executed as JAIL** (§3.2). **Not
+  this playbook.** A leak is settled by computation with no proposal, no
+  co-signing and no quorum, so none of the steps below apply to it. It is a
+  design sketch, not a decision that liveness goes unpunished — see
+  [`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md).
 - Informational → **REPUTATION** (on-chain view; DVT doesn't act).
 
 Only build a slash rule for the first case.
@@ -263,8 +279,10 @@ waking a slash never needs new execution contracts, only (sometimes) a new
 > describes the intended rule.** It frames offline as a quorum-voted DVT slash;
 > the adopted shape is a **permissionlessly-settled leak with no quorum at all**
 > ([`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md)).
-> It survives here only to show how the generic playbook is applied — the
-> on-chain-state analysis below happens to remain accurate and understated.
+> It survives only as an illustration of how the generic **voted-rule** playbook
+> is applied. **Do not read its analysis as applying to the leak** — its
+> accumulated-downtime and tier reasoning was written for a quorum-voted message
+> and understates what a permissionless settlement needs (design doc §5).
 
 Goal: 1 day offline → 10% slash; 3 days → 30% + permanent-offline until stake
 top-up.

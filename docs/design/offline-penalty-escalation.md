@@ -42,10 +42,11 @@ Slashing punishes **provable signed misbehaviour** — the protocol proves the
 behaviour, not intent. Absence is handled by a **leak**: a continuous,
 deterministic drain nobody votes on.
 
-**What the analogy buys us.** A leak is settled by computation rather than by
-consensus, so it needs no BLS quorum, no guardian vote and no fraud proof.
-**Guardian collusion is therefore absent from this path** — and guardian
-collusion is the entire reason
+**What the analogy buys us.** A leak is settled by **EVM execution rather than
+by an application-level quorum vote** — that execution is of course still
+consensus-finalised like any transaction; what disappears is the BLS quorum, the
+guardian vote and the fraud proof. **Guardian collusion is therefore absent from
+this path** — and guardian collusion is the entire reason
 [`guardian-collusion-slash.md`](./guardian-collusion-slash.md) exists.
 
 ### Where the analogy breaks — three disanalogies that matter
@@ -68,7 +69,11 @@ collusion is the entire reason
    downtime becomes invisible. The opposite case is the dangerous one: the chain
    advances normally while operators cannot get transactions included (RPC
    outage, gas exhaustion, censorship, a provider incident), and **every honest
-   operator leaks simultaneously.**
+   operator sharing that dependency leaks simultaneously.** The blast radius is
+   whoever sits behind the common failure — for a fleet on one provider, or a
+   single self-hosted deployment, that is everyone; for a genuinely diversified
+   fleet, a subset. Correlated infrastructure is the quantity to measure, not
+   operator count.
 
 ### Therefore: trust is RELOCATED, not eliminated
 
@@ -90,9 +95,15 @@ absence of risk.
 **Call this rule a `leak` (or `inactivity penalty`). Reserve `slash` for the
 voted, fraud-provable path.** This is not cosmetic: it keeps the fraud-proof
 machinery — which exists to adjudicate _unjust votes_ — out of a path that has
-no votes. It also stops the design from contradicting SP's stated scope
-(`LivenessRegistry.sol:31`): "Offline itself carries NO slash — it only shrinks
-the live-set."
+no votes.
+
+> ⚠️ **The rename does NOT resolve the conflict with SP.**
+> `LivenessRegistry.sol:7,28,31` says offline "carries NO slash — it only
+> shrinks the live-set" — i.e. **no stake punishment of any kind**, whatever it
+> is called. A leak still burns stake, so it still contradicts that stated
+> scope. Renaming only stops us from _additionally_ dragging the voted-slash
+> machinery in. The substantive disagreement is real and unresolved: it is open
+> question 1 in §9, and SP has to agree before any of this is built.
 
 ## 3. The state machine
 
@@ -202,23 +213,26 @@ this operator offline right now?"_ They are **not** enough to settle money.
 Concretely, with today's `LivenessRegistry` (`_lastLive` is a single slot,
 overwritten on every attestation, `:67,:101`):
 
-| gap                                                               | consequence if built anyway                                                                                                                                                                                                            |
-| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **No record that an outage happened** — only `lastLive`           | An operator that has been down for weeks can **attest one block before settlement and erase the entire history**. The penalty is trivially evadable                                                                                    |
-| **No settlement checkpoint** (`lastSettledPeriod` / accrued debt) | Any number of permissionless callers can settle the **same** outage repeatedly. Over-charging is as easy as calling twice                                                                                                              |
-| **Outcome depends on transaction ordering**                       | If settlement is possible, a searcher can front-run an honest operator's recovery attestation to force a burn; if the operator wins the race, the burn vanishes. **A monetary outcome decided by mempool ordering is not "objective"** |
-| **No episode start** (`offlineSinceBlock`)                        | `k` — which period the operator is in — cannot be computed at all                                                                                                                                                                      |
-| **No escalation-score state**                                     | The decay rule in §4.3 is unimplementable after any recovery                                                                                                                                                                           |
-| **`S_reg` not stored** (§4)                                       | The burn base does not exist on-chain                                                                                                                                                                                                  |
-| **No suitable burn primitive**                                    | `GTokenStaking.slashByDVT` is `authorizedSlashers`-gated and takes a **caller-supplied amount** (`:498,:504`) — the opposite shape of a permissionless, self-computing leak                                                            |
-| **Nobody is paid to call `settle`**                               | A leak that requires an altruistic gas payer does not accrue                                                                                                                                                                           |
+| gap                                                               | consequence if built anyway                                                                                                                                                                                                                                                        |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **No record that an outage happened** — only `lastLive`           | An operator that has been down for weeks can **attest one block before settlement and erase the entire history**. The penalty is trivially evadable                                                                                                                                |
+| **No settlement checkpoint** (`lastSettledPeriod` / accrued debt) | Any number of permissionless callers can settle the **same** outage repeatedly. Over-charging is as easy as calling twice                                                                                                                                                          |
+| **Outcome depends on transaction ordering**                       | If settlement is possible, a searcher can front-run an honest operator's recovery attestation to force a burn; if the operator wins the race, the burn vanishes. **A monetary outcome decided by mempool ordering is not "objective"**                                             |
+| **No durable episode start**                                      | For an operator that stayed continuously offline the start is derivable as `lastLive + window + 1`, so this row is weaker than those above — but it fails exactly when it matters: the moment the operator attests, `lastLive` moves and the past episode is unrecoverable (row 1) |
+| **No escalation-score state**                                     | The decay rule in §4.3 is unimplementable after any recovery                                                                                                                                                                                                                       |
+| **`S_reg` not stored** (§4)                                       | The burn base does not exist on-chain                                                                                                                                                                                                                                              |
+| **No suitable burn primitive**                                    | `GTokenStaking.slashByDVT` is `authorizedSlashers`-gated and takes a **caller-supplied amount** (`:498,:504`) — the opposite shape of a permissionless, self-computing leak                                                                                                        |
+| **Nobody is paid to call `settle`**                               | Accrual can be a pure function of time and be _realised_ later — but nothing is realised until someone pays gas, so with no incentive the penalty exists on paper and never moves stake. **Accrual ≠ realisation**; the design needs both                                          |
 
 **Minimum additional state before this is specifiable:**
 `offlineSinceBlock(op)`, `lastSettledPeriod(op)` or a cumulative penalty debt, a
 stored `S_reg` with defined top-up/re-registration semantics, an escalation
-score with decay, and an explicit decision on **whether `attestLiveness` settles
-outstanding debt before updating `lastLive`** (it must, or the evasion in row 1
-stands).
+score with decay, and an explicit decision on **how `attestLiveness` preserves
+outstanding debt before it overwrites `lastLive`** — it must _crystallise_ the
+accrued amount into a debt slot, **not necessarily settle it inline**: burning
+inside the attestation path couples liveness to a token transfer and invites a
+revert/DoS vector where a node cannot re-attest at all. Something must happen
+there, or the evasion in row 1 stands).
 
 **Invariants to pin down at the same time:** idempotency of `settle`, behaviour
 under reorgs, whether partial periods accrue pro rata or only on completion,
@@ -267,8 +281,10 @@ If reused: define the units explicitly (basis points), validate bounds on-chain,
 version the interface, and migrate the values deliberately.
 
 > ⚠️ **Name collision — always write these fully qualified.**
-> `RoleConfig.slashThreshold` (uint32, per role, `= 10`, **error count**, dead)
-> vs `BLSAggregator.slashThresholds[level]` (uint8, per severity, `= 2/3/3`,
+> `RoleConfig.slashThreshold` (uint32, per role, `= 10`, glossed in a 2025-12-20
+> comment as 惩罚触发阈值 / error count but **read by no code, so its units are
+> as undefined as the rest of the group**, dead) vs
+> `BLSAggregator.slashThresholds[level]` (uint8, per severity, `= 2/3/3`,
 > **signature count**, live). Two sessions have already talked past each other
 > on this.
 
@@ -281,7 +297,7 @@ version the interface, and migrate the values deliberately.
 | 3   | JAIL enforcement wired (a consumer that excludes an offline operator) | ❌ nothing reads `isOffline` for eligibility (§3)                                                                                                                                                                                                                                               |
 | 4   | registry address in node env + a first attestation                    | ❌ `AUDIT_LIVENESS_REGISTRY_ADDRESS` unset; `lastLive == 0` fleet-wide, so every operator currently reads `isOffline == true`. This one **is** just configuration — but it only enables _attesting_                                                                                             |
 | 5   | Plan A margin in place (§6)                                           | ❌ every operator holds exactly `minStake`                                                                                                                                                                                                                                                      |
-| 6   | attest cadence cross-checked against the on-chain window              | ❌ the default is 10 min (safe), but `MAX_INTERVAL_MS = 6h` (`liveness-keeper.service.ts:38`) permits a value **6× the 300-block window** with no validation, so a healthy node can be configured into permanent jail. The keeper already logs the window (`:147`); it does not enforce a ratio |
+| 6   | attest cadence cross-checked against the on-chain window              | ❌ the default is 10 min (safe), but `MAX_INTERVAL_MS = 6h` (`liveness-keeper.service.ts:40`) permits a value **6× the 300-block window** with no validation, so a healthy node can be configured into permanent jail. The keeper already logs the window (`:148`); it does not enforce a ratio |
 | 7   | the N gate                                                            | ❌ see [`SLASH_ROLLOUT_GATE.md`](../SLASH_ROLLOUT_GATE.md). **The margin buys time, not safety**: the count axis is still `minCommittee == activeCount == 3`, so an ejection at N=3 halts the stack however gently it was reached                                                               |
 
 ## 9. Open questions for SP
