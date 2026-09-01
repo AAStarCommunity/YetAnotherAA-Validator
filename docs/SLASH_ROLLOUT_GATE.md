@@ -132,8 +132,33 @@ The gates above cover **DVT originating a slash**. They do **not** cover:
 - **Guardian slashing** (`executeGuardianSlash`, armed 2026-09-04 via the
   fraud-proof verifier). That punishes _guardians who slashed unjustly_ — the
   appeal layer, not the enforcement layer. SP's three guardians have the same
-  zero margin and a MINOR threshold of 3 with exactly 3 registered, so slashing
-  any one of them takes SP's slash consensus below its own threshold.
+  zero margin, and MINOR's **slash** threshold is 3 with exactly 3 registered,
+  so slashing any one of them takes SP's slash consensus below its own
+  threshold.
+
+  > Do not generalise that to "all thresholds are 3". Verified on-chain
+  > 2026-09-01 on **both** aggregators: `slashThresholds[0,1,2] = 2,3,3` but
+  > `defaultThreshold = 7`, with only **3** validators registered (slots 1-3; 4+
+  > are zero). `defaultThreshold` governs the non-slash paths, so **the
+  > reputation-batch and generic-proposal paths cannot execute at all today** —
+  > `_checkSignatures` reverts `InvalidSignatureCount(3, 7)` before any
+  > signature is examined. Pre-existing configuration, not a result of the
+  > aggregator rotation. It does not affect DVT (the committee validator does
+  > its own BLS verification via the EIP-2537 precompiles and never routes
+  > through SP's threshold), and it does not change the slash-path conclusion
+  > above.
+
+- **A guardian's duties are broader than "sign slash proposals"** — which is
+  what makes the note above load-bearing rather than trivia. `BLSAggregator` has
+  three BLS-threshold entry points (`queueSlashWithConsensus`,
+  `verifyAndExecute` — whose reputation branch uses `defaultThreshold` — and
+  `executeProposal`), and all three reconstruct the signer set from the **same**
+  `validatorAtSlot` registry. So the correct statement is _not_ "guardians have
+  no routine duty"; it is **"the routine duties are currently unexecutable
+  because `defaultThreshold` (7) exceeds the registered count (3)"**.
+  `setDefaultThreshold` is one owner transaction away from making them live, at
+  which point guardian keys must be online. The two statements license very
+  different architecture decisions.
 - **Anything SP does on its own** with `slashByDVT` / `executeSlashWithBLS`.
 
 So "slashing is off" is precise only for the DVT-originated path. Say it that
