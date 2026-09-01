@@ -3,8 +3,11 @@
 > **Status: slashing is OFF, and that is a deliberate decision, not an
 > oversight.**
 >
-> This document records the OBJECTIVE state as of 2026-09-01 and the node-count
-> thresholds that govern when it may be turned on. For _how_ each rule works and
+> This document records the state **as observed on 2026-09-01** and the
+> node-count thresholds that govern when it may be turned on. The deployment
+> readings here are recorded observations, **not pinned reproducible evidence**
+> (no block numbers were captured — see the warning in §1); the threshold
+> arithmetic, which is derived from source, is. For _how_ each rule works and
 > why it was classified the way it was, see
 > [`AUDIT_SLASH_MODEL.md`](./AUDIT_SLASH_MODEL.md). This file answers a
 > different question: **at what network size does slashing stop being
@@ -12,8 +15,16 @@
 
 ## 1. Why the gate exists: at N=3 one slash stops the whole network
 
-Verified on-chain 2026-09-01 (`AAStarCommitteeValidator`
-`0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9`):
+Read on 2026-09-01 (Sepolia, chainId 11155111, `AAStarCommitteeValidator`
+`0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9`; getters `minStake()`,
+`minCommittee()`, `requiredQuorum()`, `activeNodeIdsSorted().length`, and
+`Registry.getEffectiveStake(op, ROLE_DVT)` per operator).
+
+> ⚠️ **This is a recorded observation, NOT reproducible evidence.** No block
+> number or transaction hash was captured, so nothing below can be independently
+> re-derived, and deployment values drift. **Do not treat these numbers as a
+> standing fact or as an audit record** — re-read them with the recipe in §5
+> before acting, and capture a block number when you do.
 
 ```
 minStake        30e18        every operator's effectiveStake   30e18   ← margin 0
@@ -22,8 +33,8 @@ requiredQuorum  2
 ```
 
 The eligibility predicate is `getEffectiveStake(op, ROLE_DVT) >= minStake`.
-Because stake equals the threshold exactly, **a slash of one wei disqualifies a
-node at the next snapshot**, and then:
+Because stake equals the threshold exactly, **any reduction at all disqualifies
+a node at the next snapshot**, and then:
 
 ```
 epochSetCount 2  <  minCommittee 3
@@ -37,6 +48,13 @@ mechanism working as designed is indistinguishable, from the outside, from a
 total outage.
 
 This is a property of N=3, not of the mechanism — see the table below.
+
+> 📌 **Read §6 before quoting this section.** The zero margin measured above is
+> real, but "a slash" is the wrong subject: `getEffectiveStake` returns the
+> **GToken** role lock, and the DVT-originated operator slash burns **aPNTs**
+> (capped at 30%), never touching it. §6 enumerates which paths can actually
+> lower this quantity — and why the gate recommendation survives the correction
+> anyway.
 
 ## 2. The deployed curve, and the three thresholds it creates
 
@@ -141,19 +159,44 @@ against a partial slash and do nothing against a full slash or a voluntary exit.
 Slashing is not merely "not used" — it is gated in code, which is stronger than
 a policy promise:
 
-| gate                        | location                                                                          | default                                                        |
-| --------------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `AUDIT_ENABLED`             | `src/config/configuration.ts`                                                     | **false**                                                      |
-| second arm (`executeSlash`) | `src/config/configuration.ts:247-251`                                             | **false** — "nothing is auto-slashed until explicitly enabled" |
-| `AUDIT_DRY_RUN`             | same                                                                              | drill mode, no broadcast                                       |
-| rule ① credit-over-limit    | retired by design review (PR #205)                                                | not a slash rule                                               |
-| rule ③ over-issue           | retired by design review (PR #205)                                                | on-chain credibility view                                      |
-| rule ② offline              | present, but needs an objective on-chain liveness signal SP has not built (CC-29) | cannot slash today                                             |
-| rule ④ proof-forgery        | closed as non-slashing                                                            | prevented, not punished                                        |
+| gate                        | location                                                                                                                                                                                                                                                                                                                                                                                                                                   | default                                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `AUDIT_ENABLED`             | `src/config/configuration.ts`                                                                                                                                                                                                                                                                                                                                                                                                              | **false**                                                                              |
+| second arm (`executeSlash`) | `src/config/configuration.ts:247-251`                                                                                                                                                                                                                                                                                                                                                                                                      | **false** — "nothing is auto-slashed until explicitly enabled"                         |
+| `AUDIT_DRY_RUN`             | same                                                                                                                                                                                                                                                                                                                                                                                                                                       | drill mode, no broadcast                                                               |
+| rule ① credit-over-limit    | retired by design review (PR #205)                                                                                                                                                                                                                                                                                                                                                                                                         | not a slash rule                                                                       |
+| rule ③ over-issue           | retired by design review (PR #205)                                                                                                                                                                                                                                                                                                                                                                                                         | on-chain credibility view                                                              |
+| rule ② offline              | **intended to burn GToken as a duration-tiered LEAK, with jail as a parallel layer over the same interval** (Jason, 2026-09-02). Intended to settle by computation, so it would never enter this pipeline. CC-29 `LivenessRegistry` IS deployed (Sepolia `0x02d841F7…`, window 300 blocks); the settlement state a leak needs is **not started** — see [`design/offline-penalty-escalation.md` §5](./design/offline-penalty-escalation.md) | cannot penalise today — a capability gap, NOT a decision that liveness is unpunishable |
+| rule ④ proof-forgery        | closed as non-slashing                                                                                                                                                                                                                                                                                                                                                                                                                     | prevented, not punished                                                                |
 
-**Two of the four rules were retired, one is blocked on an upstream signal that
-does not exist, and the fourth was deliberately closed. The origination path for
-a slash is therefore empty today even if both flags were flipped.**
+**Two of the four rules were retired, one has no origination path in this
+pipeline at all (rule ② is intended as a leak — settled by computation and
+filing no proposal, though no settlement mechanism has been built), and the
+fourth was deliberately closed. The origination path for a voted slash is
+therefore empty today even if both flags were flipped.**
+
+> ⚠️ **Do not read that as "this architecture has nothing worth punishing."**
+> Jason ruled the opposite on 2026-09-01:
+> _"存活时间就是最典型的可罚行为…但可以设定不同的时限、slash 不同的额度,这一定要有"_
+> — liveness **is** the archetypal punishable behaviour, tiered by outage
+> duration, with jail running as a parallel layer over the same interval and
+> providing the self-heal path. Rule ② is therefore an **open design item**, not
+> a closed question. The empty origination path above is a statement about
+> today's capability, not about intent.
+>
+> Note the shape, though: the intended design would settle that penalty **by
+> computation, with no quorum vote**, so it would not travel this origination
+> path at all. **"Intended" is load-bearing — no settlement mechanism exists,
+> and designing one is itself unstarted work.** It is a **leak**, not a slash,
+> and
+> [`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md)
+> is authoritative on it. What blocks it today is the settlement state described
+> in its §5, not the flags in this table.
+>
+> The same correction applies to the framing of **stake itself**. Stake is an
+> anti-sybil admission cost — Jason: _"废话,这还用说吗?肯定是反女巫有成本的"_ —
+> **and** it is punishment collateral. Those are not exclusive, and §6 records
+> the counterexample that proves the second half is load-bearing.
 
 ### What this does NOT gate
 
@@ -166,11 +209,12 @@ The gates above cover **DVT originating a slash**. They do **not** cover:
   so slashing any one of them takes SP's slash consensus below its own
   threshold.
 
-  > Do not generalise that to "all thresholds are 3". Verified on-chain
-  > 2026-09-01 on **both** aggregators: `slashThresholds[0,1,2] = 2,3,3` but
-  > `defaultThreshold = 7`, with only **3** validators registered (slots 1-3; 4+
-  > are zero). `defaultThreshold` governs the non-slash paths, so **the
-  > reputation-batch and generic-proposal paths cannot execute at all today** —
+  > Do not generalise that to "all thresholds are 3". Read on 2026-09-01
+  > (unpinned — no block number captured, same caveat as §1) on **both**
+  > aggregators: `slashThresholds[0,1,2] = 2,3,3` but `defaultThreshold = 7`,
+  > with only **3** validators registered (slots 1-3; 4+ are zero).
+  > `defaultThreshold` governs the non-slash paths, so **the reputation-batch
+  > and generic-proposal paths cannot execute at all today** —
   > `_checkSignatures` reverts `InvalidSignatureCount(3, 7)` before any
   > signature is examined. Pre-existing configuration, not a result of the
   > aggregator rotation. It does not affect DVT (the committee validator does
@@ -226,3 +270,183 @@ the call does not.
 3. **`minCommittee` must still match the intended floor for the new N.** It is
    not automatic — `setMinCommittee` floors it at 3 and nothing raises it as the
    pool grows.
+
+## 6. The stake buffer: it exists, on the wrong asset
+
+> **Corrected 2026-09-02.** An earlier revision of this section said the 30%
+> buffer "does not exist in either repo". That was wrong, and the reason is
+> worth recording: the first search used
+> `MIN_STAKE_RATIO|SLASH_*_PCT| remainingRatio|stakeRatio` and the cap is
+> written as a bare `* 3000 / BPS_DENOMINATOR`. **The search term was too
+> narrow, not the mechanism absent.** Credit to superpaymaster-b6 for re-running
+> it.
+
+Jason's recollection — a slash does not take a node offline on its own, only a
+burn past ~30% does — **is real code**. It just does not protect the asset that
+DVT eligibility reads. Verified 2026-09-02 by reading the SP contracts directly:
+
+### The three paths, and the assets they touch
+
+| path                                            | call chain                                                                                                      | asset burned                             | cap                                |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ---------------------------------- |
+| **operator slash** (DVT-originated)             | `BLSAggregator._executeSlash` `:1453` → `SP.executeSlashWithBLS` → `_slash(applyCap=true)`                      | `config.aPNTsBalance` (aPNTs inside SP)  | **30%** — `SuperPaymaster.sol:986` |
+| **guardian slash** (`executeGuardianSlash`)     | `BLSAggregator:2019` → `GTokenStaking.slashByDVT(guardian, ROLE_DVT, amount, "DVT collusion")`                  | `roleLocks[guardian][ROLE_DVT]` (GToken) | **none — hardcoded 100%** (below)  |
+| **eligibility read** (what gates the committee) | `AAStarValidator.sol:950` → `Registry.getEffectiveStake` `:264` → `GTOKEN_STAKING.getLockedStake(user, roleId)` | — reads the **GToken role lock**         | —                                  |
+
+```solidity
+// SuperPaymaster.sol:984-989 — the buffer that DOES exist
+if (applyCap) {
+    // V3.6 SECURITY: Enforce 30% Slash Hardcap for automated (BLS/DVT) slashing
+    uint256 maxSlash = (uint256(config.aPNTsBalance) * 3000) / BPS_DENOMINATOR;
+    if (penaltyAmount > maxSlash) { penaltyAmount = maxSlash; ... }
+}
+```
+
+**So the cap is on aPNTs; the committee gate reads GToken.** The one existing
+buffer cannot protect committee eligibility, because it is not applied to the
+quantity `getEffectiveStake` returns.
+
+### Guardian slashing is not "uncapped" — it is hardcoded to the full lock
+
+Sharper than "the guardian path has no 30% cap". Reading
+`BLSAggregator:2003-2021`:
+
+```solidity
+(uint128 amount,,,, ) = staking.roleLocks(guardian, roleDvt);
+if (amount == 0) { /* already exited — settle and skip */ }
+try IGTokenStakingSlash(address(staking)).slashByDVT(
+    guardian, roleDvt, uint256(amount), "DVT collusion"   // ← the ENTIRE remaining lock
+)
+```
+
+The penalty argument **is** the whole remaining lock. So `lock.amount == 0` is
+reached **by construction on every successful guardian slash**, which fires
+`GTokenStaking._removeUserRole` (`GTokenStaking.sol:526`) — the guardian does
+not fall below `minStake`, it **loses ROLE_DVT outright, in the transaction that
+punishes it**. There is no partial-guardian-slash case to reason about; the
+contract cannot express one.
+
+### A second dead configuration: the tier table is already declared
+
+`IRegistry.RoleConfig` (`contracts/src/interfaces/v3/IRegistry.sol:48-51`)
+declares `slashThreshold / slashBase / slashInc / slashMax`, and ROLE_DVT
+carries live on-chain values `10 / 2 / 1 / 10`. Verified:
+`grep '\.slashBase|\.slashInc|\.slashMax'` over all of `contracts/src/` returns
+**zero** reads. **Declared, populated on-chain, read by nothing.**
+
+> ⚠️ **These are NOT percentages.** The interface documents them as slash
+> _amount_ / _increment_ / _maximum_ (`IRegistry.sol:32-35`), and because no
+> code reads them their units have **no executable definition at all**. An
+> earlier revision of this section glossed them as "base 2%, +1% per violation,
+> cap 10%"; that was archaeology dressed up as a citation. Any reuse must define
+> units explicitly (basis points), bounds-validate on-chain and migrate
+> deliberately. See
+> [`design/offline-penalty-escalation.md` §7](./design/offline-penalty-escalation.md).
+
+The field group is nonetheless shaped like the escalation table rule ② would
+need — but as a live-looking dead value it is worse than an absence: an operator
+inspecting the chain sees a configured escalation policy that no code path
+honours.
+
+> ⚠️ **Name collision, do not conflate.** `RoleConfig.slashThreshold` (uint32,
+> per-role, = 10) and `BLSAggregator.slashThresholds[level]` (uint8,
+> per-severity **signature count**, = 2/3/3 — the mapping quoted in §4) are
+> different quantities in different units with near-identical names.
+
+### What this changes about §1, and what it does not
+
+§1's **measurement** stands: `effectiveStake == minStake == 30e18`, margin zero.
+
+§1's **causal sentence** — "a slash of one wei disqualifies a node at the next
+snapshot" — needs narrowing. `slashByDVT` has exactly **one** call site in all
+of `contracts/src/`: the guardian path at `BLSAggregator:2019`. The
+DVT-originated operator slash never reaches GToken at all. So the paths that can
+actually lower what `getEffectiveStake` returns are:
+
+1. `executeGuardianSlash` — but §5.2 **requires** guardians and committee
+   operators to be disjoint address sets, so on a correctly-configured
+   deployment this removes a guardian, not a committee member;
+2. voluntary exit / unstake (`exitRole`, `unlockAndTransfer`);
+3. an owner-authorised slasher calling `slashByDVT` directly
+   (`setAuthorizedSlasher`, `GTokenStaking.sol:475`);
+4. raising `minStake` under a zero margin.
+
+**The gate recommendation is unchanged, for two reasons that survive the
+correction.** First, zero margin means _any_ of paths 1–4 halts the stack at N=3
+— the fragility is a property of the margin, not of which path exercises it.
+Second, arming rule ② would **create a new burn path**. Jason decided on
+2026-09-02 that it burns **GToken** — the very quantity the committee gate reads
+— so it lands squarely on the zero margin rather than beside it. (The rejected
+alternative is instructive: burning capped aPNTs would not touch committee
+eligibility at all, leaving an offline node its seat and the penalty toothless.)
+
+**Because GToken was chosen, the margin is the load-bearing part of the design,
+and §7's Plan A becomes a precondition of rule ② rather than a companion to
+it.**
+
+### Why the guardian counterexample settles how stake is described
+
+Guardian collusion is the case that settles §4's note on stake's dual nature. A
+quorum of guardians slashes an honest operator:
+
+- **the damage is real** — the operator's stake is burned;
+- **on-chain verification cannot stop it** — the BLS signatures are valid and
+  the quorum is met; the contract cannot distinguish consensus from collusion;
+- **prevention fails by construction** — a quorum is a quorum;
+- **but it is attributable** — `proposalSignersCommitment` pins the signer set.
+
+Objective + attributable + unpreventable is exactly the profile that requires
+_ex post_ punishment, which is why CC-89 / SP PR #370 built
+`executeGuardianSlash` at all. Stake being an anti-sybil admission cost does not
+answer this case; only stake-as-collateral does. **Both are true at once, and
+the design depends on the second.**
+
+And the self-cannibalisation is now measured, not inferred: a guardian slash
+burns 100% by construction → `_removeUserRole` → with SP's MINOR threshold at 3
+and exactly 3 guardians registered, punishing one takes SP's own slash consensus
+below its threshold. **The appeal layer eats the enforcement layer**, and no
+buffer stands in the way because the only buffer that exists is on the other
+asset.
+
+## 7. Decision: Plan A — raise the stake, keep the floor (Jason, 2026-09-02)
+
+Two options were put to Jason for creating a stake margin:
+
+|            | **A — operators stake 50, `minStake` stays 30** | B — eligibility floor = `minStake` × 60-70% |
+| ---------- | ----------------------------------------------- | ------------------------------------------- |
+| change     | **none — top up stake**                         | **redeploy the validator**                  |
+| margin     | 20 (40%)                                        | 9-12 (30-40%)                               |
+| sybil cost | still 50                                        | **diluted to 21**                           |
+| new joiner | not guaranteed (see gap below)                  | automatic                                   |
+
+**A is adopted.** B was rejected on three grounds: `AAStarValidator` is **not
+upgradeable** (plain `constructor`, no UUPS), so B costs a full redeploy plus
+re-registration so soon after the CC-115 candidate was deployed and verified; B
+quietly lowers the real anti-sybil cost to 0.7 × `minStake`; and A is the shape
+the Beacon Chain already uses (32 ETH to activate, 16 to eject).
+
+**A's gap, to be closed at the next redeploy, not now.** `_isStaked`
+(`AAStarValidator.sol:950`) is used for **both** registration and continued
+eligibility, so nothing stops a new operator from joining at exactly `minStake`
+with zero margin. "Everyone stakes 50" is therefore an **onboarding
+convention**, and it holds only while registration stays owner-gated
+(`requireStake = false`). Making it a mechanism means separate entry and
+ejection thresholds in the contract.
+
+**Also decided:** an offline penalty burns **GToken** (the staking asset), not
+aPNTs — which is why the margin above is the load-bearing part. The escalation
+design that consumes it is
+[`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md).
+
+> ⚠️ **The margin buys time, not safety.** It converts "one burn ejects a node"
+> into "eight periods of continuous downtime eject a node". It does **not**
+> touch the count axis (`minCommittee == activeCount == 3`), so an ejection at
+> N=3 still halts the stack. §3's gate stands unchanged.
+
+> ⚠️ **The margin does not protect guardians.** `BLSAggregator:2003` reads the
+> full remaining lock and passes it as the penalty, so staking 50 and staking 30
+> both end at zero. Capping the guardian path is a separate contract change.
+
+> ⚠️ **`setMinStake` has no timelock.** Under a restored margin this is less
+> immediately fatal, but a single owner transaction raising `minStake` still
+> disqualifies operators at the next snapshot. Worth a lock of its own.
