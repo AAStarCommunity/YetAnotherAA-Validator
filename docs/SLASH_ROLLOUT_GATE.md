@@ -3,8 +3,11 @@
 > **Status: slashing is OFF, and that is a deliberate decision, not an
 > oversight.**
 >
-> This document records the OBJECTIVE state as of 2026-09-01 and the node-count
-> thresholds that govern when it may be turned on. For _how_ each rule works and
+> This document records the state **as observed on 2026-09-01** and the
+> node-count thresholds that govern when it may be turned on. The deployment
+> readings here are recorded observations, **not pinned reproducible evidence**
+> (no block numbers were captured — see the warning in §1); the threshold
+> arithmetic, which is derived from source, is. For _how_ each rule works and
 > why it was classified the way it was, see
 > [`AUDIT_SLASH_MODEL.md`](./AUDIT_SLASH_MODEL.md). This file answers a
 > different question: **at what network size does slashing stop being
@@ -156,15 +159,15 @@ against a partial slash and do nothing against a full slash or a voluntary exit.
 Slashing is not merely "not used" — it is gated in code, which is stronger than
 a policy promise:
 
-| gate                        | location                                                                                                                                                                                                                                                                                                                                                                   | default                                                                                |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `AUDIT_ENABLED`             | `src/config/configuration.ts`                                                                                                                                                                                                                                                                                                                                              | **false**                                                                              |
-| second arm (`executeSlash`) | `src/config/configuration.ts:247-251`                                                                                                                                                                                                                                                                                                                                      | **false** — "nothing is auto-slashed until explicitly enabled"                         |
-| `AUDIT_DRY_RUN`             | same                                                                                                                                                                                                                                                                                                                                                                       | drill mode, no broadcast                                                               |
-| rule ① credit-over-limit    | retired by design review (PR #205)                                                                                                                                                                                                                                                                                                                                         | not a slash rule                                                                       |
-| rule ③ over-issue           | retired by design review (PR #205)                                                                                                                                                                                                                                                                                                                                         | on-chain credibility view                                                              |
-| rule ② offline              | **intended to burn GToken as a duration-tiered LEAK, executed as jail** (Jason, 2026-09-02). Settled by computation, so it never enters this pipeline. CC-29 `LivenessRegistry` IS deployed (Sepolia `0x02d841F7…`, window 300 blocks), but the settlement state it needs is not — see [`design/offline-penalty-escalation.md` §5](./design/offline-penalty-escalation.md) | cannot penalise today — a capability gap, NOT a decision that liveness is unpunishable |
-| rule ④ proof-forgery        | closed as non-slashing                                                                                                                                                                                                                                                                                                                                                     | prevented, not punished                                                                |
+| gate                        | location                                                                                                                                                                                                                                                                                                                                                                                                                                   | default                                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `AUDIT_ENABLED`             | `src/config/configuration.ts`                                                                                                                                                                                                                                                                                                                                                                                                              | **false**                                                                              |
+| second arm (`executeSlash`) | `src/config/configuration.ts:247-251`                                                                                                                                                                                                                                                                                                                                                                                                      | **false** — "nothing is auto-slashed until explicitly enabled"                         |
+| `AUDIT_DRY_RUN`             | same                                                                                                                                                                                                                                                                                                                                                                                                                                       | drill mode, no broadcast                                                               |
+| rule ① credit-over-limit    | retired by design review (PR #205)                                                                                                                                                                                                                                                                                                                                                                                                         | not a slash rule                                                                       |
+| rule ③ over-issue           | retired by design review (PR #205)                                                                                                                                                                                                                                                                                                                                                                                                         | on-chain credibility view                                                              |
+| rule ② offline              | **intended to burn GToken as a duration-tiered LEAK, with jail as a parallel layer over the same interval** (Jason, 2026-09-02). Intended to settle by computation, so it would never enter this pipeline. CC-29 `LivenessRegistry` IS deployed (Sepolia `0x02d841F7…`, window 300 blocks); the settlement state a leak needs is **not started** — see [`design/offline-penalty-escalation.md` §5](./design/offline-penalty-escalation.md) | cannot penalise today — a capability gap, NOT a decision that liveness is unpunishable |
+| rule ④ proof-forgery        | closed as non-slashing                                                                                                                                                                                                                                                                                                                                                                                                                     | prevented, not punished                                                                |
 
 **Two of the four rules were retired, one has no origination path in this
 pipeline at all (rule ② is a leak — settled by computation, filing no proposal),
@@ -179,9 +182,11 @@ is therefore empty today even if both flags were flipped.**
 > an **open design item**, not a closed question. The empty origination path
 > above is a statement about today's capability, not about intent.
 >
-> Note the shape, though: the adopted design settles that penalty **by
-> computation, with no quorum vote** — so it would not travel this origination
-> path at all. It is a **leak**, not a slash, and
+> Note the shape, though: the intended design would settle that penalty **by
+> computation, with no quorum vote**, so it would not travel this origination
+> path at all. **"Intended" is load-bearing — no settlement mechanism exists,
+> and designing one is itself unstarted work.** It is a **leak**, not a slash,
+> and
 > [`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md)
 > is authoritative on it. What blocks it today is the settlement state described
 > in its §5, not the flags in this table.
@@ -202,11 +207,12 @@ The gates above cover **DVT originating a slash**. They do **not** cover:
   so slashing any one of them takes SP's slash consensus below its own
   threshold.
 
-  > Do not generalise that to "all thresholds are 3". Verified on-chain
-  > 2026-09-01 on **both** aggregators: `slashThresholds[0,1,2] = 2,3,3` but
-  > `defaultThreshold = 7`, with only **3** validators registered (slots 1-3; 4+
-  > are zero). `defaultThreshold` governs the non-slash paths, so **the
-  > reputation-batch and generic-proposal paths cannot execute at all today** —
+  > Do not generalise that to "all thresholds are 3". Read on 2026-09-01
+  > (unpinned — no block number captured, same caveat as §1) on **both**
+  > aggregators: `slashThresholds[0,1,2] = 2,3,3` but `defaultThreshold = 7`,
+  > with only **3** validators registered (slots 1-3; 4+ are zero).
+  > `defaultThreshold` governs the non-slash paths, so **the reputation-batch
+  > and generic-proposal paths cannot execute at all today** —
   > `_checkSignatures` reverts `InvalidSignatureCount(3, 7)` before any
   > signature is examined. Pre-existing configuration, not a result of the
   > aggregator rotation. It does not affect DVT (the committee validator does

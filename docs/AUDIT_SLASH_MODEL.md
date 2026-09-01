@@ -46,12 +46,15 @@ The two are independent. Credit/spending limits are a **sign-gate** concern
 > evidence, not **liveness** as an offence. CC-29's on-chain `isOffline(op)`
 > (`block.number - lastLive > window`, with never-attested ⇒ `true`) is a far
 > better signal than a heartbeat. So stake loss and JAIL are **not
-> alternatives** for liveness: jail is how the penalty is _executed and
-> unwound_, and a duration-tiered stake burn is the penalty itself.
+> alternatives** for liveness — they are **two independent layers on one time
+> axis**: jail removes the node from service while it is offline, and the burn
+> accrues over that same interval. Neither carries out the other; jail alone
+> takes no stake, and a burn alone would leave an unreachable node sitting in
+> the quorum.
 >
-> **Terminology:** that burn is a **leak**, not a slash — it is settled by
-> computation, not by a quorum vote, so none of the voted-slash machinery
-> applies.
+> **Terminology:** that burn is a **leak**, not a slash — it is _intended_ to be
+> settled by computation rather than by a quorum vote, so none of the
+> voted-slash machinery applies. "Intended": no settlement mechanism exists yet.
 > [`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md)
 > is authoritative on this rule; §3.2 below is a summary that defers to it.
 >
@@ -62,12 +65,12 @@ The two are independent. Credit/spending limits are a **sign-gate** concern
 
 ## 3. The four rules — final handling
 
-| #   | Rule              | Handling                                                      | Why                                                                                                                                                                           |
-| --- | ----------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ①   | credit-over-limit | **sign-gate REFUSE** (not slash)                              | an individual over their limit is refused at sign time; slashing an _operator's_ stake for a member's credit is wrong                                                         |
-| ②   | offline           | **tiered LEAK + jail** — DESIGN SKETCH, see §3.2              | liveness is the archetypal punishable behaviour (Jason, 2026-09-01); jail is the execution/recovery path, not a substitute for the penalty. Unbuilt: needs CC-29 + the N gate |
-| ③   | over-issue        | **on-chain credibility score** (not slash, not DVT-disclosed) | `credibilityScore()`/`isOverIssued()` are auto-computed on-chain views; consumers read them directly                                                                          |
-| ④   | proof-forgery     | **not done**                                                  | co-sign re-verification + on-chain aggregate rejection already block forged slashes; residual spam → reputation                                                               |
+| #   | Rule              | Handling                                                      | Why                                                                                                                                                                                                                                |
+| --- | ----------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ①   | credit-over-limit | **sign-gate REFUSE** (not slash)                              | an individual over their limit is refused at sign time; slashing an _operator's_ stake for a member's credit is wrong                                                                                                              |
+| ②   | offline           | **tiered LEAK + jail** — DESIGN SKETCH, see §3.2              | liveness is the archetypal punishable behaviour (Jason, 2026-09-01); jail and the burn are parallel layers, not one executing the other. CC-29 IS deployed — what is missing is the settlement state a leak needs, plus the N gate |
+| ③   | over-issue        | **on-chain credibility score** (not slash, not DVT-disclosed) | `credibilityScore()`/`isOverIssued()` are auto-computed on-chain views; consumers read them directly                                                                                                                               |
+| ④   | proof-forgery     | **not done**                                                  | co-sign re-verification + on-chain aggregate rejection already block forged slashes; residual spam → reputation                                                                                                                    |
 
 ### ② offline — tiered leak + jail (DESIGN SKETCH, not built, not yet specifiable)
 
@@ -81,13 +84,13 @@ asked directly:
 
 So the intended shape is:
 
-| element   | intent                                                                                                                      |
-| --------- | --------------------------------------------------------------------------------------------------------------------------- |
-| offence   | cumulative downtime beyond a threshold, measured on-chain                                                                   |
-| evidence  | CC-29 `LivenessRegistry` — but see §5 of the design doc: the registry's **current state is not sufficient** to settle money |
-| penalty   | **a LEAK — a stake burn tiered by outage duration**, settled by computation, **not** by a BLS-quorum vote                   |
-| execution | jail: fee stopped + excluded from the active set (both unbuilt)                                                             |
-| recovery  | self-healing — attest liveness again and the node re-enters the set                                                         |
+| element   | intent                                                                                                                                                                         |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| offence   | **continuous** downtime past the liveness window, counted in escalation periods, the escalation level decaying during uptime (design doc §4) — NOT a lifetime cumulative total |
+| evidence  | CC-29 `LivenessRegistry` — but see §5 of the design doc: the registry's **current state is not sufficient** to settle money                                                    |
+| penalty   | **a LEAK — a stake burn tiered by outage duration**, settled by computation, **not** by a BLS-quorum vote                                                                      |
+| execution | jail: fee stopped + excluded from the active set (both unbuilt)                                                                                                                |
+| recovery  | self-healing — attest liveness again and the node re-enters the set                                                                                                            |
 
 > **This rule does NOT travel the §5 playbook.** It files no proposal, gathers
 > no co-signatures and produces no slash message. Everything below about pinned
@@ -124,13 +127,20 @@ Five things are missing before this can be specified, let alone armed:
 
 2. **The tier table does not exist.** "不同的时限、不同的额度" needs concrete
    (duration → burn) rows with **explicitly defined units**, and they must be
-   **on-chain governance values** so that every observer recomputes the same
-   settlement — not because a quorum has to agree on a message (there is no
-   quorum here), but because a permissionless settlement whose result depends on
-   who calls it is not a settlement. Today DVT's only offline threshold is the
-   hard-coded, version-bound `OFFLINE_THRESHOLD_MS = 600_000`
-   (`audit.service.ts:66`) — a gossip wall-clock number that deliberately enters
-   the proofHash of the _voted_ pipeline. It is **not** a candidate tier source.
+   **on-chain governance values with versioned activation blocks, or snapshotted
+   into the outage episode**. On-chain alone is NOT sufficient: `livenessWindow`
+   and any tier value are mutable with immediate effect (the registry stores
+   only the _current_ window, `LivenessRegistry.sol:33`), so if governance moves
+   a parameter between the outage and its settlement, **the caller's timing
+   selects which parameter set applies** — the very caller-dependence the leak
+   exists to avoid. The requirement is not "on-chain", it is **"reconstructible
+   for the epoch being charged"**. And not because a quorum has to agree on a
+   message (there is no quorum here), but because a permissionless settlement
+   whose result depends on who calls it is not a settlement. Today DVT's only
+   offline threshold is the hard-coded, version-bound
+   `OFFLINE_THRESHOLD_MS = 600_000` (`audit.service.ts:66`) — a gossip
+   wall-clock number that deliberately enters the proofHash of the _voted_
+   pipeline. It is **not** a candidate tier source.
 3. **The asset is decided — GToken (Jason, 2026-09-02) — and that is what makes
    the margin load-bearing.** The two deployed burn paths hit different assets:
    DVT-originated operator slashing burns SP-held **aPNTs** (capped at 30%,
@@ -277,7 +287,8 @@ waking a slash never needs new execution contracts, only (sometimes) a new
 
 > ⚠️ **This worked example predates the 2026-09-02 design and no longer
 > describes the intended rule.** It frames offline as a quorum-voted DVT slash;
-> the adopted shape is a **permissionlessly-settled leak with no quorum at all**
+> the **intended** shape is a permissionlessly-settled leak with no quorum at
+> all — a sketch, not a built or fully specified mechanism
 > ([`design/offline-penalty-escalation.md`](./design/offline-penalty-escalation.md)).
 > It survives only as an illustration of how the generic **voted-rule** playbook
 > is applied. **Do not read its analysis as applying to the leak** — its
