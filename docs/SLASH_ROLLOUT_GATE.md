@@ -12,15 +12,16 @@
 
 ## 1. Why the gate exists: at N=3 one slash stops the whole network
 
-Verified on-chain 2026-09-01 (Sepolia, chainId 11155111,
-`AAStarCommitteeValidator` `0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9`; getters
-`minStake()`, `minCommittee()`, `requiredQuorum()`,
-`activeNodeIdsSorted().length`, and `Registry.getEffectiveStake(op, ROLE_DVT)`
-per operator).
+Read on 2026-09-01 (Sepolia, chainId 11155111, `AAStarCommitteeValidator`
+`0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9`; getters `minStake()`,
+`minCommittee()`, `requiredQuorum()`, `activeNodeIdsSorted().length`, and
+`Registry.getEffectiveStake(op, ROLE_DVT)` per operator).
 
-> ⚠️ **Deployment values drift and this record pins no block number.** Re-read
-> them with the recipe in §5 before acting on them; treat the numbers below as
-> the state on that date, not as a standing fact.
+> ⚠️ **This is a recorded observation, NOT reproducible evidence.** No block
+> number or transaction hash was captured, so nothing below can be independently
+> re-derived, and deployment values drift. **Do not treat these numbers as a
+> standing fact or as an audit record** — re-read them with the recipe in §5
+> before acting, and capture a block number when you do.
 
 ```
 minStake        30e18        every operator's effectiveStake   30e18   ← margin 0
@@ -155,19 +156,20 @@ against a partial slash and do nothing against a full slash or a voluntary exit.
 Slashing is not merely "not used" — it is gated in code, which is stronger than
 a policy promise:
 
-| gate                        | location                                                                                                                                                                                                                                                             | default                                                                             |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `AUDIT_ENABLED`             | `src/config/configuration.ts`                                                                                                                                                                                                                                        | **false**                                                                           |
-| second arm (`executeSlash`) | `src/config/configuration.ts:247-251`                                                                                                                                                                                                                                | **false** — "nothing is auto-slashed until explicitly enabled"                      |
-| `AUDIT_DRY_RUN`             | same                                                                                                                                                                                                                                                                 | drill mode, no broadcast                                                            |
-| rule ① credit-over-limit    | retired by design review (PR #205)                                                                                                                                                                                                                                   | not a slash rule                                                                    |
-| rule ③ over-issue           | retired by design review (PR #205)                                                                                                                                                                                                                                   | on-chain credibility view                                                           |
-| rule ② offline              | **intended to slash GToken** (duration-tiered, executed as jail — Jason, 2026-09-02). CC-29 `LivenessRegistry` IS deployed (Sepolia `0x02d841F7…`, window 300 blocks); still missing: the address in node env, a first attestation, a tier table, and a stake margin | cannot slash today — a capability gap, NOT a decision that liveness is unpunishable |
-| rule ④ proof-forgery        | closed as non-slashing                                                                                                                                                                                                                                               | prevented, not punished                                                             |
+| gate                        | location                                                                                                                                                                                                                                                                                                                                                                   | default                                                                                |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `AUDIT_ENABLED`             | `src/config/configuration.ts`                                                                                                                                                                                                                                                                                                                                              | **false**                                                                              |
+| second arm (`executeSlash`) | `src/config/configuration.ts:247-251`                                                                                                                                                                                                                                                                                                                                      | **false** — "nothing is auto-slashed until explicitly enabled"                         |
+| `AUDIT_DRY_RUN`             | same                                                                                                                                                                                                                                                                                                                                                                       | drill mode, no broadcast                                                               |
+| rule ① credit-over-limit    | retired by design review (PR #205)                                                                                                                                                                                                                                                                                                                                         | not a slash rule                                                                       |
+| rule ③ over-issue           | retired by design review (PR #205)                                                                                                                                                                                                                                                                                                                                         | on-chain credibility view                                                              |
+| rule ② offline              | **intended to burn GToken as a duration-tiered LEAK, executed as jail** (Jason, 2026-09-02). Settled by computation, so it never enters this pipeline. CC-29 `LivenessRegistry` IS deployed (Sepolia `0x02d841F7…`, window 300 blocks), but the settlement state it needs is not — see [`design/offline-penalty-escalation.md` §5](./design/offline-penalty-escalation.md) | cannot penalise today — a capability gap, NOT a decision that liveness is unpunishable |
+| rule ④ proof-forgery        | closed as non-slashing                                                                                                                                                                                                                                                                                                                                                     | prevented, not punished                                                                |
 
-**Two of the four rules were retired, one is blocked on an upstream signal that
-does not exist, and the fourth was deliberately closed. The origination path for
-a slash is therefore empty today even if both flags were flipped.**
+**Two of the four rules were retired, one has no origination path in this
+pipeline at all (rule ② is a leak — settled by computation, filing no proposal),
+and the fourth was deliberately closed. The origination path for a voted slash
+is therefore empty today even if both flags were flipped.**
 
 > ⚠️ **Do not read that as "this architecture has nothing worth punishing."**
 > Jason ruled the opposite on 2026-09-01:
@@ -320,15 +322,23 @@ contract cannot express one.
 
 `IRegistry.RoleConfig` (`contracts/src/interfaces/v3/IRegistry.sol:48-51`)
 declares `slashThreshold / slashBase / slashInc / slashMax`, and ROLE_DVT
-carries live on-chain values (`10 / 2 / 1 / 10` — the shape of "base 2%, +1% per
-violation, cap 10%"). Verified: `grep '\.slashBase|\.slashInc|\.slashMax'` over
-all of `contracts/src/` returns **zero** reads. **Declared, populated on-chain,
-read by nothing.**
+carries live on-chain values `10 / 2 / 1 / 10`. Verified:
+`grep '\.slashBase|\.slashInc|\.slashMax'` over all of `contracts/src/` returns
+**zero** reads. **Declared, populated on-chain, read by nothing.**
 
-That is roughly half the skeleton of rule ②'s tier table
-([`AUDIT_SLASH_MODEL.md` §3.2](./AUDIT_SLASH_MODEL.md)) — but as a live-looking
-dead value it is worse than an absence: an operator inspecting the chain sees a
-configured escalation policy that no code path honours.
+> ⚠️ **These are NOT percentages.** The interface documents them as slash
+> _amount_ / _increment_ / _maximum_ (`IRegistry.sol:32-35`), and because no
+> code reads them their units have **no executable definition at all**. An
+> earlier revision of this section glossed them as "base 2%, +1% per violation,
+> cap 10%"; that was archaeology dressed up as a citation. Any reuse must define
+> units explicitly (basis points), bounds-validate on-chain and migrate
+> deliberately. See
+> [`design/offline-penalty-escalation.md` §7](./design/offline-penalty-escalation.md).
+
+The field group is nonetheless shaped like the escalation table rule ② would
+need — but as a live-looking dead value it is worse than an absence: an operator
+inspecting the chain sees a configured escalation policy that no code path
+honours.
 
 > ⚠️ **Name collision, do not conflate.** `RoleConfig.slashThreshold` (uint32,
 > per-role, = 10) and `BLSAggregator.slashThresholds[level]` (uint8,
