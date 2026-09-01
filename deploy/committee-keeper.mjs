@@ -19,8 +19,12 @@ import { readFileSync } from "fs";
 const strip = s => s.replace(/^["']|["']$/g, "");
 const env = Object.fromEntries(
   readFileSync(".env.sepolia", "utf8")
-    .split("\n").filter(l => l.includes("="))
-    .map(l => { const i = l.indexOf("="); return [l.slice(0, i).trim(), strip(l.slice(i + 1).trim())]; })
+    .split("\n")
+    .filter(l => l.includes("="))
+    .map(l => {
+      const i = l.indexOf("=");
+      return [l.slice(0, i).trim(), strip(l.slice(i + 1).trim())];
+    })
 );
 // The process environment is consulted too, and FIRST. The env file here is an implicit default read
 // from the cwd, so an operator who sets SEPOLIA_RPC_URL on purpose should not be silently overridden by
@@ -29,7 +33,20 @@ const env = Object.fromEntries(
 const pick = (...names) => names.map(n => process.env[n] || env[n]).find(Boolean);
 const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
 const KEY = pick("KEEPER_PRIVATE_KEY", "PRIVATE_KEY");
-const VALIDATOR = process.env.COMMITTEE_VALIDATOR || env.COMMITTEE_VALIDATOR || "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
+// PRECEDENCE, copied from committee-health.mjs:138-147 rather than approximated. A validator from
+// the ENVIRONMENT is a deliberate act and outranks a router; one left behind in an env FILE is not.
+// Deleting the repository variable does not reach a stale .env.sepolia sitting next to a developer,
+// and letting that silently win reintroduces the very "pinned to an address nobody mounts" failure
+// this file exists to remove -- only harder to see, because the router would look configured.
+//
+// The first version of this change treated the file as explicit and let it beat the router, while
+// claiming in the same breath to mirror the health check. Measured with a stale file value and a
+// router set: keeper resolved the stale address, health resolved the router's. The tool that follows
+// the stale value is the one that SENDS TRANSACTIONS.
+const ROUTER = pick("COMMITTEE_ROUTER");
+const VALIDATOR_FROM_FILE = env.COMMITTEE_VALIDATOR;
+const VALIDATOR_EXPLICIT =
+  process.env.COMMITTEE_VALIDATOR || (ROUTER ? undefined : VALIDATOR_FROM_FILE);
 const WATCH = process.argv.includes("--watch");
 // keccak("snapshotEpoch(bytes32[])")[0:4] = 1ed58d67, the D2 stake-aware form, with the PUSH4 opcode
 // (0x63) solc always emits in front of a dispatcher selector. Matching the bare four bytes searches the
@@ -37,6 +54,46 @@ const WATCH = process.argv.includes("--watch");
 // exists in either real contract -- pr-daemon scanned ~86k hex chars of both and found none -- so this
 // is free hardening rather than a fix, but the selector scan decides which ABI we call, and a scan that
 // can drift off byte alignment is not the thing to leave loose.
+// Resolve the validator: EXPLICIT > derived from the router > fail loudly. There is deliberately no
+// hard-coded fallback. Until this existed both this script and committee-proofgen.mjs defaulted to
+// 0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64 -- which is now the RETIRED pre-D2 validator (verified:
+// `minCommittee()` reverts, `requiredQuorum()` returns the sentinel). So a keeper started without
+// COMMITTEE_VALIDATOR set would have spent gas pinning a dead stack while looking like it was working,
+// and a proofgen run would have rebuilt a tree against the wrong root. The old default was correct
+// when it was written; that is exactly the problem with a hard-coded copy of a fact that lives
+// somewhere else -- it does not fail when it goes stale, it just goes on being confidently wrong.
+// Same derivation as deploy/committee-health.mjs so the two never disagree about what is being watched.
+/// A configuration problem, as opposed to a transient one. The distinction matters in --watch: an RPC
+/// blip is temporary and retrying is the right answer, while a missing or wrong COMMITTEE_ROUTER is
+/// permanent and no amount of retrying fixes it. Until this existed both took the same path, so a
+/// keeper restarted with the wrong configuration logged `tick err` every 30s FOREVER instead of
+/// dying -- and the restart is exactly the case this file's no-default change is meant to protect.
+class FatalConfigError extends Error {}
+
+async function resolveValidator(provider, explicit, router) {
+  if (explicit) return ethers.getAddress(explicit);
+  if (!router) {
+    throw new FatalConfigError(
+      "no validator: set COMMITTEE_VALIDATOR, or COMMITTEE_ROUTER to derive it from algId 0x01.\n" +
+        "  There is no default on purpose -- the previous one is now the retired validator."
+    );
+  }
+  if (!ethers.isAddress(router))
+    throw new FatalConfigError(`COMMITTEE_ROUTER is not an address: ${router}`);
+  const r = new ethers.Contract(
+    router,
+    ["function getAlgorithm(uint8) view returns (address)"],
+    provider
+  );
+  const derived = await r.getAlgorithm(1);
+  if (derived === ethers.ZeroAddress) {
+    throw new FatalConfigError(
+      `router ${router} has no algorithm mounted at 0x01 -- nothing to watch`
+    );
+  }
+  return derived;
+}
+
 const D2_SNAPSHOT_SELECTOR = "631ed58d67";
 // keccak("snapshotEpoch()")[0:4] = e6bac5bb, the pre-D2 form, likewise behind its PUSH4.
 const LEGACY_SNAPSHOT_SELECTOR = "63e6bac5bb";
@@ -80,7 +137,10 @@ async function activeSet(v, provider) {
     return await activeSetFromEvents(v, provider);
   } catch (err) {
     const msg = err?.info?.responseBody || err?.shortMessage || err?.message || String(err);
-    console.warn("  event replay unavailable, falling back to activeNodeIdsSorted():", String(msg).slice(0, 160));
+    console.warn(
+      "  event replay unavailable, falling back to activeNodeIdsSorted():",
+      String(msg).slice(0, 160)
+    );
     const ids = await v.activeNodeIdsSorted();
     return [...ids];
   }
@@ -90,7 +150,9 @@ async function activeSetFromEvents(v, provider) {
   const head = await provider.getBlockNumber();
   const fromBlock = Number(process.env.DEPLOY_BLOCK ?? 0);
   if (!process.env.DEPLOY_BLOCK) {
-    console.warn("  keeper: DEPLOY_BLOCK unset — scanning from block 0 (set it to the validator's creation block)");
+    console.warn(
+      "  keeper: DEPLOY_BLOCK unset — scanning from block 0 (set it to the validator's creation block)"
+    );
   }
   // Configurable because providers cap eth_getLogs very differently: Alchemy's free tier allows a
   // TEN block range and rejects anything wider with a 400, which surfaced as ethers' opaque
@@ -104,7 +166,9 @@ async function activeSetFromEvents(v, provider) {
   const rawChunk = Number(process.env.LOGS_CHUNK ?? "");
   const CHUNK = Number.isInteger(rawChunk) && rawChunk > 0 ? rawChunk : 9000;
   if (process.env.LOGS_CHUNK && CHUNK !== rawChunk) {
-    console.warn(`  LOGS_CHUNK=${JSON.stringify(process.env.LOGS_CHUNK)} is not a positive integer — using ${CHUNK}`);
+    console.warn(
+      `  LOGS_CHUNK=${JSON.stringify(process.env.LOGS_CHUNK)} is not a positive integer — using ${CHUNK}`
+    );
   }
   const getLogsChunked = async filter => {
     const out = [];
@@ -117,34 +181,68 @@ async function activeSetFromEvents(v, provider) {
   const cleared = await getLogsChunked(v.filters.SlotCleared());
   // Strict LOG ORDER — ethers v6 exposes the intra-block position as `Log.index`; using the wrong
   // field yields NaN and leaves same-tx events in concatenation order, corrupting slot-rotation replay.
-  const mutations = [...assigned.map(e => ({ e, kind: "assign" })), ...cleared.map(e => ({ e, kind: "clear" }))]
-    .sort((a, b) =>
+  const mutations = [
+    ...assigned.map(e => ({ e, kind: "assign" })),
+    ...cleared.map(e => ({ e, kind: "clear" })),
+  ].sort(
+    (a, b) =>
       a.e.blockNumber - b.e.blockNumber ||
       a.e.transactionIndex - b.e.transactionIndex ||
-      a.e.index - b.e.index);
+      a.e.index - b.e.index
+  );
   const bySlot = new Map();
   for (const m of mutations) {
     const slot = BigInt(m.e.args.slot);
     if (m.kind === "assign") bySlot.set(slot, m.e.args.nodeId);
     else bySlot.delete(slot);
   }
-  const ids = [...bySlot.values()].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0));
+  const ids = [...bySlot.values()].sort((a, b) =>
+    BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0
+  );
   // Cross-check against the contract's own counter AT THE SAME HEAD: if these disagree the replay is
   // wrong and the snapshot would revert anyway — better to say so than to send a doomed transaction.
   const onChain = Number(await v.activeCount({ blockTag: head }));
   if (ids.length !== onChain) {
-    throw new Error(`active-set replay mismatch at block ${head}: ${ids.length} from events vs activeCount ${onChain}`);
+    throw new Error(
+      `active-set replay mismatch at block ${head}: ${ids.length} from events vs activeCount ${onChain}`
+    );
   }
   return ids;
 }
 
+// Resolved once, then reused. Re-deriving every tick would let the watched address change under a
+// long-running keeper without anything saying so -- the loop would silently start pinning a different
+// contract mid-run. One resolution, logged at startup, is the auditable version.
+let VALIDATOR = null;
+
 async function tick() {
   const provider = new ethers.JsonRpcProvider(RPC);
   const wallet = new ethers.Wallet(KEY, provider);
+  if (VALIDATOR === null) {
+    VALIDATOR = await resolveValidator(provider, VALIDATOR_EXPLICIT, ROUTER);
+    console.log(
+      "validator:",
+      VALIDATOR,
+      VALIDATOR_EXPLICIT
+        ? "(explicit COMMITTEE_VALIDATOR)"
+        : `(derived from router ${ROUTER} algId 0x01)`
+    );
+    if (ROUTER && VALIDATOR_FROM_FILE && !process.env.COMMITTEE_VALIDATOR) {
+      // Say it. A value being quietly ignored is how someone spends an hour wondering why their
+      // .env.sepolia has no effect -- and the whole point of the precedence rule is that the stale
+      // one loses, which is only useful if the person holding the stale file finds out.
+      console.log(
+        `           (${VALIDATOR_FROM_FILE} in the env file lost to the router — set COMMITTEE_VALIDATOR in the ENVIRONMENT to override)`
+      );
+    }
+  }
   const v = new ethers.Contract(VALIDATOR, ABI, wallet);
 
   const epochLength = await v.epochLength();
-  if (epochLength === 0n) { console.log(new Date().toISOString(), "epochLength=0 (committee OFF) — idle"); return; }
+  if (epochLength === 0n) {
+    console.log(new Date().toISOString(), "epochLength=0 (committee OFF) — idle");
+    return;
+  }
 
   const bn = BigInt(await provider.getBlockNumber());
   const e = bn / epochLength;
@@ -161,9 +259,15 @@ async function tick() {
   const deadline = start + (epochLength - 1n < 256n ? epochLength - 1n : 256n);
   const inWindow = bn > start && bn <= deadline;
 
-  if (usable) { console.log(new Date().toISOString(), `epoch ${e} already pinned (usable) — nothing to do`); return "ok"; }
+  if (usable) {
+    console.log(new Date().toISOString(), `epoch ${e} already pinned (usable) — nothing to do`);
+    return "ok";
+  }
   if (!inWindow) {
-    console.log(new Date().toISOString(), `epoch ${e}: block ${bn} outside pin window [${start + 1n}, ${deadline}] — cannot pin (self-heals next epoch)`);
+    console.log(
+      new Date().toISOString(),
+      `epoch ${e}: block ${bn} outside pin window [${start + 1n}, ${deadline}] — cannot pin (self-heals next epoch)`
+    );
     return "outside-window";
   }
   console.log(new Date().toISOString(), `epoch ${e}: pinning (block ${bn}, window ok)...`);
@@ -203,7 +307,10 @@ async function tick() {
     if (!hasStakeAware) console.log("  (pre-D2 validator: using the no-argument snapshotEpoch)");
     console.log("  snapshotEpoch tx:", tx.hash);
     const r = await tx.wait(1, 120000); // 120s timeout so a mispriced tx doesn't hang forever
-    if (!r) { console.warn("  pin tx not mined within timeout — retry next tick"); return "timeout"; }
+    if (!r) {
+      console.warn("  pin tx not mined within timeout — retry next tick");
+      return "timeout";
+    }
     console.log("  pinned in block", r.blockNumber, "status", r.status);
     return "pinned";
   } catch (err) {
@@ -233,19 +340,34 @@ async function tick() {
     let nowUsable = false;
     try {
       const at = { blockTag: await provider.getBlockNumber() };
-      const [p0, c0, cv] = await Promise.all([v.epochPinned(e, at), v.epochConfigVersion(e, at), v.configVersion(at)]);
+      const [p0, c0, cv] = await Promise.all([
+        v.epochPinned(e, at),
+        v.epochConfigVersion(e, at),
+        v.configVersion(at),
+      ]);
       stateKnown = true;
       nowUsable = p0 && c0 === cv;
     } catch {
-      console.log("  (could not read pin state at a fixed block — falling through to the revert text)");
+      console.log(
+        "  (could not read pin state at a fixed block — falling through to the revert text)"
+      );
     }
-    if (stateKnown && nowUsable) { console.log("  another keeper pinned it first (benign; verified on-chain)"); return "ok"; }
+    if (stateKnown && nowUsable) {
+      console.log("  another keeper pinned it first (benign; verified on-chain)");
+      return "ok";
+    }
     // Second chance ONLY when the chain could not be read. If the reads succeeded the chain already
     // answered definitively, and the revert text must not override it: an epoch pinned under a STALE
     // configVersion is legitimately re-pinnable, the contract's guard cannot produce "already pinned"
     // there (:387), so a node that says so would otherwise turn a genuine failure into `ok`. Gated on
     // READ FAILURE, not on !nowUsable -- the previous comment reconciled the ordering, not this.
-    if (!stateKnown && /already pinned/i.test(msg)) { console.log("  another keeper pinned it first (benign; from revert text, chain unreadable):", msg); return "ok"; }
+    if (!stateKnown && /already pinned/i.test(msg)) {
+      console.log(
+        "  another keeper pinned it first (benign; from revert text, chain unreadable):",
+        msg
+      );
+      return "ok";
+    }
     // A set change between the event replay and the transaction makes the list stale; the contract's
     // completeness check rejects it and the next tick rebuilds from a fresh head.
     if (/activeNodeIds length != activeCount|contains a non-member/i.test(msg)) {
@@ -256,11 +378,15 @@ async function tick() {
     if (/ineligible node in set/i.test(msg)) {
       const ids = await activeSet(v, provider).catch(() => []);
       const bad = [];
-      for (const id of ids) { if (!(await v.isEligibleForSnapshot(id).catch(() => true))) bad.push(id); }
+      for (const id of ids) {
+        if (!(await v.isEligibleForSnapshot(id).catch(() => true))) bad.push(id);
+      }
       // syncNode handles role/stake staleness; an in-flight ROLE_DVT exit notice needs syncExitNotice,
       // because SP keeps role AND stake intact for the whole notice and syncNode would revert.
-      console.error("  blocked by ineligible nodes — call syncNode (stake/role) or syncExitNotice (exit notice) on:",
-        bad.length ? bad : "(could not enumerate)");
+      console.error(
+        "  blocked by ineligible nodes — call syncNode (stake/role) or syncExitNotice (exit notice) on:",
+        bad.length ? bad : "(could not enumerate)"
+      );
       return "ineligible";
     }
     console.error("  snapshotEpoch FAILED:", msg);
@@ -269,11 +395,29 @@ async function tick() {
 }
 
 if (WATCH) {
-  console.log("keeper watching", VALIDATOR, "— Ctrl-C to stop");
-  const loop = async () => { try { await tick(); } catch (e) { console.error("tick err", e.shortMessage || e.message); } setTimeout(loop, 30000); };
+  console.log("keeper starting — Ctrl-C to stop (validator is resolved on the first tick)");
+  const loop = async () => {
+    try {
+      await tick();
+    } catch (e) {
+      if (e instanceof FatalConfigError) {
+        // Permanent. Exit so a supervisor restarts it (and fails visibly) rather than logging the
+        // same line every 30s while nothing is being pinned.
+        console.error("FATAL config error — not retrying:", e.message);
+        process.exit(1);
+      }
+      console.error("tick err", e.shortMessage || e.message);
+    }
+    setTimeout(loop, 30000);
+  };
   loop();
 } else {
   tick()
-    .then(status => { if (status === "error" || status === "timeout") process.exit(1); }) // cron/systemd must see failure
-    .catch(e => { console.error(e.shortMessage || e.message); process.exit(1); });
+    .then(status => {
+      if (status === "error" || status === "timeout") process.exit(1);
+    }) // cron/systemd must see failure
+    .catch(e => {
+      console.error(e.shortMessage || e.message);
+      process.exit(1);
+    });
 }

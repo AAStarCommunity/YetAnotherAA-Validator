@@ -144,7 +144,7 @@ a policy promise:
 | gate                        | location                                                                          | default                                                        |
 | --------------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------- |
 | `AUDIT_ENABLED`             | `src/config/configuration.ts`                                                     | **false**                                                      |
-| second arm (`executeSlash`) | `src/modules/audit/audit.service.ts`                                              | **false** — "nothing is auto-slashed until explicitly enabled" |
+| second arm (`executeSlash`) | `src/config/configuration.ts:247-251`                                             | **false** — "nothing is auto-slashed until explicitly enabled" |
 | `AUDIT_DRY_RUN`             | same                                                                              | drill mode, no broadcast                                       |
 | rule ① credit-over-limit    | retired by design review (PR #205)                                                | not a slash rule                                               |
 | rule ③ over-issue           | retired by design review (PR #205)                                                | on-chain credibility view                                      |
@@ -196,10 +196,33 @@ way.
 
 ## 5. Re-read this before turning it on
 
-1. `activeCount` and every operator's `effectiveStake` — the margin must be > 0
-   on **both** axes, not just the count.
-2. Whether committee operators and guardians are still disjoint address sets.
-   They are today (verified: 6 addresses, zero overlap), and that disjointness
-   is what stops `executeGuardianSlash` from taking down the committee. Merging
-   the roles couples the two failure modes.
-3. Whether `minCommittee` still matches the intended floor for the new N.
+Each item names **how to read it**, not what it read last time. Values drift;
+the call does not.
+
+1. **Both margins must be > 0** — the count axis and the stake axis, not just
+   the count.
+
+   ```
+   validator.activeNodeIdsSorted()                     -> bytes32[] nodeIds
+   validator.nodeOperator(nodeId)                      -> operator address
+   registry.getEffectiveStake(operator, ROLE_DVT)      -> must be STRICTLY > minStake()
+   validator.activeNodeIdsSorted().length              -> must be STRICTLY > minCommittee()
+   ROLE_DVT = keccak256("DVT")
+   ```
+
+2. **Committee operators and guardians must still be disjoint address sets.**
+   That disjointness is what stops `executeGuardianSlash` from taking down the
+   committee; merging the roles couples the two failure modes.
+
+   ```
+   committee: activeNodeIdsSorted() -> nodeOperator(id)      (the calls above)
+   guardians: blsAggregator.validatorAtSlot(1), (2), (3), AND (4)
+   ```
+
+   **Read slot 4 as well.** Reading only 1–3 confirms the three you expected and
+   cannot tell you a fourth was added; reading 4 turns "there are three
+   guardians" from an assumption into a measurement. (It is zero today.)
+
+3. **`minCommittee` must still match the intended floor for the new N.** It is
+   not automatic — `setMinCommittee` floors it at 3 and nothing raises it as the
+   pool grows.

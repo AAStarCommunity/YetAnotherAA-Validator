@@ -26,8 +26,13 @@ const strip = s => s.replace(/^["']|["']$/g, "");
 
 function loadEnv() {
   const env = Object.fromEntries(
-    readFileSync(".env.sepolia", "utf8").split("\n").filter(l => l.includes("="))
-      .map(l => { const i = l.indexOf("="); return [l.slice(0, i).trim(), strip(l.slice(i + 1).trim())]; })
+    readFileSync(".env.sepolia", "utf8")
+      .split("\n")
+      .filter(l => l.includes("="))
+      .map(l => {
+        const i = l.indexOf("=");
+        return [l.slice(0, i).trim(), strip(l.slice(i + 1).trim())];
+      })
   );
   return env;
 }
@@ -42,10 +47,12 @@ const ABI = [
 
 const zeros = (() => {
   const z = [ethers.ZeroHash];
-  for (let i = 0; i < TREE_DEPTH; i++) z.push(ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], [z[i], z[i]])));
+  for (let i = 0; i < TREE_DEPTH; i++)
+    z.push(ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], [z[i], z[i]])));
   return z;
 })();
-const hashPair = (a, b) => ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["bytes32", "bytes32"], [a, b]));
+const hashPair = (a, b) =>
+  ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["bytes32", "bytes32"], [a, b]));
 
 // Build the fixed-depth SMT from a slot->nodeId leaf map; return root + a proof-builder over it.
 function buildTree(leafMap) {
@@ -86,7 +93,8 @@ function buildTree(leafMap) {
 export async function reconstructFrozenTree(provider, validator, epoch) {
   const c = new ethers.Contract(validator, ABI, provider);
   const frozenRoot = await c.epochSetRoot(epoch);
-  if (frozenRoot === ethers.ZeroHash) throw new Error(`epoch ${epoch} not snapshotted (epochSetRoot==0)`);
+  if (frozenRoot === ethers.ZeroHash)
+    throw new Error(`epoch ${epoch} not snapshotted (epochSetRoot==0)`);
   const snapEvents = await c.queryFilter(c.filters.EpochSnapshotted(epoch));
   if (!snapEvents.length) throw new Error(`no EpochSnapshotted event for epoch ${epoch}`);
   const snapEvent = snapEvents[snapEvents.length - 1];
@@ -99,7 +107,10 @@ export async function reconstructFrozenTree(provider, validator, epoch) {
   // Chunked eth_getLogs from the deploy block (not 0): the log set only grows and RPCs cap by result
   // count (~10k). fromBlock defaults to DEPLOY_BLOCK env, else 0 with a warning.
   const fromBlock = Number(process.env.DEPLOY_BLOCK ?? 0);
-  if (!process.env.DEPLOY_BLOCK) console.warn("proofgen: DEPLOY_BLOCK unset — scanning from block 0 (set it to the validator's creation block for large histories)");
+  if (!process.env.DEPLOY_BLOCK)
+    console.warn(
+      "proofgen: DEPLOY_BLOCK unset — scanning from block 0 (set it to the validator's creation block for large histories)"
+    );
   const CHUNK = 9000;
   const getLogsChunked = async filter => {
     const out = [];
@@ -113,8 +124,13 @@ export async function reconstructFrozenTree(provider, validator, epoch) {
   const cleared = await getLogsChunked(c.filters.SlotCleared());
   // Strict LOG ORDER. ethers v6 renamed Log.logIndex -> Log.index; using the wrong field yields NaN and
   // leaves same-tx events in concatenation order (assign-before-clear), corrupting slot-rotation replays.
-  const mutations = [...assigned.map(e => ({ ...e, kind: "assign" })), ...cleared.map(e => ({ ...e, kind: "clear" }))]
-    .sort((a, b) => a.blockNumber - b.blockNumber || a.transactionIndex - b.transactionIndex || a.index - b.index);
+  const mutations = [
+    ...assigned.map(e => ({ ...e, kind: "assign" })),
+    ...cleared.map(e => ({ ...e, kind: "clear" })),
+  ].sort(
+    (a, b) =>
+      a.blockNumber - b.blockNumber || a.transactionIndex - b.transactionIndex || a.index - b.index
+  );
 
   // Contract semantics (CC-112 D2): snapshotEpoch freezes the LIVE set at the instant it executes.
   // Mutations EARLIER in the same block are therefore included, and mutations LATER in the same block
@@ -123,16 +139,25 @@ export async function reconstructFrozenTree(provider, validator, epoch) {
   for (const m of mutations) {
     const pos = [m.blockNumber, m.transactionIndex, m.index];
     if (pos[0] > snapPos[0]) continue;
-    if (pos[0] === snapPos[0] && (pos[1] > snapPos[1] || (pos[1] === snapPos[1] && pos[2] > snapPos[2]))) continue;
+    if (
+      pos[0] === snapPos[0] &&
+      (pos[1] > snapPos[1] || (pos[1] === snapPos[1] && pos[2] > snapPos[2]))
+    )
+      continue;
     const slot = BigInt(m.args.slot);
     if (m.kind === "assign") leafMap.set(slot, m.args.nodeId);
     else leafMap.delete(slot);
   }
   const tree = buildTree(leafMap);
   if (tree.root.toLowerCase() !== frozenRoot.toLowerCase()) {
-    const tail = mutations.filter(m => m.blockNumber <= snapBlock).slice(-5)
-      .map(m => `${m.kind}(slot ${m.args.slot} @blk ${m.blockNumber})`).join(", ");
-    throw new Error(`reconstructed root ${tree.root} != on-chain setRoot[${epoch}] ${frozenRoot} (${leafMap.size} leaves; last: ${tail})`);
+    const tail = mutations
+      .filter(m => m.blockNumber <= snapBlock)
+      .slice(-5)
+      .map(m => `${m.kind}(slot ${m.args.slot} @blk ${m.blockNumber})`)
+      .join(", ");
+    throw new Error(
+      `reconstructed root ${tree.root} != on-chain setRoot[${epoch}] ${frozenRoot} (${leafMap.size} leaves; last: ${tail})`
+    );
   }
   const slotOfNode = new Map();
   for (const [slot, nid] of leafMap) slotOfNode.set(nid.toLowerCase(), slot);
@@ -151,14 +176,16 @@ export function buildProof(reconstructed, nodeId) {
 //   [accountId(32)][ per signer: nodeId(32) || slot(32) || proof(TREE_DEPTH*32) ][ blsSig(256) ]
 // signers MUST be strictly ascending by nodeId (the aggregator sorts before submitting).
 export function buildCommitteePayload(reconstructed, accountId, signers, blsSig) {
-  if (ethers.dataLength(blsSig) !== 256) throw new Error(`blsSig must be exactly 256 bytes, got ${ethers.dataLength(blsSig)}`);
+  if (ethers.dataLength(blsSig) !== 256)
+    throw new Error(`blsSig must be exactly 256 bytes, got ${ethers.dataLength(blsSig)}`);
   // Normalize to canonical 32-byte form FIRST, then sort by numeric value (BigInt compare — NOT
   // Array.sort's Number coercion, which loses precision above 2^53). Assert strictly increasing so
   // the on-chain nid <= prevId gate never rejects and duplicates are caught here.
   const norm = signers.map(s => ethers.zeroPadValue(s, 32));
   norm.sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0));
   for (let i = 1; i < norm.length; i++) {
-    if (BigInt(norm[i]) <= BigInt(norm[i - 1])) throw new Error(`signers must be strictly increasing; dup/misorder at ${norm[i]}`);
+    if (BigInt(norm[i]) <= BigInt(norm[i - 1]))
+      throw new Error(`signers must be strictly increasing; dup/misorder at ${norm[i]}`);
   }
   let out = ethers.zeroPadValue(accountId, 32);
   for (const nid of norm) {
@@ -168,16 +195,75 @@ export function buildCommitteePayload(reconstructed, accountId, signers, blsSig)
   return ethers.concat([out, blsSig]);
 }
 
+// Resolve the validator: EXPLICIT > derived from the router > fail loudly. There is deliberately no
+// hard-coded fallback. Until this existed both this script and committee-proofgen.mjs defaulted to
+// 0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64 -- which is now the RETIRED pre-D2 validator (verified:
+// `minCommittee()` reverts, `requiredQuorum()` returns the sentinel). So a keeper started without
+// COMMITTEE_VALIDATOR set would have spent gas pinning a dead stack while looking like it was working,
+// and a proofgen run would have rebuilt a tree against the wrong root. The old default was correct
+// when it was written; that is exactly the problem with a hard-coded copy of a fact that lives
+// somewhere else -- it does not fail when it goes stale, it just goes on being confidently wrong.
+// Same derivation as deploy/committee-health.mjs so the two never disagree about what is being watched.
+/// Same class as committee-keeper.mjs. proofgen is a one-shot CLI, so a plain Error would also exit
+/// non-zero and nothing here loops to swallow it -- the class is not load-bearing HERE. It is copied
+/// anyway because these two resolvers were byte-identical one commit ago and this PR's own argument is
+/// that copies drift without anything reporting it. An asymmetry that is harmless today is exactly the
+/// kind that gets inherited by whoever adds the third caller.
+class FatalConfigError extends Error {}
+
+async function resolveValidatorCli(provider, explicit, router) {
+  if (explicit) return ethers.getAddress(explicit);
+  if (!router) {
+    throw new FatalConfigError(
+      "no validator: set COMMITTEE_VALIDATOR, or COMMITTEE_ROUTER to derive it from algId 0x01.\n" +
+        "  There is no default on purpose -- the previous one is now the retired validator."
+    );
+  }
+  if (!ethers.isAddress(router))
+    throw new FatalConfigError(`COMMITTEE_ROUTER is not an address: ${router}`);
+  const r = new ethers.Contract(
+    router,
+    ["function getAlgorithm(uint8) view returns (address)"],
+    provider
+  );
+  const derived = await r.getAlgorithm(1);
+  if (derived === ethers.ZeroAddress) {
+    throw new FatalConfigError(
+      `router ${router} has no algorithm mounted at 0x01 -- nothing to watch`
+    );
+  }
+  return derived;
+}
+
 // ---- CLI demo ----
 if (import.meta.url === `file://${process.argv[1]}`) {
   const env = loadEnv();
   const provider = new ethers.JsonRpcProvider(env.SEPOLIA_RPC_URL);
-  const validator = process.env.COMMITTEE_VALIDATOR || env.COMMITTEE_VALIDATOR || "0x1A8Db639b5d8Bd5742edB083656EDD56f416cd64";
+  // No hard-coded default: the previous one is the RETIRED validator (see committee-keeper.mjs).
+  // Same precedence as committee-keeper.mjs and committee-health.mjs: an env-FILE validator does not
+  // outrank a configured router (see the note in committee-keeper.mjs).
+  const router = process.env.COMMITTEE_ROUTER || env.COMMITTEE_ROUTER;
+  const validator = await resolveValidatorCli(
+    provider,
+    process.env.COMMITTEE_VALIDATOR || (router ? undefined : env.COMMITTEE_VALIDATOR),
+    router
+  );
   const epoch = BigInt(process.argv[2] ?? "0");
   const nodeId = process.argv[3];
   (async () => {
     const r = await reconstructFrozenTree(provider, validator, epoch);
-    console.log("frozen setRoot[" + epoch + "] reconstructed OK:", r.root, "(", r.leafMap.size, "leaves, snapBlock", r.snapBlock, ")");
+    console.log(
+      "frozen setRoot[" + epoch + "] reconstructed OK:",
+      r.root,
+      "(",
+      r.leafMap.size,
+      "leaves, snapBlock",
+      r.snapBlock,
+      ")"
+    );
     if (nodeId) console.log("proof for", nodeId, "=>", JSON.stringify(buildProof(r, nodeId)));
-  })().catch(e => { console.error("proofgen:", e.message); process.exit(1); });
+  })().catch(e => {
+    console.error("proofgen:", e.message);
+    process.exit(1);
+  });
 }
