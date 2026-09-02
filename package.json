@@ -42,7 +42,7 @@
     "@nestjs/core": "^11.1.27",
     "@nestjs/platform-express": "^11.1.28",
     "@nestjs/swagger": "^11.4.5",
-    "@noble/curves": "^2.2.0",
+    "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.2.0",
     "axios": "^1.18.1",
     "class-transformer": "^0.5.1",
