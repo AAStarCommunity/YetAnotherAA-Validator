@@ -34,7 +34,11 @@
     "release:major": "npm version major --no-git-tag-version && npm run build && echo '\u2705 Bumped to '$(jq -r .version package.json)",
     "release:minor": "npm version minor --no-git-tag-version && npm run build && echo '\u2705 Bumped to '$(jq -r .version package.json)",
     "release:patch": "npm version patch --no-git-tag-version && npm run build && echo '\u2705 Bumped to '$(jq -r .version package.json)",
-    "check:classify": "node scripts/check-quorum-classify.mjs"
+    "check:classify": "node scripts/check-quorum-classify.mjs",
+    "check:precedence": "node scripts/check-validator-precedence.mjs",
+    "e2e:committee": "node scripts/e2e/committee-e2e.mjs",
+    "e2e:selftest": "node scripts/e2e/selftest.mjs",
+    "check:pin-rate": "node scripts/check-pin-rate.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.28",
