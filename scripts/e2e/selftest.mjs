@@ -18,6 +18,12 @@ const ENTRY = env.ENTRY_POINT_ADDRESS || env.ENTRYPOINT_ADDRESS;
 // owner = PRIVATE_KEY_SUPPLIER (dvt1 operator 0xb56000, the account's on-chain owner).
 const ACCOUNT = process.env.E2E_ACCOUNT || "0x92EA8b02D34A4D5d10f0Db9Ea894e8bC72e292e8";
 const owner = new ethers.Wallet(env.PRIVATE_KEY_SUPPLIER);
+// 127.0.0.1, NOT localhost. `localhost` can resolve to ::1 first, and anything else listening on
+// IPv6 at that port answers instead of the node — on this machine an unrelated Next.js dev server
+// holds *:3001 while the DVT containers bind 127.0.0.1 only, so the run failed with "Internal Server
+// Error" and read as a broken node. Override with DVT_NODE_HOST.
+const NODE_HOST = process.env.DVT_NODE_HOST || "127.0.0.1";
+
 const userOp = {
   sender: ACCOUNT,
   nonce: "0",
@@ -40,8 +46,8 @@ const uoh = await ep.getUserOpHash(userOp);
 // ownerAuth = 0x01 tag (owner ECDSA k1) ‖ personal_sign(userOpHash); bare sig (no tag) → 0xffffffff.
 const ownerAuth = "0x01" + (await owner.signMessage(ethers.getBytes(uoh))).slice(2);
 for (const p of [3001, 3002, 3003]) {
-  const info = await (await fetch(`http://localhost:${p}/node/info`)).json();
-  const r = await fetch(`http://localhost:${p}/signature/sign`, {
+  const info = await (await fetch(`http://${NODE_HOST}:${p}/node/info`)).json();
+  const r = await fetch(`http://${NODE_HOST}:${p}/signature/sign`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ userOp, ownerAuth }),
@@ -52,7 +58,7 @@ for (const p of [3001, 3002, 3003]) {
     `:${p} info.nodeId=${(info.nodeId || "?").slice(0, 12)}.. | sign ${ok ? "✅ " + (j.message === uoh ? "hash-bound" : "??") : "❌ " + j}`
   );
 }
-const bad = await fetch(`http://localhost:3001/signature/sign`, {
+const bad = await fetch(`http://${NODE_HOST}:3001/signature/sign`, {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ userOp, ownerAuth: "0x" + "ab".repeat(65) }),

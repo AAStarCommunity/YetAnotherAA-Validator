@@ -339,11 +339,29 @@ describe("LivenessKeeperService — watchdog hardening", () => {
     // A stale or hostile lastLive used to make EVERY cycle conclude the budget was spent.
     const bc = chain({ getLastLive: jest.fn(async () => 800n) }); // 200 spent of a 100 budget
     const k = await boot(bc, 600_000);
+    // Bootstrap starts TWO things — a boot attest (`void this.tick()`) and an immediate watchdog
+    // cycle (`armWatchdog(0)`) — and `boot()` drains a fixed number of setImmediate ticks rather
+    // than waiting on a condition. Ticks are not a synchronisation primitive: under jest worker
+    // contention the boot watchdog cycle sometimes completed inside that window, attested, and armed
+    // confirmedAtBlock = 1000, which then correctly suppressed all three cycles below — so the test
+    // failed with "expected 1, received 0" about once in six full runs. Confirmed by forcing it:
+    // draining bootstrap completely makes it fail every time.
+    //
+    // Drain to the real condition and clear the suppression, so what is measured is these three
+    // cycles and nothing that happened before them. Bounded, because one test in this file boots
+    // against an RPC that deliberately never settles.
+    for (let i = 0; i < 50 && ((k as any).inFlight || (k as any).watchdogInFlight); i++)
+      await new Promise(r => setImmediate(r));
     (bc.attestLiveness as any).mockClear();
+    (k as any).confirmedAtBlock = 0;
     await (k as any).watchdogCycle(); // first: allowed, records confirmedAtBlock = 1000
     await (k as any).watchdogCycle(); // second: head has not advanced — suppressed
     await (k as any).watchdogCycle();
     expect(bc.attestLiveness).toHaveBeenCalledTimes(1);
+    // Non-vacuity. "1" on its own does not say WHY: a run where the cycles quietly did nothing and
+    // one stray call leaked in from bootstrap would read the same. Cycle 1 must have ARMED the bound
+    // at the observed head — that is the thing which suppressed cycles 2 and 3.
+    expect((k as any).confirmedAtBlock).toBe(1000);
     k.onApplicationShutdown();
   });
 
