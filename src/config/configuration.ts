@@ -231,13 +231,27 @@ export default () => {
     // DVTValidator (SP #329 finalized interface). Default is the Sepolia deployment.
     auditDvtValidatorAddress:
       process.env.AUDIT_DVT_VALIDATOR_ADDRESS || "0x568b1486BFE036e603eA11f0D03Dc47fa62c9E0e",
-    // SP BLSAggregator (A' 4.3.0) — the aggregator the guardian-slash watcher (CC-89) reads
+    // SP BLSAggregator (A' 4.11.0) — the aggregator the guardian-slash watcher (CC-89) reads
     // proposalSignersCommitment/validatorAtSlot from, and the offline-audit rule resolves
-    // operator→BLS key through. Default is the Sepolia PRODUCTION deployment (CC-89 0fe793f2;
-    // supersedes the pre-migration 0xF51c0298… which was stale/informational). ALWAYS set
-    // AUDIT_BLS_AGGREGATOR_ADDRESS explicitly per network — never rely on the default off-Sepolia.
+    // operator→BLS key through. Default is the Sepolia PRODUCTION deployment, i.e. whatever
+    // `Registry.blsAggregator()` currently returns (read 2026-09-04: 0xEaeC2F51…, version
+    // "BLSAggregator-4.11.0"; it is also the aggregator whose fraud-proof verifier was armed that
+    // day — docs/evidence/cc115-b3-arming-sepolia.md).
+    //
+    // This default was 0x174b60bB… (4.3.0) until 2026-09-04. That contract still exists and still
+    // answers `validatorAtSlot(1)` with the SAME guardian address as the live one, so a node left on
+    // it does not fail — it watches a superseded contract and silently sees no SlashExecuted events.
+    // A stale aggregator default is therefore a FAIL-SILENT bug, not a fail-closed one. Nothing
+    // automated catches it today: `scripts/check-deps.mjs` does not cover this address, and
+    // aggregator-bootstrap-guard.ts only rejects the default OFF-Sepolia — on Sepolia it lets a
+    // stale default through by design. The source of truth is `Registry.blsAggregator()` on
+    // 0xf5Bf37ca…; re-read it after every SP aggregator succession. Tracked as a gap, not a
+    // guarantee.
+    //
+    // ALWAYS set AUDIT_BLS_AGGREGATOR_ADDRESS explicitly per network — never rely on the default
+    // off-Sepolia (aggregator-bootstrap-guard.ts enforces that).
     auditBlsAggregatorAddress:
-      process.env.AUDIT_BLS_AGGREGATOR_ADDRESS || "0x174b60bB462b00550F0EC7Bc35Fe39dDB6310158",
+      process.env.AUDIT_BLS_AGGREGATOR_ADDRESS || "0xEaeC2F512eA50708211fa95533e4dBb60e3d2E5D",
     // Whether the aggregator address was set EXPLICITLY (not the resolved value — the resolved value
     // always carries the Sepolia default above, which would mask the unset case). Consumed by the
     // fail-closed off-Sepolia guard so the Sepolia default is never silently inherited on another

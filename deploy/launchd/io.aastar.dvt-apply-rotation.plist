@@ -1,18 +1,28 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- CC-115 B3: finalise the verifier rotation the day its four-day delay matures (2026-09-04
-     05:36:24Z). applyFraudProofVerifier() is permissionless and takes no arguments, so this can only
-     finalise the verifier the aggregator owner already proposed and that has already served its full
-     delay -- there is no decision left to make. Running it before readyAt exits 0 with a countdown
-     and sends nothing.
+<!-- CC-115 B3: written to finalise the verifier rotation the day its four-day delay matured
+     (2026-09-04 05:36:24Z). applyFraudProofVerifier() is permissionless and takes no arguments, so
+     it could only ever finalise the verifier the aggregator owner had already proposed and that had
+     already served its full delay -- there was no decision left to make.
+
+     IT DID NOT DO THAT. Tx 0x9add3d63... applied it at 05:37:12Z, 48 s after readyAt and before
+     this job's next hourly tick; the 05:11Z run still saw it pending and the 06:11Z run already saw
+     it applied. That was not an outside party -- the signer is this repo's own .env.sepolia deploy
+     key, i.e. someone ran apply-verifier-rotation.mjs by hand. This job observed the whole thing and
+     broadcast nothing. Its trigger fired reliably; its broadcast path has still never been
+     exercised, so do not read a green run as proof that it would apply a rotation.
+
+     WHAT IT IS NOW: a drift guard. The script fails loudly on a disarm, on a different active
+     verifier, or on a later rotation proposing an address it is not pinned to. Repoint the expected
+     verifier before any future rotation, or it goes red on a correct chain state.
 
      WHY LOCAL AND NOT THE WORKFLOW: .github/workflows/apply-verifier-rotation.yml exists and is
-     correct, but `schedule` does not fire in this repo (measured; see local-heartbeat.sh). Without
-     this job the last link in the chain is a human remembering on the day -- which is the exact risk
-     that PR was written to remove.
+     correct, but GitHub Actions `schedule` is delivered unreliably here -- sparsely for sub-hourly
+     crons and hours late for daily ones (measured; see deploy/README-heartbeat.md) -- so it is not a
+     deadline guarantee. The local heartbeat is the primary trigger.
 
-     Hourly, not daily: readyAt is 05:36Z and a laptop is not always awake at a given hour. Every run
-     before maturity is a cheap read that exits 0.
+     Hourly, not daily: a laptop is not always awake at a given hour. Every run before maturity is a
+     cheap read that exits 0.
 
      Install and verify: deploy/README-heartbeat.md -->
 <plist version="1.0">

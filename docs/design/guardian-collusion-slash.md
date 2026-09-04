@@ -37,8 +37,10 @@ k · C_max  <  m · ρ · S_op · p_G
 
 - `m` = signatures needed to pass the attack. **For a slash this is
   `slashThresholds[level]` (bootstrap WARNING=2 / MINOR=3 / MAJOR=3), NOT
-  `defaultThreshold=7`** (`defaultThreshold` is the reputation-consensus path
-  only). Using 7 overstates collusion resistance ~2–3×.
+  `defaultThreshold`** (which is **2** on the deployed 4.11.0 — it read 7 on
+  4.1.0/4.3.0 and was lowered without N changing, so do not treat it as a
+  function of committee size; `defaultThreshold` is the reputation-consensus
+  path only). Using 7 overstates collusion resistance ~2–3×.
 - `S_op` = a guardian's ROLE_DVT GToken lock.
 - `ρ` = probability the collusion is detected **and** leads to a slash — the
   term with no code correspondent until the detection layer (stage 2) exists.
@@ -91,17 +93,30 @@ dormant** until a verifier is wired) resolves this at the contract layer:
 | **Full slash, no 30% cap**              | slashes the entire lock                                              | proven collusion must lose eligibility; the operator-path 30% cap protects _honest_ operators from one bad epoch — a different threat model                                      |
 | **fail-closed**                         | `fraudProofVerifier == address(0)` → revert                          | dormant until governance wires a verifier; safe to ship                                                                                                                          |
 
-So the trigger is **solved**. The remaining unbuilt half is purely the
-**detection**: what does `verify()` actually check.
+So the trigger is **solved**. At Stage 0 the remaining unbuilt half was purely
+the **detection**: what does `verify()` actually check. That half is now built
+and merged (§5, stage 2); the limitations that remain are listed there, not
+here.
 
 ## 4. Stage-2 blueprint — `IFraudProofVerifier` (owned by this repo)
 
 ```solidity
+// AS SHIPPED — contracts/src/interfaces/IFraudProofVerifier.sol
 interface IFraudProofVerifier {
-    function verify(uint256 fraudProofId, address[] calldata guiltyGuardians, bytes calldata fraudProof)
-        external view returns (bool);
+    function verify(
+        bytes32 domainDigest,
+        uint256 fraudProofId,
+        address[] calldata guiltyGuardians,
+        bytes calldata fraudProof
+    ) external view returns (bool);
 }
 ```
+
+> The first `domainDigest` parameter was added after this blueprint was written
+> (CC-115 B1, PR #240) to bind a proof to its domain. The sketch here showed the
+> three-parameter form, whose selector belongs to no deployed function —
+> integrate against the four-parameter signature above, selector
+> **`0x61077735`** (`docs/evidence/cc115-b3-arming-sepolia.md`).
 
 SP trusts only an owner-set verifier and never judges fraud itself. This repo
 builds the verifier + the off-chain cross-monitoring that feeds it.
@@ -279,7 +294,12 @@ Any deviation just means that slash cannot be fraud-proven (no wrongful slash) �
 but it is a **cross-repo alignment point**, not something the verifier can
 self-enforce.
 
-### Prerequisites (why stage-2 implementation can't start yet)
+### Prerequisites (HISTORICAL — written before stage 2 was built)
+
+> These were the blockers as of Stage 0. Stage 2 has since been built, merged
+> and armed on Sepolia (§5). Items 1-2 below describe **production-safety** gaps
+> that remain open; they are no longer implementation blockers. Item 3 is built
+> (the watcher, #224).
 
 1. **An armed, on-chain-objective slash rule** to defend. Today none exists:
    over-issue is a _view_ (not a slash), liveness is _auto-jail_ (not a
@@ -295,25 +315,44 @@ self-enforce.
 5. Attribution direction (A') is **decided**; SP changing `verifyAndExecute` (a
    load-bearing consensus path) still requires spec alignment before code.
 
-The **spec is complete enough to build against**; the **implementation** waits
-on 1–3 (+ 4 for liveness). Orthogonal: the **stake-exit escape** (a guardian
-withdrawing its ROLE_DVT lock to 0 before the proof → `executeGuardianSlash`
-skips) is a challenger-mechanism concern (challenge period / withdrawal freeze),
-tracked separately.
+The spec was complete enough to build against, and the implementation has since
+been built and merged (§5). What items 1-2 (+ 4 for liveness) now gate is
+**production activation**, not writing the code. Orthogonal: the **stake-exit
+escape** (a guardian withdrawing its ROLE_DVT lock to 0 before the proof →
+`executeGuardianSlash` skips) is a challenger-mechanism concern (challenge
+period / withdrawal freeze), tracked separately.
 
 ## 5. Ownership & sequencing
 
-| Stage                                                        | Owner                                       | Status                                                                                                                                                                                                                  |
-| ------------------------------------------------------------ | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1 — `executeGuardianSlash` thin entry                        | SP                                          | ✅ **merged** (PR #370, BLSAggregator 4.2.0) — but **dormant/fail-closed** (`fraudProofVerifier == 0` → revert), address-based, per-`(proof,guardian)` idempotent. Code is in-tree but inert until a verifier is wired. |
-| 0 — this doc (auto-eject + threat model + trigger authority) | dvt                                         | PR #221                                                                                                                                                                                                                 |
-| 2 — `IFraudProofVerifier` + off-chain detection (produces ρ) | dvt (+ SP `proposalSignersCommitment`, §4b) | ⏳ spec drafted (§4b, attribution = A'); impl blocked on: an armed slash rule + a historical-state/challenge-window mechanism + (liveness) CC-29                                                                        |
+| Stage                                                        | Owner                                       | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------------------------------------ | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 — `executeGuardianSlash` thin entry                        | SP                                          | ✅ **merged** (PR #370) and, on **Sepolia only**, no longer inert: BLSAggregator-4.11.0 `0xEaeC2F51…` has `fraudProofVerifier() == 0xa1346F16…` since 2026-09-04T05:37:12Z (`docs/evidence/cc115-b3-arming-sepolia.md`). This evidence covers that aggregator only — it is not a deployment inventory, so any other deployment must be read independently; one with `fraudProofVerifier == 0` is dormant/fail-closed. Address-based, per-`(proof,guardian)` idempotent. |
+| 0 — this doc (auto-eject + threat model + trigger authority) | dvt                                         | PR #221                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 2 — `IFraudProofVerifier` + off-chain detection (produces ρ) | dvt (+ SP `proposalSignersCommitment`, §4b) | ✅ **built + merged**: verifier (#223), watcher (#224), assembler (#225), DVT-side E2E dry-run + runbook (#226), Sepolia deploy script (#227), and the verifier now armed on Sepolia. Still open: the SP **joint** E2E against the real verifier rather than `MockVerifier` (#222), the historical-state/challenge-window mechanism, and (liveness only) CC-29.                                                                                                         |
 
-**When to activate:** N large + operators independent (not co-located) + an
-on-chain-verifiable independent adjudication path. At the current 3-node,
-co-located, single-owner bootstrap, guardian-slash is dormant by design — the
-anti-collusion property is provided by **trusted owner**, and the paper's
-inequality is a **decentralized-phase target**, not a current deployed property.
+**When to activate:**
+
+> ⚠️ **Sepolia is technically ARMED. Do not read anything below as "inert".** On
+> `0xEaeC2F51…` the fraud-proof verifier has been live since
+> 2026-09-04T05:37:12Z, so a proof that verifies moves 100% of an accused
+> guardian's ROLE_DVT lock **on that deployment**. What follows is
+> **production-activation policy**, not contract state.
+
+Production activation needs N large + operators independent (not co-located) +
+an on-chain-verifiable independent adjudication path. At the current 3-node,
+co-located, single-owner bootstrap, guardian-slash is **not
+production-activated** — the anti-collusion property is provided by **trusted
+owner**, and the paper's inequality is a **decentralized-phase target**, not a
+current deployed property.
+
+The word "dormant" is used elsewhere in this document to mean
+`fraudProofVerifier == 0`, i.e. genuinely inert. It is deliberately NOT used
+here, because on Sepolia that is no longer the case. That deployment is armed
+solely so the joint E2E runs against a real verifier; it is equally not
+activation — the operators behind those three guardians are still the same
+party, so an armed slash path supplies no anti-collusion property the deployment
+did not already lack. Arming a testnet and activating production are different
+decisions, and only the first has been made.
 
 ## References
 

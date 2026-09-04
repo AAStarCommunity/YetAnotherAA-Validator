@@ -207,12 +207,14 @@ therefore empty today even if both flags were flipped.**
 
 The gates above cover **DVT originating a slash**. They do **not** cover:
 
-- **Guardian slashing** (`executeGuardianSlash`, armed 2026-09-04 via the
-  fraud-proof verifier). That punishes _guardians who slashed unjustly_ — the
-  appeal layer, not the enforcement layer. SP's three guardians have the same
-  zero margin, and MINOR's **slash** threshold is 3 with exactly 3 registered,
-  so slashing any one of them takes SP's slash consensus below its own
-  threshold.
+- **Guardian slashing** (`executeGuardianSlash`). Armed on **Sepolia** at
+  2026-09-04T05:37:12Z — `fraudProofVerifier() == 0xa1346F16…`, read back at
+  block 11632589; receipts in `docs/evidence/cc115-b3-arming-sepolia.md`. This
+  line was written before the arming as a scheduled event and is now a confirmed
+  one. That punishes _guardians who slashed unjustly_ — the appeal layer, not
+  the enforcement layer. SP's three guardians have the same zero margin, and
+  MINOR's **slash** threshold is 3 with exactly 3 registered, so slashing any
+  one of them takes SP's slash consensus below its own threshold.
 
   > Do not generalise that to "all thresholds are 3". Pinned read at block
   > 11611286 on aggregator `0xEaeC2F512eA50708211fa95533e4dBb60e3d2E5D`:
@@ -246,11 +248,22 @@ The gates above cover **DVT originating a slash**. They do **not** cover:
   `verifyAndExecute` — whose reputation branch uses `defaultThreshold` — and
   `executeProposal`), and all three reconstruct the signer set from the **same**
   `validatorAtSlot` registry. So the correct statement is _not_ "guardians have
-  no routine duty"; it is **"the routine duties are currently unexecutable
-  because `defaultThreshold` (7) exceeds the registered count (3)"**.
-  `setDefaultThreshold` is one owner transaction away from making them live, at
-  which point guardian keys must be online. The two statements license very
-  different architecture decisions.
+  no routine duty"; it is **"the reputation-batch and generic-proposal paths
+  execute today at `defaultThreshold = 2` against three registered guardians, so
+  guardian keys must be online NOW"**. The slash thresholds are separate
+  (`2/3/3`): losing one guardian leaves those routine paths working but takes
+  the MINOR and MAJOR 3-of-3 slash paths below their own threshold until
+  membership or thresholds are remediated.
+
+  > This bullet said the opposite until 2026-09-04 — "unexecutable because
+  > `defaultThreshold` (7) exceeds the registered count (3)" and
+  > "`setDefaultThreshold` is one owner transaction away". That was the
+  > pre-correction reading superseded in the note above, and it survived here
+  > after the note was added, so the same file argued both sides. An operator
+  > acting on the old wording could have taken guardian keys offline believing
+  > nothing depended on them. The two statements license very different
+  > architecture decisions, which is exactly why the contradiction mattered.
+
 - **Anything SP does on its own** with `slashByDVT` / `executeSlashWithBLS`.
 
 So "slashing is off" is precise only for the DVT-originated path. Say it that

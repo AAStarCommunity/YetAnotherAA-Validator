@@ -57,11 +57,11 @@ heartbeat exists.
 
 Three launchd agents, sources version-controlled in `deploy/launchd/`:
 
-| label                            | trigger                | does                                                                                                 |
-| -------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------- |
-| `io.aastar.dvt-committee-health` | every 900 s            | `committee-health.mjs` against the router; opens/updates a GitHub issue on any non-zero exit         |
-| `io.aastar.dvt-apply-rotation`   | every 3600 s           | `apply-verifier-rotation.mjs --broadcast`; a no-op that exits 0 until readyAt (2026-09-04T05:36:24Z) |
-| `io.aastar.dvt-committee-keeper` | `KeepAlive` (resident) | keeps `committee-keeper.mjs --watch` alive; restarts it if it dies                                   |
+| label                            | trigger                | does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `io.aastar.dvt-committee-health` | every 900 s            | `committee-health.mjs` against the router; opens/updates a GitHub issue on any non-zero exit                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `io.aastar.dvt-apply-rotation`   | every 3600 s           | `apply-verifier-rotation.mjs --broadcast`. **Its rotation is done** — applied externally at 2026-09-04T05:37:12Z, not by this job — so runs from here do not broadcast: they check the active verifier against the address the job is pinned to, print "already applied" and exit 0. Green means the observed state matched that pin (it fails loudly on a disarm, a different verifier, or an unpinned new rotation); it does **not** mean this job applied anything. Repoint the expected verifier before the next rotation |
+| `io.aastar.dvt-committee-keeper` | `KeepAlive` (resident) | keeps `committee-keeper.mjs --watch` alive; restarts it if it dies                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 The first two run `deploy/local-heartbeat.sh`, which is **independent of
 `committee-keeper.mjs`**. A monitor that dies with the process it watches is
@@ -180,7 +180,9 @@ fired is not delivered:
   (dedup works);
 - generation probe, both cells → new validator `d2`, old `0x1A8Db639` `pre-d2`
   (the probe moves in both directions and is not always-true);
-- `apply` before readyAt → exit 0, countdown printed, **no transaction**.
+- `apply` before readyAt → exit 0, countdown printed, **no transaction**;
+- `apply` after the rotation was consumed → exit 0, "already applied", **no
+  transaction** (observed from 2026-09-04T06:11Z onward).
 
 Three real bugs were found by running it, none of which reading it would have
 surfaced: the alert captured `gh`'s stderr into the issue URL, the labels the

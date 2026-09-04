@@ -70,12 +70,21 @@ between the messageHash field and the evidence op — for a no-real-victim demo,
 > **⚠️ These are the E2E throwaway deployment addresses — NOT production.** The
 > aggregator `0xf44E7E51…` above was a single-run fixture (its 3 guardians are
 > now slashed to 0 and ejected). The **production** Sepolia SuperPaymaster
-> BLSAggregator (A' 4.3.0) is **`0x174b60bB462b00550F0EC7Bc35Fe39dDB6310158`**
-> (the config default; see `src/config/configuration.ts`
-> `auditBlsAggregatorAddress`), with production verifier `0x128847cF…` and 3
-> persistent guardians (CC-89 comment `b26903ec`). Guardian nodes must set
-> `AUDIT_BLS_AGGREGATOR_ADDRESS` to the **production** aggregator; do not copy
+> BLSAggregator is **`0xEaeC2F512eA50708211fa95533e4dBb60e3d2E5D`**
+> (`BLSAggregator-4.11.0`; the config default — see
+> `src/config/configuration.ts` `auditBlsAggregatorAddress`), whose fraud-proof
+> verifier `0xa1346F1668cBf8D031Cc5D72eDA45F5788CA1cd3` was armed 2026-09-04
+> (`docs/evidence/cc115-b3-arming-sepolia.md`). Guardian nodes must set
+> `AUDIT_BLS_AGGREGATOR_ADDRESS` to that **production** aggregator; do not copy
 > the E2E address from this record.
+>
+> ⚠️ **Superseded.** This paragraph named `0x174b60bB…` (A' 4.3.0, verifier
+> `0x128847cF…`) as production until 2026-09-04, when SP's aggregator succession
+> made `Registry.blsAggregator()` return `0xEaeC2F51…`. The old contract still
+> exists and still answers `validatorAtSlot(1)` with the same guardian address,
+> so a node left pointed at it sees no error — only an absence of
+> `SlashExecuted` events. Left visible rather than rewritten, because anyone who
+> configured a node from the earlier text has a silently blind watcher.
 
 3 guardians registered at slots 1/2/3, each with **30e18 ROLE_DVT** locked
 (`ROLE_DVT = keccak256("DVT")`): `0xb5600060…` (slot1), `0x6F7D30f2…F96E`

@@ -17,7 +17,7 @@ describe("configuration: auditBlsAggregatorAddressFromEnv (CC-89 explicit-presen
 
   it("unset env → resolved value carries the built-in default, but fromEnv is FALSE", () => {
     const c = configuration();
-    expect(c.auditBlsAggregatorAddress).toBe("0x174b60bB462b00550F0EC7Bc35Fe39dDB6310158");
+    expect(c.auditBlsAggregatorAddress).toBe("0xEaeC2F512eA50708211fa95533e4dBb60e3d2E5D");
     expect(c.auditBlsAggregatorAddressFromEnv).toBe(false);
   });
 
