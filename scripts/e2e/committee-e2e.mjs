@@ -70,10 +70,17 @@ const VALIDATOR_EXPLICIT = process.env.COMMITTEE_VALIDATOR;
 const ENROLLED_SLOT = 42n; // `mapping(address => bool) enrolledAccount` (forge inspect storage-layout)
 
 let failures = 0;
-const step = (n, label) => console.log(`\n[${n}] ${label}`);
-const ok = m => console.log(`    ✅ ${m}`);
+// CodeQL flags these three as `js/clear-text-logging` because values that reach them can originate in
+// `process.env`, and it cannot tell a secret from a public one. Everything this driver prints from the
+// environment is an ADDRESS or a hash — E2E_ACCOUNT, the validator, the router, a userOpHash — all of
+// which are already on a public chain; the one genuine secret here, the signing key, is read straight
+// into an ethers Wallet and never reaches a log line. Suppressed at the helpers rather than at each
+// call site, and stated rather than silently filtered, so that a future line that DOES carry a secret
+// is a change to this reasoning and not just another entry under an existing exemption.
+const step = (n, label) => console.log(`\n[${n}] ${label}`); // lgtm[js/clear-text-logging]
+const ok = m => console.log(`    ✅ ${m}`); // lgtm[js/clear-text-logging]
 const bad = m => {
-  console.log(`    ❌ ${m}`);
+  console.log(`    ❌ ${m}`); // lgtm[js/clear-text-logging]
   failures++;
 };
 const die = m => {

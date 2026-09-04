@@ -84,7 +84,10 @@ const userOpHash = await call(p => new ethers.Contract(ENTRY, EP_ABI, p).getUser
 //   0x01 ‖ sig (66 bytes) -> 0xa0cf00cf accepted
 //   bare sig  (65 bytes)  -> 0xffffffff rejected
 const ownerAuth = "0x01" + (await owner.signMessage(ethers.getBytes(userOpHash))).slice(2);
-console.log("account:", ACCOUNT, "owner:", owner.address, "\nuserOpHash:", userOpHash);
+// Alert #55, open since 2026-06-20: ACCOUNT now comes from `process.env`, which CodeQL treats as
+// sensitive. It is an ERC-4337 account address — public on-chain data, and the whole point of the
+// line is to tell the reader which account a 403 is about. The signing key is never logged.
+console.log("account:", ACCOUNT, "owner:", owner.address, "\nuserOpHash:", userOpHash); // lgtm[js/clear-text-logging]
 
 const signed = [];
 for (const port of PORTS) {
