@@ -20,7 +20,18 @@ const env = Object.fromEntries(
 );
 const RPCS = [env.SEPOLIA_RPC_URL, env.SEPOLIA_RPC_URL2, env.SEPOLIA_RPC_URL3].filter(Boolean);
 const ENTRY = env.ENTRY_POINT_ADDRESS || env.ENTRYPOINT_ADDRESS;
-const ACCOUNT = "0x45Dfe3D5938fDf5a8D30641C3FDA9c9fb1F31ba9";
+// Same requirement as scripts/e2e/realnode-e2e.mjs and deploy/verify-prod-e2e.mjs: this must be an
+// account that implements isValidOwnerAuth→0xa0cf00cf. The address hard-coded here until now does
+// not (verified on Sepolia: the call reverts), and it was not even overridable, so this script could
+// not be pointed at a working account at all.
+const ACCOUNT = process.env.E2E_ACCOUNT;
+if (!ACCOUNT) {
+  console.error(
+    "\u203c E2E_ACCOUNT is required (an account implementing isValidOwnerAuth\u21920xa0cf00cf, e.g. an " +
+      "AAStarAirAccountV7). Set E2E_ACCOUNT=0x... and re-run."
+  );
+  process.exit(1);
+}
 // Pick a healthy RPC (public Sepolia endpoints are flaky under heavy eth_call/pairing).
 async function pickRpc() {
   for (const u of RPCS) {
@@ -38,6 +49,11 @@ async function pickRpc() {
 const provider = await pickRpc();
 const owner = new ethers.Wallet(env.PRIVATE_KEY_SUPPLIER, provider);
 const RECIPIENT = owner.address; // transfer back to owner to recover funds
+// 127.0.0.1, NOT localhost. `localhost` can resolve to ::1 first, and anything else listening on
+// IPv6 at that port answers instead of the node — on this machine an unrelated Next.js dev server
+// holds *:3001 while the DVT containers bind 127.0.0.1 only, so the run failed with "Internal Server
+// Error" and read as a broken node. Override with DVT_NODE_HOST.
+const NODE_HOST = process.env.DVT_NODE_HOST || "127.0.0.1";
 
 const ACCOUNT_ABI = [
   "function execute(address dest, uint256 value, bytes func)",
@@ -128,7 +144,9 @@ console.log("userOpHash:", userOpHash);
 const p256Sig = ethers.hexlify(p256.sign(ethers.getBytes(userOpHash), p256Priv, { lowS: true }));
 
 // 5. real-node BLS aggregate (node1+node2, registered) via running instances
-const ownerAuth = await owner.signMessage(ethers.getBytes(userOpHash));
+// 1-byte tag ‖ payload — see deploy/verify-prod-e2e.mjs. A bare 65-byte signature is rejected by
+// isValidOwnerAuth (0xffffffff), which 403s the node's sign gate.
+const ownerAuth = "0x01" + (await owner.signMessage(ethers.getBytes(userOpHash))).slice(2);
 // JSON-safe userOp for the node (BigInt nonce/preVerificationGas -> string).
 const userOpJson = {
   ...userOp,
@@ -137,7 +155,7 @@ const userOpJson = {
 };
 const got = [];
 for (const port of [3001, 3002]) {
-  const r = await fetch(`http://localhost:${port}/signature/sign`, {
+  const r = await fetch(`http://${NODE_HOST}:${port}/signature/sign`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ userOp: userOpJson, ownerAuth }),
@@ -175,7 +193,16 @@ try {
   console.log("[simulation] ❌ revert:", e.shortMessage || e.message);
   console.log("  raw data:", typeof data === "string" ? data.slice(0, 200) : data);
   if (typeof data === "string" && data.length >= 10) {
-    try { const p = ep.interface.parseError(data); console.log("  decoded:", p?.name, JSON.stringify(p?.args, (k,v)=>typeof v==="bigint"?v.toString():v)); } catch (err) { console.log("  (undecodable selector", data.slice(0,10) + ")"); }
+    try {
+      const p = ep.interface.parseError(data);
+      console.log(
+        "  decoded:",
+        p?.name,
+        JSON.stringify(p?.args, (k, v) => (typeof v === "bigint" ? v.toString() : v))
+      );
+    } catch (err) {
+      console.log("  (undecodable selector", data.slice(0, 10) + ")");
+    }
   }
   process.exit(1);
 }

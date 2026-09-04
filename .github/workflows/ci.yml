@@ -164,6 +164,16 @@ jobs:
       - name: Check the sentinel benign-state classifier
         run: npm run check:classify
 
+      # #283 removed a hard-coded fallback to the now-RETIRED validator from the keeper and proofgen
+      # and replaced it with one precedence rule -- EXPLICIT > router > env FILE > fail -- hand-copied
+      # into three files with three different shapes. That PR verified it ONCE by hand, and in the
+      # course of doing so the resolvers drifted twice: an env-FILE value outranked the router in the
+      # tool that SENDS TRANSACTIONS, and the two resolver bodies diverged the moment one grew a
+      # FatalConfigError. Both were caught by a person looking, not by the repo. This runs the three
+      # real tools against a stub chain and fails when they disagree.
+      - name: Check the validator-resolution precedence
+        run: npm run check:precedence
+
   # Job 3: Build project
   build:
     name: Build

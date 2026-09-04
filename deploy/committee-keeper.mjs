@@ -5,6 +5,28 @@
 // unpinned and still inside its window. Any funded key can run it (permissionless); run several for
 // redundancy — a missed window fail-closes committee ops for that epoch and the next, then self-heals.
 //
+// WHY REDUNDANCY, and what a single keeper actually loses.
+//
+// A miss is never one epoch's worth of damage: a run of k consecutive misses fail-closes k+1 epochs,
+// because validate() needs BOTH `e` and `e-1` usable. Observed with k = 1, 2, 1, 2, 3.
+//
+// In the laptop-hosted TEST phase every miss was a HOST SLEEP — clamshell at 23:47 on AC, a
+// `Sleep Service` maintenance sleep at 08:20 on battery, clamshell again at 12:10 on battery. Any
+// hour, either power source, lid open or shut. `caffeinate` does NOT cover this: it holds
+// PreventUserIdleSystemSleep, which is neither clamshell nor maintenance sleep. Only a host that
+// does not sleep does.
+//
+// NOT A PRODUCTION AVAILABILITY FIGURE. `npm run check:pin-rate` reports an unavailability
+// percentage; during that test phase it read low-teens and rose at every re-measurement. That number
+// describes ONE keeper on a developer laptop on a testnet. It is not a property of this system and
+// must not be quoted as one — it exists to size the redundancy argument, nothing else. Re-derive it
+// in whatever environment you actually care about rather than carrying this one forward.
+//
+// One part IS structural and survives any hosting: committee ops fail closed between an epoch
+// starting and its pin landing, every epoch, because a pin cannot precede the epoch it snapshots.
+// The floor is 1 block / epochLength (1.6% at L=64); the rest is pin latency, which more keepers
+// racing each other shrink.
+//
 // While epochLength == 0 (committee mode OFF) snapshotEpoch reverts and this keeper idles.
 //
 // Works against BOTH validator generations: it selects `snapshotEpoch(bytes32[])` (CC-112 D2, #244) or

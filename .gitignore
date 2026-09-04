@@ -72,3 +72,4 @@ guardian-operators.json
 
 # Emitted by deploy/apply-verifier-rotation.mjs on a successful apply; consumed by the workflow.
 rotation-readback.json
+deploy/.run/pin-rate-history.jsonl
