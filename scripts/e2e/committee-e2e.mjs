@@ -186,6 +186,16 @@ if (failures) die("committee preconditions unmet — a keeper must pin the curre
 const SAMPLED = e - 1n;
 const committedCount = await V.epochSetCount(SAMPLED, AT);
 const m = await V.expectedCommittee(committedCount, AT);
+// WHICH SORTITION REGIME IS THIS RUN IN? `_thresholdOf(n, m)` returns `type(uint256).max` when
+// `m >= n` (AAStarCommitteeValidator.sol:626) — the whole-set / tiny-pool case, where the draw admits
+// every committed signer and filters nobody. With n = 3 and expectedCommittee(3) = 3 that is exactly
+// where this stack sits, so a green run here does NOT demonstrate committee SELECTION; it
+// demonstrates parsing, enrolment, quorum, Merkle proofs and the BLS pairing.
+//
+// This line exists because the run log claimed "real sortition" for four days before anyone checked
+// the branch it lands in. Saying which regime the run is in is cheap; letting a report overstate what
+// it covered is how a passing test becomes evidence for something it never touched.
+const SAMPLING_REGIME = m < committedCount;
 const quorum = await V.requiredQuorum(AT);
 ok(
   `sampling epoch ${SAMPLED}: setCount=${committedCount}, expectedCommittee=${m}, quorum=${quorum}`
@@ -364,7 +374,14 @@ const verdict = await callValidate(userOpHash, payload, { enroll: !enrolled });
 if (verdict === 0n)
   ok(
     `validate() == 0 ACCEPTED${enrolled ? "" : "  (enrolledAccount supplied by state override)"}\n` +
-      `       real BLS pairing, real Merkle proofs against setRoot[${SAMPLED}], real sortition, at block ${HEAD}`
+      `       real BLS pairing, real Merkle proofs against setRoot[${SAMPLED}], at block ${HEAD}\n` +
+      `       sortition: ${
+        SAMPLING_REGIME
+          ? `SAMPLED regime (expectedCommittee ${m} < setCount ${committedCount}) — the draw filtered`
+          : `WHOLE-SET regime (expectedCommittee ${m} >= setCount ${committedCount}) — _thresholdOf ` +
+            `returns type(uint256).max, so the draw admitted everyone and this run does NOT cover ` +
+            `committee selection`
+      }`
   );
 else bad(`validate() == ${verdict} REJECTED — the committee path did not accept a valid aggregate`);
 
@@ -372,12 +389,24 @@ else bad(`validate() == ${verdict} REJECTED — the committee path did not accep
 // Negative controls. A verifier that accepts everything also accepts the happy path, so the run is
 // only informative if these are rejected for the RIGHT reasons.
 step(10, "negative controls — each must be REJECTED");
+// A THROWN ERROR IS NOT A VERDICT. This used to report any exception as "reverted", i.e. as the
+// control passing — which meant a 429, an RPC timeout, a node that does not support state overrides,
+// or a malformed response all printed a green line and the run finished clean having obtained no
+// answer at all for that control. The whole purpose of these four is to be the part of the run that
+// can fail, so they must not be the part that cannot.
+//
+// `validate()` is designed to RETURN 1 rather than revert, so an EVM revert is itself a regression
+// here, not a pass. It is reported distinctly from a transport failure, because the two call for
+// different actions: one is a contract change, the other is "run it again".
 const expectReject = async (label, hash, sig) => {
   let v;
   try {
     v = await callValidate(hash, sig, { enroll: !enrolled });
   } catch (err) {
-    ok(`${label}: reverted (${(err.shortMessage || err.message).slice(0, 60)})`);
+    const msg = (err.shortMessage || err.message || String(err)).slice(0, 80);
+    if (err.code === "CALL_EXCEPTION")
+      bad(`${label}: the call REVERTED — validate() is specified to return 1, not revert (${msg})`);
+    else bad(`${label}: NO VERDICT — the call failed for a non-EVM reason (${err.code}: ${msg})`);
     return;
   }
   if (v === 1n) ok(`${label}: rejected (1)`);
