@@ -76,11 +76,19 @@ jobs:
                  >/dev/null 2>&1; then
               break
             fi
-            echo "npm audit attempt $attempt did not return advisory data; retrying in $((attempt * 10))s"
             out=""
-            # No sleep after the LAST attempt — there is no fourth one to wait for, and every real
-            # outage was paying 45 s for nothing.
-            [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
+            # The message and the sleep are behind the SAME condition. They were not: the echo sat
+            # outside the guard, so the third attempt printed "retrying in 30s" and then neither
+            # slept nor retried. Caught in this step's own first live run — a log line stating
+            # something that did not happen, which is the exact class of defect this step exists to
+            # remove from CI. There is no fourth attempt to wait for, and every real outage was
+            # paying for that sleep anyway.
+            if [ "$attempt" -lt 3 ]; then
+              echo "npm audit attempt $attempt did not return advisory data; retrying in $((attempt * 10))s"
+              sleep $((attempt * 10))
+            else
+              echo "npm audit attempt $attempt did not return advisory data; no attempts left"
+            fi
           done
 
           if [ -z "$out" ]; then
