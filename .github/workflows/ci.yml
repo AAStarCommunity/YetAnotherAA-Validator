@@ -16,7 +16,10 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 10 was not enough once the audit step could retry: `npm ci` alone measured ~5.5 min here, and
+    # Trivy plus the SARIF upload still run afterwards. A job timeout that trips is another red that
+    # means "infrastructure", which is what this whole job is being fixed to stop producing.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -50,9 +53,14 @@ jobs:
         run: |
           set -uo pipefail
           for attempt in 1 2 3; do
-            # --ignore-scripts is not needed (nothing is installed here) but the timeout is: the
-            # hang is what turned a 20-second step into a cancelled 10-minute job.
-            out=$(timeout 120 npm audit --audit-level=high --json 2>/dev/null || true)
+            # THE PER-ATTEMPT TIMEOUT AND THE JOB TIMEOUT ARE ONE BUDGET, and the first version of
+            # this step blew it: `npm ci` takes ~5.5 min of the job's 10, and 3 x 120s + 45s of
+            # backoff needs 6.75 more. Attempt 3 was killed by `timeout-minutes` and the job went red
+            # with "The operation was canceled" — the retry logic working exactly as written, and the
+            # check still failing for an infrastructure reason, which is the thing this step exists to
+            # stop. 45s is generous for an endpoint that is up; one that is down does not get better
+            # at 120. Worst case is now 45+10+45+20+45 = 165s, and the job has room to spare.
+            out=$(timeout 45 npm audit --audit-level=high --json 2>/dev/null || true)
             # THE GUARD ASSERTS WHAT THE NEXT LINES CONSUME — the two numbers — not merely that their
             # parent object exists. `jq -e '.metadata.vulnerabilities'` is true for `{}`, and then
             # `null + null` is `null`, `[ "null" -gt 0 ]` errors to stderr and lands in the else
@@ -68,11 +76,11 @@ jobs:
                  >/dev/null 2>&1; then
               break
             fi
-            echo "npm audit attempt $attempt did not return advisory data; retrying in $((attempt * 15))s"
+            echo "npm audit attempt $attempt did not return advisory data; retrying in $((attempt * 10))s"
             out=""
             # No sleep after the LAST attempt — there is no fourth one to wait for, and every real
             # outage was paying 45 s for nothing.
-            [ "$attempt" -lt 3 ] && sleep $((attempt * 15))
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
           done
 
           if [ -z "$out" ]; then
