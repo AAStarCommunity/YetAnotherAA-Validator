@@ -148,7 +148,11 @@ owner-only).
    over-issued (`isOverIssued() == false`), holding that state constant through
    the run (current-state variant; historical-state is Phase-3).
 3. **DVT**: run a node with `AUDIT_GUARDIAN_WATCH_ENABLED=true` +
-   `AUDIT_BLS_AGGREGATOR_ADDRESS` set; the watcher captures the VERIFIED
+   `AUDIT_BLS_AGGREGATOR_ADDRESS` set **explicitly** to
+   `0xEaeC2F512eA50708211fa95533e4dBb60e3d2E5D` (4.11.0 — the armed one). Do not
+   lean on the built-in default: it pointed at the superseded 4.3.0 aggregator
+   until 2026-09-04, and pointing at the wrong aggregator does not fail, it just
+   never sees a `SlashExecuted`. The watcher then captures the VERIFIED
    signer-set record.
 4. **DVT**: `assembleOverIssueFraudProof(record, token)` derives the exact
    committed signer set →
@@ -177,16 +181,19 @@ DVT side:
 
 SP/DVT joint gate:
 
-- [~] A'-commitment BLSAggregator + real verifier wired on Sepolia. Aggregator
-  `0xEaeC2F51…` (BLSAggregator-4.11.0) and verifier
-  `0xa1346F1668cBf8D031Cc5D72eDA45F5788CA1cd3` are deployed and the rotation is
-  PROPOSED; not yet wired, because the delay has not matured.
-- [~] Verifier arming evidence: five of six records are FINAL — dormant at
-  deploy, deploy tx, proposal receipt, `readyAt` (2026-09-04T05:36:24Z), and the
-  negative controls. The apply receipt and final active address cannot exist
-  before the delay matures, which is the security property rather than a missing
-  step. Collected in `docs/evidence/cc115-b3-arming-sepolia.md`; finish with
-  `deploy/apply-verifier-rotation.mjs --broadcast`.
+- [x] A'-commitment BLSAggregator + real verifier wired on Sepolia. Aggregator
+      `0xEaeC2F51…` (BLSAggregator-4.11.0), verifier
+      `0xa1346F1668cBf8D031Cc5D72eDA45F5788CA1cd3`, armed 2026-09-04T05:37:12Z
+      (apply tx `0x9add3d63…`). `fraudProofVerifier()` read back at block
+      11632589 returns the verifier and no rotation is pending, so
+      `executeGuardianSlash` on this aggregator is no longer inert.
+- [x] Verifier arming evidence: all seven records FINAL in
+      `docs/evidence/cc115-b3-arming-sepolia.md` — dormant at deploy, deploy tx,
+      proposal receipt, `readyAt`, the delay served in full (48 s over), the
+      apply receipt, and the post-arm readback of the active address, its
+      aggregator / registry binding and its `0x61077735` selector. The
+      negative-control table now includes a post-arm probe: applying again
+      reverts, so the rotation is not replayable.
 - [ ] Fraudulent over-issue slash crafted (evidence convention; over-issue state
       held constant).
 - [ ] Four-parameter preflight, queue, frozen-exit, execute, full-lock slash and

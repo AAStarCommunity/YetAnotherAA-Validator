@@ -43,19 +43,31 @@
 # The local heartbeat is still the right primary trigger, but for the corrected reason: 3.6% delivery
 # cannot monitor a 12-minute outage, NOT that nothing ever runs.
 #
-# So this workflow is a genuine second path to the 2026-09-04 apply, not a decorative one. It is
-# still not the guarantee: the local launchd job `io.aastar.dvt-apply-rotation` runs hourly and
-# its trigger is verified (`launchctl print` reports `run interval = 3600 seconds`). Belt and
-# braces, and the proposal does not expire, so a duplicate attempt costs nothing.
+# So this workflow was a genuine second path to the 2026-09-04 apply, not a decorative one.
+#
+# WHAT ACTUALLY HAPPENED (2026-09-04): NEITHER automation applied the rotation. Tx 0x9add3d63... at
+# 05:37:12Z, 48 s after readyAt -- before this workflow's 06:41Z cron and before the local job's next
+# tick. NOT an external party: the signer is this repo's own .env.sepolia deploy key, i.e. a MANUAL
+# run of the same apply-verifier-rotation.mjs these jobs wrap. So the belt-and-braces was never
+# exercised on the one day it existed for; both jobs merely observed the event. A green run of either
+# proves the trigger fires, not that its broadcast path works -- that path is still untested.
+# Do not credit a later green run with the apply, and do not expect this workflow to publish the
+# readback: the already-applied branch broadcasts nothing and writes no artifact.
+#
+# The schedule is kept because the script's already-applied branch is a drift guard -- it fails
+# loudly on a disarm, on a different active verifier, or on a later rotation proposing an address it
+# is not pinned to. That is now this workflow's whole job. Repoint the expected verifier before any
+# future rotation or it goes red on a correct chain state.
 # ############################################################################################
 name: Apply Verifier Rotation
 
 on:
   schedule:
-    # Daily, offset off the hour. readyAt is 2026-09-04T05:36:24Z, so the first run that can succeed
-    # is that morning. Before then every run exits 0 with the remaining time: waiting out the delay
-    # is the DESIGNED state for four consecutive days, and painting those red would make a real
-    # failure on the fifth indistinguishable from them. The pending proposal does NOT expire, so a
+    # Daily, offset off the hour. The rotation this was written for (readyAt 2026-09-04T05:36:24Z)
+    # was applied externally at 05:37:12Z, before this cron could run; runs from then on exit 0 as a
+    # pinned-state check. The countdown branch below still matters for the NEXT rotation: waiting out
+    # a delay is the DESIGNED state for four consecutive days, and painting those red would make a
+    # real failure on the fifth indistinguishable from them. A pending proposal does NOT expire, so a
     # missed day costs nothing -- which is also why a constant concurrency group is right here.
     - cron: "41 6 * * *"
   workflow_dispatch:

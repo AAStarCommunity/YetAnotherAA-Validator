@@ -398,14 +398,15 @@ case "$MODE" in
     echo "[$(stamp)] rc=$rc $out" >> "$LOG"
     case "$rc" in
       # committee-health-infrastructure is in this list even though THIS script never opens it: the
-      # workflow does, and the workflow closes nothing (its recovery path only runs on a trigger that
-      # does not fire here). Left out, an infrastructure issue stays open forever, which by this
-      # file's own argument is the same as not alerting.
+      # workflow does, and the workflow closes nothing (its recovery path only runs on a schedule
+      # trigger that is delivered unreliably or late here -- see deploy/README-heartbeat.md -- so it
+      # cannot be relied on to arrive). Left out, an infrastructure issue stays open forever, which
+      # by this file's own argument is the same as not alerting.
       0) resolve committee-health-failing committee-health-undetermined committee-health-hung \
                  committee-health-infrastructure ;;   # healthy (or a WARN already judged benign)
       1) alert "committee-health-failing" \
            "Committee validator is failing checks (local heartbeat)" \
-           $'The local launchd heartbeat ran `committee-health.mjs` and it exited 1 -- the committee stack is not serving.\n\n```\n'"$out"$'\n```\n\nRouter: `'"$ROUTER"$'`\nSource: local launchd `io.aastar.dvt-committee-health` (GitHub Actions `schedule` does not fire in this repo -- see deploy/local-heartbeat.sh).' ;;
+           $'The local launchd heartbeat ran `committee-health.mjs` and it exited 1 -- the committee stack is not serving.\n\n```\n'"$out"$'\n```\n\nRouter: `'"$ROUTER"$'`\nSource: local launchd `io.aastar.dvt-committee-health` (GitHub Actions `schedule` is delivered sparsely or hours late here, so it is not a deadline guarantee -- see deploy/README-heartbeat.md).' ;;
       2) alert "committee-health-undetermined" \
            "Committee health could not be determined (local heartbeat)" \
            $'`committee-health.mjs` exited 2: it could not reach a conclusion (RPC, config, or wrong directory). That is NOT benign -- it reports nothing, which is the silence this monitor exists to end.\n\n```\n'"$out"$'\n```' ;;
