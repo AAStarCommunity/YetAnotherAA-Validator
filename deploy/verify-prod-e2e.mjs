@@ -25,12 +25,23 @@ const BLS_ALG = "0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174";
 // with a message naming the NODE — sending the reader to debug three healthy nodes instead of their
 // own configuration. scripts/e2e/realnode-e2e.mjs removed this same default for this same reason on
 // CC-22; this copy never got the fix.
-const ACCOUNT = process.env.E2E_ACCOUNT;
-if (!ACCOUNT) {
+const ACCOUNT_RAW = process.env.E2E_ACCOUNT;
+if (!ACCOUNT_RAW) {
   console.error(
     "\u203c E2E_ACCOUNT is required (an account implementing isValidOwnerAuth\u21920xa0cf00cf, e.g. an " +
       "AAStarAirAccountV7 such as community.toml's e2e_account). Set E2E_ACCOUNT=0x... and re-run."
   );
+  process.exit(1);
+}
+// Normalised through `ethers.getAddress` rather than used as the raw string: it rejects a malformed
+// address at the point it enters the run, with a message naming THIS variable, instead of surfacing
+// later as an opaque ENS or ABI-encoding error from three frames down. It also checksums, so the
+// address printed in the log is the one a block explorer will show.
+let ACCOUNT;
+try {
+  ACCOUNT = ethers.getAddress(ACCOUNT_RAW);
+} catch {
+  console.error(`\u203c E2E_ACCOUNT is not a valid address: "${ACCOUNT_RAW}"`);
   process.exit(1);
 }
 const owner = new ethers.Wallet(env.PRIVATE_KEY_SUPPLIER);
@@ -84,10 +95,7 @@ const userOpHash = await call(p => new ethers.Contract(ENTRY, EP_ABI, p).getUser
 //   0x01 ‖ sig (66 bytes) -> 0xa0cf00cf accepted
 //   bare sig  (65 bytes)  -> 0xffffffff rejected
 const ownerAuth = "0x01" + (await owner.signMessage(ethers.getBytes(userOpHash))).slice(2);
-// Alert #55, open since 2026-06-20: ACCOUNT now comes from `process.env`, which CodeQL treats as
-// sensitive. It is an ERC-4337 account address — public on-chain data, and the whole point of the
-// line is to tell the reader which account a 403 is about. The signing key is never logged.
-console.log("account:", ACCOUNT, "owner:", owner.address, "\nuserOpHash:", userOpHash); // lgtm[js/clear-text-logging]
+console.log("account:", ACCOUNT, "owner:", owner.address, "\nuserOpHash:", userOpHash);
 
 const signed = [];
 for (const port of PORTS) {

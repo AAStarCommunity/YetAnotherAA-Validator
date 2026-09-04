@@ -58,7 +58,21 @@ const NODE_URLS = (
 ).split(",");
 // Same account the other drivers use by default: an AAStarAirAccountV7 whose owner() is
 // PRIVATE_KEY_SUPPLIER and which implements isValidOwnerAuth -> 0xa0cf00cf.
-const ACCOUNT = process.env.E2E_ACCOUNT || "0x92EA8b02D34A4D5d10f0Db9Ea894e8bC72e292e8";
+// Normalised through `ethers.getAddress` rather than used as the raw string: it rejects a malformed
+// address at the point it enters the run, with a message naming THIS variable, instead of surfacing
+// later as an opaque ENS or ABI-encoding error from three frames down. It also checksums, so the
+// address printed in the log is the one a block explorer will show.
+const ACCOUNT_RAW = process.env.E2E_ACCOUNT || "0x92EA8b02D34A4D5d10f0Db9Ea894e8bC72e292e8";
+let ACCOUNT;
+try {
+  ACCOUNT = ethers.getAddress(ACCOUNT_RAW);
+} catch {
+  // console.error, not the `die` helper: that is declared further down the file, so calling it here
+  // is a temporal-dead-zone crash — the malformed-address path would fail with a ReferenceError
+  // about `die` instead of telling the operator what is wrong with their input.
+  console.error(`\u203c E2E_ACCOUNT is not a valid address: "${ACCOUNT_RAW}"`);
+  process.exit(1);
+}
 // Naming the STACK rather than an address, for the reason committee-health.mjs gives: algId 0x01 is
 // what actually decides which validator an account stack uses, so a run derived from the router can
 // never end up proving something about a contract nobody mounts. Defaulted exactly as
@@ -70,17 +84,10 @@ const VALIDATOR_EXPLICIT = process.env.COMMITTEE_VALIDATOR;
 const ENROLLED_SLOT = 42n; // `mapping(address => bool) enrolledAccount` (forge inspect storage-layout)
 
 let failures = 0;
-// CodeQL flags these three as `js/clear-text-logging` because values that reach them can originate in
-// `process.env`, and it cannot tell a secret from a public one. Everything this driver prints from the
-// environment is an ADDRESS or a hash — E2E_ACCOUNT, the validator, the router, a userOpHash — all of
-// which are already on a public chain; the one genuine secret here, the signing key, is read straight
-// into an ethers Wallet and never reaches a log line. Suppressed at the helpers rather than at each
-// call site, and stated rather than silently filtered, so that a future line that DOES carry a secret
-// is a change to this reasoning and not just another entry under an existing exemption.
-const step = (n, label) => console.log(`\n[${n}] ${label}`); // lgtm[js/clear-text-logging]
-const ok = m => console.log(`    ✅ ${m}`); // lgtm[js/clear-text-logging]
+const step = (n, label) => console.log(`\n[${n}] ${label}`);
+const ok = m => console.log(`    ✅ ${m}`);
 const bad = m => {
-  console.log(`    ❌ ${m}`); // lgtm[js/clear-text-logging]
+  console.log(`    ❌ ${m}`);
   failures++;
 };
 const die = m => {
