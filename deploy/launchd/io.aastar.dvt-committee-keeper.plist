@@ -63,6 +63,16 @@
          keeps this agent from becoming the next thing pinned to a retired contract (#283). -->
     <key>COMMITTEE_ROUTER</key>
     <string>0xA97A752779ebfDA58612F6727Ec7C8366c39f897</string>
+    <!-- The validator's creation block. Without it the keeper rebuilds the active set by scanning
+         `eth_getLogs` FROM BLOCK 0 on every single pin, which took ~5 minutes per epoch on Sepolia and
+         is most of the "steady state" unavailability that check-pin-rate reports: pin offsets of 24,
+         26 and 40 blocks into a 64-block epoch, during every one of which committee ops fail closed.
+         The keeper warns about this on stdout and the warning had been scrolling past unread.
+
+         Verified in BOTH directions rather than taken from the E2E driver's bisection: eth_getCode at
+         11599098 returns 0x, at 11599099 returns 46956 hex chars. -->
+    <key>DEPLOY_BLOCK</key>
+    <string>11599099</string>
   </dict>
 
   <key>KeepAlive</key>
