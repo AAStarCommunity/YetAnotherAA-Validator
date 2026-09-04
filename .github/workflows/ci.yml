@@ -16,7 +16,10 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 10 was not enough once the audit step could retry: `npm ci` alone measured ~5.5 min here, and
+    # Trivy plus the SARIF upload still run afterwards. A job timeout that trips is another red that
+    # means "infrastructure", which is what this whole job is being fixed to stop producing.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -28,8 +31,81 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # `npm audit` exits 1 for BOTH "I found high-severity advisories" and "I could not reach the
+      # registry", and those two need opposite responses. Twice today that ambiguity cost real time:
+      # a local run against a mirror that does not implement the audit endpoint returned exit 1 on
+      # BOTH master and the branch under test, which is indistinguishable from "neither is fixed"; and
+      # this job went red twice on `npm error audit endpoint returned an error` (503), then a third
+      # time by hanging until the job timed out — with `found 0 vulnerabilities` printed earlier in
+      # the very same run.
+      #
+      # So: ask for JSON, decide from the DATA, and say which of the two things happened.
+      #
+      # ON AN INFRASTRUCTURE ERROR THIS PASSES, DELIBERATELY, AND LOUDLY. That is a fail-open, and it
+      # is the right trade only because of what it is traded against: a red that means "npm is down"
+      # blocks every merge in the repo while teaching everyone to read a red audit as noise — which is
+      # exactly how a real advisory gets waved through. The other three checks in this job (Trivy,
+      # CodeQL, Dependency Review) do not depend on that endpoint. A registry outage is never silent
+      # here: it prints a ::warning:: naming itself.
+      #
+      # Advisory DATA is never fail-open: if the JSON parses, high+critical > 0 fails the step.
       - name: Run npm audit
-        run: npm audit --audit-level=high
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            # THE PER-ATTEMPT TIMEOUT AND THE JOB TIMEOUT ARE ONE BUDGET, and the first version of
+            # this step blew it: `npm ci` takes ~5.5 min of the job's 10, and 3 x 120s + 45s of
+            # backoff needs 6.75 more. Attempt 3 was killed by `timeout-minutes` and the job went red
+            # with "The operation was canceled" — the retry logic working exactly as written, and the
+            # check still failing for an infrastructure reason, which is the thing this step exists to
+            # stop. 45s is generous for an endpoint that is up; one that is down does not get better
+            # at 120. Worst case is now 45+10+45+20+45 = 165s, and the job has room to spare.
+            out=$(timeout 45 npm audit --audit-level=high --json 2>/dev/null || true)
+            # THE GUARD ASSERTS WHAT THE NEXT LINES CONSUME — the two numbers — not merely that their
+            # parent object exists. `jq -e '.metadata.vulnerabilities'` is true for `{}`, and then
+            # `null + null` is `null`, `[ "null" -gt 0 ]` errors to stderr and lands in the else
+            # branch, and the step prints "no high or critical advisories": the exact sentence this
+            # whole change exists to stop it from saying when it has not checked. Found by @clestons
+            # constructing the input rather than reading the code.
+            #
+            # Deliberately NOT `// 0`, which was independently suggested: defaulting a missing count to
+            # zero translates "I did not find out" into "there are none", which is the same defect
+            # wearing a shorter diff.
+            if [ -n "$out" ] && printf '%s' "$out" \
+                 | jq -e '.metadata.vulnerabilities | (.high|type=="number") and (.critical|type=="number")' \
+                 >/dev/null 2>&1; then
+              break
+            fi
+            out=""
+            # The message and the sleep are behind the SAME condition. They were not: the echo sat
+            # outside the guard, so the third attempt printed "retrying in 30s" and then neither
+            # slept nor retried. Caught in this step's own first live run — a log line stating
+            # something that did not happen, which is the exact class of defect this step exists to
+            # remove from CI. There is no fourth attempt to wait for, and every real outage was
+            # paying for that sleep anyway.
+            if [ "$attempt" -lt 3 ]; then
+              echo "npm audit attempt $attempt did not return advisory data; retrying in $((attempt * 10))s"
+              sleep $((attempt * 10))
+            else
+              echo "npm audit attempt $attempt did not return advisory data; no attempts left"
+            fi
+          done
+
+          if [ -z "$out" ]; then
+            echo "::warning title=npm audit could not run::The registry did not return advisory data after 3 attempts. This step PASSED WITHOUT CHECKING npm advisories — it is not a statement that there are none. Trivy, CodeQL and Dependency Review still ran."
+            exit 0
+          fi
+
+          printf '%s' "$out" | jq -r '
+            .metadata.vulnerabilities as $v
+            | "advisories: critical=\($v.critical) high=\($v.high) moderate=\($v.moderate) low=\($v.low)"'
+          bad=$(printf '%s' "$out" | jq '.metadata.vulnerabilities.high + .metadata.vulnerabilities.critical')
+          if [ "$bad" -gt 0 ]; then
+            printf '%s' "$out" | jq -r '.vulnerabilities | to_entries[] | "  \(.value.severity)\t\(.key)\t\(.value.range)"'
+            echo "::error title=npm audit found high-severity advisories::$bad high or critical advisory/advisories. This IS advisory data, not an outage."
+            exit 1
+          fi
+          echo "npm audit: no high or critical advisories."
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
