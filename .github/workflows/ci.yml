@@ -53,12 +53,26 @@ jobs:
             # --ignore-scripts is not needed (nothing is installed here) but the timeout is: the
             # hang is what turned a 20-second step into a cancelled 10-minute job.
             out=$(timeout 120 npm audit --audit-level=high --json 2>/dev/null || true)
-            if [ -n "$out" ] && printf '%s' "$out" | jq -e '.metadata.vulnerabilities' >/dev/null 2>&1; then
+            # THE GUARD ASSERTS WHAT THE NEXT LINES CONSUME — the two numbers — not merely that their
+            # parent object exists. `jq -e '.metadata.vulnerabilities'` is true for `{}`, and then
+            # `null + null` is `null`, `[ "null" -gt 0 ]` errors to stderr and lands in the else
+            # branch, and the step prints "no high or critical advisories": the exact sentence this
+            # whole change exists to stop it from saying when it has not checked. Found by @clestons
+            # constructing the input rather than reading the code.
+            #
+            # Deliberately NOT `// 0`, which was independently suggested: defaulting a missing count to
+            # zero translates "I did not find out" into "there are none", which is the same defect
+            # wearing a shorter diff.
+            if [ -n "$out" ] && printf '%s' "$out" \
+                 | jq -e '.metadata.vulnerabilities | (.high|type=="number") and (.critical|type=="number")' \
+                 >/dev/null 2>&1; then
               break
             fi
             echo "npm audit attempt $attempt did not return advisory data; retrying in $((attempt * 15))s"
             out=""
-            sleep $((attempt * 15))
+            # No sleep after the LAST attempt — there is no fourth one to wait for, and every real
+            # outage was paying 45 s for nothing.
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 15))
           done
 
           if [ -z "$out" ]; then
