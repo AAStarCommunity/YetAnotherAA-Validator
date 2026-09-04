@@ -41,7 +41,14 @@ if (!ACCOUNT) {
   process.exit(1);
 }
 const owner = new ethers.Wallet(env.PRIVATE_KEY_SUPPLIER);
-const PORTS = [3001, 3002, 3003];
+// Configurable for the same reason dvt-nodes.sh's are: the always-on testnet stack holds 3001-3003,
+// so the .e2e/ stack this driver targets is normally booted elsewhere (E2E_PORTS="3011 3012 3013").
+const PORTS = (process.env.DVT_NODE_PORTS || "3001,3002,3003").split(",").map(s => s.trim());
+// 127.0.0.1, NOT localhost. `localhost` can resolve to ::1 first, and anything else listening on
+// IPv6 at that port answers instead of the node — on this machine an unrelated Next.js dev server
+// holds *:3001 while the DVT containers bind 127.0.0.1 only, so the run failed with "Internal Server
+// Error" and read as a broken node. Override with DVT_NODE_HOST.
+const NODE_HOST = process.env.DVT_NODE_HOST || "127.0.0.1";
 
 const b48 = n => ethers.getBytes("0x" + n.toString(16).padStart(96, "0"));
 const encG2 = pt => {
@@ -93,7 +100,7 @@ console.log("userOpHash:", userOpHash);
 // 3 real running nodes co-sign (each enforces Stage 1 owner-auth against on-chain owner())
 const signed = [];
 for (const port of PORTS) {
-  const r = await fetch(`http://localhost:${port}/signature/sign`, {
+  const r = await fetch(`http://${NODE_HOST}:${port}/signature/sign`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ userOp, ownerAuth }),
@@ -116,18 +123,53 @@ console.log(
   sigs.verify(aggAll, mp, aggPk) ? "✅ VALID" : "❌ INVALID"
 );
 
-// on-chain verify via deployed AAStarBLSAlgorithm using the 2 registered nodes
-const agg2 = sigs.aggregateSignatures(
-  signed.slice(0, 2).map(s => sigs.Signature.fromHex(s.signatureCompact.replace(/^0x/, "")))
-);
-const payload = ethers.concat([env.BLS_TEST_NODE_ID_1, env.BLS_TEST_NODE_ID_2, encG2(agg2)]);
-const ret = await withRpc(p =>
+// On-chain verify via the deployed AAStarBLSAlgorithm.
+//
+// The signer set is taken from what the NODES REPORTED and from what the verifier says it knows --
+// never from env constants. Until this change the payload named BLS_TEST_NODE_ID_1/2 while the
+// aggregate was built from whichever two processes happened to answer on those ports. Those agree
+// only when the running stack is the one gen-nodes.mjs produced; point the same script at the
+// always-on testnet stack (docker, dvt1/2/3) and it claims two identities that did not sign, so
+// validate() returns a bare `1` and the reader has no way to see why. Measured: exactly that, on
+// 2026-09-01.
+// A factory, not an instance: withRpc() hands each attempt a FRESH provider so it can fail over
+// between the RPCs in RPCS, and a contract bound to one dead provider would defeat that.
+const validatorAt = p =>
   new ethers.Contract(
     BLS_ALG,
-    ["function validate(bytes32 hash, bytes signature) view returns (uint256)"],
+    [
+      "function validate(bytes32 hash, bytes signature) view returns (uint256)",
+      "function isRegistered(bytes32) view returns (bool)",
+    ],
     p
-  ).validate(userOpHash, payload)
+  );
+// Canonical 32-byte ids, then STRICTLY ASCENDING -- the contract rejects `nid <= prevId`
+// (AAStarValidator.sol:251), and BigInt compare because Array.sort's Number coercion loses
+// precision above 2^53.
+const withIds = signed.map(s => ({ ...s, id: ethers.zeroPadValue(s.nodeId, 32) }));
+const eligible = [];
+for (const n of withIds) {
+  const reg = await withRpc(p => validatorAt(p).isRegistered(n.id));
+  if (reg) eligible.push(n);
+  else console.log(`  note: ${n.id.slice(0, 18)}… is NOT registered on ${BLS_ALG} — excluded`);
+}
+if (eligible.length < 2) {
+  console.error(
+    `\n‼ only ${eligible.length} of ${withIds.length} signing nodes are registered on ${BLS_ALG}, ` +
+      `so no aggregate can verify there.\n` +
+      `  This normally means the running stack is not the one this verifier knows: ` +
+      `scripts/e2e/dvt-nodes.sh boots the .e2e/ nodes (BLS_TEST keys, registered here), while the\n` +
+      `  always-on testnet stack (docker-compose.testnet.yml, dvt1/2/3) is registered on the\n` +
+      `  router-mounted committee validator instead — use scripts/e2e/committee-e2e.mjs for that one.`
+  );
+  process.exit(1);
+}
+eligible.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0));
+const agg2 = sigs.aggregateSignatures(
+  eligible.map(s => sigs.Signature.fromHex(s.signatureCompact.replace(/^0x/, "")))
 );
+const payload = ethers.concat([...eligible.map(n => n.id), encG2(agg2)]);
+const ret = await withRpc(p => validatorAt(p).validate(userOpHash, payload));
 console.log(
   "[2] on-chain AAStarBLSAlgorithm.validate:",
   ret.toString(),

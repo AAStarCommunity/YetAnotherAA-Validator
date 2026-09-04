@@ -19,9 +19,28 @@ const env = Object.fromEntries(
 const RPC = env.SEPOLIA_RPC_URL;
 const ENTRY = env.ENTRY_POINT_ADDRESS || "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
 const BLS_ALG = "0xAF525A161CB17e0A1b6254ef0B8d8473bdA05174";
-const ACCOUNT = process.env.E2E_ACCOUNT || "0x45Dfe3D5938fDf5a8D30641C3FDA9c9fb1F31ba9";
+// E2E_ACCOUNT is REQUIRED — no default. The old hardcoded 0x45Dfe3D5… does not implement the
+// owner-gate's isValidOwnerAuth(bytes32,bytes) at all (verified on Sepolia: the call REVERTS, while
+// the same call on an AAStarAirAccountV7 returns a bytes4), so every bare run of this script 403s
+// with a message naming the NODE — sending the reader to debug three healthy nodes instead of their
+// own configuration. scripts/e2e/realnode-e2e.mjs removed this same default for this same reason on
+// CC-22; this copy never got the fix.
+const ACCOUNT = process.env.E2E_ACCOUNT;
+if (!ACCOUNT) {
+  console.error(
+    "\u203c E2E_ACCOUNT is required (an account implementing isValidOwnerAuth\u21920xa0cf00cf, e.g. an " +
+      "AAStarAirAccountV7 such as community.toml's e2e_account). Set E2E_ACCOUNT=0x... and re-run."
+  );
+  process.exit(1);
+}
 const owner = new ethers.Wallet(env.PRIVATE_KEY_SUPPLIER);
 const PORTS = [4001, 4002, 4003];
+// 127.0.0.1, NOT localhost. `localhost` can resolve to ::1 first, and anything else listening on
+// IPv6 at that port answers instead of the node — on this machine an unrelated Next.js dev server
+// holds *:3001 while the DVT containers bind 127.0.0.1 only, so the run failed with "Internal Server
+// Error" and read as a broken node. Override with DVT_NODE_HOST.
+const NODE_HOST = process.env.DVT_NODE_HOST || "127.0.0.1";
+
 const b48 = n => ethers.getBytes("0x" + n.toString(16).padStart(96, "0"));
 const encG2 = pt => {
   const a = pt.toAffine();
@@ -58,19 +77,27 @@ const EP_ABI = [
   "function getUserOpHash((address sender,uint256 nonce,bytes initCode,bytes callData,bytes32 accountGasLimits,uint256 preVerificationGas,bytes32 gasFees,bytes paymasterAndData,bytes signature) userOp) view returns (bytes32)",
 ];
 const userOpHash = await call(p => new ethers.Contract(ENTRY, EP_ABI, p).getUserOpHash(userOp));
-const ownerAuth = await owner.signMessage(ethers.getBytes(userOpHash));
+// ownerAuth = 1-byte tag ‖ payload (docs/INTERFACES.md §1). tag 0x01 = owner ECDSA (k1) over
+// personal_sign(userOpHash). isValidOwnerAuth requires EXACTLY 66 bytes and returns 0xffffffff for
+// anything else, so the bare 65-byte signature this used to send was rejected by every account.
+// Verified on Sepolia against e2e_account 0x92EA8b02…, same owner key, same hash:
+//   0x01 ‖ sig (66 bytes) -> 0xa0cf00cf accepted
+//   bare sig  (65 bytes)  -> 0xffffffff rejected
+const ownerAuth = "0x01" + (await owner.signMessage(ethers.getBytes(userOpHash))).slice(2);
 console.log("account:", ACCOUNT, "owner:", owner.address, "\nuserOpHash:", userOpHash);
 
 const signed = [];
 for (const port of PORTS) {
-  const r = await fetch(`http://localhost:${port}/signature/sign`, {
+  const r = await fetch(`http://${NODE_HOST}:${port}/signature/sign`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ userOp, ownerAuth }),
   });
   if (!r.ok) throw new Error(`node :${port} -> ${r.status} ${await r.text()}`);
   const j = await r.json();
-  console.log(`node :${port} signed  nodeId=${j.nodeId.slice(0, 20)}…  (msg==hash: ${j.message === userOpHash})`);
+  console.log(
+    `node :${port} signed  nodeId=${j.nodeId.slice(0, 20)}…  (msg==hash: ${j.message === userOpHash})`
+  );
   signed.push(j);
 }
 
@@ -81,7 +108,10 @@ const aggPk = signed
   .map(s => bls.G1.Point.fromHex(s.publicKey.replace(/^0x/, "")))
   .reduce((a, b) => a.add(b));
 const mp = bls.G2.hashToCurve(ethers.getBytes(userOpHash), { DST });
-console.log("\n[1] 3-node aggregate off-chain verify:", sigs.verify(aggAll, mp, aggPk) ? "✅ VALID" : "❌ INVALID");
+console.log(
+  "\n[1] 3-node aggregate off-chain verify:",
+  sigs.verify(aggAll, mp, aggPk) ? "✅ VALID" : "❌ INVALID"
+);
 
 const payload = ethers.concat([...signed.map(s => s.nodeId), encG2(aggAll)]);
 const ret = await call(p =>
@@ -91,4 +121,8 @@ const ret = await call(p =>
     p
   ).validate(userOpHash, payload)
 );
-console.log("[2] on-chain AAStarBLSAlgorithm.validate:", ret.toString(), ret === 0n ? "✅ VALID" : "❌ reject");
+console.log(
+  "[2] on-chain AAStarBLSAlgorithm.validate:",
+  ret.toString(),
+  ret === 0n ? "✅ VALID" : "❌ reject"
+);

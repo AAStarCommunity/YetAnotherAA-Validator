@@ -9,7 +9,23 @@
 #   ./scripts/e2e/dvt-nodes.sh stop      # stop all 3
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-E2E="$REPO/.e2e"; DIST="$REPO/dist/main.js"; PORTS=(3001 3002 3003)
+E2E="$REPO/.e2e"; DIST="$REPO/dist/main.js"
+# Ports are configurable because the ALWAYS-ON testnet stack (docker-compose.testnet.yml, the nodes
+# behind dvt1/2/3.aastar.io) binds 3001-3003 too. Booting this stack on the defaults would either
+# refuse to start or, worse, require stopping the public nodes to run a local test. Override with
+# E2E_PORTS="3011 3012 3013" to run both side by side.
+read -r -a PORTS <<< "${E2E_PORTS:-3001 3002 3003}"
+# Exactly three, checked here. Every loop below indexes PORTS[0..2]; a shorter list would fail at
+# `${PORTS[2]}` under `set -u` with an unbound-variable message that names neither this variable nor
+# the mistake. Fail where the input is.
+[ "${#PORTS[@]}" -eq 3 ] || {
+  echo "E2E_PORTS must name exactly 3 ports, got ${#PORTS[@]}: '${E2E_PORTS:-}'" >&2
+  exit 1
+}
+# 127.0.0.1, not localhost: on a dual-stack host localhost resolves to ::1 first and an unrelated
+# IPv6 listener answers instead of the node (that is exactly how selftest.mjs hit a Next.js dev
+# server on *:3001). Override with DVT_NODE_HOST.
+HOST="${DVT_NODE_HOST:-127.0.0.1}"
 cd "$REPO"
 
 ensure() {
@@ -41,7 +57,7 @@ stop() {
 status() {
   for i in 1 2 3; do
     local port="${PORTS[$((i-1))]}"
-    if curl -s -m 4 "http://localhost:$port/node/info" >/dev/null 2>&1; then echo "  node$i :$port  ✅ UP"; else echo "  node$i :$port  ❌ down"; fi
+    if curl -s -m 4 "http://$HOST:$port/node/info" >/dev/null 2>&1; then echo "  node$i :$port  ✅ UP"; else echo "  node$i :$port  ❌ down"; fi
   done
 }
 info() {
@@ -49,7 +65,10 @@ info() {
   echo "# endpoint: POST {url}/signature/sign  body {userOp, ownerAuth}  → {nodeId, signature(EIP-2537), publicKey}"
   for i in 1 2 3; do
     local port="${PORTS[$((i-1))]}"
-    node -e 'const s=require("./.e2e/node'"$i"'/node_state.json");console.log(`node'"$i"' | url=http://localhost:'"$port"' | nodeId=${s.nodeId} | pubKey=0x${s.publicKey}`)'
+    # Values go through the ENVIRONMENT, not through shell string-splicing. The splice this replaces
+    # left `$HOST` inside a single-quoted argument, so neither bash nor JS expanded it and the table
+    # printed a literal `url=http://$HOST:3001` — a shareable table whose URLs do not resolve.
+    NODE_I="$i" NODE_HOST="$HOST" NODE_PORT="$port" node -e 'const {NODE_I:i,NODE_HOST:h,NODE_PORT:p}=process.env;const s=require(`./.e2e/node${i}/node_state.json`);console.log(`node${i} | url=http://${h}:${p} | nodeId=${s.nodeId} | pubKey=0x${s.publicKey}`)'
   done
   echo "# node1/node2 BLS pubkeys are registered on AAStarBLSAlgorithm (BLS_TEST_1/2); node3 is fresh (register before on-chain use)."
 }
