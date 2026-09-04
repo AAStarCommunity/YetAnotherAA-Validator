@@ -37,11 +37,20 @@ if (!ACCOUNT_RAW) {
 // address at the point it enters the run, with a message naming THIS variable, instead of surfacing
 // later as an opaque ENS or ABI-encoding error from three frames down. It also checksums, so the
 // address printed in the log is the one a block explorer will show.
+// Describes the SHAPE of the bad value rather than echoing it. Two reasons, and the second is the
+// real one: (a) after `ethers.getAddress` the accepted value is no longer flagged by CodeQL — the
+// remaining sink was this line handing a raw `process.env` string straight to a log; (b) echoing back
+// what the operator typed adds little they do not already have, whereas "44 chars, no 0x prefix"
+// names the mistake directly. Length and prefix are derived facts about the input, not the input.
+const shapeOf = v => `${v.length} char(s), ${v.startsWith("0x") ? "0x-prefixed" : "no 0x prefix"}`;
 let ACCOUNT;
 try {
   ACCOUNT = ethers.getAddress(ACCOUNT_RAW);
 } catch {
-  console.error(`\u203c E2E_ACCOUNT is not a valid address: "${ACCOUNT_RAW}"`);
+  console.error(
+    `\u203c E2E_ACCOUNT is not a valid address (${shapeOf(ACCOUNT_RAW)}); ` +
+      `it must be a 0x-prefixed 20-byte hex address`
+  );
   process.exit(1);
 }
 const owner = new ethers.Wallet(env.PRIVATE_KEY_SUPPLIER);
