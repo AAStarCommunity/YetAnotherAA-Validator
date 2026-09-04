@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Keep committee-keeper.mjs --watch resident.
+
+     WHY THIS EXISTS, measured on 2026-09-04.
+
+     The keeper process died at roughly 23:05 local on 09-03 and was still not running eleven hours
+     later. 52 consecutive epochs went unpinned, which fail-closed committee validate() for 53 of them
+     (validate() needs BOTH `e` and `e-1`), on the morning of the CC-115 B3 evidence run.
+
+     Nothing was broken except the absence of this file. The alerting worked perfectly: the health
+     agent fired every 15 minutes and appended to issue #305 forty-five consecutive times. The host was
+     awake. The three DVT node containers were `Up 2 days (healthy)` the entire time. The ONLY thing
+     missing was something to start the process again -- the monitoring was complete and the monitored
+     process had no supervisor, so the outage was fully observed and fully unattended.
+
+     That is a different failure from the eight before it. Those were host sleep (clamshell on AC,
+     maintenance sleep on battery -- `caffeinate` covers neither), each self-healing on wake within
+     k<=3 epochs. This one could not self-heal, because a dead process does not wake up with the
+     laptop.
+
+     KeepAlive, NOT StartInterval. This supervises a RESIDENT process; the other two agents in this
+     directory run a periodic job and exit. That difference changes how you verify it -- see below.
+
+     ThrottleInterval 30: if the keeper is crashing on startup (bad RPC, missing key), relaunching it
+     ten times a second turns a configuration error into a spend. 30s still recovers a real crash well
+     inside one epoch (64 blocks ~= 12.8 min).
+
+     VERIFY DIFFERENTLY FROM THE OTHER TWO. `launchctl print` will NOT show a `run interval` line here
+     -- correctly, there is no interval. Read `state` and `pid` instead:
+
+         launchctl print gui/$(id -u)/io.aastar.dvt-committee-keeper | grep -E "state|pid|last exit"
+         #   state = running        <- what matters
+         #   pid = NNNNN
+
+     And do not stop at "launchd says running" -- that was never the failing question. Ask the chain:
+
+         node scripts/check-pin-rate.mjs --blocks 600     # recent epochs, misses grouped into runs
+
+     Install: deploy/README-heartbeat.md -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.aastar.dvt-committee-keeper</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jason/.nvm/versions/node/v22.22.2/bin/node</string>
+    <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/committee-keeper.mjs</string>
+    <string>--watch</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/jason/.nvm/versions/node/v22.22.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/jason</string>
+    <!-- The ROUTER, not a validator address. Resolving algId 0x01 through the router every run is what
+         keeps this agent from becoming the next thing pinned to a retired contract (#283). -->
+    <key>COMMITTEE_ROUTER</key>
+    <string>0xA97A752779ebfDA58612F6727Ec7C8366c39f897</string>
+    <!-- The validator's creation block. Without it the keeper rebuilds the active set by scanning
+         `eth_getLogs` FROM BLOCK 0 on every single pin, which took ~5 minutes per epoch on Sepolia and
+         is most of the "steady state" unavailability that check-pin-rate reports: pin offsets of 24,
+         26 and 40 blocks into a 64-block epoch, during every one of which committee ops fail closed.
+         The keeper warns about this on stdout and the warning had been scrolling past unread.
+
+         Verified in BOTH directions rather than taken from the E2E driver's bisection: eth_getCode at
+         11599098 returns 0x, at 11599099 returns 46956 hex chars. -->
+    <key>DEPLOY_BLOCK</key>
+    <string>11599099</string>
+  </dict>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/.run/committee-keeper.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/.run/committee-keeper.log</string>
+</dict>
+</plist>

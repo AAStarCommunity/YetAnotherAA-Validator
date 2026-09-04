@@ -55,16 +55,42 @@ heartbeat exists.
 
 ## What is installed
 
-Two launchd agents, sources version-controlled in `deploy/launchd/`:
+Three launchd agents, sources version-controlled in `deploy/launchd/`:
 
-| label                            | interval | does                                                                                                 |
-| -------------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `io.aastar.dvt-committee-health` | 900 s    | `committee-health.mjs` against the router; opens/updates a GitHub issue on any non-zero exit         |
-| `io.aastar.dvt-apply-rotation`   | 3600 s   | `apply-verifier-rotation.mjs --broadcast`; a no-op that exits 0 until readyAt (2026-09-04T05:36:24Z) |
+| label                            | trigger                | does                                                                                                 |
+| -------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------- |
+| `io.aastar.dvt-committee-health` | every 900 s            | `committee-health.mjs` against the router; opens/updates a GitHub issue on any non-zero exit         |
+| `io.aastar.dvt-apply-rotation`   | every 3600 s           | `apply-verifier-rotation.mjs --broadcast`; a no-op that exits 0 until readyAt (2026-09-04T05:36:24Z) |
+| `io.aastar.dvt-committee-keeper` | `KeepAlive` (resident) | keeps `committee-keeper.mjs --watch` alive; restarts it if it dies                                   |
 
-Both run `deploy/local-heartbeat.sh`, which is **independent of
+The first two run `deploy/local-heartbeat.sh`, which is **independent of
 `committee-keeper.mjs`**. A monitor that dies with the process it watches is
 silent in exactly the case it exists for.
+
+### Why the third one exists
+
+For most of this file's life there were two agents, and the thing they watched
+had no supervisor at all — it was started by hand with `nohup`.
+
+On 2026-09-04 that cost eleven hours. The keeper process died around 23:05 the
+previous night and was still not running the next morning: **52 consecutive
+epochs unpinned, committee `validate()` fail-closed for 53 of them** (it needs
+both `e` and `e-1`), on the morning of the CC-115 B3 evidence run.
+
+Nothing was broken except the absence of that agent. The health monitor worked
+perfectly — it fired every 15 minutes and appended to issue #305 forty-five
+consecutive times. The host was awake; the three DVT containers reported
+`Up 2 days (healthy)` throughout. The outage was **fully observed and fully
+unattended**, which is its own failure mode and not one this directory had a
+name for: complete monitoring pointed at a process nothing would restart.
+
+It is also a different failure from the eight misses before it. Those were host
+sleep (clamshell on AC, maintenance sleep on battery — `caffeinate` covers
+neither), each self-healing on wake within k≤3 epochs. A dead process does not
+wake up with the laptop.
+
+`KeepAlive`, not `StartInterval`: this one supervises a **resident** process
+rather than running a job and exiting — which changes how you verify it, below.
 
 The Actions workflows stay installed as redundancy — they cost nothing and might
 fire. They are not the guarantee.
@@ -85,7 +111,7 @@ monitor.
 install -d -m 700 deploy/.run
 
 cp deploy/launchd/io.aastar.dvt-*.plist ~/Library/LaunchAgents/
-for L in io.aastar.dvt-committee-health io.aastar.dvt-apply-rotation; do
+for L in io.aastar.dvt-committee-health io.aastar.dvt-apply-rotation io.aastar.dvt-committee-keeper; do
   launchctl bootout    gui/$(id -u)/$L 2>/dev/null
   launchctl bootstrap  gui/$(id -u) ~/Library/LaunchAgents/$L.plist
 done
@@ -102,6 +128,35 @@ happened. Ask **launchd** what it registered:
 ```bash
 launchctl print gui/$(id -u)/io.aastar.dvt-committee-health | grep -E "run interval|runs|last exit"
 #   run interval = 900 seconds     <- the line that matters. Its ABSENCE is the bug above.
+```
+
+The keeper agent is the exception, and reading it the same way would be a false
+alarm: it has **no** interval, so `run interval` is correctly absent. Read
+`state` and `pid`:
+
+```bash
+launchctl print gui/$(id -u)/io.aastar.dvt-committee-keeper | grep -E "state|pid|last exit"
+#   state = running
+#   pid = NNNNN
+```
+
+Then verify the RESTART, not the running — the outage above was not caused by
+launchd failing to keep something alive, it was caused by nothing being asked
+to. So ask it, by killing the process and watching it come back:
+
+```bash
+PID=$(launchctl print gui/$(id -u)/io.aastar.dvt-committee-keeper | awk '/^\tpid = /{print $3}')
+kill -9 "$PID"
+sleep 35 && launchctl print gui/$(id -u)/io.aastar.dvt-committee-keeper | grep pid   # a DIFFERENT pid
+```
+
+Done on install: pid 51320 killed with `-9`, relaunched as 52488 after ~20 s.
+
+And do not stop at "launchd says running" — that was never the failing question.
+Ask the chain:
+
+```bash
+node scripts/check-pin-rate.mjs --blocks 600    # recent epochs, misses grouped into runs
 ```
 
 Then confirm the interval actually fires, rather than only `RunAtLoad`:
