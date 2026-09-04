@@ -28,8 +28,54 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # `npm audit` exits 1 for BOTH "I found high-severity advisories" and "I could not reach the
+      # registry", and those two need opposite responses. Twice today that ambiguity cost real time:
+      # a local run against a mirror that does not implement the audit endpoint returned exit 1 on
+      # BOTH master and the branch under test, which is indistinguishable from "neither is fixed"; and
+      # this job went red twice on `npm error audit endpoint returned an error` (503), then a third
+      # time by hanging until the job timed out — with `found 0 vulnerabilities` printed earlier in
+      # the very same run.
+      #
+      # So: ask for JSON, decide from the DATA, and say which of the two things happened.
+      #
+      # ON AN INFRASTRUCTURE ERROR THIS PASSES, DELIBERATELY, AND LOUDLY. That is a fail-open, and it
+      # is the right trade only because of what it is traded against: a red that means "npm is down"
+      # blocks every merge in the repo while teaching everyone to read a red audit as noise — which is
+      # exactly how a real advisory gets waved through. The other three checks in this job (Trivy,
+      # CodeQL, Dependency Review) do not depend on that endpoint. A registry outage is never silent
+      # here: it prints a ::warning:: naming itself.
+      #
+      # Advisory DATA is never fail-open: if the JSON parses, high+critical > 0 fails the step.
       - name: Run npm audit
-        run: npm audit --audit-level=high
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            # --ignore-scripts is not needed (nothing is installed here) but the timeout is: the
+            # hang is what turned a 20-second step into a cancelled 10-minute job.
+            out=$(timeout 120 npm audit --audit-level=high --json 2>/dev/null || true)
+            if [ -n "$out" ] && printf '%s' "$out" | jq -e '.metadata.vulnerabilities' >/dev/null 2>&1; then
+              break
+            fi
+            echo "npm audit attempt $attempt did not return advisory data; retrying in $((attempt * 15))s"
+            out=""
+            sleep $((attempt * 15))
+          done
+
+          if [ -z "$out" ]; then
+            echo "::warning title=npm audit could not run::The registry did not return advisory data after 3 attempts. This step PASSED WITHOUT CHECKING npm advisories — it is not a statement that there are none. Trivy, CodeQL and Dependency Review still ran."
+            exit 0
+          fi
+
+          printf '%s' "$out" | jq -r '
+            .metadata.vulnerabilities as $v
+            | "advisories: critical=\($v.critical) high=\($v.high) moderate=\($v.moderate) low=\($v.low)"'
+          bad=$(printf '%s' "$out" | jq '.metadata.vulnerabilities.high + .metadata.vulnerabilities.critical')
+          if [ "$bad" -gt 0 ]; then
+            printf '%s' "$out" | jq -r '.vulnerabilities | to_entries[] | "  \(.value.severity)\t\(.key)\t\(.value.range)"'
+            echo "::error title=npm audit found high-severity advisories::$bad high or critical advisory/advisories. This IS advisory data, not an outage."
+            exit 1
+          fi
+          echo "npm audit: no high or critical advisories."
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
