@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Keeps dvt{1,2,3}.aastar.io reachable: probes the PUBLIC endpoints every 5 minutes and restarts
+     the cloudflared container when they stop serving. See deploy/tunnel-keepalive.sh for why the
+     probe is end-to-end over the public hostname and not a Docker healthcheck.
+
+     WHY THIS EXISTS: the tunnel was down for days while every local signal stayed green -- three
+     node containers reporting `Up 3 days (healthy)` behind a dead tunnel, because their healthcheck
+     runs inside the container and never crosses it. Nothing was watching the only thing that could
+     have failed visibly. Same shape as the keeper outage that io.aastar.dvt-committee-keeper was
+     written for: complete monitoring pointed at something with no supervisor.
+
+     StartInterval at the TOP level of this dict, not nested inside EnvironmentVariables -- nesting
+     it passes `plutil -lint` while launchd silently ignores it. Verify with
+     `launchctl print gui/$(id -u)/io.aastar.dvt-tunnel-keepalive | grep "run interval"`,
+     which must print 300. A green plist lint is not evidence the job will ever fire.
+
+     Install:
+       cp deploy/launchd/io.aastar.dvt-tunnel-keepalive.plist ~/Library/LaunchAgents/
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.aastar.dvt-tunnel-keepalive.plist
+     Verify it recovers a real outage, not just that it is loaded:
+       docker stop dvt-cloudflared && ./deploy/tunnel-keepalive.sh   # must end "RECOVERED 3/3" -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.aastar.dvt-tunnel-keepalive</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/tunnel-keepalive.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/jason/.nvm/versions/node/v22.22.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/jason</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/.run/launchd-tunnel-keepalive.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jason/Dev/aastar/YetAnotherAA-Validator/deploy/.run/launchd-tunnel-keepalive.log</string>
+</dict>
+</plist>
