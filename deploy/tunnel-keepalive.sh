@@ -91,8 +91,17 @@ internet_up() {
 # therefore the condition that makes compose refuse to start. A 2-of-3 degradation would have been
 # converted by this script into a 3-of-3 outage.
 #
-# Empty status (a container with no healthcheck defined) counts as NOT healthy: compose's
-# service_healthy would not be satisfiable either, so fail-closed is the truthful direction.
+# A container with no healthcheck counts as NOT healthy, which is the right direction (compose's
+# service_healthy would not be satisfiable either). But note the MECHANISM, because the obvious
+# reading is wrong: `.State.Health` is absent rather than empty on such a container, so the template
+# does not return "" -- `docker inspect` FAILS with
+#   template parsing error: ... map has no entry for key "Health"
+# and exits 1, and the `2>/dev/null` below swallows it. `st` ends up empty as a side effect of the
+# command failing, not because the field is empty. Anyone who removes that redirect to debug
+# something else will suddenly see template errors here; they are pre-existing, not a new fault.
+# (Measured. Also measured: aastar-dvt:latest carries its own HEALTHCHECK, which compose inherits
+# even when the service does not declare one, so reaching this state at all needs an explicit
+# `healthcheck: {disable: true}`.)
 nodes_healthy() {
   local c st
   for c in "${CONTAINERS[@]}"; do
@@ -148,7 +157,10 @@ if ! nodes_healthy; then
   say "NODES DOWN or NOT HEALTHY: one or more of ${CONTAINERS[*]} is not reporting healthy. The \
 tunnel is not the problem; restarting it would front an empty origin -- and compose would destroy \
 the running tunnel and then refuse to recreate it, turning a partial outage into a total one. \
-Start or repair the node stack first."
+Start or repair the node stack first. NOTE: while ONE node is unhealthy, cloudflared cannot be \
+started at all (compose gates it on all three being healthy), so if the tunnel also goes down in \
+that window, the healthy nodes' public endpoints cannot come back either -- do not read 'the \
+tunnel is not the problem' as 'the other two are fine publicly'."
   exit 3
 fi
 
