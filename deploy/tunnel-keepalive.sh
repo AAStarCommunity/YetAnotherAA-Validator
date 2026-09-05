@@ -27,8 +27,9 @@
 #   1  still down after a restart attempt -- a real problem, look at it
 #   2  could not reach a conclusion (this host has no working internet, or the API was unreachable);
 #      deliberately NOT a restart, because restarting a tunnel you cannot see is thrashing
-#   3  the node containers are not running -- the tunnel is not the problem; restarting it would
-#      only put a healthy tunnel in front of nothing
+#   3  the node containers are not all reporting healthy -- the tunnel is not the problem. Restarting
+#      it would front an empty origin, and worse: compose destroys the old cloudflared BEFORE
+#      checking its `service_healthy` dependency, so the restart would leave no tunnel at all
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -77,10 +78,26 @@ internet_up() {
   return 1
 }
 
-nodes_running() {
-  local c
+# Gate on HEALTH, not on Running -- it must match the condition compose itself enforces.
+#
+# This was `.State.Running` and that was a live bug (PR #318 review). `docker-compose.testnet.yml`
+# gates cloudflared on `depends_on: condition: service_healthy`, and compose DESTROYS the old
+# cloudflared container before evaluating that condition. So a node that is Running but unhealthy
+# passed this check, reached the restart, and left the tunnel destroyed-and-not-recreated -- every
+# 300 s, forever.
+#
+# The coupling is what makes it bite rather than being a corner case: the node healthcheck fetches
+# `/health`, the SAME endpoint probe_one requests. The condition that makes the public probe fail is
+# therefore the condition that makes compose refuse to start. A 2-of-3 degradation would have been
+# converted by this script into a 3-of-3 outage.
+#
+# Empty status (a container with no healthcheck defined) counts as NOT healthy: compose's
+# service_healthy would not be satisfiable either, so fail-closed is the truthful direction.
+nodes_healthy() {
+  local c st
   for c in "${CONTAINERS[@]}"; do
-    [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = "true" ] || return 1
+    st=$(docker inspect -f '{{.State.Health.Status}}' "$c" 2>/dev/null)
+    [ "$st" = "healthy" ] || return 1
   done
   return 0
 }
@@ -127,9 +144,11 @@ if ! internet_up; then
   exit 2
 fi
 
-if ! nodes_running; then
-  say "NODES DOWN: one or more of ${CONTAINERS[*]} is not running. The tunnel is not the problem; \
-restarting it would front an empty origin. Start the node stack first."
+if ! nodes_healthy; then
+  say "NODES DOWN or NOT HEALTHY: one or more of ${CONTAINERS[*]} is not reporting healthy. The \
+tunnel is not the problem; restarting it would front an empty origin -- and compose would destroy \
+the running tunnel and then refuse to recreate it, turning a partial outage into a total one. \
+Start or repair the node stack first."
   exit 3
 fi
 
