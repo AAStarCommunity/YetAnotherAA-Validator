@@ -47,11 +47,15 @@ function nodeState(overrides: Partial<NodeState> = {}): NodeState {
 function makeChain(overrides: {
   checkNodeRegistration?: jest.Mock<() => Promise<boolean>>;
   getNodePublicKey?: jest.Mock<() => Promise<string>>;
+  getBlockNumber?: jest.Mock<() => Promise<number>>;
 }): BlockchainService {
   return {
     checkNodeRegistration: overrides.checkNodeRegistration ?? jest.fn(() => Promise.resolve(true)),
     getNodePublicKey:
       overrides.getNodePublicKey ?? jest.fn(() => Promise.resolve(KEY_A.eip2537Hex)),
+    // Round-6 M1: checkOnchain() pins both reads to one shared block — fixed default so
+    // existing assertions (which predate the blockTag param) are unaffected.
+    getBlockNumber: overrides.getBlockNumber ?? jest.fn(() => Promise.resolve(12345)),
   } as unknown as BlockchainService;
 }
 
@@ -270,6 +274,96 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2/
     expect(jest.getTimerCount()).toBe(1);
 
     service.stop();
+  });
+
+  it("M2 (round 6): an old in-flight check that REJECTS after being superseded checks staleness FIRST — no checkerError leaks onto the new identity", async () => {
+    // Codex round-3 finding: the catch in loop() called recordCheckerError() BEFORE checking
+    // the generation, so a superseded (stale) attempt that eventually REJECTS (not just
+    // resolves — Medium-4 only covered the resolving case) would stamp its error onto
+    // whichever identity happens to be CURRENT when it settles. This spies on check() itself
+    // to control exactly when the OLD attempt settles, independent of what internally causes
+    // it to reject.
+    const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
+    const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
+    const service = new NodeKeyConsistencyService(chain, realBls);
+
+    let rejectFirst!: (err: Error) => void;
+    const firstCheckPromise = new Promise<any>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const realCheck = service.check.bind(service);
+    let checkCallCount = 0;
+    jest.spyOn(service, "check").mockImplementation((...args: any[]) => {
+      checkCallCount++;
+      if (checkCallCount === 1) {
+        return firstCheckPromise; // the FIRST (old-identity) attempt hangs, then rejects
+      }
+      return (realCheck as any)(...args);
+    });
+
+    const oldNodeId = "0x" + "aa".repeat(32);
+    const newNodeId = "0x" + "bb".repeat(32);
+
+    service.start(nodeState({ nodeId: oldNodeId }), "0xcontract");
+    await jest.advanceTimersByTimeAsync(1); // loop() is now awaiting the hung first check()
+    expect(service.getLastResult()).toBeNull();
+
+    // Supersede it with a NEW identity while the old attempt is still hanging.
+    service.start(nodeState({ nodeId: newNodeId }), "0xcontract");
+    await jest.advanceTimersByTimeAsync(1); // the new loop's OWN check() runs for real
+    expect(service.getLastResult()?.status).toBe("ok");
+    expect(service.getLastResult()?.nodeId).toBe(newNodeId);
+
+    // NOW the OLD (superseded) check() finally REJECTS.
+    rejectFirst(new Error("stale RPC error from a superseded identity"));
+    await jest.advanceTimersByTimeAsync(1);
+
+    const after = service.getLastResult();
+    // Untouched: still the NEW identity's clean "ok" — no checkerError leaked onto it.
+    expect(after?.nodeId).toBe(newNodeId);
+    expect(after?.status).toBe("ok");
+    expect(after?.checkerError).toBeUndefined();
+    // The stale loop must not reschedule either — only ONE timer pending.
+    expect(jest.getTimerCount()).toBe(1);
+
+    service.stop();
+  });
+
+  it("M2b (round 6): an old in-flight check that REJECTS after clearResult() must not resurrect the cleared result", async () => {
+    const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
+    const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
+    const service = new NodeKeyConsistencyService(chain, realBls);
+
+    let rejectFirst!: (err: Error) => void;
+    const firstCheckPromise = new Promise<any>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const realCheck = service.check.bind(service);
+    let checkCallCount = 0;
+    jest.spyOn(service, "check").mockImplementation((...args: any[]) => {
+      checkCallCount++;
+      if (checkCallCount === 1) {
+        return firstCheckPromise;
+      }
+      return (realCheck as any)(...args);
+    });
+
+    service.start(nodeState(), "0xcontract");
+    await jest.advanceTimersByTimeAsync(1); // still hanging on the first (only) check()
+    expect(service.getLastResult()).toBeNull();
+
+    // Node deleted: stop + clearResult (mirrors NodeService.reloadNodeState()'s "no node" path).
+    service.stop();
+    service.clearResult();
+    expect(service.getLastResult()).toBeNull();
+
+    // The OLD hung check now rejects.
+    rejectFirst(new Error("stale RPC error after deletion"));
+    await jest.advanceTimersByTimeAsync(1);
+
+    // Must STILL be null — the stale rejection must not resurrect anything.
+    expect(service.getLastResult()).toBeNull();
+    expect(jest.getTimerCount()).toBe(0);
   });
 
   it("HIGH-3: an unexpected throw deep inside a check() attempt never produces an unhandledRejection, and the loop survives it", async () => {

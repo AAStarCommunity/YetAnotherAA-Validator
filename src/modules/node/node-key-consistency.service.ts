@@ -194,6 +194,15 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     try {
       await this.check(nodeState, contractAddress, myGeneration);
     } catch (error: unknown) {
+      // Round-6 M2: check staleness BEFORE recording anything. An in-flight attempt from a
+      // SUPERSEDED identity/loop (start()/stop() ran while it was pending) that REJECTS must
+      // be discarded exactly like one that resolves normally (Medium-4's non-throwing path
+      // already does this) — otherwise its error would stamp `checkerError` onto (or
+      // fabricate a synthetic result for) whichever identity is CURRENT now, potentially
+      // resurrecting a result `clearResult()` had just wiped for a deleted node.
+      if (this.isStaleOrStopped(myGeneration)) {
+        return;
+      }
       // Structural boundary (round-2 High-3), FAIL-LOUD not silent (round-3 Medium): see
       // recordCheckerError. This is deliberately the INNER catch (around check() only) so
       // scheduling below still runs even when check() itself threw — an internal bug must
@@ -202,7 +211,7 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
       // its own — the two layers have different jobs and must stay separate.
       this.recordCheckerError(nodeState, error);
     }
-    if (this.stopped || myGeneration !== this.generation) {
+    if (this.isStaleOrStopped(myGeneration)) {
       // Either stopped, or superseded by a newer start()/stop() while this attempt was in
       // flight — don't reschedule. This is also what keeps exactly one timer alive at a time.
       return;
@@ -215,6 +224,11 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     // Never keep the process alive just for this self-check (mirrors the rest of the
     // codebase's fire-and-forget timers; this one just says so explicitly).
     this.timer.unref?.();
+  }
+
+  /** A generation captured at loop()-start time is stale once a newer start()/stop() ran. */
+  private isStaleOrStopped(myGeneration: number): boolean {
+    return this.stopped || myGeneration !== this.generation;
   }
 
   /**
@@ -432,15 +446,34 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     }
   }
 
-  /** node_state.publicKey (EIP-2537-encoded) vs. registeredKeys(nodeId), gated by isRegistered. */
+  /**
+   * node_state.publicKey (EIP-2537-encoded) vs. registeredKeys(nodeId), gated by isRegistered.
+   *
+   * Round-6 M1: `isRegistered` and `registeredKeys` are pinned to the SAME `blockTag` (read
+   * once up front) rather than each defaulting to its own independent `latest` read. Without
+   * this, a node deactivated by the validator's permissionless `syncNode(nodeId)` (which
+   * clears `registeredKeys`) exactly between the two calls would read "registered" (from the
+   * first, slightly-earlier call) + "empty key" (from the second, slightly-later call) and
+   * report `mismatch_onchain` — a status that was never actually true at ANY single point in
+   * time; the real transition is registered -> not_registered, with no "registered but wrong
+   * key" state in between. Pinning both reads to one block makes them atomic.
+   *
+   * The empty-`registeredKeys` check right after is defense-in-depth for the same scenario
+   * (e.g. an RPC/indexer that doesn't honor `blockTag` consistently) — an empty on-chain key
+   * is treated as `not_registered` rather than `mismatch_onchain` even if `isRegistered`
+   * somehow still said true.
+   */
   private async checkOnchain(
     nodeState: NodeState,
     contractAddress: string
   ): Promise<"ok" | "mismatch" | "not_registered" | "unknown"> {
     try {
+      const blockTag = await this.blockchainService.getBlockNumber();
+
       const isRegistered = await this.blockchainService.checkNodeRegistration(
         contractAddress,
-        nodeState.nodeId
+        nodeState.nodeId,
+        blockTag
       );
       if (!isRegistered) {
         return "not_registered";
@@ -460,8 +493,14 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
 
       const onchainKey = await this.blockchainService.getNodePublicKey(
         contractAddress,
-        nodeState.nodeId
+        nodeState.nodeId,
+        blockTag
       );
+      if (!onchainKey || onchainKey === "0x") {
+        // Defense-in-depth (see docstring above): an empty registeredKeys() return means
+        // "not actually registered" regardless of what isRegistered() reported.
+        return "not_registered";
+      }
       return normalizeHex(onchainKey) === normalizeHex(localEip2537) ? "ok" : "mismatch";
     } catch (error: any) {
       // RPC failure/timeout/revert. NEVER read this as a mismatch (would falsely accuse a

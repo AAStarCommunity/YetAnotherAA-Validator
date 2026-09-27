@@ -65,12 +65,16 @@ function baseNodeState(overrides: Partial<NodeState> = {}): NodeState {
 function makeBlockchainMock(overrides: {
   checkNodeRegistration?: () => Promise<boolean>;
   getNodePublicKey?: () => Promise<string>;
+  getBlockNumber?: () => Promise<number>;
 }): BlockchainService {
   return {
     checkNodeRegistration: jest.fn(
       overrides.checkNodeRegistration ?? (() => Promise.resolve(false))
     ),
     getNodePublicKey: jest.fn(overrides.getNodePublicKey ?? (() => Promise.resolve("0x"))),
+    // Round-6 M1: checkOnchain() pins both reads to one block — every test gets a fixed
+    // default so existing assertions (which predate the blockTag param) are unaffected.
+    getBlockNumber: jest.fn(overrides.getBlockNumber ?? (() => Promise.resolve(12345))),
   } as unknown as BlockchainService;
 }
 
@@ -402,6 +406,59 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       const result = await service.check(state, "0xcontract");
       expect(result.status).not.toBe("ok");
       expect(result.status).toBe("unknown"); // infinity rejected -> unparsable -> can't compare
+    });
+  });
+
+  describe("M1 (round 6): isRegistered and registeredKeys must be read at the SAME blockTag — never two independent `latest` reads", () => {
+    it("both on-chain reads receive the identical blockTag returned by getBlockNumber()", async () => {
+      const seen: { isRegistered: (number | undefined)[]; registeredKeys: (number | undefined)[] } =
+        { isRegistered: [], registeredKeys: [] };
+      const chain = {
+        getBlockNumber: jest.fn(() => Promise.resolve(100)),
+        checkNodeRegistration: jest.fn((_addr: string, _id: string, blockTag?: number) => {
+          seen.isRegistered.push(blockTag);
+          return Promise.resolve(true);
+        }),
+        getNodePublicKey: jest.fn((_addr: string, _id: string, blockTag?: number) => {
+          seen.registeredKeys.push(blockTag);
+          return Promise.resolve(KEY_A.eip2537Hex);
+        }),
+      } as unknown as BlockchainService;
+      const service = makeService(chain);
+      await service.check(baseNodeState(), "0xcontract");
+      expect(seen.isRegistered).toEqual([100]);
+      expect(seen.registeredKeys).toEqual([100]);
+      expect(chain.getBlockNumber).toHaveBeenCalledTimes(1); // one shared read, not two
+    });
+
+    it("REGRESSION: a node deactivated between the two reads (syncNode race) never surfaces as mismatch_onchain — a status that was never actually true", async () => {
+      // Simulate: at block 100 the node is registered with the correct key; by block 101
+      // (one block later) syncNode() deactivated it and cleared registeredKeys. Pinning both
+      // reads to ONE getBlockNumber() call means both see the consistent block-100 snapshot
+      // (registered + correct key -> ok), never the impossible "registered + empty key" blend
+      // a pair of independent `latest` reads straddling the transition could produce.
+      const chain = {
+        getBlockNumber: jest.fn(() => Promise.resolve(100)),
+        checkNodeRegistration: jest.fn((_addr: string, _id: string, blockTag?: number) =>
+          Promise.resolve(blockTag === 100) // true only "as of block 100"
+        ),
+        getNodePublicKey: jest.fn((_addr: string, _id: string, blockTag?: number) =>
+          Promise.resolve(blockTag === 100 ? KEY_A.eip2537Hex : "0x") // empty "as of block 101+"
+        ),
+      } as unknown as BlockchainService;
+      const service = makeService(chain);
+      const result = await service.check(baseNodeState(), "0xcontract");
+      expect(result.status).toBe("ok");
+    });
+
+    it("defense-in-depth: an empty registeredKeys() return is treated as not_registered, never mismatch_onchain, even if isRegistered() somehow still said true", async () => {
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve("0x"), // empty bytes
+      });
+      const service = makeService(chain);
+      const result = await service.check(baseNodeState(), "0xcontract");
+      expect(result.status).toBe("not_registered");
     });
   });
 
