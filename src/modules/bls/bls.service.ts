@@ -7,6 +7,13 @@ import { NodeKeyPair } from "../../interfaces/node.interface.js";
 import { BlockchainService, PackedUserOp } from "../blockchain/blockchain.service.js";
 import { SignerService } from "../signer/signer.service.js";
 
+/**
+ * A fixed, harmless probe message (32 bytes, clearly non-random so it's recognizable in any
+ * signer-side logs) used ONLY by `resolveSigningPublicKey`'s remote-signer probe — see there
+ * for why no dedicated "get public key" endpoint exists to ask for instead.
+ */
+const REMOTE_SIGNER_PROBE_HASH = "0x" + "cc36".repeat(16);
+
 @Injectable()
 export class BlsService {
   private readonly logger = new Logger(BlsService.name);
@@ -138,12 +145,12 @@ export class BlsService {
    * error it falls back to Node signing, unless RUST_SIGNER_REQUIRED=true (fail-closed).
    */
   async signDerivedHash(userOpHash: string, node: NodeKeyPair): Promise<SignatureResult> {
-    const base = this.configService?.get<string>("rustSignerUrl");
-    if (base) {
+    const rust = this.getRustSignerConfig();
+    if (rust) {
       try {
-        return await this.signViaRust(base, userOpHash, node);
+        return await this.signViaRust(rust, userOpHash, node);
       } catch (error: any) {
-        if (this.configService?.get<boolean>("rustSignerRequired") === true) {
+        if (rust.required) {
           // Production wants Rust — surface the failure instead of silently degrading.
           this.logger.error(`Rust signer required but failed: ${error?.message ?? error}`);
           throw error;
@@ -156,19 +163,114 @@ export class BlsService {
     return this.signViaNode(userOpHash, node);
   }
 
+  /**
+   * The ONE place both `signDerivedHash()` and any other consumer that needs to know
+   * "which signer is currently authoritative for this node" (the node key-consistency
+   * self-check, round-3 High-2) read the hybrid-signer config — so they can never
+   * independently re-read the same env vars and silently drift apart on the decision.
+   * Returns null when no remote signer is configured at all (plain local signing).
+   */
+  private getRustSignerConfig(): { url: string; required: boolean; token?: string } | null {
+    const url = this.configService?.get<string>("rustSignerUrl");
+    if (!url) {
+      return null;
+    }
+    return {
+      url,
+      required: this.configService?.get<boolean>("rustSignerRequired") === true,
+      token: this.configService?.get<string>("rustSignerToken"),
+    };
+  }
+
+  /**
+   * Round-3 High-2: which public key is CURRENTLY authoritative for this node's signing,
+   * resolved via the EXACT same signer selection `signDerivedHash()` uses
+   * (`getRustSignerConfig()`), without producing a real signature over caller-supplied
+   * data. The node key-consistency self-check uses this instead of unconditionally
+   * comparing the local `privateKey` field — a node can be configured for remote (Rust/
+   * TEE-KMS) signing while STILL carrying a (possibly stale) local `privateKey` in
+   * node_state.json, so comparing the local key would be comparing the wrong thing
+   * entirely: it could report `ok` while every real (remote) signature actually fails, or
+   * report a mismatch while every real signature is actually fine.
+   *
+   * Deliberately simpler than `signDerivedHash()`'s RUST_SIGNER_REQUIRED fallback nuance:
+   * a real sign call may fall back to local when the remote is optional and unreachable,
+   * but for THIS purpose "remote is configured at all" already means it's the FIRST thing
+   * a real sign attempts (see signDerivedHash), so an unreachable remote here must NEVER
+   * silently fall back to reporting the local key as authoritative — that is exactly the
+   * bug this method exists to prevent. `required` only changes whether a REAL sign call
+   * falls back after a failed remote attempt; it does not change what this method reports.
+   */
+  async resolveSigningPublicKey(node: NodeKeyPair): Promise<
+    | { source: "local"; publicKey: any }
+    | { source: "remote"; publicKeyHex: string }
+    | { source: "remote_unavailable" }
+    | { source: "no_signer" }
+  > {
+    const rust = this.getRustSignerConfig();
+    if (!rust) {
+      if (!node.privateKey) {
+        return { source: "no_signer" };
+      }
+      const signer = this.signerService.forNode(node);
+      const publicKey = await signer.getPublicKey();
+      return { source: "local", publicKey };
+    }
+    try {
+      const publicKeyHex = await this.probeRemoteSignerPublicKey(rust, node);
+      return { source: "remote", publicKeyHex };
+    } catch (error: any) {
+      this.logger.warn(
+        `remote signer public-key probe failed for node ${node.nodeId}: ${error?.message ?? error}`
+      );
+      return { source: "remote_unavailable" };
+    }
+  }
+
+  /**
+   * Ask the remote/rust signer for its public key. There is no dedicated "get public key"
+   * endpoint (the signer only exposes /sign) — every /sign response includes `public_key`
+   * alongside the signature, so this probes with a fixed, clearly-marked, harmless message
+   * reserved for this purpose. Shares the exact URL/token construction `signViaRust` uses
+   * (via the same `rust` config object) so this can never silently drift from the real
+   * signing request shape.
+   */
+  private async probeRemoteSignerPublicKey(
+    rust: { url: string; token?: string },
+    node: NodeKeyPair
+  ): Promise<string> {
+    const url = `${rust.url.replace(/\/+$/, "")}/sign`;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (rust.token) {
+      headers["X-Signer-Token"] = rust.token;
+    }
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ user_op_hash: REMOTE_SIGNER_PROBE_HASH, node_id: node.nodeId }),
+    });
+    if (!response.ok) {
+      throw new Error(`remote signer probe HTTP ${response.status}`);
+    }
+    const data = (await response.json()) as { public_key?: string };
+    if (typeof data.public_key !== "string" || data.public_key.length === 0) {
+      throw new Error("remote signer probe returned no public_key");
+    }
+    return data.public_key;
+  }
+
   /** Delegate signing to the local Rust signer. Throws on any transport/HTTP error. */
   private async signViaRust(
-    base: string,
+    rust: { url: string; token?: string },
     userOpHash: string,
     node: NodeKeyPair
   ): Promise<SignatureResult> {
-    const url = `${base.replace(/\/+$/, "")}/sign`;
+    const url = `${rust.url.replace(/\/+$/, "")}/sign`;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     // KMS-TEE mode: attach the shared secret when configured so a KMS signer with
     // KMS_BLS_SIGNER_TOKEN set accepts this request (and rejects other local processes).
-    const signerToken = this.configService?.get<string>("rustSignerToken");
-    if (signerToken) {
-      headers["X-Signer-Token"] = signerToken;
+    if (rust.token) {
+      headers["X-Signer-Token"] = rust.token;
     }
     const response = await fetch(url, {
       method: "POST",

@@ -5,23 +5,31 @@ import { NodeState } from "../../interfaces/node.interface.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { BlsService } from "../bls/bls.service.js";
 import { SignerService } from "../signer/signer.service.js";
+import { ConfigService } from "@nestjs/config";
 
-/**
- * A real BlsService — NOT a mock — used purely for its `encodePublicKeyToEIP2537` (a pure
- * function of its argument; it reads none of the injected BlockchainService/SignerService
- * state). Fixtures are built with the exact same encoder the check itself is required to
- * use (CC-36 round-2 review), so "ok" here means byte-identical agreement with what
- * `registerOnChain()` actually writes on-chain — not agreement with a second, possibly
- * drifted, re-implementation.
- */
-const realBls = new BlsService({} as any, {} as any);
+function makeConfig(overrides: Record<string, unknown> = {}): ConfigService {
+  return { get: (k: string) => overrides[k] } as unknown as ConfigService;
+}
 
 /**
  * A real SignerService (round-2 Medium-5) — resolves to `LocalKeySigner` under the default
- * "local" backend (config.get always returns undefined) — so `checkLocal()` derives keys
+ * "local" backend — so the local branch of `BlsService.resolveSigningPublicKey` derives keys
  * through the EXACT validation the node signs with, never a separate hex re-parse.
  */
-const realSigner = new SignerService({ get: () => undefined } as any);
+const realSigner = new SignerService(makeConfig());
+
+/**
+ * A real BlsService — NOT a mock — built with `realSigner` and a controllable config, so
+ * `resolveSigningPublicKey` (round-3 High-2) exercises the SAME signer-selection logic
+ * `signDerivedHash()` uses. Fixtures are built with the exact same `encodePublicKeyToEIP2537`
+ * encoder the check itself is required to use (round-2 review), so "ok" here means
+ * byte-identical agreement with what `registerOnChain()` actually writes on-chain — not
+ * agreement with a second, possibly drifted, re-implementation.
+ */
+function makeBls(configOverrides: Record<string, unknown> = {}): BlsService {
+  return new BlsService({} as any, realSigner, makeConfig(configOverrides));
+}
+const realBls = makeBls(); // no rustSignerUrl -> local signer selection (the common case)
 
 /**
  * Real BLS keypairs (not hardcoded fixtures) so every fixture is internally
@@ -67,7 +75,7 @@ function makeBlockchainMock(overrides: {
 }
 
 function makeService(chain: BlockchainService, blsService: BlsService = realBls) {
-  return new NodeKeyConsistencyService(chain, blsService, realSigner);
+  return new NodeKeyConsistencyService(chain, blsService);
 }
 
 describe("NodeKeyConsistencyService (CC-36)", () => {
@@ -233,14 +241,19 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
   });
 
   it("uses BlsService.encodePublicKeyToEIP2537 — NOT a local re-implementation — to encode for the on-chain comparison (CC-36 round 2)", async () => {
-    // A stub BlsService that returns an unmistakable sentinel instead of a real encoding.
-    // If the check ever reverted to a local re-implementation of the encoder (ignoring the
-    // injected BlsService), this stub's output would never be consulted, the comparison
-    // would use the REAL encoding instead, `getNodePublicKey`'s sentinel wouldn't match it,
-    // and this test would go red on "ok" -> "mismatch_onchain".
+    // A stub BlsService that returns an unmistakable sentinel instead of a real encoding
+    // (resolveSigningPublicKey is delegated to the real realBls instance so the LOCAL branch
+    // still works normally — only the encoder is stubbed). If the check ever reverted to a
+    // local re-implementation of the encoder (ignoring the injected BlsService), this stub's
+    // output would never be consulted, the comparison would use the REAL encoding instead,
+    // getNodePublicKey's sentinel wouldn't match it, and this test would go red on
+    // "ok" -> "mismatch_onchain".
     const sentinelEip2537 = "0x" + "ee".repeat(128);
     const encodeSpy = jest.fn(() => sentinelEip2537);
-    const stubBls = { encodePublicKeyToEIP2537: encodeSpy } as unknown as BlsService;
+    const stubBls = {
+      encodePublicKeyToEIP2537: encodeSpy,
+      resolveSigningPublicKey: realBls.resolveSigningPublicKey.bind(realBls),
+    } as unknown as BlsService;
     const chain = makeBlockchainMock({
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(sentinelEip2537),
@@ -258,6 +271,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
     const sentinelEip2537 = "0x" + "ee".repeat(128);
     const stubBls = {
       encodePublicKeyToEIP2537: jest.fn(() => sentinelEip2537),
+      resolveSigningPublicKey: realBls.resolveSigningPublicKey.bind(realBls),
     } as unknown as BlsService;
     const chain = makeBlockchainMock({
       checkNodeRegistration: () => Promise.resolve(true),
@@ -325,13 +339,181 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       });
       const service = makeService(chain);
       // Right length (256 hex chars) but NOT a valid curve point (all zero x, all-ones y — off
-      // curve). assertValidity() must reject this rather than @noble/curves silently accepting it.
+      // curve, and the padding is non-zero too). Must be rejected rather than @noble/curves
+      // silently accepting it.
       const bogus = "0x" + "00".repeat(64) + "ff".repeat(64);
       const state = baseNodeState({ publicKey: bogus, privateKey: undefined as any });
       const result = await service.check(state, "0xcontract");
       // No private key (skipped local) and the bogus on-chain-format key can't be parsed ->
       // checkOnchain must say "unknown" (never guess ok/mismatch for something unparsable).
       expect(result.status).toBe("unknown");
+    });
+
+    it("HIGH-1.1: non-zero padding is rejected as malformed, not silently normalized (round 3)", async () => {
+      // Flip only the FIRST padding nibble (byte offset 0, which must be zero in a real
+      // EIP-2537 encoding) from '0' to '1'. X and Y are untouched — WITHOUT a padding check,
+      // this would still parse to the exact same point as KEY_A.eip2537Hex and report "ok".
+      const body = KEY_A.eip2537Hex.slice(2);
+      const mutated = "0x1" + body.slice(1);
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex), // the CORRECTLY-encoded key
+      });
+      const service = makeService(chain);
+      const state = baseNodeState({ publicKey: mutated, privateKey: undefined as any });
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).not.toBe("ok");
+      expect(result.status).toBe("unknown"); // can't parse the local (malformed) key to compare
+    });
+
+    it("HIGH-1.2: the point-at-infinity (128-byte all-zero) is rejected, NEVER reported ok — the rogue-key bypass registerWithProof guards against on-chain", async () => {
+      const infinityKey = "0x" + "00".repeat(128);
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        // Adversarially assume the chain ALSO somehow has the same (it shouldn't, but even so
+        // this must never be reported ok).
+        getNodePublicKey: () => Promise.resolve(infinityKey),
+      });
+      const service = makeService(chain);
+      const state = baseNodeState({ publicKey: infinityKey, privateKey: undefined as any });
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).not.toBe("ok");
+      expect(result.status).toBe("unknown"); // infinity is rejected -> unparsable -> can't compare
+    });
+
+    it("HIGH-1.2b: the point-at-infinity (compressed 48-byte canonical encoding) is rejected too", async () => {
+      // Canonical BLS12-381 compressed-infinity: compression flag (0x80) | infinity flag
+      // (0x40) on the first byte, all remaining bytes zero. @noble/curves' assertValidity()
+      // ALONE does not reject this (it's a mathematically valid group-identity point) — only
+      // an explicit .is0() check does.
+      const bytes = new Uint8Array(48);
+      bytes[0] = 0xc0;
+      const infinityCompressed = "0x" + Buffer.from(bytes).toString("hex");
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        // A REAL registered key (not another all-zero value) — if the infinity guard were
+        // missing, encoding the (wrongly-accepted) infinity point would ALSO produce all-zero
+        // 128 bytes, and comparing that against an all-zero on-chain value would coincidentally
+        // still read "not ok" (skipped_no_private_key) for the WRONG reason, masking the bug.
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain);
+      const state = baseNodeState({ publicKey: infinityCompressed, privateKey: undefined as any });
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).not.toBe("ok");
+      expect(result.status).toBe("unknown"); // infinity rejected -> unparsable -> can't compare
+    });
+  });
+
+  describe("HIGH-2: signer selection must match the REAL signing path (local @noble/curves vs. remote Rust/TEE-KMS)", () => {
+    const originalFetch = global.fetch;
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
+    it("remote signer configured+reachable, reporting a DIFFERENT key (B) than local/state/chain (A) => NOT ok — the silent-failure scenario", async () => {
+      // Everything LOCAL looks consistent as A (privateKey derives A, state.publicKey is A,
+      // on-chain registeredKeys is A) — but the node is actually configured for remote
+      // signing, and the REAL signer signs with B. A check that compares the local key would
+      // wrongly say "ok" while every real signature the node produces actually uses B.
+      global.fetch = jest.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          public_key: KEY_B.compressedHex,
+          signature: "0x",
+          signature_compact: "0x",
+        }),
+      })) as any;
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain, remoteBls);
+      const result = await service.check(baseNodeState(), "0xcontract"); // privateKey=A, publicKey=A
+      expect(result.status).not.toBe("ok");
+      expect(result.status).toBe("mismatch_local");
+    });
+
+    it("remote signer configured+reachable, reporting the key state/chain ALREADY reflect (B) => ok, even though local privateKey is a stale A — the false-positive scenario", async () => {
+      global.fetch = jest.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          public_key: KEY_B.compressedHex,
+          signature: "0x",
+          signature_compact: "0x",
+        }),
+      })) as any;
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex),
+      });
+      const service = makeService(chain, remoteBls);
+      // privateKey stays A (stale/irrelevant now that remote signing is configured);
+      // publicKey correctly reflects B (what the remote signer + chain actually use).
+      const state = baseNodeState({ publicKey: KEY_B.compressedHex });
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).toBe("ok");
+    });
+
+    it("remote signer configured but UNREACHABLE => skipped_remote_signer, NEVER falls back to comparing the local key", async () => {
+      global.fetch = jest.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      }) as any;
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        // Deliberately matches local/state — a fallback-to-local check would wrongly say "ok".
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain, remoteBls);
+      const result = await service.check(baseNodeState(), "0xcontract");
+      expect(result.status).not.toBe("ok");
+      expect(result.status).not.toBe("mismatch_local");
+      expect(result.status).toBe("skipped_remote_signer");
+    });
+
+    it("remote signer HTTP error response (non-2xx) also => skipped_remote_signer, not a crash", async () => {
+      global.fetch = jest.fn(async () => ({
+        ok: false,
+        status: 503,
+        json: async () => ({}),
+      })) as any;
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain, remoteBls);
+      const result = await service.check(baseNodeState(), "0xcontract");
+      expect(result.status).toBe("skipped_remote_signer");
+    });
+
+    it("RUST_SIGNER_REQUIRED does not change what this check reports — remote is asked first regardless", async () => {
+      global.fetch = jest.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          public_key: KEY_B.compressedHex,
+          signature: "0x",
+          signature_compact: "0x",
+        }),
+      })) as any;
+      const remoteBls = makeBls({
+        rustSignerUrl: "http://fake-signer.local",
+        rustSignerRequired: true,
+      });
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex),
+      });
+      const service = makeService(chain, remoteBls);
+      const state = baseNodeState({ publicKey: KEY_B.compressedHex });
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).toBe("ok");
     });
   });
 });

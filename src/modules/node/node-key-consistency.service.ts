@@ -3,7 +3,6 @@ import { ethers } from "ethers";
 import { bls } from "../../utils/bls.util.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { BlsService } from "../bls/bls.service.js";
-import { SignerService } from "../signer/signer.service.js";
 import { NodeState } from "../../interfaces/node.interface.js";
 
 export type KeyConsistencyStatus =
@@ -12,7 +11,8 @@ export type KeyConsistencyStatus =
   | "mismatch_onchain"
   | "not_registered"
   | "unknown"
-  | "skipped_no_private_key";
+  | "skipped_no_private_key"
+  | "skipped_remote_signer";
 
 export interface KeyConsistencyResult {
   /**
@@ -34,6 +34,18 @@ export interface KeyConsistencyResult {
    */
   derivedMatches: boolean | null;
   nodeId: string;
+  /**
+   * Round-3 Medium: set when the CHECKER ITSELF threw unexpectedly on the most recent
+   * attempt (a bug — NOT an RPC blip, which already collapses to `unknown` inside `check()`
+   * and never reaches here). `status`/`checkedAt`/`derivedMatches` are the last CONCLUSIVE
+   * result from BEFORE the checker broke — preserved, never downgraded — but this field
+   * means that conclusion has NOT been re-verified since `checkerErrorAt`; treat it as
+   * stale. Cleared the next time an attempt completes without the checker itself throwing
+   * (regardless of what status that attempt computes — even a fresh `unknown` clears it,
+   * because it proves the checker is running again).
+   */
+  checkerError?: string;
+  checkerErrorAt?: string;
 }
 
 /** The outcome of a single, stateless comparison — before it's merged into the held `lastResult`. */
@@ -60,10 +72,12 @@ function normalizeHex(hex: unknown): string {
  * online and silently non-participating.
  *
  * Three-way comparison (one attempt, see `computeFresh`):
- *   1. local:    privateKey -> derive pubkey via the REAL signing path (SignerService.forNode /
- *                LocalKeySigner, never a local re-parse of the hex) -> compare to
- *                node_state.publicKey (accepting EITHER wire format actually seen in
- *                production — see `parsePublicKeyPoint`)
+ *   1. local:    resolve the CURRENTLY AUTHORITATIVE signing public key via
+ *                `BlsService.resolveSigningPublicKey` — the exact same signer selection
+ *                `signDerivedHash()` uses (local @noble/curves vs. remote Rust/TEE-KMS,
+ *                round-3 High-2) — and compare it to node_state.publicKey (accepting
+ *                EITHER wire format actually seen in production — see `parsePublicKeyPoint`,
+ *                which also rejects a malformed or point-at-infinity value, round-3 High-1)
  *   2. on-chain: node_state.publicKey normalized to EIP-2537 via the SAME encoder the
  *                registration path writes with — BlsService.encodePublicKeyToEIP2537,
  *                never a local re-implementation, so this check can never silently
@@ -72,8 +86,11 @@ function normalizeHex(hex: unknown): string {
  *   3. derivedMatches (informational only): nodeId == keccak256(EIP-2537 publicKey)
  *
  * Fail-loud, not fail-stop: a single attempt is designed to never throw — every failure mode
- * (malformed key material, RPC error, timeout) collapses into a `status` value — and `loop()`
- * additionally holds a structural boundary in case a future bug throws anyway (round-2 High-3).
+ * (malformed key material, RPC error, timeout) collapses into a `status` value. `loop()`
+ * additionally holds a structural boundary in case a future bug throws anyway (round-2
+ * High-3) — but unlike an RPC blip, an internal throw is FAIL-LOUD, not silent: it stamps
+ * `checkerError`/`checkerErrorAt` onto the (preserved) result rather than quietly retrying
+ * forever with no visible trace (round-3 Medium).
  *
  * Runs as a self-scheduling loop (`start()`), not a one-shot: an `unknown` result
  * (RPC error) retries with bounded backoff (30s/60s/120s/240s, then folding into the
@@ -109,8 +126,7 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
 
   constructor(
     private readonly blockchainService: BlockchainService,
-    private readonly blsService: BlsService,
-    private readonly signerService: SignerService
+    private readonly blsService: BlsService
   ) {}
 
   /** The most recently held result (a preserved conclusion survives a failed retry). Read by /health. */
@@ -170,12 +186,14 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
   ): Promise<void> {
     try {
       await this.check(nodeState, contractAddress, myGeneration);
-    } catch {
-      // Structural boundary (round-2 High-3): check() is designed to never throw (every
-      // failure mode collapses into a status), but this is the last line of defense in case a
-      // future bug does anyway. The retry loop must survive a single bad tick and keep
-      // scheduling rather than dying silently, and this handler does NOTHING that could
-      // itself throw (no logger call here — logging happens, if at all, inside check()).
+    } catch (error: unknown) {
+      // Structural boundary (round-2 High-3), FAIL-LOUD not silent (round-3 Medium): see
+      // recordCheckerError. This is deliberately the INNER catch (around check() only) so
+      // scheduling below still runs even when check() itself threw — an internal bug must
+      // not also kill the retry loop's future ticks. The OUTER `.catch(() => {})` at both
+      // call sites of loop() is a separate, last-resort "never crash" net with no logic of
+      // its own — the two layers have different jobs and must stay separate.
+      this.recordCheckerError(nodeState, error);
     }
     if (this.stopped || myGeneration !== this.generation) {
       // Either stopped, or superseded by a newer start()/stop() while this attempt was in
@@ -192,6 +210,57 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     this.timer.unref?.();
   }
 
+  /**
+   * Round-3 Medium: `check()` is designed to never throw (every failure mode it knows about
+   * collapses into a status), but if it does anyway — a bug, NOT an RPC blip — this must be
+   * FAIL-LOUD, never silent. A deterministic internal bug looking identical to "everything's
+   * fine, still ok" forever is worse than no result at all — it is a confident lie. The prior
+   * CONCLUSIVE result is preserved (same non-downgrade principle as an RPC failure: an
+   * internal bug is not grounds to erase a real mismatch_onchain either), but the result is
+   * stamped `checkerError`/`checkerErrorAt` so /health visibly flags that conclusion as
+   * stale-since, and `lastAttemptAt` still advances (proving the loop itself is alive).
+   */
+  private recordCheckerError(nodeState: NodeState, error: unknown): void {
+    const now = new Date().toISOString();
+    const message = error instanceof Error ? error.message : String(error);
+    const base: KeyConsistencyResult =
+      this.lastResult ??
+      ({
+        status: "unknown",
+        checkedAt: now,
+        lastAttemptAt: now,
+        derivedMatches: null,
+        nodeId: this.safeNodeId(nodeState),
+      } as KeyConsistencyResult);
+    this.lastResult = {
+      ...base,
+      lastAttemptAt: now,
+      checkerError: message,
+      checkerErrorAt: now,
+    };
+    try {
+      this.logger.error(
+        `Key-consistency self-check threw unexpectedly (this should never happen — check() is ` +
+          `designed to fail loud via a status value, not throw): ${message}. Preserving the ` +
+          `last conclusive result (${this.lastResult.status} from ${this.lastResult.checkedAt}) ` +
+          `— it has NOT been re-verified since; treat it as stale until the next successful attempt.`
+      );
+    } catch {
+      // Logging itself must never be allowed to turn a checker bug into a crash — this is
+      // exactly the concern that made the OUTER loop()-call-site catches necessary too.
+    }
+  }
+
+  /** Best-effort nodeId read for the synthetic fallback result above — must not itself throw
+   *  (e.g. if nodeId is a throwing getter on a pathological nodeState). */
+  private safeNodeId(nodeState: NodeState): string {
+    try {
+      return typeof nodeState?.nodeId === "string" ? nodeState.nodeId : "";
+    } catch {
+      return "";
+    }
+  }
+
   private nextDelayMs(): number {
     const backoff = NodeKeyConsistencyService.UNKNOWN_BACKOFF_MS;
     if (this.consecutiveUnknown > 0 && this.consecutiveUnknown <= backoff.length) {
@@ -204,10 +273,12 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
    * Run one attempt and merge it into the held result.
    *
    * The merge rule is the load-bearing part: a fresh `unknown` (this attempt's RPC failed)
-   * NEVER overwrites a previously-held CONCLUSIVE result — it only bumps `lastAttemptAt`.
-   * Reading a network blip as "we no longer know" would silently launder away a real
-   * mismatch_onchain the moment the RPC hiccups, which defeats the whole point of this
-   * check. `checkedAt` only advances when a conclusion was actually (re-)established.
+   * NEVER overwrites a previously-held CONCLUSIVE result — it only bumps `lastAttemptAt` (and
+   * clears any stale `checkerError` — reaching this line at all proves the checker itself
+   * did NOT throw this time, regardless of what status it computed). Reading a network blip
+   * as "we no longer know" would silently launder away a real mismatch_onchain the moment the
+   * RPC hiccups, which defeats the whole point of this check. `checkedAt` only advances when
+   * a conclusion was actually (re-)established.
    *
    * `generationToken` is set ONLY by `loop()` (a direct/manual call — as every existing unit
    * test makes — omits it and always publishes). When set and stale (round-2 Medium-4: a
@@ -242,7 +313,12 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     if (fresh.status === "unknown") {
       this.consecutiveUnknown++;
       if (this.lastResult && this.lastResult.status !== "unknown") {
-        this.lastResult = { ...this.lastResult, lastAttemptAt: now };
+        this.lastResult = {
+          ...this.lastResult,
+          lastAttemptAt: now,
+          checkerError: undefined,
+          checkerErrorAt: undefined,
+        };
       } else {
         // No prior conclusion to preserve (first-ever attempt, or every attempt so far has
         // been unknown) — "unknown" IS the current conclusion in that case.
@@ -273,14 +349,14 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     this.logger.error(
       `KEY CONSISTENCY FAILURE [${status}] for node ${nodeState.nodeId}: ` +
         (status === "mismatch_local"
-          ? `the private key in node_state.json does NOT derive node_state.publicKey ` +
+          ? `the current signing key does NOT match node_state.publicKey ` +
             `(local publicKey=${localPrefix}...). `
           : `node_state.publicKey (${localPrefix}...) does NOT match the on-chain ` +
             `registeredKeys() entry for this nodeId. `) +
         `This node will keep signing, but its signatures can NEVER verify against the ` +
         `on-chain registration — it is online and healthy while being silently ` +
         `non-participating. Fix: re-register the correct public key on-chain for this ` +
-        `nodeId, or restore the matching privateKey/publicKey pair in node_state.json.`
+        `nodeId, or restore the matching signer/publicKey pair in node_state.json.`
     );
   }
 
@@ -299,33 +375,59 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
   }
 
   /**
-   * privateKey -> derived pubkey vs. node_state.publicKey. Key-less nodes are a legitimate
-   * skip. Delegates key derivation to the REAL signing path (round-2 Medium-5): a bare
-   * `SignerService.forNode(nodeState)` throws exactly when `LocalKeySigner`'s constructor
-   * would reject the private key (wrong length, non-hex char, etc.) — the same validation
-   * the node actually signs with — so this can never say "ok" for a key the signer would
-   * refuse, and can never silently coerce an invalid hex char into 0.
+   * The CURRENTLY AUTHORITATIVE signing public key vs. node_state.publicKey. Delegates
+   * signer selection entirely to `BlsService.resolveSigningPublicKey` (round-3 High-2): a
+   * node may be configured for remote (Rust/TEE-KMS) signing while STILL carrying a
+   * (possibly stale) local `privateKey` in node_state.json, so this must NEVER just compare
+   * the local private key unconditionally — that would compare the wrong thing whenever a
+   * remote signer is in play, producing either a false "ok" (local matches, but every real
+   * signature is remote and different) or a false mismatch (local is stale, but every real
+   * signature is remote and fine).
+   *
+   * `"no_signer"` (neither a local key nor a remote signer configured) maps to the
+   * legitimate `skipped_no_private_key` outcome. `"remote_unavailable"` (a remote signer IS
+   * configured but did not answer) maps to `skipped_remote_signer` — explicitly NOT a
+   * fallback to comparing the local key, which is exactly the bug this exists to prevent.
    */
-  private async checkLocal(nodeState: NodeState): Promise<"ok" | "mismatch" | "skipped"> {
-    if (!nodeState.privateKey) {
-      return "skipped";
-    }
+  private async checkLocal(
+    nodeState: NodeState
+  ): Promise<"ok" | "mismatch" | "skipped_no_private_key" | "skipped_remote_signer"> {
     try {
-      const signer = this.signerService.forNode(nodeState);
-      const derivedPub = await signer.getPublicKey();
+      const resolved = await this.blsService.resolveSigningPublicKey(nodeState);
+      if (resolved.source === "no_signer") {
+        return "skipped_no_private_key";
+      }
+      if (resolved.source === "remote_unavailable") {
+        return "skipped_remote_signer";
+      }
+
+      let derivedHex: string;
+      if (resolved.source === "local") {
+        derivedHex = normalizeHex(resolved.publicKey.toHex());
+      } else {
+        const remotePoint = this.parsePublicKeyPoint(resolved.publicKeyHex);
+        if (remotePoint === null) {
+          this.logger.warn(
+            `remote signer reported a public key for node ${nodeState.nodeId} that is not a ` +
+              "valid G1 point in either accepted wire format"
+          );
+          return "mismatch";
+        }
+        derivedHex = normalizeHex(remotePoint.toHex());
+      }
+
       const statePoint = this.parsePublicKeyPoint(nodeState.publicKey);
       if (statePoint === null) {
         // node_state.publicKey isn't a valid point in EITHER accepted wire format.
         return "mismatch";
       }
-      const derivedHex = normalizeHex(derivedPub.toHex());
-      const stateHex = normalizeHex(statePoint.toHex());
-      return derivedHex === stateHex ? "ok" : "mismatch";
+      return derivedHex === normalizeHex(statePoint.toHex()) ? "ok" : "mismatch";
     } catch (error: any) {
-      // The signer rejected the private key (or deriving/comparing otherwise failed) —
-      // cannot prove correctness, so treat as a mismatch rather than silently skipping.
+      // Signer resolution itself failed unexpectedly (e.g. the local signer rejected a
+      // malformed private key) — cannot prove correctness, so treat as a mismatch rather
+      // than silently skipping.
       this.logger.warn(
-        `local key-consistency check could not derive/compare a public key: ${error?.message ?? error}`
+        `local key-consistency check could not resolve/compare a signing public key: ${error?.message ?? error}`
       );
       return "mismatch";
     }
@@ -397,30 +499,52 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
    *
    * The 128-byte branch reconstructs the point via @noble/curves' OWN `Point.fromAffine` (a
    * public primitive of the SAME class `.fromHex()` returns) from the raw X/Y coordinates,
-   * then calls `.assertValidity()` — the identical subgroup/curve-equation check `.fromHex()`
-   * performs on the compressed form — so a malformed or off-curve 128-byte value is rejected
-   * exactly like a malformed compressed one would be, never silently accepted.
+   * after first validating the 16-byte zero-padding on EACH coordinate (round-3 High-1.1: a
+   * non-zero-padded value is not a well-formed EIP-2537 encoding — the encoder never
+   * produces one — so it must be rejected as malformed, not silently normalized as if it
+   * were legitimate).
+   *
+   * BOTH branches then explicitly reject the point-at-infinity (round-3 High-1.2, the more
+   * serious gap): `.assertValidity()` alone does NOT reject it — @noble/curves deliberately
+   * allows the group identity as "on-curve" — but an infinity "public key" is never a real
+   * one: `e(_, infinity) = 1` trivially, so a pairing-based signature check against it would
+   * pass with NO private key at all. This is exactly the rogue-key bypass
+   * `AAStarValidator.registerWithProof`'s `require(!_isInfinity(publicKey))` guards against
+   * on-chain (contracts/src/AAStarValidator.sol) — this check must refuse it with the same
+   * finality, not launder it through as a valid-looking "ok" comparison.
    */
   private parsePublicKeyPoint(publicKeyHex: unknown): any | null {
     if (typeof publicKeyHex !== "string" || publicKeyHex.length === 0) {
       return null;
     }
-    const hex = publicKeyHex.replace(/^0x/i, "");
+    const hex = publicKeyHex.replace(/^0x/i, "").toLowerCase();
     try {
       if (hex.length === 96) {
         // 48-byte compressed G1.
         const point = bls.G1.Point.fromHex(hex);
         point.assertValidity();
+        if (point.is0()) {
+          return null; // point-at-infinity — see class doc above.
+        }
         return point;
       }
       if (hex.length === 256) {
         // 128-byte EIP-2537: 16 zero-pad + 48-byte X + 16 zero-pad + 48-byte Y — the exact
         // inverse layout of BlsService's private encodeG1Point (byte offsets 16 and 80; in
-        // hex-char offsets that's X at [32,128) and Y at [160,256)).
+        // hex-char offsets that's X at [32,128) and Y at [160,256), padding at [0,32) and
+        // [128,160)).
+        const pad1 = hex.slice(0, 32);
+        const pad2 = hex.slice(128, 160);
+        if (pad1 !== "0".repeat(32) || pad2 !== "0".repeat(32)) {
+          return null; // non-zero padding: not a well-formed EIP-2537 encoding.
+        }
         const x = BigInt("0x" + hex.slice(32, 128));
         const y = BigInt("0x" + hex.slice(160, 256));
         const point = bls.G1.Point.fromAffine({ x, y });
         point.assertValidity();
+        if (point.is0()) {
+          return null; // point-at-infinity — see class doc above.
+        }
         return point;
       }
       return null; // neither accepted wire format
@@ -454,19 +578,20 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
    * signal (the key on disk is definitely broken), then a proven on-chain mismatch
    * (the exact silent failure this check exists to catch), then the informational
    * not_registered / unknown on-chain outcomes, then — only once nothing else is
-   * wrong — `skipped_no_private_key` if the local dimension could not be checked at
-   * all (a key-less node is legitimate, but we were only able to verify half the
-   * picture, so we don't claim full `ok`).
+   * wrong — the two "couldn't fully verify the local dimension" outcomes
+   * (`skipped_no_private_key` / `skipped_remote_signer`; a legitimate configuration, but we
+   * only verified half the picture, so we don't claim full `ok`).
    */
   private combine(
-    local: "ok" | "mismatch" | "skipped",
+    local: "ok" | "mismatch" | "skipped_no_private_key" | "skipped_remote_signer",
     onchain: "ok" | "mismatch" | "not_registered" | "unknown"
   ): KeyConsistencyStatus {
     if (local === "mismatch") return "mismatch_local";
     if (onchain === "mismatch") return "mismatch_onchain";
     if (onchain === "not_registered") return "not_registered";
     if (onchain === "unknown") return "unknown";
-    if (local === "skipped") return "skipped_no_private_key";
+    if (local === "skipped_no_private_key") return "skipped_no_private_key";
+    if (local === "skipped_remote_signer") return "skipped_remote_signer";
     return "ok";
   }
 }

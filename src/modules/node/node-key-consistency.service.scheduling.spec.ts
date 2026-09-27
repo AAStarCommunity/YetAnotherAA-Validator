@@ -7,7 +7,7 @@ import { BlsService } from "../bls/bls.service.js";
 import { SignerService } from "../signer/signer.service.js";
 
 /**
- * CC-36 round 2: the self-check is not a one-shot — it retries with bounded backoff while
+ * CC-36 round 2/3: the self-check is not a one-shot — it retries with bounded backoff while
  * `unknown` (an RPC blip must not freeze the node on a boot-time hiccup forever) and
  * periodically rechecks once conclusive (so a post-boot on-chain change — e.g. the
  * validator's permissionless `syncNode(nodeId)` deactivating an under-staked operator —
@@ -18,8 +18,8 @@ import { SignerService } from "../signer/signer.service.js";
  * exact millisecond: Jest/@sinonjs fake timers' tickAsync does not guarantee sub-second
  * precision when a timer callback itself chains further awaits before rescheduling.
  */
-const realBls = new BlsService({} as any, {} as any);
 const realSigner = new SignerService({ get: () => undefined } as any);
+const realBls = new BlsService({} as any, realSigner, { get: () => undefined } as any);
 
 function makeKeyPair(seed: number) {
   const privBytes = new Uint8Array(32);
@@ -55,7 +55,7 @@ function makeChain(overrides: {
   } as unknown as BlockchainService;
 }
 
-describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)", () => {
+describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2/3)", () => {
   beforeEach(() => {
     jest.useFakeTimers();
   });
@@ -68,7 +68,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
   it("retries with bounded backoff (30s/60s/120s/240s) while stuck on unknown, then folds into the 15-minute cadence", async () => {
     const checkNodeRegistration = jest.fn(() => Promise.reject(new Error("RPC down")));
     const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
 
     service.start(nodeState(), "0xcontract");
     await jest.advanceTimersByTimeAsync(10); // flush the immediate boot attempt
@@ -112,7 +112,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
   it("rechecks periodically (every ~15 minutes) once a conclusive result is reached", async () => {
     const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
     const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
 
     service.start(nodeState(), "0xcontract");
     await jest.advanceTimersByTimeAsync(10);
@@ -133,7 +133,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
       .mockResolvedValueOnce(true) // boot: registered
       .mockRejectedValueOnce(new Error("RPC blip") as never); // 15-min recheck: fails
     const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
 
     service.start(nodeState(), "0xcontract");
     await jest.advanceTimersByTimeAsync(10);
@@ -170,7 +170,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
       checkNodeRegistration: checkNodeRegistration as any,
       getNodePublicKey: getNodePublicKey as any,
     });
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
 
     service.start(nodeState(), "0xcontract");
     await jest.advanceTimersByTimeAsync(10);
@@ -190,7 +190,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
 
   it("stop() clears the timer — no leftover handle after shutdown", async () => {
     const chain = makeChain({});
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     service.start(nodeState(), "0xcontract");
     await jest.advanceTimersByTimeAsync(10);
     expect(jest.getTimerCount()).toBeGreaterThan(0);
@@ -201,7 +201,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
 
   it("onModuleDestroy() also clears the timer (Nest lifecycle hook) — same guarantee as stop()", async () => {
     const chain = makeChain({});
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     service.start(nodeState(), "0xcontract");
     await jest.advanceTimersByTimeAsync(10);
 
@@ -217,7 +217,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
   it("start() is idempotent: calling it again restarts cleanly instead of stacking loops", async () => {
     const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
     const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
 
     service.start(nodeState(), "0xcontract");
     await jest.advanceTimersByTimeAsync(10);
@@ -243,7 +243,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
       .mockImplementationOnce(() => firstCallPromise) // 1st call: hangs until resolved manually
       .mockImplementation(() => Promise.resolve(true)); // every later call: normal ok
     const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
 
     const oldNodeId = "0x" + "aa".repeat(32);
     const newNodeId = "0x" + "bb".repeat(32);
@@ -274,7 +274,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
 
   it("HIGH-3: an unexpected throw deep inside a check() attempt never produces an unhandledRejection, and the loop survives it", async () => {
     const chain = makeChain({});
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
 
     // A pathological nodeState: reading .nodeId throws, simulating some future bug reading a
     // raw disk-JSON field this check doesn't (or one day might not) defensively guard. This
@@ -299,19 +299,26 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
       expect(unhandled).toEqual([]);
       // The loop survived: it scheduled a next attempt instead of dying silently.
       expect(jest.getTimerCount()).toBe(1);
+      // FAIL-LOUD (round-3 Medium): this is NOT silent — /health must be able to see that the
+      // checker itself broke, not just that no result exists.
+      expect(service.getLastResult()?.checkerError).toContain("simulated malformed disk field");
+      expect(service.getLastResult()?.checkerErrorAt).toBeDefined();
     } finally {
       process.off("unhandledRejection", onUnhandledRejection);
       service.stop();
     }
   });
 
-  it("HIGH-3 regression: a non-string node_state field (raw disk JSON) does not crash the check", async () => {
+  it("HIGH-3 regression: a non-string node_state field (raw disk JSON) does not crash the check, and does NOT spuriously set checkerError", async () => {
     const chain = makeChain({
       checkNodeRegistration: jest.fn(() => Promise.resolve(true)) as any,
     });
-    const service = new NodeKeyConsistencyService(chain, realBls, realSigner);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     // Simulates a node_state.json that doesn't match the NodeState type at runtime (no schema
-    // validation guards this file today) — publicKey as a number, not a string.
+    // validation guards this file today) — publicKey as a number, not a string. Round-3
+    // hardened parsePublicKeyPoint()/normalizeHex() handle this gracefully (return
+    // null/"" rather than throw), so — unlike the poisoned-getter test above — this one
+    // should NOT reach the checker-error path at all; it's a plain determinate result.
     const malformed = { ...nodeState(), publicKey: 12345 as unknown as string };
 
     const unhandled: unknown[] = [];
@@ -324,10 +331,70 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2)
 
       expect(unhandled).toEqual([]);
       expect(service.getLastResult()).not.toBeNull();
+      expect(service.getLastResult()?.checkerError).toBeUndefined();
       expect(jest.getTimerCount()).toBe(1);
     } finally {
       process.off("unhandledRejection", onUnhandledRejection);
       service.stop();
     }
+  });
+
+  it("MEDIUM (round 3): a checker-internal throw preserves the prior conclusive result but stamps checkerError; clears on the next healthy attempt", async () => {
+    const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
+    const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
+    const service = new NodeKeyConsistencyService(chain, realBls);
+
+    const state = nodeState();
+    const originalNodeId = state.nodeId;
+
+    service.start(state, "0xcontract");
+    await jest.advanceTimersByTimeAsync(10);
+    const first = service.getLastResult();
+    expect(first?.status).toBe("ok");
+    expect(first?.checkerError).toBeUndefined();
+
+    // Poison nodeId AFTER the first successful attempt, so the NEXT scheduled (periodic
+    // recheck) attempt throws internally — simulating a future bug, NOT an RPC blip.
+    Object.defineProperty(state, "nodeId", {
+      configurable: true,
+      get(): never {
+        throw new Error("simulated internal bug");
+      },
+    });
+
+    await jest.advanceTimersByTimeAsync(14 * 60_000); // well under the ~900s recheck
+    expect(checkNodeRegistration).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(65_000); // past it: the recheck fires and throws
+
+    const second = service.getLastResult();
+    // The prior CONCLUSIVE result is preserved — an internal bug is NOT grounds to erase it
+    // (same non-downgrade principle as an RPC failure).
+    expect(second?.status).toBe("ok");
+    expect(second?.checkedAt).toBe(first?.checkedAt);
+    // …but it is now explicitly, visibly flagged as checker-broken (fail-loud, not silent),
+    // and lastAttemptAt still advanced (the loop is alive, still ticking).
+    expect(second?.checkerError).toContain("simulated internal bug");
+    expect(second?.checkerErrorAt).toBeDefined();
+    expect(second?.lastAttemptAt).not.toBe(first?.lastAttemptAt);
+    // checkNodeRegistration must NOT have been reached — the throw happens before checkOnchain.
+    expect(checkNodeRegistration).toHaveBeenCalledTimes(1);
+
+    // Un-poison — the next attempt completes normally and must clear checkerError, proving
+    // it isn't a permanent scar once the checker is healthy again.
+    Object.defineProperty(state, "nodeId", {
+      configurable: true,
+      value: originalNodeId,
+      writable: true,
+    });
+    await jest.advanceTimersByTimeAsync(16 * 60_000); // past the next ~900s recheck
+
+    const third = service.getLastResult();
+    expect(third?.checkerError).toBeUndefined();
+    expect(third?.checkerErrorAt).toBeUndefined();
+    expect(third?.status).toBe("ok");
+    expect(third?.checkedAt).not.toBe(second?.checkedAt); // a fresh conclusion was established
+    expect(checkNodeRegistration).toHaveBeenCalledTimes(2);
+
+    service.stop();
   });
 });
