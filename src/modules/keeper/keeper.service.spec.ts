@@ -1,4 +1,5 @@
 import { jest } from "@jest/globals";
+import { Logger } from "@nestjs/common";
 import { KeeperService } from "./keeper.service.js";
 
 const PAYMASTER = "0x" + "12".repeat(20);
@@ -55,6 +56,11 @@ function makeRegistry() {
     registered,
     register: (cap: { name: string }) => registered.push(cap.name),
   } as any;
+}
+
+/** Stand-in for OpsAlertService — only `isEnabled()` matters to the self-check. */
+function makeOpsAlert(configured: boolean) {
+  return { isEnabled: () => configured, alert: jest.fn() } as any;
 }
 
 /** Fixed clock at t=now (unix ms). Allows overriding "now" for time-based guardrail tests. */
@@ -327,6 +333,379 @@ describe("KeeperService", () => {
 
       svc.onApplicationShutdown();
       expect((svc as any).timer).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+/**
+ * Startup self-check: "keeper enabled but alerts unconfigured" must never go
+ * unnoticed silently (the real incident that motivates this: a neighboring repo's
+ * price keeper ran for 3.5 weeks, failing every tick, with a broken alert channel
+ * — nobody knew). This must ONLY ever log; it must never throw or block startup.
+ *
+ * Scope note (see keeper.service.ts docstring): this checks CONFIGURATION
+ * (OpsAlertService.isEnabled()), not deliverability — it cannot and does not
+ * claim to catch a configured-but-dead transport.
+ */
+describe("KeeperService — startup self-check: alert configured", () => {
+  let errorSpy: ReturnType<typeof jest.spyOn>;
+
+  beforeEach(() => {
+    errorSpy = jest.spyOn(Logger.prototype, "error").mockImplementation((() => undefined) as any);
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
+  });
+
+  it("keeper enabled + alerts configured ⇒ no self-check error", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig(),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      makeOpsAlert(true)
+    );
+    svc.onApplicationBootstrap();
+    svc.onApplicationShutdown();
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeper enabled + OpsAlertService present but disabled ⇒ logs an error at startup", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig(),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      makeOpsAlert(false)
+    );
+    svc.onApplicationBootstrap();
+    svc.onApplicationShutdown();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const [msg] = errorSpy.mock.calls[0] as unknown as [string];
+    expect(msg).toContain("no configured operator-alert path");
+    expect(msg).toContain("OPS_ALERT_ENABLED");
+  });
+
+  it("keeper enabled + OpsAlertService not injected at all (undefined) ⇒ logs an error", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig(),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      undefined // no opsAlert provider in this DI graph
+    );
+    svc.onApplicationBootstrap();
+    svc.onApplicationShutdown();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeper NOT enabled ⇒ no self-check noise, regardless of alert state", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig({ keeperEnabled: false }),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      makeOpsAlert(false)
+    );
+    svc.onApplicationBootstrap();
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeper enabled + no paymaster addresses (keeper won't actually run) ⇒ no self-check noise", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig({ keeperPaymasterAddress: "" }),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      makeOpsAlert(false) // alerts unconfigured too, but irrelevant — keeper never runs
+    );
+    svc.onApplicationBootstrap();
+    // Only the existing "disabled" warn fires; the alert self-check must not.
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("self-check error does NOT stop the keeper — it still schedules and runs ticks normally", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0, // no jitter — fire immediately
+        makeOpsAlert(false) // unconfigured ⇒ self-check logs, but must not block anything
+      );
+
+      svc.onApplicationBootstrap();
+      // The self-check fired loudly...
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      // ...but scheduling proceeded exactly as if alerting were fine.
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      // The first tick actually ran and called updatePrice().
+      expect(updates).toHaveLength(1);
+      // The recurring interval is armed as normal.
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+      expect((svc as any).timer).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  /**
+   * The probe (`this.opsAlert?.isEnabled()`) runs before the timers are armed, so
+   * it must never throw into the caller — an uncaught throw here would abort
+   * `onApplicationBootstrap` entirely and block scheduling, which is exactly the
+   * "block keeper operation" outcome the hard constraint forbids. Each case below
+   * must both log an error AND leave the keeper scheduling/ticking normally.
+   */
+  it("opsAlert injected but missing isEnabled entirely ⇒ probe error is caught, keeper still runs", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      const malformedOpsAlert = { alert: jest.fn() } as any; // no isEnabled at all
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0,
+        malformedOpsAlert
+      );
+
+      svc.onApplicationBootstrap();
+      // Calling opsAlert.isEnabled() throws (not a function) — caught and logged,
+      // never propagated.
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("opsAlert.isEnabled() throws when called ⇒ probe error is caught, keeper still runs", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      const throwingOpsAlert = {
+        isEnabled: () => {
+          throw new Error("boom");
+        },
+        alert: jest.fn(),
+      } as any;
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0,
+        throwingOpsAlert
+      );
+
+      svc.onApplicationBootstrap();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("opsAlert.isEnabled() returns a Promise (misbehaving mock) ⇒ treated as not configured, never crashes, keeper still runs", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      // isEnabled() is documented as synchronous+boolean; a mock returning a
+      // Promise violates that contract. A Promise is truthy, so a loose `if`
+      // would misread it as "configured" — strict `=== true` must not.
+      const asyncOpsAlert = {
+        isEnabled: () => Promise.resolve(true),
+        alert: jest.fn(),
+      } as any;
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0,
+        asyncOpsAlert
+      );
+
+      svc.onApplicationBootstrap();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it(
+    "opsAlert.isEnabled() returns a REJECTED Promise ⇒ the rejection is consumed " +
+      "(no unhandledRejection, even after a real macrotask turn), and the keeper " +
+      "still schedules and runs a tick",
+    async () => {
+      // Node's unhandledRejection bookkeeping settles on a LATER turn of the event
+      // loop than the microtask queue — awaiting only `Promise.resolve()` (a
+      // microtask) resolves before that point, so a check placed there would pass
+      // whether or not the rejection was actually consumed (a vacuous assertion).
+      // Waiting a real `setImmediate` (Node's "check" phase, a macrotask) is
+      // reliably later than that bookkeeping, so seeing nothing fire by then is a
+      // real assertion. Capture the REAL setImmediate BEFORE enabling fake
+      // timers: modern fake timers fake setImmediate too, so a reference taken
+      // now still points at Node's genuine implementation.
+      const realSetImmediate = globalThis.setImmediate;
+      jest.useFakeTimers();
+      const unhandled = jest.fn();
+      process.on("unhandledRejection", unhandled);
+      try {
+        const updates: boolean[] = [];
+        const blockchain = makeBlockchain({
+          getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+          updatePrice: async () => {
+            updates.push(true);
+            return "0xTX";
+          },
+        });
+        const rejectingOpsAlert = {
+          isEnabled: () => Promise.reject(new Error("probe rejected")),
+          alert: jest.fn(),
+        } as any;
+        const svc = new KeeperService(
+          blockchain,
+          makeNotify(),
+          makeConfig({ keeperIntervalMs: 60_000 }),
+          NOW_NEAR_EXPIRY,
+          makeRegistry(),
+          () => 0,
+          rejectingOpsAlert
+        );
+
+        svc.onApplicationBootstrap();
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        expect((svc as any).startupTimer).not.toBeNull();
+
+        // A real macrotask turn — later than the point where Node would have
+        // emitted `unhandledRejection` for a rejection nobody attached a handler
+        // to.
+        await new Promise<void>(resolve => realSetImmediate(resolve));
+        expect(unhandled).not.toHaveBeenCalled();
+
+        await jest.advanceTimersByTimeAsync(0);
+        expect(updates).toHaveLength(1);
+        expect((svc as any).timer).not.toBeNull();
+
+        svc.onApplicationShutdown();
+      } finally {
+        jest.useRealTimers();
+        process.off("unhandledRejection", unhandled);
+      }
+    }
+  );
+
+  it("logger.error itself throws inside the self-check ⇒ the boundary guard swallows it, keeper still runs", async () => {
+    jest.useFakeTimers();
+    // Reuse the describe-level spy (installed in beforeEach) rather than
+    // re-spying — just swap its implementation to throw for this one test.
+    // afterEach's errorSpy.mockRestore() still tears it down as usual.
+    errorSpy.mockImplementation(() => {
+      throw new Error("logging backend down");
+    });
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0,
+        makeOpsAlert(false) // unconfigured ⇒ checkAlertConfigured() will try to log
+      );
+
+      // onApplicationBootstrap must not throw even though the diagnostic logger
+      // itself throws — this is exactly what the call-site boundary try/catch
+      // (not a nested catch inside checkAlertConfigured) exists to contain.
+      expect(() => svc.onApplicationBootstrap()).not.toThrow();
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
     } finally {
       jest.useRealTimers();
     }
