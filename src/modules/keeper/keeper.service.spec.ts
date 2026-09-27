@@ -607,8 +607,19 @@ describe("KeeperService — startup self-check: alert configured", () => {
 
   it(
     "opsAlert.isEnabled() returns a REJECTED Promise ⇒ the rejection is consumed " +
-      "(no unhandledRejection), and the keeper still schedules and runs a tick",
+      "(no unhandledRejection, even after a real macrotask turn), and the keeper " +
+      "still schedules and runs a tick",
     async () => {
+      // Node's unhandledRejection bookkeeping settles on a LATER turn of the event
+      // loop than the microtask queue — awaiting only `Promise.resolve()` (a
+      // microtask) resolves before that point, so a check placed there would pass
+      // whether or not the rejection was actually consumed (a vacuous assertion).
+      // Waiting a real `setImmediate` (Node's "check" phase, a macrotask) is
+      // reliably later than that bookkeeping, so seeing nothing fire by then is a
+      // real assertion. Capture the REAL setImmediate BEFORE enabling fake
+      // timers: modern fake timers fake setImmediate too, so a reference taken
+      // now still points at Node's genuine implementation.
+      const realSetImmediate = globalThis.setImmediate;
       jest.useFakeTimers();
       const unhandled = jest.fn();
       process.on("unhandledRejection", unhandled);
@@ -639,11 +650,10 @@ describe("KeeperService — startup self-check: alert configured", () => {
         expect(errorSpy).toHaveBeenCalledTimes(1);
         expect((svc as any).startupTimer).not.toBeNull();
 
-        // Flush the microtask queue so the rejected promise settles — if the
-        // rejection were left unconsumed, this is where Node would emit
-        // `unhandledRejection` (a process crash under Node 15+ defaults).
-        await Promise.resolve();
-        await Promise.resolve();
+        // A real macrotask turn — later than the point where Node would have
+        // emitted `unhandledRejection` for a rejection nobody attached a handler
+        // to.
+        await new Promise<void>(resolve => realSetImmediate(resolve));
         expect(unhandled).not.toHaveBeenCalled();
 
         await jest.advanceTimersByTimeAsync(0);
