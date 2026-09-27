@@ -389,7 +389,7 @@ describe("KeeperService — startup self-check: alert configured", () => {
     svc.onApplicationShutdown();
     expect(errorSpy).toHaveBeenCalledTimes(1);
     const [msg] = errorSpy.mock.calls[0] as unknown as [string];
-    expect(msg).toContain("NOT configured");
+    expect(msg).toContain("no configured operator-alert path");
     expect(msg).toContain("OPS_ALERT_ENABLED");
   });
 
@@ -472,6 +472,134 @@ describe("KeeperService — startup self-check: alert configured", () => {
 
       svc.onApplicationShutdown();
       expect((svc as any).timer).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  /**
+   * The probe (`this.opsAlert?.isEnabled()`) runs before the timers are armed, so
+   * it must never throw into the caller — an uncaught throw here would abort
+   * `onApplicationBootstrap` entirely and block scheduling, which is exactly the
+   * "block keeper operation" outcome the hard constraint forbids. Each case below
+   * must both log an error AND leave the keeper scheduling/ticking normally.
+   */
+  it("opsAlert injected but missing isEnabled entirely ⇒ probe error is caught, keeper still runs", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      const malformedOpsAlert = { alert: jest.fn() } as any; // no isEnabled at all
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0,
+        malformedOpsAlert
+      );
+
+      svc.onApplicationBootstrap();
+      // Calling opsAlert.isEnabled() throws (not a function) — caught and logged,
+      // never propagated.
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("opsAlert.isEnabled() throws when called ⇒ probe error is caught, keeper still runs", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      const throwingOpsAlert = {
+        isEnabled: () => {
+          throw new Error("boom");
+        },
+        alert: jest.fn(),
+      } as any;
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0,
+        throwingOpsAlert
+      );
+
+      svc.onApplicationBootstrap();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("opsAlert.isEnabled() returns a Promise (misbehaving mock) ⇒ treated as not configured, never crashes, keeper still runs", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      // isEnabled() is documented as synchronous+boolean; a mock returning a
+      // Promise violates that contract. A Promise is truthy, so a loose `if`
+      // would misread it as "configured" — strict `=== true` must not.
+      const asyncOpsAlert = {
+        isEnabled: () => Promise.resolve(true),
+        alert: jest.fn(),
+      } as any;
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0,
+        asyncOpsAlert
+      );
+
+      svc.onApplicationBootstrap();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
     } finally {
       jest.useRealTimers();
     }
