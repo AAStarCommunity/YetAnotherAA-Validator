@@ -464,50 +464,42 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
 
   describe("HIGH-2: signer selection must match the REAL signing path (local @noble/curves vs. remote Rust/TEE-KMS)", () => {
     // Round-4 correction (coordinator + Codex): an earlier version of this check PROBED the
-    // remote signer's /sign endpoint to read its public key back, so it could compare A/B
-    // scenarios directly. That was rejected — it makes a background health check itself
-    // produce a real, unauthorized signature (see BlsService.resolveSigningPublicKey's
-    // docstring). The corrected behavior is simpler and more conservative: ANY remote signer
-    // configuration => skipped_remote_signer, with NO network call at all. This trades away
-    // the ability to distinguish "remote actually signs A" from "remote actually signs B" —
-    // an honest, documented limitation — but it also means the OLD false-"ok" and
-    // false-mismatch_local failure modes (comparing the possibly-stale local privateKey
-    // against what a remote signer is doing) can no longer happen either, since the local
-    // dimension is never even evaluated when a remote signer is configured.
+    // remote signer's /sign endpoint to read its public key back. That was rejected — it
+    // makes a background health check itself produce a real, unauthorized signature (see
+    // BlsService.resolveSigningPublicKey's docstring). No probe, no network call, ever.
+    //
+    // Round-7 correction (coordinator + Codex): round-4/5 then made ANY remote config —
+    // required OR optional — collapse to skipped_remote_signer unconditionally. That itself
+    // was a gap: in OPTIONAL mode, signDerivedHash() SILENTLY FALLS BACK to the local
+    // privateKey whenever the remote call fails, so the local key is a REAL signing key that
+    // must be verified — skipping it left exactly the silent-failure gap this check exists to
+    // close (see the "silent failure" test below, which replaces the round-4/5 test that used
+    // to pin this unsafe behavior). Required mode has no fallback path, so it still skips.
     const originalFetch = global.fetch;
     afterEach(() => {
       global.fetch = originalFetch;
     });
 
-    it("remote signer configured => skipped_remote_signer, regardless of what node_state.privateKey/publicKey say locally", async () => {
-      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
+    it("REQUIRED mode: skipped_remote_signer regardless of what node_state.privateKey/publicKey say locally — no fallback path exists, so the local key is signing-irrelevant", async () => {
+      const remoteBls = makeBls({
+        rustSignerUrl: "http://fake-signer.local",
+        rustSignerRequired: true,
+      });
       const chain = makeBlockchainMock({
         checkNodeRegistration: () => Promise.resolve(true),
         getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
       });
       const service = makeService(chain, remoteBls);
       // Everything LOCAL still looks consistent as A (privateKey derives A, state.publicKey
-      // is A) — under the OLD (rejected) probing design this would have been compared
-      // against whatever the remote claimed and could go either way; now it's never compared.
+      // is A) — required mode never even looks at it.
       const result = await service.check(baseNodeState(), "0xcontract");
       expect(result.status).not.toBe("ok");
       expect(result.status).not.toBe("mismatch_local");
       expect(result.status).toBe("skipped_remote_signer");
+      expect(result.scope).toBeUndefined(); // never scoped — the local dimension wasn't touched
     });
 
-    it("remote signer configured => skipped_remote_signer even when local privateKey is stale/irrelevant and state/chain reflect a different key", async () => {
-      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
-      const chain = makeBlockchainMock({
-        checkNodeRegistration: () => Promise.resolve(true),
-        getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex),
-      });
-      const service = makeService(chain, remoteBls);
-      const state = baseNodeState({ publicKey: KEY_B.compressedHex }); // privateKey stays A
-      const result = await service.check(state, "0xcontract");
-      expect(result.status).toBe("skipped_remote_signer");
-    });
-
-    it("RUST_SIGNER_REQUIRED does not change what this check reports — any remote config => skipped_remote_signer", async () => {
+    it("REQUIRED mode + a stale local privateKey (A) that no longer matches state/chain (B): still skipped_remote_signer — the stale local key is irrelevant when there's no fallback", async () => {
       const remoteBls = makeBls({
         rustSignerUrl: "http://fake-signer.local",
         rustSignerRequired: true,
@@ -517,21 +509,85 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
         getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex),
       });
       const service = makeService(chain, remoteBls);
-      const state = baseNodeState({ publicKey: KEY_B.compressedHex });
+      const state = baseNodeState({ publicKey: KEY_B.compressedHex }); // privateKey stays A (stale)
       const result = await service.check(state, "0xcontract");
       expect(result.status).toBe("skipped_remote_signer");
+      expect(result.scope).toBeUndefined();
     });
 
-    it("INVARIANT (round-4, the most important test in this file): a remote-signer node NEVER causes the checker to call fetch — no probe, no signature", async () => {
-      const fetchSpy = jest.fn();
-      global.fetch = fetchSpy as any;
-      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
+    it("OPTIONAL mode + NO local private key: no fallback exists to verify => skipped_remote_signer", async () => {
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" }); // required NOT set
       const chain = makeBlockchainMock({
         checkNodeRegistration: () => Promise.resolve(true),
         getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
       });
       const service = makeService(chain, remoteBls);
-      await service.check(baseNodeState(), "0xcontract");
+      const state = baseNodeState();
+      delete (state as Partial<NodeState>).privateKey;
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).toBe("skipped_remote_signer");
+      expect(result.scope).toBeUndefined();
+    });
+
+    it("OPTIONAL mode + local fallback key (A) internally consistent with state and chain: ok, but EXPLICITLY scoped to local_fallback_only", async () => {
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" }); // required NOT set
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain, remoteBls);
+      // baseNodeState(): privateKey=A, publicKey=A — internally consistent.
+      const result = await service.check(baseNodeState(), "0xcontract");
+      expect(result.status).toBe("ok");
+      // The scope tag is load-bearing: without it, this "ok" would be misread as "the remote
+      // signer's primary key is fine too" — it was never checked (no probe, no signature).
+      expect(result.scope).toBe("local_fallback_only");
+    });
+
+    it("SILENT-FAILURE regression (replaces the round-4/5 test that used to pin this unsafe behavior): OPTIONAL mode + stale local fallback key (A) + on-chain re-registered to B => mismatch_onchain, scoped to local_fallback_only", async () => {
+      // The exact scenario the whole feature exists to catch: signDerivedHash() will fall
+      // back to signing with the stale local key A whenever the remote call fails, but the
+      // chain has since been re-registered to B — every such fallback signature fails
+      // verification forever. Previously (round-4/5) this silently reported
+      // skipped_remote_signer; now the fallback key is actually checked.
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" }); // optional
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex), // chain has moved on to B
+      });
+      const service = makeService(chain, remoteBls);
+      // baseNodeState(): privateKey=A, publicKey=A — the fallback key (A) is internally
+      // consistent with node_state, so the LOCAL dimension alone reports ok; it's the
+      // ON-CHAIN dimension (state A vs. chain B) that catches the drift.
+      const result = await service.check(baseNodeState(), "0xcontract");
+      expect(result.status).toBe("mismatch_onchain");
+      expect(result.scope).toBe("local_fallback_only");
+    });
+
+    it("INVARIANT (round-4/7, the most important test in this file): a remote-signer node NEVER causes the checker to call fetch — no probe, no signature, in EITHER required or optional mode", async () => {
+      const fetchSpy = jest.fn();
+      global.fetch = fetchSpy as any;
+
+      // Optional mode (exercises the NEW local_fallback derivation path too — pure
+      // computation, must still never touch the network).
+      const optionalBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
+      const chainA = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      await makeService(chainA, optionalBls).check(baseNodeState(), "0xcontract");
+
+      // Required mode.
+      const requiredBls = makeBls({
+        rustSignerUrl: "http://fake-signer.local",
+        rustSignerRequired: true,
+      });
+      const chainB = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      await makeService(chainB, requiredBls).check(baseNodeState(), "0xcontract");
+
       expect(fetchSpy).not.toHaveBeenCalled();
     });
   });

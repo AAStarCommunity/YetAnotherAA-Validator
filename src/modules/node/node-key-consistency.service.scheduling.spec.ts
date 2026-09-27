@@ -492,7 +492,7 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2/
     service.stop();
   });
 
-  it("INVARIANT (round-4): a remote-signer node NEVER causes the checker to call fetch (no probe, no signature), across boot + several periodic rechecks", async () => {
+  it("INVARIANT (round-4/7): a remote-signer node NEVER causes the checker to call fetch (no probe, no signature), across boot + several periodic rechecks — OPTIONAL mode (exercises the local_fallback derivation path)", async () => {
     // Codex + coordinator round-4: the checker must NEVER invoke the remote signer at all —
     // an earlier version probed its /sign endpoint to read a public key back, which produces
     // a REAL, unauthorized signature (see BlsService.resolveSigningPublicKey's docstring for
@@ -500,6 +500,11 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2/
     // one shared entry point any such call would have to go through (global fetch) and runs
     // the self-check through a boot attempt plus several periodic recheck cycles, asserting
     // zero calls throughout — not just on a single one-shot check().
+    //
+    // Round-7: this config (rustSignerUrl set, rustSignerRequired NOT set) is OPTIONAL mode,
+    // and nodeState() carries a privateKey — so this now exercises the local_fallback
+    // derivation path (a REAL local key check, but pure @noble/curves computation, zero
+    // network I/O) on every single tick. The invariant must still hold: fetch stays at 0.
     const fetchSpy = jest.fn();
     const originalFetch = global.fetch;
     global.fetch = fetchSpy as any;
@@ -515,14 +520,53 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2/
 
       service.start(nodeState(), "0xcontract");
       await jest.advanceTimersByTimeAsync(10); // boot attempt
-      expect(service.getLastResult()?.status).toBe("skipped_remote_signer");
+      // Optional mode + a local key + node_state internally consistent -> ok, scoped.
+      expect(service.getLastResult()?.status).toBe("ok");
+      expect(service.getLastResult()?.scope).toBe("local_fallback_only");
 
-      // Several periodic recheck cycles (skipped_remote_signer is non-"unknown", so the
-      // cadence is the regular ~15-minute one each time, same as a conclusive "ok").
+      // Several periodic recheck cycles.
       await jest.advanceTimersByTimeAsync(16 * 60_000);
       await jest.advanceTimersByTimeAsync(16 * 60_000);
       await jest.advanceTimersByTimeAsync(16 * 60_000);
       expect(checkNodeRegistration.mock.calls.length).toBeGreaterThanOrEqual(4); // boot + 3 rechecks actually ran
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      service.stop();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it("INVARIANT (round-7): REQUIRED mode also never calls fetch, across boot + several periodic rechecks", async () => {
+    const fetchSpy = jest.fn();
+    const originalFetch = global.fetch;
+    global.fetch = fetchSpy as any;
+    try {
+      const remoteBls = new BlsService(
+        {} as any,
+        realSigner,
+        {
+          get: (k: string) =>
+            k === "rustSignerUrl"
+              ? "http://fake-signer.local"
+              : k === "rustSignerRequired"
+                ? true
+                : undefined,
+        } as any
+      );
+      const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
+      const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
+      const service = new NodeKeyConsistencyService(chain, remoteBls);
+
+      service.start(nodeState(), "0xcontract");
+      await jest.advanceTimersByTimeAsync(10);
+      expect(service.getLastResult()?.status).toBe("skipped_remote_signer");
+      expect(service.getLastResult()?.scope).toBeUndefined();
+
+      await jest.advanceTimersByTimeAsync(16 * 60_000);
+      await jest.advanceTimersByTimeAsync(16 * 60_000);
+      await jest.advanceTimersByTimeAsync(16 * 60_000);
+      expect(checkNodeRegistration.mock.calls.length).toBeGreaterThanOrEqual(4);
 
       expect(fetchSpy).not.toHaveBeenCalled();
       service.stop();

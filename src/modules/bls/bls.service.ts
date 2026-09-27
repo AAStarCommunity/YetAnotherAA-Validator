@@ -204,10 +204,11 @@ export class BlsService {
    *   3. It signs in the SAME BLS domain (`BLS_DST`, the same `_RO_POP_` suffix) as
    *      production traffic — not a separate, clearly-scoped test domain.
    *
-   * The honest consequence: a remote-signing node is NOT verified by this check right now
-   * (the self-check reports `skipped_remote_signer` — a deliberate, documented limitation,
-   * never silently guessed as ok or mismatch in either direction). Two follow-ups would close
-   * this WITHOUT ever causing an extra signature (neither is implemented here):
+   * The honest consequence: the remote signer's OWN key is NOT verified by this check right
+   * now (the self-check reports `skipped_remote_signer` for that dimension — a deliberate,
+   * documented limitation, never silently guessed as ok or mismatch in either direction). Two
+   * follow-ups would close this WITHOUT ever causing an extra signature (neither is
+   * implemented here):
    *   A. Passive observation: every REAL, already-authorized `/sign` response already
    *      includes `public_key` (see `signViaRust`) — record it from actual signing traffic
    *      (keyed by node/time) and compare THAT against the on-chain registration instead of
@@ -216,9 +217,29 @@ export class BlsService {
    *   B. Ask repo:kms to add a read-only "get public key" endpoint to the remote signer,
    *      distinct from `/sign`, so a health check can query identity without invoking
    *      signing at all.
+   *
+   * Round-7 correction (Codex + coordinator): the round-4/5 version returned `{ source:
+   * "remote" }` for ANY remote configuration, required or optional. That was itself a gap in
+   * OPTIONAL mode (`rust.required === false`): `signDerivedHash()` SILENTLY FALLS BACK to the
+   * local key (`signViaNode`) whenever the remote call fails — so in optional mode the local
+   * `privateKey` is a REAL signing key that gets used, not a stale leftover. Skipping it
+   * entirely left exactly the silent-failure gap this whole check exists to close (a stale
+   * local fallback key, never verified, signing against the wrong on-chain registration).
+   * Required mode has NO fallback path at all, so the local key stays signing-irrelevant
+   * there and is still never touched.
+   *
+   * So now: required mode (or optional-but-no-local-key) -> `{ source: "remote" }`
+   * (unverifiable, no fallback exists to check). Optional mode WITH a local `privateKey` ->
+   * `{ source: "local_fallback", publicKey }`, derived by the exact same PURE computation as
+   * the `"local"` branch (no network call, no signature — `resolveSigningPublicKey` still
+   * never causes the checker to sign or contact any signer). The caller (the node
+   * key-consistency self-check) MUST tag any result built from `"local_fallback"` with an
+   * explicit scope (`scope: "local_fallback_only"`) — an `ok` here proves only that the
+   * FALLBACK key is internally consistent, never that the remote signer's primary key is.
    */
   async resolveSigningPublicKey(node: NodeKeyPair): Promise<
     | { source: "local"; publicKey: any }
+    | { source: "local_fallback"; publicKey: any }
     | { source: "remote" }
     | { source: "no_signer" }
   > {
@@ -230,6 +251,14 @@ export class BlsService {
       const signer = this.signerService.forNode(node);
       const publicKey = await signer.getPublicKey();
       return { source: "local", publicKey };
+    }
+    if (!rust.required && node.privateKey) {
+      // Optional remote + a local key exists: signDerivedHash() WILL fall back to signing
+      // with this exact key if the remote call fails, so verifying it (pure derivation, zero
+      // signatures) closes a real gap rather than opening one — see the docstring above.
+      const signer = this.signerService.forNode(node);
+      const publicKey = await signer.getPublicKey();
+      return { source: "local_fallback", publicKey };
     }
     return { source: "remote" };
   }

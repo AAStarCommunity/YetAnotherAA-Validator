@@ -46,12 +46,24 @@ export interface KeyConsistencyResult {
    */
   checkerError?: string;
   checkerErrorAt?: string;
+  /**
+   * Round-7: set when `status` was determined using the OPTIONAL-remote-signer LOCAL
+   * FALLBACK key (see `BlsService.resolveSigningPublicKey`), not a node's sole/primary
+   * signing key. `signDerivedHash()` silently falls back to this exact local key whenever an
+   * optional remote signer's call fails, so it IS a real signing key worth checking — but an
+   * `ok` here proves ONLY that the fallback key is internally consistent; it says NOTHING
+   * about whether the remote signer's own (primary, unverifiable-without-signing) key is
+   * correct. Never read `status === "ok"` as "fully verified" without also checking this is
+   * absent.
+   */
+  scope?: "local_fallback_only";
 }
 
 /** The outcome of a single, stateless comparison — before it's merged into the held `lastResult`. */
 interface FreshCheck {
   status: KeyConsistencyStatus;
   derivedMatches: boolean | null;
+  scope?: "local_fallback_only";
 }
 
 /** Type-safe against whatever a raw, unvalidated node_state.json actually contains on disk
@@ -323,6 +335,7 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
           lastAttemptAt: now,
           derivedMatches: fresh.derivedMatches,
           nodeId: nodeState.nodeId,
+          scope: fresh.scope,
         }
       );
     }
@@ -349,6 +362,7 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
           lastAttemptAt: now,
           derivedMatches: fresh.derivedMatches,
           nodeId: nodeState.nodeId,
+          scope: fresh.scope,
         };
       }
     } else {
@@ -359,6 +373,7 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
         lastAttemptAt: now,
         derivedMatches: fresh.derivedMatches,
         nodeId: nodeState.nodeId,
+        scope: fresh.scope,
       };
     }
 
@@ -385,8 +400,8 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     const derivedMatches = this.computeDerivedMatches(nodeState);
     const local = await this.checkLocal(nodeState);
     const onchain = await this.checkOnchain(nodeState, contractAddress);
-    const status = this.combine(local, onchain);
-    return { status, derivedMatches };
+    const status = this.combine(local.outcome, onchain);
+    return { status, derivedMatches, scope: local.scope };
   }
 
   /** Type-safe against a raw, unvalidated node_state.json field (round-2 High-3). */
@@ -406,35 +421,43 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
    * signature is remote and fine).
    *
    * `"no_signer"` (neither a local key nor a remote signer configured) maps to the
-   * legitimate `skipped_no_private_key` outcome. `"remote"` (a remote signer IS configured)
-   * ALSO maps to `skipped_remote_signer` (round-4 correction) — NEVER a fallback to
-   * comparing the local key (which is exactly the bug this exists to prevent) and NEVER a
-   * probe of the remote signer either (`resolveSigningPublicKey` deliberately makes no
-   * request to it — see its docstring: doing so would make this background check itself
-   * produce an unauthorized signature). This is a deliberate, honest limitation: a
-   * remote-signing node's local dimension is simply not verified right now.
+   * legitimate `skipped_no_private_key` outcome. `"remote"` — required mode, or optional mode
+   * with no local key to fall back to — maps to `skipped_remote_signer`: NEVER a fallback to
+   * comparing an irrelevant local key, and NEVER a probe of the remote signer either
+   * (`resolveSigningPublicKey` deliberately makes no request to it in this branch).
+   *
+   * `"local_fallback"` (round-7 correction, optional remote mode WITH a local key) IS
+   * checked, via the normal derive-and-compare below — that key is a REAL fallback signing
+   * key `signDerivedHash()` silently uses whenever the remote call fails, so leaving it
+   * unverified was itself the exact silent-failure gap this check exists to close. The
+   * result is tagged with `scope: "local_fallback_only"` (see `computeFresh`/`check`) so an
+   * `ok` here is never misread as "the remote signer's own key is fine too" — it isn't
+   * checked and can't be without producing a signature.
    */
-  private async checkLocal(
-    nodeState: NodeState
-  ): Promise<"ok" | "mismatch" | "skipped_no_private_key" | "skipped_remote_signer"> {
+  private async checkLocal(nodeState: NodeState): Promise<{
+    outcome: "ok" | "mismatch" | "skipped_no_private_key" | "skipped_remote_signer";
+    scope?: "local_fallback_only";
+  }> {
     try {
       const resolved = await this.blsService.resolveSigningPublicKey(nodeState);
       if (resolved.source === "no_signer") {
-        return "skipped_no_private_key";
+        return { outcome: "skipped_no_private_key" };
       }
       if (resolved.source === "remote") {
-        return "skipped_remote_signer";
+        return { outcome: "skipped_remote_signer" };
       }
 
-      // resolved.source === "local"
+      // resolved.source === "local" | "local_fallback"
+      const scope = resolved.source === "local_fallback" ? ("local_fallback_only" as const) : undefined;
       const derivedHex = normalizeHex(resolved.publicKey.toHex());
 
       const statePoint = this.parsePublicKeyPoint(nodeState.publicKey);
       if (statePoint === null) {
         // node_state.publicKey isn't a valid point in EITHER accepted wire format.
-        return "mismatch";
+        return { outcome: "mismatch", scope };
       }
-      return derivedHex === normalizeHex(statePoint.toHex()) ? "ok" : "mismatch";
+      const outcome = derivedHex === normalizeHex(statePoint.toHex()) ? "ok" : "mismatch";
+      return { outcome, scope };
     } catch (error: any) {
       // Signer resolution itself failed unexpectedly (e.g. the local signer rejected a
       // malformed private key) — cannot prove correctness, so treat as a mismatch rather
@@ -442,7 +465,7 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
       this.logger.warn(
         `local key-consistency check could not resolve/compare a signing public key: ${error?.message ?? error}`
       );
-      return "mismatch";
+      return { outcome: "mismatch" };
     }
   }
 

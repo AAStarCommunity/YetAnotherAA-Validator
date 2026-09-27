@@ -63,6 +63,27 @@ describe("HealthController", () => {
     expect(result.capabilities).toEqual([]);
   });
 
+  it("CC-36 round-7: scope: \"local_fallback_only\" surfaces through /health — an ok result must be readable as scoped, not as a full verification", () => {
+    // Round-7: in optional remote-signer mode, `ok` may come from checking only the LOCAL
+    // fallback key (never the remote signer's own key, which can't be checked without
+    // producing a signature). Assert this scope flag is visible at the /health CONTRACT
+    // layer so a caller that reads `status === "ok"` can also see it's scope-limited.
+    const fakeResult: KeyConsistencyResult = {
+      status: "ok",
+      checkedAt: "2026-01-01T00:00:00.000Z",
+      lastAttemptAt: "2026-01-01T00:00:00.000Z",
+      derivedMatches: true,
+      nodeId: "0xabc",
+      scope: "local_fallback_only",
+    };
+    const controller = new HealthController(undefined, {
+      getLastResult: () => fakeResult,
+    } as any);
+    const result = controller.health();
+    expect(result.keyConsistency?.scope).toBe("local_fallback_only");
+    expect(result.status).toBe("ok");
+  });
+
   it("root() endpoint is unaffected (CC-36 only touches /health)", () => {
     const controller = new HealthController(undefined, undefined);
     const result = controller.root();
