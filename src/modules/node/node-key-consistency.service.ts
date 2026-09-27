@@ -1,8 +1,9 @@
 import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { ethers } from "ethers";
-import { bls, sigs } from "../../utils/bls.util.js";
+import { bls } from "../../utils/bls.util.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { BlsService } from "../bls/bls.service.js";
+import { SignerService } from "../signer/signer.service.js";
 import { NodeState } from "../../interfaces/node.interface.js";
 
 export type KeyConsistencyStatus =
@@ -41,8 +42,11 @@ interface FreshCheck {
   derivedMatches: boolean | null;
 }
 
-function normalizeHex(hex: string | undefined | null): string {
-  return "0x" + (hex ?? "").replace(/^0x/i, "").toLowerCase();
+/** Type-safe against whatever a raw, unvalidated node_state.json actually contains on disk
+ *  (round-2 High-3): a non-string field must normalize to "", never throw. */
+function normalizeHex(hex: unknown): string {
+  const s = typeof hex === "string" ? hex : "";
+  return "0x" + s.replace(/^0x/i, "").toLowerCase();
 }
 
 /**
@@ -56,17 +60,20 @@ function normalizeHex(hex: string | undefined | null): string {
  * online and silently non-participating.
  *
  * Three-way comparison (one attempt, see `computeFresh`):
- *   1. local:    privateKey  -> derive pubkey -> compare to node_state.publicKey
- *   2. on-chain: node_state.publicKey (EIP-2537-encoded via the SAME encoder the
+ *   1. local:    privateKey -> derive pubkey via the REAL signing path (SignerService.forNode /
+ *                LocalKeySigner, never a local re-parse of the hex) -> compare to
+ *                node_state.publicKey (accepting EITHER wire format actually seen in
+ *                production — see `parsePublicKeyPoint`)
+ *   2. on-chain: node_state.publicKey normalized to EIP-2537 via the SAME encoder the
  *                registration path writes with — BlsService.encodePublicKeyToEIP2537,
  *                never a local re-implementation, so this check can never silently
- *                drift from what registerOnChain() actually wrote) -> compare to
+ *                drift from what registerOnChain() actually wrote -> compare to
  *                registeredKeys(nodeId) (only meaningful when isRegistered(nodeId))
  *   3. derivedMatches (informational only): nodeId == keccak256(EIP-2537 publicKey)
  *
- * Fail-loud, not fail-stop: a single attempt never throws. Every failure mode
- * (malformed key material, RPC error, timeout) collapses into a `status` value so a
- * broken node stays observable instead of taking the process down with it.
+ * Fail-loud, not fail-stop: a single attempt is designed to never throw — every failure mode
+ * (malformed key material, RPC error, timeout) collapses into a `status` value — and `loop()`
+ * additionally holds a structural boundary in case a future bug throws anyway (round-2 High-3).
  *
  * Runs as a self-scheduling loop (`start()`), not a one-shot: an `unknown` result
  * (RPC error) retries with bounded backoff (30s/60s/120s/240s, then folding into the
@@ -76,6 +83,12 @@ function normalizeHex(hex: string | undefined | null): string {
  * `syncNode(nodeId)` deactivating an under-staked/role-losing operator) surfaces as
  * `not_registered` in /health instead of showing its startup `ok` forever. A recheck
  * that itself fails RPC never downgrades a known conclusion to `unknown` — see `check()`.
+ *
+ * `start()` is bound to one node identity at a time and is generation-tokened (round-2
+ * Medium-4): restarting it (e.g. NodeService.reloadNodeState() after a dashboard
+ * create/import/delete) invalidates any in-flight attempt from the previous identity, so its
+ * result — however it eventually resolves — is discarded rather than clobbering the new
+ * identity's published result or stacking a second timer.
  */
 @Injectable()
 export class NodeKeyConsistencyService implements OnModuleDestroy {
@@ -90,10 +103,14 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
   private consecutiveUnknown = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = true;
+  /** Bumped by every start()/stop(). A loop() iteration captures its generation at start() time
+   *  and checks it after each attempt — a mismatch means a newer start()/stop() superseded it. */
+  private generation = 0;
 
   constructor(
     private readonly blockchainService: BlockchainService,
-    private readonly blsService: BlsService
+    private readonly blsService: BlsService,
+    private readonly signerService: SignerService
   ) {}
 
   /** The most recently held result (a preserved conclusion survives a failed retry). Read by /health. */
@@ -102,23 +119,43 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
   }
 
   /**
-   * Start the self-check loop: an immediate check, then bounded-backoff retries while
-   * `unknown`, then periodic rechecks once conclusive. Idempotent — calling again restarts
-   * the loop from scratch (stopping any existing timer first) rather than stacking loops.
+   * Start the self-check loop for `nodeState`: an immediate check, then bounded-backoff
+   * retries while `unknown`, then periodic rechecks once conclusive. Idempotent — calling
+   * again (e.g. against a NEW node identity after a dashboard create/import) restarts the
+   * loop from scratch: stops any existing timer, bumps the generation token (invalidating an
+   * in-flight attempt from the previous call), and clears the held result immediately so a
+   * previous identity's finding is never shown even for a moment under the new loop.
    */
   start(nodeState: NodeState, contractAddress: string): void {
     this.stop();
+    this.lastResult = null;
+    this.consecutiveUnknown = 0;
+    this.generation++;
+    const myGeneration = this.generation;
     this.stopped = false;
-    void this.loop(nodeState, contractAddress);
+    void this.loop(nodeState, contractAddress, myGeneration).catch(() => {});
   }
 
-  /** Stop the loop and clear its timer. Safe to call repeatedly, or before `start()`. */
+  /** Stop the loop and clear its timer. Safe to call repeatedly, or before `start()`. Does NOT
+   *  clear the held result — callers that also want that (e.g. node deletion) call `clearResult()`. */
   stop(): void {
     this.stopped = true;
+    this.generation++; // invalidate any in-flight loop() from the previous start()
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+  }
+
+  /**
+   * Forget the held result entirely (round-2 High-2): called when the node identity is
+   * deleted and none replaces it, so /health's `keyConsistency` goes back to being omitted
+   * rather than confidently showing a stale identity's "ok" (or any other stale status) for
+   * a node that no longer exists. Does not touch the timer/loop — pair with `stop()`.
+   */
+  clearResult(): void {
+    this.lastResult = null;
+    this.consecutiveUnknown = 0;
   }
 
   /** Nest lifecycle hook — guarantees the timer never survives module/app shutdown. */
@@ -126,15 +163,29 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     this.stop();
   }
 
-  private async loop(nodeState: NodeState, contractAddress: string): Promise<void> {
-    await this.check(nodeState, contractAddress);
-    if (this.stopped) {
-      // stop() raced with this in-flight attempt — don't schedule a next one.
+  private async loop(
+    nodeState: NodeState,
+    contractAddress: string,
+    myGeneration: number
+  ): Promise<void> {
+    try {
+      await this.check(nodeState, contractAddress, myGeneration);
+    } catch {
+      // Structural boundary (round-2 High-3): check() is designed to never throw (every
+      // failure mode collapses into a status), but this is the last line of defense in case a
+      // future bug does anyway. The retry loop must survive a single bad tick and keep
+      // scheduling rather than dying silently, and this handler does NOTHING that could
+      // itself throw (no logger call here — logging happens, if at all, inside check()).
+    }
+    if (this.stopped || myGeneration !== this.generation) {
+      // Either stopped, or superseded by a newer start()/stop() while this attempt was in
+      // flight — don't reschedule. This is also what keeps exactly one timer alive at a time.
       return;
     }
     const delay = this.nextDelayMs();
     this.timer = setTimeout(() => {
-      void this.loop(nodeState, contractAddress);
+      // Same structural boundary on the recurring path.
+      void this.loop(nodeState, contractAddress, myGeneration).catch(() => {});
     }, delay);
     // Never keep the process alive just for this self-check (mirrors the rest of the
     // codebase's fire-and-forget timers; this one just says so explicitly).
@@ -157,10 +208,32 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
    * Reading a network blip as "we no longer know" would silently launder away a real
    * mismatch_onchain the moment the RPC hiccups, which defeats the whole point of this
    * check. `checkedAt` only advances when a conclusion was actually (re-)established.
+   *
+   * `generationToken` is set ONLY by `loop()` (a direct/manual call — as every existing unit
+   * test makes — omits it and always publishes). When set and stale (round-2 Medium-4: a
+   * newer start()/stop() ran while this attempt was in flight), the result is discarded
+   * entirely: not merged into `lastResult`, not logged as a fresh finding. `loop()` itself
+   * separately checks the generation afterward to decide whether to reschedule.
    */
-  async check(nodeState: NodeState, contractAddress: string): Promise<KeyConsistencyResult> {
+  async check(
+    nodeState: NodeState,
+    contractAddress: string,
+    generationToken?: number
+  ): Promise<KeyConsistencyResult> {
     const now = new Date().toISOString();
     const fresh = await this.computeFresh(nodeState, contractAddress);
+
+    if (generationToken !== undefined && generationToken !== this.generation) {
+      return (
+        this.lastResult ?? {
+          status: fresh.status,
+          checkedAt: now,
+          lastAttemptAt: now,
+          derivedMatches: fresh.derivedMatches,
+          nodeId: nodeState.nodeId,
+        }
+      );
+    }
 
     if (fresh.status === "mismatch_local" || fresh.status === "mismatch_onchain") {
       this.logMismatch(fresh.status, nodeState);
@@ -211,42 +284,48 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
     );
   }
 
-  private async computeFresh(
-    nodeState: NodeState,
-    contractAddress: string
-  ): Promise<FreshCheck> {
+  private async computeFresh(nodeState: NodeState, contractAddress: string): Promise<FreshCheck> {
     const derivedMatches = this.computeDerivedMatches(nodeState);
-    const local = this.checkLocal(nodeState);
+    const local = await this.checkLocal(nodeState);
     const onchain = await this.checkOnchain(nodeState, contractAddress);
     const status = this.combine(local, onchain);
     return { status, derivedMatches };
   }
 
-  private prefix(hex: string | undefined): string {
-    const h = (hex ?? "").replace(/^0x/i, "");
-    return "0x" + h.slice(0, 10);
+  /** Type-safe against a raw, unvalidated node_state.json field (round-2 High-3). */
+  private prefix(hex: unknown): string {
+    const s = typeof hex === "string" ? hex : "";
+    return "0x" + s.replace(/^0x/i, "").slice(0, 10);
   }
 
-  /** privateKey -> derived pubkey vs. node_state.publicKey. Key-less nodes are a legitimate skip. */
-  private checkLocal(nodeState: NodeState): "ok" | "mismatch" | "skipped" {
+  /**
+   * privateKey -> derived pubkey vs. node_state.publicKey. Key-less nodes are a legitimate
+   * skip. Delegates key derivation to the REAL signing path (round-2 Medium-5): a bare
+   * `SignerService.forNode(nodeState)` throws exactly when `LocalKeySigner`'s constructor
+   * would reject the private key (wrong length, non-hex char, etc.) — the same validation
+   * the node actually signs with — so this can never say "ok" for a key the signer would
+   * refuse, and can never silently coerce an invalid hex char into 0.
+   */
+  private async checkLocal(nodeState: NodeState): Promise<"ok" | "mismatch" | "skipped"> {
     if (!nodeState.privateKey) {
       return "skipped";
     }
     try {
-      const privHex = nodeState.privateKey.replace(/^0x/i, "");
-      const privBytes = new Uint8Array(privHex.length / 2);
-      for (let i = 0; i < privHex.length; i += 2) {
-        privBytes[i / 2] = parseInt(privHex.substr(i, 2), 16);
+      const signer = this.signerService.forNode(nodeState);
+      const derivedPub = await signer.getPublicKey();
+      const statePoint = this.parsePublicKeyPoint(nodeState.publicKey);
+      if (statePoint === null) {
+        // node_state.publicKey isn't a valid point in EITHER accepted wire format.
+        return "mismatch";
       }
-      const derivedPub = sigs.getPublicKey(privBytes);
       const derivedHex = normalizeHex(derivedPub.toHex());
-      const stateHex = normalizeHex(nodeState.publicKey);
+      const stateHex = normalizeHex(statePoint.toHex());
       return derivedHex === stateHex ? "ok" : "mismatch";
     } catch (error: any) {
-      // Malformed key material — cannot prove correctness, so treat as a mismatch rather
-      // than silently skipping (a corrupt privateKey is itself worth surfacing).
+      // The signer rejected the private key (or deriving/comparing otherwise failed) —
+      // cannot prove correctness, so treat as a mismatch rather than silently skipping.
       this.logger.warn(
-        `local key-consistency check could not compute a public key from privateKey: ${error?.message ?? error}`
+        `local key-consistency check could not derive/compare a public key: ${error?.message ?? error}`
       );
       return "mismatch";
     }
@@ -268,11 +347,12 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
 
       const localEip2537 = this.toEip2537Hex(nodeState.publicKey);
       if (localEip2537 === null) {
-        // Registered on-chain, but the local publicKey isn't even a parsable curve
-        // point — we cannot determine agreement either way. Never guess: unknown.
+        // Registered on-chain, but the local publicKey isn't a parsable curve point in
+        // EITHER accepted wire format — we cannot determine agreement either way. Never
+        // guess: unknown.
         this.logger.warn(
           `key-consistency check: node_state.publicKey for ${nodeState.nodeId} is not a valid ` +
-            "G1 point; cannot compare against the on-chain registration"
+            "G1 point in either accepted wire format; cannot compare against the on-chain registration"
         );
         return "unknown";
       }
@@ -306,19 +386,63 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
   }
 
   /**
-   * Decompress a 48-byte compressed G1 hex pubkey and re-encode it as 128-byte EIP-2537 —
-   * via `BlsService.encodePublicKeyToEIP2537`, the SAME encoder `registerOnChain()` writes
+   * Parse node_state.publicKey into a validated G1 curve point, accepting BOTH wire formats
+   * actually seen on real nodes (round-2 review, High-1): 48-byte COMPRESSED (what a signing
+   * node normally carries — verified against a live node's `/node/info`) and 128-byte
+   * EIP-2537 UNCOMPRESSED (what dashboard.service.ts's create-node path stores —
+   * `encodePublicKeyToEIP2537`'s own output — and `import-node.dto.ts` accepts as-is for
+   * `publicKey`). Assuming only the compressed form would misreport every dashboard-created
+   * node as `mismatch_local` — a false accusation against a legitimately-created node, the
+   * same class of bug as trusting `derivedMatches` as a judgment.
+   *
+   * The 128-byte branch reconstructs the point via @noble/curves' OWN `Point.fromAffine` (a
+   * public primitive of the SAME class `.fromHex()` returns) from the raw X/Y coordinates,
+   * then calls `.assertValidity()` — the identical subgroup/curve-equation check `.fromHex()`
+   * performs on the compressed form — so a malformed or off-curve 128-byte value is rejected
+   * exactly like a malformed compressed one would be, never silently accepted.
+   */
+  private parsePublicKeyPoint(publicKeyHex: unknown): any | null {
+    if (typeof publicKeyHex !== "string" || publicKeyHex.length === 0) {
+      return null;
+    }
+    const hex = publicKeyHex.replace(/^0x/i, "");
+    try {
+      if (hex.length === 96) {
+        // 48-byte compressed G1.
+        const point = bls.G1.Point.fromHex(hex);
+        point.assertValidity();
+        return point;
+      }
+      if (hex.length === 256) {
+        // 128-byte EIP-2537: 16 zero-pad + 48-byte X + 16 zero-pad + 48-byte Y — the exact
+        // inverse layout of BlsService's private encodeG1Point (byte offsets 16 and 80; in
+        // hex-char offsets that's X at [32,128) and Y at [160,256)).
+        const x = BigInt("0x" + hex.slice(32, 128));
+        const y = BigInt("0x" + hex.slice(160, 256));
+        const point = bls.G1.Point.fromAffine({ x, y });
+        point.assertValidity();
+        return point;
+      }
+      return null; // neither accepted wire format
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Normalize node_state.publicKey (either accepted wire format) to 128-byte EIP-2537 — via
+   * `BlsService.encodePublicKeyToEIP2537`, the SAME encoder `registerOnChain()` writes
    * on-chain with (and gossip/dashboard/quorum-cosigner all read on-chain data with). This is
    * deliberately NOT a local re-implementation: a future change to the encoder would
    * otherwise silently diverge between what got written on-chain and what this check
    * compares against, causing exactly the kind of undetected drift this check exists to catch.
    */
-  private toEip2537Hex(compressedPublicKeyHex: string | undefined): string | null {
-    if (!compressedPublicKeyHex) {
+  private toEip2537Hex(publicKeyHex: unknown): string | null {
+    const point = this.parsePublicKeyPoint(publicKeyHex);
+    if (point === null) {
       return null;
     }
     try {
-      const point = bls.G1.Point.fromHex(compressedPublicKeyHex.replace(/^0x/i, ""));
       return this.blsService.encodePublicKeyToEIP2537(point);
     } catch {
       return null;

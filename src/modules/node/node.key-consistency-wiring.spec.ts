@@ -91,3 +91,123 @@ describe("NodeService — key-consistency self-check wiring (CC-36)", () => {
     }
   });
 });
+
+/**
+ * CC-36 round 2 (High-2): the self-check is bound to one node identity. dashboard.service.ts
+ * calls reloadNodeState() after every create/import/delete — it must restart the check
+ * against the NEW identity, or stop + clear it entirely when the node was deleted, so
+ * /health never keeps confidently reporting a status for an identity that no longer exists.
+ */
+describe("NodeService — reloadNodeState() restarts/stops the self-check on identity change (CC-36 round 2)", () => {
+  const makeState = (nodeId: string) => ({
+    nodeId,
+    nodeName: "n",
+    publicKey: "0xabcd",
+    createdAt: "t",
+    description: "d",
+    privateKey: "0x" + "1".padStart(64, "0"),
+  });
+
+  const makeSvc = (
+    file: string,
+    keyConsistencyService: {
+      start: jest.Mock;
+      stop: jest.Mock;
+      clearResult: jest.Mock;
+      getLastResult: () => null;
+    }
+  ) => {
+    const config = {
+      get: (k: string) => (k === "validatorContractAddress" ? "0xcontract" : undefined),
+    } as unknown as ConfigService;
+    const svc = new NodeService({} as any, {} as any, config, keyConsistencyService as any);
+    (svc as any).nodeStateFilePath = file;
+    (svc as any).contractAddress = "0xcontract"; // normally set by initializeNode() before boot
+    return svc;
+  };
+
+  it("create: reloadNodeState() starts the check against the newly-created identity", () => {
+    const dir = mkdtempSync(join(tmpdir(), "kc-reload-"));
+    const file = join(dir, "node_state.json");
+    const start = jest.fn();
+    const stop = jest.fn();
+    const clearResult = jest.fn();
+    const svc = makeSvc(file, { start, stop, clearResult, getLastResult: () => null });
+
+    try {
+      // No node yet — the file doesn't exist. reloadNodeState() must stop+clear, not start.
+      svc.reloadNodeState();
+      expect(start).not.toHaveBeenCalled();
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(clearResult).toHaveBeenCalledTimes(1);
+
+      // Dashboard "create" writes node_state.json, then calls reloadNodeState().
+      writeFileSync(file, JSON.stringify(makeState("0xnew")));
+      svc.reloadNodeState();
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(start).toHaveBeenCalledWith(
+        expect.objectContaining({ nodeId: "0xnew" }),
+        "0xcontract"
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("delete: reloadNodeState() stops the check and clears its result — /health must not keep a stale identity's ok", () => {
+    const dir = mkdtempSync(join(tmpdir(), "kc-reload-"));
+    const file = join(dir, "node_state.json");
+    writeFileSync(file, JSON.stringify(makeState("0xold")));
+    const start = jest.fn();
+    const stop = jest.fn();
+    const clearResult = jest.fn();
+    const svc = makeSvc(file, { start, stop, clearResult, getLastResult: () => null });
+
+    try {
+      svc.reloadNodeState(); // node exists -> start()
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(stop).not.toHaveBeenCalled();
+
+      // Dashboard "delete" removes node_state.json, then calls reloadNodeState().
+      rmSync(file);
+      svc.reloadNodeState();
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(clearResult).toHaveBeenCalledTimes(1);
+      expect(start).toHaveBeenCalledTimes(1); // not called again — still just the one from before
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("replace: reloadNodeState() restarts the check against the NEW identity, never the old one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "kc-reload-"));
+    const file = join(dir, "node_state.json");
+    writeFileSync(file, JSON.stringify(makeState("0xold")));
+    const start = jest.fn();
+    const svc = makeSvc(file, {
+      start,
+      stop: jest.fn(),
+      clearResult: jest.fn(),
+      getLastResult: () => null,
+    });
+
+    try {
+      svc.reloadNodeState();
+      expect(start).toHaveBeenLastCalledWith(
+        expect.objectContaining({ nodeId: "0xold" }),
+        "0xcontract"
+      );
+
+      // A delete followed by an import with a DIFFERENT identity (the dashboard's replace flow).
+      rmSync(file);
+      writeFileSync(file, JSON.stringify(makeState("0xnew")));
+      svc.reloadNodeState();
+      expect(start).toHaveBeenLastCalledWith(
+        expect.objectContaining({ nodeId: "0xnew" }),
+        "0xcontract"
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -4,6 +4,7 @@ import { bls, sigs } from "../../utils/bls.util.js";
 import { NodeState } from "../../interfaces/node.interface.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { BlsService } from "../bls/bls.service.js";
+import { SignerService } from "../signer/signer.service.js";
 
 /**
  * A real BlsService — NOT a mock — used purely for its `encodePublicKeyToEIP2537` (a pure
@@ -14,6 +15,13 @@ import { BlsService } from "../bls/bls.service.js";
  * drifted, re-implementation.
  */
 const realBls = new BlsService({} as any, {} as any);
+
+/**
+ * A real SignerService (round-2 Medium-5) — resolves to `LocalKeySigner` under the default
+ * "local" backend (config.get always returns undefined) — so `checkLocal()` derives keys
+ * through the EXACT validation the node signs with, never a separate hex re-parse.
+ */
+const realSigner = new SignerService({ get: () => undefined } as any);
 
 /**
  * Real BLS keypairs (not hardcoded fixtures) so every fixture is internally
@@ -27,7 +35,7 @@ function makeKeyPair(seed: number) {
   const pub = sigs.getPublicKey(privBytes);
   const compressedHex = "0x" + pub.toHex(); // node_state.publicKey format (48-byte compressed)
   const point = bls.G1.Point.fromHex(pub.toHex());
-  const eip2537Hex = realBls.encodePublicKeyToEIP2537(point); // on-chain format (128-byte)
+  const eip2537Hex = realBls.encodePublicKeyToEIP2537(point); // on-chain / dashboard-create format (128-byte)
   return { privateKey, compressedHex, eip2537Hex };
 }
 
@@ -58,13 +66,17 @@ function makeBlockchainMock(overrides: {
   } as unknown as BlockchainService;
 }
 
+function makeService(chain: BlockchainService, blsService: BlsService = realBls) {
+  return new NodeKeyConsistencyService(chain, blsService, realSigner);
+}
+
 describe("NodeKeyConsistencyService (CC-36)", () => {
   it("ok: local privateKey derives publicKey AND on-chain registeredKeys matches", async () => {
     const chain = makeBlockchainMock({
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("ok");
     expect(service.getLastResult()).toEqual(result);
@@ -75,11 +87,41 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     // privateKey is A's, but publicKey on disk is B's — a corrupted/swapped node_state.
     const state = baseNodeState({ publicKey: KEY_B.compressedHex });
     const result = await service.check(state, "0xcontract");
     expect(result.status).toBe("mismatch_local");
+  });
+
+  it("MEDIUM-5 regression: a private key the REAL signer would reject must NOT be reported ok", async () => {
+    // LocalKeySigner requires exactly 64 hex chars, all valid hex digits. An odd-length /
+    // non-hex-char key is something the node itself could never sign with — the check must
+    // agree, not silently coerce it (e.g. via parseInt-NaN -> 0) into a false "ok".
+    const chain = makeBlockchainMock({
+      checkNodeRegistration: () => Promise.resolve(true),
+      getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+    });
+    const service = makeService(chain);
+    const state = baseNodeState({ privateKey: "0x" + "zz".repeat(32) }); // non-hex chars
+    const result = await service.check(state, "0xcontract");
+    expect(result.status).not.toBe("ok");
+    expect(result.status).toBe("mismatch_local");
+  });
+
+  it("MEDIUM-5: an uppercase 0X-prefixed private key (which LocalKeySigner rejects) is NOT reported ok", async () => {
+    // LocalKeySigner's `startsWith("0x")` check is case-sensitive, so an uppercase "0X" prefix
+    // is NOT stripped and the remaining string fails the 64-hex-char regex — the real signer
+    // throws. A check that case-insensitively strips "0x" before validating would disagree.
+    const chain = makeBlockchainMock({
+      checkNodeRegistration: () => Promise.resolve(true),
+      getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+    });
+    const service = makeService(chain);
+    const upper = "0X" + KEY_A.privateKey.slice(2);
+    const state = baseNodeState({ privateKey: upper });
+    const result = await service.check(state, "0xcontract");
+    expect(result.status).not.toBe("ok");
   });
 
   it("mismatch_onchain: registered, but registeredKeys() differs from local publicKey — the silent failure", async () => {
@@ -87,7 +129,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex), // someone else's key is registered
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("mismatch_onchain");
   });
@@ -96,7 +138,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
     const chain = makeBlockchainMock({
       checkNodeRegistration: () => Promise.resolve(false),
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("not_registered");
     // getNodePublicKey must not even be consulted once we know it's unregistered.
@@ -108,7 +150,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
     (chain.checkNodeRegistration as jest.Mock).mockRejectedValueOnce(
       new Error("RPC timeout") as never
     );
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("unknown");
   });
@@ -120,7 +162,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
     (chain.getNodePublicKey as jest.Mock).mockRejectedValueOnce(
       new Error("RPC timeout") as never
     );
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("unknown");
   });
@@ -130,7 +172,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const state = baseNodeState();
     delete (state as Partial<NodeState>).privateKey;
     const result = await service.check(state, "0xcontract");
@@ -142,7 +184,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const state = baseNodeState();
     delete (state as Partial<NodeState>).privateKey;
     const result = await service.check(state, "0xcontract");
@@ -157,7 +199,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const bootstrapNodeId = "0x" + "11".repeat(32); // deliberately NOT keccak256(KEY_A.eip2537Hex)
     const state = baseNodeState({ nodeId: bootstrapNodeId });
     const result = await service.check(state, "0xcontract");
@@ -173,7 +215,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const result = await service.check(baseNodeState({ nodeId: derivedNodeId }), "0xcontract");
     expect(result.status).toBe("ok");
     expect(result.derivedMatches).toBe(true);
@@ -185,7 +227,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       // Same bytes as KEY_A.eip2537Hex, but uppercase and without the 0x prefix.
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex.slice(2).toUpperCase()),
     });
-    const service = new NodeKeyConsistencyService(chain, realBls);
+    const service = makeService(chain);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("ok");
   });
@@ -203,7 +245,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(sentinelEip2537),
     });
-    const service = new NodeKeyConsistencyService(chain, stubBls);
+    const service = makeService(chain, stubBls);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(encodeSpy).toHaveBeenCalled();
     expect(result.status).toBe("ok");
@@ -221,8 +263,75 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve("0x" + "11".repeat(128)),
     });
-    const service = new NodeKeyConsistencyService(chain, stubBls);
+    const service = makeService(chain, stubBls);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("mismatch_onchain");
+  });
+
+  describe("HIGH-1: node_state.publicKey may legitimately be 128-byte EIP-2537 (dashboard.service.ts create path)", () => {
+    it("a dashboard-created node (128-byte publicKey on disk) is reported ok, not mismatch_local", async () => {
+      // dashboard.service.ts's createNode() stores `publicKey =
+      // this.blsService.encodePublicKeyToEIP2537(publicKeyPoint)` — the FULL 128-byte form —
+      // in node_state.json, never the 48-byte compressed form a signing node normally has.
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain);
+      const state = baseNodeState({ publicKey: KEY_A.eip2537Hex }); // 128 bytes, not compressed
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).toBe("ok");
+    });
+
+    it("a 128-byte publicKey still correctly detects a REAL mismatch (not a blanket pass)", async () => {
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain);
+      // privateKey is A's, but the 128-byte publicKey on disk is B's.
+      const state = baseNodeState({ publicKey: KEY_B.eip2537Hex });
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).toBe("mismatch_local");
+    });
+
+    it("on-chain comparison also works when node_state.publicKey is 128-byte (round-trips through the same encoder)", async () => {
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex), // a DIFFERENT key registered
+      });
+      const service = makeService(chain);
+      const state = baseNodeState({ publicKey: KEY_A.eip2537Hex, privateKey: KEY_A.privateKey });
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).toBe("mismatch_onchain");
+    });
+
+    it("derivedMatches is computed correctly for a 128-byte publicKey too", async () => {
+      const { ethers } = await import("ethers");
+      const derivedNodeId = ethers.keccak256(KEY_A.eip2537Hex);
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain);
+      const state = baseNodeState({ publicKey: KEY_A.eip2537Hex, nodeId: derivedNodeId });
+      const result = await service.check(state, "0xcontract");
+      expect(result.derivedMatches).toBe(true);
+    });
+
+    it("a malformed 128-byte-length publicKey (not a real point) is rejected, not silently accepted", async () => {
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+      });
+      const service = makeService(chain);
+      // Right length (256 hex chars) but NOT a valid curve point (all zero x, all-ones y — off
+      // curve). assertValidity() must reject this rather than @noble/curves silently accepting it.
+      const bogus = "0x" + "00".repeat(64) + "ff".repeat(64);
+      const state = baseNodeState({ publicKey: bogus, privateKey: undefined as any });
+      const result = await service.check(state, "0xcontract");
+      // No private key (skipped local) and the bogus on-chain-format key can't be parsed ->
+      // checkOnchain must say "unknown" (never guess ok/mismatch for something unparsable).
+      expect(result.status).toBe("unknown");
+    });
   });
 });

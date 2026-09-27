@@ -285,5 +285,18 @@ export class NodeService implements OnModuleInit {
       this.nodeState = null;
       this.logger.log("Node state file not found, cleared internal state");
     }
+    // CC-36 round 2 (High-2): the key-consistency self-check is bound to one node identity.
+    // A dashboard create/import/delete calls reloadNodeState() and MUST restart the check
+    // against the new identity — or stop and clear it entirely when the node was deleted.
+    // Without this, a deleted/replaced node keeps publishing its OLD identity's result
+    // forever, and /health would confidently report "ok" for a node that no longer exists —
+    // worse than reporting nothing. NodeKeyConsistencyService's generation token (Medium-4)
+    // ensures a stale in-flight check from the previous identity can't clobber this.
+    if (this.nodeState) {
+      this.runKeyConsistencyCheck();
+    } else if (this.keyConsistencyService) {
+      this.keyConsistencyService.stop();
+      this.keyConsistencyService.clearResult();
+    }
   }
 }
