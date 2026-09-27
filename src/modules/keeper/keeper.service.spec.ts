@@ -59,8 +59,8 @@ function makeRegistry() {
 }
 
 /** Stand-in for OpsAlertService — only `isEnabled()` matters to the self-check. */
-function makeOpsAlert(deliverable: boolean) {
-  return { isEnabled: () => deliverable, alert: jest.fn() } as any;
+function makeOpsAlert(configured: boolean) {
+  return { isEnabled: () => configured, alert: jest.fn() } as any;
 }
 
 /** Fixed clock at t=now (unix ms). Allows overriding "now" for time-based guardrail tests. */
@@ -340,12 +340,16 @@ describe("KeeperService", () => {
 });
 
 /**
- * Startup self-check: "keeper enabled but alerts undeliverable" must never go
+ * Startup self-check: "keeper enabled but alerts unconfigured" must never go
  * unnoticed silently (the real incident that motivates this: a neighboring repo's
  * price keeper ran for 3.5 weeks, failing every tick, with a broken alert channel
  * — nobody knew). This must ONLY ever log; it must never throw or block startup.
+ *
+ * Scope note (see keeper.service.ts docstring): this checks CONFIGURATION
+ * (OpsAlertService.isEnabled()), not deliverability — it cannot and does not
+ * claim to catch a configured-but-dead transport.
  */
-describe("KeeperService — startup self-check: alert deliverability", () => {
+describe("KeeperService — startup self-check: alert configured", () => {
   let errorSpy: ReturnType<typeof jest.spyOn>;
 
   beforeEach(() => {
@@ -356,7 +360,7 @@ describe("KeeperService — startup self-check: alert deliverability", () => {
     errorSpy.mockRestore();
   });
 
-  it("keeper enabled + alerts deliverable ⇒ no self-check error", () => {
+  it("keeper enabled + alerts configured ⇒ no self-check error", () => {
     const svc = new KeeperService(
       makeBlockchain(),
       makeNotify(),
@@ -371,7 +375,7 @@ describe("KeeperService — startup self-check: alert deliverability", () => {
     expect(errorSpy).not.toHaveBeenCalled();
   });
 
-  it("keeper enabled + OpsAlertService configured but disabled ⇒ logs an error at startup", () => {
+  it("keeper enabled + OpsAlertService present but disabled ⇒ logs an error at startup", () => {
     const svc = new KeeperService(
       makeBlockchain(),
       makeNotify(),
@@ -385,7 +389,7 @@ describe("KeeperService — startup self-check: alert deliverability", () => {
     svc.onApplicationShutdown();
     expect(errorSpy).toHaveBeenCalledTimes(1);
     const [msg] = errorSpy.mock.calls[0] as unknown as [string];
-    expect(msg).toContain("NOT deliverable");
+    expect(msg).toContain("NOT configured");
     expect(msg).toContain("OPS_ALERT_ENABLED");
   });
 
@@ -418,6 +422,21 @@ describe("KeeperService — startup self-check: alert deliverability", () => {
     expect(errorSpy).not.toHaveBeenCalled();
   });
 
+  it("keeper enabled + no paymaster addresses (keeper won't actually run) ⇒ no self-check noise", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig({ keeperPaymasterAddress: "" }),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      makeOpsAlert(false) // alerts unconfigured too, but irrelevant — keeper never runs
+    );
+    svc.onApplicationBootstrap();
+    // Only the existing "disabled" warn fires; the alert self-check must not.
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
   it("self-check error does NOT stop the keeper — it still schedules and runs ticks normally", async () => {
     jest.useFakeTimers();
     try {
@@ -436,7 +455,7 @@ describe("KeeperService — startup self-check: alert deliverability", () => {
         NOW_NEAR_EXPIRY,
         makeRegistry(),
         () => 0, // no jitter — fire immediately
-        makeOpsAlert(false) // undeliverable ⇒ self-check logs, but must not block anything
+        makeOpsAlert(false) // unconfigured ⇒ self-check logs, but must not block anything
       );
 
       svc.onApplicationBootstrap();

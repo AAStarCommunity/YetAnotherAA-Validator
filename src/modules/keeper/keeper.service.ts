@@ -90,13 +90,13 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
 
   onApplicationBootstrap(): void {
     if (!this.enabled) return;
-    this.checkAlertDeliverability();
     if (this.paymasterAddresses.length === 0) {
       this.logger.warn(
         "Keeper: KEEPER_ENABLED=true but KEEPER_PAYMASTER_ADDRESS not set — disabled"
       );
       return;
     }
+    this.checkAlertConfigured();
     this.lastDayNumber = this.todayNumber();
     // Phase-jitter the first tick across [0, intervalMs) so redundant keepers
     // that boot together don't all fire updatePrice() in the same window.
@@ -141,19 +141,29 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
    * price) that this keeper exists to prevent — the safe response is to keep
    * working and say so loudly, not to stop.
    *
-   * Deliverability is judged solely by `OpsAlertService.isEnabled()` — the single
-   * place that already encodes "opt-in flag AND a transport is actually
-   * configured" (see ops-alert.service.ts). Duplicating that condition here would
-   * let the two checks drift.
+   * Scope, precisely: this checks CONFIGURATION, not deliverability.
+   * `OpsAlertService.isEnabled()` — the single place that already encodes "opt-in
+   * flag AND a transport is actually configured" (see ops-alert.service.ts) — only
+   * tells us a transport was *set up*. It does not probe that transport, so a
+   * configured-but-broken transport (e.g. a revoked Telegram bot token —
+   * `Unauthorized` on every send) still reports `isEnabled() === true` and this
+   * check stays silent. That is in fact the shape of the neighboring incident
+   * this is modeled on: the token was configured, just dead. This check only
+   * catches the "never configured at all" class (this repo's `deploy/*.env.example`
+   * templates ship with no `OPS_ALERT_*` entries set, matching that state).
+   * Catching a configured-but-dead transport requires an actual delivery drill
+   * before relying on it, not a config read.
    */
-  private checkAlertDeliverability(): void {
+  private checkAlertConfigured(): void {
     if (this.opsAlert?.isEnabled()) return;
     this.logger.error(
-      "Keeper is ENABLED but operator alerts are NOT deliverable — if updatePrice() " +
+      "Keeper is ENABLED but operator alerts are NOT configured — if updatePrice() " +
         "fails, nobody will be notified (this is exactly how a stale-price outage goes " +
         "unnoticed). This does not stop the keeper. Configure alerting via " +
         "OPS_ALERT_ENABLED=true plus a transport: OPS_ALERT_BOT_TOKEN + OPS_ALERT_CHAT_ID " +
-        "(Telegram), or AASTAR_MONITOR_URL (+ optional AASTAR_MONITOR_TOKEN) for a webhook."
+        "(Telegram), or AASTAR_MONITOR_URL (+ optional AASTAR_MONITOR_TOKEN) for a webhook. " +
+        "Note: configured is not the same as deliverable — a dead token/webhook still " +
+        "passes this check; only a real alert drill proves delivery actually works."
     );
   }
 
