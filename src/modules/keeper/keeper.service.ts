@@ -90,6 +90,7 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
 
   onApplicationBootstrap(): void {
     if (!this.enabled) return;
+    this.checkAlertDeliverability();
     if (this.paymasterAddresses.length === 0) {
       this.logger.warn(
         "Keeper: KEEPER_ENABLED=true but KEEPER_PAYMASTER_ADDRESS not set — disabled"
@@ -124,6 +125,36 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  /**
+   * Startup self-check (real incident driven — a neighboring repo's price keeper
+   * failed silently for 3.5 weeks: process alive, every tick failing, zero alerts,
+   * because its alert channel was also broken and nobody knew).
+   *
+   * The keeper's own failure path (`refreshOne` below) only ever *tries* to alert
+   * via `this.opsAlert?.alert(...)` — that call is a silent no-op whenever
+   * OpsAlertService is disabled/unconfigured, or isn't injected at all. Loudly
+   * surface that combination once at startup so it isn't discovered only after an
+   * updatePrice() failure goes unnoticed. This intentionally does NOT stop the
+   * keeper: halting on an alerting gap would guarantee the exact harm (a stale
+   * price) that this keeper exists to prevent — the safe response is to keep
+   * working and say so loudly, not to stop.
+   *
+   * Deliverability is judged solely by `OpsAlertService.isEnabled()` — the single
+   * place that already encodes "opt-in flag AND a transport is actually
+   * configured" (see ops-alert.service.ts). Duplicating that condition here would
+   * let the two checks drift.
+   */
+  private checkAlertDeliverability(): void {
+    if (this.opsAlert?.isEnabled()) return;
+    this.logger.error(
+      "Keeper is ENABLED but operator alerts are NOT deliverable — if updatePrice() " +
+        "fails, nobody will be notified (this is exactly how a stale-price outage goes " +
+        "unnoticed). This does not stop the keeper. Configure alerting via " +
+        "OPS_ALERT_ENABLED=true plus a transport: OPS_ALERT_BOT_TOKEN + OPS_ALERT_CHAT_ID " +
+        "(Telegram), or AASTAR_MONITOR_URL (+ optional AASTAR_MONITOR_TOKEN) for a webhook."
+    );
   }
 
   /** Startup phase offset in [0, intervalMs). Visible for testing. */

@@ -1,4 +1,5 @@
 import { jest } from "@jest/globals";
+import { Logger } from "@nestjs/common";
 import { KeeperService } from "./keeper.service.js";
 
 const PAYMASTER = "0x" + "12".repeat(20);
@@ -55,6 +56,11 @@ function makeRegistry() {
     registered,
     register: (cap: { name: string }) => registered.push(cap.name),
   } as any;
+}
+
+/** Stand-in for OpsAlertService — only `isEnabled()` matters to the self-check. */
+function makeOpsAlert(deliverable: boolean) {
+  return { isEnabled: () => deliverable, alert: jest.fn() } as any;
 }
 
 /** Fixed clock at t=now (unix ms). Allows overriding "now" for time-based guardrail tests. */
@@ -323,6 +329,126 @@ describe("KeeperService", () => {
       await jest.advanceTimersByTimeAsync(30_000);
       expect(updates).toHaveLength(1);
       expect((svc as any).startupTimer).toBeNull();
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+      expect((svc as any).timer).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+/**
+ * Startup self-check: "keeper enabled but alerts undeliverable" must never go
+ * unnoticed silently (the real incident that motivates this: a neighboring repo's
+ * price keeper ran for 3.5 weeks, failing every tick, with a broken alert channel
+ * — nobody knew). This must ONLY ever log; it must never throw or block startup.
+ */
+describe("KeeperService — startup self-check: alert deliverability", () => {
+  let errorSpy: ReturnType<typeof jest.spyOn>;
+
+  beforeEach(() => {
+    errorSpy = jest.spyOn(Logger.prototype, "error").mockImplementation((() => undefined) as any);
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
+  });
+
+  it("keeper enabled + alerts deliverable ⇒ no self-check error", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig(),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      makeOpsAlert(true)
+    );
+    svc.onApplicationBootstrap();
+    svc.onApplicationShutdown();
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeper enabled + OpsAlertService configured but disabled ⇒ logs an error at startup", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig(),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      makeOpsAlert(false)
+    );
+    svc.onApplicationBootstrap();
+    svc.onApplicationShutdown();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const [msg] = errorSpy.mock.calls[0] as unknown as [string];
+    expect(msg).toContain("NOT deliverable");
+    expect(msg).toContain("OPS_ALERT_ENABLED");
+  });
+
+  it("keeper enabled + OpsAlertService not injected at all (undefined) ⇒ logs an error", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig(),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      undefined // no opsAlert provider in this DI graph
+    );
+    svc.onApplicationBootstrap();
+    svc.onApplicationShutdown();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeper NOT enabled ⇒ no self-check noise, regardless of alert state", () => {
+    const svc = new KeeperService(
+      makeBlockchain(),
+      makeNotify(),
+      makeConfig({ keeperEnabled: false }),
+      clockAt(0),
+      makeRegistry(),
+      undefined,
+      makeOpsAlert(false)
+    );
+    svc.onApplicationBootstrap();
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("self-check error does NOT stop the keeper — it still schedules and runs ticks normally", async () => {
+    jest.useFakeTimers();
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0, // no jitter — fire immediately
+        makeOpsAlert(false) // undeliverable ⇒ self-check logs, but must not block anything
+      );
+
+      svc.onApplicationBootstrap();
+      // The self-check fired loudly...
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      // ...but scheduling proceeded exactly as if alerting were fine.
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      // The first tick actually ran and called updatePrice().
+      expect(updates).toHaveLength(1);
+      // The recurring interval is armed as normal.
       expect((svc as any).timer).not.toBeNull();
 
       svc.onApplicationShutdown();
