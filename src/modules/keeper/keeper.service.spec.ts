@@ -604,4 +604,100 @@ describe("KeeperService — startup self-check: alert configured", () => {
       jest.useRealTimers();
     }
   });
+
+  it(
+    "opsAlert.isEnabled() returns a REJECTED Promise ⇒ the rejection is consumed " +
+      "(no unhandledRejection), and the keeper still schedules and runs a tick",
+    async () => {
+      jest.useFakeTimers();
+      const unhandled = jest.fn();
+      process.on("unhandledRejection", unhandled);
+      try {
+        const updates: boolean[] = [];
+        const blockchain = makeBlockchain({
+          getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+          updatePrice: async () => {
+            updates.push(true);
+            return "0xTX";
+          },
+        });
+        const rejectingOpsAlert = {
+          isEnabled: () => Promise.reject(new Error("probe rejected")),
+          alert: jest.fn(),
+        } as any;
+        const svc = new KeeperService(
+          blockchain,
+          makeNotify(),
+          makeConfig({ keeperIntervalMs: 60_000 }),
+          NOW_NEAR_EXPIRY,
+          makeRegistry(),
+          () => 0,
+          rejectingOpsAlert
+        );
+
+        svc.onApplicationBootstrap();
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        expect((svc as any).startupTimer).not.toBeNull();
+
+        // Flush the microtask queue so the rejected promise settles — if the
+        // rejection were left unconsumed, this is where Node would emit
+        // `unhandledRejection` (a process crash under Node 15+ defaults).
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(unhandled).not.toHaveBeenCalled();
+
+        await jest.advanceTimersByTimeAsync(0);
+        expect(updates).toHaveLength(1);
+        expect((svc as any).timer).not.toBeNull();
+
+        svc.onApplicationShutdown();
+      } finally {
+        jest.useRealTimers();
+        process.off("unhandledRejection", unhandled);
+      }
+    }
+  );
+
+  it("logger.error itself throws inside the self-check ⇒ the boundary guard swallows it, keeper still runs", async () => {
+    jest.useFakeTimers();
+    // Reuse the describe-level spy (installed in beforeEach) rather than
+    // re-spying — just swap its implementation to throw for this one test.
+    // afterEach's errorSpy.mockRestore() still tears it down as usual.
+    errorSpy.mockImplementation(() => {
+      throw new Error("logging backend down");
+    });
+    try {
+      const updates: boolean[] = [];
+      const blockchain = makeBlockchain({
+        getPriceInfo: async () => ({ updatedAt: 1000n, threshold: 3600n }),
+        updatePrice: async () => {
+          updates.push(true);
+          return "0xTX";
+        },
+      });
+      const svc = new KeeperService(
+        blockchain,
+        makeNotify(),
+        makeConfig({ keeperIntervalMs: 60_000 }),
+        NOW_NEAR_EXPIRY,
+        makeRegistry(),
+        () => 0,
+        makeOpsAlert(false) // unconfigured ⇒ checkAlertConfigured() will try to log
+      );
+
+      // onApplicationBootstrap must not throw even though the diagnostic logger
+      // itself throws — this is exactly what the call-site boundary try/catch
+      // (not a nested catch inside checkAlertConfigured) exists to contain.
+      expect(() => svc.onApplicationBootstrap()).not.toThrow();
+      expect((svc as any).startupTimer).not.toBeNull();
+
+      await jest.advanceTimersByTimeAsync(0);
+      expect(updates).toHaveLength(1);
+      expect((svc as any).timer).not.toBeNull();
+
+      svc.onApplicationShutdown();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });
