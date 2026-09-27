@@ -1,7 +1,8 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { ethers } from "ethers";
-import { bls, sigs, encodeG1Point } from "../../utils/bls.util.js";
+import { bls, sigs } from "../../utils/bls.util.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
+import { BlsService } from "../bls/bls.service.js";
 import { NodeState } from "../../interfaces/node.interface.js";
 
 export type KeyConsistencyStatus =
@@ -13,8 +14,15 @@ export type KeyConsistencyStatus =
   | "skipped_no_private_key";
 
 export interface KeyConsistencyResult {
+  /**
+   * Most recent CONCLUSIVE status (i.e. one this instance actually determined, never a
+   * transient RPC failure "laundered" into `unknown` over a known conclusion — see `check()`).
+   */
   status: KeyConsistencyStatus;
+  /** When `status` (and `derivedMatches`) was last actually determined — NOT bumped by a failed retry. */
   checkedAt: string;
+  /** When the most recent check ATTEMPT ran, successful or not — proves the retry loop is alive. */
+  lastAttemptAt: string;
   /**
    * Informational only (per CC-36): whether `nodeId === keccak256(EIP-2537 publicKey)`.
    * The contract's `registerWithProof` path derives nodeId this way, but the older
@@ -25,6 +33,12 @@ export interface KeyConsistencyResult {
    */
   derivedMatches: boolean | null;
   nodeId: string;
+}
+
+/** The outcome of a single, stateless comparison — before it's merged into the held `lastResult`. */
+interface FreshCheck {
+  status: KeyConsistencyStatus;
+  derivedMatches: boolean | null;
 }
 
 function normalizeHex(hex: string | undefined | null): string {
@@ -41,63 +55,171 @@ function normalizeHex(hex: string | undefined | null): string {
  * fail verification against the on-chain registration forever — the node is
  * online and silently non-participating.
  *
- * Three-way comparison:
+ * Three-way comparison (one attempt, see `computeFresh`):
  *   1. local:    privateKey  -> derive pubkey -> compare to node_state.publicKey
- *   2. on-chain: node_state.publicKey (EIP-2537-encoded) -> compare to
+ *   2. on-chain: node_state.publicKey (EIP-2537-encoded via the SAME encoder the
+ *                registration path writes with — BlsService.encodePublicKeyToEIP2537,
+ *                never a local re-implementation, so this check can never silently
+ *                drift from what registerOnChain() actually wrote) -> compare to
  *                registeredKeys(nodeId) (only meaningful when isRegistered(nodeId))
  *   3. derivedMatches (informational only): nodeId == keccak256(EIP-2537 publicKey)
  *
- * Fail-loud, not fail-stop: `check()` never throws. Every failure mode (malformed
- * key material, RPC error, timeout) collapses into a `status` value so a broken
- * node stays observable instead of taking the process down with it — a node that
- * already can't produce valid signatures gains nothing from also losing its
- * health/metrics endpoint.
+ * Fail-loud, not fail-stop: a single attempt never throws. Every failure mode
+ * (malformed key material, RPC error, timeout) collapses into a `status` value so a
+ * broken node stays observable instead of taking the process down with it.
+ *
+ * Runs as a self-scheduling loop (`start()`), not a one-shot: an `unknown` result
+ * (RPC error) retries with bounded backoff (30s/60s/120s/240s, then folding into the
+ * regular cadence) rather than freezing forever on a boot-time hiccup, and a
+ * CONCLUSIVE result is periodically rechecked (every RECHECK_INTERVAL_MS) so a node
+ * that gets kicked off the on-chain registry post-boot (the validator's permissionless
+ * `syncNode(nodeId)` deactivating an under-staked/role-losing operator) surfaces as
+ * `not_registered` in /health instead of showing its startup `ok` forever. A recheck
+ * that itself fails RPC never downgrades a known conclusion to `unknown` — see `check()`.
  */
 @Injectable()
-export class NodeKeyConsistencyService {
+export class NodeKeyConsistencyService implements OnModuleDestroy {
+  /** Backoff schedule while stuck on `unknown` (RPC down). After this it folds into RECHECK_INTERVAL_MS. */
+  private static readonly UNKNOWN_BACKOFF_MS = [30_000, 60_000, 120_000, 240_000];
+  /** Cadence once (and while) a conclusive result holds — also the post-backoff fallback cadence. */
+  private static readonly RECHECK_INTERVAL_MS = 15 * 60_000;
+
   private readonly logger = new Logger(NodeKeyConsistencyService.name);
   private lastResult: KeyConsistencyResult | null = null;
+  /** Consecutive `unknown` FRESH attempts (independent of `lastResult.status`, which may be a preserved older conclusion). */
+  private consecutiveUnknown = 0;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private stopped = true;
 
-  constructor(private readonly blockchainService: BlockchainService) {}
+  constructor(
+    private readonly blockchainService: BlockchainService,
+    private readonly blsService: BlsService
+  ) {}
 
-  /** The most recent check() result, or null if none has run yet. Read by /health. */
+  /** The most recently held result (a preserved conclusion survives a failed retry). Read by /health. */
   getLastResult(): KeyConsistencyResult | null {
     return this.lastResult;
   }
 
-  async check(nodeState: NodeState, contractAddress: string): Promise<KeyConsistencyResult> {
-    const checkedAt = new Date().toISOString();
-    const derivedMatches = this.computeDerivedMatches(nodeState);
+  /**
+   * Start the self-check loop: an immediate check, then bounded-backoff retries while
+   * `unknown`, then periodic rechecks once conclusive. Idempotent — calling again restarts
+   * the loop from scratch (stopping any existing timer first) rather than stacking loops.
+   */
+  start(nodeState: NodeState, contractAddress: string): void {
+    this.stop();
+    this.stopped = false;
+    void this.loop(nodeState, contractAddress);
+  }
 
+  /** Stop the loop and clear its timer. Safe to call repeatedly, or before `start()`. */
+  stop(): void {
+    this.stopped = true;
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  /** Nest lifecycle hook — guarantees the timer never survives module/app shutdown. */
+  onModuleDestroy(): void {
+    this.stop();
+  }
+
+  private async loop(nodeState: NodeState, contractAddress: string): Promise<void> {
+    await this.check(nodeState, contractAddress);
+    if (this.stopped) {
+      // stop() raced with this in-flight attempt — don't schedule a next one.
+      return;
+    }
+    const delay = this.nextDelayMs();
+    this.timer = setTimeout(() => {
+      void this.loop(nodeState, contractAddress);
+    }, delay);
+    // Never keep the process alive just for this self-check (mirrors the rest of the
+    // codebase's fire-and-forget timers; this one just says so explicitly).
+    this.timer.unref?.();
+  }
+
+  private nextDelayMs(): number {
+    const backoff = NodeKeyConsistencyService.UNKNOWN_BACKOFF_MS;
+    if (this.consecutiveUnknown > 0 && this.consecutiveUnknown <= backoff.length) {
+      return backoff[this.consecutiveUnknown - 1];
+    }
+    return NodeKeyConsistencyService.RECHECK_INTERVAL_MS;
+  }
+
+  /**
+   * Run one attempt and merge it into the held result.
+   *
+   * The merge rule is the load-bearing part: a fresh `unknown` (this attempt's RPC failed)
+   * NEVER overwrites a previously-held CONCLUSIVE result — it only bumps `lastAttemptAt`.
+   * Reading a network blip as "we no longer know" would silently launder away a real
+   * mismatch_onchain the moment the RPC hiccups, which defeats the whole point of this
+   * check. `checkedAt` only advances when a conclusion was actually (re-)established.
+   */
+  async check(nodeState: NodeState, contractAddress: string): Promise<KeyConsistencyResult> {
+    const now = new Date().toISOString();
+    const fresh = await this.computeFresh(nodeState, contractAddress);
+
+    if (fresh.status === "mismatch_local" || fresh.status === "mismatch_onchain") {
+      this.logMismatch(fresh.status, nodeState);
+    }
+
+    if (fresh.status === "unknown") {
+      this.consecutiveUnknown++;
+      if (this.lastResult && this.lastResult.status !== "unknown") {
+        this.lastResult = { ...this.lastResult, lastAttemptAt: now };
+      } else {
+        // No prior conclusion to preserve (first-ever attempt, or every attempt so far has
+        // been unknown) — "unknown" IS the current conclusion in that case.
+        this.lastResult = {
+          status: "unknown",
+          checkedAt: now,
+          lastAttemptAt: now,
+          derivedMatches: fresh.derivedMatches,
+          nodeId: nodeState.nodeId,
+        };
+      }
+    } else {
+      this.consecutiveUnknown = 0;
+      this.lastResult = {
+        status: fresh.status,
+        checkedAt: now,
+        lastAttemptAt: now,
+        derivedMatches: fresh.derivedMatches,
+        nodeId: nodeState.nodeId,
+      };
+    }
+
+    return this.lastResult;
+  }
+
+  private logMismatch(status: "mismatch_local" | "mismatch_onchain", nodeState: NodeState): void {
+    const localPrefix = this.prefix(nodeState.publicKey);
+    this.logger.error(
+      `KEY CONSISTENCY FAILURE [${status}] for node ${nodeState.nodeId}: ` +
+        (status === "mismatch_local"
+          ? `the private key in node_state.json does NOT derive node_state.publicKey ` +
+            `(local publicKey=${localPrefix}...). `
+          : `node_state.publicKey (${localPrefix}...) does NOT match the on-chain ` +
+            `registeredKeys() entry for this nodeId. `) +
+        `This node will keep signing, but its signatures can NEVER verify against the ` +
+        `on-chain registration — it is online and healthy while being silently ` +
+        `non-participating. Fix: re-register the correct public key on-chain for this ` +
+        `nodeId, or restore the matching privateKey/publicKey pair in node_state.json.`
+    );
+  }
+
+  private async computeFresh(
+    nodeState: NodeState,
+    contractAddress: string
+  ): Promise<FreshCheck> {
+    const derivedMatches = this.computeDerivedMatches(nodeState);
     const local = this.checkLocal(nodeState);
     const onchain = await this.checkOnchain(nodeState, contractAddress);
     const status = this.combine(local, onchain);
-
-    const result: KeyConsistencyResult = {
-      status,
-      checkedAt,
-      derivedMatches,
-      nodeId: nodeState.nodeId,
-    };
-
-    if (status === "mismatch_local" || status === "mismatch_onchain") {
-      const localPrefix = this.prefix(nodeState.publicKey);
-      this.logger.error(
-        `KEY CONSISTENCY FAILURE [${status}] for node ${nodeState.nodeId}: ` +
-          (status === "mismatch_local"
-            ? `the private key in node_state.json does NOT derive node_state.publicKey ` +
-              `(local publicKey=${localPrefix}...). `
-            : `node_state.publicKey (${localPrefix}...) does NOT match the on-chain ` +
-              `registeredKeys() entry for this nodeId. `) +
-          `This node will keep signing, but its signatures can NEVER verify against the ` +
-          `on-chain registration — it is online and healthy while being silently ` +
-          `non-participating. Fix: re-register the correct public key on-chain for this ` +
-          `nodeId, or restore the matching privateKey/publicKey pair in node_state.json.`
-      );
-    }
-
-    this.lastResult = result;
-    return result;
+    return { status, derivedMatches };
   }
 
   private prefix(hex: string | undefined): string {
@@ -183,15 +305,21 @@ export class NodeKeyConsistencyService {
     return normalizeHex(derivedNodeId) === normalizeHex(nodeState.nodeId);
   }
 
-  /** Decompress a 48-byte compressed G1 hex pubkey and re-encode it as 128-byte EIP-2537. */
+  /**
+   * Decompress a 48-byte compressed G1 hex pubkey and re-encode it as 128-byte EIP-2537 —
+   * via `BlsService.encodePublicKeyToEIP2537`, the SAME encoder `registerOnChain()` writes
+   * on-chain with (and gossip/dashboard/quorum-cosigner all read on-chain data with). This is
+   * deliberately NOT a local re-implementation: a future change to the encoder would
+   * otherwise silently diverge between what got written on-chain and what this check
+   * compares against, causing exactly the kind of undetected drift this check exists to catch.
+   */
   private toEip2537Hex(compressedPublicKeyHex: string | undefined): string | null {
     if (!compressedPublicKeyHex) {
       return null;
     }
     try {
       const point = bls.G1.Point.fromHex(compressedPublicKeyHex.replace(/^0x/i, ""));
-      const encoded = encodeG1Point(point);
-      return "0x" + Buffer.from(encoded).toString("hex");
+      return this.blsService.encodePublicKeyToEIP2537(point);
     } catch {
       return null;
     }

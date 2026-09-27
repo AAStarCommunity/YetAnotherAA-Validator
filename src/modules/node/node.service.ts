@@ -43,11 +43,11 @@ export class NodeService implements OnModuleInit {
       this.loadExistingNodeState();
       if (this.nodeState) {
         this.logger.log(`Loaded node state: ${this.nodeState.nodeId}`);
-        // CC-36: best-effort, fire-and-forget — a slow/unavailable RPC must never
-        // delay or block startup (`void`, not `await`). The check itself never
-        // throws (fail-loud via logger.error, fail-open on the process), but the
-        // wrapper still guards against a future bug in the check surfacing here.
-        void this.runKeyConsistencyCheck();
+        // CC-36: best-effort — a slow/unavailable RPC must never delay or block startup.
+        // This starts the self-scheduling retry/recheck loop; it does not await anything
+        // itself. The check itself never throws (fail-loud via logger.error, fail-open on
+        // the process), but the wrapper still guards against a future bug surfacing here.
+        this.runKeyConsistencyCheck();
       }
     } else {
       this.logger.log("No node state file found. Node is not created yet.");
@@ -55,13 +55,18 @@ export class NodeService implements OnModuleInit {
     }
   }
 
-  /** See NodeKeyConsistencyService — never awaited on the startup path, never throws. */
-  private async runKeyConsistencyCheck(): Promise<void> {
+  /**
+   * See NodeKeyConsistencyService — starts its self-scheduling retry/recheck loop.
+   * `start()` itself is synchronous and fire-and-forget internally (never awaited on the
+   * startup path); this wrapper only guards against a future bug surfacing as an unhandled
+   * exception here instead of the check's own designed fail-loud logging.
+   */
+  private runKeyConsistencyCheck(): void {
     if (!this.nodeState || !this.keyConsistencyService) {
       return;
     }
     try {
-      await this.keyConsistencyService.check(this.nodeState, this.contractAddress);
+      this.keyConsistencyService.start(this.nodeState, this.contractAddress);
     } catch (error: any) {
       this.logger.error(
         `Key-consistency self-check crashed unexpectedly (this should never happen — the check ` +

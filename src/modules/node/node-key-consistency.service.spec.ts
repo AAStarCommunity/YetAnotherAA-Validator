@@ -1,8 +1,19 @@
 import { jest } from "@jest/globals";
 import { NodeKeyConsistencyService } from "./node-key-consistency.service.js";
-import { bls, sigs, encodeG1Point } from "../../utils/bls.util.js";
+import { bls, sigs } from "../../utils/bls.util.js";
 import { NodeState } from "../../interfaces/node.interface.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
+import { BlsService } from "../bls/bls.service.js";
+
+/**
+ * A real BlsService — NOT a mock — used purely for its `encodePublicKeyToEIP2537` (a pure
+ * function of its argument; it reads none of the injected BlockchainService/SignerService
+ * state). Fixtures are built with the exact same encoder the check itself is required to
+ * use (CC-36 round-2 review), so "ok" here means byte-identical agreement with what
+ * `registerOnChain()` actually writes on-chain — not agreement with a second, possibly
+ * drifted, re-implementation.
+ */
+const realBls = new BlsService({} as any, {} as any);
 
 /**
  * Real BLS keypairs (not hardcoded fixtures) so every fixture is internally
@@ -16,7 +27,7 @@ function makeKeyPair(seed: number) {
   const pub = sigs.getPublicKey(privBytes);
   const compressedHex = "0x" + pub.toHex(); // node_state.publicKey format (48-byte compressed)
   const point = bls.G1.Point.fromHex(pub.toHex());
-  const eip2537Hex = "0x" + Buffer.from(encodeG1Point(point)).toString("hex"); // on-chain format (128-byte)
+  const eip2537Hex = realBls.encodePublicKeyToEIP2537(point); // on-chain format (128-byte)
   return { privateKey, compressedHex, eip2537Hex };
 }
 
@@ -53,7 +64,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("ok");
     expect(service.getLastResult()).toEqual(result);
@@ -64,7 +75,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     // privateKey is A's, but publicKey on disk is B's — a corrupted/swapped node_state.
     const state = baseNodeState({ publicKey: KEY_B.compressedHex });
     const result = await service.check(state, "0xcontract");
@@ -76,7 +87,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex), // someone else's key is registered
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("mismatch_onchain");
   });
@@ -85,7 +96,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
     const chain = makeBlockchainMock({
       checkNodeRegistration: () => Promise.resolve(false),
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("not_registered");
     // getNodePublicKey must not even be consulted once we know it's unregistered.
@@ -97,7 +108,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
     (chain.checkNodeRegistration as jest.Mock).mockRejectedValueOnce(
       new Error("RPC timeout") as never
     );
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("unknown");
   });
@@ -109,7 +120,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
     (chain.getNodePublicKey as jest.Mock).mockRejectedValueOnce(
       new Error("RPC timeout") as never
     );
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("unknown");
   });
@@ -119,7 +130,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const state = baseNodeState();
     delete (state as Partial<NodeState>).privateKey;
     const result = await service.check(state, "0xcontract");
@@ -131,7 +142,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const state = baseNodeState();
     delete (state as Partial<NodeState>).privateKey;
     const result = await service.check(state, "0xcontract");
@@ -146,7 +157,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const bootstrapNodeId = "0x" + "11".repeat(32); // deliberately NOT keccak256(KEY_A.eip2537Hex)
     const state = baseNodeState({ nodeId: bootstrapNodeId });
     const result = await service.check(state, "0xcontract");
@@ -162,7 +173,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       checkNodeRegistration: () => Promise.resolve(true),
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const result = await service.check(baseNodeState({ nodeId: derivedNodeId }), "0xcontract");
     expect(result.status).toBe("ok");
     expect(result.derivedMatches).toBe(true);
@@ -174,8 +185,44 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       // Same bytes as KEY_A.eip2537Hex, but uppercase and without the 0x prefix.
       getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex.slice(2).toUpperCase()),
     });
-    const service = new NodeKeyConsistencyService(chain);
+    const service = new NodeKeyConsistencyService(chain, realBls);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("ok");
+  });
+
+  it("uses BlsService.encodePublicKeyToEIP2537 — NOT a local re-implementation — to encode for the on-chain comparison (CC-36 round 2)", async () => {
+    // A stub BlsService that returns an unmistakable sentinel instead of a real encoding.
+    // If the check ever reverted to a local re-implementation of the encoder (ignoring the
+    // injected BlsService), this stub's output would never be consulted, the comparison
+    // would use the REAL encoding instead, `getNodePublicKey`'s sentinel wouldn't match it,
+    // and this test would go red on "ok" -> "mismatch_onchain".
+    const sentinelEip2537 = "0x" + "ee".repeat(128);
+    const encodeSpy = jest.fn(() => sentinelEip2537);
+    const stubBls = { encodePublicKeyToEIP2537: encodeSpy } as unknown as BlsService;
+    const chain = makeBlockchainMock({
+      checkNodeRegistration: () => Promise.resolve(true),
+      getNodePublicKey: () => Promise.resolve(sentinelEip2537),
+    });
+    const service = new NodeKeyConsistencyService(chain, stubBls);
+    const result = await service.check(baseNodeState(), "0xcontract");
+    expect(encodeSpy).toHaveBeenCalled();
+    expect(result.status).toBe("ok");
+  });
+
+  it("a mismatch is still correctly detected when the STUB encoder disagrees with the on-chain read", async () => {
+    // Same stub as above, but getNodePublicKey now returns something OTHER than the stub's
+    // sentinel — proves the comparison is actually USING the injected BlsService's output
+    // (not, say, ignoring it and always returning ok).
+    const sentinelEip2537 = "0x" + "ee".repeat(128);
+    const stubBls = {
+      encodePublicKeyToEIP2537: jest.fn(() => sentinelEip2537),
+    } as unknown as BlsService;
+    const chain = makeBlockchainMock({
+      checkNodeRegistration: () => Promise.resolve(true),
+      getNodePublicKey: () => Promise.resolve("0x" + "11".repeat(128)),
+    });
+    const service = new NodeKeyConsistencyService(chain, stubBls);
+    const result = await service.check(baseNodeState(), "0xcontract");
+    expect(result.status).toBe("mismatch_onchain");
   });
 });

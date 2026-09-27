@@ -26,6 +26,7 @@ describe("HealthController", () => {
     const fakeResult: KeyConsistencyResult = {
       status: "mismatch_onchain",
       checkedAt: "2026-01-01T00:00:00.000Z",
+      lastAttemptAt: "2026-01-01T00:00:00.000Z",
       derivedMatches: true,
       nodeId: "0xabc",
     };

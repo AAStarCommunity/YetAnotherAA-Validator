@@ -24,25 +24,6 @@ export function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Encode a G1 point (BLS public key) to the 128-byte EIP-2537 wire format — the
- * uncompressed x||y form the on-chain validator stores in `registeredKeys`.
- * Mirrors `BlsService.encodeG1Point` (kept private there, on the sign path); this
- * copy lives here so read-only consumers (e.g. the node key-consistency
- * self-check) don't need to reach into BlsService for a pure encoding helper.
- */
-export function encodeG1Point(point: any): Uint8Array {
-  const result = new Uint8Array(128);
-  const affine = point.toAffine();
-
-  const xBytes = hexToBytes(affine.x.toString(16).padStart(96, "0"));
-  const yBytes = hexToBytes(affine.y.toString(16).padStart(96, "0"));
-
-  result.set(xBytes, 16); // Skip 16 zero bytes at start
-  result.set(yBytes, 80); // Skip 16 zero bytes at start
-  return result;
-}
-
 export const BLS_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 export const bls = bls12_381;
 export const sigs = bls.longSignatures;
