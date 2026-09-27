@@ -397,4 +397,43 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2/
 
     service.stop();
   });
+
+  it("INVARIANT (round-4): a remote-signer node NEVER causes the checker to call fetch (no probe, no signature), across boot + several periodic rechecks", async () => {
+    // Codex + coordinator round-4: the checker must NEVER invoke the remote signer at all —
+    // an earlier version probed its /sign endpoint to read a public key back, which produces
+    // a REAL, unauthorized signature (see BlsService.resolveSigningPublicKey's docstring for
+    // why that breaks this repo's core owner-authorization invariant). This test spies on the
+    // one shared entry point any such call would have to go through (global fetch) and runs
+    // the self-check through a boot attempt plus several periodic recheck cycles, asserting
+    // zero calls throughout — not just on a single one-shot check().
+    const fetchSpy = jest.fn();
+    const originalFetch = global.fetch;
+    global.fetch = fetchSpy as any;
+    try {
+      const remoteBls = new BlsService(
+        {} as any,
+        realSigner,
+        { get: (k: string) => (k === "rustSignerUrl" ? "http://fake-signer.local" : undefined) } as any
+      );
+      const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
+      const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
+      const service = new NodeKeyConsistencyService(chain, remoteBls);
+
+      service.start(nodeState(), "0xcontract");
+      await jest.advanceTimersByTimeAsync(10); // boot attempt
+      expect(service.getLastResult()?.status).toBe("skipped_remote_signer");
+
+      // Several periodic recheck cycles (skipped_remote_signer is non-"unknown", so the
+      // cadence is the regular ~15-minute one each time, same as a conclusive "ok").
+      await jest.advanceTimersByTimeAsync(16 * 60_000);
+      await jest.advanceTimersByTimeAsync(16 * 60_000);
+      await jest.advanceTimersByTimeAsync(16 * 60_000);
+      expect(checkNodeRegistration.mock.calls.length).toBeGreaterThanOrEqual(4); // boot + 3 rechecks actually ran
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      service.stop();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
 });

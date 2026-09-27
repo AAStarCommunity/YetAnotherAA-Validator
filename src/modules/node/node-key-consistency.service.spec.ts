@@ -406,102 +406,51 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
   });
 
   describe("HIGH-2: signer selection must match the REAL signing path (local @noble/curves vs. remote Rust/TEE-KMS)", () => {
+    // Round-4 correction (coordinator + Codex): an earlier version of this check PROBED the
+    // remote signer's /sign endpoint to read its public key back, so it could compare A/B
+    // scenarios directly. That was rejected — it makes a background health check itself
+    // produce a real, unauthorized signature (see BlsService.resolveSigningPublicKey's
+    // docstring). The corrected behavior is simpler and more conservative: ANY remote signer
+    // configuration => skipped_remote_signer, with NO network call at all. This trades away
+    // the ability to distinguish "remote actually signs A" from "remote actually signs B" —
+    // an honest, documented limitation — but it also means the OLD false-"ok" and
+    // false-mismatch_local failure modes (comparing the possibly-stale local privateKey
+    // against what a remote signer is doing) can no longer happen either, since the local
+    // dimension is never even evaluated when a remote signer is configured.
     const originalFetch = global.fetch;
     afterEach(() => {
       global.fetch = originalFetch;
     });
 
-    it("remote signer configured+reachable, reporting a DIFFERENT key (B) than local/state/chain (A) => NOT ok — the silent-failure scenario", async () => {
-      // Everything LOCAL looks consistent as A (privateKey derives A, state.publicKey is A,
-      // on-chain registeredKeys is A) — but the node is actually configured for remote
-      // signing, and the REAL signer signs with B. A check that compares the local key would
-      // wrongly say "ok" while every real signature the node produces actually uses B.
-      global.fetch = jest.fn(async () => ({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          public_key: KEY_B.compressedHex,
-          signature: "0x",
-          signature_compact: "0x",
-        }),
-      })) as any;
+    it("remote signer configured => skipped_remote_signer, regardless of what node_state.privateKey/publicKey say locally", async () => {
       const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
       const chain = makeBlockchainMock({
         checkNodeRegistration: () => Promise.resolve(true),
         getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
       });
       const service = makeService(chain, remoteBls);
-      const result = await service.check(baseNodeState(), "0xcontract"); // privateKey=A, publicKey=A
-      expect(result.status).not.toBe("ok");
-      expect(result.status).toBe("mismatch_local");
-    });
-
-    it("remote signer configured+reachable, reporting the key state/chain ALREADY reflect (B) => ok, even though local privateKey is a stale A — the false-positive scenario", async () => {
-      global.fetch = jest.fn(async () => ({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          public_key: KEY_B.compressedHex,
-          signature: "0x",
-          signature_compact: "0x",
-        }),
-      })) as any;
-      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
-      const chain = makeBlockchainMock({
-        checkNodeRegistration: () => Promise.resolve(true),
-        getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex),
-      });
-      const service = makeService(chain, remoteBls);
-      // privateKey stays A (stale/irrelevant now that remote signing is configured);
-      // publicKey correctly reflects B (what the remote signer + chain actually use).
-      const state = baseNodeState({ publicKey: KEY_B.compressedHex });
-      const result = await service.check(state, "0xcontract");
-      expect(result.status).toBe("ok");
-    });
-
-    it("remote signer configured but UNREACHABLE => skipped_remote_signer, NEVER falls back to comparing the local key", async () => {
-      global.fetch = jest.fn(async () => {
-        throw new Error("ECONNREFUSED");
-      }) as any;
-      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
-      const chain = makeBlockchainMock({
-        checkNodeRegistration: () => Promise.resolve(true),
-        // Deliberately matches local/state — a fallback-to-local check would wrongly say "ok".
-        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
-      });
-      const service = makeService(chain, remoteBls);
+      // Everything LOCAL still looks consistent as A (privateKey derives A, state.publicKey
+      // is A) — under the OLD (rejected) probing design this would have been compared
+      // against whatever the remote claimed and could go either way; now it's never compared.
       const result = await service.check(baseNodeState(), "0xcontract");
       expect(result.status).not.toBe("ok");
       expect(result.status).not.toBe("mismatch_local");
       expect(result.status).toBe("skipped_remote_signer");
     });
 
-    it("remote signer HTTP error response (non-2xx) also => skipped_remote_signer, not a crash", async () => {
-      global.fetch = jest.fn(async () => ({
-        ok: false,
-        status: 503,
-        json: async () => ({}),
-      })) as any;
+    it("remote signer configured => skipped_remote_signer even when local privateKey is stale/irrelevant and state/chain reflect a different key", async () => {
       const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
       const chain = makeBlockchainMock({
         checkNodeRegistration: () => Promise.resolve(true),
-        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+        getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex),
       });
       const service = makeService(chain, remoteBls);
-      const result = await service.check(baseNodeState(), "0xcontract");
+      const state = baseNodeState({ publicKey: KEY_B.compressedHex }); // privateKey stays A
+      const result = await service.check(state, "0xcontract");
       expect(result.status).toBe("skipped_remote_signer");
     });
 
-    it("RUST_SIGNER_REQUIRED does not change what this check reports — remote is asked first regardless", async () => {
-      global.fetch = jest.fn(async () => ({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          public_key: KEY_B.compressedHex,
-          signature: "0x",
-          signature_compact: "0x",
-        }),
-      })) as any;
+    it("RUST_SIGNER_REQUIRED does not change what this check reports — any remote config => skipped_remote_signer", async () => {
       const remoteBls = makeBls({
         rustSignerUrl: "http://fake-signer.local",
         rustSignerRequired: true,
@@ -513,7 +462,20 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       const service = makeService(chain, remoteBls);
       const state = baseNodeState({ publicKey: KEY_B.compressedHex });
       const result = await service.check(state, "0xcontract");
-      expect(result.status).toBe("ok");
+      expect(result.status).toBe("skipped_remote_signer");
+    });
+
+    it("INVARIANT (round-4, the most important test in this file): a remote-signer node NEVER causes the checker to call fetch — no probe, no signature", async () => {
+      const fetchSpy = jest.fn();
+      global.fetch = fetchSpy as any;
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" });
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_A.eip2537Hex),
+      });
+      const service = makeService(chain, remoteBls);
+      await service.check(baseNodeState(), "0xcontract");
+      expect(fetchSpy).not.toHaveBeenCalled();
     });
   });
 });

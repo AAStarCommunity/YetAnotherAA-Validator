@@ -7,13 +7,6 @@ import { NodeKeyPair } from "../../interfaces/node.interface.js";
 import { BlockchainService, PackedUserOp } from "../blockchain/blockchain.service.js";
 import { SignerService } from "../signer/signer.service.js";
 
-/**
- * A fixed, harmless probe message (32 bytes, clearly non-random so it's recognizable in any
- * signer-side logs) used ONLY by `resolveSigningPublicKey`'s remote-signer probe — see there
- * for why no dedicated "get public key" endpoint exists to ask for instead.
- */
-const REMOTE_SIGNER_PROBE_HASH = "0x" + "cc36".repeat(16);
-
 @Injectable()
 export class BlsService {
   private readonly logger = new Logger(BlsService.name);
@@ -183,28 +176,50 @@ export class BlsService {
   }
 
   /**
-   * Round-3 High-2: which public key is CURRENTLY authoritative for this node's signing,
-   * resolved via the EXACT same signer selection `signDerivedHash()` uses
-   * (`getRustSignerConfig()`), without producing a real signature over caller-supplied
-   * data. The node key-consistency self-check uses this instead of unconditionally
-   * comparing the local `privateKey` field — a node can be configured for remote (Rust/
-   * TEE-KMS) signing while STILL carrying a (possibly stale) local `privateKey` in
-   * node_state.json, so comparing the local key would be comparing the wrong thing
+   * Round-3 High-2, round-4 correction: which public key is CURRENTLY authoritative for
+   * this node's signing, resolved via the EXACT same signer selection `signDerivedHash()`
+   * uses (`getRustSignerConfig()`). The node key-consistency self-check uses this instead of
+   * unconditionally comparing the local `privateKey` field — a node can be configured for
+   * remote (Rust/TEE-KMS) signing while STILL carrying a (possibly stale) local `privateKey`
+   * in node_state.json, so comparing the local key would be comparing the wrong thing
    * entirely: it could report `ok` while every real (remote) signature actually fails, or
    * report a mismatch while every real signature is actually fine.
    *
-   * Deliberately simpler than `signDerivedHash()`'s RUST_SIGNER_REQUIRED fallback nuance:
-   * a real sign call may fall back to local when the remote is optional and unreachable,
-   * but for THIS purpose "remote is configured at all" already means it's the FIRST thing
-   * a real sign attempts (see signDerivedHash), so an unreachable remote here must NEVER
-   * silently fall back to reporting the local key as authoritative — that is exactly the
-   * bug this method exists to prevent. `required` only changes whether a REAL sign call
-   * falls back after a failed remote attempt; it does not change what this method reports.
+   * When a remote signer is configured, this method makes NO request to it and returns
+   * `{ source: "remote" }` with nothing to compare — round-4 review (Codex + coordinator):
+   * an earlier version probed the remote signer's `/sign` endpoint with a fixed, harmless
+   * message to read its public key off the response. That was REJECTED, because it breaks
+   * the repo's core invariant that a node signs ONLY after the owner-authorization gate
+   * (`authorizeAndDeriveHash`) passes (see CLAUDE.md, and the fail-closed gate above) — a
+   * background health-check tick is not an authorized request, so it must never itself
+   * cause the signer to produce a signature, no matter how "harmless" the message is:
+   *   1. It breaks the audit invariant that every signature a TEE/KMS signer ever produces
+   *      corresponds to an authorized request — a probe every cadence tick is an
+   *      unauthorized signature with no owner-auth record behind it (~96/node/day at the
+   *      15-minute recheck cadence).
+   *   2. A KMS-TEE signer's operational policy is opaque to this repo — it may meter,
+   *      rate-limit, run anomaly detection, or require operator/device presence per
+   *      signature. A background probe competes with real traffic for that budget and could
+   *      itself trip a rate limit or an alert, or in the worst case delay a real signature.
+   *   3. It signs in the SAME BLS domain (`BLS_DST`, the same `_RO_POP_` suffix) as
+   *      production traffic — not a separate, clearly-scoped test domain.
+   *
+   * The honest consequence: a remote-signing node is NOT verified by this check right now
+   * (the self-check reports `skipped_remote_signer` — a deliberate, documented limitation,
+   * never silently guessed as ok or mismatch in either direction). Two follow-ups would close
+   * this WITHOUT ever causing an extra signature (neither is implemented here):
+   *   A. Passive observation: every REAL, already-authorized `/sign` response already
+   *      includes `public_key` (see `signViaRust`) — record it from actual signing traffic
+   *      (keyed by node/time) and compare THAT against the on-chain registration instead of
+   *      asking for a dedicated read here. Zero extra signatures; only requires the node to
+   *      have signed at least once recently.
+   *   B. Ask repo:kms to add a read-only "get public key" endpoint to the remote signer,
+   *      distinct from `/sign`, so a health check can query identity without invoking
+   *      signing at all.
    */
   async resolveSigningPublicKey(node: NodeKeyPair): Promise<
     | { source: "local"; publicKey: any }
-    | { source: "remote"; publicKeyHex: string }
-    | { source: "remote_unavailable" }
+    | { source: "remote" }
     | { source: "no_signer" }
   > {
     const rust = this.getRustSignerConfig();
@@ -216,47 +231,7 @@ export class BlsService {
       const publicKey = await signer.getPublicKey();
       return { source: "local", publicKey };
     }
-    try {
-      const publicKeyHex = await this.probeRemoteSignerPublicKey(rust, node);
-      return { source: "remote", publicKeyHex };
-    } catch (error: any) {
-      this.logger.warn(
-        `remote signer public-key probe failed for node ${node.nodeId}: ${error?.message ?? error}`
-      );
-      return { source: "remote_unavailable" };
-    }
-  }
-
-  /**
-   * Ask the remote/rust signer for its public key. There is no dedicated "get public key"
-   * endpoint (the signer only exposes /sign) — every /sign response includes `public_key`
-   * alongside the signature, so this probes with a fixed, clearly-marked, harmless message
-   * reserved for this purpose. Shares the exact URL/token construction `signViaRust` uses
-   * (via the same `rust` config object) so this can never silently drift from the real
-   * signing request shape.
-   */
-  private async probeRemoteSignerPublicKey(
-    rust: { url: string; token?: string },
-    node: NodeKeyPair
-  ): Promise<string> {
-    const url = `${rust.url.replace(/\/+$/, "")}/sign`;
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (rust.token) {
-      headers["X-Signer-Token"] = rust.token;
-    }
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ user_op_hash: REMOTE_SIGNER_PROBE_HASH, node_id: node.nodeId }),
-    });
-    if (!response.ok) {
-      throw new Error(`remote signer probe HTTP ${response.status}`);
-    }
-    const data = (await response.json()) as { public_key?: string };
-    if (typeof data.public_key !== "string" || data.public_key.length === 0) {
-      throw new Error("remote signer probe returned no public_key");
-    }
-    return data.public_key;
+    return { source: "remote" };
   }
 
   /** Delegate signing to the local Rust signer. Throws on any transport/HTTP error. */

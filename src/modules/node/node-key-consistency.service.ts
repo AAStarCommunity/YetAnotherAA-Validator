@@ -77,7 +77,14 @@ function normalizeHex(hex: unknown): string {
  *                `signDerivedHash()` uses (local @noble/curves vs. remote Rust/TEE-KMS,
  *                round-3 High-2) — and compare it to node_state.publicKey (accepting
  *                EITHER wire format actually seen in production — see `parsePublicKeyPoint`,
- *                which also rejects a malformed or point-at-infinity value, round-3 High-1)
+ *                which also rejects a malformed or point-at-infinity value, round-3 High-1).
+ *                When a REMOTE signer is configured, this comparison is deliberately NOT
+ *                performed at all (round-4 correction): resolving the remote key would
+ *                require asking the signer to sign a probe message, which would make this
+ *                background health check itself produce an unauthorized signature — see
+ *                `BlsService.resolveSigningPublicKey`'s docstring for why that is
+ *                unacceptable. The honest, documented consequence is `skipped_remote_signer`:
+ *                a remote-signing node is simply NOT verified by this dimension right now.
  *   2. on-chain: node_state.publicKey normalized to EIP-2537 via the SAME encoder the
  *                registration path writes with — BlsService.encodePublicKeyToEIP2537,
  *                never a local re-implementation, so this check can never silently
@@ -385,9 +392,13 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
    * signature is remote and fine).
    *
    * `"no_signer"` (neither a local key nor a remote signer configured) maps to the
-   * legitimate `skipped_no_private_key` outcome. `"remote_unavailable"` (a remote signer IS
-   * configured but did not answer) maps to `skipped_remote_signer` — explicitly NOT a
-   * fallback to comparing the local key, which is exactly the bug this exists to prevent.
+   * legitimate `skipped_no_private_key` outcome. `"remote"` (a remote signer IS configured)
+   * ALSO maps to `skipped_remote_signer` (round-4 correction) — NEVER a fallback to
+   * comparing the local key (which is exactly the bug this exists to prevent) and NEVER a
+   * probe of the remote signer either (`resolveSigningPublicKey` deliberately makes no
+   * request to it — see its docstring: doing so would make this background check itself
+   * produce an unauthorized signature). This is a deliberate, honest limitation: a
+   * remote-signing node's local dimension is simply not verified right now.
    */
   private async checkLocal(
     nodeState: NodeState
@@ -397,24 +408,12 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
       if (resolved.source === "no_signer") {
         return "skipped_no_private_key";
       }
-      if (resolved.source === "remote_unavailable") {
+      if (resolved.source === "remote") {
         return "skipped_remote_signer";
       }
 
-      let derivedHex: string;
-      if (resolved.source === "local") {
-        derivedHex = normalizeHex(resolved.publicKey.toHex());
-      } else {
-        const remotePoint = this.parsePublicKeyPoint(resolved.publicKeyHex);
-        if (remotePoint === null) {
-          this.logger.warn(
-            `remote signer reported a public key for node ${nodeState.nodeId} that is not a ` +
-              "valid G1 point in either accepted wire format"
-          );
-          return "mismatch";
-        }
-        derivedHex = normalizeHex(remotePoint.toHex());
-      }
+      // resolved.source === "local"
+      const derivedHex = normalizeHex(resolved.publicKey.toHex());
 
       const statePoint = this.parsePublicKeyPoint(nodeState.publicKey);
       if (statePoint === null) {
