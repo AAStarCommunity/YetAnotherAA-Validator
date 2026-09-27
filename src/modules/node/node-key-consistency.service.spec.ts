@@ -564,6 +564,33 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       expect(result.scope).toBe("local_fallback_only");
     });
 
+    it("SILENT-FAILURE regression #2 (the coverage gap the previous test's status assertion didn't catch): OPTIONAL mode + stale local privateKey (A) but node_state.publicKey correctly re-imported as B (= on-chain B) => mismatch_local, scoped to local_fallback_only", async () => {
+      // The previous test's fixture had node_state.publicKey === A (the same stale key as
+      // privateKey), so the ON-CHAIN comparison (A vs. chain B) already caught the drift on
+      // its own — disabling local_fallback entirely still left `status` at mismatch_onchain
+      // (only `scope` went missing), so that test alone could not prove the LOCAL check was
+      // the one doing the work.
+      //
+      // This fixture is the scenario Codex flagged as the real danger: privateKey is stale
+      // (A), but node_state.publicKey was separately (and correctly) re-imported as B, and
+      // the chain ALSO has B (import-node.dto.ts accepts publicKey and privateKey as two
+      // independent fields — nothing forces them to be a matching pair). Now the ON-CHAIN
+      // comparison is B vs. chain B => ok, so ONLY the local_fallback comparison (privateKey
+      // A's derived key vs. node_state.publicKey B) can catch that the private key on disk
+      // doesn't actually correspond to the identity everything else agrees on.
+      const remoteBls = makeBls({ rustSignerUrl: "http://fake-signer.local" }); // optional
+      const chain = makeBlockchainMock({
+        checkNodeRegistration: () => Promise.resolve(true),
+        getNodePublicKey: () => Promise.resolve(KEY_B.eip2537Hex), // chain: B
+      });
+      const service = makeService(chain, remoteBls);
+      // privateKey stays A (stale/mismatched); publicKey correctly reflects B (= chain).
+      const state = baseNodeState({ publicKey: KEY_B.compressedHex });
+      const result = await service.check(state, "0xcontract");
+      expect(result.status).toBe("mismatch_local");
+      expect(result.scope).toBe("local_fallback_only");
+    });
+
     it("INVARIANT (round-4/7, the most important test in this file): a remote-signer node NEVER causes the checker to call fetch — no probe, no signature, in EITHER required or optional mode", async () => {
       const fetchSpy = jest.fn();
       global.fetch = fetchSpy as any;
