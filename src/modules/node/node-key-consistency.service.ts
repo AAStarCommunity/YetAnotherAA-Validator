@@ -448,7 +448,8 @@ export class NodeKeyConsistencyService implements OnModuleDestroy {
       }
 
       // resolved.source === "local" | "local_fallback"
-      const scope = resolved.source === "local_fallback" ? ("local_fallback_only" as const) : undefined;
+      const scope =
+        resolved.source === "local_fallback" ? ("local_fallback_only" as const) : undefined;
       const derivedHex = normalizeHex(resolved.publicKey.toHex());
 
       const statePoint = this.parsePublicKeyPoint(nodeState.publicKey);

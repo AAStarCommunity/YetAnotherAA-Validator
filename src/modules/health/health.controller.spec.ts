@@ -63,7 +63,7 @@ describe("HealthController", () => {
     expect(result.capabilities).toEqual([]);
   });
 
-  it("CC-36 round-7: scope: \"local_fallback_only\" surfaces through /health — an ok result must be readable as scoped, not as a full verification", () => {
+  it('CC-36 round-7: scope: "local_fallback_only" surfaces through /health — an ok result must be readable as scoped, not as a full verification', () => {
     // Round-7: in optional remote-signer mode, `ok` may come from checking only the LOCAL
     // fallback key (never the remote signer's own key, which can't be checked without
     // producing a signature). Assert this scope flag is visible at the /health CONTRACT

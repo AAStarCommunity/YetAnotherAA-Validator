@@ -237,7 +237,9 @@ export class BlsService {
    * explicit scope (`scope: "local_fallback_only"`) — an `ok` here proves only that the
    * FALLBACK key is internally consistent, never that the remote signer's primary key is.
    */
-  async resolveSigningPublicKey(node: NodeKeyPair): Promise<
+  async resolveSigningPublicKey(
+    node: NodeKeyPair
+  ): Promise<
     | { source: "local"; publicKey: any }
     | { source: "local_fallback"; publicKey: any }
     | { source: "remote" }

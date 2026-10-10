@@ -44,7 +44,10 @@ describe("NodeService — key-consistency self-check wiring (CC-36)", () => {
     try {
       await (svc as any).initializeNode();
       expect(startFn).toHaveBeenCalledTimes(1);
-      expect(startFn).toHaveBeenCalledWith(expect.objectContaining({ nodeId: "0x1" }), "0xcontract");
+      expect(startFn).toHaveBeenCalledWith(
+        expect.objectContaining({ nodeId: "0x1" }),
+        "0xcontract"
+      );
     } finally {
       cwdSpy.mockRestore();
       rmSync(dir, { recursive: true, force: true });

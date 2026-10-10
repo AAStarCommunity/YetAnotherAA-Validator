@@ -509,11 +509,9 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2/
     const originalFetch = global.fetch;
     global.fetch = fetchSpy as any;
     try {
-      const remoteBls = new BlsService(
-        {} as any,
-        realSigner,
-        { get: (k: string) => (k === "rustSignerUrl" ? "http://fake-signer.local" : undefined) } as any
-      );
+      const remoteBls = new BlsService({} as any, realSigner, {
+        get: (k: string) => (k === "rustSignerUrl" ? "http://fake-signer.local" : undefined),
+      } as any);
       const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
       const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
       const service = new NodeKeyConsistencyService(chain, remoteBls);
@@ -542,18 +540,14 @@ describe("NodeKeyConsistencyService — retry/recheck scheduling (CC-36 round 2/
     const originalFetch = global.fetch;
     global.fetch = fetchSpy as any;
     try {
-      const remoteBls = new BlsService(
-        {} as any,
-        realSigner,
-        {
-          get: (k: string) =>
-            k === "rustSignerUrl"
-              ? "http://fake-signer.local"
-              : k === "rustSignerRequired"
-                ? true
-                : undefined,
-        } as any
-      );
+      const remoteBls = new BlsService({} as any, realSigner, {
+        get: (k: string) =>
+          k === "rustSignerUrl"
+            ? "http://fake-signer.local"
+            : k === "rustSignerRequired"
+              ? true
+              : undefined,
+      } as any);
       const checkNodeRegistration = jest.fn(() => Promise.resolve(true));
       const chain = makeChain({ checkNodeRegistration: checkNodeRegistration as any });
       const service = new NodeKeyConsistencyService(chain, remoteBls);

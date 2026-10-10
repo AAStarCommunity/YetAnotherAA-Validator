@@ -171,9 +171,7 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
     const chain = makeBlockchainMock({
       checkNodeRegistration: () => Promise.resolve(true),
     });
-    (chain.getNodePublicKey as jest.Mock).mockRejectedValueOnce(
-      new Error("RPC timeout") as never
-    );
+    (chain.getNodePublicKey as jest.Mock).mockRejectedValueOnce(new Error("RPC timeout") as never);
     const service = makeService(chain);
     const result = await service.check(baseNodeState(), "0xcontract");
     expect(result.status).toBe("unknown");
@@ -439,11 +437,12 @@ describe("NodeKeyConsistencyService (CC-36)", () => {
       // a pair of independent `latest` reads straddling the transition could produce.
       const chain = {
         getBlockNumber: jest.fn(() => Promise.resolve(100)),
-        checkNodeRegistration: jest.fn((_addr: string, _id: string, blockTag?: number) =>
-          Promise.resolve(blockTag === 100) // true only "as of block 100"
+        checkNodeRegistration: jest.fn(
+          (_addr: string, _id: string, blockTag?: number) => Promise.resolve(blockTag === 100) // true only "as of block 100"
         ),
-        getNodePublicKey: jest.fn((_addr: string, _id: string, blockTag?: number) =>
-          Promise.resolve(blockTag === 100 ? KEY_A.eip2537Hex : "0x") // empty "as of block 101+"
+        getNodePublicKey: jest.fn(
+          (_addr: string, _id: string, blockTag?: number) =>
+            Promise.resolve(blockTag === 100 ? KEY_A.eip2537Hex : "0x") // empty "as of block 101+"
         ),
       } as unknown as BlockchainService;
       const service = makeService(chain);

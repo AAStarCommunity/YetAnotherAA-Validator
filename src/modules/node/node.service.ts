@@ -7,10 +7,7 @@ import { BlsService } from "../bls/bls.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { randomBytes, createHash } from "crypto";
 import { decryptKeystore, isKeystore } from "../../utils/keystore.util.js";
-import {
-  NodeKeyConsistencyService,
-  KeyConsistencyResult,
-} from "./node-key-consistency.service.js";
+import { NodeKeyConsistencyService, KeyConsistencyResult } from "./node-key-consistency.service.js";
 
 @Injectable()
 export class NodeService implements OnModuleInit {
