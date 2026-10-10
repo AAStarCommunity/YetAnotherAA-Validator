@@ -256,7 +256,18 @@ export class BlockchainService {
     }
   }
 
-  async checkNodeRegistration(contractAddress: string, nodeId: string): Promise<boolean> {
+  /**
+   * `blockTag` (optional) pins the read to a specific block — CC-36 round-6 M1: a caller
+   * that also reads `getNodePublicKey` for the SAME nodeId and wants the two reads to be
+   * atomic (not two independent `latest` reads racing a state change in between, e.g. the
+   * validator's permissionless `syncNode` deactivating the node between the two calls) must
+   * pass the SAME `blockTag` to both. Omitted, this reads `latest` exactly as before.
+   */
+  async checkNodeRegistration(
+    contractAddress: string,
+    nodeId: string,
+    blockTag?: number
+  ): Promise<boolean> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
@@ -266,7 +277,7 @@ export class BlockchainService {
     const contract = new ethers.Contract(contractAddress, abi, this.provider);
 
     try {
-      const isRegistered = await contract.isRegistered(nodeId);
+      const isRegistered = await contract.isRegistered(nodeId, { blockTag });
       return isRegistered;
     } catch (error: any) {
       this.logger.error(`Failed to check registration status: ${error.message}`);
@@ -374,7 +385,13 @@ export class BlockchainService {
     }
   }
 
-  async getNodePublicKey(contractAddress: string, nodeId: string): Promise<string> {
+  /** `blockTag` (optional) — see `checkNodeRegistration`'s doc for why a caller reading both
+   *  in one logical check should pin both to the same block. Omitted, reads `latest`. */
+  async getNodePublicKey(
+    contractAddress: string,
+    nodeId: string,
+    blockTag?: number
+  ): Promise<string> {
     if (!this.provider) {
       throw new Error("Blockchain provider not configured");
     }
@@ -384,7 +401,7 @@ export class BlockchainService {
     const contract = new ethers.Contract(contractAddress, abi, this.provider);
 
     try {
-      const publicKey = await contract.registeredKeys(nodeId);
+      const publicKey = await contract.registeredKeys(nodeId, { blockTag });
       return publicKey;
     } catch (error: any) {
       this.logger.error(`Failed to get node public key: ${error.message}`);

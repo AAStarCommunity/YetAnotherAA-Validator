@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit, Logger, Inject, forwardRef } from "@nestjs/common";
+import { Injectable, OnModuleInit, Logger, Inject, forwardRef, Optional } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { NodeKeyPair, NodeState } from "../../interfaces/node.interface.js";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
@@ -7,6 +7,7 @@ import { BlsService } from "../bls/bls.service.js";
 import { BlockchainService } from "../blockchain/blockchain.service.js";
 import { randomBytes, createHash } from "crypto";
 import { decryptKeystore, isKeystore } from "../../utils/keystore.util.js";
+import { NodeKeyConsistencyService, KeyConsistencyResult } from "./node-key-consistency.service.js";
 
 @Injectable()
 export class NodeService implements OnModuleInit {
@@ -19,7 +20,10 @@ export class NodeService implements OnModuleInit {
     @Inject(forwardRef(() => BlsService))
     private blsService: BlsService,
     private blockchainService: BlockchainService,
-    private configService: ConfigService
+    private configService: ConfigService,
+    // @Optional() so existing 3-arg test constructions keep working, and so a DI
+    // container without this provider wired (unlikely, but defensive) still boots.
+    @Optional() private readonly keyConsistencyService?: NodeKeyConsistencyService
   ) {}
 
   async onModuleInit() {
@@ -36,11 +40,41 @@ export class NodeService implements OnModuleInit {
       this.loadExistingNodeState();
       if (this.nodeState) {
         this.logger.log(`Loaded node state: ${this.nodeState.nodeId}`);
+        // CC-36: best-effort — a slow/unavailable RPC must never delay or block startup.
+        // This starts the self-scheduling retry/recheck loop; it does not await anything
+        // itself. The check itself never throws (fail-loud via logger.error, fail-open on
+        // the process), but the wrapper still guards against a future bug surfacing here.
+        this.runKeyConsistencyCheck();
       }
     } else {
       this.logger.log("No node state file found. Node is not created yet.");
       this.nodeState = null;
     }
+  }
+
+  /**
+   * See NodeKeyConsistencyService — starts its self-scheduling retry/recheck loop.
+   * `start()` itself is synchronous and fire-and-forget internally (never awaited on the
+   * startup path); this wrapper only guards against a future bug surfacing as an unhandled
+   * exception here instead of the check's own designed fail-loud logging.
+   */
+  private runKeyConsistencyCheck(): void {
+    if (!this.nodeState || !this.keyConsistencyService) {
+      return;
+    }
+    try {
+      this.keyConsistencyService.start(this.nodeState, this.contractAddress);
+    } catch (error: any) {
+      this.logger.error(
+        `Key-consistency self-check crashed unexpectedly (this should never happen — the check ` +
+          `is designed to fail loud, not throw): ${error?.message ?? error}`
+      );
+    }
+  }
+
+  /** Last result of the CC-36 key-consistency self-check, or null if none has run/registered. */
+  getKeyConsistency(): KeyConsistencyResult | null {
+    return this.keyConsistencyService?.getLastResult() ?? null;
   }
 
   private loadContractAddress(): void {
@@ -247,6 +281,19 @@ export class NodeService implements OnModuleInit {
     } else {
       this.nodeState = null;
       this.logger.log("Node state file not found, cleared internal state");
+    }
+    // CC-36 round 2 (High-2): the key-consistency self-check is bound to one node identity.
+    // A dashboard create/import/delete calls reloadNodeState() and MUST restart the check
+    // against the new identity — or stop and clear it entirely when the node was deleted.
+    // Without this, a deleted/replaced node keeps publishing its OLD identity's result
+    // forever, and /health would confidently report "ok" for a node that no longer exists —
+    // worse than reporting nothing. NodeKeyConsistencyService's generation token (Medium-4)
+    // ensures a stale in-flight check from the previous identity can't clobber this.
+    if (this.nodeState) {
+      this.runKeyConsistencyCheck();
+    } else if (this.keyConsistencyService) {
+      this.keyConsistencyService.stop();
+      this.keyConsistencyService.clearResult();
     }
   }
 }
