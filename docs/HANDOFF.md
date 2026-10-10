@@ -386,13 +386,15 @@ launchctl print-disabled gui/$(id -u) | grep -E 'committee-keeper|apply-rotation
 # latest DSR instruction — newest [from:dsr] comment on Seeder CC-122
 ```
 
-**Local branches kept on purpose** (the only two holding commits no remote has):
+**Local branch housekeeping (2026-10-10).** 51 local branches and two agent
+worktrees were pruned after proving every commit reachable from a remote or a
+GitHub PR ref. The only two branches holding commits no remote had were
+resolved:
 
-- `opt/validator-gas-safe` (`8848937`) — the CC-96 `_hashToG2` buffer
-  optimisation that was measured and **declined** (~0.3 %; paper §6.5). Archive
-  value only.
-- `pr-244` (`37b45ed`) — a pre-merge iteration of #244, superseded by `b97e533`.
-  Delete if not needed.
-
-Everything else local was pruned on 2026-10-10 after proving every commit
-reachable from a remote or a GitHub PR ref.
+- `opt/validator-gas-safe` (`8848937`) — **pushed to `origin` as an archive.**
+  The CC-96 `_hashToG2` buffer optimisation that was measured and **declined**
+  (~0.3 %; paper §6.5). Deliberately **no PR**: it is a record of a rejected
+  change, not a candidate for merging.
+- `pr-244` (`37b45ed207911d66d0f82bcbcb0678cb0c6e729d`) — **deleted.** A
+  pre-merge iteration of #244, superseded by the merged `b97e533`. Recoverable
+  by SHA while the object survives local GC.
