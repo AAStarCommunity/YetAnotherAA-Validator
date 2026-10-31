@@ -1,0 +1,43 @@
+# Local compile of SP d23ab088 (git archive; foundry.toml at that commit: solc 0.8.33, via_ir, optimizer_runs 500, cancun, bytecode_hash none) vs on-chain runtime at block 12030989
+# forge: forge Version: 1.7.1
+# deps symlinked from the local SP checkout (singleton-paymaster, contracts/lib); not re-pinned. Only immutableReferences are masked; their on-chain values are printed.
+# on-chain runtime read from rpc1=eth-sepolia.g.alchemy.com at block 12030989. rpc2 cross-check is at the end.
+== DVTValidator 0x568b1486BFE036e603eA11f0D03Dc47fa62c9E0e artifact=DVTValidator runtime_keccak=0x945bf1df04a0894f57b0da0d62661f123a8ccec7e1c9e748610d0663e71b863c
+local_bytes=6326 chain_bytes=6326
+immutables_on_chain= {'655': ['000000000000000000000000f5bf37ca83afdaab73691ba7eccdfa69b8708e71']}
+differing_bytes_outside_immutables=0 first=[]
+MATCH_MODULO_IMMUTABLES=True
+== BLSAggregator 0xEaeC2F512eA50708211fa95533e4dBb60e3d2E5D artifact=BLSAggregator runtime_keccak=0xa47bcf01babb782960fab93f8b5d5a9ca6e27c1aa96c0aa8648386b4a75bde4c
+local_bytes=23667 chain_bytes=23667
+immutables_on_chain= {'1173': ['000000000000000000000000f5bf37ca83afdaab73691ba7eccdfa69b8708e71']}
+differing_bytes_outside_immutables=0 first=[]
+MATCH_MODULO_IMMUTABLES=True
+== ReputationSystem 0x4Ec2D49D75D5D4206B64387A7d6a6C3c5c90fB5A artifact=ReputationSystem runtime_keccak=0x6d712dae9628ea0788b9ace4c3c1f4d981c2add68f3e9d0ac28eb189c01deaa3
+local_bytes=7044 chain_bytes=7044
+immutables_on_chain= {'5936': ['000000000000000000000000f5bf37ca83afdaab73691ba7eccdfa69b8708e71']}
+differing_bytes_outside_immutables=0 first=[]
+MATCH_MODULO_IMMUTABLES=True
+== RegistryImpl 0x9beD0F58d6001B0006923eb8c4b1Cc548D42ccEe artifact=Registry runtime_keccak=0xa43e76a74928389398d096f3a877828b84b21cd7b0294c1cfd56a888431ad5a8
+local_bytes=23038 chain_bytes=23038
+immutables_on_chain= {'5111': ['0000000000000000000000009bed0f58d6001b0006923eb8c4b1cc548d42ccee']}
+differing_bytes_outside_immutables=0 first=[]
+MATCH_MODULO_IMMUTABLES=True
+== SPImpl 0xe25f88dbeaFc64200270A948Df8e9dd2F9b22C27 artifact=SuperPaymaster runtime_keccak=0x63a66dc03dfe0a16788f2f14625d661affac311f7b11e3a7a4acffd5b4435135
+local_bytes=23569 chain_bytes=23569
+immutables_on_chain= {'12664': ['000000000000000000000000e25f88dbeafc64200270a948df8e9dd2f9b22c27'], '6893': ['0000000000000000000000000000000071727de22e5e9d8baf0edac6f37da032'], '7120': ['000000000000000000000000f5bf37ca83afdaab73691ba7eccdfa69b8708e71'], '7127': ['000000000000000000000000694aa1769357215de4fac081bf1f309adc325306']}
+differing_bytes_outside_immutables=0 first=[]
+MATCH_MODULO_IMMUTABLES=True
+== NEGATIVE CONTROL: BLSAggregator artifact from fbd74fb1 (v5.5.0-rc.4) vs the same on-chain runtime; must not match
+local_bytes=24345 chain_bytes=23667
+MATCH_MODULO_IMMUTABLES=False (length differs)
+== NEGATIVE CONTROL: DVTValidator artifact from d23ab088 with one flipped byte (offset 100)
+local_bytes=6326 chain_bytes=6326
+immutables_on_chain= {'655': ['000000000000000000000000f5bf37ca83afdaab73691ba7eccdfa69b8708e71']}
+differing_bytes_outside_immutables=1 first=[100]
+MATCH_MODULO_IMMUTABLES=False
+== rpc2 cross-check: ethereum-sepolia-rpc.publicnode.com refused eth_getCode at block 12030989 for these on this run (historical state not available), so it was read at latest block 12033330. Not the pinned block. DVTValidator was read at the pinned block on rpc2 earlier (dvtvalidator-selectors.txt).
+DVTValidator latest_rpc2_equals_pinned_rpc1=true bytes=6326
+BLSAggregator latest_rpc2_equals_pinned_rpc1=true bytes=23667
+ReputationSystem latest_rpc2_equals_pinned_rpc1=true bytes=7044
+RegistryImpl latest_rpc2_equals_pinned_rpc1=true bytes=23038
+SPImpl latest_rpc2_equals_pinned_rpc1=true bytes=23569

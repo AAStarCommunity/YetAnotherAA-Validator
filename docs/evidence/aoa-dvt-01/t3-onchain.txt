@@ -1,0 +1,4 @@
+read_utc=2026-10-27T07:50:02Z block=12003735 validator=0x7ac7E9d471742FA4397Beef0B5b11fbD22D196a9 (read-only eth_call, pinned --block)
+epochLength()(uint64) = 64
+requiredQuorum()(uint256) = 115792089237316195423570985008687907853269984665640564039457584007913129639935 [1.157e77]
+configVersion()(uint256) = 5
