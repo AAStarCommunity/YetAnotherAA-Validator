@@ -1,5 +1,9 @@
 # AOA-DVT-01 — DVT score source and credit-OFF boundary (evidence)
 
+> **Erratum 2026-10-31:** item 2 wording on who can write and the SP version
+> mapping are corrected in
+> [`aoa-dvt-01-erratum-2026-10-31.md`](aoa-dvt-01-erratum-2026-10-31.md).
+
 > Work order: AOA-DVT-01 (Seeder CC-129, from repo:dsr, 2026-10-26). Covers:
 > M2.4 / M2.5 / M4.4 as named by the work order. dvt cannot read those milestone
 > definitions; this report answers the work order's own deliverable list item by
