@@ -124,6 +124,7 @@ rpc2 could not serve the `0x4Ec2…` codehash at this block
 | `…/codehash.txt`, `impl.txt`                            | runtime codehashes, ERC-1967 implementations (Registry → `0x9beD0F58…`, matching the deploy record; SP → `0xe25f88db…`), DVTValidator `version()` control, `isValidator`, `isReputationSource`, Chainlink age |
 | `…/slots.txt`                                           | `validatorAtSlot(1..13)` on both RPCs (slots 4–13 are the zero address)                                                                                                                                       |
 | `…/dvtvalidator-selectors.txt`, `outbound_selectors.py` | DVTValidator runtime selectors, including `SHL`-encoded outbound ones, with same-shape positive controls; opcode counts; runtime identical on both RPCs                                                       |
+| `…/bytecode-match.txt`, `bytecode_match.py`             | local compile of `d23ab088` vs on-chain runtime for 5 contracts, masking only immutables; two negative controls; second-RPC cross-check                                                                       |
 | `…/repsource-logs.txt`                                  | all `ReputationSourceUpdated` events, block 0 → pin (Alchemy)                                                                                                                                                 |
 | `…/repsource-0x4ec2.txt`                                | `0x4Ec2…` `REGISTRY()`, `version()`, `owner()`, codehash, `syncToRegistry` selector check, both RPCs                                                                                                          |
 
@@ -133,18 +134,22 @@ line of `calls.txt`. Source:
 
 ## 6. Limitations
 
-- The deployed runtime bytecode was **not** rebuilt and compared with
-  `d23ab088`. Source↔deployment correspondence rests on `version()` strings, the
-  SP deploy record, and the Registry implementation address matching it. Exact
-  codehash binding belongs to SP's M1.6 package.
-- SP-5.4.2's implementation source commit was not pinned beyond "a commit
-  carrying `SuperPaymaster-5.4.2`". `d23ab088` is used because it is the
-  deploy-record source for the B3 generation. The original delivery cited
-  `7cba99a9`, a later descendant of `d23ab088`: for `BLSAggregator.sol`,
-  `SuperPaymaster.sol`, `ReputationSystem.sol` and `DVTValidator.sol` the two
-  are byte-identical, and `Registry.sol` differs only in comments (+36/−3 from
-  `d23ab088` to `7cba99a9` lines), so Registry line numbers differ between them;
-  this file uses `d23ab088`.
+- Deployed source binding: `d23ab088`, compiled locally with that commit's
+  `foundry.toml`, matches the runtime of BLSAggregator, DVTValidator,
+  ReputationSystem, and the Registry and SP **implementations** byte for byte at
+  the pin block, outside immutable slots, whose on-chain values are printed
+  (`bytecode-match.txt`). Negative controls fail as they should (the `fbd74fb1`
+  aggregator; one flipped byte). This binds only the deployed `D` lines. It says
+  nothing about the target pin `T`, whose codehash binding belongs to SP's M1.6
+  package. Dependencies came from the local SP checkout and were not re-pinned;
+  the match is the evidence that they were the right ones. The pinned-block
+  runtime is from Alchemy; publicnode refused those reads on this run, so its
+  cross-check is at a later block, except DVTValidator.
+- The original delivery cited `7cba99a9`, a later descendant of `d23ab088`: for
+  `BLSAggregator.sol`, `SuperPaymaster.sol`, `ReputationSystem.sol` and
+  `DVTValidator.sol` the two are byte-identical, and `Registry.sol` differs only
+  in comments (+36/−3 lines from `d23ab088` to `7cba99a9`), so Registry line
+  numbers differ between them; this file uses `d23ab088`.
 - The publicnode log query over the full history did not finish within this
   session. Reputation-source **state** was read on both RPCs; event history is
   from Alchemy only.
@@ -152,12 +157,9 @@ line of `calls.txt`. Source:
   stores even selectors as a shifted constant plus `SHL` (`hasRole` 0x91d14854 =
   `0x24745215 << 226`). The earlier `version()` control was inbound and could
   not show this. The script decodes `PUSH4`, `PUSHn`+`PUSHm`+`SHL` and
-  left-aligned `PUSH32`; the scan is linear, not control-flow analysis, and the
-  source was not rebuilt. The decoded selectors are consistent with `d23ab088`
-  but do not prove a byte match.
-- `0x4Ec2…` was not bytecode-matched to `RS` source; the claim that
-  `syncToRegistry` has no caller check is source-level (`version()` + selector
-  presence only).
+  left-aligned `PUSH32`; the scan is linear, not control-flow analysis. The
+  source match above is what makes "the source never calls `executeProposal`" a
+  statement about the deployed contract.
 - `ROLE_DVT` grant/revoke authority in Registry, and GToken stake custody, were
   not expanded. They gate which slots can sign but do not change the rows above.
 - Who custodies the guardian secrets: operator declaration (§2.1), not proven.
