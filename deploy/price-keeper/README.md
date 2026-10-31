@@ -7,7 +7,7 @@ SuperPaymaster proxy and on PaymasterV4 `0x2118…a4B6`, which are the two contr
 |---|---|
 | Keeper code | `aastar-sdk` detached worktree at `~/Dev/aastar/aastar-sdk-price-keeper` |
 | Signer | Dedicated EOA `0xc2dF42897a186e268ee4f1F4aB041DD6557AeB1e`; the key was generated on the Mini and stays there |
-| Config | `~/.config/aastar-price-keeper/` (`rpc.env` and `key.env`, mode 600) |
+| Config | `~/.config/aastar-price-keeper/` (`rpc.env`, `key.env` and `telegram.env`, mode 600) |
 | Service | LaunchAgent `io.aastar.price-keeper`, with `RunAtLoad` and `KeepAlive` |
 | Log | `~/Library/Logs/aastar-price-keeper.log` on the Mini |
 
@@ -26,8 +26,8 @@ while every RPC call returned 403.
 
 ## Limits
 
-- Telegram alerts are off because the old bot token returns `Unauthorized`. Nothing pushes an alert; someone has to
-  run `status` or add a monitor.
+- Telegram alerts go through `@AAstarMonitorBot`, configured in `telegram.env` (mode 600). They come from the keeper
+  process, so a dead keeper or a dead Mini sends nothing; `status` is still the check for that.
 - `status` warns below 0.01 ETH.
 - `run-keeper.sh` in `aastar-sdk` bakes in SuperPaymaster 5.3.3, so `run.sh` passes the addresses explicitly.
 - Do not re-enable `io.aastar.price-keeper` on the laptop: two keepers would spend gas on the same updates.

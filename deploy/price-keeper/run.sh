@@ -15,6 +15,7 @@ fi
 set -a
 . "$CONFIG_DIR/rpc.env"
 . "$CONFIG_DIR/key.env"
+[ -f "$CONFIG_DIR/telegram.env" ] && . "$CONFIG_DIR/telegram.env"
 set +a
 
 cd "$SDK_DIR"
