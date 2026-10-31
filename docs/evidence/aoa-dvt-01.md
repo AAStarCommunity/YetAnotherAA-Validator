@@ -2,7 +2,10 @@
 
 > **Erratum 2026-10-31:** item 2 wording on who can write and the SP version
 > mapping are corrected in
-> [`aoa-dvt-01-erratum-2026-10-31.md`](aoa-dvt-01-erratum-2026-10-31.md).
+> [`aoa-dvt-01-erratum-2026-10-31.md`](aoa-dvt-01-erratum-2026-10-31.md). The
+> "deployed source" `7cba99a9` cited below and the erratum's `d23ab088` carry
+> the same contract versions; `7cba99a9` descends from `d23ab088` and, for the
+> contracts cited, differs only in `Registry.sol` comments (erratum §6).
 
 > Work order: AOA-DVT-01 (Seeder CC-129, from repo:dsr, 2026-10-26). Covers:
 > M2.4 / M2.5 / M4.4 as named by the work order. dvt cannot read those milestone
