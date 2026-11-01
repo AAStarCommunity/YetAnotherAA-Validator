@@ -2,6 +2,10 @@ import { createRequire } from "module";
 import { Controller, Get, Optional } from "@nestjs/common";
 import { ApiOperation, ApiTags } from "@nestjs/swagger";
 import { CapabilityRegistry } from "../capability/capability-registry.service.js";
+import {
+  NodeKeyConsistencyService,
+  KeyConsistencyResult,
+} from "../node/node-key-consistency.service.js";
 
 const require = createRequire(import.meta.url);
 const { version: APP_VERSION } = require("../../../package.json") as { version: string };
@@ -16,7 +20,12 @@ const { version: APP_VERSION } = require("../../../package.json") as { version: 
 @ApiTags("health")
 @Controller()
 export class HealthController {
-  constructor(@Optional() private readonly capabilities?: CapabilityRegistry) {}
+  constructor(
+    @Optional() private readonly capabilities?: CapabilityRegistry,
+    // CC-36: optional so /health keeps working even if NodeModule ever isn't wired in
+    // some deployment variant. Additive-only field — see `health()` below.
+    @Optional() private readonly keyConsistency?: NodeKeyConsistencyService
+  ) {}
 
   @Get()
   @ApiOperation({
@@ -54,8 +63,19 @@ export class HealthController {
     status: string;
     version: string;
     capabilities: Array<{ name: string; enabled: boolean }>;
+    keyConsistency?: KeyConsistencyResult;
   } {
-    return { status: "ok", version: APP_VERSION, capabilities: this.capList() };
+    // Additive-only (CC-36): status/version/capabilities are unchanged and MUST stay
+    // that way — external probes depend on them. `keyConsistency` is omitted entirely
+    // (not even `null`) until a self-check has actually run, so existing consumers
+    // that don't know the field see no shape change.
+    const result = this.keyConsistency?.getLastResult() ?? undefined;
+    return {
+      status: "ok",
+      version: APP_VERSION,
+      capabilities: this.capList(),
+      ...(result ? { keyConsistency: result } : {}),
+    };
   }
 
   private capList(): Array<{ name: string; enabled: boolean }> {

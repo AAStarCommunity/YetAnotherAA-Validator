@@ -255,3 +255,119 @@ describe("BlsService — owner-authorization gate (Fix 2 Stage 1)", () => {
     expect(isValidOwnerAuth).toHaveBeenCalledWith(victimAccount, derivedHash, ownerAuth);
   });
 });
+
+/**
+ * CC-36 round-6 L1: `signDerivedHash()` (the hybrid local/remote signing selection) was
+ * refactored across rounds 4-5 (extracting `getRustSignerConfig()`, adding
+ * `resolveSigningPublicKey()`). Codex manually diffed the refactor against the original and
+ * confirmed behavior preservation, but the test SUITE never actually exercised the remote
+ * signing path at all — the node-key-consistency self-check's own remote-signer tests only
+ * prove the CHECKER doesn't call fetch; they say nothing about whether real remote SIGNING
+ * still works. These four tests lock signDerivedHash()'s own behavior directly (deliberately
+ * narrow scope, per the round-6 review — not expanding beyond these four).
+ */
+describe("BlsService — signDerivedHash hybrid local/remote signing (CC-36 round-6 L1)", () => {
+  const node: NodeKeyPair = {
+    nodeId: "node_test",
+    nodeName: "test",
+    privateKey: "0x" + "00".repeat(31) + "01",
+    publicKey: "0x",
+    description: "test node",
+  };
+  const derivedHash = "0x8bb1b199f427dfc49e5fe40f2f3278cb1a48587824b78263051c8c4d81d77a81";
+
+  function makeConfig(overrides: Record<string, unknown>) {
+    return { get: (k: string) => overrides[k] } as any;
+  }
+
+  function makeService(configOverrides: Record<string, unknown>) {
+    const blockchain = {} as unknown as InstanceType<typeof BlockchainService>;
+    const signer = {
+      forNode: (n: { privateKey: string }) => new LocalKeySigner(n.privateKey),
+    } as unknown as SignerService;
+    return new BlsService(blockchain, signer, makeConfig(configOverrides));
+  }
+
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  it("1. remote signing succeeds and the response is mapped to SignatureResult correctly", async () => {
+    global.fetch = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        signature: "0xaaaa",
+        signature_compact: "bbbb",
+        public_key: "cccc",
+      }),
+    })) as any;
+    const service = makeService({ rustSignerUrl: "http://fake-signer.local" });
+
+    const result = await service.signDerivedHash(derivedHash, node);
+
+    expect(result).toEqual({
+      nodeId: node.nodeId,
+      signature: "0xaaaa",
+      signatureCompact: "bbbb",
+      publicKey: "cccc",
+      message: derivedHash,
+    });
+  });
+
+  it("2. rustSignerToken is sent as the X-Signer-Token request header", async () => {
+    let capturedHeaders: Record<string, string> | undefined;
+    global.fetch = jest.fn(async (_url: unknown, init: any) => {
+      capturedHeaders = init.headers;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ signature: "0x", signature_compact: "0x", public_key: "0x" }),
+      };
+    }) as any;
+    const service = makeService({
+      rustSignerUrl: "http://fake-signer.local",
+      rustSignerToken: "s3cr3t-token",
+    });
+
+    await service.signDerivedHash(derivedHash, node);
+
+    expect(capturedHeaders?.["X-Signer-Token"]).toBe("s3cr3t-token");
+  });
+
+  it("3. RUST_SIGNER_REQUIRED=true and the remote signer fails => rethrows, does NOT fall back to local", async () => {
+    global.fetch = jest.fn(async () => ({
+      ok: false,
+      status: 500,
+      json: async () => ({}),
+    })) as any;
+    const service = makeService({
+      rustSignerUrl: "http://fake-signer.local",
+      rustSignerRequired: true,
+    });
+
+    await expect(service.signDerivedHash(derivedHash, node)).rejects.toThrow(
+      /Rust signer HTTP 500/
+    );
+  });
+
+  it("4. remote signer is OPTIONAL and fails => falls back to local (@noble/curves) signing", async () => {
+    global.fetch = jest.fn(async () => ({
+      ok: false,
+      status: 500,
+      json: async () => ({}),
+    })) as any;
+    // rustSignerRequired is NOT set -> optional.
+    const service = makeService({ rustSignerUrl: "http://fake-signer.local" });
+
+    const result = await service.signDerivedHash(derivedHash, node);
+
+    // The mocked bls.util at the top of this file makes the local signing path
+    // deterministic: fakeG1Point.toHex() = "cd".repeat(48), fakeG2Point.toHex() = "ab".repeat(96).
+    expect(result.nodeId).toBe(node.nodeId);
+    expect(result.publicKey).toBe("cd".repeat(48));
+    expect(result.signatureCompact).toBe("ab".repeat(96));
+    expect(result.message).toBe(derivedHash);
+  });
+});
