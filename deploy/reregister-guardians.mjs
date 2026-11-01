@@ -55,6 +55,13 @@
 // each registration from the on-chain owner(), and writes the public PoP data for that owner to send.
 // It never creates a wallet, ignores any signing key in the env file, and refuses --broadcast.
 //
+// --export-fraud-drill <file> IS FOR A FORK REHEARSAL ONLY. It writes one valid over-issue fraud proof,
+// the state a fork must be given for it to pass, and four cases that must be rejected. It reads no node
+// file and produces NO BLS SIGNATURE: a guardian signature over a slash message has the same domain on
+// the fork and on the real chain, so the aggregator owner could use it for a real slash. The fork writes
+// proposalSignersCommitment directly instead. On the real chain that commitment is zero and the token
+// has no code, so the proof is rejected. This covers the verifier path, not verifyAndExecute's write.
+//
 // PARTIAL FAILURE IS SAFE TO RETRY. All gates run before the first transaction, so a pre-flight
 // failure sends nothing. If a LATER broadcast reverts, earlier registrations stay — just re-run.
 // SP makes re-registration idempotent for an unchanged (validator, slot, key): re-registering the
@@ -69,11 +76,14 @@
 //   node deploy/reregister-guardians.mjs --aggregator 0x... --env ../SuperPaymaster/.env.sepolia
 //   node deploy/reregister-guardians.mjs --aggregator 0x... --env <path> --broadcast
 //   node deploy/reregister-guardians.mjs --aggregator 0x... --env <path> --export-pop <file>
+//   node deploy/reregister-guardians.mjs --aggregator 0x... --env <path> --export-fraud-drill <file> --verifier 0x...
 //   optional: --nodes node_dev_001.json,node_dev_002.json,node_dev_003.json
 //             --expect-version "BLSAggregator-4.11.0"   (only after re-verifying the new release)
 //             --chain-id <n>                             (default 11155111; override for a fork)
 import { ethers } from "ethers";
 import { readFileSync, writeFileSync } from "fs";
+import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
 
 const POP_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
@@ -87,6 +97,9 @@ const flag = name => {
 };
 const BROADCAST = argv.includes("--broadcast");
 const EXPORT_FILE = flag("--export-pop");
+const DRILL_FILE = flag("--export-fraud-drill");
+const VERIFIER = flag("--verifier");
+const READ_ONLY = Boolean(EXPORT_FILE || DRILL_FILE);
 const AGGREGATOR = flag("--aggregator") || process.env.BLS_AGGREGATOR_ADDRESS;
 const ENV_FILE = flag("--env") || process.env.DVT_ENV_FILE || ".env.sepolia";
 const NODE_FILES = (flag("--nodes") || DEFAULT_NODES.join(","))
@@ -121,6 +134,12 @@ if (argv.includes("--export-pop") && (!EXPORT_FILE || EXPORT_FILE.startsWith("--
   die("--export-pop needs an output file path");
 }
 if (EXPORT_FILE && BROADCAST) die("--export-pop never sends transactions; remove --broadcast");
+if (argv.includes("--export-fraud-drill") && (!DRILL_FILE || DRILL_FILE.startsWith("--"))) {
+  die("--export-fraud-drill needs an output file path");
+}
+if (DRILL_FILE && BROADCAST) die("--export-fraud-drill never sends transactions; remove --broadcast");
+if (DRILL_FILE && EXPORT_FILE) die("use --export-pop or --export-fraud-drill, not both");
+if (DRILL_FILE && !ethers.isAddress(VERIFIER ?? "")) die("--export-fraud-drill needs --verifier <address>");
 if (!AGGREGATOR) die("missing --aggregator <address> (the NEW BLSAggregator, from SP's B3 handoff)");
 if (!ethers.isAddress(AGGREGATOR)) die(`--aggregator is not an address: ${AGGREGATOR}`);
 
@@ -150,11 +169,11 @@ try {
 // caught it. `--env <path>` is an explicit instruction; ambient variables are the fallback, never the
 // override — this script signs transactions, so the quiet direction must be the safe one.
 const RPC = env.SEPOLIA_RPC_URL || env.ETH_RPC_URL || env.RPC_URL || process.env.SEPOLIA_RPC_URL;
-const KEY = EXPORT_FILE
+const KEY = READ_ONLY
   ? undefined
   : env.OWNER_PRIVATE_KEY || env.DEPLOYER_PRIVATE_KEY || env.PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY;
 if (!RPC) die(`no RPC url in ${ENV_FILE} (SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL)`);
-if (!EXPORT_FILE && !KEY) die(`no signing key in ${ENV_FILE} (OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY)`);
+if (!READ_ONLY && !KEY) die(`no signing key in ${ENV_FILE} (OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY)`);
 if (process.env.SEPOLIA_RPC_URL && process.env.SEPOLIA_RPC_URL !== RPC) {
   console.warn(`! ignoring ambient SEPOLIA_RPC_URL; ${ENV_FILE} wins (see the note above this check)`);
 }
@@ -166,10 +185,12 @@ const ABI = [
   "function TAG_POP() view returns (bytes32)",
   "function DOMAIN_NAME() view returns (bytes32)",
   "function REGISTRY() view returns (address)",
+  "function fraudProofVerifier() view returns (address)",
   "function MAX_VALIDATORS() view returns (uint256)",
   "function validatorAtSlot(uint8) view returns (address)",
   "function blsKeyOwner(bytes32) view returns (address)",
   "function getBLSPublicKey(address) view returns ((bytes32,bytes32,bytes32,bytes32))",
+  "function fraudProofDigest(uint256 fraudProofId, address[] guiltyGuardians) view returns (bytes32)",
   "function popDigest(address validator, (bytes32,bytes32,bytes32,bytes32) publicKey) view returns (bytes32)",
   "function registerBLSPublicKey(address validator, (bytes32,bytes32,bytes32,bytes32) publicKey, uint8 slot, (bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32) popSignature)",
 ];
@@ -207,9 +228,160 @@ function encodeG1(point) {
   return ethers.hexlify(out);
 }
 
+const DRILL_ABI = [
+  "function AGGREGATOR() view returns (address)",
+  "function REGISTRY() view returns (address)",
+  "function domainSeparator() view returns (bytes32)",
+  "function deriveFraudProofId(uint256) pure returns (uint256)",
+  "function slashMessageHash(uint256,address,uint8,uint256,address) view returns (bytes32)",
+];
+// Ascending by uint160, as the verifier requires. Slots 2, 1 and 3 in that order.
+const DRILL_GUARDIANS = [
+  "0x40F0b12128f256B62Fa22b36D37012Ee004bbd1f",
+  "0x5D870E132CC010E882E90f4aFaACDC4F19C7Eca3",
+  "0xD904A706E355D6b48bAeDBec472CE94BC6981601",
+];
+const DRILL_SLASH_LEVEL = 1;
+const DRILL_EPOCH = 1n;
+const DRILL_MASK = 0x7n;
+
+/// Everything is derived from the aggregator address, so a re-run gives the same file and the ID
+/// cannot coincide with a real proposal by accident.
+async function exportFraudDrill({ provider, agg, owner, version, chainId, domainSep, coder }) {
+  const label = s => ethers.keccak256(ethers.toUtf8Bytes(`DVT_FRAUD_DRILL_V1:${s}:${AGGREGATOR.toLowerCase()}`));
+  const proposalId = BigInt(label("proposal"));
+  const operator = ethers.getAddress(ethers.dataSlice(label("operator"), 12));
+  const token = ethers.getAddress(ethers.dataSlice(label("token"), 12));
+
+  const verifier = new ethers.Contract(VERIFIER, DRILL_ABI, provider);
+  if ((await provider.getCode(VERIFIER)) === "0x") die(`no code at verifier ${VERIFIER}`);
+  let boundAggregator, boundRegistry, verifierDomain, registry, activeVerifier;
+  try {
+    [boundAggregator, boundRegistry, verifierDomain, registry, activeVerifier] = await Promise.all([
+      verifier.AGGREGATOR(),
+      verifier.REGISTRY(),
+      verifier.domainSeparator(),
+      agg.REGISTRY(),
+      agg.fraudProofVerifier(),
+    ]);
+  } catch (e) {
+    die(`${VERIFIER} does not answer as an OverIssueFraudProofVerifier: ${e.shortMessage ?? e.message}`);
+  }
+  // queueGuardianSlash calls the aggregator's active verifier, so a drill built for any other one
+  // would fail on the fork for a reason that says nothing about the proof.
+  if (activeVerifier.toLowerCase() !== VERIFIER.toLowerCase()) {
+    die(`aggregator.fraudProofVerifier() is ${activeVerifier}, expected ${VERIFIER}`);
+  }
+  if (boundAggregator.toLowerCase() !== AGGREGATOR.toLowerCase()) {
+    die(`verifier.AGGREGATOR() is ${boundAggregator}, expected ${AGGREGATOR}`);
+  }
+  if (boundRegistry.toLowerCase() !== registry.toLowerCase()) {
+    die(`verifier.REGISTRY() is ${boundRegistry}, aggregator.REGISTRY() is ${registry}`);
+  }
+  if (verifierDomain.toLowerCase() !== domainSep.toLowerCase()) die("verifier and aggregator domain separators differ");
+  if ((await provider.getCode(token)) !== "0x") die(`drill token address ${token} already has code on this chain`);
+
+  const artifactPath = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "../contracts/out/MockOverIssuableToken.sol/MockOverIssuableToken.json"
+  );
+  let tokenRuntime;
+  try {
+    tokenRuntime = JSON.parse(readFileSync(artifactPath, "utf8")).deployedBytecode.object;
+  } catch (e) {
+    die(`cannot read ${artifactPath}: ${e.message}\n  Run forge build in contracts/ first.`);
+  }
+
+  const fraudProofId = await verifier.deriveFraudProofId(proposalId);
+  const messageHash = await verifier.slashMessageHash(proposalId, operator, DRILL_SLASH_LEVEL, DRILL_EPOCH, token);
+  const commitment = ethers.keccak256(
+    coder.encode(
+      ["bytes32", "bytes32", "uint256", "bytes32", "uint256", "address[]"],
+      [domainSep, ethers.id("SuperPaymaster.BLS.SignersCommitment.v1"), proposalId, messageHash, DRILL_MASK, DRILL_GUARDIANS]
+    )
+  );
+  const encodeProof = mask =>
+    coder.encode(
+      ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]"],
+      [proposalId, operator, DRILL_SLASH_LEVEL, DRILL_EPOCH, token, mask, DRILL_GUARDIANS]
+    );
+  const proof = encodeProof(DRILL_MASK);
+  const digest = await agg.fraudProofDigest(fraudProofId, DRILL_GUARDIANS);
+  const flipped = ethers.getBytes(digest);
+  flipped[31] ^= 1;
+
+  const drill = {
+    purpose: "fork rehearsal only; contains no signature",
+    chainId,
+    aggregator: AGGREGATOR,
+    version,
+    owner,
+    verifier: VERIFIER,
+    registry,
+    domainSeparator: domainSep,
+    block: await provider.getBlockNumber(),
+    forkState: {
+      token: { address: token, runtimeBytecode: tokenRuntime, overIssuedStorageSlot: 0 },
+      commitment: {
+        mapping: "proposalSignersCommitment",
+        key: proposalId.toString(),
+        value: commitment,
+        check: "proposalSignersCommitment(key) must read back as value, otherwise stop",
+      },
+    },
+    valid: {
+      call: "queueGuardianSlash(fraudProofId, guiltyGuardians, fraudProof)",
+      expect: "succeeds and emits GuardianSlashQueued",
+      proposalId: proposalId.toString(),
+      fraudProofId: fraudProofId.toString(),
+      guiltyGuardians: DRILL_GUARDIANS,
+      fraudProof: proof,
+      domainDigest: digest,
+      signerMask: ethers.toBeHex(DRILL_MASK),
+      operator,
+      slashLevel: DRILL_SLASH_LEVEL,
+      epoch: DRILL_EPOCH.toString(),
+    },
+    mustReject: [
+      {
+        id: "N1",
+        change: "one guardian removed",
+        guiltyGuardians: DRILL_GUARDIANS.slice(0, -1),
+        fraudProof: proof,
+        expect: "queueGuardianSlash reverts InvalidFraudProof",
+      },
+      {
+        id: "N2",
+        change: "set token storage slot 0 to 1 (over-issued), same proof",
+        guiltyGuardians: DRILL_GUARDIANS,
+        fraudProof: proof,
+        expect: "queueGuardianSlash reverts InvalidFraudProof",
+      },
+      {
+        id: "N3",
+        change: "signerMask in the proof differs by one bit",
+        guiltyGuardians: DRILL_GUARDIANS,
+        fraudProof: encodeProof(DRILL_MASK ^ 1n),
+        expect: "queueGuardianSlash reverts InvalidFraudProof",
+      },
+      {
+        id: "N4",
+        change: "digest differs by one bit; call the verifier directly because the aggregator computes its own digest",
+        call: "verifier.verify(domainDigest, fraudProofId, guiltyGuardians, fraudProof)",
+        domainDigest: ethers.hexlify(flipped),
+        guiltyGuardians: DRILL_GUARDIANS,
+        fraudProof: proof,
+        expect: "returns false",
+      },
+    ],
+  };
+  writeFileSync(DRILL_FILE, JSON.stringify(drill, null, 2) + "\n");
+  console.log(`Wrote ${DRILL_FILE}. Nothing was sent and nothing was signed.`);
+}
+
 async function main() {
   const provider = new ethers.JsonRpcProvider(RPC);
-  const wallet = EXPORT_FILE ? null : new ethers.Wallet(KEY, provider);
+  const wallet = READ_ONLY ? null : new ethers.Wallet(KEY, provider);
   const agg = new ethers.Contract(AGGREGATOR, ABI, wallet ?? provider);
 
   // Print the network before anything else. The address alone is NOT enough to tell you which chain
@@ -223,7 +395,13 @@ async function main() {
   console.log(`aggregator : ${AGGREGATOR}`);
   console.log(`signer     : ${wallet ? wallet.address : "none (export only)"}`);
   console.log(`env file   : ${ENV_FILE}`);
-  const mode = EXPORT_FILE ? `export PoP data to ${EXPORT_FILE}` : BROADCAST ? "BROADCAST" : "dry-run (pass --broadcast to send)";
+  const mode = DRILL_FILE
+    ? `export fraud drill to ${DRILL_FILE}`
+    : EXPORT_FILE
+      ? `export PoP data to ${EXPORT_FILE}`
+      : BROADCAST
+        ? "BROADCAST"
+        : "dry-run (pass --broadcast to send)";
   console.log(`mode       : ${mode}\n`);
   if (EXPECT_CHAIN_ID && chainId !== EXPECT_CHAIN_ID) {
     die(`wrong network: connected to chainId ${chainId}, expected ${EXPECT_CHAIN_ID}`);
@@ -296,6 +474,10 @@ async function main() {
   console.log(`MAX_VALIDATORS: ${maxValidators}\n`);
 
   const coder = ethers.AbiCoder.defaultAbiCoder();
+  if (DRILL_FILE) {
+    await exportFraudDrill({ provider, agg, owner, version, chainId, domainSep, coder });
+    return;
+  }
   const plans = [];
 
   for (const file of NODE_FILES) {
