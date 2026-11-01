@@ -51,6 +51,10 @@
 //
 // Dry-run is the DEFAULT. Nothing is broadcast without --broadcast.
 //
+// --export-pop <file> IS FOR WHEN DVT DOES NOT HOLD THE OWNER KEY. It runs the same gates, simulates
+// each registration from the on-chain owner(), and writes the public PoP data for that owner to send.
+// It never creates a wallet, ignores any signing key in the env file, and refuses --broadcast.
+//
 // PARTIAL FAILURE IS SAFE TO RETRY. All gates run before the first transaction, so a pre-flight
 // failure sends nothing. If a LATER broadcast reverts, earlier registrations stay — just re-run.
 // SP makes re-registration idempotent for an unchanged (validator, slot, key): re-registering the
@@ -64,11 +68,12 @@
 // Usage:
 //   node deploy/reregister-guardians.mjs --aggregator 0x... --env ../SuperPaymaster/.env.sepolia
 //   node deploy/reregister-guardians.mjs --aggregator 0x... --env <path> --broadcast
+//   node deploy/reregister-guardians.mjs --aggregator 0x... --env <path> --export-pop <file>
 //   optional: --nodes node_dev_001.json,node_dev_002.json,node_dev_003.json
 //             --expect-version "BLSAggregator-4.11.0"   (only after re-verifying the new release)
 //             --chain-id <n>                             (default 11155111; override for a fork)
 import { ethers } from "ethers";
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
 
 const POP_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
@@ -81,9 +86,13 @@ const flag = name => {
   return i === -1 ? undefined : argv[i + 1];
 };
 const BROADCAST = argv.includes("--broadcast");
+const EXPORT_FILE = flag("--export-pop");
 const AGGREGATOR = flag("--aggregator") || process.env.BLS_AGGREGATOR_ADDRESS;
 const ENV_FILE = flag("--env") || process.env.DVT_ENV_FILE || ".env.sepolia";
-const NODE_FILES = (flag("--nodes") || DEFAULT_NODES.join(",")).split(",").map(s => s.trim()).filter(Boolean);
+const NODE_FILES = (flag("--nodes") || DEFAULT_NODES.join(","))
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 const EXPECT_VERSION = flag("--expect-version") || DEFAULT_VERSION;
 // Defaults to Sepolia, overridable, same shape as --expect-version. NOT opt-in: a fork of Sepolia
 // shares its bytecode, version() and owner(), and can even host a contract at the same CREATE
@@ -108,6 +117,10 @@ function describe(e) {
   return String(e);
 }
 
+if (argv.includes("--export-pop") && (!EXPORT_FILE || EXPORT_FILE.startsWith("--"))) {
+  die("--export-pop needs an output file path");
+}
+if (EXPORT_FILE && BROADCAST) die("--export-pop never sends transactions; remove --broadcast");
 if (!AGGREGATOR) die("missing --aggregator <address> (the NEW BLSAggregator, from SP's B3 handoff)");
 if (!ethers.isAddress(AGGREGATOR)) die(`--aggregator is not an address: ${AGGREGATOR}`);
 
@@ -124,7 +137,9 @@ try {
       })
   );
 } catch (e) {
-  die(`cannot read env file ${ENV_FILE}: ${e.message}\n  Sepolia credentials live in SuperPaymaster/.env.sepolia — pass --env <path>.`);
+  die(
+    `cannot read env file ${ENV_FILE}: ${e.message}\n  Sepolia credentials live in SuperPaymaster/.env.sepolia — pass --env <path>.`
+  );
 }
 
 // THE ENV FILE WINS over ambient process.env. This is deliberate and was learned the hard way: an
@@ -135,9 +150,11 @@ try {
 // caught it. `--env <path>` is an explicit instruction; ambient variables are the fallback, never the
 // override — this script signs transactions, so the quiet direction must be the safe one.
 const RPC = env.SEPOLIA_RPC_URL || env.ETH_RPC_URL || env.RPC_URL || process.env.SEPOLIA_RPC_URL;
-const KEY = env.OWNER_PRIVATE_KEY || env.DEPLOYER_PRIVATE_KEY || env.PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY;
+const KEY = EXPORT_FILE
+  ? undefined
+  : env.OWNER_PRIVATE_KEY || env.DEPLOYER_PRIVATE_KEY || env.PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY;
 if (!RPC) die(`no RPC url in ${ENV_FILE} (SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL)`);
-if (!KEY) die(`no signing key in ${ENV_FILE} (OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY)`);
+if (!EXPORT_FILE && !KEY) die(`no signing key in ${ENV_FILE} (OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY)`);
 if (process.env.SEPOLIA_RPC_URL && process.env.SEPOLIA_RPC_URL !== RPC) {
   console.warn(`! ignoring ambient SEPOLIA_RPC_URL; ${ENV_FILE} wins (see the note above this check)`);
 }
@@ -192,8 +209,8 @@ function encodeG1(point) {
 
 async function main() {
   const provider = new ethers.JsonRpcProvider(RPC);
-  const wallet = new ethers.Wallet(KEY, provider);
-  const agg = new ethers.Contract(AGGREGATOR, ABI, wallet);
+  const wallet = EXPORT_FILE ? null : new ethers.Wallet(KEY, provider);
+  const agg = new ethers.Contract(AGGREGATOR, ABI, wallet ?? provider);
 
   // Print the network before anything else. The address alone is NOT enough to tell you which chain
   // you are on: a CREATE from the same account at the same nonce lands on the same address on every
@@ -204,9 +221,10 @@ async function main() {
   console.log(`chainId    : ${chainId}${EXPECT_CHAIN_ID ? ` (expected ${EXPECT_CHAIN_ID})` : ""}`);
   console.log(`block      : ${await provider.getBlockNumber()}`);
   console.log(`aggregator : ${AGGREGATOR}`);
-  console.log(`signer     : ${wallet.address}`);
+  console.log(`signer     : ${wallet ? wallet.address : "none (export only)"}`);
   console.log(`env file   : ${ENV_FILE}`);
-  console.log(`mode       : ${BROADCAST ? "BROADCAST" : "dry-run (pass --broadcast to send)"}\n`);
+  const mode = EXPORT_FILE ? `export PoP data to ${EXPORT_FILE}` : BROADCAST ? "BROADCAST" : "dry-run (pass --broadcast to send)";
+  console.log(`mode       : ${mode}\n`);
   if (EXPECT_CHAIN_ID && chainId !== EXPECT_CHAIN_ID) {
     die(`wrong network: connected to chainId ${chainId}, expected ${EXPECT_CHAIN_ID}`);
   }
@@ -227,7 +245,7 @@ async function main() {
   // ---- gate 2: owner path is the only usable path (see AUTHORIZATION) ---------------------------
   const owner = await agg.owner();
   console.log(`owner()    : ${owner}`);
-  if (owner.toLowerCase() !== wallet.address.toLowerCase()) {
+  if (wallet && owner.toLowerCase() !== wallet.address.toLowerCase()) {
     die(
       `signer is not the aggregator owner.\n` +
         `  owner()  = ${owner}\n` +
@@ -359,7 +377,9 @@ async function main() {
 
     // ---- gate 7: dry-run the real call ---------------------------------------------------------
     try {
-      await agg.registerBLSPublicKey.staticCall(validator, pkWords, slot, popWords);
+      await agg.registerBLSPublicKey.staticCall(validator, pkWords, slot, popWords, {
+        from: owner,
+      });
     } catch (e) {
       die(`${label}: eth_call dry-run of registerBLSPublicKey reverted: ${e.shortMessage ?? e.message}`);
     }
@@ -368,7 +388,7 @@ async function main() {
     console.log(`    validator ${validator}  slot ${slot}`);
     console.log(`    popDigest ${onchainDigest}`);
     console.log(`    slot now  ${slotHolder === ethers.ZeroAddress ? "free" : slotHolder}`);
-    plans.push({ label, validator, slot, pkWords, popWords });
+    plans.push({ label, validator, slot, pkWords, popWords, popDigest: onchainDigest });
   }
 
   // ---- gate 10: the plans must not collide with EACH OTHER ---------------------------------------
@@ -397,6 +417,28 @@ async function main() {
     }
   }
 
+  if (EXPORT_FILE) {
+    // Listed field by field so a private key from a node file cannot reach this output.
+    const exported = {
+      chainId,
+      aggregator: AGGREGATOR,
+      version,
+      owner,
+      domainSeparator: domainSep,
+      block: await provider.getBlockNumber(),
+      registrations: plans.map(p => ({
+        validator: p.validator,
+        slot: p.slot,
+        publicKey: p.pkWords,
+        popDigest: p.popDigest,
+        popSignature: p.popWords,
+      })),
+    };
+    writeFileSync(EXPORT_FILE, JSON.stringify(exported, null, 2) + "\n");
+    console.log(`\nAll ${plans.length} registrations passed. Wrote ${EXPORT_FILE}. Nothing was sent.`);
+    return;
+  }
+
   if (!BROADCAST) {
     console.log(`\nAll ${plans.length} registrations passed every pre-flight gate. Nothing was sent.`);
     console.log("Re-run with --broadcast to submit.");
@@ -412,7 +454,9 @@ async function main() {
   let nonce = await provider.getTransactionCount(wallet.address, "pending");
   const receipts = [];
   for (const p of plans) {
-    const tx = await agg.registerBLSPublicKey(p.validator, p.pkWords, p.slot, p.popWords, { nonce: nonce++ });
+    const tx = await agg.registerBLSPublicKey(p.validator, p.pkWords, p.slot, p.popWords, {
+      nonce: nonce++,
+    });
     const rc = await tx.wait();
     if (rc.status !== 1) die(`${p.label}: tx ${tx.hash} reverted on-chain`);
     console.log(`✓ ${p.label}  slot ${p.slot}  tx ${tx.hash}  block ${rc.blockNumber}`);
