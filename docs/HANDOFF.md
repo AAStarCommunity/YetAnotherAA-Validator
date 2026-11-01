@@ -5,8 +5,13 @@
 > notes. Facts here decay: re-derive before relying on any of them — §9 lists
 > the commands.
 >
-> **Read §1 first.** The repo is under an external HOLD that forbids actions
-> which look like ordinary maintenance.
+> **Status on 2026-11-01: the v4 HOLD described here has been lifted.** On
+> 2026-10-31 the author allowed PRs, image rebuilds and write transactions while
+> the paper is being revised, and will freeze the repo again later. This
+> document remains a 2026-10-10 snapshot: its freeze rules and PR states are
+> history. #377 and #378 are merged. Still in force: the committee keeper stays
+> off, and the A3a senders must not send transactions until SuperPaymaster
+> clears them.
 
 ---
 
