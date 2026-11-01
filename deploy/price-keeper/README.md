@@ -71,6 +71,8 @@ Nothing runs `status` on a schedule yet, so someone has to run it by hand.
   (mode 600). They come from the keeper process, so a dead keeper or a dead Mini
   sends nothing; `status` is still the check for that.
 - `status` warns below 0.01 ETH.
+- `run.sh` sets the Chainlink stale alert to 4200s. The SDK default of 600s alerted about every 12 minutes on Sepolia,
+  where normal feed ages reach about an hour.
 - `run-keeper.sh` in `aastar-sdk` bakes in SuperPaymaster 5.3.3, so `run.sh`
   passes the addresses explicitly.
 - Do not re-enable `io.aastar.price-keeper` on the laptop: two keepers would

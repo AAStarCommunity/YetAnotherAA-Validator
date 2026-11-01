@@ -27,6 +27,7 @@ exec node_modules/.bin/tsx scripts/keeper.ts \
   --poll-interval "${KEEPER_POLL_INTERVAL:-180}" \
   --safety-margin "${KEEPER_SAFETY_MARGIN:-600}" \
   --health-interval "${KEEPER_HEALTH_INTERVAL:-1800}" \
+  --chainlink-stale-sec "${KEEPER_CHAINLINK_STALE_SEC:-4200}" \
   --volatility-threshold-bps "${KEEPER_VOL_BPS:-150}" \
   --volatility-cooldown "${KEEPER_VOL_COOLDOWN:-600}" \
   "$@"
