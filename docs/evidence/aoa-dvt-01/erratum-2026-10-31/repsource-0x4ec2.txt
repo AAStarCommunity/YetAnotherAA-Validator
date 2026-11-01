@@ -1,0 +1,5 @@
+# 0x4Ec2D49D75D5D4206B64387A7d6a6C3c5c90fB5A (ReputationSystem), block 12030989
+# read 2026-10-31 for PR #383 review B-1; rpc1 = eth-sepolia.g.alchemy.com, rpc2 = ethereum-sepolia-rpc.publicnode.com
+# syncToRegistry(address,address[],bytes32[][],uint256[][],uint256,bytes) selector = 0x9172ff45
+rpc1 REGISTRY()=0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71 version="Reputation-0.3.2" owner=0xb5600060e6de5E11D3636731964218E53caadf0E codehash=0x6d712dae9628ea0788b9ace4c3c1f4d981c2add68f3e9d0ac28eb189c01deaa3 runtime_contains_0x9172ff45=1
+rpc2 REGISTRY()=0xf5Bf37ca83AfdAab73691bA7eCcDfA69b8708E71 version="Reputation-0.3.2" owner=0xb5600060e6de5E11D3636731964218E53caadf0E codehash=<rpc2 error -32602: distance to target block exceeds maximum proof window> runtime_contains_0x9172ff45=1

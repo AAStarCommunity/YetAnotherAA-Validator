@@ -1,0 +1,16 @@
+# DVTValidator 0x568b1486BFE036e603eA11f0D03Dc47fa62c9E0e runtime at block 12030989, PR #383 review V383-1
+# rpc1=eth-sepolia.g.alchemy.com rpc2=ethereum-sepolia-rpc.publicnode.com; runtime sha256 (hex text) both: 31640297c811603b0d19218af5f213e52010dfa166bfd2efad02e7aa060b5ec5 / 31640297c811603b0d19218af5f213e52010dfa166bfd2efad02e7aa060b5ec5
+# python3 outbound_selectors.py <runtime.hex> name=selector ...
+runtime_bytes=6326 instructions=4007 push4_distinct=38 shl_constants_distinct=19 push32_aligned=0
+version 0x54fd4d50 raw_hex=1 push4=1 shl=[] push32=0
+executeWithProof 0x08f41334 raw_hex=1 push4=1 shl=[] push32=0
+addValidator 0x4d238c8e raw_hex=1 push4=1 shl=[] push32=0
+verifyAndExecute 0xd38f1586 raw_hex=0 push4=0 shl=[(4103, '0x69c78ac3', 225)] push32=0
+queueSlashWithConsensus 0x47730efa raw_hex=0 push4=0 shl=[(1478, '0x23b9877d', 225)] push32=0
+hasRole 0x91d14854 raw_hex=0 push4=0 shl=[(1768, '0x24745215', 226), (2660, '0x24745215', 226), (5764, '0x24745215', 226)] push32=0
+getRoleConfig 0xb5e936ab raw_hex=3 push4=1 shl=[(1899, '0xb5e936ab', 224), (2827, '0xb5e936ab', 224), (5892, '0xb5e936ab', 224)] push32=0
+GTOKEN_STAKING 0x826600ce raw_hex=0 push4=0 shl=[(1837, '0x41330067', 225), (2765, '0x41330067', 225), (5831, '0x41330067', 225)] push32=0
+roleLocks 0x30b039ee raw_hex=0 push4=0 shl=[(1956, '0x18581cf7', 225), (2884, '0x18581cf7', 225), (5949, '0x18581cf7', 225)] push32=0
+executeProposal 0x5e1a03a2 raw_hex=0 push4=0 shl=[] push32=0
+all_shl_constants: ['0208a005', '118cdaa7', '1e4fbdf7', '204cba09', '30b039ee', '37603bef', '47730efa', '4e487b71', '6264d57f', '69d6514c', '826600ce', '84536595', '91d14854', '997a3f56', 'b3186f36', 'b5e936ab', 'c23285bd', 'd38f1586', 'd9c78e02']
+# opcode counts (linear scan, PUSH data skipped): CALL=2 STATICCALL=12 DELEGATECALL=0 CALLCODE=0 CREATE=0 SELFDESTRUCT=0

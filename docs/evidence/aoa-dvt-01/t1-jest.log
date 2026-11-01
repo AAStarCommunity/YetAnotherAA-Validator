@@ -1,0 +1,76 @@
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:00 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+(node:94085) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+[33m[Nest] 94078  - [39m10/27/2026, 2:44:00 PM [33m   WARN[39m [38;5;3m[GossipQuorumCoSigner] [39m[33mGossip quorum co-sign OK: 3 signers (slots 1,2,3), signerMask=7 for execute slash of 0x1212121212121212121212121212121212121212[39m
+(node:94095) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:94083) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:94096) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:94087) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:94084) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:02 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[33m[Nest] 94078  - [39m10/27/2026, 2:44:02 PM [33m   WARN[39m [38;5;3m[GossipQuorumCoSigner] [39m[33mco-sign domain attestation FAILED — refusing to co-sign over an unverified domain: attestDomain: local domainSeparator != aggregator[39m
+[33m[Nest] 94078  - [39m10/27/2026, 2:44:02 PM [33m   WARN[39m [38;5;3m[GossipQuorumCoSigner] [39m[33mco-sign domain attestation FAILED — refusing to co-sign over an unverified domain: attestDomain: local domainSeparator != aggregator[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:02 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[33m[Nest] 94078  - [39m10/27/2026, 2:44:02 PM [33m   WARN[39m [38;5;3m[GossipQuorumCoSigner] [39m[33mco-sign domain attestation FAILED — refusing to co-sign over an unverified domain: attestDomain: local domainSeparator != aggregator[39m
+[33m[Nest] 94078  - [39m10/27/2026, 2:44:02 PM [33m   WARN[39m [38;5;3m[GossipQuorumCoSigner] [39m[33mco-sign domain attestation FAILED — refusing to co-sign over an unverified domain: attestDomain: local domainSeparator != aggregator[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:03 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[33m[Nest] 94082  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[BlsService] [39m[33mOwner-auth rejected for account 0x08923CE682336DF2f238C034B4add5Bf73d4028A: eth_call isValidOwnerAuth returned false[39m
+[33m[Nest] 94082  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[BlsService] [39m[33mOwner-auth rejected for account 0x08923CE682336DF2f238C034B4add5Bf73d4028A: eth_call isValidOwnerAuth returned false[39m
+[33m[Nest] 94082  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[BlsService] [39m[33mOwner-auth rejected for account 0x08923CE682336DF2f238C034B4add5Bf73d4028A: eth_call isValidOwnerAuth returned false[39m
+[33m[Nest] 94082  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[BlsService] [39m[33mOwner-auth rejected for account 0x08923CE682336DF2f238C034B4add5Bf73d4028A: eth_call isValidOwnerAuth returned false[39m
+(node:94079) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m[Nest] 94079  - [39m10/27/2026, 2:44:03 PM [32m    LOG[39m [38;5;3m[GuardianSlashWatcherService] [39m[32mcaptured signer set for proposal 42 (3 signers, block 50)[39m
+[33m[Nest] 94082  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[BlsService] [39m[33mOwner-auth rejected for account 0x08923CE682336DF2f238C034B4add5Bf73d4028A: eth_call isValidOwnerAuth returned false[39m
+[33m[Nest] 94079  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[GuardianSlashWatcherService] [39m[33mproposal 43 QUARANTINED — commitment self-check failed (needs manual review)[39m
+(node:94082) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+[33m[Nest] 94079  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[GuardianSlashWatcherService] [39m[33mcould not capture proposal 44 (attempt 1) — dead-lettered: tx 0xc3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3 not found[39m
+[33m[Nest] 94079  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[GuardianSlashWatcherService] [39m[33mcould not capture proposal 45 (attempt 1) — dead-lettered: tx 0xd4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4 not found[39m
+[32m[Nest] 94079  - [39m10/27/2026, 2:44:03 PM [32m    LOG[39m [38;5;3m[GuardianSlashWatcherService] [39m[32mcaptured signer set for proposal 45 (3 signers, block 50)[39m
+[33m[Nest] 94079  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[GuardianSlashWatcherService] [39m[33mwatcher bootstrap read failed — DISABLED: execution reverted (no proposalSignersCommitment)[39m
+[33m[Nest] 94079  - [39m10/27/2026, 2:44:03 PM [33m   WARN[39m [38;5;3m[GuardianSlashWatcherService] [39m[33mwatcher bootstrap read failed — DISABLED: attestDomain: local domainSeparator 0x493856645603ffae13f36483e2a59afa0784edb33f91dcd24107d59d0b13284a != aggregator.domainSeparator() 0xdededededededededededededededededededededededededededededededede[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:04 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:05 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:07 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:09 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:10 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:11 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:11 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:11 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:11 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[33m[Nest] 94078  - [39m10/27/2026, 2:44:12 PM [33m   WARN[39m [38;5;3m[GossipQuorumCoSigner] [39m[33mGossip quorum co-sign OK: 2 signers (slots 1,2), signerMask=3 for execute slash of 0x1212121212121212121212121212121212121212[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:12 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:12 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:12 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:12 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:12 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[33m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [33m   WARN[39m [38;5;3m[GossipQuorumCoSigner] [39m[33mverifyAndSign refused: proof schema version mismatch: req=3 local=2 — all DVT nodes must run the same inc-2-live version; refusing to co-sign[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:13 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:14 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:14 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:14 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:14 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:14 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+[32m[Nest] 94078  - [39m10/27/2026, 2:44:15 PM [32m    LOG[39m [38;5;3m[GossipQuorumCoSigner] [39m[32mGossip quorum co-sign responder registered (armed)[39m
+(node:94078) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+Test Suites: 10 passed, 10 total
+Tests:       129 passed, 129 total
+Snapshots:   0 total
+Time:        19.591 s
+Ran all test suites matching src/modules/bls|src/modules/signature|src/modules/audit/slash-consensus|src/modules/audit/bls-consensus-domain|src/modules/audit/gossip-quorum-cosigner|src/modules/audit/guardian-fraud-proof|src/modules/audit/guardian-slash-watcher.

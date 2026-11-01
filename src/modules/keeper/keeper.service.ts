@@ -96,6 +96,15 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
       );
       return;
     }
+    try {
+      this.checkAlertConfigured();
+    } catch {
+      // Structural boundary, not a point-fix: whatever escapes checkAlertConfigured()
+      // (a throwing logger, a throwing diagnostic, anything) is swallowed HERE so it
+      // is structurally impossible for the self-check to abort scheduling below.
+      // Intentionally do NOT log here — logging is exactly the kind of thing that
+      // may have thrown; a nested catch just moves the same question one level down.
+    }
     this.lastDayNumber = this.todayNumber();
     // Phase-jitter the first tick across [0, intervalMs) so redundant keepers
     // that boot together don't all fire updatePrice() in the same window.
@@ -124,6 +133,95 @@ export class KeeperService implements OnApplicationBootstrap, OnApplicationShutd
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  /**
+   * Startup self-check (real incident driven — a neighboring repo's price keeper
+   * failed silently for 3.5 weeks: process alive, every tick failing, zero alerts,
+   * because its alert channel was also broken and nobody knew).
+   *
+   * The keeper's own failure path (`refreshOne` below) only ever *tries* to raise
+   * an operator alert via `this.opsAlert?.alert(...)` — that call is a silent
+   * no-op whenever OpsAlertService is disabled/unconfigured, or isn't injected at
+   * all. Loudly surface that combination once at startup so it isn't discovered
+   * only after an updatePrice() failure goes unnoticed on that path. This
+   * intentionally does NOT stop the keeper: halting on an alerting gap would
+   * guarantee the exact harm (a stale price) that this keeper exists to prevent —
+   * the safe response is to keep working and say so loudly, not to stop.
+   *
+   * Scope, precisely — two axes:
+   *  - This is ONLY about the operator-alert path (`OpsAlertService`), i.e.
+   *    whether an *operator* gets paged. It says nothing about
+   *    `notificationService.sendToAccount(...)` in `refreshOne`'s catch block —
+   *    that end-user notification path is separate and unaffected by this check.
+   *  - This checks CONFIGURATION, not deliverability.
+   *    `OpsAlertService.isEnabled()` — the single place that already encodes
+   *    "opt-in flag AND a transport is actually configured" (see
+   *    ops-alert.service.ts) — only tells us a transport was *set up*. It does
+   *    not probe that transport, so a configured-but-broken transport (e.g. a
+   *    revoked Telegram bot token — `Unauthorized` on every send) still reports
+   *    `isEnabled() === true` and this check stays silent. That is in fact the
+   *    shape of the neighboring incident this is modeled on: the token was
+   *    configured, just dead. This check only catches the "never configured at
+   *    all" class (this repo's `deploy/*.env.example` templates ship with no
+   *    `OPS_ALERT_*` entries set, matching that state). Catching a
+   *    configured-but-dead transport requires an actual delivery drill before
+   *    relying on it, not a config read.
+   *
+   * Robustness: the probe itself must never throw into the caller — this method
+   * runs before the timers are armed (see onApplicationBootstrap above), so an
+   * uncaught throw here would abort scheduling entirely, which is precisely the
+   * "block keeper operation" outcome the hard constraint forbids. A malformed
+   * `opsAlert` (missing `isEnabled`, or one that throws/returns something odd) is
+   * therefore treated the same as "not configured", never allowed to propagate.
+   * Only the literal boolean `true` counts as "configured" — `isEnabled()` is
+   * documented as synchronous and boolean-returning, so anything else (undefined,
+   * a non-boolean, a Promise from a misbehaving mock/partial implementation,
+   * which is truthy under a loose check) is read as "not configured" rather than
+   * silently accepted as "probably fine". A thenable result is additionally given
+   * a no-op rejection handler (never awaited — this path must stay synchronous) so
+   * a mock that returns a *rejected* promise can't surface as an unhandled
+   * rejection later and crash the process (Node 15+ default behavior).
+   *
+   * This method's own try/catch only covers the probe + rejection-consumption; it
+   * does NOT try to also guarantee the diagnostic logging below can't throw — that
+   * would just push the same question into a nested catch. Instead the CALLER
+   * (`onApplicationBootstrap`) wraps the whole `checkAlertConfigured()` call in a
+   * boundary try/catch that swallows anything, unconditionally. That is the single
+   * place the "never blocks scheduling" invariant is actually enforced.
+   */
+  private checkAlertConfigured(): void {
+    let configured: boolean;
+    try {
+      // Declared type is `boolean`, but a misbehaving mock can violate that at
+      // runtime (that's exactly the case this guards against) — widen to
+      // `unknown` so the shape checks below are honest about what's possible.
+      const result: unknown = this.opsAlert?.isEnabled();
+      // Consume a rejection on a misbehaving async mock so it never becomes an
+      // unhandled rejection down the line. Never `await` — this must stay sync.
+      if (result != null && typeof (result as { then?: unknown }).then === "function") {
+        (result as Promise<unknown>).then(undefined, () => {});
+      }
+      configured = result === true;
+    } catch (e) {
+      this.logger.error(
+        "Keeper: could not determine whether an operator-alert path is configured " +
+          `(the probe itself threw: ${String(e)}). Treating it as NOT configured — ` +
+          "failing loud, not silent. This does not stop the keeper."
+      );
+      return;
+    }
+    if (configured) return;
+    this.logger.error(
+      "Keeper is ENABLED but there is no configured operator-alert path — a failed " +
+        "updatePrice() will NOT raise an operator alert (this is exactly how a " +
+        "stale-price outage goes unnoticed). This does not stop the keeper. Configure " +
+        "alerting via OPS_ALERT_ENABLED=true plus a transport: OPS_ALERT_BOT_TOKEN + " +
+        "OPS_ALERT_CHAT_ID (Telegram), or AASTAR_MONITOR_URL (+ optional " +
+        "AASTAR_MONITOR_TOKEN) for a webhook. Note: configured is not the same as " +
+        "deliverable — a dead token/webhook still passes this check; only a real " +
+        "alert drill proves delivery actually works."
+    );
   }
 
   /** Startup phase offset in [0, intervalMs). Visible for testing. */
