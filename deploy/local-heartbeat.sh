@@ -134,6 +134,10 @@ watchdog: killed after ${WATCHDOG_SECS}s -- the child never returned"
 # rule. It is also the SAFE-TO-CLOSE predicate below: only an issue carrying this marker was opened
 # by a heartbeat, so auto-recovery can never close an issue a human filed under the same label.
 MARKER_PREFIX="<!-- committee-health-alert-v1:"
+# Comment on an already-open alert issue at most this often (seconds). See alert().
+COMMENT_INTERVAL="${HEARTBEAT_COMMENT_INTERVAL:-3600}"
+case "$COMMENT_INTERVAL" in (*[!0-9]*|"") COMMENT_INTERVAL=3600;; esac
+COMMENT_CAP=2500
 
 log() { echo "[$(stamp)] $*" | tee -a "$LOG" >&2; }
 
@@ -268,7 +272,7 @@ sanitise() {
 # issue rather than each opening its own. (The workflow filters on `github-actions[bot]`; a local
 # run is authored by the human, so an author filter would defeat the dedup across the two.)
 alert() {
-  local catlabel="$1" title="$2" body="$3"
+  local catlabel="$1" title="$2" body="$3" rawbody="$3"
   body="${MARKER_PREFIX}${catlabel} -->
 ${body}"
   if ! command -v gh >/dev/null 2>&1; then
@@ -298,17 +302,92 @@ ${body}"
   # Require the marker here too, not only when closing. Without it a human-filed issue carrying the
   # same labels becomes the dedup target and silently suppresses every future alert in its category
   # -- which is the exact risk the workflow's author filter was written to avoid, solved properly.
+  # The NEWEST marked issue wins. A rollover leaves the full predecessor open until its successor
+  # exists (and open if closing it then fails), so two marked issues can be open at once; taking the
+  # first match would keep picking the full one and roll over again every tick.
   local n
   for n in $listing; do
     case "$n" in (*[!0-9]*|"") continue;; esac
     if gh issue view "$n" --repo "$GH_REPO_SLUG" --json body -q .body 2>/dev/null \
-       | grep -qF "${MARKER_PREFIX}${catlabel} -->"; then existing="$n"; break; fi
+       | grep -qF "${MARKER_PREFIX}${catlabel} -->"; then
+      if [ -z "$existing" ] || [ "$n" -gt "$existing" ]; then existing="$n"; fi
+    fi
   done
+  local predecessor=""
   if [ -n "$existing" ]; then
-    printf '%s' "$body" | gh issue comment "$existing" --repo "$GH_REPO_SLUG" --body-file - >/dev/null 2>&1 \
-      && log "appended to existing issue #$existing" \
-      || log "FAILED to comment on #$existing"
-    return
+    # Throttled. Commenting on every 15-minute tick filled #381 to GitHub's 2,500-comment cap in about
+    # a month; after that every comment failed and the alert path was silent while this log said
+    # "FAILED to comment" 61 times. The open issue already says "still failing"; a comment every few
+    # hour keeps the diagnostics fresh (about 100 days to the cap) without spending it. The stamp is per
+    # issue, so a new issue comments at once. ACCEPTED: a different failure in the same category inside
+    # the hour is not commented. The issue already says the category is failing, and every run is in
+    # $LOG; comparing bodies does not help because they carry the block and epoch, which change each
+    # run.
+    local cstamp="$RUN_DIR/last-comment-${catlabel}-${existing}.txt" last=0 now
+    now=$(date -u +%s)
+    [ -f "$cstamp" ] && last=$(cat "$cstamp" 2>/dev/null)
+    case "$last" in (*[!0-9]*|"") last=0;; esac
+    # A stamp in the future (clock moved back, or corrupt) counts as expired, never as "just now":
+    # otherwise it would mute comments, and the rollover, until that future time.
+    if [ "$last" -le "$now" ] && [ $(( now - last )) -lt "$COMMENT_INTERVAL" ]; then
+      log "issue #$existing is open; last comment $(( now - last ))s ago (< ${COMMENT_INTERVAL}s) -- not commenting"
+      return
+    fi
+    if printf '%s' "$body" | gh issue comment "$existing" --repo "$GH_REPO_SLUG" --body-file - >/dev/null 2>&1; then
+      echo "$now" > "$cstamp"
+      log "appended to existing issue #$existing"
+      return
+    fi
+    # A full issue cannot take another comment, ever, so retrying is not a recovery. Open a successor
+    # that points back, and close the full one only AFTER the successor exists: closing first would
+    # leave the incident with no open issue if creation then failed, and would let the Actions monitor
+    # see none and open its own. Any other failure keeps the old behaviour: log and retry next tick.
+    local ccount
+    ccount=$(gh api "repos/$GH_REPO_SLUG/issues/$existing" --jq .comments 2>/dev/null)
+    case "$ccount" in (*[!0-9]*|"") ccount=0;; esac
+    if [ "$ccount" -lt "$COMMENT_CAP" ]; then
+      log "FAILED to comment on #$existing ($ccount comments, below the cap) -- will retry next tick"
+      return
+    fi
+    # A successor from an earlier tick that never got its labels: finish that one instead of opening
+    # another. Without this, a persistent labelling failure would open a new issue every tick.
+    local pending="$RUN_DIR/successor-${catlabel}-${existing}.txt" snum=""
+    [ -f "$pending" ] && snum=$(cat "$pending" 2>/dev/null)
+    case "$snum" in (*[!0-9]*|"") snum="";; esac
+    # Only an OPEN successor can take over. Forget it only when it is confirmed CLOSED; a failed
+    # lookup keeps the record and retries, because the record is the only way to find it again.
+    if [ -n "$snum" ]; then
+      local sstate
+      sstate=$(gh issue view "$snum" --repo "$GH_REPO_SLUG" --json state -q .state 2>/dev/null)
+      case "$sstate" in
+        OPEN) ;;
+        CLOSED) log "recorded successor #$snum of full #$existing was closed -- discarding it"
+                rm -f "$pending"; snum="" ;;
+        *) log "could not read the state of successor #$snum -- keeping the record; will retry next tick"
+           return ;;
+      esac
+    fi
+    if [ -n "$snum" ]; then
+      if gh issue edit "$snum" --repo "$GH_REPO_SLUG" \
+           --add-label committee-health --add-label "$catlabel" >/dev/null 2>&1; then
+        rm -f "$pending"
+        printf '%s' "$body" | gh issue comment "$snum" --repo "$GH_REPO_SLUG" --body-file - >/dev/null 2>&1 \
+          && log "labelled successor #$snum and appended to it" \
+          || log "labelled successor #$snum; FAILED to append this run's diagnostics"
+        gh issue close "$existing" --repo "$GH_REPO_SLUG" >/dev/null 2>&1 \
+          && log "closed #$existing (full); #$snum continues it" \
+          || log "FAILED to close full #$existing; #$snum is newer, so dedup now uses it"
+      else
+        log "successor #$snum of full #$existing is still unlabelled -- not opening another; will retry next tick"
+      fi
+      return
+    fi
+    log "#$existing reached the ${COMMENT_CAP}-comment cap; opening a successor before closing it"
+    predecessor="$existing"
+    body="${MARKER_PREFIX}${catlabel} -->
+Continues #${existing}, which reached GitHub's ${COMMENT_CAP}-comment limit; the heartbeat closes it once this issue exists.
+
+${rawbody}"
   fi
   # Create first, label second: `gh issue create --label` resolves every label BEFORE creating
   # anything, so one missing label would veto the whole alert.
@@ -336,12 +415,25 @@ ${body}"
   case "$num" in (*[!0-9]*|"") log "parsed issue number '$num' is not numeric -- not labelling"; return;; esac
   if ! gh issue edit "$num" --repo "$GH_REPO_SLUG" \
         --add-label committee-health --add-label "$catlabel" >/dev/null 2>&1; then
+    # A rollover successor that dedup cannot see must not replace the issue dedup CAN see. Keep the
+    # predecessor open and remember the successor, so the next tick labels it rather than opening
+    # yet another.
+    if [ -n "$predecessor" ]; then
+      echo "$num" > "$RUN_DIR/successor-${catlabel}-${predecessor}.txt"
+      log "successor #$num created but labelling failed -- keeping full #$predecessor open; next tick retries the labels"
+      return
+    fi
     log "issue #$num created but labelling failed -- dedup is BROKEN, this will open a new issue every run"
     # Say it in the issue too. A log line on a laptop is not where anyone looks.
     gh issue comment "$num" --repo "$GH_REPO_SLUG" --body \
       "⚠️ This issue could not be labelled \`committee-health\`/\`$catlabel\`, so the heartbeat cannot dedup against it and will open a NEW issue on every failing run until that is fixed." >/dev/null 2>&1 || true
   fi
   log "opened issue $url"
+  if [ -n "$predecessor" ]; then
+    gh issue close "$predecessor" --repo "$GH_REPO_SLUG" >/dev/null 2>&1 \
+      && log "closed #$predecessor (full); #$num continues it" \
+      || log "FAILED to close full #$predecessor; #$num is newer, so dedup now uses it"
+  fi
 }
 
 # The other half of dedup, and the reason it is not optional. Deduplicating means the EXISTENCE of an
@@ -371,6 +463,21 @@ resolve() {
       gh issue close "$n" --repo "$GH_REPO_SLUG" \
         --comment "Recovered at $(stamp): the heartbeat now reports healthy. Closed automatically so the set of open \`committee-health\` issues keeps meaning \"failing right now\" rather than \"failed at some point\". Reopen if this was premature." \
         >/dev/null 2>&1 && log "closed #$n on recovery" || log "FAILED to close #$n on recovery"
+    done
+    # A rollover successor whose labelling failed is invisible to the label query above. Close it
+    # too, so recovery does not strand an open alert nobody will ever close.
+    local f s
+    for f in "$RUN_DIR"/successor-"${catlabel}"-*.txt; do
+      [ -f "$f" ] || continue
+      s=$(cat "$f" 2>/dev/null)
+      case "$s" in (*[!0-9]*|"") rm -f "$f"; continue;; esac
+      if gh issue close "$s" --repo "$GH_REPO_SLUG" \
+           --comment "Recovered at $(stamp): the heartbeat now reports healthy. This successor was never labelled, so it is closed from the heartbeat's local record." \
+           >/dev/null 2>&1 || [ "$(gh issue view "$s" --repo "$GH_REPO_SLUG" --json state -q .state 2>/dev/null)" = CLOSED ]; then
+        rm -f "$f"; log "closed unlabelled successor #$s on recovery"
+      else
+        log "FAILED to close unlabelled successor #$s on recovery -- will retry"
+      fi
     done
   done
 }
