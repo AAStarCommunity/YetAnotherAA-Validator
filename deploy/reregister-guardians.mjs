@@ -614,6 +614,8 @@ async function main() {
         publicKey: p.pkWords,
         popDigest: p.popDigest,
         popSignature: p.popWords,
+        // The exact bytes gate 7 dry-ran, so a consumer does not have to re-encode the call.
+        calldata: agg.interface.encodeFunctionData("registerBLSPublicKey", [p.validator, p.pkWords, p.slot, p.popWords]),
       })),
     };
     writeFileSync(EXPORT_FILE, JSON.stringify(exported, null, 2) + "\n");
