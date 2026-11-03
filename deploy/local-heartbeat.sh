@@ -344,7 +344,13 @@ ${body}"
     # see none and open its own. Any other failure keeps the old behaviour: log and retry next tick.
     local ccount
     ccount=$(gh api "repos/$GH_REPO_SLUG/issues/$existing" --jq .comments 2>/dev/null)
-    case "$ccount" in (*[!0-9]*|"") ccount=0;; esac
+    case "$ccount" in
+      (*[!0-9]*|"")
+        # Unknown is not "below the cap": say which one it is, so a full issue behind a failing API
+        # does not hide as an ordinary retry.
+        log "FAILED to comment on #$existing and could not read its comment count -- not rolling over; will retry next tick"
+        return ;;
+    esac
     if [ "$ccount" -lt "$COMMENT_CAP" ]; then
       log "FAILED to comment on #$existing ($ccount comments, below the cap) -- will retry next tick"
       return

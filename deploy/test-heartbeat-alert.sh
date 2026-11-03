@@ -69,7 +69,7 @@ run "failure below the cap only retries" "below the cap" STUB_COMMENT_OK=0 STUB_
 grep -qE "issue (close|create)" "$T/calls" && { echo "FAIL rolled over without reaching the cap"; fail=1; }
 
 rm -f "$stampfile"
-run "unreadable count does not roll over" "below the cap" STUB_COMMENT_OK=0 STUB_COUNT=oops
+run "unreadable count does not roll over" "could not read its comment count" STUB_COMMENT_OK=0 STUB_COUNT=oops
 grep -qE "issue (close|create)" "$T/calls" && { echo "FAIL rolled over on an unreadable count"; fail=1; }
 
 rm -f "$stampfile"
