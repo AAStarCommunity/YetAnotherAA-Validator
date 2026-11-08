@@ -67,6 +67,14 @@ expect "re-alerts at once with both lines" '[ "$(sent)" = 1 ] && grep -q "LOW_GA
 run "same two items again" STUB_CODE=1 STUB_OUT="LOW_GAS keeper y
 STALE PaymasterV4 z"
 expect "not repeated (order and detail do not matter)" '[ "$(sent)" = 0 ]'
+stamp_before="$(cat "$T/state/alerted-stale")"; kinds_before="$(cat "$T/state/alerted-stale-kinds")"
+run "a new set, but Telegram rejects it" STUB_CODE=1 STUB_TG_OK=0 STUB_OUT="STALE SuperPaymaster x
+STALE PaymasterV4 y"
+expect "state left as it was, so the next run retries" \
+  '[ "$(cat "$T/state/alerted-stale")" = "$stamp_before" ] && [ "$(cat "$T/state/alerted-stale-kinds")" = "$kinds_before" ]'
+run "the same new set, Telegram accepts" STUB_CODE=1 STUB_OUT="STALE SuperPaymaster x
+STALE PaymasterV4 y"
+expect "retried within the interval and delivered" '[ "$(sent)" = 1 ] && grep -q "STALE SuperPaymaster" "$T/sent"'
 
 run "recovered"
 expect "one RECOVERED, stamp cleared" '[ "$(sent)" = 1 ] && grep -q RECOVERED "$T/sent" && [ ! -f "$T/state/alerted-stale" ] && [ ! -f "$T/state/alerted-stale-kinds" ]'
@@ -153,10 +161,21 @@ expect "skipped" 'grep -q "holds the lock" "$T/log"'
 wait "$bg"
 rm -rf "$T/state"
 
-# status.mjs itself: a broken setup (no config, no viem) must exit 2, not 1, so it reads UNDETERMINED, not STALE.
+# status.mjs itself: a broken setup must exit 2, not 1, so it reads UNDETERMINED, not STALE.
 if command -v node >/dev/null; then
-  mkdir -p "$T/nohome"; out=$(HOME="$T/nohome" node "$HERE/status.mjs" 2>&1); rc=$?; CUR="status.mjs without its config"
-  expect "exit 2 with UNDETERMINED" '[ "$rc" = 2 ] && printf "%s" "$out" | grep -q "^UNDETERMINED"'
+  mjs() { # name, expected message, setup of $H -- run status.mjs under a fake HOME
+    local H="$T/home-$1"; mkdir -p "$H/.config/aastar-price-keeper"; eval "$3"
+    out=$(HOME="$H" node "$HERE/status.mjs" 2>&1); rc=$?; CUR="status.mjs: $1"
+    expect "exit 2, UNDETERMINED $2" '[ "$rc" = 2 ] && printf "%s" "$out" | grep -q "^UNDETERMINED.*'"$2"'"'
+  }
+  mjs no-viem "" ':'
+  # A stub viem, so the config paths are reached; any RPC call it would make fails the test (exit 9).
+  viem='v="$H/Dev/aastar/aastar-sdk-price-keeper/packages/core/node_modules/viem"; mkdir -p "$v"
+    echo "{\"name\":\"viem\",\"main\":\"index.js\"}" > "$v/package.json"
+    echo "const no=()=>process.exit(9); module.exports={createPublicClient:no,http:()=>0,parseAbi:()=>[],formatEther:String}" > "$v/index.js"'
+  mjs no-rpc-env ENOENT "$viem"
+  mjs no-rpc-url "RPC_URL missing" "$viem; echo OTHER=1 > \$H/.config/aastar-price-keeper/rpc.env"
+  mjs no-address ENOENT "$viem; echo RPC_URL=http://127.0.0.1:9 > \$H/.config/aastar-price-keeper/rpc.env"
 else
   echo "skip status.mjs check: no node"
 fi
