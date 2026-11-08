@@ -19,7 +19,9 @@ if [ -n "${STUB_BG:-}" ]; then
   if [ -n "${STUB_BG_IGNTERM:-}" ]; then
     # Handshake: the stub exits only after the trap is installed, so TERM cannot land before it.
     ready="$(mktemp -u)"; bash -c "trap '' TERM; : > '$ready'; exec sleep $STUB_BG" &
-    for _ in $(seq 1 50); do [ -e "$ready" ] && break; sleep 0.1; done; rm -f "$ready"
+    for _ in $(seq 1 50); do [ -e "$ready" ] && break; sleep 0.1; done
+    # No handshake means TERM could kill it before the trap: fail the case instead of passing untested.
+    [ -e "$ready" ] || { echo "NOREADY"; exit 99; }; rm -f "$ready"
   else sleep "$STUB_BG" & fi
   echo $! >> "${PIDS:-/dev/null}"
 fi
