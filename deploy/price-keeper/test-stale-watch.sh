@@ -14,7 +14,17 @@ cat > "$T/status" <<'S'
 # STUB_FDS: report any open fd above 2 (the lock must not leak into the status command).
 [ -n "${STUB_FDS:-}" ] && for fd in /dev/fd/*; do n="${fd##*/}"; [ "$n" -gt 2 ] && [ "$n" != 255 ] && [ -e "$fd" ] && echo "FDLEAK $n"; done
 # STUB_BG: leave a background descendant holding stdout and exit at once.
-[ -n "${STUB_BG:-}" ] && { sleep "$STUB_BG" & }
+# STUB_BG_IGNTERM: that descendant ignores TERM, so only the KILL step can end it. Its pid goes to $PIDS.
+if [ -n "${STUB_BG:-}" ]; then
+  if [ -n "${STUB_BG_IGNTERM:-}" ]; then
+    # Handshake: the stub exits only after the trap is installed, so TERM cannot land before it.
+    ready="$(mktemp -u)"; bash -c "trap '' TERM; : > '$ready'; exec sleep $STUB_BG" &
+    for _ in $(seq 1 50); do [ -e "$ready" ] && break; sleep 0.1; done
+    # No handshake means TERM could kill it before the trap: fail the case instead of passing untested.
+    [ -e "$ready" ] || { echo "NOREADY"; exit 99; }; rm -f "$ready"
+  else sleep "$STUB_BG" & fi
+  echo $! >> "${PIDS:-/dev/null}"
+fi
 printf '%s\n' "${STUB_OUT:-FRESH SuperPaymaster age=1s limit=4200s}"; exit "${STUB_CODE:-0}"
 S
 cat > "$T/curl" <<'S'
@@ -30,14 +40,33 @@ fail=0
 run() {
   local name="$1"; shift; local want=0
   case "${1:-}" in WANT_RC=*) want="${1#WANT_RC=}"; shift ;; esac
-  : > "$T/sent"
+  : > "$T/sent"; : > "$T/pids"
   local t0; t0=$(date +%s)
   env "$@" KEEPER_CONFIG_DIR="$T/cfg" STALE_WATCH_STATE_DIR="${SD:-$T/state}" STALE_WATCH_STATUS_CMD="$T/status" \
-    STALE_WATCH_CURL="$T/curl" SENT="$T/sent" bash "$HERE/stale-watch.sh" ${ARGS:-} > "$T/log" 2>&1
+    STALE_WATCH_CURL="$T/curl" SENT="$T/sent" PIDS="$T/pids" bash "$HERE/stale-watch.sh" ${ARGS:-} > "$T/log" 2>&1
   RC=$?; ELAPSED=$(( $(date +%s) - t0 )); CUR="$name"
   if [ "$RC" != "$want" ]; then echo "FAIL $CUR: exit $RC, wanted $want"; cat "$T/log"; fail=1; fi
 }
 sent() { grep -c . "$T/sent"; }
+# 0 when every descendant pid the stub recorded is gone (and at least one was recorded)
+# A pid counts as gone when it no longer exists, is a zombie waiting for its new parent, or now
+# belongs to something other than the stub's sleep (pid reuse). Polls up to 3s for the reaping.
+reaped() {
+  [ -s "$T/pids" ] || return 1
+  local p st gone _
+  while read -r p; do
+    gone=""
+    for _ in $(seq 1 30); do
+      st="$(ps -o stat=,comm= -p "$p" 2>/dev/null)"
+      if [ -z "$st" ]; then gone=1; break; fi            # no such process
+      case "$st" in Z*) gone=1; break ;; esac             # zombie: dead, not yet reaped
+      case "$st" in *sleep) ;; *) gone=1; break ;; esac   # pid reused by something else
+      sleep 0.1
+    done
+    [ -n "$gone" ] || return 1
+  done < "$T/pids"
+  return 0
+}
 expect() { # description, condition
   if eval "$2"; then echo "ok   $CUR: $1"; else echo "FAIL $CUR: $1"; cat "$T/log"; fail=1; fi
 }
@@ -61,8 +90,23 @@ echo 99999999999 > "$T/state/alerted-stale"
 run "future stamp" STUB_CODE=1 STUB_OUT="STALE PaymasterV4"
 expect "does not mute" '[ "$(sent)" = 1 ]'
 
+run "a second item starts failing within the interval" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 x
+LOW_GAS keeper balance=0.001 ETH"
+expect "re-alerts at once with both lines" '[ "$(sent)" = 1 ] && grep -q "LOW_GAS keeper" "$T/sent"'
+run "same two items again" STUB_CODE=1 STUB_OUT="LOW_GAS keeper y
+STALE PaymasterV4 z"
+expect "not repeated (order and detail do not matter)" '[ "$(sent)" = 0 ]'
+stamp_before="$(cat "$T/state/alerted-stale")"; kinds_before="$(cat "$T/state/alerted-stale-kinds")"
+run "a new set, but Telegram rejects it" STUB_CODE=1 STUB_TG_OK=0 STUB_OUT="STALE SuperPaymaster x
+STALE PaymasterV4 y"
+expect "state left as it was, so the next run retries" \
+  '[ "$(cat "$T/state/alerted-stale")" = "$stamp_before" ] && [ "$(cat "$T/state/alerted-stale-kinds")" = "$kinds_before" ]'
+run "the same new set, Telegram accepts" STUB_CODE=1 STUB_OUT="STALE SuperPaymaster x
+STALE PaymasterV4 y"
+expect "retried within the interval and delivered" '[ "$(sent)" = 1 ] && grep -q "STALE SuperPaymaster" "$T/sent"'
+
 run "recovered"
-expect "one RECOVERED, stamp cleared" '[ "$(sent)" = 1 ] && grep -q RECOVERED "$T/sent" && [ ! -f "$T/state/alerted-stale" ]'
+expect "one RECOVERED, stamp cleared" '[ "$(sent)" = 1 ] && grep -q RECOVERED "$T/sent" && [ ! -f "$T/state/alerted-stale" ] && [ ! -f "$T/state/alerted-stale-kinds" ]'
 
 run "fresh again"
 expect "no second RECOVERED" '[ "$(sent)" = 0 ] && grep -q "status exit 0" "$T/log"'
@@ -107,8 +151,17 @@ rm -rf "$T/state"
 run "status command fds" STUB_FDS=1
 expect "inherits no fd above 2" '! grep -q FDLEAK "$T/log"'
 
-run "child exits but a descendant keeps the pipe" STUB_BG=30 STALE_WATCH_STATUS_TIMEOUT=1 STALE_WATCH_UNDETERMINED_AFTER=1
-expect "still bounded: UNDETERMINED, ends in seconds" 'grep -q "did not finish within 1s" "$T/sent" && [ "$ELAPSED" -lt 10 ]'
+run "child exits 0 but a descendant keeps the pipe" STUB_BG=30 STALE_WATCH_STATUS_TIMEOUT=1 STALE_WATCH_UNDETERMINED_AFTER=1
+expect "the child's result stands: exit 0, no alert, ends in seconds" \
+  '[ "$(sent)" = 0 ] && grep -q "status exit 0: FRESH" "$T/log" && [ "$ELAPSED" -lt 10 ]'
+expect "the descendant holding the pipe was killed" 'reaped'
+run "child exits 1 but a descendant keeps the pipe" STUB_BG=30 STUB_CODE=1 STUB_OUT="STALE PaymasterV4" STALE_WATCH_UNDETERMINED_AFTER=1
+expect "STALE alert, not UNDETERMINED; a short grace, not the 120s timeout" \
+  'grep -q "ALERT.*STALE PaymasterV4" "$T/sent" && ! grep -q UNDETERMINED "$T/sent" && [ "$ELAPSED" -lt 15 ]'
+expect "the descendant holding the pipe was killed" 'reaped'
+rm -rf "$T/state"
+run "a descendant that ignores TERM keeps the pipe" STUB_BG=30 STUB_BG_IGNTERM=1 STUB_CODE=1 STUB_OUT="STALE PaymasterV4"
+expect "KILL ends it; the child's result still stands" 'reaped && grep -q "ALERT.*STALE PaymasterV4" "$T/sent" && [ "$ELAPSED" -lt 15 ]'
 rm -rf "$T/state"
 
 mkdir -p "$T/state"; echo 0008 > "$T/state/undetermined-count"
@@ -141,6 +194,25 @@ run "second check while the first is running" STUB_CODE=1 STUB_OUT="STALE x"
 expect "skipped" 'grep -q "holds the lock" "$T/log"'
 wait "$bg"
 rm -rf "$T/state"
+
+# status.mjs itself: a broken setup must exit 2, not 1, so it reads UNDETERMINED, not STALE.
+if command -v node >/dev/null; then
+  mjs() { # name, expected message, setup of $H -- run status.mjs under a fake HOME
+    local H="$T/home-$1"; mkdir -p "$H/.config/aastar-price-keeper"; eval "$3"
+    out=$(HOME="$H" node "$HERE/status.mjs" 2>&1); rc=$?; CUR="status.mjs: $1"
+    expect "exit 2, UNDETERMINED $2" '[ "$rc" = 2 ] && printf "%s" "$out" | grep -q "^UNDETERMINED.*'"$2"'"'
+  }
+  mjs no-viem "" ':'
+  # A stub viem, so the config paths are reached; any RPC call it would make fails the test (exit 9).
+  viem='v="$H/Dev/aastar/aastar-sdk-price-keeper/packages/core/node_modules/viem"; mkdir -p "$v"
+    echo "{\"name\":\"viem\",\"main\":\"index.js\"}" > "$v/package.json"
+    echo "const no=()=>process.exit(9); module.exports={createPublicClient:no,http:()=>0,parseAbi:()=>[],formatEther:String}" > "$v/index.js"'
+  mjs no-rpc-env ENOENT "$viem"
+  mjs no-rpc-url "RPC_URL missing" "$viem; echo OTHER=1 > \$H/.config/aastar-price-keeper/rpc.env"
+  mjs no-address ENOENT "$viem; echo RPC_URL=http://127.0.0.1:9 > \$H/.config/aastar-price-keeper/rpc.env"
+else
+  echo "skip status.mjs check: no node"
+fi
 
 mkdir -p "$T/ro"; chmod 500 "$T/ro"
 SD="$T/ro/state" run "state dir cannot be created" WANT_RC=1 STUB_CODE=2

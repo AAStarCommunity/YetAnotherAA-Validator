@@ -71,17 +71,20 @@ sends Telegram messages through the same bot and chat as the keeper, from a
 separate process, so it still alerts when the keeper is stuck or has skipped a
 target.
 
-| `status` exit | What `stale-watch` sends                                   |
-| ------------- | ---------------------------------------------------------- |
-| 0             | `RECOVERED`, once, if an alert was outstanding             |
-| 1             | `ALERT` with the `STALE` / `LOW_GAS` lines, at most hourly |
-| 2             | `UNDETERMINED` after 3 checks in a row, at most hourly     |
+| `status` exit | What `stale-watch` sends                                                                             |
+| ------------- | ---------------------------------------------------------------------------------------------------- |
+| 0             | `RECOVERED`, once, if an alert was outstanding                                                       |
+| 1             | `ALERT` with the `STALE` / `LOW_GAS` lines, at most hourly, and at once when what is failing changes |
+| 2             | `UNDETERMINED` after 3 checks in a row, at most hourly                                               |
 
 Install or update it on the Mini:
 
 ```bash
-cp stale-watch.sh ~/.config/aastar-price-keeper/
+cd <this repo>/deploy/price-keeper
+cp stale-watch.sh status.mjs ~/.config/aastar-price-keeper/
 cp io.aastar.price-keeper-stale-watch.plist ~/Library/LaunchAgents/
+# On an update the job is already loaded; bootstrap fails until it is booted out.
+launchctl bootout gui/$(id -u)/io.aastar.price-keeper-stale-watch 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.aastar.price-keeper-stale-watch.plist
 launchctl print gui/$(id -u)/io.aastar.price-keeper-stale-watch | grep -E "state|run interval|runs"
 bash ~/.config/aastar-price-keeper/stale-watch.sh --test   # one TEST message to the chat
