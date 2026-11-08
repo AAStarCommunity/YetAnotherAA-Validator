@@ -14,7 +14,11 @@ cat > "$T/status" <<'S'
 # STUB_FDS: report any open fd above 2 (the lock must not leak into the status command).
 [ -n "${STUB_FDS:-}" ] && for fd in /dev/fd/*; do n="${fd##*/}"; [ "$n" -gt 2 ] && [ "$n" != 255 ] && [ -e "$fd" ] && echo "FDLEAK $n"; done
 # STUB_BG: leave a background descendant holding stdout and exit at once.
-[ -n "${STUB_BG:-}" ] && { sleep "$STUB_BG" & }
+# STUB_BG_IGNTERM: that descendant ignores TERM, so only the KILL step can end it. Its pid goes to $PIDS.
+if [ -n "${STUB_BG:-}" ]; then
+  if [ -n "${STUB_BG_IGNTERM:-}" ]; then bash -c "trap '' TERM; exec sleep $STUB_BG" & else sleep "$STUB_BG" & fi
+  echo $! >> "${PIDS:-/dev/null}"
+fi
 printf '%s\n' "${STUB_OUT:-FRESH SuperPaymaster age=1s limit=4200s}"; exit "${STUB_CODE:-0}"
 S
 cat > "$T/curl" <<'S'
@@ -30,14 +34,16 @@ fail=0
 run() {
   local name="$1"; shift; local want=0
   case "${1:-}" in WANT_RC=*) want="${1#WANT_RC=}"; shift ;; esac
-  : > "$T/sent"
+  : > "$T/sent"; : > "$T/pids"
   local t0; t0=$(date +%s)
   env "$@" KEEPER_CONFIG_DIR="$T/cfg" STALE_WATCH_STATE_DIR="${SD:-$T/state}" STALE_WATCH_STATUS_CMD="$T/status" \
-    STALE_WATCH_CURL="$T/curl" SENT="$T/sent" bash "$HERE/stale-watch.sh" ${ARGS:-} > "$T/log" 2>&1
+    STALE_WATCH_CURL="$T/curl" SENT="$T/sent" PIDS="$T/pids" bash "$HERE/stale-watch.sh" ${ARGS:-} > "$T/log" 2>&1
   RC=$?; ELAPSED=$(( $(date +%s) - t0 )); CUR="$name"
   if [ "$RC" != "$want" ]; then echo "FAIL $CUR: exit $RC, wanted $want"; cat "$T/log"; fail=1; fi
 }
 sent() { grep -c . "$T/sent"; }
+# 0 when every descendant pid the stub recorded is gone (and at least one was recorded)
+reaped() { [ -s "$T/pids" ] || return 1; local p; while read -r p; do kill -0 "$p" 2>/dev/null && return 1; done < "$T/pids"; return 0; }
 expect() { # description, condition
   if eval "$2"; then echo "ok   $CUR: $1"; else echo "FAIL $CUR: $1"; cat "$T/log"; fail=1; fi
 }
@@ -125,9 +131,14 @@ expect "inherits no fd above 2" '! grep -q FDLEAK "$T/log"'
 run "child exits 0 but a descendant keeps the pipe" STUB_BG=30 STALE_WATCH_STATUS_TIMEOUT=1 STALE_WATCH_UNDETERMINED_AFTER=1
 expect "the child's result stands: exit 0, no alert, ends in seconds" \
   '[ "$(sent)" = 0 ] && grep -q "status exit 0: FRESH" "$T/log" && [ "$ELAPSED" -lt 10 ]'
+expect "the descendant holding the pipe was killed" 'reaped'
 run "child exits 1 but a descendant keeps the pipe" STUB_BG=30 STUB_CODE=1 STUB_OUT="STALE PaymasterV4" STALE_WATCH_UNDETERMINED_AFTER=1
 expect "STALE alert, not UNDETERMINED; a short grace, not the 120s timeout" \
   'grep -q "ALERT.*STALE PaymasterV4" "$T/sent" && ! grep -q UNDETERMINED "$T/sent" && [ "$ELAPSED" -lt 15 ]'
+expect "the descendant holding the pipe was killed" 'reaped'
+rm -rf "$T/state"
+run "a descendant that ignores TERM keeps the pipe" STUB_BG=30 STUB_BG_IGNTERM=1 STUB_CODE=1 STUB_OUT="STALE PaymasterV4"
+expect "KILL ends it; the child's result still stands" 'reaped && grep -q "ALERT.*STALE PaymasterV4" "$T/sent" && [ "$ELAPSED" -lt 15 ]'
 rm -rf "$T/state"
 
 mkdir -p "$T/state"; echo 0008 > "$T/state/undetermined-count"
