@@ -77,6 +77,14 @@ target.
 | 1             | `ALERT` with the `STALE` / `LOW_GAS` lines, at most hourly, and at once when a new item fails |
 | 2             | `UNDETERMINED` after 3 checks in a row, at most hourly                                        |
 
+"A new item" means one that was not in the last delivered alert. While the set
+of failing items only shrinks, the stored set keeps the old items, so an item
+that flaps back is not a new item and waits for the hourly repeat, up to
+`REALERT_SECONDS` (one hour). This keeps a value hovering at its threshold, such
+as the keeper balance near 0.01 ETH, from alerting on every run. The cost: an
+item that recovered and then fails again inside that hour is reported at the
+hourly repeat, not at once.
+
 Install or update it on the Mini:
 
 ```bash

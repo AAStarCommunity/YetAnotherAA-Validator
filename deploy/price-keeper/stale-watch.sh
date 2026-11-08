@@ -186,7 +186,9 @@ case "$code" in
     kinds="${kinds:-exit1}"
     alerted=" $(cat "$stale_kinds" 2>/dev/null) "
     new_item=""
+    set -f   # split $kinds on spaces only; never glob-expand an item name
     for k in $kinds; do case "$alerted" in *" $k "*) ;; *) new_item="$k"; break ;; esac; done
+    set +f
     if due "$stale_stamp" || [ -n "$new_item" ]; then
       if send "[price-keeper] ALERT on $host: ${bad:-status exit 1 }-- run keeperctl.sh status"; then
         put "$stale_stamp" "$now_s" || state_broken "alerted-stale"
