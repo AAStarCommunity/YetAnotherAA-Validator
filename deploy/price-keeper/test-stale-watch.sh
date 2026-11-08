@@ -16,7 +16,11 @@ cat > "$T/status" <<'S'
 # STUB_BG: leave a background descendant holding stdout and exit at once.
 # STUB_BG_IGNTERM: that descendant ignores TERM, so only the KILL step can end it. Its pid goes to $PIDS.
 if [ -n "${STUB_BG:-}" ]; then
-  if [ -n "${STUB_BG_IGNTERM:-}" ]; then bash -c "trap '' TERM; exec sleep $STUB_BG" & else sleep "$STUB_BG" & fi
+  if [ -n "${STUB_BG_IGNTERM:-}" ]; then
+    # Handshake: the stub exits only after the trap is installed, so TERM cannot land before it.
+    ready="$(mktemp -u)"; bash -c "trap '' TERM; : > '$ready'; exec sleep $STUB_BG" &
+    for _ in $(seq 1 50); do [ -e "$ready" ] && break; sleep 0.1; done; rm -f "$ready"
+  else sleep "$STUB_BG" & fi
   echo $! >> "${PIDS:-/dev/null}"
 fi
 printf '%s\n' "${STUB_OUT:-FRESH SuperPaymaster age=1s limit=4200s}"; exit "${STUB_CODE:-0}"
@@ -43,7 +47,24 @@ run() {
 }
 sent() { grep -c . "$T/sent"; }
 # 0 when every descendant pid the stub recorded is gone (and at least one was recorded)
-reaped() { [ -s "$T/pids" ] || return 1; local p; while read -r p; do kill -0 "$p" 2>/dev/null && return 1; done < "$T/pids"; return 0; }
+# A pid counts as gone when it no longer exists, is a zombie waiting for its new parent, or now
+# belongs to something other than the stub's sleep (pid reuse). Polls up to 3s for the reaping.
+reaped() {
+  [ -s "$T/pids" ] || return 1
+  local p st gone _
+  while read -r p; do
+    gone=""
+    for _ in $(seq 1 30); do
+      st="$(ps -o stat=,comm= -p "$p" 2>/dev/null)"
+      if [ -z "$st" ]; then gone=1; break; fi            # no such process
+      case "$st" in Z*) gone=1; break ;; esac             # zombie: dead, not yet reaped
+      case "$st" in *sleep) ;; *) gone=1; break ;; esac   # pid reused by something else
+      sleep 0.1
+    done
+    [ -n "$gone" ] || return 1
+  done < "$T/pids"
+  return 0
+}
 expect() { # description, condition
   if eval "$2"; then echo "ok   $CUR: $1"; else echo "FAIL $CUR: $1"; cat "$T/log"; fail=1; fi
 }
