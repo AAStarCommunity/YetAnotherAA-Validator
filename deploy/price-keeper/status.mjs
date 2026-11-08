@@ -5,24 +5,27 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 
-const home = homedir();
-const require = createRequire(`${home}/Dev/aastar/aastar-sdk-price-keeper/packages/core/package.json`);
-const { createPublicClient, http, parseAbi, formatEther } = require("viem");
-
-const rpc = readFileSync(`${home}/.config/aastar-price-keeper/rpc.env`, "utf8")
-  .match(/^RPC_URL=["']?([^"'\n]+)/m)?.[1];
-const keeper = readFileSync(`${home}/.config/aastar-price-keeper/address`, "utf8").trim();
-const targets = {
-  SuperPaymaster: process.env.KEEPER_SUPERPAYMASTER || "0x09DF0d2e3722EC0e401fE3819E64278a42ae4DE9",
-  PaymasterV4: process.env.KEEPER_PAYMASTER || "0x2118e9a404C15F70B1D4f53b400c8a566A5ea4B6",
-};
-const abi = parseAbi([
-  "function cachedPrice() view returns (int256, uint256)",
-  "function priceStalenessThreshold() view returns (uint256)",
-]);
-const MIN_BALANCE_WEI = 10_000_000_000_000_000n; // 0.01 ETH
-
+// Everything that can throw, including reading the config and loading viem, is inside try, so a
+// broken setup reports UNDETERMINED (exit 2) instead of crashing with exit 1, which reads as STALE.
 try {
+  const home = homedir();
+  const require = createRequire(`${home}/Dev/aastar/aastar-sdk-price-keeper/packages/core/package.json`);
+  const { createPublicClient, http, parseAbi, formatEther } = require("viem");
+
+  const rpc = readFileSync(`${home}/.config/aastar-price-keeper/rpc.env`, "utf8")
+    .match(/^RPC_URL=["']?([^"'\n]+)/m)?.[1];
+  if (!rpc) throw new Error("RPC_URL missing from rpc.env");
+  const keeper = readFileSync(`${home}/.config/aastar-price-keeper/address`, "utf8").trim();
+  const targets = {
+    SuperPaymaster: process.env.KEEPER_SUPERPAYMASTER || "0x09DF0d2e3722EC0e401fE3819E64278a42ae4DE9",
+    PaymasterV4: process.env.KEEPER_PAYMASTER || "0x2118e9a404C15F70B1D4f53b400c8a566A5ea4B6",
+  };
+  const abi = parseAbi([
+    "function cachedPrice() view returns (int256, uint256)",
+    "function priceStalenessThreshold() view returns (uint256)",
+  ]);
+  const MIN_BALANCE_WEI = 10_000_000_000_000_000n; // 0.01 ETH
+
   const client = createPublicClient({ transport: http(rpc) });
   const { timestamp } = await client.getBlock();
   let ok = true;

@@ -61,8 +61,15 @@ echo 99999999999 > "$T/state/alerted-stale"
 run "future stamp" STUB_CODE=1 STUB_OUT="STALE PaymasterV4"
 expect "does not mute" '[ "$(sent)" = 1 ]'
 
+run "a second item starts failing within the interval" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 x
+LOW_GAS keeper balance=0.001 ETH"
+expect "re-alerts at once with both lines" '[ "$(sent)" = 1 ] && grep -q "LOW_GAS keeper" "$T/sent"'
+run "same two items again" STUB_CODE=1 STUB_OUT="LOW_GAS keeper y
+STALE PaymasterV4 z"
+expect "not repeated (order and detail do not matter)" '[ "$(sent)" = 0 ]'
+
 run "recovered"
-expect "one RECOVERED, stamp cleared" '[ "$(sent)" = 1 ] && grep -q RECOVERED "$T/sent" && [ ! -f "$T/state/alerted-stale" ]'
+expect "one RECOVERED, stamp cleared" '[ "$(sent)" = 1 ] && grep -q RECOVERED "$T/sent" && [ ! -f "$T/state/alerted-stale" ] && [ ! -f "$T/state/alerted-stale-kinds" ]'
 
 run "fresh again"
 expect "no second RECOVERED" '[ "$(sent)" = 0 ] && grep -q "status exit 0" "$T/log"'
@@ -107,8 +114,12 @@ rm -rf "$T/state"
 run "status command fds" STUB_FDS=1
 expect "inherits no fd above 2" '! grep -q FDLEAK "$T/log"'
 
-run "child exits but a descendant keeps the pipe" STUB_BG=30 STALE_WATCH_STATUS_TIMEOUT=1 STALE_WATCH_UNDETERMINED_AFTER=1
-expect "still bounded: UNDETERMINED, ends in seconds" 'grep -q "did not finish within 1s" "$T/sent" && [ "$ELAPSED" -lt 10 ]'
+run "child exits 0 but a descendant keeps the pipe" STUB_BG=30 STALE_WATCH_STATUS_TIMEOUT=1 STALE_WATCH_UNDETERMINED_AFTER=1
+expect "the child's result stands: exit 0, no alert, ends in seconds" \
+  '[ "$(sent)" = 0 ] && grep -q "status exit 0: FRESH" "$T/log" && [ "$ELAPSED" -lt 10 ]'
+run "child exits 1 but a descendant keeps the pipe" STUB_BG=30 STUB_CODE=1 STUB_OUT="STALE PaymasterV4" STALE_WATCH_UNDETERMINED_AFTER=1
+expect "STALE alert, not UNDETERMINED; a short grace, not the 120s timeout" \
+  'grep -q "ALERT.*STALE PaymasterV4" "$T/sent" && ! grep -q UNDETERMINED "$T/sent" && [ "$ELAPSED" -lt 15 ]'
 rm -rf "$T/state"
 
 mkdir -p "$T/state"; echo 0008 > "$T/state/undetermined-count"
@@ -141,6 +152,14 @@ run "second check while the first is running" STUB_CODE=1 STUB_OUT="STALE x"
 expect "skipped" 'grep -q "holds the lock" "$T/log"'
 wait "$bg"
 rm -rf "$T/state"
+
+# status.mjs itself: a broken setup (no config, no viem) must exit 2, not 1, so it reads UNDETERMINED, not STALE.
+if command -v node >/dev/null; then
+  mkdir -p "$T/nohome"; out=$(HOME="$T/nohome" node "$HERE/status.mjs" 2>&1); rc=$?; CUR="status.mjs without its config"
+  expect "exit 2 with UNDETERMINED" '[ "$rc" = 2 ] && printf "%s" "$out" | grep -q "^UNDETERMINED"'
+else
+  echo "skip status.mjs check: no node"
+fi
 
 mkdir -p "$T/ro"; chmod 500 "$T/ro"
 SD="$T/ro/state" run "state dir cannot be created" WANT_RC=1 STUB_CODE=2

@@ -7,7 +7,8 @@
 #   stale-watch.sh --test   send one test message and exit
 #
 # Alert rules:
-#   status exit 1 (a cache STALE or keeper LOW_GAS)  alert at once, repeat at most every REALERT_SECONDS
+#   status exit 1 (a cache STALE or keeper LOW_GAS)  alert at once, repeat at most every REALERT_SECONDS,
+#                                                    or at once when the set of failing items changes
 #   status exit 2, or a status run that hangs        alert after UNDETERMINED_AFTER checks in a row
 #   back to exit 0 after an alert                    one RECOVERED message
 #   state that cannot be written                     alert at once (it would otherwise mute the rules above)
@@ -19,7 +20,6 @@ STATUS_CMD="${STALE_WATCH_STATUS_CMD:-node $CONFIG_DIR/status.mjs}"
 STATUS_TIMEOUT="${STALE_WATCH_STATUS_TIMEOUT:-120}"
 REALERT_SECONDS="${STALE_WATCH_REALERT_SECONDS:-3600}"
 UNDETERMINED_AFTER="${STALE_WATCH_UNDETERMINED_AFTER:-3}"
-LOCK_STALE_SECONDS="${STALE_WATCH_LOCK_STALE_SECONDS:-900}"
 TG_API="${STALE_WATCH_TG_API:-https://api.telegram.org}"
 CURL="${STALE_WATCH_CURL:-curl}"   # the test swaps in a stub
 
@@ -101,7 +101,8 @@ fi
 # while one is still going. A timeout counts as UNDETERMINED.
 # The supervisor reads the command's output itself and keeps the deadline until both the child has
 # exited and the pipe reached EOF, so a descendant left holding the pipe (even after the child
-# exits) cannot keep this run alive. On the deadline the whole process group is killed. The child
+# exits) cannot keep this run alive. On the deadline the whole process group is killed; if the child
+# had already exited by then, its own exit code and output are used, not a timeout. The child
 # gets no fds above 2, so it cannot inherit the lock.
 out="$(perl -e '
   use POSIX qw(:sys_wait_h); my $t = shift; my $deadline = time + $t;
@@ -122,12 +123,29 @@ out="$(perl -e '
         my $n = sysread($r, my $chunk, 65536); if ($n) { $buf .= $chunk } else { $eof = 1 }
       }
     } else { select(undef, undef, undef, 0.1) }
-    if (!defined $status && waitpid($pid, WNOHANG) == $pid) { $status = $? }
+    if (!defined $status && waitpid($pid, WNOHANG) == $pid) {
+      $status = $?;
+      # The child is done; a descendant still holding the pipe gets a short grace, not the full timeout.
+      $deadline = time + 5 if $deadline > time + 5;
+    }
     if ($eof && defined $status) {
       print $buf; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
     }
   }
-  kill "TERM", -$pid, $pid; sleep 2; kill "KILL", -$pid, $pid; waitpid($pid, WNOHANG);
+  # Deadline. If the child already exited and only a descendant holds the pipe, the child result
+  # stands: kill the group, keep what is still buffered in the pipe, and exit with its code.
+  $status = $? if !defined $status && waitpid($pid, WNOHANG) == $pid;
+  kill "TERM", -$pid, $pid; sleep 2; kill "KILL", -$pid, $pid;
+  if (defined $status) {
+    my $end = time + 2;
+    while (!$eof && time < $end) {
+      my $rin = ""; vec($rin, fileno($r), 1) = 1;
+      last unless select(my $rout = $rin, undef, undef, 0.5) > 0;
+      my $n = sysread($r, my $chunk, 65536); if ($n) { $buf .= $chunk } else { $eof = 1 }
+    }
+    print $buf; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+  }
+  waitpid($pid, WNOHANG);
   print $buf; exit 142;
 ' "$STATUS_TIMEOUT" $STATUS_CMD)"; code=$?
 if [ "$code" -eq 142 ]; then out="UNDETERMINED status did not finish within ${STATUS_TIMEOUT}s"; code=2; fi
@@ -137,6 +155,7 @@ put "$STATE_DIR/last-run" "$now_s $code" || state_broken "last-run"   # evidence
 
 # One stamp per alert kind, so an UNDETERMINED alert never mutes a later STALE one.
 stale_stamp="$STATE_DIR/alerted-stale"
+stale_kinds="$STATE_DIR/alerted-stale-kinds"
 undet_stamp="$STATE_DIR/alerted-undetermined"
 undet_file="$STATE_DIR/undetermined-count"
 
@@ -152,16 +171,21 @@ case "$code" in
     put "$undet_file" 0 || state_broken "undetermined-count"
     if [ -f "$stale_stamp" ] || [ -f "$undet_stamp" ]; then
       if send "[price-keeper] RECOVERED on $host: $(printf '%s' "$out" | tr '\n' ' ')"; then
-        rm -f "$stale_stamp" "$undet_stamp" || state_broken "clear stamps"
+        rm -f "$stale_stamp" "$stale_kinds" "$undet_stamp" || state_broken "clear stamps"
       fi
     fi
     ;;
   1)
     put "$undet_file" 0 || state_broken "undetermined-count"
-    if due "$stale_stamp"; then
-      bad="$(printf '%s\n' "$out" | grep -E '^(STALE|LOW_GAS)' | tr '\n' ' ')"
+    bad="$(printf '%s\n' "$out" | grep -E '^(STALE|LOW_GAS)' | tr '\n' ' ')"
+    # What is failing, e.g. "LOW_GAS:keeper STALE:PaymasterV4". A change re-alerts at once, so a
+    # second failure is not muted for an hour behind the first one's alert.
+    kinds="$(printf '%s\n' "$out" | awk '/^(STALE|LOW_GAS) /{print $1":"$2}' | sort -u | tr '\n' ' ')"
+    kinds="${kinds:-exit1}"
+    if due "$stale_stamp" || [ "$kinds" != "$(cat "$stale_kinds" 2>/dev/null)" ]; then
       if send "[price-keeper] ALERT on $host: ${bad:-status exit 1 }-- run keeperctl.sh status"; then
         put "$stale_stamp" "$now_s" || state_broken "alerted-stale"
+        put "$stale_kinds" "$kinds" || state_broken "alerted-stale-kinds"
       fi
     else
       log "still failing; not repeating within ${REALERT_SECONDS}s"
