@@ -8,38 +8,55 @@
 #
 # Alert rules:
 #   status exit 1 (a cache STALE or keeper LOW_GAS)  alert at once, repeat at most every REALERT_SECONDS
-#   status exit 2 (could not tell, e.g. RPC failed)  alert after UNDETERMINED_AFTER checks in a row
+#   status exit 2, or a status run that hangs        alert after UNDETERMINED_AFTER checks in a row
 #   back to exit 0 after an alert                    one RECOVERED message
+#   state that cannot be written                     alert at once (it would otherwise mute the rules above)
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 CONFIG_DIR="${KEEPER_CONFIG_DIR:-$HOME/.config/aastar-price-keeper}"
 STATE_DIR="${STALE_WATCH_STATE_DIR:-$CONFIG_DIR/stale-watch}"
 STATUS_CMD="${STALE_WATCH_STATUS_CMD:-node $CONFIG_DIR/status.mjs}"
+STATUS_TIMEOUT="${STALE_WATCH_STATUS_TIMEOUT:-120}"
 REALERT_SECONDS="${STALE_WATCH_REALERT_SECONDS:-3600}"
 UNDETERMINED_AFTER="${STALE_WATCH_UNDETERMINED_AFTER:-3}"
+LOCK_STALE_SECONDS="${STALE_WATCH_LOCK_STALE_SECONDS:-900}"
 TG_API="${STALE_WATCH_TG_API:-https://api.telegram.org}"
 CURL="${STALE_WATCH_CURL:-curl}"   # the test swaps in a stub
-mkdir -p "$STATE_DIR"
 
 now() { date -u +%s; }
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
-# Reads a non-negative integer from a state file; anything else counts as 0.
-read_int() { local v; v="$(cat "$1" 2>/dev/null)"; case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac; }
+# A decimal integer from a state file. Leading zeros are dropped (bash would read 0008 as bad octal);
+# empty, non-digit or longer than 12 digits counts as 0.
+read_int() {
+  local v; v="$(cat "$1" 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) echo 0; return ;; esac
+  [ "${#v}" -le 12 ] || { echo 0; return; }
+  echo $((10#$v))
+}
 
-send() { # text -> 0 when Telegram accepted it
+send() { # text -> 0 only when curl succeeded and Telegram answered ok:true
   [ -f "$CONFIG_DIR/telegram.env" ] || { log "no telegram.env -- cannot alert: $1"; return 1; }
   local TELEGRAM_BOT_TOKEN="" TELEGRAM_CHAT_ID=""
   # shellcheck disable=SC1091
   . "$CONFIG_DIR/telegram.env"
   [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || { log "telegram.env incomplete -- cannot alert"; return 1; }
   # The token goes through curl's config on stdin, so it never appears in the process list.
-  local resp
+  local resp rc errf; errf="$(mktemp)"
   resp="$(printf 'url = "%s/bot%s/sendMessage"\n' "$TG_API" "$TELEGRAM_BOT_TOKEN" |
-    $CURL -sS -m 20 -K - --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=$1" 2>&1)"
-  case "$resp" in *'"ok":true'*) return 0 ;; esac
-  log "telegram send FAILED: $(printf '%s' "$resp" | head -c 200)"
-  return 1
+    $CURL -sS -m 20 -K - --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=$1" 2>"$errf")"
+  rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$resp" | grep -Eq '^[[:space:]]*\{[[:space:]]*"ok"[[:space:]]*:[[:space:]]*true'; then
+    rm -f "$errf"; return 0
+  fi
+  log "telegram send FAILED (curl exit $rc): $(printf '%s' "$resp" | head -c 200) $(head -c 200 "$errf")"
+  rm -f "$errf"; return 1
+}
+
+put() { # file value -> atomic replace; 1 on failure
+  local tmp="$1.tmp.$$"
+  printf '%s\n' "$2" > "$tmp" 2>/dev/null && mv -f "$tmp" "$1" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null; return 1
 }
 
 host="$(scutil --get LocalHostName 2>/dev/null || hostname)"
@@ -51,10 +68,37 @@ if [ "${1:-}" = "--test" ]; then
   exit 1
 fi
 
-out="$($STATUS_CMD 2>&1)"; code=$?
+state_broken() {
+  log "state dir $STATE_DIR not writable: $1"
+  send "[price-keeper] stale-watch on $host cannot write its state ($1) -- alerts may be muted until fixed"
+  exit 1
+}
+mkdir -p "$STATE_DIR" 2>/dev/null || state_broken "mkdir failed"
+
+# One check at a time (a manual run can overlap the scheduled one). mkdir is atomic; a lock left by a
+# killed run is taken over once it is older than LOCK_STALE_SECONDS.
+LOCK="$STATE_DIR/lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  held="$(read_int "$LOCK/since")"
+  # No stamp (a run killed between mkdir and the stamp): fall back to the lock dir's mtime, so such a
+  # lock still expires instead of blocking every later run.
+  [ "$held" -gt 0 ] || held="$(stat -f %m "$LOCK" 2>/dev/null || echo 0)"
+  if [ $(( $(now) - held )) -ge "$LOCK_STALE_SECONDS" ]; then
+    log "taking over a stale lock from $held"; rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || { log "lock busy"; exit 0; }
+  else
+    log "another check holds the lock -- skipping this run"; exit 0
+  fi
+fi
+trap 'rm -rf "$LOCK"' EXIT
+put "$LOCK/since" "$(now)" || state_broken "lock stamp"
+
+# Bounded run: a hung RPC call would otherwise keep this job alive, and launchd starts no new run
+# while one is still going. A timeout counts as UNDETERMINED.
+out="$(perl -e 'alarm shift; exec @ARGV or exit 127' "$STATUS_TIMEOUT" $STATUS_CMD 2>&1)"; code=$?
+if [ "$code" -eq 142 ]; then out="UNDETERMINED status did not finish within ${STATUS_TIMEOUT}s"; code=2; fi
 log "status exit $code: $(printf '%s' "$out" | tr '\n' ';')"
 now_s="$(now)"
-echo "$now_s $code" > "$STATE_DIR/last-run"   # evidence that the job fires
+put "$STATE_DIR/last-run" "$now_s $code" || state_broken "last-run"   # evidence that the job fires
 
 # One stamp per alert kind, so an UNDETERMINED alert never mutes a later STALE one.
 stale_stamp="$STATE_DIR/alerted-stale"
@@ -70,25 +114,31 @@ due() { # stamp-file -> 0 when no alert is outstanding or the last one is older 
 
 case "$code" in
   0)
-    echo 0 > "$undet_file"
+    put "$undet_file" 0 || state_broken "undetermined-count"
     if [ -f "$stale_stamp" ] || [ -f "$undet_stamp" ]; then
-      send "[price-keeper] RECOVERED on $host: $(printf '%s' "$out" | tr '\n' ' ')" && rm -f "$stale_stamp" "$undet_stamp"
+      if send "[price-keeper] RECOVERED on $host: $(printf '%s' "$out" | tr '\n' ' ')"; then
+        rm -f "$stale_stamp" "$undet_stamp" || state_broken "clear stamps"
+      fi
     fi
     ;;
   1)
-    echo 0 > "$undet_file"
+    put "$undet_file" 0 || state_broken "undetermined-count"
     if due "$stale_stamp"; then
       bad="$(printf '%s\n' "$out" | grep -E '^(STALE|LOW_GAS)' | tr '\n' ' ')"
-      send "[price-keeper] ALERT on $host: ${bad:-status exit 1 }-- run keeperctl.sh status" && echo "$now_s" > "$stale_stamp"
+      if send "[price-keeper] ALERT on $host: ${bad:-status exit 1 }-- run keeperctl.sh status"; then
+        put "$stale_stamp" "$now_s" || state_broken "alerted-stale"
+      fi
     else
       log "still failing; not repeating within ${REALERT_SECONDS}s"
     fi
     ;;
   *)
-    n=$(( $(read_int "$undet_file") + 1 )); echo "$n" > "$undet_file"
+    n=$(( $(read_int "$undet_file") + 1 ))
+    put "$undet_file" "$n" || state_broken "undetermined-count"
     if [ "$n" -ge "$UNDETERMINED_AFTER" ] && due "$undet_stamp"; then
-      send "[price-keeper] UNDETERMINED on $host for $n checks in a row: $(printf '%s' "$out" | tail -1)" \
-        && echo "$now_s" > "$undet_stamp"
+      if send "[price-keeper] UNDETERMINED on $host for $n checks in a row: $(printf '%s' "$out" | tail -1)"; then
+        put "$undet_stamp" "$now_s" || state_broken "alerted-undetermined"
+      fi
     fi
     ;;
 esac
