@@ -11,6 +11,10 @@ cat > "$T/status" <<'S'
 #!/bin/bash
 # STUB_SLEEP runs in a child (bash -c), so a hang is held by a DESCENDANT of the status command.
 [ -n "${STUB_SLEEP:-}" ] && bash -c "sleep $STUB_SLEEP"
+# STUB_FDS: report any open fd above 2 (the lock must not leak into the status command).
+[ -n "${STUB_FDS:-}" ] && for fd in /dev/fd/*; do n="${fd##*/}"; [ "$n" -gt 2 ] && [ "$n" != 255 ] && [ -e "$fd" ] && echo "FDLEAK $n"; done
+# STUB_BG: leave a background descendant holding stdout and exit at once.
+[ -n "${STUB_BG:-}" ] && { sleep "$STUB_BG" & }
 printf '%s\n' "${STUB_OUT:-FRESH SuperPaymaster age=1s limit=4200s}"; exit "${STUB_CODE:-0}"
 S
 cat > "$T/curl" <<'S'
@@ -100,6 +104,13 @@ expect "UNDETERMINED alert, and the run ends in seconds, not 30" \
   'grep -q "did not finish within 1s" "$T/sent" && [ "$ELAPSED" -lt 10 ]'
 rm -rf "$T/state"
 
+run "status command fds" STUB_FDS=1
+expect "inherits no fd above 2" '! grep -q FDLEAK "$T/log"'
+
+run "child exits but a descendant keeps the pipe" STUB_BG=30 STALE_WATCH_STATUS_TIMEOUT=1 STALE_WATCH_UNDETERMINED_AFTER=1
+expect "still bounded: UNDETERMINED, ends in seconds" 'grep -q "did not finish within 1s" "$T/sent" && [ "$ELAPSED" -lt 10 ]'
+rm -rf "$T/state"
+
 mkdir -p "$T/state"; echo 0008 > "$T/state/undetermined-count"
 run "counter with leading zeros" STUB_CODE=2 STUB_OUT="UNDETERMINED x" STALE_WATCH_UNDETERMINED_AFTER=9
 expect "read as decimal 8, so the 9th check alerts" '[ "$(cat "$T/state/undetermined-count")" = 9 ] && [ "$(sent)" = 1 ]'
@@ -115,6 +126,20 @@ expect "skips without touching state" '[ "$(sent)" = 0 ] && [ ! -f "$T/state/las
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
 run "lock file left behind after the holder died" STUB_CODE=1 STUB_OUT="STALE x"
 expect "not blocking: alert sent" '[ "$(sent)" = 1 ]'
+rm -rf "$T/state"
+
+# The worker (not a parent that could be killed separately) must hold the lock for the whole check.
+env KEEPER_CONFIG_DIR="$T/cfg" STALE_WATCH_STATE_DIR="$T/state" STALE_WATCH_STATUS_CMD="$T/status" \
+  STALE_WATCH_CURL="$T/curl" SENT="$T/sent.bg" STUB_SLEEP=4 STALE_WATCH_STATUS_TIMEOUT=30 \
+  bash "$HERE/stale-watch.sh" > "$T/log.bg" 2>&1 & bg=$!
+sleep 1
+# $bg runs perl as a child; perl must have exec'd into the bash worker, not stayed around as its parent.
+kid=$(pgrep -P "$bg" | head -1); comm=$(ps -o comm= -p "$kid" 2>/dev/null)
+case "$comm" in */bash|bash) echo "ok   lock: the lock holder is the bash worker itself ($comm)" ;;
+  *) echo "FAIL lock: child of $bg is '$comm', not the bash worker"; fail=1 ;; esac
+run "second check while the first is running" STUB_CODE=1 STUB_OUT="STALE x"
+expect "skipped" 'grep -q "holds the lock" "$T/log"'
+wait "$bg"
 rm -rf "$T/state"
 
 mkdir -p "$T/ro"; chmod 500 "$T/ro"

@@ -78,14 +78,16 @@ state_broken() {
 mkdir -p "$STATE_DIR" 2>/dev/null || state_broken "mkdir failed"
 
 # One check at a time (a manual run can overlap the scheduled one). perl takes an exclusive flock on
-# the lock file and runs the rest of this script as its child; the kernel drops the lock when perl
-# exits, so a killed run cannot leave a lock behind.
+# the lock file and execs this script again with the lock fd still open; the kernel drops the lock
+# when that worker exits, however it exits, so a killed run cannot leave a lock behind.
 if [ -z "${STALE_WATCH_LOCKED:-}" ]; then
+  # The lock fd is kept open across exec, so the bash worker itself holds the lock until it exits.
   STALE_WATCH_LOCKED=1 perl -e '
-    use Fcntl qw(:flock); my $lock = shift;
+    use Fcntl qw(:flock F_SETFD); my $lock = shift;
     open(my $fh, ">>", $lock) or exit 3;
     flock($fh, LOCK_EX | LOCK_NB) or exit 75;
-    system(@ARGV); exit($? == -1 ? 127 : ($? & 127) ? 128 + ($? & 127) : $? >> 8);
+    fcntl($fh, F_SETFD, 0) or exit 3;
+    exec @ARGV or exit 127;
   ' "$STATE_DIR/lock" bash "$0" "$@"
   rc=$?
   case "$rc" in
@@ -97,15 +99,37 @@ fi
 
 # Bounded run: a hung RPC call would otherwise keep this job alive, and launchd starts no new run
 # while one is still going. A timeout counts as UNDETERMINED.
-# The command runs in its own process group and the whole group is killed on timeout, so a
-# descendant holding the output pipe cannot keep this run waiting.
+# The supervisor reads the command's output itself and keeps the deadline until both the child has
+# exited and the pipe reached EOF, so a descendant left holding the pipe (even after the child
+# exits) cannot keep this run alive. On the deadline the whole process group is killed. The child
+# gets no fds above 2, so it cannot inherit the lock.
 out="$(perl -e '
-  my $t = shift; my $pid = fork; defined $pid or exit 127;
-  if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
-  $SIG{ALRM} = sub { kill "TERM", -$pid, $pid; sleep 2; kill "KILL", -$pid, $pid; waitpid($pid, 0); exit 142 };
-  alarm $t; waitpid($pid, 0);
-  exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
-' "$STATUS_TIMEOUT" $STATUS_CMD 2>&1)"; code=$?
+  use POSIX qw(:sys_wait_h); my $t = shift; my $deadline = time + $t;
+  pipe(my $r, my $w) or exit 127;
+  my $pid = fork; defined $pid or exit 127;
+  if (!$pid) {
+    setpgrp(0, 0); close $r;
+    open(STDOUT, ">&", $w) or exit 127; open(STDERR, ">&", $w) or exit 127; close $w;
+    POSIX::close($_) for 3 .. 255;
+    exec @ARGV; exit 127;
+  }
+  close $w; my ($buf, $eof, $status) = ("", 0, undef);
+  while (1) {
+    my $left = $deadline - time; last if $left <= 0;
+    if (!$eof) {
+      my $rin = ""; vec($rin, fileno($r), 1) = 1;
+      if (select(my $rout = $rin, undef, undef, $left > 1 ? 1 : $left) > 0) {
+        my $n = sysread($r, my $chunk, 65536); if ($n) { $buf .= $chunk } else { $eof = 1 }
+      }
+    } else { select(undef, undef, undef, 0.1) }
+    if (!defined $status && waitpid($pid, WNOHANG) == $pid) { $status = $? }
+    if ($eof && defined $status) {
+      print $buf; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+    }
+  }
+  kill "TERM", -$pid, $pid; sleep 2; kill "KILL", -$pid, $pid; waitpid($pid, WNOHANG);
+  print $buf; exit 142;
+' "$STATUS_TIMEOUT" $STATUS_CMD)"; code=$?
 if [ "$code" -eq 142 ]; then out="UNDETERMINED status did not finish within ${STATUS_TIMEOUT}s"; code=2; fi
 log "status exit $code: $(printf '%s' "$out" | tr '\n' ';')"
 now_s="$(now)"
