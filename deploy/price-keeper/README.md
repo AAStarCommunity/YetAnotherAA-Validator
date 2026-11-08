@@ -27,8 +27,8 @@ git checkout -- pnpm-lock.yaml
 
 mkdir -p ~/.config/aastar-price-keeper && chmod 700 ~/.config/aastar-price-keeper
 cd <this repo>/deploy/price-keeper
-cp run.sh keeperctl.sh status.mjs ~/.config/aastar-price-keeper/
-cp io.aastar.price-keeper.plist ~/Library/LaunchAgents/
+cp run.sh keeperctl.sh status.mjs stale-watch.sh ~/.config/aastar-price-keeper/
+cp io.aastar.price-keeper.plist io.aastar.price-keeper-stale-watch.plist ~/Library/LaunchAgents/
 ```
 
 Create these files in `~/.config/aastar-price-keeper/`. Set mode 600 on the
@@ -63,13 +63,40 @@ previous keeper stayed running for weeks while every RPC call returned 403.
 | 1         | A cache is stale or the balance is below 0.01 ETH                                |
 | 2         | The check could not determine the state, for example because the RPC call failed |
 
-Nothing runs `status` on a schedule yet, so someone has to run it by hand.
+## External stale check
+
+LaunchAgent `io.aastar.price-keeper-stale-watch` runs `stale-watch.sh` every
+600s and at load, so it comes back after a reboot. It runs `status.mjs` and
+sends Telegram messages through the same bot and chat as the keeper, from a
+separate process, so it still alerts when the keeper is stuck or has skipped a
+target.
+
+| `status` exit | What `stale-watch` sends                                   |
+| ------------- | ---------------------------------------------------------- |
+| 0             | `RECOVERED`, once, if an alert was outstanding             |
+| 1             | `ALERT` with the `STALE` / `LOW_GAS` lines, at most hourly |
+| 2             | `UNDETERMINED` after 3 checks in a row, at most hourly     |
+
+Install or update it on the Mini:
+
+```bash
+cp stale-watch.sh ~/.config/aastar-price-keeper/
+cp io.aastar.price-keeper-stale-watch.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.aastar.price-keeper-stale-watch.plist
+launchctl print gui/$(id -u)/io.aastar.price-keeper-stale-watch | grep -E "state|run interval|runs"
+bash ~/.config/aastar-price-keeper/stale-watch.sh --test   # one TEST message to the chat
+```
+
+`~/.config/aastar-price-keeper/stale-watch/last-run` holds the time and exit
+code of the last check, which shows the job is firing. Its log is
+`~/Library/Logs/aastar-price-keeper-stale-watch.log`. Test it offline with
+`bash deploy/price-keeper/test-stale-watch.sh`.
 
 ## Limits
 
 - Telegram alerts go through `@AAstarMonitorBot`, configured in `telegram.env`
-  (mode 600). They come from the keeper process, so a dead keeper or a dead Mini
-  sends nothing; `status` is still the check for that.
+  (mode 600). The keeper's own alerts stop when the keeper dies; `stale-watch`
+  covers that, but a dead Mini sends nothing at all.
 - `status` warns below 0.01 ETH.
 - `run.sh` sets the Chainlink stale alert to 4200s. The SDK default of 600s
   alerted about every 12 minutes on Sepolia, where normal feed ages reach about
