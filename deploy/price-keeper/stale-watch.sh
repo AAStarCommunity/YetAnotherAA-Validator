@@ -46,7 +46,9 @@ send() { # text -> 0 only when curl succeeded and Telegram answered ok:true
   resp="$(printf 'url = "%s/bot%s/sendMessage"\n' "$TG_API" "$TELEGRAM_BOT_TOKEN" |
     $CURL -sS -m 20 -K - --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=$1" 2>"$errf")"
   rc=$?
-  if [ "$rc" -eq 0 ] && printf '%s' "$resp" | grep -Eq '^[[:space:]]*\{[[:space:]]*"ok"[[:space:]]*:[[:space:]]*true'; then
+  # Delivered only if curl succeeded and the whole body parses as JSON whose top-level ok is boolean true.
+  if [ "$rc" -eq 0 ] && [ "$(printf '%s' "$resp" | plutil -type ok - 2>/dev/null)" = bool ] &&
+     [ "$(printf '%s' "$resp" | plutil -extract ok raw -o - - 2>/dev/null)" = true ]; then
     rm -f "$errf"; return 0
   fi
   log "telegram send FAILED (curl exit $rc): $(printf '%s' "$resp" | head -c 200) $(head -c 200 "$errf")"
@@ -75,26 +77,35 @@ state_broken() {
 }
 mkdir -p "$STATE_DIR" 2>/dev/null || state_broken "mkdir failed"
 
-# One check at a time (a manual run can overlap the scheduled one). mkdir is atomic; a lock left by a
-# killed run is taken over once it is older than LOCK_STALE_SECONDS.
-LOCK="$STATE_DIR/lock"
-if ! mkdir "$LOCK" 2>/dev/null; then
-  held="$(read_int "$LOCK/since")"
-  # No stamp (a run killed between mkdir and the stamp): fall back to the lock dir's mtime, so such a
-  # lock still expires instead of blocking every later run.
-  [ "$held" -gt 0 ] || held="$(stat -f %m "$LOCK" 2>/dev/null || echo 0)"
-  if [ $(( $(now) - held )) -ge "$LOCK_STALE_SECONDS" ]; then
-    log "taking over a stale lock from $held"; rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || { log "lock busy"; exit 0; }
-  else
-    log "another check holds the lock -- skipping this run"; exit 0
-  fi
+# One check at a time (a manual run can overlap the scheduled one). perl takes an exclusive flock on
+# the lock file and runs the rest of this script as its child; the kernel drops the lock when perl
+# exits, so a killed run cannot leave a lock behind.
+if [ -z "${STALE_WATCH_LOCKED:-}" ]; then
+  STALE_WATCH_LOCKED=1 perl -e '
+    use Fcntl qw(:flock); my $lock = shift;
+    open(my $fh, ">>", $lock) or exit 3;
+    flock($fh, LOCK_EX | LOCK_NB) or exit 75;
+    system(@ARGV); exit($? == -1 ? 127 : ($? & 127) ? 128 + ($? & 127) : $? >> 8);
+  ' "$STATE_DIR/lock" bash "$0" "$@"
+  rc=$?
+  case "$rc" in
+    75) log "another check holds the lock -- skipping this run"; exit 0 ;;
+    3) state_broken "cannot open lock file" ;;
+  esac
+  exit "$rc"
 fi
-trap 'rm -rf "$LOCK"' EXIT
-put "$LOCK/since" "$(now)" || state_broken "lock stamp"
 
 # Bounded run: a hung RPC call would otherwise keep this job alive, and launchd starts no new run
 # while one is still going. A timeout counts as UNDETERMINED.
-out="$(perl -e 'alarm shift; exec @ARGV or exit 127' "$STATUS_TIMEOUT" $STATUS_CMD 2>&1)"; code=$?
+# The command runs in its own process group and the whole group is killed on timeout, so a
+# descendant holding the output pipe cannot keep this run waiting.
+out="$(perl -e '
+  my $t = shift; my $pid = fork; defined $pid or exit 127;
+  if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
+  $SIG{ALRM} = sub { kill "TERM", -$pid, $pid; sleep 2; kill "KILL", -$pid, $pid; waitpid($pid, 0); exit 142 };
+  alarm $t; waitpid($pid, 0);
+  exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
+' "$STATUS_TIMEOUT" $STATUS_CMD 2>&1)"; code=$?
 if [ "$code" -eq 142 ]; then out="UNDETERMINED status did not finish within ${STATUS_TIMEOUT}s"; code=2; fi
 log "status exit $code: $(printf '%s' "$out" | tr '\n' ';')"
 now_s="$(now)"
