@@ -71,11 +71,11 @@ sends Telegram messages through the same bot and chat as the keeper, from a
 separate process, so it still alerts when the keeper is stuck or has skipped a
 target.
 
-| `status` exit | What `stale-watch` sends                                                                             |
-| ------------- | ---------------------------------------------------------------------------------------------------- |
-| 0             | `RECOVERED`, once, if an alert was outstanding                                                       |
-| 1             | `ALERT` with the `STALE` / `LOW_GAS` lines, at most hourly, and at once when what is failing changes |
-| 2             | `UNDETERMINED` after 3 checks in a row, at most hourly                                               |
+| `status` exit | What `stale-watch` sends                                                                      |
+| ------------- | --------------------------------------------------------------------------------------------- |
+| 0             | `RECOVERED`, once, if an alert was outstanding                                                |
+| 1             | `ALERT` with the `STALE` / `LOW_GAS` lines, at most hourly, and at once when a new item fails |
+| 2             | `UNDETERMINED` after 3 checks in a row, at most hourly                                        |
 
 Install or update it on the Mini:
 

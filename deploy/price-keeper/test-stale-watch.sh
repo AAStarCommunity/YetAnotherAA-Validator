@@ -104,6 +104,16 @@ expect "state left as it was, so the next run retries" \
 run "the same new set, Telegram accepts" STUB_CODE=1 STUB_OUT="STALE SuperPaymaster x
 STALE PaymasterV4 y"
 expect "retried within the interval and delivered" '[ "$(sent)" = 1 ] && grep -q "STALE SuperPaymaster" "$T/sent"'
+run "one item recovers, the set only shrinks" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 y"
+expect "not repeated within the interval" '[ "$(sent)" = 0 ] && grep -q "not repeating" "$T/log"'
+run "the item flaps back" STUB_CODE=1 STUB_OUT="STALE SuperPaymaster x
+STALE PaymasterV4 y"
+expect "not repeated: it was in the last alert" '[ "$(sent)" = 0 ]'
+rm -rf "$T/state"
+run "one STALE item" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 y"
+expect "alerts" '[ "$(sent)" = 1 ]'
+run "a different item of the same kind" STUB_CODE=1 STUB_OUT="STALE SuperPaymaster x"
+expect "re-alerts at once" '[ "$(sent)" = 1 ] && grep -q "STALE SuperPaymaster" "$T/sent"'
 
 run "recovered"
 expect "one RECOVERED, stamp cleared" '[ "$(sent)" = 1 ] && grep -q RECOVERED "$T/sent" && [ ! -f "$T/state/alerted-stale" ] && [ ! -f "$T/state/alerted-stale-kinds" ]'

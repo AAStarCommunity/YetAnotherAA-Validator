@@ -8,7 +8,7 @@
 #
 # Alert rules:
 #   status exit 1 (a cache STALE or keeper LOW_GAS)  alert at once, repeat at most every REALERT_SECONDS,
-#                                                    or at once when the set of failing items changes
+#                                                    or at once when an item not in the last alert fails
 #   status exit 2, or a status run that hangs        alert after UNDETERMINED_AFTER checks in a row
 #   back to exit 0 after an alert                    one RECOVERED message
 #   state that cannot be written                     alert at once (it would otherwise mute the rules above)
@@ -178,11 +178,16 @@ case "$code" in
   1)
     put "$undet_file" 0 || state_broken "undetermined-count"
     bad="$(printf '%s\n' "$out" | grep -E '^(STALE|LOW_GAS)' | tr '\n' ' ')"
-    # What is failing, e.g. "LOW_GAS:keeper STALE:PaymasterV4". A change re-alerts at once, so a
-    # second failure is not muted for an hour behind the first one's alert.
+    # What is failing, e.g. "LOW_GAS:keeper STALE:PaymasterV4". An item that was not in the last
+    # alert re-alerts at once, so a second failure is not muted for an hour behind the first one.
+    # A set that only shrinks waits for the hourly repeat, so an item flapping around its threshold
+    # cannot alert on every run.
     kinds="$(printf '%s\n' "$out" | awk '/^(STALE|LOW_GAS) /{print $1":"$2}' | sort -u | tr '\n' ' ')"
     kinds="${kinds:-exit1}"
-    if due "$stale_stamp" || [ "$kinds" != "$(cat "$stale_kinds" 2>/dev/null)" ]; then
+    alerted=" $(cat "$stale_kinds" 2>/dev/null) "
+    new_item=""
+    for k in $kinds; do case "$alerted" in *" $k "*) ;; *) new_item="$k"; break ;; esac; done
+    if due "$stale_stamp" || [ -n "$new_item" ]; then
       if send "[price-keeper] ALERT on $host: ${bad:-status exit 1 }-- run keeperctl.sh status"; then
         put "$stale_stamp" "$now_s" || state_broken "alerted-stale"
         put "$stale_kinds" "$kinds" || state_broken "alerted-stale-kinds"
