@@ -120,8 +120,12 @@ The over-issue category, if the owner ever enables it, would be
 `body = abi.encode(uint256 B, bytes32 blockhashB, address token, address operator, uint256 epoch)`
 and its checker returns `IOverIssuable(token).isOverIssued()` **at execution**
 plus the B checks above. That is a check on current state taken while B is
-fresh, i.e. an ex-ante proof check. Not written now (DSR ruling: no category
-predicate until the owner enables one).
+fresh, i.e. an ex-ante proof check. It is acceptable only as an ex-ante gate: a
+stale or repaired state makes execution revert rather than framing anyone. It
+must also restrict `token` to an immutable set of known implementation
+codehashes (the xPNTs EIP-1167 clones), otherwise a mutable token returns `true`
+on demand. Not written now (DSR ruling: no category predicate until the owner
+enables one).
 
 ### 3.4 Off-chain half: verify before signing
 
@@ -145,22 +149,25 @@ watcher flags, whose factual fields are verified on-chain at write time.
   which a reply must match. No admin, no delete, no edit, no upgrade, no proxy.
 - `WRITER` (the watcher EOA) and `AGGREGATOR` are immutable constructor
   arguments. Only `WRITER` may append a primary entry.
-- Rotation: a lost or compromised watcher key means a new registry. The manifest
-  pins the current registry; readers follow the manifest; old registries stay
-  readable.
+- Rotation: a lost or compromised watcher key means a new registry. So does a
+  new aggregator (for example for more than 64 guardians), because `AGGREGATOR`
+  and its `domainSeparator` are fixed. The manifest pins the current registry;
+  readers follow the manifest; old registries stay readable.
 
 ### 4.2 Primary entry
 
 ```
 function disclose(
-    uint256 proposalId, uint8 kind,            // 0 = slash/rep (verifyAndExecute), 1 = generic (executeProposal)
+    uint256 proposalId, uint8 kind,            // 0 = slash/rep (verifyAndExecute), 1 = generic (executeProposal),
+                                               // 2 = queue (queueSlashWithConsensus) — reserved, see 4.2a
     bytes calldata messageInputs,              // kind 1: abi.encode(target, callDataHash, requiredThreshold)
                                                // kind 0: abi.encode of the aggregator's execute-slash fields
     address subjectToken,                      // community token the entry concerns, or 0
     uint256 signerMask, address[] calldata signers,
     bytes32 anchor,                            // once SP's anchor lands; else 0
     bytes32 txHash, uint64 blockNumber,
-    bytes32 evidenceHash, string calldata recordURI, bytes32 recordHash
+    bytes32 evidenceHash, bytes20 rulesetCommit,   // git SHA of the pinned ruleset (§5.2)
+    string calldata recordURI, bytes32 recordHash
 ) external returns (uint256 entryId)
 ```
 
@@ -180,13 +187,35 @@ On-chain checks, all must pass or revert:
    either path. The final tuple and key scheme come from SP's implemented code.
    A non-zero commitment is required (an unexecuted key has commitment 0 and is
    rejected).
-5. Emit
-   `Disclosed(entryId, proposalId, kind, signers, txHash, blockNumber, evidenceHash, recordURI, recordHash)`.
+5. Block binding (once the anchor is in the commitment): if `blockNumber - 1` is
+   inside the EIP-2935 window as seen now, require
+   `EIP2935.get(blockNumber - 1) == anchor` and set `blockVerified = true`.
+   Outside the window, set `blockVerified = false`; do not revert. The watcher
+   writes within minutes, so the normal case is verified.
+6. Emit
+   `Disclosed(entryId, proposalId, kind, signers, txHash, blockNumber, blockVerified, evidenceHash, rulesetCommit, recordURI, recordHash)`.
 
-What stays a **claim**: `txHash`/`blockNumber` (the commitment does not bind
-them; the recheck script confirms them), `recordURI` content, and the
-interpretation of why the action is misbehaviour. Readers treat an entry as a
-claim to recheck; the paper says so.
+What stays a **claim**: `txHash`, `blockNumber` when `blockVerified = false`,
+the `recordURI` content, and the interpretation of why the action is
+misbehaviour. The recheck script confirms the first two. Readers treat an entry
+as a claim to recheck; the paper says so.
+
+### 4.2a The queue path (kind 2) — blocking, pending SP
+
+`queueSlashWithConsensus` is a guardian-quorum action too: it freezes an
+operator. It does **not** write `proposalSignersCommitment` (SuperPaymaster
+`origin/main`: it checks the signatures, calls `SUPERPAYMASTER.queueSlash`, and
+emits `SlashPreQueued`). A disclosure of a quorum freeze therefore cannot have
+its signer set verified on-chain today. There are two ways forward:
+
+- SP adds a commitment on the queue path under its own typed key (for example
+  `keccak256(abi.encode(TAG_QUEUE, messageHash))`). The registry then verifies
+  kind 2 exactly like kinds 0 and 1.
+- If SP cannot add it, kind 2 entries carry `signersVerified = false`, and the
+  paper states that queue disclosures are unverified claims.
+
+`kind = 2` is reserved in the enum either way. The registry interface is not
+frozen until this is settled.
 
 ### 4.3 Reply entry (right of reply)
 
@@ -240,8 +269,14 @@ disabled.
 - Every BLS-executed action produces a record. A record is flagged
   **suspicious** when a rule says so (5.5.0 rules: any operator slash at all —
   impossible under the empty allowlist, so its appearance is itself the finding;
-  any generic call whose target/selector is outside a published expected set;
-  any reputation batch). Unflagged actions are still recorded as routine.
+  any generic call whose target/selector is outside the expected set; any
+  reputation batch; any queue freeze). Unflagged actions are still recorded as
+  routine.
+- The expected set of generic targets and selectors, and every flag rule, live
+  in one pinned file in this repo (`services/guardian-watcher/ruleset.json`).
+  Every record, and the registry event (`rulesetCommit`), carries the commit SHA
+  of the ruleset that produced the flag. That way the watcher cannot decide
+  after the fact what counts as suspicious.
 
 ### 5.3 Disclosure
 
@@ -337,7 +372,8 @@ On the A7 fork, archived under `docs/evidence/guardian-watcher-rehearsal/`:
    then RECOVERED.
 5. `pauseUnderstakedOperator` gap: injected staking slash below min → slash,
    detection, pause times.
-6. Rebuild one record from an RPC with no DVT state.
+6. Rebuild one record from an RPC with no DVT state. 6a. A queue-path (kind 2)
+   disclosure, once §4.2a is settled.
 7. Deployment facts: Mini only, keystore EOA distinct from
    guardian/owner/deployer, committee keeper disabled,
    `fraudProofVerifier == 0`, `categoryCount() == 0`.
