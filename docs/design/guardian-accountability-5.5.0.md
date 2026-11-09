@@ -174,11 +174,12 @@ On-chain checks, all must pass or revert:
    and thresholds are verified, not claimed.
 3. `signers` strictly ascending by `uint160`, length == popcount(`signerMask`).
 4. `keccak256(abi.encode(domainSeparator, TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, signers [, anchor]))`
-   == `AGGREGATOR.proposalSignersCommitment(key)`, where `key` is the raw
-   `proposalId` for `kind = 0` and
-   `uint256(keccak256(abi.encode(TAG_PROPOSAL, proposalId)))` for `kind = 1` (§7
-   item 3). The final tuple comes from SP's implemented code. A non-zero
-   commitment is required (an unexecuted id has commitment 0 and is rejected).
+   == `AGGREGATOR.proposalSignersCommitment(key)`, where `key` is the per-path
+   namespaced key SP settles (§7 item 3; **pending**). The registry derives it
+   from `kind` and the on-chain tag constants, and must not assume the raw id on
+   either path. The final tuple and key scheme come from SP's implemented code.
+   A non-zero commitment is required (an unexecuted key has commitment 0 and is
+   rejected).
 5. Emit
    `Disclosed(entryId, proposalId, kind, signers, txHash, blockNumber, evidenceHash, recordURI, recordHash)`.
 
@@ -292,18 +293,22 @@ detection time, pause tx time.
    `abi.encode` tuple to DVT.
 2. `signerMask` in `SlashExecuted` / `ProposalExecuted` — round 3a. Priority
    over the anchor if bytes are short.
-3. **C4-L-01 commitment collision — settled by SP (option a).** Today both paths
-   share `executedProposals[proposalId]`, so an id executes once. After C4-L-01
-   separates the replay bits, the same raw id could run on both paths and the
-   second run would overwrite `proposalSignersCommitment[id]`. SP's fix: the
-   commitment uses the same key as the replay bit. Slash path
-   (`verifyAndExecute`): raw `proposalId`. Generic path (`executeProposal`):
-   `k = uint256(keccak256(abi.encode(TAG_PROPOSAL, proposalId)))`,
-   `TAG_PROPOSAL` read on chain. (SP rejected "require the slot empty": a
-   generic id executed first would pre-consume the slash id.) The registry
-   selects the key from `kind`. Open: whether the `proposalId` field _inside_
-   the commitment tuple is the raw id or `k` on the generic path — from SP's
-   final tuple.
+3. **C4-L-01 commitment collision — key scheme pending from SP.** Today both
+   paths share `executedProposals[proposalId]`, so an id executes once. Once
+   C4-L-01 separates the replay bits, a raw id on one path can collide with a
+   namespaced key on the other and overwrite `proposalSignersCommitment`. This
+   holds in both directions: DSR found that a slash whose raw id equals
+   `keccak256(abi.encode(TAG_PROPOSAL, id'))` overwrites the generic commitment
+   of `id'`. SP's plan, pending byte measurement:
+   - slash key `keccak256(abi.encode(TAG_SLASH, id))`;
+   - generic key `keccak256(abi.encode(TAG_PROPOSAL, id))`;
+   - the same key for both `executedProposals` and `proposalSignersCommitment`.
+
+   Fallback: the raw slash id with `require(id < 2**128)`. SP rejected "require
+   the slot empty", because a generic id executed first would pre-consume a
+   slash id. DVT builds on whichever scheme SP ships. Also open: whether the
+   `proposalId` field _inside_ the commitment tuple is the raw id or the key.
+
 4. `MAX_VALIDATORS` 13 → 64; signerMask width unchanged (uint256).
 5. DVTValidator raw evidence per §3, empty allowlist in the 5.5.0 manifest.
 
