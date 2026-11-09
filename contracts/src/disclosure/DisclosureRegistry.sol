@@ -32,10 +32,9 @@ interface ICommunityToken {
  *         No admin, no owner, no upgrade, no delete, no edit. A lost writer key or a new aggregator
  *         means a new registry; the release manifest pins the current one.
  *
- * @dev PENDING SP rc.8 r3a/r3b — the commitment storage KEY per path and the exact commitment
- *      TUPLE (anchor position) are taken from SP's stated intent and MUST be re-checked against the
- *      implemented BLSAggregator before this contract is frozen. They live only in `commitmentKey`
- *      and `expectedCommitment`.
+ * @dev Key scheme and commitment tuple follow SP's BLSAggregator-4.13.0 (rc.8 r3b) as reported
+ *      from its implementation; PENDING re-check against SP's committed source SHA before freeze.
+ *      They live only in `commitmentKey` and `expectedCommitment`.
  */
 contract DisclosureRegistry {
     // ---- aggregator constants (byte-identical to SuperPaymaster BLSAggregator) ----
@@ -44,9 +43,9 @@ contract DisclosureRegistry {
     bytes32 internal constant TAG_REPUTATION = keccak256("SuperPaymaster.BLS.Reputation.v1");
     bytes32 internal constant TAG_PROPOSAL = keccak256("SuperPaymaster.BLS.Proposal.v1");
     bytes32 internal constant TAG_SIGNERS_COMMITMENT = keccak256("SuperPaymaster.BLS.SignersCommitment.v1");
-    /// @dev PENDING SP: typed slash key (byte priority 4). If SP ships the raw slash id instead,
-    ///      `commitmentKey` changes for SLASH/REPUTATION.
-    bytes32 internal constant TAG_SLASH = keccak256("SuperPaymaster.BLS.Slash.v1");
+    /// @dev verifyAndExecute keys its commitment at the RAW proposalId and requires id < 2^128, so a
+    ///      slash/reputation id can never equal a generic typed key or a queue message hash.
+    uint256 internal constant RAW_ID_BOUND = 1 << 128;
 
     /// @dev EIP-2935 history contract; same address and code on OP Mainnet, OP Sepolia, Sepolia.
     address internal constant HISTORY = 0x0000F90827F1C53a10cb7A02335B175320002935;
@@ -191,6 +190,8 @@ contract DisclosureRegistry {
             if (s.proposalId != 0) revert BadProposalId();
         } else if (s.proposalId == 0) {
             revert BadProposalId();
+        } else if (s.kind != Kind.GENERIC && s.proposalId >= RAW_ID_BOUND) {
+            revert BadProposalId();
         }
         messageHash = messageHashOf(ds, s.kind, s.proposalId, s.messageInputs);
         key = commitmentKey(s.kind, s.proposalId, messageHash);
@@ -272,15 +273,18 @@ contract DisclosureRegistry {
         revert BadKind();
     }
 
-    /// @notice Storage key of `proposalSignersCommitment` per path. PENDING SP final scheme.
+    /// @notice Storage key of `proposalSignersCommitment` per path (BLSAggregator-4.13.0 r3b):
+    ///   GENERIC    uint256(keccak256(abi.encode(TAG_PROPOSAL, proposalId)))  (= its replay slot)
+    ///   QUEUE      uint256(messageHash)
+    ///   SLASH/REP  proposalId (raw, < 2^128)
     function commitmentKey(Kind kind, uint256 proposalId, bytes32 messageHash) public pure returns (uint256) {
         if (kind == Kind.GENERIC) return uint256(keccak256(abi.encode(TAG_PROPOSAL, proposalId)));
         if (kind == Kind.QUEUE) return uint256(messageHash);
-        return uint256(keccak256(abi.encode(TAG_SLASH, proposalId))); // SLASH and REPUTATION
+        return proposalId;
     }
 
-    /// @notice The commitment tuple. PENDING SP final tuple (storage key in the id position,
-    ///         parent-block anchor appended).
+    /// @notice The commitment tuple, identical on all paths: storage key in the id position, signers
+    ///         ascending by uint160, parent-block hash `blockhash(N-1)` appended.
     function expectedCommitment(
         bytes32 ds,
         uint256 key,

@@ -176,13 +176,14 @@ contract DisclosureRegistryTest is Test {
         return keccak256(abi.encode(ds, keccak256("SuperPaymaster.BLS.Reputation.v1"), id, u, sc, e));
     }
 
-    /// Storage key per path — SP's stated rc.8 plan (PENDING the implemented code).
+    /// Storage key per path — BLSAggregator-4.13.0 r3b as SP reported it from code
+    /// (PENDING re-check against SP's committed SHA).
     function _spKey(DisclosureRegistry.Kind kind, uint256 id, bytes32 mh) internal pure returns (uint256) {
         if (kind == DisclosureRegistry.Kind.GENERIC) {
             return uint256(keccak256(abi.encode(keccak256("SuperPaymaster.BLS.Proposal.v1"), id)));
         }
         if (kind == DisclosureRegistry.Kind.QUEUE) return uint256(mh);
-        return uint256(keccak256(abi.encode(keccak256("SuperPaymaster.BLS.Slash.v1"), id)));
+        return id; // slash and reputation: raw id, < 2^128
     }
 
     function _slashInputs() internal returns (bytes memory) {
@@ -339,6 +340,31 @@ contract DisclosureRegistryTest is Test {
         vm.prank(writer);
         vm.expectRevert(DisclosureRegistry.BadProposalId.selector);
         reg.disclose(s, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+    }
+
+    /// A raw slash/reputation id >= 2^128 is rejected even when a commitment sits at that key —
+    /// e.g. a generic action's typed key, which a reputation id must never be able to claim.
+    function test_rawIdBoundRejectsCrossPathKey() public {
+        DisclosureRegistry.Signed memory g = _executed(DisclosureRegistry.Kind.GENERIC, 5, _genericInputs(), 0x7);
+        uint256 genericKey = _spKey(DisclosureRegistry.Kind.GENERIC, 5, bytes32(0));
+        assertGe(genericKey, uint256(1) << 128);
+
+        DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, genericKey, _slashInputs(), 0x7);
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.BadProposalId.selector);
+        reg.disclose(s, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+
+        // boundary: 2^128 - 1 is a valid raw id; 2^128 is not
+        DisclosureRegistry.Signed memory ok =
+            _executed(DisclosureRegistry.Kind.SLASH, (uint256(1) << 128) - 1, _slashInputs(), 0x7);
+        vm.prank(writer);
+        reg.disclose(ok, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+        DisclosureRegistry.Signed memory bad =
+            _executed(DisclosureRegistry.Kind.SLASH, uint256(1) << 128, _slashInputs(), 0x7);
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.BadProposalId.selector);
+        reg.disclose(bad, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+        g; // generic entry executed only to place a commitment at genericKey
     }
 
     // ---------------------------------------------------------------- writer
