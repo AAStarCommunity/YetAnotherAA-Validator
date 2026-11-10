@@ -42,6 +42,7 @@ export const REGISTRY_ABI = [
   "function disclose((uint8 kind, uint256 proposalId, bytes messageInputs, uint256 signerMask, address[] signers, bytes32 anchor) s, address subjectToken, bytes32 txHash, uint64 blockNumber, bytes20 rulesetCommit, string recordURI, bytes32 recordHash)",
   "event Disclosed(uint256 indexed entryId, uint8 indexed kind, uint256 indexed key, uint256 proposalId, bytes32 messageHash, address[] signers, address subjectToken, bytes32 txHash, uint64 blockNumber, bool blockVerified, bytes20 rulesetCommit, string recordURI, bytes32 recordHash)",
   "function AGGREGATOR() view returns (address)",
+  "function entryCount() view returns (uint256)",
 ];
 
 export const aggIface = new ethers.Interface(AGGREGATOR_ABI);
@@ -212,18 +213,21 @@ export function makeProvider(url) {
   return new ethers.JsonRpcProvider(url, undefined, { cacheTimeout: -1 });
 }
 
-/** Canonical hash of block `number` now, read uncached when the chain offers raw `send`. */
-async function canonicalHash(chain, number) {
-  if (typeof chain.send === "function") {
-    const b = await chain.send("eth_getBlockByNumber", [ethers.toQuantity(Number(number)), false]);
-    return b ? b.hash : null;
-  }
-  const b = await chain.getBlock(Number(number));
-  return b ? b.hash : null;
+/**
+ * Canonical header { hash, parentHash } of block `number` now, or null. Read uncached through raw
+ * `send` when the chain offers one (a Promise-returning `send(method, params) -> result`, as ethers'
+ * is); otherwise through getBlock.
+ */
+async function canonicalHeader(chain, number) {
+  const b =
+    typeof chain.send === "function"
+      ? await chain.send("eth_getBlockByNumber", [ethers.toQuantity(Number(number)), false])
+      : await chain.getBlock(Number(number));
+  return b && b.hash ? { hash: b.hash, parentHash: b.parentHash ?? undefined } : null;
 }
 
 async function canonical(chain, number, blockHash) {
-  const h = await canonicalHash(chain, number);
+  const h = (await canonicalHeader(chain, number))?.hash;
   return !!h && !!blockHash && h.toLowerCase() === String(blockHash).toLowerCase();
 }
 
@@ -251,8 +255,15 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
   const agg = ethers.getAddress(aggregator);
   const tx = await chain.getTransaction(txHash);
   const rc = await chain.getTransactionReceipt(txHash);
-  if (!tx || !rc) return { status: Status.MISMATCH, reason: "action tx not found" };
-  if (Number(rc.status) !== 1) return { status: Status.MISMATCH, reason: "action tx reverted" };
+  // Absence is not evidence: a pruned tx index, a reorg mid-check, or a fabricated hash all look
+  // the same from one RPC.
+  if (!tx || !rc) {
+    return {
+      status: Status.INCONCLUSIVE,
+      reason:
+        "action tx or receipt not available from this RPC (pruned index, reorg, or a fabricated hash)",
+    };
+  }
   const blockNumber = Number(rc.blockNumber);
   if (blockNumber > snapshot) {
     return {
@@ -260,12 +271,20 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
       reason: "action tx is newer than the confirmed snapshot",
     };
   }
-  if (!(await canonical(chain, blockNumber, rc.blockHash))) {
+  const header = await canonicalHeader(chain, blockNumber);
+  if (!header || header.hash.toLowerCase() !== String(rc.blockHash).toLowerCase()) {
     return {
       status: Status.INCONCLUSIVE,
       reason: "action receipt is not in the canonical chain (reorg?)",
     };
   }
+  // A MISMATCH from the action side is final only while the action is still canonical.
+  const mismatch = async reason =>
+    (await canonical(chain, blockNumber, rc.blockHash))
+      ? { status: Status.MISMATCH, reason }
+      : { status: Status.INCONCLUSIVE, reason: "canonical chain changed during the check" };
+  // Only a canonical receipt's status is evidence.
+  if (Number(rc.status) !== 1) return mismatch("action tx reverted");
 
   const commits = rc.logs
     .filter(
@@ -279,10 +298,7 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
     }));
   const commit = commits.find(c => c.key === BigInt(key));
   if (!commit) {
-    return {
-      status: Status.MISMATCH,
-      reason: `action tx emits no SignersCommitted for key ${key}`,
-    };
+    return mismatch(`action tx emits no SignersCommitted for key ${key}`);
   }
 
   // Facts that hold whatever the calldata looks like.
@@ -291,10 +307,13 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
     signerMask: commit.signerMask,
     blockNumber,
     blockHash: rc.blockHash,
-    anchor: await canonicalHash(chain, blockNumber - 1),
+    // The anchor is blockhash(N-1): the canonical header's parentHash. Missing => not a fact.
+    anchor: header.parentHash,
     caller: ethers.getAddress(tx.from),
     incomplete: [],
   };
+  if (facts.anchor === undefined)
+    facts.incomplete.push("action block header carries no parentHash");
 
   if (!tx.to || ethers.getAddress(tx.to) !== agg) {
     facts.incomplete.push(
@@ -311,17 +330,14 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
     (action.kind === Kind.SLASH || action.kind === Kind.REPUTATION) &&
     BigInt(action.proposalId) >= RAW_ID_BOUND
   ) {
-    return { status: Status.MISMATCH, reason: "action proposalId >= 2^128" };
+    return mismatch("action proposalId >= 2^128");
   }
 
   const ds = await view(chain, agg, "domainSeparator", [], blockNumber);
   const messageHash = messageHashOf(ds, action.kind, action.proposalId, action.fields);
   const derivedKey = commitmentKey(action.kind, action.proposalId, messageHash);
   if (derivedKey !== commit.key) {
-    return {
-      status: Status.MISMATCH,
-      reason: "key derived from calldata differs from SignersCommitted key",
-    };
+    return mismatch("key derived from calldata differs from SignersCommitted key");
   }
   Object.assign(facts, {
     kind: action.kind,
@@ -422,7 +438,8 @@ export async function recheckEntry(
   { registry, aggregator, entryId, fromBlock = 0, confirmations = 0, page = 10_000 }
 ) {
   assertBlockInt("fromBlock", fromBlock);
-  assertBlockInt("confirmations", confirmations); // page is checked by findEntryLogs
+  assertBlockInt("confirmations", confirmations);
+  assertBlockInt("page", page, { positive: true }); // before any RPC; findEntryLogs re-checks
   const done = (status, extra) => ({
     status,
     ok: status === Status.MATCH,
@@ -437,6 +454,25 @@ export async function recheckEntry(
       reasons: [`confirmed snapshot ${snapshot} is before fromBlock ${fromBlock}`],
     });
   }
+  // No log found anywhere up to head. Only the registry's own counter can turn that into proof:
+  // an id above entryCount was never issued (MISMATCH); otherwise the log search missed it.
+  const noLogVerdict = async () => {
+    const ret = await chain.call({
+      to: registry,
+      data: regIface.encodeFunctionData("entryCount", []),
+      blockTag: head,
+    });
+    const count = regIface.decodeFunctionResult("entryCount", ret)[0];
+    return BigInt(entryId) > count || BigInt(entryId) === 0n
+      ? done(Status.MISMATCH, {
+          reasons: [`entry ${entryId} was never issued (entryCount ${count} at block ${head})`],
+        })
+      : done(Status.INCONCLUSIVE, {
+          reasons: [
+            `entry ${entryId} exists (entryCount ${count}) but no Disclosed log was found from block ${fromBlock}`,
+          ],
+        });
+  };
   const logs = await findEntryLogs(chain, registry, entryId, fromBlock, snapshot, page);
   if (logs.length > 1) {
     return done(Status.MISMATCH, {
@@ -455,9 +491,7 @@ export async function recheckEntry(
             `entry ${entryId} is in block ${tail[0].blockNumber}, not yet ${confirmations} confirmations deep`,
           ],
         })
-      : done(Status.MISMATCH, {
-          reasons: [`expected one Disclosed log for entry ${entryId} up to block ${head}, found 0`],
-        });
+      : await noLogVerdict();
   }
   const log = logs[0];
   if (!(await canonical(chain, log.blockNumber, log.blockHash))) {
@@ -478,7 +512,17 @@ export async function recheckEntry(
   }
 
   const r = await rebuildFromAction(chain, aggregator, entry.txHash, entry.key, snapshot);
-  if (r.status) return done(r.status, { reasons: [r.reason], entry, unverified });
+  if (r.status) {
+    // A definitive verdict needs the disclosure to still be canonical, like the full path below.
+    if (r.status === Status.MISMATCH && !(await canonical(chain, log.blockNumber, log.blockHash))) {
+      return done(Status.INCONCLUSIVE, {
+        reasons: ["canonical chain changed during the check"],
+        entry,
+        unverified,
+      });
+    }
+    return done(r.status, { reasons: [r.reason], entry, unverified });
+  }
   const diffs = compareEntry(entry, signed, r.facts);
 
   // Both inclusions must still be canonical after all reads, or a reorg ran underneath the check.

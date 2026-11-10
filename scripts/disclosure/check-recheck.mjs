@@ -109,22 +109,37 @@ function makeChain() {
   let slots = { 1: G[0], 2: G[1], 3: G[2] };
   const snapshot = () => ({ ...slots });
   for (let n = 0; n <= head; n++)
-    blocks.set(n, { hash: ethers.id(`block-${n}`), slots: snapshot() });
+    blocks.set(n, {
+      hash: ethers.id(`block-${n}`),
+      parentHash: n ? ethers.id(`block-${n - 1}`) : ethers.ZeroHash,
+      slots: snapshot(),
+    });
 
   const mine = () => {
     head++;
-    blocks.set(head, { hash: ethers.id(`block-${head}`), slots: snapshot() });
+    blocks.set(head, {
+      hash: ethers.id(`block-${head}`),
+      parentHash: blocks.get(head - 1).hash,
+      slots: snapshot(),
+    });
     return head;
   };
   const slotsAt = tag => blocks.get(tag === "latest" ? head : Number(tag)).slots;
   let maxRange = Infinity; // emulate a range-capped RPC
   let getLogsCalls = 0;
+  let onReceipt = null; // one-shot hook around the next receipt fetch
+  let afterSends = null; // { left, fn }: run fn once `left` more raw sends have returned
 
   const chain = {
     async getTransaction(h) {
       return txs.get(h)?.tx ?? null;
     },
     async getTransactionReceipt(h) {
+      if (onReceipt) {
+        const f = onReceipt;
+        onReceipt = null;
+        return f(h);
+      }
       return txs.get(h)?.receipt ?? null;
     },
     async getBlock(n) {
@@ -138,7 +153,13 @@ function makeChain() {
     async send(method, params) {
       if (method !== "eth_getBlockByNumber") throw new Error(`stub send: ${method}`);
       const b = blocks.get(Number(params[0]));
-      return b ? { hash: b.hash } : null;
+      const out = b ? { hash: b.hash, parentHash: b.parentHash } : null;
+      if (afterSends && --afterSends.left === 0) {
+        const f = afterSends.fn;
+        afterSends = null;
+        f();
+      }
+      return out;
     },
     async getLogs({ address, topics, fromBlock, toBlock }) {
       getLogsCalls++;
@@ -152,6 +173,12 @@ function makeChain() {
       );
     },
     async call({ to, data, blockTag }) {
+      if (to === REG) {
+        const q = regIface.parseTransaction({ data });
+        if (q.name === "entryCount")
+          return regIface.encodeFunctionResult(q.name, [BigInt(entryCount)]);
+        throw new Error(`stub registry: ${q.name}`);
+      }
       if (to !== AGG) throw new Error("call to unknown contract");
       const p = aggIface.parseTransaction({ data });
       if (p.name === "domainSeparator") return aggIface.encodeFunctionResult(p.name, [DS]);
@@ -173,7 +200,7 @@ function makeChain() {
   };
 
   /** Execute one action as SP would: commitment over pre-block slots, SignersCommitted log. */
-  function execute(kind, id, f, mask, { to = AGG, from = SAFE, midSlots } = {}) {
+  function execute(kind, id, f, mask, { to = AGG, from = SAFE, midSlots, status = 1 } = {}) {
     const n = mine();
     // midSlots: the slot table as an earlier tx in this block left it and a later one undid it.
     const pre = midSlots ?? blocks.get(n - 1).slots;
@@ -235,7 +262,7 @@ function makeChain() {
     txs.set(hash, {
       tx: { hash, to, from, data },
       receipt: {
-        status: 1,
+        status,
         blockNumber: n,
         blockHash: blocks.get(n).hash,
         logs: [{ address: AGG, topics: ev.topics, data: ev.data }],
@@ -318,6 +345,26 @@ function makeChain() {
     disclose,
     setSlot: (s, v) => (slots[s] = v),
     /** Replace block `n` with a sibling: same number, new hash (receipts fetched before keep the old one). */
+    /** Drop the parentHash from block n's header (an RPC that omits it). */
+    dropParentHash: n => blocks.set(n, { ...blocks.get(n), parentHash: undefined }),
+    /** During the next receipt fetch: replace the listed blocks (a reorg) and answer null. */
+    reorgDuringReceipt: ns =>
+      (onReceipt = () => {
+        for (const n of ns) blocks.set(n, { ...blocks.get(n), hash: ethers.id(`rcpt-reorg-${n}`) });
+        return null;
+      }),
+    /** Replace block n and return a reverted receipt from the orphaned branch. */
+    revertedOnOrphan: (hash, n) =>
+      (onReceipt = () => {
+        blocks.set(n, { ...blocks.get(n), hash: ethers.id(`orphan-${n}`) });
+        return { ...txs.get(hash).receipt, status: 0 };
+      }),
+    /** After `k` more raw block reads, replace block n (a reorg at an exact point in the check). */
+    reorgAfterSends: (k, n) =>
+      (afterSends = {
+        left: k,
+        fn: () => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`late-reorg-${n}`) }),
+      }),
     reorg: n => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`reorged-${n}`) }),
     disclosureBlock: entryId => logs.find(l => BigInt(l.topics[1]) === BigInt(entryId)).blockNumber,
     capRange: r => (maxRange = r),
@@ -393,6 +440,10 @@ const {
   mineEmpty,
   reorgDuringNextCheck,
   head: headNow,
+  dropParentHash,
+  reorgDuringReceipt,
+  revertedOnOrphan,
+  reorgAfterSends,
 } = makeChain();
 const results = [];
 // want: "PASS" | { diff } (MISMATCH on that field) | { status, reason } | { unverified: {...} } (MATCH,
@@ -405,6 +456,7 @@ async function expectCase(name, entryId, want, opts = {}) {
       aggregator: AGG,
       entryId,
       page: opts.page,
+      fromBlock: opts.fromBlock ?? 0,
       confirmations: opts.confirmations ?? 0,
     });
   } catch (e) {
@@ -487,9 +539,9 @@ await expectCase(
   disclose(Kind.SLASH, 7n, slashIn, aS, { anchor: ethers.id("y") }),
   { diff: "signed.anchor" }
 );
-await expectCase("missing entry", 999n, {
+await expectCase("never-issued entry id is MISMATCH", 999n, {
   status: "MISMATCH",
-  reason: "expected one Disclosed log",
+  reason: "was never issued",
 });
 
 const aW = execute(Kind.SLASH, 11n, slashF, 0b011n, { to: WRAPPER });
@@ -630,6 +682,76 @@ await expectCase(
   { status: "THREW", reason: "confirmations must be" },
   { confirmations: -1 }
 );
+
+// Codex round 3, M1: absence and orphaned evidence are not accusations.
+{
+  const aX = execute(Kind.SLASH, 24n, slashF, 0b011n);
+  const eX = disclose(Kind.SLASH, 24n, slashIn, aX, { txHash: ethers.id("no-such-tx") });
+  await expectCase("entry naming a tx this RPC does not have is INCONCLUSIVE", eX, {
+    status: "INCONCLUSIVE",
+    reason: "not available from this RPC",
+  });
+  const aY = execute(Kind.SLASH, 25n, slashF, 0b011n);
+  const eY = disclose(Kind.SLASH, 25n, slashIn, aY);
+  reorgDuringReceipt([aY.block, disclosureBlock(eY)]);
+  await expectCase("reorg while fetching the receipt (null) is INCONCLUSIVE", eY, {
+    status: "INCONCLUSIVE",
+    reason: "not available from this RPC",
+  });
+  const aZ = execute(Kind.SLASH, 26n, slashF, 0b011n);
+  const eZ = disclose(Kind.SLASH, 26n, slashIn, aZ);
+  revertedOnOrphan(aZ.hash, aZ.block);
+  await expectCase("reverted receipt from an orphaned block is INCONCLUSIVE", eZ, {
+    status: "INCONCLUSIVE",
+    reason: "not in the canonical chain",
+  });
+  const aRv = execute(Kind.SLASH, 27n, slashF, 0b011n, { status: 0 });
+  await expectCase(
+    "canonical reverted action is MISMATCH",
+    disclose(Kind.SLASH, 27n, slashIn, aRv),
+    {
+      status: "MISMATCH",
+      reason: "action tx reverted",
+    }
+  );
+  // An issued entry whose log the search window misses is not proof it is absent.
+  await expectCase(
+    "issued entry outside the searched range is INCONCLUSIVE",
+    1n,
+    { status: "INCONCLUSIVE", reason: "but no Disclosed log was found" },
+    { fromBlock: headNow() }
+  );
+}
+
+// A MISMATCH found on the action side is re-confirmed: reads 1 = disclosure log, 2 = action
+// header; a reorg right after read 2 must turn the verdict INCONCLUSIVE, whichever block moved.
+{
+  const aM = execute(Kind.SLASH, 29n, slashF, 0b011n);
+  const eM = disclose(Kind.SLASH, 29n, slashIn, aM, { txHash: aG.hash }); // provably wrong pointer
+  reorgAfterSends(2, aG.block);
+  await expectCase("action reorged after a MISMATCH was found is INCONCLUSIVE", eM, {
+    status: "INCONCLUSIVE",
+    reason: "canonical chain changed during the check",
+  });
+  const aOther = execute(Kind.GENERIC, 30n, genF, 0b111n); // fresh target: the cell above reorged aG
+  const eM2 = disclose(Kind.SLASH, 29n, slashIn, aM, { txHash: aOther.hash });
+  reorgAfterSends(2, disclosureBlock(eM2));
+  await expectCase("disclosure reorged after a MISMATCH was found is INCONCLUSIVE", eM2, {
+    status: "INCONCLUSIVE",
+    reason: "canonical chain changed during the check",
+  });
+}
+
+// Codex round 3, M2: a missing parent header is a missing fact, not an anchor contradiction.
+{
+  const aH = execute(Kind.SLASH, 28n, slashF, 0b011n, { to: WRAPPER });
+  const eH = disclose(Kind.SLASH, 28n, slashIn, aH);
+  dropParentHash(aH.block);
+  await expectCase("wrapped action with no parent header is INCONCLUSIVE, not MISMATCH", eH, {
+    status: "INCONCLUSIVE",
+    reason: "no parentHash",
+  });
+}
 
 // Codex L4: a range-capped RPC still finds the entry (pages halve until they fit), across pages.
 capRange(16);
