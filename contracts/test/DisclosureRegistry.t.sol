@@ -594,4 +594,161 @@ contract DisclosureRegistryTest is Test {
         vm.expectRevert();
         reg.reply(id, s, address(0), "", bytes32(0));
     }
+
+    // ---------------------------------------------------------------- one primary entry per action
+
+    function test_secondDiscloseOfSameActionRevertsWithOriginalId() public {
+        DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, 31, _slashInputs(), 0x7);
+        uint256 id = _disclose(s);
+        bytes32 action = keccak256(abi.encode(DisclosureRegistry.Kind.SLASH, uint256(31)));
+        assertEq(reg.entryOf(action), id, "entryOf points at the first entry");
+        // a second disclosure of the same action, even with different claim fields, is refused
+        vm.prank(writer);
+        vm.expectRevert(abi.encodeWithSelector(DisclosureRegistry.AlreadyDisclosed.selector, id));
+        reg.disclose(s, makeAddr("otherToken"), keccak256("tx2"), EXEC_BLOCK, bytes20(0), "repo://other", bytes32(0));
+        assertEq(reg.entryCount(), id, "no new entry");
+    }
+
+    function test_differentActionsGetTheirOwnEntries() public {
+        uint256 a = _disclose(_executed(DisclosureRegistry.Kind.SLASH, 32, _slashInputs(), 0x7));
+        uint256 b = _disclose(_executed(DisclosureRegistry.Kind.GENERIC, 32, _genericInputs(), 0x7));
+        uint256 c = _disclose(_executed(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs(), 0x3));
+        assertTrue(a != b && b != c && a != c);
+        assertEq(
+            reg.entryOf(
+                keccak256(
+                    abi.encode(DisclosureRegistry.Kind.GENERIC, _spKey(DisclosureRegistry.Kind.GENERIC, 32, bytes32(0)))
+                )
+            ),
+            b
+        );
+    }
+
+    function test_amendByWriterEmitsAndLeavesThePrimaryEntryUnchanged() public {
+        DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, 33, _slashInputs(), 0x7);
+        uint256 id = _disclose(s);
+        bytes32 bindingBefore = reg.entryBinding(id);
+        bytes32 action = keccak256(abi.encode(DisclosureRegistry.Kind.SLASH, uint256(33)));
+        vm.prank(writer);
+        vm.expectEmit(true, false, false, true, address(reg));
+        DisclosureRegistry.Amendment memory a = DisclosureRegistry.Amendment({
+            txHash: keccak256("the real tx"),
+            blockNumber: EXEC_BLOCK + 1,
+            rulesetCommit: bytes20(uint160(0xbeef)),
+            recordURI: "ipfs://fixed",
+            recordHash: keccak256("fixed")
+        });
+        emit DisclosureRegistry.Amended(id, a, keccak256("why"));
+        reg.amend(id, a, keccak256("why"));
+        assertEq(reg.entryBinding(id), bindingBefore, "binding unchanged");
+        assertEq(reg.entryOf(action), id, "still the same primary entry");
+        assertEq(reg.entryCount(), id, "no new entry");
+    }
+
+    function test_amendOfMissingEntryReverts() public {
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.UnknownEntry.selector);
+        reg.amend(42, _amendment(), bytes32(0));
+    }
+
+    function test_amendByNonWriterReverts() public {
+        uint256 id = _disclose(_executed(DisclosureRegistry.Kind.SLASH, 34, _slashInputs(), 0x7));
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(DisclosureRegistry.NotWriter.selector);
+        reg.amend(id, _amendment(), bytes32(0));
+    }
+
+    function test_duplicateRefusedForEveryKind() public {
+        DisclosureRegistry.Signed[4] memory list = [
+            _executed(DisclosureRegistry.Kind.SLASH, 41, _slashInputs(), 0x7),
+            _executed(DisclosureRegistry.Kind.GENERIC, 42, _genericInputs(), 0x7),
+            _executed(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs(), 0x3),
+            _executed(DisclosureRegistry.Kind.REPUTATION, 43, _repInputs(), 0x7)
+        ];
+        for (uint256 i = 0; i < 4; i++) {
+            uint256 id = _disclose(list[i]);
+            vm.prank(writer);
+            vm.expectRevert(abi.encodeWithSelector(DisclosureRegistry.AlreadyDisclosed.selector, id));
+            reg.disclose(list[i], address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+        }
+    }
+
+    function test_queueWithANewEpochIsANewAction() public {
+        uint256 a = _disclose(
+            _executed(DisclosureRegistry.Kind.QUEUE, 0, abi.encode(makeAddr("operator"), uint8(1), uint256(42)), 0x3)
+        );
+        uint256 b = _disclose(
+            _executed(DisclosureRegistry.Kind.QUEUE, 0, abi.encode(makeAddr("operator"), uint8(1), uint256(43)), 0x3)
+        );
+        assertTrue(a != b, "a re-queue with a new epoch is its own entry");
+    }
+
+    function _amendment() internal pure returns (DisclosureRegistry.Amendment memory) {
+        return DisclosureRegistry.Amendment({
+            txHash: bytes32(0), blockNumber: 0, rulesetCommit: bytes20(0), recordURI: "ipfs://x", recordHash: bytes32(0)
+        });
+    }
+
+    function test_queueEntryOfIsKeyedByMessageHash() public {
+        DisclosureRegistry.Signed memory q = _executed(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs(), 0x3);
+        uint256 id = _disclose(q);
+        bytes32 mh = _spMessageHash(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs());
+        assertEq(reg.entryOf(keccak256(abi.encode(DisclosureRegistry.Kind.QUEUE, uint256(mh)))), id);
+    }
+
+    function test_version() public view {
+        assertEq(reg.version(), "DisclosureRegistry-1.0.0");
+    }
+
+    /// Consumers decode Amended by its canonical signature; pin topic and data layout independently
+    /// of the contract's own declaration, and show that a later amendment fully replaces an earlier one.
+    function test_amendedEventEncodingAndSequence() public {
+        uint256 id = _disclose(_executed(DisclosureRegistry.Kind.SLASH, 51, _slashInputs(), 0x7));
+        bytes32 topic = keccak256("Amended(uint256,(bytes32,uint64,bytes20,string,bytes32),bytes32)");
+        vm.recordLogs();
+        vm.startPrank(writer);
+        reg.amend(
+            id,
+            DisclosureRegistry.Amendment(keccak256("tx-a"), 11, bytes20(uint160(1)), "ipfs://a", keccak256("a")),
+            keccak256("first")
+        );
+        reg.amend(id, DisclosureRegistry.Amendment(bytes32(0), 0, bytes20(0), "", bytes32(0)), keccak256("second"));
+        vm.stopPrank();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2);
+        for (uint256 i = 0; i < 2; i++) {
+            assertEq(logs[i].topics[0], topic, "canonical Amended topic");
+            assertEq(uint256(logs[i].topics[1]), id, "entryId indexed");
+        }
+        // data = abi.encode(Amendment, bytes32 reasonHash), decoded with plain types, not the contract's struct
+        (bytes32 tx0, uint64 bn0, bytes20 rc0, string memory uri0, bytes32 rh0) = _decodeAmendment(logs[0].data);
+        assertEq(tx0, keccak256("tx-a"));
+        assertEq(bn0, 11);
+        assertEq(rc0, bytes20(uint160(1)));
+        assertEq(uri0, "ipfs://a");
+        assertEq(rh0, keccak256("a"));
+        (bytes32 tx1, uint64 bn1, bytes20 rc1, string memory uri1, bytes32 rh1) = _decodeAmendment(logs[1].data);
+        assertEq(tx1, bytes32(0), "a later amendment replaces every claim field, also with zero values");
+        assertEq(bn1, 0);
+        assertEq(rc1, bytes20(0));
+        assertEq(bytes(uri1).length, 0);
+        assertEq(rh1, bytes32(0));
+    }
+
+    struct PlainAmendment {
+        bytes32 txHash;
+        uint64 blockNumber;
+        bytes20 rulesetCommit;
+        string recordURI;
+        bytes32 recordHash;
+    }
+
+    function _decodeAmendment(bytes memory data)
+        internal
+        pure
+        returns (bytes32, uint64, bytes20, string memory, bytes32)
+    {
+        (PlainAmendment memory a,) = abi.decode(data, (PlainAmendment, bytes32));
+        return (a.txHash, a.blockNumber, a.rulesetCommit, a.recordURI, a.recordHash);
+    }
 }

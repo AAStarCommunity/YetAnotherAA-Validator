@@ -154,12 +154,34 @@ watcher flags, whose factual fields are verified on-chain at write time.
 
 ### 4.1 Properties (DSR constraints)
 
-- Events carry the record. Storage is limited to a counter and one word per
-  entry,
-  `entryBinding[entryId] = keccak256(abi.encode(kind, proposalId, subjectToken))`,
-  which a reply must match. No admin, no delete, no edit, no upgrade, no proxy.
+- Events carry the record. Storage is limited to a counter and two words per
+  entry:
+  `entryBinding[entryId] = keccak256(abi.encode(kind, key, subjectToken))`,
+  which a reply must match, and
+  `entryOf[keccak256(abi.encode(kind, key))] = entryId`. No admin, no delete, no
+  edit, no upgrade, no proxy.
+- One primary entry per action: a second `disclose` of the same `(kind, key)`
+  reverts `AlreadyDisclosed(entryId)`, whatever the claim fields say. Duplicates
+  are impossible on chain, independent of the watcher's journal.
+- The claim fields of an entry can be corrected only by
+  `amend(entryId, Amendment{txHash, blockNumber, rulesetCommit, recordURI, recordHash}, reasonHash)`:
+  WRITER only, append-only, emits `Amended`, never edits the primary entry;
+  readers apply amendments in order, each replacing the previous claim values in
+  full. A corrected `blockNumber` is a claim (not re-verified against EIP-2935).
+  `subjectToken` is part of the binding and cannot be amended (§4.3). The
+  on-chain-verified fields (signers, message, key) cannot be wrong and are never
+  amended. The watcher builds every entry from `rebuildFromAction` (the recheck
+  library), so its verified fields already reproduce the commitment before
+  `disclose`; amendments are for its claim fields and are the exception. The
+  recheck tool currently reads the original claims of an entry; applying
+  amendments (an amended `txHash`/`blockNumber` changes which tx it rebuilds
+  from) is a follow-up, and until then an amended entry is rechecked against its
+  original claims. An amended `blockNumber` never inherits the entry's
+  `blockVerified`.
+- `version()` returns `"DisclosureRegistry-1.0.0"` (SP's IVersioned shape), read
+  back by the release manifest.
 - `WRITER` (the watcher EOA) and `AGGREGATOR` are immutable constructor
-  arguments. Only `WRITER` may append a primary entry.
+  arguments. Only `WRITER` may append a primary entry or an amendment.
 - Rotation: a lost or compromised watcher key means a new registry. So does a
   new aggregator (for example for more than 64 guardians), because `AGGREGATOR`
   and its `domainSeparator` are fixed. The manifest pins the current registry;
@@ -263,7 +285,11 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
   reports it as unverified. The second route lets the party an action actually
   named reply even when the entry is attributed to the wrong community. A
   GENERIC action names no reply party (its target is only a contract address);
-  its signers and the claimed community owner can reply.
+  its signers and the claimed community owner can reply. `subjectToken` is part
+  of `entryBinding` and cannot be amended, so a wrong `subjectToken` in the
+  first entry permanently gives that token's community owner the right of reply.
+  That is harmless: replies are append-only claims, and the parties the action
+  actually names keep their own reply route.
 - Emits `Replied(entryId, msg.sender, replyURI, replyHash)`. Cannot edit or
   delete anything.
 
@@ -356,7 +382,9 @@ disabled.
 
 For a flagged action: write the repo evidence record (JSON: tx, block, signers,
 target, calldata, evidence, the recheck command), send Telegram, then
-`DisclosureRegistry.disclose`. Each step is idempotent by `(proposalId, kind)`.
+`DisclosureRegistry.disclose`. Each step is idempotent by `(kind, key)` (QUEUE
+has no proposal id; its key is the message hash), and the registry itself
+refuses a second primary entry for the same `(kind, key)`.
 
 ### 5.4 `pauseUnderstakedOperator`
 
