@@ -37,7 +37,7 @@
     "check:classify": "node scripts/check-quorum-classify.mjs",
     "check:precedence": "node scripts/check-validator-precedence.mjs",
     "check:disclosure": "node scripts/disclosure/check-recheck.mjs && node scripts/disclosure/gen-vectors.mjs",
-    "check:watcher": "node services/guardian-watcher/check-watcher.mjs",
+    "check:watcher": "node services/guardian-watcher/check-watcher.mjs && node services/guardian-watcher/check-publish.mjs",
     "e2e:committee": "node scripts/e2e/committee-e2e.mjs",
     "e2e:selftest": "node scripts/e2e/selftest.mjs",
     "check:pin-rate": "node scripts/check-pin-rate.mjs"
