@@ -4344,6 +4344,192 @@ try {
     { n1: w1.length, s1: shas(w1).size, n3: w3.length }
   );
 }
+// ---- follow-up #2 R7: the same for logs 100 deep (storable as JSON, but past MAX_EVIDENCE_DEPTH)
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-deeptx100-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("dt-a"), addr("dt-b")]);
+  const nest = leaf => {
+    let v = leaf;
+    for (let i = 0; i < 100; i++) v = [v];
+    return v;
+  };
+  const h = ethers.id("dt-tx-100");
+  let w1, w3;
+  try {
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("a"),
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("b"),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: h,
+    });
+    // the first tick fails at its cursor write, so the same range is read again while the dead
+    // letter is open: the fresh copies must match their stored placeholders, not add to them
+    const setCursor = store.setCursor.bind(store);
+    store.setCursor = () => {
+      store.setCursor = setCursor;
+      throw new Error("injected cursor write failure");
+    };
+    await runOnce(c.chain, cfg, store, rs, ident);
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("a"),
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("b"),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: h,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    w1 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    for (let i = 0; i < 2; i++) await runOnce(c.chain, cfg, store, rs, ident);
+    w3 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const shas = w => new Set(w.map(x => x.rawSha256).filter(Boolean));
+  cell(
+    "follow-up R7: two distinct 100-deep logs of one tx are two stored observations with distinct digests, unchanged by a re-read of the same range and by retries",
+    w1.length === 2 &&
+      shas(w1).size === 2 &&
+      w3.length === 2 &&
+      JSON.stringify(w3) === JSON.stringify(w1),
+    { n1: w1.length, s1: shas(w1).size, n3: w3.length }
+  );
+}
+
+// ---- follow-up #2 R7: stored evidence thousands deep is decoded without recursion (retries run,
+// attempts count); one tx's watched logs and one block's records are bounded
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r7-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r7-a"), addr("r7-b")]);
+  const out = {};
+  try {
+    // a log whose data is 6000 nested objects: a dead letter, retried on later ticks
+    const a = mk();
+    for (let i = 0; i < 4; i++) a.c.mine();
+    let deep = "x";
+    // 6000: still storable as JSON, but deeper than any recursive decoder survives
+    for (let i = 0; i < 6000; i++) deep = { a: deep };
+    const h = ethers.id("r7-deep");
+    a.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: deep,
+      blockNumber: a.cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    out.a1 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.a2 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.a3 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.aAtt = a.store.getDeadLetter(`tx-${h.toLowerCase()}`)?.attempts;
+    // stored as a placeholder (prefix, length, sha256), so the file stays small: indented JSON of a
+    // 6000-deep value would be tens of MB, rewritten on every retry
+    const dlFile = join(a.store.dir, "deadletters", `tx-${h.toLowerCase()}.json`);
+    out.aBytes = readFileSync(dlFile).length;
+    out.aW = a.store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    // 2100 watched SP logs in one tx: one quarantine, no records or dead letters each
+    const b = mk();
+    for (let i = 0; i < 3; i++) b.c.mine();
+    for (let i = 0; i < 2100; i++)
+      b.c.injectLog(b.cfg.startBlock + 1, {
+        address: SP,
+        ...gs,
+        index: i,
+        transactionHash: ethers.id("r7-big"),
+      });
+    for (let i = 0; i < 4; i++) b.c.mine();
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    out.bRecs = b.store.countRecords();
+    out.bQ = withQ(b.store).filter(x => x.quarantine);
+    // healthy txs in one block whose records reach the per-block cap: the tx after it is quarantined
+    const e = mk();
+    const ev = (n, tag) =>
+      Array.from({ length: n }, (_, i) => ({
+        name: "SlashCancelled",
+        args: [addr(`${tag}-${i}`)],
+      }));
+    const t1 = e.c.ownerTx(ev(1500, "r7-t1"));
+    e.c.ownerTx(ev(600, "r7-t2"), { atBlock: t1.block });
+    const t3 = e.c.ownerTx(ev(5, "r7-t3"), { atBlock: t1.block });
+    for (let i = 0; i < 4; i++) e.c.mine();
+    out.e = (await runOnce(e.c.chain, e.cfg, e.store, rs, ident)).status;
+    out.eRecs = e.store.countRecords();
+    out.eQ = withQ(e.store).filter(x => x.quarantine);
+    out.eT3 = readdirSync(join(e.store.dir, "records")).some(f =>
+      f.includes(t3.hash.toLowerCase().slice(2))
+    );
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R7: 6000-deep evidence is stored as a small placeholder and retried (ticks ok, attempts count); 2100 watched logs in one tx are one quarantine; records past the per-block cap send the next tx to quarantine",
+    out.a1.ok &&
+      out.a2.ok &&
+      out.a3.ok &&
+      out.aAtt >= 3 &&
+      out.aBytes < 100_000 &&
+      out.aW.length === 1 &&
+      /^0x[0-9a-f]{64}$/.test(out.aW[0].rawSha256 ?? "") &&
+      out.b.ok &&
+      out.bRecs === 1 &&
+      out.bQ.length === 1 &&
+      out.bQ[0].entries === 2100 &&
+      out.e.ok &&
+      out.eRecs === 2100 + 1 &&
+      !out.eT3 &&
+      out.eQ.length === 1,
+    {
+      a: [out.a1.ok, out.a2.ok, out.a2.lastError, out.a3.ok, out.aAtt, out.aBytes, out.aW.length],
+      b: [out.b.ok, out.bRecs, out.bQ.length, out.bQ[0]?.entries],
+      e: [out.e.ok, out.e.lastError, out.eRecs, out.eT3, out.eQ.length, out.eQ[0]?.entries],
+    }
+  );
+}
 
 // ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)
 {

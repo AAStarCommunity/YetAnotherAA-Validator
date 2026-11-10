@@ -519,8 +519,17 @@ aggregator-only.
     block can carry), or in the shared bucket of txs outside the range, the
     excess goes into one quarantine record per query.
   - A tx with more than 300 `SignersCommitted` logs (more than a block's gas can
-    BLS-verify) cannot be real: its logs go into one quarantine record per
-    query, not one dead letter per commitment.
+    BLS-verify), or more than 2000 watched logs, cannot be real: its logs go
+    into one quarantine record per query, not one dead letter or record each.
+    The per-block cap counts records as well as dead letters, so no block writes
+    without bound; only dead letters spend the per-tick budget, so a busy
+    healthy range is never reported degraded.
+  - An evidence item nested more than 64 levels deep (real logs are about 3) is
+    stored as a placeholder with its prefix, full length and sha256: state files
+    are indented, so a stored value grows with the square of its depth (a
+    6000-deep value of 42 KB was a 72 MB dead letter). Stored evidence is
+    decoded without recursion, and evidence that cannot be decoded spends a
+    retry attempt, so no nesting depth fails a tick.
   - Identities stay distinct at any depth: a deep value is keyed by the sha256
     of its full text, and the placeholder it is stored as keeps that digest, so
     distinct deep observations are never merged and a retry never duplicates

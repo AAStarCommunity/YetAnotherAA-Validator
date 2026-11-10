@@ -547,6 +547,13 @@ function mergeEvidence(a, b) {
   const key = e => {
     if (e?.raw === DEEP_PLACEHOLDER && typeof e.rawSha256 === "string")
       return `deep:${e.rawSha256}`;
+    // stored as a placeholder (too deep for any real log): keyed as that placeholder will be
+    if (deeperThan(e, MAX_EVIDENCE_DEPTH))
+      try {
+        return `deep:${deepDigest(e)}`;
+      } catch {
+        // keyed below
+      }
     const k = rawLogKey(e) + safeJson([e?.source ?? null, e?.range ?? null]) + str(e?.raw);
     if (!k.includes("<unserialisable")) return k;
     try {
@@ -766,6 +773,9 @@ const MAX_TXS_PER_BLOCK = 2000;
 /** More SignersCommitted logs in one tx than a 30M-gas block can BLS-verify (each needs a pairing
  * check, well over 100 000 gas): such a tx cannot be real. */
 const MAX_COMMITS_PER_TX = 300;
+/** More watched logs in one tx than a real admin or aggregator tx emits (the watched SP events are
+ * privileged state changes); bounds the records one tx can write (follow-up #2 R7). */
+const MAX_LOGS_PER_TX = 2000;
 const RESERVED = ["source", "range", "raw", "count", "quarantine"];
 
 /** A fresh RPC log never brings our own evidence fields (a returned `range` must not stand in for
@@ -818,61 +828,113 @@ const DEEP_PLACEHOLDER = "<evidence too deep or too large to serialise>";
 function typedEvidence(watched) {
   // Never the original object as a fallback: a value that cannot be serialised (nested too deep,
   // say) would then throw in the dead-letter write, outside the isolation (follow-up #2 R2). Each
-  // item that cannot be encoded becomes a placeholder that keeps its query and range.
-  try {
-    return JSON.parse(safeJson(watched));
-  } catch {
-    return (Array.isArray(watched) ? watched : [watched]).map(item => {
+  // item that cannot be encoded, or is nested deeper than any real log (MAX_EVIDENCE_DEPTH), becomes
+  // a placeholder that keeps its query and range. The depth bound matters: state files are
+  // indented, so a stored value's size grows with the square of its depth (a 6000-deep value of
+  // 42 KB was a 72 MB dead letter, rewritten on every retry: follow-up #2 R7).
+  const items = Array.isArray(watched) ? watched : [watched];
+  if (!items.some(it => deeperThan(it, MAX_EVIDENCE_DEPTH)))
+    try {
+      return JSON.parse(safeJson(watched));
+    } catch {
+      // fall through to the per-item encoding
+    }
+  return items.map(item => {
+    if (!deeperThan(item, MAX_EVIDENCE_DEPTH))
       try {
         return JSON.parse(safeJson(item));
       } catch {
-        // what cannot be stored as JSON is kept as its full text's prefix, length and sha256
-        // (follow-up #2 R5), so distinct items stay distinct and each can be checked
-        let text = null;
-        try {
-          text = iterJson(item);
-        } catch {
-          text = null;
-        }
-        return {
-          raw: DEEP_PLACEHOLDER,
-          ...(text === null
-            ? {}
-            : {
-                rawPrefix: text.slice(0, QUARANTINE_SAMPLE_CHARS),
-                rawLength: text.length,
-                rawSha256: `0x${createHash("sha256").update(text).digest("hex")}`, // = deepDigest(item)
-              }),
-          source: typeof item?.source === "string" ? item.source : null,
-          range:
-            Array.isArray(item?.range) &&
-            item.range.length === 2 &&
-            item.range.every(n => Number.isSafeInteger(n))
-              ? [item.range[0], item.range[1]]
-              : null,
-        };
+        // a placeholder below
       }
-    });
+    return deepPlaceholder(item);
+  });
+}
+
+/** Whether a value nests deeper than `max` levels (arrays and objects), found without recursion
+ * and stopping at the first such path. */
+function deeperThan(v, max) {
+  const st = [[v, 0]];
+  while (st.length) {
+    const [x, d] = st.pop();
+    if (!x || typeof x !== "object") continue;
+    if (d >= max) return true;
+    for (const c of Array.isArray(x) ? x : Object.values(x)) st.push([c, d + 1]);
   }
+  return false;
+}
+const MAX_EVIDENCE_DEPTH = 64;
+
+/** The stored form of an evidence item too deep or too large to keep as JSON. */
+function deepPlaceholder(item) {
+  // what cannot be stored as JSON is kept as its full text's prefix, length and sha256
+  // (follow-up #2 R5), so distinct items stay distinct and each can be checked
+  let text = null;
+  try {
+    text = iterJson(item);
+  } catch {
+    text = null;
+  }
+  return {
+    raw: DEEP_PLACEHOLDER,
+    ...(text === null
+      ? {}
+      : {
+          rawPrefix: text.slice(0, QUARANTINE_SAMPLE_CHARS),
+          rawLength: text.length,
+          rawSha256: `0x${createHash("sha256").update(text).digest("hex")}`, // = deepDigest(item)
+        }),
+    source: typeof item?.source === "string" ? item.source : null,
+    range:
+      Array.isArray(item?.range) &&
+      item.range.length === 2 &&
+      item.range.every(n => Number.isSafeInteger(n))
+        ? [item.range[0], item.range[1]]
+        : null,
+  };
 }
 
 /** Stored evidence back to the values it was seen with (the inverse of typedEvidence): every read of
  * persisted evidence decodes, every write encodes, so persistence is idempotent and an observation
  * keeps one identity across any number of retries (Codex follow-up R12). */
 function nativeEvidence(watched) {
-  const dec = x => {
-    if (Array.isArray(x)) return x.map(dec);
-    if (!x || typeof x !== "object") return x;
+  // Iterative (follow-up #2 R7): stored evidence may be nested thousands deep, and a recursive
+  // decoder would overflow on every retry, outside the isolation.
+  const conv = x => {
+    if (Array.isArray(x)) return [new Array(x.length), x.map((v, k) => [k, v])];
+    if (!x || typeof x !== "object") return [x, null];
     const keys = Object.keys(x);
     if (keys.length === 1 && keys[0] === "$bigint" && typeof x.$bigint === "string")
       try {
-        return BigInt(x.$bigint);
+        return [BigInt(x.$bigint), null];
       } catch {
-        return x;
+        return [x, null];
       }
-    if (keys.length === 1 && keys[0] === "$obj" && x.$obj && typeof x.$obj === "object")
-      return Object.fromEntries(Object.entries(x.$obj).map(([k, v]) => [k, dec(v)]));
-    return Object.fromEntries(Object.entries(x).map(([k, v]) => [k, dec(v)]));
+    const src =
+      keys.length === 1 && keys[0] === "$obj" && x.$obj && typeof x.$obj === "object" ? x.$obj : x;
+    return [{}, Object.entries(src)];
+  };
+  const set = (target, k, v) =>
+    Array.isArray(target)
+      ? (target[k] = v)
+      : // defineProperty, never assignment: a key named __proto__ stays a plain key
+        Object.defineProperty(target, k, {
+          value: v,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+  const dec = root => {
+    const [out, children] = conv(root);
+    const st = children ? [[out, children]] : [];
+    while (st.length) {
+      const [target, ch] = st.pop();
+      for (const [k, v] of ch) {
+        const [r, cc] = conv(v);
+        set(target, k, r);
+        if (cc) st.push([r, cc]);
+      }
+    }
+    return out;
   };
   return Array.isArray(watched) ? watched.map(dec) : watched;
 }
@@ -1192,7 +1254,12 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   const byFrame = new Map();
   for (const e of independent) {
     const f = frameOf(e);
-    if (f) byFrame.set(f, [...(byFrame.get(f) ?? []), e.event]);
+    if (f) {
+      // push, never a copy of the growing list: linear in the events (follow-up #2 R7)
+      const list = byFrame.get(f) ?? [];
+      list.push(e.event);
+      byFrame.set(f, list);
+    }
   }
   const recs = [];
   let priceFailed = false;
@@ -1491,8 +1558,16 @@ export async function tick(chain, cfg, store, rs, ctx) {
     if (dl.route === "tx") {
       // The watched logs come from the dead letter's own getLogs evidence; a dead letter written
       // without it re-reads them from its block by hash (EIP-234), never from the receipt.
-      let watched =
-        Array.isArray(dl.watched) && dl.watched.length ? nativeEvidence(dl.watched) : null;
+      let watched = null;
+      try {
+        watched =
+          Array.isArray(dl.watched) && dl.watched.length ? nativeEvidence(dl.watched) : null;
+      } catch {
+        // stored evidence that cannot be decoded spends an attempt, so the cap still ends it
+        // (follow-up #2 R7); it is never a reason for the tick to fail
+        store.putDeadLetter({ ...dl, reasons: ["stored evidence unreadable"] });
+        continue;
+      }
       if (!watched) {
         try {
           watched = await watchedLogsOf(chain, cfg, dl.txHash, dl.blockNumber);
@@ -1639,19 +1714,21 @@ export async function tick(chain, cfg, store, rs, ctx) {
     // through fail() without throwing, and must spend the budget too (follow-up #2 R5).
     // A tx with more commitments than a block's gas could verify is not a real tx: its logs join
     // the bounded quarantine instead of one dead letter per commitment (follow-up #2 R6).
-    if (t.agg.length > MAX_COMMITS_PER_TX) {
+    if (t.agg.length > MAX_COMMITS_PER_TX || t.agg.length + t.sp.length > MAX_LOGS_PER_TX) {
       for (const l of t.agg) impossible.agg.push(l);
       for (const l of t.sp) impossible.sp.push(l);
       continue;
     }
-    // every dead letter written counts (one tx can write several: one per commitment)
+    // every dead letter written counts towards the budget (one tx can write several: one per
+    // commitment); the per-block cap counts records too, so no block writes without bound (R7)
     const before = summary.deadLetters;
+    const recBefore = summary.newRecords + summary.upgraded;
     await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
     const writes = summary.deadLetters - before;
-    if (writes > 0) {
-      perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + writes);
-      if (inRange(b)) inRangeIsolations += writes;
-    }
+    const recWrites = summary.newRecords + summary.upgraded - recBefore;
+    if (writes + recWrites > 0)
+      perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + writes + recWrites);
+    if (writes > 0 && inRange(b)) inRangeIsolations += writes;
     if (stopAt === null && inRange(b) && inRangeIsolations >= MAX_PER_TX_ISOLATIONS) stopAt = b;
   }
   const cutoff = stopAt ?? to;
@@ -1680,7 +1757,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
         source,
         from,
         cutoff,
-        `in a tx with more than ${MAX_COMMITS_PER_TX} commitments (more than a block can verify)`
+        `in a tx with more than ${MAX_COMMITS_PER_TX} commitments or ${MAX_LOGS_PER_TX} watched logs`
       );
   if (cutoff < to || overflow.agg.length || overflow.sp.length) summary.budgetStop = true;
   summary.to = cutoff;
