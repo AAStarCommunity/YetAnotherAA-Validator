@@ -539,8 +539,17 @@ function evidenceLog(l, source, range) {
 function mergeEvidence(a, b) {
   // identity = raw contents, the query that returned it, and its range (Codex follow-up R8)
   const key = e => rawLogKey(e) + safeJson([e?.source ?? null, e?.range ?? null]) + str(e?.raw);
+  // each key computed once, a Set for membership: linear, whatever the flood (follow-up #2 R2)
   const out = [];
-  for (const e of [...(a ?? []), ...(b ?? [])]) if (!out.some(x => key(x) === key(e))) out.push(e);
+  const seen = new Set();
+  for (const part of [a ?? [], b ?? []])
+    for (const e of part) {
+      const k = key(e);
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(e);
+      }
+    }
   return out;
 }
 
@@ -660,6 +669,17 @@ function quarantineRaw(store, ctx, summary, bad, source, from, to) {
   summary.deadLetters++;
 }
 const QUARANTINE_SAMPLES = 10;
+const MAX_PER_TX_ISOLATIONS = 100;
+
+/** A cheap, non-throwing shape check of one returned log (the full checks run inside processTx). */
+function looksMalformed(l) {
+  return (
+    !validLog(l) ||
+    !/^0x[0-9a-fA-F]{64}$/.test(str(l.transactionHash)) ||
+    receiptPos(l) === null ||
+    parsePosition(l.blockNumber) === null
+  );
+}
 
 /** JSON that never throws on RPC values: a BigInt keeps its type in the text, so identities
  * built from it stay distinct and stable (Codex follow-up R10). */
@@ -688,10 +708,23 @@ export function safeJson(v) {
  * strings, so a stored observation keeps the identity it had when seen (1n and "1" stay two
  * observations through a retry: Codex follow-up R11). */
 function typedEvidence(watched) {
+  // Never the original object as a fallback: a value that cannot be serialised (nested too deep,
+  // say) would then throw in the dead-letter write, outside the isolation (follow-up #2 R2). Each
+  // item that cannot be encoded becomes a placeholder that keeps its query and range.
   try {
     return JSON.parse(safeJson(watched));
   } catch {
-    return watched;
+    return (Array.isArray(watched) ? watched : [watched]).map(item => {
+      try {
+        return JSON.parse(safeJson(item));
+      } catch {
+        return {
+          raw: "<evidence too deep or too large to serialise>",
+          source: typeof item?.source === "string" ? item.source : null,
+          range: Array.isArray(item?.range) ? item.range.slice(0, 2) : null,
+        };
+      }
+    });
   }
 }
 
@@ -1236,7 +1269,8 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
           );
         }
         // raw comparison: a malformed position must not throw here, outside the per-tx isolation
-        const fresh = got.filter(g => !logs.some(l => rawLogKey(l) === rawLogKey(g)));
+        const have = new Set(logs.map(rawLogKey));
+        const fresh = got.filter(g => !have.has(rawLogKey(g)));
         if (fresh.length) {
           for (const x of fresh) extra.push(x);
           summary.bloomRecovered++;
@@ -1388,10 +1422,17 @@ export async function tick(chain, cfg, store, rs, ctx) {
   const intake = (raw, source) => {
     const ok = [];
     const bad = [];
+    const suspect = [];
     for (const x of raw ?? []) {
-      if (x && typeof x === "object" && !Array.isArray(x)) ok.push(x);
-      else bad.push(x);
+      if (!(x && typeof x === "object" && !Array.isArray(x))) bad.push(x);
+      else if (looksMalformed(x)) suspect.push(x);
+      else ok.push(x);
     }
+    // A few malformed logs are isolated per tx, with full evidence; a flood of them (more than
+    // MAX_PER_TX_ISOLATIONS in one answer) joins the bounded quarantine instead, so junk cannot
+    // turn one tick into thousands of fsynced dead letters (follow-up #2 R2).
+    const flood = suspect.length > MAX_PER_TX_ISOLATIONS;
+    for (const x of suspect) (flood ? bad : ok).push(x);
     if (bad.length) quarantineRaw(store, ctx, summary, bad, source, from, to);
     return ok;
   };
@@ -1432,7 +1473,12 @@ export async function tick(chain, cfg, store, rs, ctx) {
     // Grouping never throws on log contents: a malformed position is judged inside the per-tx
     // isolation (Codex follow-up R1). Duplicates (bloom-recovered copies) are dropped by their
     // raw position fields.
-    if (!list.some(x => rawLogKey(x) === rawLogKey(l))) list.push(l);
+    const key = `${source}|${rawLogKey(l)}`; // one log from both queries is two observations (R8)
+    t.keys ??= new Set();
+    if (!t.keys.has(key)) {
+      t.keys.add(key);
+      list.push(l);
+    }
     byTx.set(k, t);
   }
   const ordered = [...byTx.entries()].sort((a, b) => a[1].block - b[1].block);

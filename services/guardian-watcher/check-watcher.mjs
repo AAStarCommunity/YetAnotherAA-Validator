@@ -3424,6 +3424,88 @@ try {
   }
 }
 
+// ---- follow-up #2 R2: floods of object-shaped junk stay linear and bounded; deep JSON is stored
+{
+  const run = async (inject, label) => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-flood-"));
+    try {
+      const c = makeChain();
+      const cfg = {
+        aggregator: AGG,
+        roles: { superPaymaster: SP },
+        forwarders: FORWARDERS,
+        startBlock: c.head() + 1,
+        maxBlocksPerTick: 1000,
+        page: 5000,
+      };
+      const store = new Store(d);
+      const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+      for (let i = 0; i < 4; i++) c.mine();
+      inject(c);
+      const t0 = Date.now();
+      const st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+      return { st, ms: Date.now() - t0, dls: store.listDeadLetters(), label };
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("fl-a"), addr("fl-b")]);
+  const objFlood = await run(c => {
+    for (let i = 0; i < 4000; i++) c.injectRawResult(SP, { logIndex: i });
+  }, "4000 {logIndex}");
+  const few = await run(c => {
+    for (let i = 0; i < 50; i++)
+      c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: 101,
+        index: "bad",
+        transactionHash: ethers.id(`fl-few-${i}`),
+      });
+  }, "50 malformed");
+  const many = await run(c => {
+    for (let i = 0; i < 150; i++)
+      c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: 101,
+        index: "bad",
+        transactionHash: ethers.id(`fl-many-${i}`),
+      });
+  }, "150 malformed");
+  let deepData = "x";
+  for (let i = 0; i < 10_000; i++) deepData = [deepData];
+  const deep = await run(c => {
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: deepData,
+      blockNumber: 101,
+      index: 0,
+      transactionHash: ethers.id("fl-deep"),
+    });
+  }, "deep data");
+  cell(
+    "floods stay linear and bounded: 4000 object-shaped junk entries and 150 malformed logs make one quarantine each; 50 are isolated per tx; deeply nested data is stored as a placeholder; every tick completes",
+    [objFlood, few, many, deep].every(x => x.st.ok === true && x.st.cursor !== null) &&
+      objFlood.ms < 10_000 &&
+      objFlood.dls.filter(x => x.quarantine).length === 1 &&
+      many.dls.filter(x => x.quarantine).length === 1 &&
+      many.dls.length === 1 &&
+      few.dls.filter(x => !x.quarantine).length === 50 &&
+      deep.dls.length === 1 &&
+      /too deep or too large/.test(JSON.stringify(deep.dls[0].watched)),
+    [objFlood, few, many, deep].map(x => [
+      x.label,
+      x.st.ok,
+      x.st.lastError,
+      x.ms,
+      x.dls.length,
+      x.dls.filter(d => d.quarantine).length,
+    ])
+  );
+}
+
 // ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)
 {
   const got = [];
