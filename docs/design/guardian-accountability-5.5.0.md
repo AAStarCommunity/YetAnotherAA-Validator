@@ -154,12 +154,22 @@ watcher flags, whose factual fields are verified on-chain at write time.
 
 ### 4.1 Properties (DSR constraints)
 
-- Events carry the record. Storage is limited to a counter and one word per
-  entry,
-  `entryBinding[entryId] = keccak256(abi.encode(kind, proposalId, subjectToken))`,
-  which a reply must match. No admin, no delete, no edit, no upgrade, no proxy.
+- Events carry the record. Storage is limited to a counter and two words per
+  entry:
+  `entryBinding[entryId] = keccak256(abi.encode(kind, key, subjectToken))`,
+  which a reply must match, and
+  `entryOf[keccak256(abi.encode(kind, key))] = entryId`. No admin, no delete, no
+  edit, no upgrade, no proxy.
+- One primary entry per action: a second `disclose` of the same `(kind, key)`
+  reverts `AlreadyDisclosed(entryId)`, whatever the claim fields say. Duplicates
+  are impossible on chain, independent of the watcher's journal.
+- The claim fields of an entry (record location/hash) can be corrected only by
+  `amend(entryId, recordURI, recordHash, reasonHash)`: WRITER only, append-only,
+  emits `Amended`, never edits the primary entry; readers apply amendments in
+  order. The on-chain-verified fields (signers, message, key) cannot be wrong
+  and are never amended.
 - `WRITER` (the watcher EOA) and `AGGREGATOR` are immutable constructor
-  arguments. Only `WRITER` may append a primary entry.
+  arguments. Only `WRITER` may append a primary entry or an amendment.
 - Rotation: a lost or compromised watcher key means a new registry. So does a
   new aggregator (for example for more than 64 guardians), because `AGGREGATOR`
   and its `domainSeparator` are fixed. The manifest pins the current registry;

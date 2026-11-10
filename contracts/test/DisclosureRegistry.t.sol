@@ -594,4 +594,60 @@ contract DisclosureRegistryTest is Test {
         vm.expectRevert();
         reg.reply(id, s, address(0), "", bytes32(0));
     }
+
+    // ---------------------------------------------------------------- one primary entry per action
+
+    function test_secondDiscloseOfSameActionRevertsWithOriginalId() public {
+        DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, 31, _slashInputs(), 0x7);
+        uint256 id = _disclose(s);
+        bytes32 action = keccak256(abi.encode(DisclosureRegistry.Kind.SLASH, uint256(31)));
+        assertEq(reg.entryOf(action), id, "entryOf points at the first entry");
+        // a second disclosure of the same action, even with different claim fields, is refused
+        vm.prank(writer);
+        vm.expectRevert(abi.encodeWithSelector(DisclosureRegistry.AlreadyDisclosed.selector, id));
+        reg.disclose(s, makeAddr("otherToken"), keccak256("tx2"), EXEC_BLOCK, bytes20(0), "repo://other", bytes32(0));
+        assertEq(reg.entryCount(), id, "no new entry");
+    }
+
+    function test_differentActionsGetTheirOwnEntries() public {
+        uint256 a = _disclose(_executed(DisclosureRegistry.Kind.SLASH, 32, _slashInputs(), 0x7));
+        uint256 b = _disclose(_executed(DisclosureRegistry.Kind.GENERIC, 32, _genericInputs(), 0x7));
+        uint256 c = _disclose(_executed(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs(), 0x3));
+        assertTrue(a != b && b != c && a != c);
+        assertEq(
+            reg.entryOf(
+                keccak256(
+                    abi.encode(DisclosureRegistry.Kind.GENERIC, _spKey(DisclosureRegistry.Kind.GENERIC, 32, bytes32(0)))
+                )
+            ),
+            b
+        );
+    }
+
+    function test_amendByWriterEmitsAndLeavesThePrimaryEntryUnchanged() public {
+        DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, 33, _slashInputs(), 0x7);
+        uint256 id = _disclose(s);
+        bytes32 bindingBefore = reg.entryBinding(id);
+        bytes32 action = keccak256(abi.encode(DisclosureRegistry.Kind.SLASH, uint256(33)));
+        vm.prank(writer);
+        vm.expectEmit(true, false, false, true, address(reg));
+        emit DisclosureRegistry.Amended(id, "ipfs://fixed", keccak256("fixed"), keccak256("why"));
+        reg.amend(id, "ipfs://fixed", keccak256("fixed"), keccak256("why"));
+        assertEq(reg.entryBinding(id), bindingBefore, "binding unchanged");
+        assertEq(reg.entryOf(action), id, "still the same primary entry");
+        assertEq(reg.entryCount(), id, "no new entry");
+    }
+
+    function test_amendOfMissingEntryReverts() public {
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.UnknownEntry.selector);
+        reg.amend(42, "ipfs://x", bytes32(0), bytes32(0));
+    }
+
+    function test_amendByNonWriterReverts() public {
+        uint256 id = _disclose(_executed(DisclosureRegistry.Kind.SLASH, 34, _slashInputs(), 0x7));
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(DisclosureRegistry.NotWriter.selector);
+        reg.amend(id, "ipfs://x", bytes32(0), bytes32(0));
+    }
 }

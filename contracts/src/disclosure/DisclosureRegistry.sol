@@ -69,6 +69,10 @@ contract DisclosureRegistry {
     uint256 public entryCount;
     /// @notice keccak256(abi.encode(kind, key, subjectToken)) per entry; a reply must match it.
     mapping(uint256 => bytes32) public entryBinding;
+    /// @notice The one primary entry of an action: keccak256(abi.encode(kind, key)) -> entryId (0 =
+    ///         none). A guardian action is disclosed at most once, whatever the writer does; its
+    ///         claim fields can only be corrected by `amend`, never by a second primary entry.
+    mapping(bytes32 => uint256) public entryOf;
 
     struct Signed {
         Kind kind;
@@ -104,6 +108,11 @@ contract DisclosureRegistry {
 
     event Replied(uint256 indexed entryId, address indexed replier, string replyURI, bytes32 replyHash);
 
+    /// @notice The writer's correction of an entry's CLAIM fields (record location and hash). It
+    ///         never edits the primary entry; readers apply amendments in order. `reasonHash`
+    ///         commits to a public explanation.
+    event Amended(uint256 indexed entryId, string recordURI, bytes32 recordHash, bytes32 reasonHash);
+
     error NotWriter();
     error ZeroAddress();
     error BadKind();
@@ -115,6 +124,7 @@ contract DisclosureRegistry {
     error UnknownEntry();
     error BindingMismatch();
     error NotAccused();
+    error AlreadyDisclosed(uint256 entryId);
 
     constructor(address writer, address aggregator) {
         if (writer == address(0) || aggregator == address(0)) revert ZeroAddress();
@@ -157,9 +167,20 @@ contract DisclosureRegistry {
     function _append(Signed calldata s, Record memory r) internal returns (uint256 entryId) {
         (uint256 key, bytes32 messageHash) = _verifySigned(s);
         r.blockVerified = _verifyBlock(r.blockNumber, s.anchor);
+        bytes32 action = keccak256(abi.encode(s.kind, key));
+        uint256 existing = entryOf[action];
+        if (existing != 0) revert AlreadyDisclosed(existing);
         entryId = ++entryCount;
+        entryOf[action] = entryId;
         entryBinding[entryId] = keccak256(abi.encode(s.kind, key, r.subjectToken));
         emit Disclosed(entryId, s.kind, key, s.proposalId, messageHash, s.signers, r);
+    }
+
+    /// @notice Correct the record location/hash of an existing entry (WRITER only, append-only).
+    function amend(uint256 entryId, string calldata recordURI, bytes32 recordHash, bytes32 reasonHash) external {
+        if (msg.sender != WRITER) revert NotWriter();
+        if (entryBinding[entryId] == bytes32(0)) revert UnknownEntry();
+        emit Amended(entryId, recordURI, recordHash, reasonHash);
     }
 
     /// @notice Right of reply. Appends only. The caller must be one of:
