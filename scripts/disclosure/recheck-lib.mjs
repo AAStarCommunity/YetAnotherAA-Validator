@@ -289,7 +289,12 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
   const candidates = [];
   const notes = [];
 
-  async function fromDvt(data, route, proven) {
+  // DVTValidator-derived candidates are never `proven`: DVTValidator propagates reverts, but it
+  // forwards to its mutable BLS_AGGREGATOR (owner-settable, even within one block), so its success
+  // does not show that the PINNED aggregator ran. They count only through the commitment. (In a
+  // trace, the forwarded CALL into the pinned aggregator is decoded on its own and is proven.)
+  async function fromDvt(data, route) {
+    const proven = false;
     let p;
     try {
       p = dvtIface.parseTransaction({ data });
@@ -349,8 +354,9 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
     );
   }
 
-  // `proven`: the call is known to have succeeded. True only while every hop so far propagates a
-  // revert (a top-level call in a successful tx, DVTValidator's forwarding). A Safe hop clears it.
+  // `proven`: the call is known to have reached the pinned aggregator and succeeded. True only for
+  // the top-level call of a successful tx; a Safe hop clears it (execTransaction does not revert
+  // when its inner call fails), and DVTValidator-derived candidates never carry it (see fromDvt).
   async function follow(to, data, route, depth, proven) {
     if (depth > 4) return notes.push(`${route}: nesting too deep`);
     if (eqAddr(to, aggregator)) {
@@ -359,7 +365,7 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
       else notes.push(`${route}: aggregator calldata is not an entry point`);
       return;
     }
-    if (eqAddr(to, fw.dvtValidator)) return fromDvt(data, `${route}.dvtValidator`, proven);
+    if (eqAddr(to, fw.dvtValidator)) return fromDvt(data, `${route}.dvtValidator`);
     if (eqAddr(to, fw.ownerSafe)) {
       let p;
       try {
@@ -445,7 +451,7 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
             const a = decodeAction(f.input);
             if (a) candidates.push({ ...a, route: `${path}.aggregator`, proven: true });
           } else if (eqAddr(f.to, fw.dvtValidator)) {
-            await fromDvt(f.input, `${path}.dvtValidator`, true);
+            await fromDvt(f.input, `${path}.dvtValidator`);
           }
         }
         for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`);

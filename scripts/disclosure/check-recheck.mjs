@@ -299,7 +299,7 @@ function makeChain() {
                   slashLevel: 0,
                   evidenceHash: ethers.ZeroHash,
                 }
-              : { block: via.createdAt ?? n - 1, ...f }
+              : { block: via.createdAt ?? n - 1, ...(via.overrideProposal ?? f) }
           );
         return { to: DVT, data: dvtData() };
       case "fake-dvt": // DVTValidator calldata at an address the manifest does not pin
@@ -319,6 +319,7 @@ function makeChain() {
                 { op: 0, to: addr("unrelated"), data: "0x1234" },
                 ...via.subs.map(op => ({ op, to: AGG, data: aggData })),
                 ...(via.extraAgg ? [{ op: 0, to: AGG, data: via.extraAgg }] : []),
+                ...(via.extraSub ? [via.extraSub] : []),
               ]),
             ]),
             1
@@ -1131,25 +1132,34 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
       reason: "no recovered call is authenticated",
     }
   );
-  // M1: two candidates under one key, only one authenticates -> that one is used.
+  // M1: two candidates under one key, only one authenticates -> that one is used. The second is a
+  // nested Safe execTransaction whose inner call fails: Safe returns false without reverting, so
+  // the batch (and the honest call before it) still succeeds.
+  const nestedFail = {
+    op: 0,
+    to: SAFE,
+    data: safeIface.encodeFunctionData("execTransaction", [
+      AGG,
+      0,
+      aggIface.encodeFunctionData("executeProposal", [61n, genF.target, "0x77", 3n, "0x"]),
+      0,
+      0,
+      0,
+      0,
+      ethers.ZeroAddress,
+      ethers.ZeroAddress,
+      "0x",
+    ]),
+  };
   const aTwo = execute(
     Kind.GENERIC,
     61n,
     genF,
     0b111n,
-    r("multisend", {
-      subs: [0],
-      extraAgg: aggIface.encodeFunctionData("executeProposal", [
-        61n,
-        genF.target,
-        "0x77",
-        3n,
-        "0x",
-      ]),
-    })
+    r("multisend", { subs: [0], extraSub: nestedFail })
   );
   await expectCase(
-    "same-key candidates: the one that reproduces the commitment is used",
+    "same-key candidates (one inside a failing nested Safe call): the authenticated one is used",
     disclose(Kind.GENERIC, 61n, genIn, aTwo),
     "PASS"
   );
@@ -1173,6 +1183,25 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
       reason: "module route not followed",
     }
   );
+  // Codex R2 Medium: a DVTValidator-derived candidate is not proven (its BLS_AGGREGATOR is mutable),
+  // so when it does not reproduce the commitment it must not accuse: INCONCLUSIVE, not MISMATCH.
+  {
+    const aDv = execute(
+      Kind.SLASH,
+      65n,
+      slashF,
+      0b011n,
+      r("dvt", { overrideProposal: { ...slashF, slashLevel: 2 } })
+    );
+    await expectCase(
+      "unauthenticated DVTValidator candidate cannot accuse an honest entry",
+      disclose(Kind.SLASH, 65n, slashIn, aDv),
+      {
+        status: "INCONCLUSIVE",
+        reason: "no recovered call is authenticated",
+      }
+    );
+  }
   const aTdg = execute(Kind.GENERIC, 64n, genF, 0b111n, r("trace-delegate"));
   await expectCase(
     "trace: aggregator call under a non-MultiSend DELEGATECALL is INCONCLUSIVE",
