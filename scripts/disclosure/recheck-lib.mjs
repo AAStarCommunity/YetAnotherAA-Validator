@@ -201,17 +201,40 @@ async function resolveSigners(chain, aggregator, mask, blockTag) {
   return sortAddresses(out);
 }
 
+export const Status = { MATCH: "MATCH", MISMATCH: "MISMATCH", INCONCLUSIVE: "INCONCLUSIVE" };
+
+/** True when `blockHash` is the canonical hash of `number` right now. */
+async function canonical(chain, number, blockHash) {
+  const b = await chain.getBlock(Number(number));
+  return !!b && !!blockHash && b.hash.toLowerCase() === String(blockHash).toLowerCase();
+}
+
 /**
- * Rebuild what the registry entry for `key` should say, from the action tx `txHash` only.
- * Returns { ok, reason?, rebuilt? }.
+ * Rebuild what the registry entry for `key` should say, from the action tx `txHash` only, with every
+ * state read pinned to block `snapshot`. Returns { status, reason?, rebuilt? }:
+ *   MISMATCH      the tx provably does not support an entry for `key` (forged or wrong pointer);
+ *   INCONCLUSIVE  the tx cannot be checked from its own data (wrapped call, non-canonical block,
+ *                 or a slot table that changed inside the block) — neither confirmed nor refuted.
  */
-export async function rebuildFromAction(chain, aggregator, txHash, key) {
+export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot) {
   const agg = ethers.getAddress(aggregator);
   const tx = await chain.getTransaction(txHash);
   const rc = await chain.getTransactionReceipt(txHash);
-  if (!tx || !rc) return { ok: false, reason: "action tx not found" };
-  if (Number(rc.status) !== 1) return { ok: false, reason: "action tx reverted" };
+  if (!tx || !rc) return { status: Status.MISMATCH, reason: "action tx not found" };
+  if (Number(rc.status) !== 1) return { status: Status.MISMATCH, reason: "action tx reverted" };
   const blockNumber = Number(rc.blockNumber);
+  if (blockNumber > snapshot) {
+    return {
+      status: Status.INCONCLUSIVE,
+      reason: "action tx is newer than the confirmed snapshot",
+    };
+  }
+  if (!(await canonical(chain, blockNumber, rc.blockHash))) {
+    return {
+      status: Status.INCONCLUSIVE,
+      reason: "action receipt is not in the canonical chain (reorg?)",
+    };
+  }
 
   const commits = rc.logs
     .filter(
@@ -224,36 +247,50 @@ export async function rebuildFromAction(chain, aggregator, txHash, key) {
       signerMask: BigInt(aggIface.decodeEventLog("SignersCommitted", l.data, l.topics).signerMask),
     }));
   const commit = commits.find(c => c.key === BigInt(key));
-  if (!commit) return { ok: false, reason: `action tx emits no SignersCommitted for key ${key}` };
+  if (!commit) {
+    return {
+      status: Status.MISMATCH,
+      reason: `action tx emits no SignersCommitted for key ${key}`,
+    };
+  }
 
   if (!tx.to || ethers.getAddress(tx.to) !== agg) {
     return {
-      ok: false,
+      status: Status.INCONCLUSIVE,
       reason:
         "action is not a top-level aggregator call (wrapped); message fields not recoverable from the tx",
     };
   }
   const action = decodeAction(tx.data);
-  if (!action) return { ok: false, reason: "action calldata is not an aggregator entry point" };
+  if (!action) {
+    return {
+      status: Status.INCONCLUSIVE,
+      reason: "action calldata is not an aggregator entry point",
+    };
+  }
   if (
-    action.kind !== Kind.QUEUE &&
-    BigInt(action.proposalId) >= RAW_ID_BOUND &&
-    action.kind !== Kind.GENERIC
+    (action.kind === Kind.SLASH || action.kind === Kind.REPUTATION) &&
+    BigInt(action.proposalId) >= RAW_ID_BOUND
   ) {
-    return { ok: false, reason: "action proposalId >= 2^128" };
+    return { status: Status.MISMATCH, reason: "action proposalId >= 2^128" };
   }
 
   const ds = await view(chain, agg, "domainSeparator", [], blockNumber);
   const messageHash = messageHashOf(ds, action.kind, action.proposalId, action.fields);
   const derivedKey = commitmentKey(action.kind, action.proposalId, messageHash);
-  if (derivedKey !== commit.key)
-    return { ok: false, reason: "key derived from calldata differs from SignersCommitted key" };
+  if (derivedKey !== commit.key) {
+    return {
+      status: Status.MISMATCH,
+      reason: "key derived from calldata differs from SignersCommitted key",
+    };
+  }
 
   const anchor = (await chain.getBlock(blockNumber - 1)).hash;
-  const onchain = await view(chain, agg, "proposalSignersCommitment", [commit.key], "latest");
+  const onchain = await view(chain, agg, "proposalSignersCommitment", [commit.key], snapshot);
 
   // The aggregator resolved slots during the tx. Pre-block state equals that unless an earlier tx in
-  // the same block re-registered a slot, so try the parent block first, then the block itself.
+  // the same block re-registered a slot, so try the parent block first, then the block itself. A
+  // change that is undone later in the same block is visible in neither: INCONCLUSIVE, not MISMATCH.
   let signers = null;
   let slotBlock = null;
   for (const tag of [blockNumber - 1, blockNumber]) {
@@ -264,14 +301,17 @@ export async function rebuildFromAction(chain, aggregator, txHash, key) {
       break;
     }
   }
-  if (!signers)
+  if (!signers) {
     return {
-      ok: false,
-      reason: "signers resolved from signerMask do not reproduce proposalSignersCommitment",
+      status: Status.INCONCLUSIVE,
+      reason:
+        "signers at the parent block and at the block do not reproduce proposalSignersCommitment " +
+        "(slot table changed inside the block, or the commitment was overwritten); replay the block to decide",
     };
+  }
 
   return {
-    ok: true,
+    status: Status.MATCH,
     rebuilt: {
       kind: action.kind,
       key: commit.key,
@@ -282,6 +322,7 @@ export async function rebuildFromAction(chain, aggregator, txHash, key) {
       signers,
       anchor,
       blockNumber,
+      blockHash: rc.blockHash,
       caller: ethers.getAddress(tx.from),
       slotBlock,
     },
@@ -311,29 +352,68 @@ export function compareEntry(entry, signed, rebuilt) {
 }
 
 /**
- * Full recheck of entry `entryId` in `registry`. Locates the Disclosed log (and the disclose tx),
- * rebuilds from the action tx it names, compares. Returns { ok, reasons[], diffs[], rebuilt? }.
+ * Disclosed logs for `entryId` in [fromBlock, toBlock], paged so a range-capped RPC still answers:
+ * a page that errors is halved, down to a single block, before the error is passed on.
+ */
+export async function findEntryLogs(chain, registry, entryId, fromBlock, toBlock, page = 10_000) {
+  const topics = [regIface.getEvent("Disclosed").topicHash, ethers.toBeHex(BigInt(entryId), 32)];
+  const out = [];
+  let from = Number(fromBlock);
+  let size = page;
+  while (from <= toBlock) {
+    const to = Math.min(toBlock, from + size - 1);
+    try {
+      out.push(
+        ...(await chain.getLogs({ address: registry, topics, fromBlock: from, toBlock: to }))
+      );
+      from = to + 1;
+      size = page;
+    } catch (e) {
+      if (size === 1) throw e;
+      size = Math.max(1, Math.floor(size / 2));
+    }
+  }
+  return out;
+}
+
+/** Fields an entry carries that no on-chain data can confirm; reported, never counted as verified. */
+export const UNVERIFIED_FIELDS = ["subjectToken", "rulesetCommit", "recordURI", "recordHash"];
+
+/**
+ * Full recheck of entry `entryId` in `registry`, against one snapshot `head - confirmations`.
+ * Returns { status, ok, reasons[], diffs[], unverified, rebuilt?, entry? }. `ok` is true only for
+ * MATCH; MATCH covers the verified fields and says nothing about UNVERIFIED_FIELDS.
  */
 export async function recheckEntry(
   chain,
-  { registry, aggregator, entryId, fromBlock = 0, toBlock = "latest" }
+  { registry, aggregator, entryId, fromBlock = 0, confirmations = 0, page }
 ) {
-  const topic0 = regIface.getEvent("Disclosed").topicHash;
-  const logs = await chain.getLogs({
-    address: registry,
-    topics: [topic0, ethers.toBeHex(BigInt(entryId), 32)],
-    fromBlock,
-    toBlock,
+  const done = (status, extra) => ({
+    status,
+    ok: status === Status.MATCH,
+    reasons: [],
+    diffs: [],
+    ...extra,
   });
-  if (logs.length !== 1)
-    return {
-      ok: false,
-      reasons: [`expected one Disclosed log for entry ${entryId}, found ${logs.length}`],
-      diffs: [],
-    };
-  const entry = regIface.decodeEventLog("Disclosed", logs[0].data, logs[0].topics);
+  const snapshot = (await chain.getBlockNumber()) - confirmations;
+  const logs = await findEntryLogs(chain, registry, entryId, fromBlock, snapshot, page);
+  if (logs.length !== 1) {
+    return done(Status.MISMATCH, {
+      reasons: [
+        `expected one Disclosed log for entry ${entryId} up to block ${snapshot}, found ${logs.length}`,
+      ],
+    });
+  }
+  const log = logs[0];
+  if (!(await canonical(chain, log.blockNumber, log.blockHash))) {
+    return done(Status.INCONCLUSIVE, {
+      reasons: ["Disclosed log is not in the canonical chain (reorg?)"],
+    });
+  }
+  const entry = regIface.decodeEventLog("Disclosed", log.data, log.topics);
+  const unverified = Object.fromEntries(UNVERIFIED_FIELDS.map(f => [f, String(entry[f])]));
 
-  const dtx = await chain.getTransaction(logs[0].transactionHash);
+  const dtx = await chain.getTransaction(log.transactionHash);
   let signed = null;
   try {
     const p = regIface.parseTransaction({ data: dtx.data });
@@ -342,14 +422,26 @@ export async function recheckEntry(
     /* disclose through a wrapper: compare the event only */
   }
 
-  const r = await rebuildFromAction(chain, aggregator, entry.txHash, entry.key);
-  if (!r.ok) return { ok: false, reasons: [r.reason], diffs: [], entry };
+  const r = await rebuildFromAction(chain, aggregator, entry.txHash, entry.key, snapshot);
+  if (r.status !== Status.MATCH) return done(r.status, { reasons: [r.reason], entry, unverified });
   const diffs = compareEntry(entry, signed, r.rebuilt);
-  return {
-    ok: diffs.length === 0,
+
+  // Both inclusions must still be canonical after all reads, or a reorg ran underneath the check.
+  const still =
+    (await canonical(chain, log.blockNumber, log.blockHash)) &&
+    (await canonical(chain, r.rebuilt.blockNumber, r.rebuilt.blockHash));
+  if (!still) {
+    return done(Status.INCONCLUSIVE, {
+      reasons: ["canonical chain changed during the check"],
+      entry,
+      unverified,
+    });
+  }
+  return done(diffs.length === 0 ? Status.MATCH : Status.MISMATCH, {
     reasons: signed ? [] : ["disclose calldata not top-level; event fields only"],
     diffs,
     rebuilt: r.rebuilt,
     entry,
-  };
+    unverified,
+  });
 }

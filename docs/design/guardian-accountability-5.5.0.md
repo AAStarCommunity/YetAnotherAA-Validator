@@ -249,9 +249,17 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
 - `s` passes the same checks as §4.2 steps 2–4, and
   `keccak256(abi.encode(s.kind, key, subjectToken)) == entryBinding[entryId]`
   (so the entry exists and the reply cites the same action).
-- The caller is either a member of `signers`, where `signers` reproduces the
-  commitment exactly as in §4.2 step 4, or
-  `IxPNTsToken(subjectToken).communityOwner()` when `subjectToken != 0`.
+- The caller is one of:
+  - a member of `signers`, where `signers` reproduces the commitment exactly as
+    in §4.2 step 4;
+  - a party the signed message names, which the commitment therefore covers: the
+    `operator` of a SLASH or QUEUE action, or a user of a REPUTATION batch;
+  - `IxPNTsToken(subjectToken).communityOwner()` when `subjectToken != 0`.
+- `subjectToken` is the writer's claim: no commitment covers it, and the recheck
+  reports it as unverified. The second route lets the party an action actually
+  named reply even when the entry is attributed to the wrong community. A
+  GENERIC action names no reply party (its target is only a contract address);
+  its signers and the claimed community owner can reply.
 - Emits `Replied(entryId, msg.sender, replyURI, replyHash)`. Cannot edit or
   delete anything.
 
@@ -269,6 +277,12 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
   entry → revert.
 - An independent script rebuilds an entry from the tx alone (RPC only, no DVT
   state) and matches; a deliberately wrong entry is flagged by the same script.
+  Its verdict has three values: MATCH (the verified fields agree; claims such as
+  `subjectToken` are listed as unverified), MISMATCH (provably wrong), and
+  INCONCLUSIVE (not decidable from the tx's own data: a wrapped call, a
+  non-canonical block, or a slot table that changed inside the block). Every
+  read is pinned to one confirmed snapshot, and canonical inclusion is checked
+  before and after (`scripts/disclosure/recheck-entry.mjs`).
 
 ## 5. Watcher service (DVT repo, Mac Mini only)
 

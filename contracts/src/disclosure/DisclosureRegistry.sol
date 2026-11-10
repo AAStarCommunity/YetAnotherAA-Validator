@@ -150,8 +150,14 @@ contract DisclosureRegistry {
         );
     }
 
-    /// @notice Right of reply. The caller must be one of the proven signers of the entry's action,
-    ///         or the community owner of the entry's subject token. Appends only.
+    /// @notice Right of reply. Appends only. The caller must be one of:
+    ///         - a proven signer of the entry's action;
+    ///         - a party the SIGNED message names, verified through the commitment: the operator of
+    ///           a SLASH or QUEUE action, or a user of a REPUTATION batch;
+    ///         - the `communityOwner()` of the entry's `subjectToken`. `subjectToken` is the writer's
+    ///           CLAIM (no commitment covers it), so this route is only as good as the watcher; the
+    ///           two routes above do not depend on it, so a wrongly attributed entry cannot shut out
+    ///           the party the action actually named.
     function reply(
         uint256 entryId,
         Signed calldata s,
@@ -171,6 +177,7 @@ contract DisclosureRegistry {
                 break;
             }
         }
+        if (!accused) accused = _namedBySignedMessage(s.kind, s.messageInputs, msg.sender);
         if (!accused && subjectToken != address(0) && subjectToken.code.length != 0) {
             try ICommunityToken(subjectToken).communityOwner() returns (address owner_) {
                 accused = owner_ == msg.sender && owner_ != address(0);
@@ -204,6 +211,23 @@ contract DisclosureRegistry {
         ) {
             revert CommitmentMismatch();
         }
+    }
+
+    /// @dev Whether `who` is a party the signed message itself names. Only called after `_verifySigned`
+    ///      accepted `inputs`, so the names are covered by the guardians' commitment.
+    function _namedBySignedMessage(Kind kind, bytes calldata inputs, address who) internal pure returns (bool) {
+        if (kind == Kind.SLASH || kind == Kind.QUEUE) {
+            // SLASH (operator, level, epoch, evidenceHash) and QUEUE (operator, level, epoch) both
+            // lead with the operator.
+            return abi.decode(inputs[:32], (address)) == who;
+        }
+        if (kind == Kind.REPUTATION) {
+            (address[] memory users,,) = abi.decode(inputs, (address[], uint256[], uint256));
+            for (uint256 i = 0; i < users.length; i++) {
+                if (users[i] == who) return true;
+            }
+        }
+        return false;
     }
 
     /// @dev Non-empty, strictly ascending, no zero address, length == popcount(mask) <= 256.

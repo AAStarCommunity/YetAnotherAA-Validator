@@ -469,6 +469,47 @@ contract DisclosureRegistryTest is Test {
         reg.reply(id, other, address(0), "", bytes32(0));
     }
 
+    /// Codex M1: the party the signed message names may reply even when the writer attributed the
+    /// entry to an unrelated community token (whose owner is someone else).
+    function test_replyByNamedOperatorDespiteWrongSubjectToken() public {
+        CommunityToken unrelated = new CommunityToken(makeAddr("accomplice"));
+        DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, 11, _slashInputs(), 0x7);
+        vm.prank(writer);
+        uint256 id = reg.disclose(s, address(unrelated), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+        vm.prank(makeAddr("operator"));
+        reg.reply(id, s, address(unrelated), "repo://operator-reply", bytes32(0));
+
+        DisclosureRegistry.Signed memory q = _executed(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs(), 0x3);
+        uint256 qid = _disclose(q);
+        vm.prank(makeAddr("operator"));
+        reg.reply(qid, q, address(0), "", bytes32(0));
+    }
+
+    function test_replyByReputationUserOnly() public {
+        DisclosureRegistry.Signed memory r = _executed(DisclosureRegistry.Kind.REPUTATION, 21, _repInputs(), 0x7);
+        uint256 id = _disclose(r);
+        vm.prank(makeAddr("u1"));
+        reg.reply(id, r, address(0), "", bytes32(0));
+        vm.prank(makeAddr("operator")); // not named by a reputation batch
+        vm.expectRevert(DisclosureRegistry.NotAccused.selector);
+        reg.reply(id, r, address(0), "", bytes32(0));
+    }
+
+    /// A generic action names no reply party: its target is not given a reply right.
+    function test_replyByGenericTargetReverts() public {
+        DisclosureRegistry.Signed memory g = _executed(DisclosureRegistry.Kind.GENERIC, 5, _genericInputs(), 0x7);
+        uint256 id = _disclose(g);
+        vm.prank(makeAddr("target"));
+        vm.expectRevert(DisclosureRegistry.NotAccused.selector);
+        reg.reply(id, g, address(0), "", bytes32(0));
+        // nor a different operator on a slash
+        DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, 12, _slashInputs(), 0x7);
+        uint256 sid = _disclose(s);
+        vm.prank(makeAddr("otherOperator"));
+        vm.expectRevert(DisclosureRegistry.NotAccused.selector);
+        reg.reply(sid, s, address(0), "", bytes32(0));
+    }
+
     function test_replyCannotForgeSignerSet() public {
         DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, 11, _slashInputs(), 0x7);
         uint256 id = _disclose(s);

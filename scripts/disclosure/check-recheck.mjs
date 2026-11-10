@@ -95,7 +95,15 @@ function spSigners(slots, mask) {
 function makeChain() {
   const blocks = new Map(); // number -> { hash, slots }
   const txs = new Map(); // hash -> { tx, receipt }
-  const commitments = new Map(); // key -> bytes32
+  const commitments = new Map(); // key -> [{ block, value }] (historical, like real state)
+  const commitAt = (key, tag) => {
+    const at = tag === "latest" ? head : Number(tag);
+    const hist = (commitments.get(key) ?? []).filter(h => h.block <= at);
+    return hist.length ? hist[hist.length - 1].value : ethers.ZeroHash;
+  };
+  const setCommit = (key, block, value) =>
+    commitments.set(key, [...(commitments.get(key) ?? []), { block, value }]);
+  let onCommitRead = null; // one-shot hook: runs while a check is in flight
   const logs = [];
   let head = 100;
   let slots = { 1: G[0], 2: G[1], 3: G[2] };
@@ -109,6 +117,8 @@ function makeChain() {
     return head;
   };
   const slotsAt = tag => blocks.get(tag === "latest" ? head : Number(tag)).slots;
+  let maxRange = Infinity; // emulate a range-capped RPC
+  let getLogsCalls = 0;
 
   const chain = {
     async getTransaction(h) {
@@ -120,9 +130,18 @@ function makeChain() {
     async getBlock(n) {
       return blocks.get(Number(n)) ?? null;
     },
-    async getLogs({ address, topics }) {
+    async getBlockNumber() {
+      return head;
+    },
+    async getLogs({ address, topics, fromBlock, toBlock }) {
+      getLogsCalls++;
+      if (toBlock - fromBlock + 1 > maxRange) throw new Error("block range too large");
       return logs.filter(
-        l => l.address === address && topics.every((t, i) => t == null || l.topics[i] === t)
+        l =>
+          l.address === address &&
+          l.blockNumber >= fromBlock &&
+          l.blockNumber <= toBlock &&
+          topics.every((t, i) => t == null || l.topics[i] === t)
       );
     },
     async call({ to, data, blockTag }) {
@@ -133,24 +152,31 @@ function makeChain() {
         return aggIface.encodeFunctionResult(p.name, [
           slotsAt(blockTag)[Number(p.args[0])] ?? ethers.ZeroAddress,
         ]);
-      if (p.name === "proposalSignersCommitment")
-        return aggIface.encodeFunctionResult(p.name, [
-          commitments.get(BigInt(p.args[0])) ?? ethers.ZeroHash,
-        ]);
+      if (p.name === "proposalSignersCommitment") {
+        const v = commitAt(BigInt(p.args[0]), blockTag);
+        if (onCommitRead) {
+          const f = onCommitRead;
+          onCommitRead = null;
+          f();
+        }
+        return aggIface.encodeFunctionResult(p.name, [v]);
+      }
       throw new Error(`stub: ${p.name}`);
     },
   };
 
   /** Execute one action as SP would: commitment over pre-block slots, SignersCommitted log. */
-  function execute(kind, id, f, mask, { to = AGG, from = SAFE } = {}) {
+  function execute(kind, id, f, mask, { to = AGG, from = SAFE, midSlots } = {}) {
     const n = mine();
-    const pre = blocks.get(n - 1).slots;
+    // midSlots: the slot table as an earlier tx in this block left it and a later one undid it.
+    const pre = midSlots ?? blocks.get(n - 1).slots;
     const mh = spMessageHash(kind, id, f);
     const key = spKey(kind, id, mh);
     const signers = spSigners(pre, mask);
     const anchor = blocks.get(n - 1).hash;
-    commitments.set(
+    setCommit(
       key,
+      n,
       ethers.keccak256(
         ABI.encode(
           ["bytes32", "bytes32", "uint256", "bytes32", "uint256", "address[]", "bytes32"],
@@ -204,6 +230,7 @@ function makeChain() {
       receipt: {
         status: 1,
         blockNumber: n,
+        blockHash: blocks.get(n).hash,
         logs: [{ address: AGG, topics: ev.topics, data: ev.data }],
       },
     });
@@ -265,13 +292,36 @@ function makeChain() {
     ]);
     txs.set(hash, {
       tx: { hash, to: REG, from: WATCHER, data },
-      receipt: { status: 1, blockNumber: n, logs: [] },
+      receipt: { status: 1, blockNumber: n, blockHash: blocks.get(n).hash, logs: [] },
     });
-    logs.push({ address: REG, topics: ev.topics, data: ev.data, transactionHash: hash });
+    logs.push({
+      address: REG,
+      topics: ev.topics,
+      data: ev.data,
+      transactionHash: hash,
+      blockNumber: n,
+      blockHash: blocks.get(n).hash,
+    });
     return entryId;
   }
 
-  return { chain, execute, disclose, setSlot: (s, v) => (slots[s] = v) };
+  return {
+    chain,
+    execute,
+    disclose,
+    setSlot: (s, v) => (slots[s] = v),
+    /** Replace block `n` with a sibling: same number, new hash (receipts fetched before keep the old one). */
+    reorg: n => (blocks.get(n).hash = ethers.id(`reorged-${n}`)),
+    disclosureBlock: entryId => logs.find(l => BigInt(l.topics[1]) === BigInt(entryId)).blockNumber,
+    capRange: r => (maxRange = r),
+    /** Overwrite the commitment at `key` in a new block (what a key collision would do). */
+    overwrite: key => setCommit(key, mine(), ethers.id(`overwrite-${key}`)),
+    mineEmpty: () => mine(),
+    reorgDuringNextCheck: n =>
+      (onCommitRead = () => (blocks.get(n).hash = ethers.id(`mid-reorg-${n}`))),
+    logCalls: () => getLogsCalls,
+    head: () => head,
+  };
 }
 
 // ------------------------------------------------------------------ fixtures
@@ -299,19 +349,47 @@ const repIn = ABI.encode(
 );
 
 // ------------------------------------------------------------------ cases
-const { chain, execute, disclose, setSlot } = makeChain();
+const {
+  chain,
+  execute,
+  disclose,
+  setSlot,
+  reorg,
+  disclosureBlock,
+  capRange,
+  logCalls,
+  overwrite,
+  mineEmpty,
+  reorgDuringNextCheck,
+  head: headNow,
+} = makeChain();
 const results = [];
-async function expectCase(name, entryId, want) {
-  const r = await recheckEntry(chain, { registry: REG, aggregator: AGG, entryId });
+// want: "PASS" | { diff } (MISMATCH on that field) | { status, reason } | { unverified: {...} } (MATCH,
+// with those claims reported back verbatim as unverified).
+async function expectCase(name, entryId, want, opts = {}) {
+  const r = await recheckEntry(chain, {
+    registry: REG,
+    aggregator: AGG,
+    entryId,
+    page: opts.page,
+    confirmations: opts.confirmations ?? 0,
+  });
   let ok;
-  if (want === "PASS") ok = r.ok;
-  else if (want.diff) ok = !r.ok && r.diffs.some(d => d.field === want.diff);
-  else ok = !r.ok && r.reasons.some(x => x.includes(want.reason));
+  if (want === "PASS") ok = r.status === "MATCH" && r.ok;
+  else if (want.unverified)
+    ok =
+      r.status === "MATCH" &&
+      Object.entries(want.unverified).every(
+        ([k, v]) => r.unverified?.[k]?.toLowerCase() === v.toLowerCase()
+      );
+  else if (want.diff)
+    ok = r.status === "MISMATCH" && !r.ok && r.diffs.some(d => d.field === want.diff);
+  else ok = r.status === want.status && !r.ok && r.reasons.some(x => x.includes(want.reason));
   results.push({
     name,
     ok,
     want: JSON.stringify(want),
-    got: JSON.stringify({ ok: r.ok, reasons: r.reasons, diffs: r.diffs.map(d => d.field) }),
+    got: JSON.stringify({ status: r.status, reasons: r.reasons, diffs: r.diffs.map(d => d.field) }),
   });
 }
 
@@ -342,7 +420,7 @@ await expectCase(
 await expectCase(
   "forged txHash (points at another action)",
   disclose(Kind.SLASH, 7n, slashIn, aS, { txHash: aG.hash }),
-  { reason: "no SignersCommitted for key" }
+  { status: "MISMATCH", reason: "no SignersCommitted for key" }
 );
 await expectCase(
   "forged blockNumber",
@@ -373,12 +451,112 @@ await expectCase(
   disclose(Kind.SLASH, 7n, slashIn, aS, { anchor: ethers.id("y") }),
   { diff: "signed.anchor" }
 );
-await expectCase("missing entry", 999n, { reason: "expected one Disclosed log" });
+await expectCase("missing entry", 999n, {
+  status: "MISMATCH",
+  reason: "expected one Disclosed log",
+});
 
 const aW = execute(Kind.SLASH, 11n, slashF, 0b011n, { to: WRAPPER });
-await expectCase("wrapped action call fails closed", disclose(Kind.SLASH, 11n, slashIn, aW), {
+await expectCase("wrapped action call is INCONCLUSIVE", disclose(Kind.SLASH, 11n, slashIn, aW), {
+  status: "INCONCLUSIVE",
   reason: "wrapped",
 });
+
+// Codex M1: subjectToken is a claim. A MATCH must hand it back as unverified, never as verified.
+const OTHER_TOKEN = addr("unrelated-community-token");
+await expectCase(
+  "unrelated subjectToken is reported unverified, not verified",
+  disclose(Kind.SLASH, 7n, slashIn, aS, { subjectToken: OTHER_TOKEN }),
+  { unverified: { subjectToken: OTHER_TOKEN } }
+);
+
+// Codex M3: a slot assignment that existed only inside the block (set by an earlier tx, undone by a
+// later one) is in neither snapshot. Undecidable from snapshots: INCONCLUSIVE, not MISMATCH.
+const aMid = execute(Kind.SLASH, 12n, slashF, 0b011n, {
+  midSlots: { 1: G[0], 2: addr("transient") },
+});
+await expectCase(
+  "intra-block slot change is INCONCLUSIVE",
+  disclose(Kind.SLASH, 12n, slashIn, aMid),
+  {
+    status: "INCONCLUSIVE",
+    reason: "inside the block",
+  }
+);
+
+// Codex M2: reorgs. The action's block replaced by a sibling, and the disclosure's block replaced.
+const aRe = execute(Kind.SLASH, 13n, slashF, 0b011n);
+const eRe = disclose(Kind.SLASH, 13n, slashIn, aRe);
+reorg(aRe.block);
+await expectCase("action block reorged out is INCONCLUSIVE", eRe, {
+  status: "INCONCLUSIVE",
+  reason: "action receipt is not in the canonical chain",
+});
+const aRe2 = execute(Kind.SLASH, 14n, slashF, 0b011n);
+const eRe2 = disclose(Kind.SLASH, 14n, slashIn, aRe2);
+reorg(disclosureBlock(eRe2));
+await expectCase("disclosure block reorged out is INCONCLUSIVE", eRe2, {
+  status: "INCONCLUSIVE",
+  reason: "Disclosed log is not in the canonical chain",
+});
+
+// Codex M2 (cont.): a reorg that happens WHILE the check runs is caught by the closing re-check.
+const aRe3 = execute(Kind.SLASH, 15n, slashF, 0b011n);
+const eRe3 = disclose(Kind.SLASH, 15n, slashIn, aRe3);
+reorgDuringNextCheck(aRe3.block);
+await expectCase("reorg during the check is INCONCLUSIVE", eRe3, {
+  status: "INCONCLUSIVE",
+  reason: "canonical chain changed during the check",
+});
+
+// All state is read at one snapshot (head - confirmations): a commitment overwritten after the
+// snapshot does not change the verdict, and a pointer to an action newer than the snapshot is not
+// judged on unconfirmed data.
+const aSnap = execute(Kind.SLASH, 16n, slashF, 0b011n);
+const eSnap = disclose(Kind.SLASH, 16n, slashIn, aSnap);
+mineEmpty();
+overwrite(aSnap.key);
+await expectCase("reads pinned to the snapshot, not latest", eSnap, "PASS", { confirmations: 2 });
+// Entry written at block D that points at an action executed later, at A = D + 1. With the snapshot
+// at D (confirmations = 1) the action is not yet confirmed: INCONCLUSIVE, not judged on it.
+{
+  const D = headNow() + 1;
+  const A = D + 1;
+  const id = 18n;
+  const mh = spMessageHash(Kind.SLASH, id, slashF);
+  const placeholder = {
+    hash: ethers.id(`action-${A}-${Kind.SLASH}-${id}`),
+    key: id,
+    mh,
+    signers: [],
+    anchor: ethers.ZeroHash,
+    block: A,
+    mask: 0b011n,
+  };
+  const eFwd = disclose(Kind.SLASH, id, slashIn, placeholder);
+  const aFwd = execute(Kind.SLASH, id, slashF, 0b011n);
+  if (aFwd.hash !== placeholder.hash)
+    throw new Error("self-test setup: predicted action hash wrong");
+  await expectCase(
+    "entry pointing at an action newer than the snapshot is INCONCLUSIVE",
+    eFwd,
+    { status: "INCONCLUSIVE", reason: "newer than the confirmed snapshot" },
+    { confirmations: 1 }
+  );
+}
+
+// Codex L4: a range-capped RPC still finds the entry (pages halve until they fit), across pages.
+capRange(16);
+const before = logCalls();
+await expectCase("range-capped RPC: paged log search finds the entry", 1n, "PASS", { page: 64 });
+const paged = logCalls() - before;
+results.push({
+  name: "paging actually split the range",
+  ok: paged > 2,
+  want: ">2 getLogs calls",
+  got: String(paged),
+});
+capRange(Infinity);
 
 let failed = 0;
 for (const r of results) {
@@ -387,7 +565,7 @@ for (const r of results) {
   );
   if (!r.ok) failed++;
 }
-const honest = results.filter(r => r.want === '"PASS"').length;
+const honest = results.filter(r => r.want === '"PASS"' || r.want.includes('"unverified"')).length;
 console.log(
   `\n${results.length - failed}/${results.length} cells (${honest} must-pass, ${results.length - honest} must-fail)`
 );
