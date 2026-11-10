@@ -3053,6 +3053,162 @@ try {
   }
 }
 
+// ---- DSR: no provider URL / key / foreign error text in anything the watcher writes. Every RPC
+// method throws, at some point, an error whose message, shortMessage, info and url carry a
+// sentinel key; malformed items trigger the isolation reasons; then every file under the data dir
+// (dead letters, records, amendments, status.json, cursor) and every returned status is searched.
+{
+  const SENT = "SENTINELKEY9f3a";
+  const URL = `https://eth-sepolia.example.io/v2/${SENT}`;
+  const leakErr = () =>
+    Object.assign(new Error(`request to ${URL} failed: ${SENT}`), {
+      shortMessage: `bad response ${SENT}`,
+      info: { error: { message: `upstream ${URL}` }, requestUrl: URL },
+      url: URL,
+      code: "SERVER_ERROR",
+    });
+  const dS = mkdtempSync(join(tmpdir(), "guardian-watcher-sentinel-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dS);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const KEEP = addr("sent-keeper");
+    const pauseSel = ethers.id("pauseUnderstakedOperator(address)").slice(0, 10);
+    // traffic: a traced public tx, a BLS action, a price-reading generic action, an owner event
+    const tPub = c.ownerTx([{ name: "OperatorPaused", args: [addr("sent-op")] }], {
+      from: KEEP,
+      data: pauseSel,
+    });
+    const tBls = c.execute(Kind.SLASH, 9191n, slashF, 0b011n);
+    const priceG = {
+      target: SP,
+      callData: spIface.encodeFunctionData("updatePriceDVT", [262000000000n, 21n, "0x", 0]),
+      requiredThreshold: 2n,
+    };
+    const tGen = c.execute(Kind.GENERIC, 9292n, priceG, 0b111n, { price: 262000000000n });
+    const tOwn = c.ownerTx([{ name: "GuardianSet", args: [addr("sent-g1"), addr("sent-g2")] }]);
+    // malformed items for the isolation reasons
+    const quiet = c.ownerTx([]);
+    const quiet2 = c.ownerTx([]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const rq = await c.chain.getTransactionReceipt(quiet.hash);
+    const rq2 = await c.chain.getTransactionReceipt(quiet2.hash);
+    const gs = spIface.encodeEventLog("GuardianSet", [addr("sent-a"), addr("sent-b")]);
+    // a chain whose methods throw sentinel-carrying errors on chosen calls
+    const plan = {
+      getLogs: new Set([1]), // the first range read fails the whole tick
+      getTransaction: new Set([2, 3]),
+      getTransactionReceipt: new Set([2, 5]),
+      call: new Set([1, 2]),
+      send: new Set([4, 9, 15]),
+    };
+    const counts = {};
+    const leaky = new Proxy(c.chain, {
+      get(t, p) {
+        const v = t[p];
+        if (typeof v !== "function") return v;
+        return async (...a) => {
+          counts[p] = (counts[p] ?? 0) + 1;
+          if (plan[p]?.has(counts[p])) throw leakErr();
+          if (
+            p === "send" &&
+            a[0] === "debug_traceTransaction" &&
+            (counts.trace = (counts.trace ?? 0) + 1) % 2
+          )
+            throw leakErr();
+          return v.apply(t, a);
+        };
+      },
+    });
+    const statuses = [];
+    // the malformed items are answered from the first tick past the planned failures (the stub
+    // hands an injected answer out once; a real RPC would repeat it)
+    const injectMalformed = () => {
+      c.injectRawResult(SP, null);
+      c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: rq2.blockNumber,
+        blockHash: rq2.blockHash,
+        index: "bad",
+        transactionHash: quiet2.hash,
+      });
+      c.injectRawResult(SP, {
+        address: addr("sent-other"),
+        ...gs,
+        blockNumber: rq.blockNumber,
+        blockHash: rq.blockHash,
+        index: 0,
+        transactionHash: quiet.hash,
+      });
+    };
+    // a foreign error thrown from inside the per-tx processing (here a store write) reaches the
+    // isolation handler itself: its text must not be kept either
+    const realPut = store.putRecord.bind(store);
+    let putFails = 0;
+    store.putRecord = r => {
+      if (putFails-- > 0) throw leakErr();
+      return realPut(r);
+    };
+    for (let i = 0; i < MAX_DEADLETTER_ATTEMPTS + 3; i++) {
+      if (i === 2) injectMalformed();
+      if (i === 2) putFails = 1;
+      statuses.push((await runOnce(leaky, cfg, store, rs, ident)).status);
+    }
+    store.putRecord = realPut;
+    const files = [];
+    const walk = p => {
+      for (const n of readdirSync(p, { withFileTypes: true })) {
+        const q = join(p, n.name);
+        if (n.isDirectory()) walk(q);
+        else files.push(q);
+      }
+    };
+    walk(dS);
+    const leaks = files.filter(
+      f => readFileSync(f, "utf8").includes(SENT) || readFileSync(f, "utf8").includes("example.io")
+    );
+    const statusLeak = statuses.some(st => JSON.stringify(st).includes(SENT));
+    // isolation reasons and external-error categories, wherever they ended (open, exhausted, records)
+    const all = files.map(f => readFileSync(f, "utf8")).join("\n");
+    const reasons = new Set(all.match(/tx processing failed[^"]*/g) ?? []);
+    cell(
+      "DSR: no provider URL, key or foreign error text in dead letters, records, amendments, status or any written file (every RPC method throws a sentinel; isolation reasons triggered)",
+      leaks.length === 0 &&
+        !statusLeak &&
+        statuses.some(st => st.ok === false) &&
+        files.length > 5 &&
+        reasons.size >= 2 &&
+        /UNREADABLE/.test(all),
+      {
+        leaks,
+        statusLeak,
+        files: files.map(f => f.slice(dS.length)),
+        dlReasons: files
+          .filter(f => f.includes("deadletters"))
+          .map(f => JSON.parse(readFileSync(f, "utf8")).reasons ?? null),
+        counts,
+        st: statuses.slice(0, 4).map(x => [x.ok, x.lastError, x.isolatedThisTick, x.scanned]),
+        quiet: quiet.hash.slice(0, 10),
+      }
+    );
+    void tPub;
+    void tBls;
+    void tGen;
+    void tOwn;
+  } finally {
+    rmSync(dS, { recursive: true, force: true });
+  }
+}
+
 // ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)
 {
   const got = [];
