@@ -143,6 +143,7 @@ function makeChain() {
   const txPatch = new Map(); // hash -> fields a mixed backend answers for getTransaction
   const receiptPatch = new Map(); // hash -> fields a stale backend answers differently
   const receiptLogs = new Map(); // hash -> logs a (inconsistent) RPC returns in the receipt instead
+  const headerPatches = new Map(); // block -> fields one header read answers malformed
   const rawResults = []; // non-log values a broken RPC returns once in a range getLogs answer
   let upperTopics = false; // a client answering getLogs topics in upper-case hex
   let traceMode = "ok"; // ok | unsupported (no debug namespace) | noLogs (withLog ignored)
@@ -270,6 +271,11 @@ function makeChain() {
         const f = afterSends.fn;
         afterSends = null;
         f();
+      }
+      if (out && headerPatches.has(num)) {
+        const p = headerPatches.get(num);
+        headerPatches.delete(num); // once
+        return { ...out, ...p };
       }
       return out;
     },
@@ -754,6 +760,8 @@ function makeChain() {
     setUpperTopics: v => (upperTopics = v),
     /** Make the next range getLogs for `address` also return `value` (e.g. null). */
     injectRawResult: (address, value) => rawResults.push({ address, value }),
+    /** The next header read of block n answers with `patch` applied (once). */
+    patchHeaderOnce: (n, patch) => headerPatches.set(n, patch),
     /** Patch the getLogs copy of a tx's logs (e.g. a contradictory position), not its receipt. */
     patchLogs: (hash, patch) => {
       for (const l of logs) if (l.transactionHash === hash) Object.assign(l, patch);

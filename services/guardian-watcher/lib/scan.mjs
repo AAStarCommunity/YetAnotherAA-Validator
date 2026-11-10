@@ -21,7 +21,13 @@ async function header(chain, tag) {
     false,
   ]);
   if (!b || !b.hash) throw new Error(`block ${tag} unavailable`);
-  return { number: Number(b.number), hash: b.hash, logsBloom: b.logsBloom };
+  // A header is accepted only with a 32-byte hash and a parseable height: a malformed one fails the
+  // tick (the cursor is never set from it) and is never interpolated (Codex follow-up R10).
+  const number = parsePosition(b.number);
+  if (typeof b.hash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(b.hash) || number === null)
+    throw new Error("malformed block header");
+  if (typeof tag === "number" && number !== tag) throw new Error("block header for another height");
+  return { number, hash: b.hash, logsBloom: b.logsBloom };
 }
 
 /** getLogs over [from, to], paged; a failing page halves down to one block before giving up. */
@@ -507,8 +513,7 @@ function evidenceLog(l, source, range) {
  * so a later sighting never replaces an earlier one (Codex follow-up R7). */
 function mergeEvidence(a, b) {
   // identity = raw contents, the query that returned it, and its range (Codex follow-up R8)
-  const key = e =>
-    rawLogKey(e) + JSON.stringify([e?.source ?? null, e?.range ?? null]) + String(e?.raw ?? "");
+  const key = e => rawLogKey(e) + safeJson([e?.source ?? null, e?.range ?? null]) + str(e?.raw);
   const out = [];
   for (const e of [...(a ?? []), ...(b ?? [])]) if (!out.some(x => key(x) === key(e))) out.push(e);
   return out;
@@ -559,12 +564,19 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
     try {
       watched = mergeEvidence(existing?.watched, evidenceOf(t));
     } catch {
-      watched = existing?.watched ?? [];
+      // never only the old evidence: this observation is kept too, unmerged if need be (R10)
+      let incoming;
+      try {
+        incoming = evidenceOf(t);
+      } catch {
+        incoming = [{ raw: safeJson([t.agg, t.sp]), source: "unmerged" }];
+      }
+      watched = [...(existing?.watched ?? []), ...incoming];
     }
     // An item without a usable tx hash gets a quarantine identity derived from its evidence: it
     // is retried and counted, never attributed to any tx (Codex follow-up R2).
     const okHash = /^0x[0-9a-fA-F]{64}$/.test(str(txHash));
-    const qid = okHash ? null : ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(watched)));
+    const qid = okHash ? null : ethers.keccak256(ethers.toUtf8Bytes(safeJson(watched)));
     store.putDeadLetter({
       ...(existing ?? {}),
       route: "tx",
@@ -589,12 +601,12 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
 function quarantineRaw(store, ctx, summary, x, source, from, to) {
   let raw;
   try {
-    raw = JSON.stringify(x) ?? typeof x;
+    raw = safeJson(x) ?? typeof x;
   } catch {
     raw = `<unserialisable ${typeof x}>`;
   }
   const evidence = [{ raw, source, range: [from, to] }];
-  const qid = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(evidence)));
+  const qid = ethers.keccak256(ethers.toUtf8Bytes(safeJson(evidence)));
   summary.isolated = (summary.isolated ?? 0) + 1;
   store.putDeadLetter({
     route: "tx",
@@ -611,11 +623,21 @@ function quarantineRaw(store, ctx, summary, x, source, from, to) {
   summary.deadLetters++;
 }
 
+/** JSON that never throws on RPC values: a BigInt keeps its type in the text, so identities
+ * built from it stay distinct and stable (Codex follow-up R10). */
+export function safeJson(v) {
+  try {
+    return JSON.stringify(v, (_, x) => (typeof x === "bigint" ? { $bigint: x.toString() } : x));
+  } catch {
+    return `<unserialisable ${typeof v}>`;
+  }
+}
+
 /** A log's raw identity for de-duplication: every field as the RPC gave it, never parsed, so only
  * identical copies collapse and conflicting ones at one position survive (Codex follow-up R2). */
 export function rawLogKey(l) {
   const h = x => (typeof x === "string" ? x.toLowerCase() : x);
-  return JSON.stringify([
+  return safeJson([
     h(l?.address),
     Array.isArray(l?.topics) ? l.topics.map(h) : l?.topics,
     h(l?.data),

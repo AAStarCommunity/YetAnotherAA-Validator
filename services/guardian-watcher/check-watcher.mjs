@@ -2793,6 +2793,58 @@ try {
       );
     }
 
+    // Codex follow-up R10: BigInt fields, merged evidence, malformed headers
+    {
+      const b = mk();
+      const quiet = b.c.ownerTx([]);
+      settle(b.c);
+      const rq = await b.c.chain.getTransactionReceipt(quiet.hash);
+      const gs = spIface.encodeEventLog("GuardianSet", [addr("r10-a"), addr("r10-b")]);
+      const at = {
+        blockNumber: rq.blockNumber,
+        blockHash: rq.blockHash,
+        transactionHash: quiet.hash,
+      };
+      b.c.injectRawResult(SP, { address: SP, ...gs, ...at, index: 0 });
+      b.c.injectRawResult(SP, { address: SP, ...gs, ...at, index: 1n }); // a BigInt position
+      b.c.injectRawResult(AGG, { address: AGG, ...gs, ...at, index: 2n });
+      b.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: rq.blockNumber,
+        blockHash: rq.blockHash,
+        index: 0,
+        transactionHash: 1n,
+      });
+      const bs = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+      const bq = b.store.listDeadLetters().find(x => x.txHash === quiet.hash);
+      // a malformed hash in the final header read: the tick fails, the cursor is not poisoned
+      b.c.mine();
+      settle(b.c);
+      const curBefore = b.store.getCursor();
+      const fin = b.c.head() - 2;
+      b.c.patchHeaderOnce(fin, { hash: { toString: null } });
+      const bad = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+      const curAfterBad = b.store.getCursor();
+      const good = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+      cell(
+        "follow-up R10: BigInt fields never throw (isolated, every observation kept); a malformed header hash fails the tick without poisoning the cursor",
+        bs.ok === true &&
+          bq?.watched?.length === 3 &&
+          b.store.listDeadLetters().some(x => x.quarantine === true) &&
+          bad.ok === false &&
+          j(curAfterBad) === j(curBefore) &&
+          good.ok === true &&
+          b.store.getCursor().block > curBefore.block,
+        {
+          bs: [bs.ok, bs.lastError],
+          w: bq?.watched?.length,
+          bad: [bad.ok, bad.lastError],
+          good: [good.ok, good.lastError],
+        }
+      );
+    }
+
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it
     const b = mk();
