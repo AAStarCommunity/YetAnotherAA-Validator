@@ -30,6 +30,28 @@ async function header(chain, tag) {
   return { number, hash: b.hash, logsBloom: b.logsBloom };
 }
 
+/**
+ * eth_getLogs through raw `send`, never the provider's getLogs (#403 review M-1): ethers formats
+ * every log of the answer and throws on one it cannot format (a null entry, a bad index, a short
+ * address, a missing hash), which would stop the whole tick before the per-tx isolation could
+ * see the item. The raw answer reaches intake() and the isolation instead. Only a non-array
+ * answer is an error here (the tick fails and is retried).
+ */
+export async function rawGetLogs(chain, { address, topics, fromBlock, toBlock, blockHash }) {
+  const filter =
+    blockHash !== undefined
+      ? { address, topics, blockHash }
+      : {
+          address,
+          topics,
+          fromBlock: ethers.toQuantity(fromBlock),
+          toBlock: ethers.toQuantity(toBlock),
+        };
+  const r = await chain.send("eth_getLogs", [filter]);
+  if (!Array.isArray(r)) throw new Error("eth_getLogs answer is not an array");
+  return r;
+}
+
 /** getLogs over [from, to], paged; a failing page halves down to one block before giving up. */
 export async function pagedLogs(chain, address, topics, from, to, page = 5_000) {
   const out = [];
@@ -38,7 +60,7 @@ export async function pagedLogs(chain, address, topics, from, to, page = 5_000) 
   while (a <= to) {
     const b = Math.min(to, a + size - 1);
     try {
-      out.push(...(await chain.getLogs({ address, topics, fromBlock: a, toBlock: b })));
+      out.push(...(await rawGetLogs(chain, { address, topics, fromBlock: a, toBlock: b })));
       a = b + 1;
       size = page;
     } catch (e) {
@@ -706,7 +728,7 @@ async function watchedLogsOf(chain, cfg, txHash, blockNumber) {
     [cfg.aggregator, [SIGNERS_COMMITTED()]],
     [cfg.roles.superPaymaster, spTopics()],
   ]) {
-    const got = await chain.getLogs({ address, topics: [topics], blockHash: h.hash });
+    const got = await rawGetLogs(chain, { address, topics: [topics], blockHash: h.hash });
     for (const l of got)
       if (lcEq(l.transactionHash, txHash))
         out.push(evidenceLog(l, lcEq(address, cfg.aggregator) ? "agg" : "sp"));
@@ -1179,7 +1201,7 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
         if (!missing.length) continue;
         let got;
         try {
-          got = await chain.getLogs({ address: addr, topics: [topics], blockHash: h.hash });
+          got = await rawGetLogs(chain, { address: addr, topics: [topics], blockHash: h.hash });
         } catch {
           throw new Error(
             `block ${n}: logsBloom shows a watched log that getLogs did not return, and the by-hash re-read failed; retrying`

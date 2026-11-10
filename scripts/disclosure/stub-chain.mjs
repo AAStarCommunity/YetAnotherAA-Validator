@@ -216,6 +216,18 @@ function makeChain() {
         }
         return out;
       }
+      if (method === "eth_getLogs") {
+        // the raw method: the same answer as getLogs (injected malformed values pass unchanged)
+        const f = params[0] ?? {};
+        const q = x => (typeof x === "string" ? Number(BigInt(x)) : x);
+        return chain.getLogs({
+          address: f.address,
+          topics: f.topics ?? [],
+          ...(f.blockHash !== undefined
+            ? { blockHash: f.blockHash }
+            : { fromBlock: q(f.fromBlock), toBlock: q(f.toBlock) }),
+        });
+      }
       if (method === "eth_getStorageAt") {
         const [who, slot, tag] = params;
         const at = tag === undefined || tag === "latest" ? head : Number(tag);

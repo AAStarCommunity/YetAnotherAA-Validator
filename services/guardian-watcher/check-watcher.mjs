@@ -426,6 +426,11 @@ try {
     getLogs: async () => {
       throw new Error("rpc down");
     },
+    // range reads go through raw eth_getLogs (#403 review M-1): the RPC is down there too
+    send: async (m, p) => {
+      if (m === "eth_getLogs") throw new Error("rpc down");
+      return c.chain.send(m, p);
+    },
   };
   c.execute(Kind.SLASH, 104n, slashF, 0b011n);
   const r4 = await runOnce(broken, cfg, store, rs, ident);
@@ -3045,6 +3050,165 @@ try {
     );
   } finally {
     rmSync(d7, { recursive: true, force: true });
+  }
+}
+
+// ---- #403 review M-1: the production path. A real ethers JsonRpcProvider (only its transport
+// replaced) answers eth_getLogs with raw JSON holding malformed entries; the range read must not go
+// through ethers' log formatter (which throws on them), so the tick completes, the cursor moves and
+// every malformed entry is isolated.
+{
+  const dP = mkdtempSync(join(tmpdir(), "guardian-watcher-realprov-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const good = c.ownerTx([{ name: "GuardianSet", args: [addr("rp-g1"), addr("rp-g2")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const q = x => ethers.toQuantity(x);
+    const asJson = l => ({
+      address: l.address,
+      topics: l.topics,
+      data: l.data,
+      blockNumber: q(l.blockNumber),
+      blockHash: l.blockHash,
+      transactionHash: l.transactionHash,
+      transactionIndex: "0x0",
+      logIndex: q(l.index),
+      removed: false,
+    });
+    const gs = spIface.encodeEventLog("GuardianSet", [addr("rp-a"), addr("rp-b")]);
+    const rq = await c.chain.getTransactionReceipt(good.hash);
+    const base = {
+      address: SP.toLowerCase(),
+      topics: gs.topics,
+      data: gs.data,
+      blockNumber: q(rq.blockNumber),
+      blockHash: rq.blockHash,
+      transactionIndex: "0x0",
+      removed: false,
+    };
+    const malformed = [
+      null,
+      { ...base, transactionHash: ethers.id("rp-badidx"), logIndex: "bad" },
+      { ...base, transactionHash: ethers.id("rp-short"), logIndex: "0x5", address: "0x1234" },
+      { ...base, logIndex: "0x6" }, // no transactionHash
+      {
+        ...base,
+        transactionHash: ethers.id("rp-huge"),
+        logIndex: "0x7",
+        blockNumber: "0x" + "f".repeat(80),
+      },
+    ];
+    let malformedServed = false;
+    let byHashMalformed = false;
+    let malformedByHash = [];
+    class RawRpc extends ethers.JsonRpcProvider {
+      constructor() {
+        super("http://127.0.0.1:1", undefined, {
+          staticNetwork: ethers.Network.from(1),
+          batchMaxCount: 1,
+          cacheTimeout: -1,
+        });
+      }
+      async _send(payload) {
+        const out = [];
+        for (const p of Array.isArray(payload) ? payload : [payload]) {
+          try {
+            let result;
+            if (p.method === "eth_chainId") result = "0x1";
+            else if (p.method === "eth_getLogs") {
+              const raw = (await c.chain.send("eth_getLogs", p.params)).map(asJson);
+              const isSp = String(p.params[0].address).toLowerCase() === SP.toLowerCase();
+              const byHash = p.params[0].blockHash !== undefined;
+              if (isSp && byHash && byHashMalformed) {
+                byHashMalformed = false;
+                result = [...raw, ...malformedByHash];
+              } else if (isSp && !byHash && !malformedServed) {
+                malformedServed = true;
+                result = [...raw, ...malformed];
+              } else result = raw;
+            } else if (p.method === "eth_getBlockByNumber")
+              result = await c.chain.send(p.method, p.params);
+            else if (["eth_getTransactionByHash", "eth_getTransactionReceipt"].includes(p.method))
+              result = null;
+            else throw new Error(`not served: ${p.method}`);
+            out.push({ id: p.id, jsonrpc: "2.0", result });
+          } catch (e) {
+            out.push({
+              id: p.id,
+              jsonrpc: "2.0",
+              error: { code: -32601, message: String(e.message) },
+            });
+          }
+        }
+        return out;
+      }
+    }
+    const prov = new RawRpc();
+    // control: the provider's own getLogs throws on this answer (the formatter boundary is real)
+    malformedServed = false;
+    let formatterThrew = false;
+    try {
+      await prov.getLogs({ address: SP, fromBlock: cfg.startBlock, toBlock: c.head() });
+    } catch {
+      formatterThrew = true;
+    }
+    malformedServed = false;
+    const store = new Store(dP);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const head1 = c.head();
+    const st = (await runOnce(prov, cfg, store, rs, ident)).status;
+    // the bloom's by-hash re-read is the same raw path: a lagging range answer leaves a watched log
+    // out, the by-hash answer brings it back together with a malformed entry
+    const g2 = c.ownerTx([{ name: "GuardianSet", args: [addr("rp-h1"), addr("rp-h2")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const r2 = await c.chain.getTransactionReceipt(g2.hash);
+    c.lagTopic(r2.blockNumber, gs.topics[0]);
+    malformedByHash = [
+      {
+        ...base,
+        blockNumber: q(r2.blockNumber),
+        blockHash: r2.blockHash,
+        transactionHash: ethers.id("rp-byhash"),
+        logIndex: "bad",
+      },
+    ];
+    byHashMalformed = true;
+    const st2 = (await runOnce(prov, cfg, store, rs, ident)).status;
+    c.clearLag();
+    const dls = store.listDeadLetters();
+    cell(
+      "M-1: the bloom's by-hash re-read also takes the raw path: a malformed entry there is isolated, the tick completes",
+      st2.ok === true &&
+        st2.bloom.recovered >= 1 &&
+        dls.some(x => x.txHash === ethers.id("rp-byhash")),
+      { st2: [st2.ok, st2.lastError, st2.bloom], dls: dls.map(x => x.txHash.slice(0, 10)) }
+    );
+    cell(
+      "M-1: through a real ethers JsonRpcProvider, malformed raw eth_getLogs entries are isolated and the tick completes (the provider's own getLogs throws on the same answer)",
+      formatterThrew &&
+        st.ok === true &&
+        st.cursor === head1 &&
+        st.isolatedThisTick >= 4 &&
+        dls.some(x => x.quarantine === true) &&
+        dls.some(x => x.txHash === ethers.id("rp-badidx")) &&
+        dls.some(x => x.txHash === ethers.id("rp-short")) &&
+        dls.some(x => x.txHash === ethers.id("rp-huge")),
+      {
+        formatterThrew,
+        st: [st.ok, st.lastError, st.cursor, st.isolatedThisTick],
+        dls: dls.map(x => [x.txHash.slice(0, 10), x.quarantine, x.reasons]),
+      }
+    );
+  } finally {
+    rmSync(dP, { recursive: true, force: true });
   }
 }
 
