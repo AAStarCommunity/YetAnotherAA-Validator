@@ -95,6 +95,20 @@ export function traceUnsupported(e) {
   );
 }
 
+/** The same log: position, address, every topic and the data (case-insensitive hex). */
+export function sameLog(a, b) {
+  const h = x => String(x ?? "").toLowerCase();
+  const ta = a.topics ?? [];
+  const tb = b.topics ?? [];
+  return (
+    logPos(a) === logPos(b) &&
+    h(a.address) === h(b.address) &&
+    ta.length === tb.length &&
+    ta.every((t, i) => h(t) === h(tb[i])) &&
+    h(a.data) === h(b.data)
+  );
+}
+
 /** Whether any frame of a callTracer trace carries a log (withLog honoured). */
 function traceHasLogs(node) {
   if (!node || typeof node !== "object") return false;
@@ -181,7 +195,7 @@ export async function verifyTrace(
 /** Full receipt + callTracer (withLog) trace of a tx, for attribution; null parts when unavailable.
  * `stats` counts outcomes for status: ok, unsupported, failed, noLogs (a trace without any log
  * while the receipt has some: withLog ignored, so nothing can be aligned). */
-async function traceAndReceipt(chain, txHash, stats = {}) {
+async function traceAndReceipt(chain, txHash, stats = {}, expectLogs = false) {
   let trace = null;
   let rc = null;
   try {
@@ -192,7 +206,10 @@ async function traceAndReceipt(chain, txHash, stats = {}) {
   if (typeof chain.send === "function") {
     try {
       trace = await chain.send("debug_traceTransaction", [txHash, TRACE_OPTS]);
-      if (rc?.logs?.length && !traceHasLogs(trace)) stats.noLogs = (stats.noLogs ?? 0) + 1;
+      // getLogs already saw watched logs in this tx: a trace without any log proves withLog is not
+      // honoured, whatever the receipt says (Codex #400-fix R6).
+      if ((expectLogs || rc?.logs?.length) && !traceHasLogs(trace))
+        stats.noLogs = (stats.noLogs ?? 0) + 1;
       else stats.ok = (stats.ok ?? 0) + 1;
     } catch (e) {
       trace = null;
@@ -351,15 +368,14 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   // is asked for whenever an ambiguous event is present, direct or not (Codex #400-fix H1).
   const needFrame = decoded.some(x => amb.has(x.d.event));
   if ((t.agg.length && t.sp.length) || needFrame) {
-    const { trace, logs } = await traceAndReceipt(chain, txHash, (summary.trace ??= {}));
-    // The receipt must contain every watched log getLogs returned for this tx (same position and
-    // topic): an inconsistent receipt aligns with nothing it should (Codex #400-fix R5).
     const watched = [...t.agg, ...t.sp];
-    const consistent =
-      !!logs &&
-      watched.every(w =>
-        logs.some(r => logPos(r) === logPos(w) && r.topics?.[0] === w.topics?.[0])
-      );
+    const stats = (summary.trace ??= {});
+    const { trace, logs } = await traceAndReceipt(chain, txHash, stats, watched.length > 0);
+    // The receipt must contain every watched log getLogs returned for this tx, identical (address,
+    // every topic, data) at the same position: an inconsistent receipt aligns with nothing it
+    // should (Codex #400-fix R5, R6), and it is a health finding, not only a retry.
+    const consistent = !!logs && watched.every(w => logs.some(r => sameLog(r, w)));
+    if (logs && !consistent) stats.inconsistent = (stats.inconsistent ?? 0) + 1;
     attr = !logs
       ? { aligned: false, owner: new Map(), spCall: new Map(), why: "receipt unavailable" }
       : !consistent

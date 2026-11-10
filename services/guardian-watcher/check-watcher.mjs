@@ -20,7 +20,7 @@ import {
 } from "../../scripts/disclosure/stub-chain.mjs";
 import { spIface } from "./lib/sp-abi.mjs";
 import { validateRuleset, evaluate, matchGeneric } from "./lib/rules.mjs";
-import { MAX_DEADLETTER_ATTEMPTS, traceUnsupported, verifyTrace } from "./lib/scan.mjs";
+import { MAX_DEADLETTER_ATTEMPTS, traceUnsupported, verifyTrace, sameLog } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
@@ -1378,6 +1378,47 @@ try {
     }
     settle(r5.c);
     const r5a = (await runOnce(r5.c.chain, r5.cfg, r5.store, rs, ident, { now: T0 })).status;
+    // R6: a fresh proof exists; the node now ignores withLog and the receipt comes back empty
+    const r6 = mk();
+    const s6 = r6.c.ownerTx(pause("r6-1"), keeper);
+    r6.c.setReceiptLogs(s6.hash, []);
+    r6.c.setTraceMode("noLogs");
+    settle(r6.c);
+    r6.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+    const r6a = (await runOnce(r6.c.chain, r6.cfg, r6.store, rs, ident, { now: T0 + 1 })).status;
+    r6.c.setTraceMode("ok");
+    // R6: receipt and trace carry OperatorPaused(B) where getLogs saw OperatorPaused(A)
+    const r7 = mk();
+    const s7 = r7.c.ownerTx(pause("r6-A"), keeper);
+    {
+      const b = spIface.encodeEventLog("OperatorPaused", [addr("r6-B")]);
+      r7.c.setReceiptLogs(s7.hash, [
+        { address: SP, topics: b.topics, data: b.data, index: 0, blockNumber: s7.block },
+      ]);
+      r7.c.setTrace(s7.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: b.topics, data: b.data }],
+      });
+    }
+    settle(r7.c);
+    r7.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+    const r7a = (await runOnce(r7.c.chain, r7.cfg, r7.store, rs, ident, { now: T0 + 1 })).status;
+    const r7recs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+    cell(
+      "trace R6: watched logs make a log-less trace unsupported even with an empty receipt; a receipt with other contents is inconsistent (no attribution, degraded, proof dropped)",
+      r6a.healthy === false &&
+        r6a.trace.thisTick.noLogs >= 1 &&
+        r6a.trace.capability !== "verified" &&
+        r7a.healthy === false &&
+        r7a.trace.thisTick.inconsistent === 1 &&
+        !r7a.trace.thisTick.verified &&
+        r7a.degraded.some(x => /disagrees with getLogs/.test(x)) &&
+        r7recs.length === 0,
+      { r6: [r6a.trace, r6a.degraded], r7: [r7a.trace, r7a.degraded], r7recs }
+    );
     cell(
       "trace R5: unsupported in the scan drops the proof; a stored sample re-proves a quiet chain; failed verification traces degrade; an empty receipt proves nothing",
       r1a.healthy === true &&
@@ -1454,6 +1495,14 @@ try {
       await traceHealth(empty, thCfg, st, { noLogs: 1 }, 50, 6000);
       const h4 = await traceHealth(empty, thCfg, st, {}, 50, 7000);
       cell("traceHealth: a log-less scan trace also drops the proof", h4.degraded !== null, h4);
+      st.putTraceCapability({ verifiedAt: 1000, txHash: null, by: "test" });
+      await traceHealth(empty, thCfg, st, { inconsistent: 1 }, 50, 8000);
+      const h5 = await traceHealth(empty, thCfg, st, {}, 50, 9000);
+      cell(
+        "traceHealth: a receipt that disagrees with getLogs also drops the proof",
+        h5.degraded !== null && h5.trace.capability === "unverified",
+        h5
+      );
     } finally {
       rmSync(d6, { recursive: true, force: true });
     }
@@ -1474,6 +1523,23 @@ try {
       !traceUnsupported(Object.assign(new Error("x"), { code: "ECONNRESET" })),
     null
   );
+  {
+    const pu = spIface.encodeEventLog("PriceUpdated", [1n, 2n]);
+    const l = { address: SP, topics: pu.topics, data: pu.data, index: 3 };
+    const up = x => ({ ...x, address: x.address.toUpperCase().replace("0X", "0x") });
+    cell(
+      "sameLog: position, address, every topic and data must all match (hex case ignored)",
+      sameLog(l, up(l)) &&
+        !sameLog(l, { ...l, index: 4 }) &&
+        !sameLog(l, { ...l, address: AGG }) &&
+        !sameLog(l, {
+          ...l,
+          data: ethers.AbiCoder.defaultAbiCoder().encode(["int256", "uint256"], [1n, 3n]),
+        }) &&
+        !sameLog(l, { ...l, topics: [...l.topics, ethers.ZeroHash] }),
+      null
+    );
+  }
   cell(
     "verifyTrace: a chain without send() is unsupported",
     (await verifyTrace({}, { roles: {} }, 10)).state === "unsupported",
