@@ -361,10 +361,31 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
     ruleset: ctx.ruleset,
     seenAt: ctx.now,
   };
+  // The commitment getLogs reported must be in the receipt reconstruction will read, identical
+  // (position, emitter, key, mask): a backend answering the two differently must not let one
+  // mask be recorded with the signers authenticated for another (Codex follow-up R7).
+  const guarded = identityGuard(chain, Number(log.blockNumber));
+  let commitInReceipt = false;
+  try {
+    const rc = await guarded.getTransactionReceipt(log.transactionHash);
+    commitInReceipt = !!rc?.logs?.some(x => sameLog(x, log));
+  } catch {
+    commitInReceipt = false;
+  }
+  if (!commitInReceipt)
+    return {
+      deadLetter: {
+        ...base,
+        status: "ERROR",
+        reasons: ["commitment log not found unchanged in the tx receipt"],
+        verdict: evaluate(rs, cfg.roles, { ...base, kind: undefined }),
+        spEvents,
+      },
+    };
   let r;
   try {
     r = await rebuildFromAction(
-      identityGuard(chain, Number(log.blockNumber)),
+      guarded,
       cfg.aggregator,
       log.transactionHash,
       key,
@@ -453,7 +474,7 @@ const selectorOf = data =>
     : null;
 
 /** A watched log as stored evidence (plain JSON, full contents and position). */
-function evidenceLog(l, source) {
+function evidenceLog(l, source, range) {
   // Best effort: a malformed log is kept as evidence as far as it can be (an isolated tx keeps
   // what the RPC said: #400 review L1), never a reason to lose the dead letter.
   // The RAW position fields and `removed` are kept as the RPC gave them: normalising here would
@@ -473,13 +494,24 @@ function evidenceLog(l, source) {
     // which query returned it (aggregator or SuperPaymaster): a retry classifies by this, never by
     // re-filtering a possibly malformed log out of existence (Codex follow-up R2)
     ...(source ? { source } : {}),
+    // the query range this observation came from (kept per observation: Codex follow-up R7)
+    ...(Array.isArray(l?.range) ? { range: l.range } : range ? { range } : {}),
   };
+}
+
+/** Observations of one tx, merged: every distinct observation (content and query range) is kept,
+ * so a later sighting never replaces an earlier one (Codex follow-up R7). */
+function mergeEvidence(a, b) {
+  const key = e => rawLogKey(e) + JSON.stringify(e?.range ?? null) + String(e?.raw ?? "");
+  const out = [];
+  for (const e of [...(a ?? []), ...(b ?? [])]) if (!out.some(x => key(x) === key(e))) out.push(e);
+  return out;
 }
 
 /** Evidence of a tx: its aggregator and SP logs, each tagged with its source query. */
 const evidenceOf = t => [
-  ...t.agg.map(l => evidenceLog(l, "agg")),
-  ...t.sp.map(l => evidenceLog(l, "sp")),
+  ...t.agg.map(l => evidenceLog(l, "agg", t.range)),
+  ...t.sp.map(l => evidenceLog(l, "sp", t.range)),
 ];
 
 /** The tx shape of stored evidence: by source when recorded; legacy evidence is split by
@@ -514,18 +546,22 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
     return await processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot);
   } catch (e) {
     summary.isolated = (summary.isolated ?? 0) + 1;
+    // what this tx's dead letter already holds is merged with this observation, never replaced
+    const okH = /^0x[0-9a-fA-F]{64}$/.test(String(txHash));
+    const existing =
+      prev ?? (okH ? store.getDeadLetter(`tx-${String(txHash).toLowerCase()}`) : null);
     let watched = [];
     try {
-      watched = evidenceOf(t);
+      watched = mergeEvidence(existing?.watched, evidenceOf(t));
     } catch {
-      watched = prev?.watched ?? [];
+      watched = existing?.watched ?? [];
     }
     // An item without a usable tx hash gets a quarantine identity derived from its evidence: it
     // is retried and counted, never attributed to any tx (Codex follow-up R2).
     const okHash = /^0x[0-9a-fA-F]{64}$/.test(String(txHash));
     const qid = okHash ? null : ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(watched)));
     store.putDeadLetter({
-      ...(prev ?? {}),
+      ...(existing ?? {}),
       route: "tx",
       txHash: okHash ? txHash : qid,
       ...(okHash ? {} : { quarantine: true }),
@@ -533,8 +569,8 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
       status: "ERROR",
       reasons: [isolatedReason(e)],
       ...(t.range ? { range: t.range } : {}),
-      events: prev?.events ?? [],
-      watched: prev?.watched?.length ? prev.watched : watched,
+      events: existing?.events ?? [],
+      watched,
       ruleset: ctx.ruleset,
       seenAt: ctx.now,
     });
@@ -669,6 +705,10 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   if (t.block > snapshot) throw new Error("watched log beyond the finalized block");
   if (t.range && (t.block < t.range[0] || t.block > t.range[1]))
     throw new Error("watched log outside the requested range");
+  // each observation also against the range it came from (merged evidence keeps one per log)
+  for (const l of [...t.agg, ...t.sp])
+    if (Array.isArray(l.range) && (t.block < l.range[0] || t.block > l.range[1]))
+      throw new Error("watched log outside the requested range");
   const canon = (await header(chain, t.block)).hash;
   for (const l of [...t.agg, ...t.sp])
     if (l.blockHash !== undefined && l.blockHash !== null && !lcEq(l.blockHash, canon))
@@ -838,7 +878,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       events: independent,
       // The watched logs exactly as getLogs returned them: a retry is judged against THIS
       // evidence, never against a receipt that may be the thing in dispute (Codex #400-fix R7).
-      watched: evidenceOf(t),
+      watched: mergeEvidence(store.getDeadLetter(txDl)?.watched, evidenceOf(t)),
       // Records already classified, missing only their price (Codex #400-fix M3): exhaustion
       // keeps their route, caller and verdict, marked price.unavailable.
       ...(pendingRecords ? { pendingRecords } : {}),
@@ -1206,6 +1246,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
       continue;
     }
     const log = {
+      address: cfg.aggregator,
       topics: [SIGNERS_COMMITTED(), ethers.toBeHex(BigInt(dl.key), 32)],
       data: ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [BigInt(dl.signerMask)]),
       transactionHash: dl.txHash,

@@ -2664,6 +2664,65 @@ try {
       );
     }
 
+    // Codex follow-up R7
+    {
+      const w = mk();
+      // (1) getLogs says mask 4, the receipt (and the commitment) say mask 3
+      const sl = w.c.execute(Kind.SLASH, 7070n, slashF, 0b011n);
+      w.c.patchLogs(sl.hash, {
+        data: ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [4n]),
+      });
+      // (2) two observations of one tx from two scan ranges, different and both malformed
+      const quiet = w.c.ownerTx([]);
+      settle(w.c);
+      const rq = await w.c.chain.getTransactionReceipt(quiet.hash);
+      const gs = spIface.encodeEventLog("GuardianSet", [addr("r7-a"), addr("r7-b")]);
+      const obs = data => ({
+        address: SP,
+        topics: [gs.topics[0]],
+        data,
+        blockNumber: rq.blockNumber,
+        blockHash: rq.blockHash,
+        index: 0,
+        transactionHash: quiet.hash,
+      });
+      w.c.injectRawResult(SP, obs("0x"));
+      await runOnce(w.c.chain, w.cfg, w.store, rs, ident);
+      w.c.mine();
+      settle(w.c);
+      w.c.injectRawResult(SP, obs("0x00"));
+      await runOnce(w.c.chain, w.cfg, w.store, rs, ident);
+      // a third, valid observation of the same tx (from outside its range, so isolated): merged too
+      const op = spIface.encodeEventLog("OperatorPaused", [addr("r7-op")]);
+      w.c.mine();
+      settle(w.c);
+      w.c.injectRawResult(SP, {
+        address: SP,
+        ...op,
+        blockNumber: rq.blockNumber,
+        blockHash: rq.blockHash,
+        index: 1,
+        transactionHash: quiet.hash,
+      });
+      await runOnce(w.c.chain, w.cfg, w.store, rs, ident);
+      const wd = w.store.listDeadLetters();
+      const q = wd.find(x => x.txHash === quiet.hash);
+      const ranges = new Set((q?.watched ?? []).map(e => JSON.stringify(e.range)));
+      cell(
+        "follow-up R7: a commitment log that differs from the receipt is a dead letter (no record with mismatched signers); two observations of one tx from two ranges are both kept with their ranges",
+        wd.some(
+          x =>
+            x.txHash === sl.hash &&
+            x.route === "bls" &&
+            /not found unchanged/.test(x.reasons?.[0] ?? "")
+        ) &&
+          !w.recs().some(r => r.txHash === sl.hash) &&
+          q?.watched?.length >= 3 &&
+          ranges.size === 3,
+        { bls: wd.filter(x => x.txHash === sl.hash).map(x => x.reasons), q: q?.watched }
+      );
+    }
+
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it
     const b = mk();
