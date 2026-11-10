@@ -2412,6 +2412,73 @@ try {
       );
     }
 
+    // Codex follow-up R3
+    {
+      const k = mk();
+      const n = k.c.mine();
+      const sc = spIface.encodeEventLog("SlashCancelled", [addr("r3-sc")]);
+      // (1) two copies that disagree only on their block
+      k.c.injectLog(n, { address: SP, ...sc, transactionHash: ethers.id("r3-blocks"), index: 0 });
+      k.c.injectLog(n, {
+        address: SP,
+        ...sc,
+        transactionHash: ethers.id("r3-blocks"),
+        index: 0,
+        blockHash: ethers.id("r3-other-block"),
+      });
+      // (4) an invalid block number
+      k.c.injectRawResult(SP, {
+        address: SP,
+        ...sc,
+        transactionHash: ethers.id("r3-height"),
+        index: 2,
+        blockNumber: "not-a-number",
+      });
+      // (3) a null entry next to a valid log
+      k.c.injectRawResult(SP, null);
+      const ok3 = k.c.ownerTx([{ name: "GuardianSet", args: [addr("r3-g1"), addr("r3-g2")] }]);
+      settle(k.c);
+      const ks = (await runOnce(k.c.chain, k.cfg, k.store, rs, ident)).status;
+      const kd = k.store.listDeadLetters();
+      const hDl = kd.find(x => x.txHash === ethers.id("r3-height"));
+      cell(
+        "follow-up R3: copies disagreeing on their block, an invalid height and a null entry are isolated (tick ok, valid log recorded, raw height kept)",
+        ks.ok === true &&
+          kd.some(x => x.txHash === ethers.id("r3-blocks") && x.watched.length === 2) &&
+          hDl?.watched?.[0]?.blockNumber === "not-a-number" &&
+          kd.some(x => x.quarantine === true && /null/.test(x.watched?.[0]?.raw ?? "")) &&
+          k.recs().some(r => r.txHash === ok3.hash) &&
+          !k.recs().some(r => [ethers.id("r3-blocks"), ethers.id("r3-height")].includes(r.txHash)),
+        {
+          ok: ks.ok,
+          err: ks.lastError,
+          dls: kd.map(x => [x.txHash.slice(0, 10), x.quarantine, x.watched?.length]),
+        }
+      );
+      // (2) a parseable but invalid amendment is replaced by the valid proof, its bytes kept
+      const key = 777n;
+      const keyHex = key.toString(16).padStart(64, "0");
+      writeFileSync(
+        join(k.d, "amendments", `bls-${keyHex}.json`),
+        JSON.stringify({ key: "777", spEvents: [null] })
+      );
+      const good = {
+        key: "777",
+        txHash: ethers.id("r3-am"),
+        provenBy: "trace",
+        spEvents: [{ event: "PriceUpdated", logIndex: 1 }],
+      };
+      const r2 = k.store.putBlsAmendment(key, good);
+      cell(
+        "follow-up R3: an existing amendment must be valid in identity, proof and events; an invalid one is kept aside and replaced",
+        r2 === "repaired" &&
+          k.store.getBlsAmendment(key)?.txHash === good.txHash &&
+          readdirSync(join(k.d, "amendments")).some(f => f.endsWith(".invalid.1")) &&
+          k.store.putBlsAmendment(key, good) === "same",
+        { r2, files: readdirSync(join(k.d, "amendments")) }
+      );
+    }
+
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it
     const b = mk();

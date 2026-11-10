@@ -21,6 +21,28 @@ const bigintSafe = (_, v) => (typeof v === "bigint" ? v.toString() : v);
  * empty file, and a returned write survives the crash (the W2 journal relies on that).
  */
 /** Write every byte of `buf` to `fd`; `write` is injectable for a fault test. */
+/** A well-formed amendment for `key`: its key, a tx hash, how it was proven, and at least one
+ * event, each with a name and a position. */
+export function validAmendment(a, key) {
+  return (
+    !!a &&
+    typeof a === "object" &&
+    String(a.key) === BigInt(key).toString() &&
+    /^0x[0-9a-fA-F]{64}$/.test(String(a.txHash)) &&
+    typeof a.provenBy === "string" &&
+    Array.isArray(a.spEvents) &&
+    a.spEvents.length > 0 &&
+    a.spEvents.every(
+      e =>
+        e &&
+        typeof e === "object" &&
+        typeof e.event === "string" &&
+        e.event.length > 0 &&
+        Number.isSafeInteger(Number(e.logIndex))
+    )
+  );
+}
+
 export function writeAll(fd, buf, write = writeSync) {
   let off = 0;
   while (off < buf.length) {
@@ -199,17 +221,14 @@ export class Store {
       // an existing amendment counts only if it is a valid one for this key; a truncated or
       // foreign file is repaired, never trusted (Codex follow-up R2)
       try {
-        const cur = JSON.parse(readFileSync(path, "utf8"));
-        if (
-          cur &&
-          String(cur.key) === BigInt(key).toString() &&
-          Array.isArray(cur.spEvents) &&
-          cur.spEvents.length
-        )
-          return "same";
+        if (validAmendment(JSON.parse(readFileSync(path, "utf8")), key)) return "same";
       } catch {
         // falls through to the repair
       }
+      // keep the invalid bytes for inspection, then persist the valid proof (Codex follow-up R3)
+      let k = 1;
+      while (existsSync(`${path}.invalid.${k}`)) k++;
+      renameSync(path, `${path}.invalid.${k}`);
       atomicWriteJson(path, amendment);
       return "repaired";
     }

@@ -9,7 +9,7 @@ import {
 } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.mjs";
-import { attributeLogs, receiptPos, validLog } from "./attribute.mjs";
+import { attributeLogs, receiptPos, validLog, parsePosition } from "./attribute.mjs";
 import { mayHaveLog } from "./bloom.mjs";
 import { Store } from "./store.mjs";
 
@@ -430,7 +430,7 @@ function evidenceLog(l, source) {
     ...(has("index") ? { index: l.index } : {}),
     ...(has("logIndex") ? { logIndex: l.logIndex } : {}),
     ...(has("removed") ? { removed: l.removed } : {}),
-    blockNumber: Number(l?.blockNumber),
+    blockNumber: l?.blockNumber, // raw: an invalid height stays as the RPC gave it
     ...(l?.blockHash ? { blockHash: l.blockHash } : {}),
     transactionHash: l?.transactionHash,
     // which query returned it (aggregator or SuperPaymaster): a retry classifies by this, never by
@@ -505,6 +505,33 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
   }
 }
 
+/** A returned entry that is not a log object at all: a quarantine dead letter keyed by its raw value
+ * and query, retried to the cap, then an UNREADABLE record that names no tx. */
+function quarantineRaw(store, ctx, summary, x, source, from, to) {
+  let raw;
+  try {
+    raw = JSON.stringify(x) ?? String(x);
+  } catch {
+    raw = String(x);
+  }
+  const evidence = [{ raw, source, range: [from, to] }];
+  const qid = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(evidence)));
+  summary.isolated = (summary.isolated ?? 0) + 1;
+  store.putDeadLetter({
+    route: "tx",
+    txHash: qid,
+    quarantine: true,
+    blockNumber: from,
+    status: "ERROR",
+    reasons: ["returned entry is not a log"],
+    events: [],
+    watched: evidence,
+    ruleset: ctx.ruleset,
+    seenAt: ctx.now,
+  });
+  summary.deadLetters++;
+}
+
 /** A log's raw identity for de-duplication: every field as the RPC gave it, never parsed, so only
  * identical copies collapse and conflicting ones at one position survive (Codex follow-up R2). */
 export function rawLogKey(l) {
@@ -517,6 +544,10 @@ export function rawLogKey(l) {
     l?.logIndex ?? null,
     l?.removed ?? null,
     h(l?.transactionHash),
+    // block identity too: copies that disagree on their block are a conflict, not duplicates
+    // (Codex follow-up R3)
+    h(l?.blockHash),
+    l?.blockNumber ?? null,
   ]);
 }
 
@@ -563,7 +594,11 @@ function splitLogs(logs, cfg, block) {
 async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot) {
   // A watched log must be well formed, and an aggregator log must carry its 32-byte key: anything
   // else is a malformed RPC answer, isolated by the caller (#400 review L1).
-  if (t.malformed) throw new Error("stored evidence does not classify");
+  if (t.malformed) throw new Error("malformed or unclassifiable watched log");
+  if (!Number.isSafeInteger(t.block) || t.block < 0) throw new Error("invalid block number");
+  for (const l of [...t.agg, ...t.sp])
+    if (parsePosition(l.blockNumber) !== t.block)
+      throw new Error("watched logs name different blocks");
   if (!/^0x[0-9a-fA-F]{64}$/.test(String(txHash))) throw new Error("watched log without a tx hash");
   for (const l of [...t.agg, ...t.sp]) if (!validLog(l)) throw new Error("malformed watched log");
   // a log the RPC marks removed is never evidence, on any path (Codex follow-up R2)
@@ -986,7 +1021,7 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
           extra.push(...fresh);
           summary.bloomRecovered++;
         }
-        if (missing.some(topic => !got.some(g => g.topics?.[0] === topic)))
+        if (missing.some(topic => !got.some(g => lcEq(String(g?.topics?.[0] ?? ""), topic))))
           summary.bloomFalsePositives++;
       }
     }
@@ -1126,9 +1161,27 @@ export async function tick(chain, cfg, store, rs, ctx) {
 
   if (from > to) return summary;
 
-  const aggLogs = await pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page);
-  const spLogs = await pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page);
-  const { extraAgg, extraSp } = await bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary);
+  // A returned entry that is not even an object cannot be grouped or bloom-checked: it is
+  // quarantined at once with its raw value and query, never a reason to stop (Codex follow-up R3).
+  const intake = (raw, source) => {
+    const ok = [];
+    for (const x of raw ?? []) {
+      if (x && typeof x === "object" && !Array.isArray(x)) ok.push(x);
+      else quarantineRaw(store, ctx, summary, x, source, from, to);
+    }
+    return ok;
+  };
+  const aggLogs = intake(
+    await pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page),
+    "agg"
+  );
+  const spLogs = intake(
+    await pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page),
+    "sp"
+  );
+  const bc = await bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary);
+  const extraAgg = intake(bc.extraAgg, "agg");
+  const extraSp = intake(bc.extraSp, "sp");
 
   const byTx = new Map();
   for (const l of [...aggLogs, ...extraAgg, ...spLogs, ...extraSp]) {

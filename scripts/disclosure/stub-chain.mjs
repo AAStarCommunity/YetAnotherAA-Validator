@@ -140,6 +140,7 @@ function makeChain() {
   let noBloom = false; // headers without logsBloom
   const receiptPatch = new Map(); // hash -> fields a stale backend answers differently
   const receiptLogs = new Map(); // hash -> logs a (inconsistent) RPC returns in the receipt instead
+  const rawResults = []; // non-log values a broken RPC returns once in a range getLogs answer
   let upperTopics = false; // a client answering getLogs topics in upper-case hex
   let traceMode = "ok"; // ok | unsupported (no debug namespace) | noLogs (withLog ignored)
   const txFailures = new Map(); // hash -> remaining getTransaction failures
@@ -288,7 +289,16 @@ function makeChain() {
                 t == null || (Array.isArray(t) ? t.includes(l.topics[i]) : l.topics[i] === t)
             )
         )
-        .map(l => (upperTopics ? { ...l, topics: l.topics.map(up) } : l));
+        .map(l => (upperTopics ? { ...l, topics: l.topics.map(up) } : l))
+        .concat(
+          blockHash === undefined
+            ? (() => {
+                const mine = rawResults.filter(r => r.address === address);
+                for (const r of mine) rawResults.splice(rawResults.indexOf(r), 1);
+                return mine.map(r => r.value);
+              })()
+            : []
+        );
     },
     async call({ to, data, blockTag }) {
       if (to === SP) {
@@ -734,6 +744,8 @@ function makeChain() {
     failTx: (hash, times) => txFailures.set(hash, times),
     setTraceMode: m => (traceMode = m),
     setUpperTopics: v => (upperTopics = v),
+    /** Make the next range getLogs for `address` also return `value` (e.g. null). */
+    injectRawResult: (address, value) => rawResults.push({ address, value }),
     /** Patch the getLogs copy of a tx's logs (e.g. a contradictory position), not its receipt. */
     patchLogs: (hash, patch) => {
       for (const l of logs) if (l.transactionHash === hash) Object.assign(l, patch);
