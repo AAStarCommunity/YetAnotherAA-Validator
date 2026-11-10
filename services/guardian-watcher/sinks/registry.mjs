@@ -49,6 +49,28 @@ export const actionId = (kind, key) =>
   ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["uint8", "uint256"], [kind, key]));
 
 /**
+ * Whether a broadcast error says the node already holds this exact tx (Codex W2c R4/R5). Each
+ * message is matched WHOLE against the known client phrasings, never as a substring of joined
+ * wrapper text ("unknown transaction" must not match "known transaction").
+ */
+export function alreadyKnown(e) {
+  const known = new Set([
+    "already known", // geth
+    "known transaction", // older geth
+    "transaction already imported", // nethermind / parity
+  ]);
+  const norm = m =>
+    String(m)
+      .trim()
+      .toLowerCase()
+      .replace(/^(rpc error|error|returned error):\s*/, "")
+      .replace(/[.]$/, "");
+  return [e?.error?.message, e?.info?.error?.message, e?.message]
+    .filter(x => typeof x === "string")
+    .some(m => known.has(norm(m)) || /^known transaction: 0x[0-9a-f]{64}$/.test(norm(m)));
+}
+
+/**
  * provider: ethers Provider with `send`; wallet: ethers Wallet (connected or not); registry address;
  * fromBlock: the registry's deploy block (log scans); roles: { deployer, aggregatorOwner, guardians }
  * (required: the wallet is checked against them before anything is signed).
@@ -197,15 +219,7 @@ export function registrySink({
       } catch (e) {
         // Rebroadcasting a tx the node already holds is the normal pending case, not a failure
         // (the text is only classified here; it never leaves this sink).
-        const t = [e?.code, e?.error?.message, e?.info?.error?.message, e?.shortMessage, e?.message]
-          .filter(x => typeof x === "string")
-          .join(" ");
-        if (
-          /already known|known transaction|already imported|ALREADY_EXISTS|tx already in mempool/i.test(
-            t
-          )
-        )
-          return { known: true };
+        if (alreadyKnown(e)) return { known: true };
         throw e;
       }
     },

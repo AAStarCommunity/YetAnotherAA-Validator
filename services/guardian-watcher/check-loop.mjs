@@ -867,7 +867,7 @@ const cfg = { aggregator: AGG };
       }
     }
     cell(
-      "R4: a generation closes only after a traversal that began after it opened (a record added mid-sweep is published first)",
+      "R4: a generation closes only after a traversal that began after it opened (a record present at its opening is published first)",
       closedWithA === true,
       { closedWithA }
     );
@@ -982,6 +982,69 @@ const cfg = { aggregator: AGG };
       "R4: a schedule write that fails when a generation closes is reported: not ok, alerted",
       r.ok === false && r.failed >= 1,
       r
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- W2c R5: snapshot contract for generations; legacy open generation migrates
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const rec = hx => ({ ...owner, txHash: "0x" + hx.repeat(32) });
+    store.putRecord(rec("bb"));
+    store.putRecord(rec("cc"));
+    const s = sinks();
+    const built = {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      wallet: writer,
+      registryFor: () => s.registry,
+    };
+    const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+    const PL = { ...P, limits: { maxParse: 1, maxRecords: 1 } };
+    const T = P.reverifyEveryMs + 10;
+    await publishPhase(store, roleChain(roles), cfg, PL, built, { now: T }); // opens, reads b
+    store.putRecord(rec("aa")); // added behind the cursor after the generation opened
+    const aId = Store.recordId(rec("aa"));
+    for (let i = 1; i < 12; i++)
+      await publishPhase(store, roleChain(roles), cfg, PL, built, { now: T + i });
+    cell(
+      "R5: a record added behind the cursor after a generation opened is outside it, and is still published by the normal path",
+      store.getPublication(aId)?.published === true &&
+        (store.getAlertState()?.lastReverifyAt ?? 0) === T,
+      { a: !!store.getPublication(aId)?.published, last: store.getAlertState()?.lastReverifyAt }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(owner);
+    // a schedule written before reverifyGenNeed existed, with a generation open
+    store.putSchedule({ reverifyGen: 42, reverifyGenSweeps: 0, sweeps: 3, cursor: null });
+    const s = sinks();
+    const built = {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      wallet: writer,
+      registryFor: () => s.registry,
+    };
+    const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+    const out = [];
+    for (let i = 0; i < 4; i++)
+      out.push(await publishPhase(store, roleChain(roles), cfg, P, built, { now: 1000 + i }));
+    cell(
+      "R5: a legacy open generation (no reverifyGenNeed) gets a finite threshold and closes",
+      out.some(r => r.reverified) && (store.getAlertState()?.lastReverifyAt ?? 0) === 42,
+      out.map(r => [r.reverified, r.reverifying])
     );
   } finally {
     rmSync(d, { recursive: true, force: true });

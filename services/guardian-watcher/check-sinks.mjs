@@ -19,7 +19,13 @@ import { filebasePinner } from "./sinks/filebase.mjs";
 import { telegramSink } from "./sinks/telegram.mjs";
 import { request, jsonOf } from "./sinks/http.mjs";
 import { gitMirror } from "./sinks/git-mirror.mjs";
-import { registrySink, assertWriterRole, actionId, regSinkIface } from "./sinks/registry.mjs";
+import {
+  alreadyKnown,
+  registrySink,
+  assertWriterRole,
+  actionId,
+  regSinkIface,
+} from "./sinks/registry.mjs";
 
 const results = [];
 const j = v => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
@@ -925,6 +931,29 @@ try {
         /registry broadcast: SERVER_ERROR/.test(real ?? "") &&
         !/TOKSECRET/.test(real ?? ""),
       { known, real }
+    );
+  }
+
+  {
+    const E = m => Object.assign(new Error("wrapper"), { error: { message: m } });
+    const yes = [
+      "already known",
+      "Known transaction",
+      "transaction already imported",
+      "rpc error: already known.",
+      "known transaction: 0x" + "ab".repeat(32),
+    ];
+    const no = [
+      "unknown transaction",
+      "failed: transaction is not already known",
+      "already known by nobody",
+      "nonce too low",
+      "replacement transaction underpriced",
+    ];
+    cell(
+      "alreadyKnown: only whole known-tx phrasings match; 'unknown transaction' and wrapped negatives do not",
+      yes.every(m => alreadyKnown(E(m))) && no.every(m => !alreadyKnown(E(m))),
+      { yes: yes.map(m => alreadyKnown(E(m))), no: no.map(m => alreadyKnown(E(m))) }
     );
   }
 

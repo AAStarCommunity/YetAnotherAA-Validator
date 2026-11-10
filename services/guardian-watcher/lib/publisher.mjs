@@ -431,8 +431,10 @@ export async function publishPhase(store, chain, cfg, p, built, { now = Date.now
   }
   // The weekly reverify is a generation: opened when due, closed only when every done record has
   // been re-checked in it, however many bounded passes that takes (Codex W2c R2).
-  // It closes only after a full directory sweep that began after it opened, so records the
-  // bounded batches had not reached yet are counted too (Codex W2c R3).
+  // Contract (Codex W2c R5): a generation covers the records that existed when it opened. It
+  // closes only after a full directory traversal that began after it opened (so every such record
+  // is registered and re-checked, whatever the bounded batches had reached). A record added later
+  // is not done, so it needs no re-check: it is published by the normal path when reached.
   const schedFailures = []; // generation-transition schedule writes that failed (Codex W2c R4)
   const meta = store.getAlertState() ?? {};
   let gen = getSchedule(store).reverifyGen ?? null;
@@ -444,6 +446,15 @@ export async function publishPhase(store, chain, cfg, p, built, { now = Date.now
     const need = (sc.sweeps ?? 0) + (sc.cursor ? 2 : 1);
     if (!saveSchedule(store, { ...sc, reverifyGen: gen, reverifyGenNeed: need }))
       schedFailures.push("generation open");
+  }
+  // A generation opened before reverifyGenNeed existed gets a finite threshold now, needing a
+  // fresh traversal (Codex W2c R5); without it the generation could never close.
+  if (gen !== null && getSchedule(store).reverifyGenNeed === undefined) {
+    const sc = getSchedule(store);
+    const { reverifyGenSweeps, ...rest } = sc;
+    void reverifyGenSweeps;
+    if (!saveSchedule(store, { ...rest, reverifyGenNeed: (sc.sweeps ?? 0) + (sc.cursor ? 2 : 1) }))
+      schedFailures.push("generation migration");
   }
   const genNeed = getSchedule(store).reverifyGenNeed ?? Infinity;
   const res = await publishPending(
