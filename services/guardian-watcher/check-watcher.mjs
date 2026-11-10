@@ -26,6 +26,7 @@ import {
   verifyTrace,
   sameLog,
   envelopeProblem,
+  txOfEvidence,
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store, writeAll } from "./lib/store.mjs";
@@ -2256,6 +2257,160 @@ try {
       rmDl?.watched?.[0]?.removed === true && !f2.recs().some(r => r.txHash === rm1.hash),
       { rmDl: rmDl?.watched, n: f2.recs().length }
     );
+
+    // Codex follow-up R2
+    {
+      const g = mk();
+      const n = g.c.mine();
+      const gs = spIface.encodeEventLog("GuardianSet", [addr("r2-a"), addr("r2-b")]);
+      const op = spIface.encodeEventLog("OperatorPaused", [addr("r2-op")]);
+      // (a) bloom recovery next to a malformed position; (c) conflicting copies at one position;
+      // (e) a log without a tx hash
+      g.c.injectLog(n, { address: SP, ...op, transactionHash: ethers.id("r2-badpos"), index: "x" });
+      g.c.injectLog(n, { address: SP, ...gs, transactionHash: ethers.id("r2-lagged"), index: 1 });
+      g.c.lagTopic(n, gs.topics[0]);
+      const n2 = g.c.mine();
+      g.c.injectLog(n2, {
+        address: SP,
+        ...gs,
+        transactionHash: ethers.id("r2-conflict"),
+        index: 0,
+      });
+      g.c.injectLog(n2, {
+        address: SP,
+        topics: [gs.topics[0]],
+        data: "0x",
+        transactionHash: ethers.id("r2-conflict"),
+        index: 0,
+      });
+      const n3 = g.c.mine();
+      g.c.injectLog(n3, { address: SP, ...op, index: 0 }); // no transactionHash
+      // (d) a removed standalone privileged event
+      const rmTx = g.c.ownerTx([{ name: "GuardianSet", args: [addr("r2-rm1"), addr("r2-rm2")] }]);
+      g.c.patchLogs(rmTx.hash, { removed: true });
+      settle(g.c);
+      const gs1 = (await runOnce(g.c.chain, g.cfg, g.store, rs, ident)).status;
+      g.c.clearLag();
+      const gDls = g.store.listDeadLetters();
+      cell(
+        "follow-up R2: bloom recovery beside a malformed position, conflicting copies at one position, a log without a tx hash and a removed standalone event are each isolated; tick ok",
+        gs1.ok === true &&
+          gs1.bloom.recovered === 1 &&
+          gDls.some(x => x.txHash === ethers.id("r2-badpos")) &&
+          gDls.some(x => x.txHash === ethers.id("r2-conflict") && x.watched.length === 2) &&
+          gDls.some(x => x.quarantine === true && x.watched.length === 1) &&
+          gDls.some(x => x.txHash === rmTx.hash) &&
+          !g.recs().some(r => [ethers.id("r2-conflict"), rmTx.hash].includes(r.txHash)),
+        {
+          ok: gs1.ok,
+          err: gs1.lastError,
+          bloom: gs1.bloom,
+          dls: gDls.map(x => [x.txHash.slice(0, 10), x.quarantine, x.reasons]),
+        }
+      );
+      for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+        await runOnce(g.c.chain, g.cfg, g.store, rs, ident);
+      const q = g.recs().find(r => r.event === "UNREADABLE" && /quarantine/.test(r.label));
+      cell(
+        "follow-up R2: a quarantined item (no tx hash) ends as an UNREADABLE record that names no tx",
+        q && q.evidence?.length === 1 && q.caller === null,
+        q
+      );
+      // (b, end to end) a dead letter whose legacy evidence holds a log with a malformed address is
+      // retried as malformed, never resolved because filtering emptied it
+      const lg = g.c.ownerTx([{ name: "OperatorPaused", args: [addr("r2-legacy")] }], {
+        from: KEEPER,
+        data: pauseSel,
+        trace: false,
+      });
+      settle(g.c);
+      await runOnce(g.c.chain, g.cfg, g.store, rs, ident);
+      {
+        const ddir = join(g.d, "deadletters");
+        const fl = readdirSync(ddir).find(f => f === `tx-${lg.hash.toLowerCase()}.json`);
+        const v = JSON.parse(readFileSync(join(ddir, fl), "utf8"));
+        v.watched = v.watched.map(({ source, ...w }) => ({ ...w, address: "0xBAD" }));
+        writeFileSync(join(ddir, fl), JSON.stringify(v));
+      }
+      await runOnce(g.c.chain, g.cfg, g.store, rs, ident);
+      const lgDl = g.store.listDeadLetters().find(x => x.txHash === lg.hash);
+      cell(
+        "follow-up R2: a retry whose stored evidence no longer classifies stays a dead letter (never resolved empty)",
+        lgDl && /tx processing failed/.test(lgDl.reasons[0]),
+        lgDl
+      );
+      // (b) stored evidence classifies by its source; legacy evidence that would fall out of the
+      // address/topic split marks the tx malformed
+      const ev = { address: "0xBAD", topics: [op.topics[0]], data: "0x", index: 0 };
+      const sourced = txOfEvidence([{ ...ev, source: "sp" }], g.cfg, 1);
+      const legacy = txOfEvidence([ev], g.cfg, 1);
+      cell(
+        "follow-up R2: retry evidence keeps its source classification; legacy evidence that does not classify is malformed",
+        sourced.sp.length === 1 && !sourced.malformed && legacy.malformed === true,
+        { sourced, legacy }
+      );
+    }
+    {
+      // (f) a stale snapshot must not undo a patch: retry the tx dead letter first; (g) a corrupt
+      // amendment is repaired
+      const h = mk();
+      const sx = h.c.execute(Kind.GENERIC, 4646n, priceG, 0b111n, {
+        via: { route: "safe" },
+        spLogs: [{ name: "PriceUpdated", args: [261000000000n, 20n] }],
+        price: 261000000000n,
+      });
+      settle(h.c);
+      h.c.failPriceReads(1_000_000);
+      await runOnce(h.c.chain, h.cfg, h.store, rs, ident);
+      const pu = spIface.encodeEventLog("PriceUpdated", [261000000000n, 20n]);
+      h.c.setTrace(sx.hash, {
+        type: "CALL",
+        to: SAFE,
+        calls: [
+          {
+            type: "CALL",
+            to: AGG,
+            logs: [
+              {
+                address: AGG,
+                ...aggIface.encodeEventLog("SignersCommitted", [sx.key, sx.mask]),
+                position: 0,
+              },
+            ],
+            calls: [
+              {
+                type: "CALL",
+                from: AGG,
+                to: SP,
+                input: priceG.callData.slice(0, 10),
+                logs: [{ address: SP, topics: pu.topics, data: pu.data }],
+              },
+            ],
+          },
+        ],
+      });
+      const realIds = h.store.listDeadLetterIds.bind(h.store);
+      h.store.listDeadLetterIds = () => realIds().reverse(); // tx-… before bls-…
+      await runOnce(h.c.chain, h.cfg, h.store, rs, ident);
+      h.c.failPriceReads(0);
+      await runOnce(h.c.chain, h.cfg, h.store, rs, ident);
+      h.store.listDeadLetterIds = realIds;
+      const rx = h.recs().find(r => r.txHash === sx.hash && r.route === "bls");
+      // corrupt amendment repaired on the next proof
+      const keyHex = BigInt(sx.key).toString(16).padStart(64, "0");
+      writeFileSync(join(h.d, "amendments", `bls-${keyHex}.json`), "{trunc");
+      const rep = h.store.putBlsAmendment(sx.key, {
+        key: BigInt(sx.key).toString(),
+        spEvents: [{ event: "PriceUpdated" }],
+      });
+      cell(
+        "follow-up R2: a patched dead letter survives a tx-first retry order (effects reach the record); a corrupt amendment is repaired, not trusted",
+        rx?.spEvents?.[0]?.event === "PriceUpdated" &&
+          rep === "repaired" &&
+          h.store.getBlsAmendment(sx.key)?.spEvents?.length === 1,
+        { rx: rx?.spEvents, rep }
+      );
+    }
 
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it

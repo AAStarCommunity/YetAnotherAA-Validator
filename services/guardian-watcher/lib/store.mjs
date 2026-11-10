@@ -195,7 +195,24 @@ export class Store {
       "amendments",
       `bls-${BigInt(key).toString(16).padStart(64, "0")}.json`
     );
-    if (existsSync(path)) return "same";
+    if (existsSync(path)) {
+      // an existing amendment counts only if it is a valid one for this key; a truncated or
+      // foreign file is repaired, never trusted (Codex follow-up R2)
+      try {
+        const cur = JSON.parse(readFileSync(path, "utf8"));
+        if (
+          cur &&
+          String(cur.key) === BigInt(key).toString() &&
+          Array.isArray(cur.spEvents) &&
+          cur.spEvents.length
+        )
+          return "same";
+      } catch {
+        // falls through to the repair
+      }
+      atomicWriteJson(path, amendment);
+      return "repaired";
+    }
     atomicWriteJson(path, amendment);
     return "new";
   }
@@ -250,6 +267,14 @@ export class Store {
     if (!cur) return false;
     atomicWriteJson(path, { ...cur, ...patch, id: cur.id ?? id, attempts: cur.attempts });
     return true;
+  }
+
+  /** Ids of the open dead letters (file names), sorted. */
+  listDeadLetterIds() {
+    return readdirSync(join(this.dir, "deadletters"))
+      .filter(f => f.endsWith(".json"))
+      .map(f => f.slice(0, -5))
+      .sort();
   }
 
   /** The open dead letter with this id, or null. */
