@@ -79,6 +79,19 @@ contract DisclosureRegistry {
         bytes32 anchor; // blockhash(executionBlock - 1) as committed by the aggregator
     }
 
+    /// @dev The entry's context. `blockVerified` is checked on chain (EIP-2935); the other fields
+    ///      are the writer's claims (see the recheck tool). Grouped so the event stays compilable
+    ///      without viaIR (forge coverage).
+    struct Record {
+        address subjectToken;
+        bytes32 txHash;
+        uint64 blockNumber;
+        bool blockVerified;
+        bytes20 rulesetCommit;
+        string recordURI;
+        bytes32 recordHash;
+    }
+
     event Disclosed(
         uint256 indexed entryId,
         Kind indexed kind,
@@ -86,13 +99,7 @@ contract DisclosureRegistry {
         uint256 proposalId,
         bytes32 messageHash,
         address[] signers,
-        address subjectToken,
-        bytes32 txHash,
-        uint64 blockNumber,
-        bool blockVerified,
-        bytes20 rulesetCommit,
-        string recordURI,
-        bytes32 recordHash
+        Record record
     );
 
     event Replied(uint256 indexed entryId, address indexed replier, string replyURI, bytes32 replyHash);
@@ -100,6 +107,7 @@ contract DisclosureRegistry {
     error NotWriter();
     error ZeroAddress();
     error BadKind();
+    error NonCanonicalInputs();
     error BadProposalId();
     error BadSigners();
     error CommitmentMismatch();
@@ -130,26 +138,28 @@ contract DisclosureRegistry {
         bytes32 recordHash
     ) external returns (uint256 entryId) {
         if (msg.sender != WRITER) revert NotWriter();
-        (uint256 key, bytes32 messageHash) = _verifySigned(s);
-        bool blockVerified = _verifyBlock(blockNumber, s.anchor);
-
-        entryId = ++entryCount;
-        entryBinding[entryId] = keccak256(abi.encode(s.kind, key, subjectToken));
-        emit Disclosed(
-            entryId,
-            s.kind,
-            key,
-            s.proposalId,
-            messageHash,
-            s.signers,
-            subjectToken,
-            txHash,
-            blockNumber,
-            blockVerified,
-            rulesetCommit,
-            recordURI,
-            recordHash
+        entryId = _append(
+            s,
+            Record({
+                subjectToken: subjectToken,
+                txHash: txHash,
+                blockNumber: blockNumber,
+                blockVerified: false, // set in _append, after the signer check
+                rulesetCommit: rulesetCommit,
+                recordURI: recordURI,
+                recordHash: recordHash
+            })
         );
+    }
+
+    /// @dev Signer/message check first, then block binding, then append + emit. Split out of
+    ///      `disclose` only to keep the stack shallow without viaIR.
+    function _append(Signed calldata s, Record memory r) internal returns (uint256 entryId) {
+        (uint256 key, bytes32 messageHash) = _verifySigned(s);
+        r.blockVerified = _verifyBlock(r.blockNumber, s.anchor);
+        entryId = ++entryCount;
+        entryBinding[entryId] = keccak256(abi.encode(s.kind, key, r.subjectToken));
+        emit Disclosed(entryId, s.kind, key, s.proposalId, messageHash, s.signers, r);
     }
 
     /// @notice Right of reply. Appends only. The caller must be one of:
@@ -157,9 +167,12 @@ contract DisclosureRegistry {
     ///         - a party the SIGNED message names, verified through the commitment: the operator of
     ///           a SLASH or QUEUE action, or a user of a REPUTATION batch;
     ///         - the `communityOwner()` of the entry's `subjectToken`. `subjectToken` is the writer's
-    ///           CLAIM (no commitment covers it), so this route is only as good as the watcher; the
-    ///           two routes above do not depend on it, so a wrongly attributed entry cannot shut out
-    ///           the party the action actually named.
+    ///           CLAIM (no commitment covers it), so this route is only as good as the watcher.
+    ///         For SLASH, QUEUE and REPUTATION the second route does not depend on the writer, so a
+    ///         wrongly attributed entry cannot shut out the party the action named. A GENERIC action
+    ///         commits only to `callDataHash`, so the parties its calldata affects are not
+    ///         identifiable on chain; for GENERIC entries a non-signer can reply only through the
+    ///         claimed `subjectToken` route.
     function reply(
         uint256 entryId,
         Signed calldata s,
@@ -278,25 +291,36 @@ contract DisclosureRegistry {
         pure
         returns (bytes32)
     {
+        // Each branch also requires `inputs` to be the canonical encoding of what it decoded
+        // (abi.decode alone accepts trailing bytes and non-canonical offsets), so an accepted entry
+        // carries exactly the bytes an independent re-encoding produces.
         if (kind == Kind.SLASH) {
             (address operator, uint8 level, uint256 epoch, bytes32 evidenceHash) =
                 abi.decode(inputs, (address, uint8, uint256, bytes32));
+            _requireCanonical(inputs, abi.encode(operator, level, epoch, evidenceHash));
             return keccak256(abi.encode(ds, TAG_EXECUTE_SLASH, proposalId, operator, level, epoch, evidenceHash));
         }
         if (kind == Kind.GENERIC) {
             (address target, bytes32 callDataHash, uint256 threshold) = abi.decode(inputs, (address, bytes32, uint256));
+            _requireCanonical(inputs, abi.encode(target, callDataHash, threshold));
             return keccak256(abi.encode(ds, TAG_PROPOSAL, proposalId, target, callDataHash, threshold));
         }
         if (kind == Kind.QUEUE) {
             (address operator, uint8 level, uint256 epoch) = abi.decode(inputs, (address, uint8, uint256));
+            _requireCanonical(inputs, abi.encode(operator, level, epoch));
             return keccak256(abi.encode(ds, TAG_QUEUE_SLASH, operator, level, epoch));
         }
         if (kind == Kind.REPUTATION) {
             (address[] memory users, uint256[] memory scores, uint256 epoch) =
                 abi.decode(inputs, (address[], uint256[], uint256));
+            _requireCanonical(inputs, abi.encode(users, scores, epoch));
             return keccak256(abi.encode(ds, TAG_REPUTATION, proposalId, users, scores, epoch));
         }
         revert BadKind();
+    }
+
+    function _requireCanonical(bytes calldata inputs, bytes memory canonical) private pure {
+        if (keccak256(inputs) != keccak256(canonical)) revert NonCanonicalInputs();
     }
 
     /// @notice Storage key of `proposalSignersCommitment` per path (BLSAggregator-4.13.0 r3b):

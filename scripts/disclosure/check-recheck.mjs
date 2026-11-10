@@ -320,13 +320,15 @@ function makeChain() {
       e.proposalId,
       e.messageHash,
       e.signers,
-      e.subjectToken,
-      e.txHash,
-      e.blockNumber,
-      e.blockVerified,
-      e.rulesetCommit,
-      e.recordURI,
-      e.recordHash,
+      [
+        e.subjectToken,
+        e.txHash,
+        e.blockNumber,
+        e.blockVerified,
+        e.rulesetCommit,
+        e.recordURI,
+        e.recordHash,
+      ],
     ]);
     const hash = ethers.id(`disclose-${entryId}`);
     const data = regIface.encodeFunctionData("disclose", [

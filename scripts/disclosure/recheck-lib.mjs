@@ -41,7 +41,7 @@ export const AGGREGATOR_ABI = [
 
 export const REGISTRY_ABI = [
   "function disclose((uint8 kind, uint256 proposalId, bytes messageInputs, uint256 signerMask, address[] signers, bytes32 anchor) s, address subjectToken, bytes32 txHash, uint64 blockNumber, bytes20 rulesetCommit, string recordURI, bytes32 recordHash)",
-  "event Disclosed(uint256 indexed entryId, uint8 indexed kind, uint256 indexed key, uint256 proposalId, bytes32 messageHash, address[] signers, address subjectToken, bytes32 txHash, uint64 blockNumber, bool blockVerified, bytes20 rulesetCommit, string recordURI, bytes32 recordHash)",
+  "event Disclosed(uint256 indexed entryId, uint8 indexed kind, uint256 indexed key, uint256 proposalId, bytes32 messageHash, address[] signers, (address subjectToken, bytes32 txHash, uint64 blockNumber, bool blockVerified, bytes20 rulesetCommit, string recordURI, bytes32 recordHash) record)",
   "function AGGREGATOR() view returns (address)",
   "function entryCount() view returns (uint256)",
 ];
@@ -393,7 +393,7 @@ export function compareEntry(entry, signed, facts) {
     if (norm(a) !== norm(b)) diffs.push({ field: name, entry: norm(a), rebuilt: norm(b) });
   };
   eq("key", BigInt(entry.key), facts.key);
-  eq("blockNumber", Number(entry.blockNumber), facts.blockNumber);
+  eq("blockNumber", Number(entry.record.blockNumber), facts.blockNumber);
   eq("kind", Number(entry.kind), facts.kind);
   eq("proposalId", BigInt(entry.proposalId), facts.proposalId);
   eq("messageHash", entry.messageHash, facts.messageHash);
@@ -531,7 +531,7 @@ export async function recheckEntry(
     });
   }
   const entry = regIface.decodeEventLog("Disclosed", log.data, log.topics);
-  const unverified = Object.fromEntries(UNVERIFIED_FIELDS.map(f => [f, String(entry[f])]));
+  const unverified = Object.fromEntries(UNVERIFIED_FIELDS.map(f => [f, String(entry.record[f])]));
 
   const dtx = await chain.getTransaction(log.transactionHash);
   let signed = null;
@@ -542,7 +542,7 @@ export async function recheckEntry(
     /* disclose through a wrapper: compare the event only */
   }
 
-  const r = await rebuildFromAction(chain, aggregator, entry.txHash, entry.key, snapshot);
+  const r = await rebuildFromAction(chain, aggregator, entry.record.txHash, entry.key, snapshot);
   if (r.status) {
     // A definitive verdict needs the disclosure to still be canonical, like the full path below.
     if (r.status === Status.MISMATCH && !(await canonical(chain, log.blockNumber, log.blockHash))) {

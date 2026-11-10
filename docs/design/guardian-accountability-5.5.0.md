@@ -221,7 +221,11 @@ On-chain checks, all must pass or revert:
 6. Store
    `entryBinding[entryId] = keccak256(abi.encode(kind, key, subjectToken))` and
    emit
-   `Disclosed(entryId, kind, key, proposalId, messageHash, signers, subjectToken, txHash, blockNumber, blockVerified, rulesetCommit, recordURI, recordHash)`.
+   `Disclosed(entryId, kind, key, proposalId, messageHash, signers, record)`,
+   where
+   `record = (subjectToken, txHash, blockNumber, blockVerified, rulesetCommit, recordURI, recordHash)`.
+   `messageInputs` must be the canonical ABI encoding of the decoded fields
+   (trailing bytes or non-canonical offsets revert `NonCanonicalInputs`).
 
 What stays a **claim**: `txHash`, `blockNumber` when `blockVerified = false`,
 the `recordURI` content, and the interpretation of why the action is

@@ -229,18 +229,16 @@ contract DisclosureRegistryTest is Test {
         vm.recordLogs();
         _disclose(s);
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        // non-indexed data: proposalId, messageHash, signers, subjectToken, txHash, blockNumber,
-        // blockVerified, rulesetCommit, recordURI, recordHash
-        (uint256 pid, bytes32 mh, address[] memory sg, address subj, bytes32 txh, uint64 bn, bool bv,,,) = abi.decode(
-            logs[0].data, (uint256, bytes32, address[], address, bytes32, uint64, bool, bytes20, string, bytes32)
-        );
+        // non-indexed data: proposalId, messageHash, signers, Record
+        (uint256 pid, bytes32 mh, address[] memory sg, DisclosureRegistry.Record memory r) =
+            abi.decode(logs[0].data, (uint256, bytes32, address[], DisclosureRegistry.Record));
         assertEq(pid, 5);
         assertTrue(mh != bytes32(0));
         assertEq(sg.length, 3);
-        assertEq(subj, address(0));
-        assertEq(txh, keccak256("tx"));
-        assertEq(bn, EXEC_BLOCK);
-        assertTrue(bv, "block inside window and anchor matches");
+        assertEq(r.subjectToken, address(0));
+        assertEq(r.txHash, keccak256("tx"));
+        assertEq(r.blockNumber, EXEC_BLOCK);
+        assertTrue(r.blockVerified, "block inside window and anchor matches");
     }
 
     // ---------------------------------------------------------------- signer set
@@ -396,10 +394,9 @@ contract DisclosureRegistryTest is Test {
         vm.recordLogs();
         _disclose(s);
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        (,,,,,, bool bv,,,) = abi.decode(
-            logs[0].data, (uint256, bytes32, address[], address, bytes32, uint64, bool, bytes20, string, bytes32)
-        );
-        assertFalse(bv);
+        (,,, DisclosureRegistry.Record memory r) =
+            abi.decode(logs[0].data, (uint256, bytes32, address[], DisclosureRegistry.Record));
+        assertFalse(r.blockVerified);
     }
 
     function test_blockInsideWindowWithWrongNumberReverts() public {
@@ -509,6 +506,82 @@ contract DisclosureRegistryTest is Test {
         vm.prank(makeAddr("otherOperator"));
         vm.expectRevert(DisclosureRegistry.NotAccused.selector);
         reg.reply(sid, s, address(0), "", bytes32(0));
+    }
+
+    /// clestons N1: inputs must be the canonical encoding — trailing bytes or a re-pointed dynamic
+    /// offset are rejected, so an accepted entry's bytes equal an independent re-encoding.
+    function test_nonCanonicalInputsRevert() public {
+        DisclosureRegistry.Signed memory s = _executed(DisclosureRegistry.Kind.SLASH, 11, _slashInputs(), 0x7);
+        s.messageInputs = bytes.concat(_slashInputs(), bytes32(0));
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.NonCanonicalInputs.selector);
+        reg.disclose(s, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+
+        DisclosureRegistry.Signed memory g = _executed(DisclosureRegistry.Kind.GENERIC, 5, _genericInputs(), 0x7);
+        g.messageInputs = bytes.concat(_genericInputs(), hex"01");
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.NonCanonicalInputs.selector);
+        reg.disclose(g, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+
+        DisclosureRegistry.Signed memory q = _executed(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs(), 0x3);
+        q.messageInputs = bytes.concat(_queueInputs(), bytes32(uint256(1)));
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.NonCanonicalInputs.selector);
+        reg.disclose(q, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+
+        DisclosureRegistry.Signed memory r = _executed(DisclosureRegistry.Kind.REPUTATION, 21, _repInputs(), 0x7);
+        r.messageInputs = bytes.concat(_repInputs(), hex"00");
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.NonCanonicalInputs.selector);
+        reg.disclose(r, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+
+        // same decoded values, but the first array's offset points past a padding word
+        bytes memory canon = _repInputs();
+        bytes memory moved = new bytes(canon.length + 32);
+        assembly {
+            let src := add(canon, 32)
+            let dst := add(moved, 32)
+            // head: off(users)+32, off(scores)+32, epoch
+            mstore(dst, add(mload(src), 32))
+            mstore(add(dst, 32), add(mload(add(src, 32)), 32))
+            mstore(add(dst, 64), mload(add(src, 64)))
+            // one zero padding word, then the original tail
+            let n := sub(mload(canon), 96)
+            for { let i := 0 } lt(i, n) { i := add(i, 32) } {
+                mstore(add(add(dst, 128), i), mload(add(add(src, 96), i)))
+            }
+        }
+        DisclosureRegistry.Signed memory r2 = _executed(DisclosureRegistry.Kind.REPUTATION, 22, _repInputs(), 0x7);
+        r2.messageInputs = moved;
+        // decodes to the same values (so the commitment would match) — still rejected
+        assertEq(
+            reg.messageHashOf(bytes32(0), DisclosureRegistry.Kind.REPUTATION, 1, _repInputs()),
+            keccak256(
+                abi.encode(
+                    bytes32(0),
+                    keccak256("SuperPaymaster.BLS.Reputation.v1"),
+                    uint256(1),
+                    _repUsers(),
+                    _repScores(),
+                    uint256(7)
+                )
+            )
+        );
+        vm.prank(writer);
+        vm.expectRevert(DisclosureRegistry.NonCanonicalInputs.selector);
+        reg.disclose(r2, address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+    }
+
+    function _repUsers() internal returns (address[] memory u) {
+        u = new address[](2);
+        u[0] = makeAddr("u0");
+        u[1] = makeAddr("u1");
+    }
+
+    function _repScores() internal pure returns (uint256[] memory sc) {
+        sc = new uint256[](2);
+        sc[0] = 10;
+        sc[1] = 20;
     }
 
     function test_replyCannotForgeSignerSet() public {
