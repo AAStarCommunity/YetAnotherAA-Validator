@@ -485,12 +485,18 @@ aggregator-only.
   - a record whose price never read (an authenticated BLS action, or an SP event
     already classified) is kept with its route, caller and verdict, and
     `price.unavailable`.
-- One tx never stops the scan: any exception while processing a tx (for example
-  a malformed RPC answer such as a frame address that is not an address, or an
-  aggregator log without its key) makes that tx a dead letter with its watched
-  evidence, and the cursor moves on. At the attempt cap it becomes an
-  `unattributed` record (`UNREADABLE`, nobody accused) carrying that evidence;
-  `status.json` counts txs isolated in the tick and unreadable txs in total.
+- One malformed item never stops the scan. Logs are read through raw
+  `eth_getLogs` (range and by hash), not the provider's `getLogs`, whose
+  formatter throws on an entry it cannot format before any isolation could see
+  it. An entry that is not a log object is quarantined at intake; any exception
+  while processing a tx (a malformed or inconsistent RPC answer) makes that tx a
+  dead letter with its watched evidence, and the cursor moves on. At the attempt
+  cap it becomes an `unattributed` record (`UNREADABLE`, its own verdict, nobody
+  accused) carrying that evidence. A tick that isolated anything is reported
+  degraded (`status.healthy` false, with the count), and `status.json` counts
+  unreadable txs in total. A tick still fails, and is retried with the cursor
+  unchanged, when a read it cannot do without fails (a header, a non-array log
+  answer).
 - A BLS action with an open dead letter is retried by that dead letter alone,
   once per tick; retirements of one id are numbered, never overwritten.
 - An SP effect that the trace proves to belong to a BLS action only after the

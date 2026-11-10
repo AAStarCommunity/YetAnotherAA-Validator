@@ -1,7 +1,7 @@
 // CI self-test for the guardian watcher core (W1) against the shared stub chain. Each cell asserts a
 // specific outcome; must-pass and must-fail cells are both present (a self-test of only one kind
 // proves nothing).
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,7 +29,7 @@ import {
   txOfEvidence,
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
-import { Store, writeAll, validAmendment } from "./lib/store.mjs";
+import { Store, writeAll, validAmendment, atomicWriteJson } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
 import { attributeLogs, flattenTraceLogs, validLog, receiptPos } from "./lib/attribute.mjs";
 
@@ -2176,7 +2176,16 @@ try {
       "L1: a malformed frame or aggregator log is isolated per tx (tick ok, dead letter with evidence), ends unattributed and counted; the scan moves on",
       s1.ok === true &&
         s1.isolatedThisTick === 1 &&
-        dl1.some(x => x.txHash === t1.hash && x.route === "tx") &&
+        // #403 review L-2: isolating a malformed answer makes the tick degraded, not healthy
+        s1.healthy === false &&
+        s1.degraded?.some(x => /1 malformed RPC answer\(s\) isolated/.test(x)) &&
+        // L-4: the reason names the malformed frame address, not missing positions
+        dl1.some(
+          x =>
+            x.txHash === t1.hash &&
+            x.route === "tx" &&
+            /trace frame address malformed/.test(x.reasons?.[0] ?? "")
+        ) &&
         dl1.some(
           x =>
             x.txHash === ethers.id("rev-malformed") &&
@@ -2187,6 +2196,8 @@ try {
         unread?.route === "unattributed" &&
         unread.event === "UNREADABLE" &&
         unread.evidence?.length === 1 &&
+        unread.verdict?.rule === "watcher.UNREADABLE" &&
+        !/SuperPaymaster|permissionless/.test(unread.verdict.reasons.join(" ")) &&
         sEnd.unreadableTotal === 1 &&
         sEnd.ok === true,
       { s1: [s1.ok, s1.isolatedThisTick, s1.lastError], dl1, unread, sEnd: sEnd.unreadableTotal }
@@ -2409,7 +2420,7 @@ try {
         spEvents: [{ event: "PriceUpdated" }],
       });
       cell(
-        "follow-up R2: a patched dead letter survives a tx-first retry order (effects reach the record); a corrupt amendment is repaired, not trusted",
+        "follow-up R2: a patched dead letter survives a tx-first retry order (effects reach the record); a corrupt amendment file is set aside and replaced, never trusted",
         rx?.spEvents?.[0]?.event === "PriceUpdated" &&
           rep === "repaired" &&
           h.store.getBlsAmendment(sx.key)?.spEvents?.length === 1,
@@ -3010,15 +3021,18 @@ try {
     e5.c.ownerTx([{ name: "GuardianSet", args: [addr("rev-l5a"), addr("rev-l5b")] }]);
     settle(e5.c);
     e5.c.setUpperTopics(true);
+    const calls0 = e5.c.logCalls();
     const s5 = (await runOnce(e5.c.chain, e5.cfg, e5.store, rs, ident)).status;
+    const callsUsed = e5.c.logCalls() - calls0; // aggregator + SP range reads, no by-hash re-read
     e5.c.setUpperTopics(false);
     cell(
       "L5: bloom topics compared case-insensitively (no false re-read for upper-case hex)",
       s5.ok === true &&
         s5.bloom.recovered === 0 &&
         s5.bloom.falsePositives === 0 &&
-        e5.recs().length === 1,
-      { bloom: s5.bloom, n: e5.recs().length, err: s5.lastError }
+        e5.recs().length === 1 &&
+        callsUsed === 2, // #403 review L-3: no by-hash re-read at all
+      { bloom: s5.bloom, n: e5.recs().length, err: s5.lastError, callsUsed }
     );
   } finally {
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
@@ -3209,6 +3223,106 @@ try {
     );
   } finally {
     rmSync(dP, { recursive: true, force: true });
+  }
+}
+
+// ---- #403 review L-1, L-3 (wiring, patch), L-5
+{
+  const dL = mkdtempSync(join(tmpdir(), "guardian-watcher-403l-"));
+  try {
+    // L-3: atomicWriteJson goes through writeAll (a short writer is driven to completion)
+    let calls = 0;
+    const short = (fd, b, off, len) => {
+      calls++;
+      return writeSync(fd, b, off, Math.min(5, len));
+    };
+    const p = join(dL, "w.json");
+    atomicWriteJson(p, { a: "x".repeat(40) }, short);
+    cell(
+      "L-3: atomicWriteJson writes through writeAll (a short writer is looped to a complete file)",
+      calls > 2 && JSON.parse(readFileSync(p, "utf8")).a.length === 40,
+      { calls }
+    );
+    // L-3: patchDeadLetter spends no attempt
+    const st = new Store(join(dL, "s"));
+    const dl = {
+      route: "tx",
+      txHash: ethers.id("l3"),
+      blockNumber: 1,
+      status: "ERROR",
+      reasons: ["x"],
+      events: [],
+      seenAt: "t",
+    };
+    st.putDeadLetter(dl);
+    const id = `tx-${dl.txHash.toLowerCase()}`;
+    st.patchDeadLetter(id, { spEvents: [{ event: "PriceUpdated", logIndex: 1 }] });
+    const after = st.getDeadLetter(id);
+    cell(
+      "L-3: patchDeadLetter updates fields without spending an attempt",
+      after.attempts === 1 && after.spEvents?.length === 1,
+      after
+    );
+    // L-5: the same conflicting proof is stored once, and conflicts are counted in total
+    const okA = {
+      key: "9",
+      txHash: ethers.id("l5-a"),
+      provenBy: "trace",
+      spEvents: [{ event: "PriceUpdated", logIndex: 1 }],
+    };
+    const okB = { ...okA, txHash: ethers.id("l5-b") };
+    const seq = [okA, okA, okB, okB, okB, okA].map(x => st.putBlsAmendment(9n, x));
+    cell(
+      "L-5: an identical conflicting amendment is stored once; conflicts are counted in total",
+      j(seq) === j(["new", "same", "conflict", "conflict", "conflict", "same"]) &&
+        st.countAmendmentConflicts() === 1,
+      { seq, conflicts: st.countAmendmentConflicts() }
+    );
+  } finally {
+    rmSync(dL, { recursive: true, force: true });
+  }
+  // L-1: a later failed tx lookup keeps the sender / target / selector an earlier one established
+  const dK = mkdtempSync(join(tmpdir(), "guardian-watcher-403l1-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dK);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const KEEP = addr("l1-keeper");
+    const sel = ethers.id("pauseUnderstakedOperator(address)").slice(0, 10);
+    const t = c.ownerTx([{ name: "OperatorPaused", args: [addr("l1-op")] }], {
+      from: KEEP,
+      data: sel,
+      trace: false,
+    });
+    for (let i = 0; i < 4; i++) c.mine();
+    await runOnce(c.chain, cfg, store, rs, ident); // the lookup works: sender etc. stored
+    c.failTx(t.hash, 1_000_000); // every later lookup fails
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      await runOnce(c.chain, cfg, store, rs, ident);
+    c.failTx(t.hash, 0);
+    const recs = readdirSync(join(dK, "records")).map(f =>
+      JSON.parse(readFileSync(join(dK, "records", f), "utf8"))
+    );
+    const r = recs.find(x => x.txHash === t.hash);
+    cell(
+      "L-1: later failed tx lookups keep the sender, target and root selector of an earlier one, through exhaustion",
+      r?.route === "unattributed" &&
+        r.from === KEEP &&
+        r.to === SP &&
+        r.rootSelector === sel &&
+        r.caller === null,
+      r
+    );
+  } finally {
+    rmSync(dK, { recursive: true, force: true });
   }
 }
 

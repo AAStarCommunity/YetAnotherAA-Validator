@@ -982,13 +982,19 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       ...(t.range ? { range: t.range } : {}),
       // What is known of the tx itself, kept for an unattributed record at exhaustion (#400 review
       // nit): its sender, target and root selector (not the emitting call's).
+      // A later failed lookup keeps what an earlier one established (#403 review L-1).
       ...(tx
         ? {
             txFrom: tx.from ? ethers.getAddress(tx.from) : null,
             txTo: tx.to ? ethers.getAddress(tx.to) : null,
             rootSelector: selectorOf(tx.data),
           }
-        : {}),
+        : (() => {
+            const prior = store.getDeadLetter(txDl);
+            return prior && "txFrom" in prior
+              ? { txFrom: prior.txFrom, txTo: prior.txTo, rootSelector: prior.rootSelector }
+              : {};
+          })()),
       ruleset: ctx.ruleset,
       seenAt: ctx.now,
     });
@@ -1106,7 +1112,13 @@ function exhaust(store, rs, cfg, ctx, summary, dl) {
       ruleset: dl.ruleset ?? ctx.ruleset,
       seenAt: ctx.now,
     };
-    rec.verdict = evaluate(rs, cfg.roles, rec);
+    // its own verdict: not the SP-event wording of the unattributed rule (it can be an aggregator
+    // log, or no log at all), flagged as that rule flags, nobody accused (#403 review L-4)
+    rec.verdict = {
+      flagged: !!rs.publicRoute?.unattributed?.flag,
+      rule: "watcher.UNREADABLE",
+      reasons: ["an RPC answer could not be read (malformed or inconsistent); nobody accused"],
+    };
     note(summary, store.putRecord(rec), rec);
     summary.unreadable = (summary.unreadable ?? 0) + 1;
   } else if (dl.route === "tx") {

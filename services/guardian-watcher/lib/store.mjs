@@ -15,12 +15,6 @@ import { join, dirname } from "node:path";
 
 const bigintSafe = (_, v) => (typeof v === "bigint" ? v.toString() : v);
 
-/**
- * Atomic AND durable (#400 Low; W2c R1 H1): the bytes are fsynced before the rename and the
- * directory after it, so a power cut leaves either the old file or the complete new one, never an
- * empty file, and a returned write survives the crash (the W2 journal relies on that).
- */
-/** Write every byte of `buf` to `fd`; `write` is injectable for a fault test. */
 /** A well-formed amendment for `key`: its key, a tx hash, how it was proven, and at least one
  * event, each with a name and a position. */
 export function validAmendment(a, key) {
@@ -46,6 +40,7 @@ export function validAmendment(a, key) {
   );
 }
 
+/** Write every byte of `buf` to `fd`; `write` is injectable for a fault test. */
 export function writeAll(fd, buf, write = writeSync) {
   let off = 0;
   while (off < buf.length) {
@@ -55,7 +50,13 @@ export function writeAll(fd, buf, write = writeSync) {
   }
 }
 
-export function atomicWriteJson(path, obj) {
+/**
+ * Atomic AND durable (#400 Low; W2c R1 H1): the bytes are fsynced before the rename and the
+ * directory after it, so a power cut leaves either the old file or the complete new one, never an
+ * empty file, and a returned write survives the crash (the W2 journal relies on that). `write` is
+ * the byte writer handed to writeAll (injectable, so a cell can prove the wiring: #403 review L-3).
+ */
+export function atomicWriteJson(path, obj, write = writeSync) {
   const tmp = `${path}.tmp-${process.pid}`;
   const buf = Buffer.from(JSON.stringify(obj, bigintSafe, 2) + "\n", "utf8");
   const fd = openSync(tmp, "w", 0o600);
@@ -63,13 +64,23 @@ export function atomicWriteJson(path, obj) {
     // writeSync may write fewer bytes than asked (e.g. a full disk): loop until every byte is
     // written, and refuse zero progress, so a short file is never fsynced and renamed into place
     // (Codex W2c R2).
-    writeAll(fd, buf);
+    writeAll(fd, buf, write);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
   renameSync(tmp, path);
-  const d = openSync(dirname(path), "r");
+  fsyncDir(dirname(path));
+}
+
+/** A rename is durable only once its directory is fsynced (#403 review L-4). */
+export function renameDurable(from, to) {
+  renameSync(from, to);
+  fsyncDir(dirname(to));
+}
+
+function fsyncDir(dir) {
+  const d = openSync(dir, "r");
   try {
     fsyncSync(d);
   } finally {
@@ -135,7 +146,7 @@ export class Store {
       );
       if (existsSync(placeholder)) {
         atomicWriteJson(`${placeholder}.resolved`, { resolvedBy: id });
-        renameSync(placeholder, `${placeholder}.done`);
+        renameDurable(placeholder, `${placeholder}.done`);
         resolved = true;
       }
     }
@@ -189,7 +200,7 @@ export class Store {
   resolveDeadLetter(id) {
     const path = join(this.dir, "deadletters", `${id}.json`);
     if (!existsSync(path)) return false;
-    renameSync(path, `${path}.done`);
+    renameDurable(path, `${path}.done`);
     return true;
   }
 
@@ -200,7 +211,7 @@ export class Store {
     // never overwrite an earlier retirement of the same id (#400 review L2): number them
     let target = `${path}.exhausted`;
     for (let k = 2; existsSync(target); k++) target = `${path}.exhausted.${k}`;
-    renameSync(path, target);
+    renameDurable(path, target);
   }
 
   /** Unattributed records of txs whose answers never became readable (#400 review L1). */
@@ -236,16 +247,27 @@ export class Store {
           JSON.stringify(cur.spEvents, bigintSafe) ===
             JSON.stringify(amendment.spEvents, bigintSafe);
         if (same) return "same";
-        // a different valid proof for the same action: both kept, never one overwriting the other
+        // a different valid proof for the same action: both kept, never one overwriting the other;
+        // the same conflicting proof is stored once, not again on every retry (#403 review L-5)
+        const sig = a =>
+          `${String(a?.txHash).toLowerCase()}|${JSON.stringify(a?.spEvents, bigintSafe)}`;
         let c = 1;
-        while (existsSync(`${path}.conflict.${c}`)) c++;
+        while (existsSync(`${path}.conflict.${c}`)) {
+          try {
+            if (sig(JSON.parse(readFileSync(`${path}.conflict.${c}`, "utf8"))) === sig(amendment))
+              return "conflict";
+          } catch {
+            // an unreadable conflict file is kept; the proof is written under the next number
+          }
+          c++;
+        }
         atomicWriteJson(`${path}.conflict.${c}`, amendment);
         return "conflict";
       }
       // keep the invalid bytes for inspection, then persist the valid proof (Codex follow-up R3)
       let k = 1;
       while (existsSync(`${path}.invalid.${k}`)) k++;
-      renameSync(path, `${path}.invalid.${k}`);
+      renameDurable(path, `${path}.invalid.${k}`);
       atomicWriteJson(path, amendment);
       return "repaired";
     }
@@ -262,6 +284,11 @@ export class Store {
     } catch {
       return null;
     }
+  }
+
+  /** Conflicting amendment proofs kept so far, in total (#403 review L-5). */
+  countAmendmentConflicts() {
+    return readdirSync(join(this.dir, "amendments")).filter(f => /\.conflict\.\d+$/.test(f)).length;
   }
 
   countAmendments() {

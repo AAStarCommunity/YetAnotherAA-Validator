@@ -141,7 +141,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
   const status = { at: started, ruleset: ident, lastError: null };
-  const finish = async (stats, finalized) => {
+  const finish = async (stats, finalized, isolated = 0) => {
     let h;
     try {
       h = await traceHealth(chain, cfg, store, stats, finalized, nowMs);
@@ -149,7 +149,10 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
       h = { trace: { capability: "unverified" }, degraded: ["trace capability check failed"] };
     }
     status.trace = h.trace;
-    status.degraded = h.degraded;
+    // A tick that had to isolate malformed RPC answers is not healthy: the data is being set aside,
+    // not read (#403 review L-2). The scan still moved on; the reason and count say why.
+    const extra = isolated ? [`${isolated} malformed RPC answer(s) isolated this tick`] : [];
+    status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
     status.healthy = status.ok === true && !status.degraded;
   };
   try {
@@ -173,6 +176,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
       unreadableTotal: store.countUnreadable(),
       blsAmendments: store.countAmendments(),
       amendmentConflictsThisTick: s.amendmentConflicts ?? 0,
+      amendmentConflictsTotal: store.countAmendmentConflicts(),
       exhaustedTotal: store.countExhausted(),
       bloom: {
         recovered: s.bloomRecovered,
@@ -180,7 +184,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
         unchecked: s.bloomUnchecked,
       },
     });
-    await finish(s.trace, s.finalized);
+    await finish(s.trace, s.finalized, s.isolated ?? 0);
     store.writeStatus(status);
     return { status, summary: s };
   } catch (e) {

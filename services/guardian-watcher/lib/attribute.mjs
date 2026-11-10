@@ -67,16 +67,19 @@ const same = (t, r) =>
  * { from, selector } of the call that emitted the log, i.e. who called SP and which function
  * (#400 M1). A DELEGATECALL from SP into its own module is not a new entry and is looked through.
  */
+// why the last flattenTraceLogs call found the trace unusable (for the dead-letter reason)
+let lastUnsureWhy = null;
+
 export function flattenTraceLogs(trace, aggregator, sp) {
   let nextId = 0;
-  let unsure = false;
+  let unsureWhy = null;
   const walk = (f, aggCall, spCall) => {
     if (!f || f.error) return [];
     const isCall = typeof f.type === "string" && f.type.toUpperCase() === "CALL";
     // A frame's addresses are used for attribution: malformed ones make the trace unusable rather
     // than throwing later (#400 review L1).
     const addrOk = a => a === undefined || a === null || (typeof a === "string" && isAddr(a));
-    if (!addrOk(f.from) || !addrOk(f.to)) unsure = true;
+    if (!addrOk(f.from) || !addrOk(f.to)) unsureWhy ??= "trace frame address malformed";
     const here = isCall && lc(f.to) === lc(aggregator) ? nextId++ : aggCall;
     const spHere =
       sp && isCall && lc(f.to) === lc(sp)
@@ -93,7 +96,8 @@ export function flattenTraceLogs(trace, aggregator, sp) {
     const missing = l => l.position === undefined || l.position === null;
     // A log without `position` is placed after the children. That is unambiguous only when no
     // child subtree has a surviving log (geth before positions existed: Codex #400-fix R11).
-    if (logs.some(missing) && childOut.some(o => o.length)) unsure = true;
+    if (logs.some(missing) && childOut.some(o => o.length))
+      unsureWhy ??= "trace logs lack positions";
     // An explicit position must place the log between child calls: an integer in
     // [0, calls.length], given as a number or a decimal/0x string (no booleans, arrays, empty
     // strings), and a frame's positions never decrease in emission order. Anything else is a
@@ -102,7 +106,8 @@ export function flattenTraceLogs(trace, aggregator, sp) {
     for (const l of logs) {
       if (missing(l)) continue;
       const p = parsePosition(l.position);
-      if (p === null || p > calls.length || p < prev) unsure = true;
+      if (p === null || p > calls.length || p < prev)
+        unsureWhy ??= "trace log position invalid or out of order";
       else prev = p;
     }
     const at = k =>
@@ -122,7 +127,8 @@ export function flattenTraceLogs(trace, aggregator, sp) {
     return out;
   };
   const seq = walk(trace, null, null);
-  return unsure ? null : seq;
+  lastUnsureWhy = unsureWhy;
+  return unsureWhy ? null : seq;
 }
 
 /**
@@ -143,7 +149,7 @@ export function attributeLogs(trace, receiptLogs, aggregator, sp) {
   if (!valid || (pos.length && Math.max(...pos) - Math.min(...pos) + 1 !== pos.length))
     return { aligned: false, owner, spCall, why: "receipt log positions invalid or duplicated" };
   const seq = flattenTraceLogs(trace, aggregator, sp);
-  if (!seq) return { aligned: false, owner, spCall, why: "trace logs lack positions" };
+  if (!seq) return { aligned: false, owner, spCall, why: lastUnsureWhy ?? "trace unusable" };
   const rl = [...receiptLogs].sort((a, b) => receiptPos(a) - receiptPos(b));
   if (seq.length !== rl.length)
     return {
