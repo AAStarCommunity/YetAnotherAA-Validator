@@ -1,7 +1,7 @@
 // CI self-test for W2c: the publication loop (lib/publisher.mjs), sink construction from config
 // (lib/sinks-config.mjs) and the store's publication journal, against the shared mock sinks.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -327,6 +327,109 @@ const cfg = { aggregator: AGG };
         r.alerts.length === 1 &&
         /persist failed: ENOSPC; publication pass stopped/.test(r.alerts[0]),
       r
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- M4 / M5 / H3: done means every pin current and the same bytes; bounded, rotating passes
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(owner);
+    const s = sinks({ filebase: { fail: true } });
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    const p1 = await publishPending(store, sk);
+    const p2 = await publishPending(store, sk);
+    const fbTried = s.calls.uploads.filebase;
+    s.pinOpts.filebase.fail = false;
+    const p3 = await publishPending(store, sk);
+    const p4 = await publishPending(store, sk);
+    const st = store.getPublication(Store.recordId(owner));
+    cell(
+      "M5: a published record with a failed configured pin is not done; the pin is retried each pass until it lands",
+      p1.counts.done === 0 &&
+        p2.counts.ran === 1 &&
+        p2.alerts.some(a => /1\/2 current pins/.test(a)) &&
+        fbTried >= 2 &&
+        p3.counts.done === 1 &&
+        p4.counts.ran === 0 &&
+        st.pins.filebase?.current === true,
+      { p1: p1.counts, p2: p2.counts, p3: p3.counts, p4: p4.counts, fbTried }
+    );
+    // M4: the record's bytes change on disk after publication
+    const id = Store.recordId(owner);
+    const original = readFileSync(join(d, "records", `${id}.json`), "utf8");
+    writeFileSync(
+      join(d, "records", `${id}.json`),
+      JSON.stringify({ ...JSON.parse(original), tampered: true })
+    );
+    const p5 = await publishPending(store, sk);
+    const p6 = await publishPending(store, sk);
+    const st5 = store.getPublication(id);
+    writeFileSync(join(d, "records", `${id}.json`), original); // changed back: still an incident
+    const p7 = await publishPending(store, sk);
+    cell(
+      "M4: changed bytes are never done: a durable INCIDENT, alerted every pass, never republished",
+      p5.counts.done === 0 &&
+        p5.alerts.some(a => /bytes changed.*INCIDENT/.test(a)) &&
+        p6.counts.incidents === 1 &&
+        p6.alerts.some(a => /bytes changed/.test(a)) &&
+        st5.bytesChanged?.to &&
+        st5.cid !== st5.bytesChanged.to &&
+        p7.counts.done === 0 &&
+        p7.counts.incidents === 1,
+      { p5: p5.counts, p6: p6.counts, bc: st5.bytesChanged }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const ids = [];
+    for (let i = 0; i < 5; i++) {
+      const r = { ...owner, txHash: ethers.id(`backlog-${i}`) };
+      store.putRecord(r);
+      ids.push(Store.recordId(r));
+    }
+    const s = sinks({ pinata: { fail: true }, filebase: { fail: true } });
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    let t = 1000;
+    const clock = () => t++;
+    const a = await publishPending(store, sk, { maxRecords: 2, now: clock });
+    const b = await publishPending(store, sk, { maxRecords: 2, now: clock });
+    const c = await publishPending(store, sk, { maxRecords: 2, now: clock });
+    const ran = ids.filter(x => store.getPublication(x)?.lastRunAt).length;
+    let slow = 0;
+    const tick = () => (slow += 200_000);
+    const timed = await publishPending(store, sk, { now: tick });
+    cell(
+      "H3: a pass runs at most maxRecords (and stops starting new ones after maxMs); passes rotate through the backlog",
+      a.counts.ran === 2 &&
+        a.counts.deferred === 3 &&
+        b.counts.ran === 2 &&
+        c.counts.ran === 2 &&
+        ran === 5 &&
+        timed.counts.ran === 1 &&
+        timed.counts.deferred === 4,
+      { a: a.counts, b: b.counts, c: c.counts, ran, timed: timed.counts }
+    );
+    // an acknowledged registry incident is parked: not run every pass
+    store.putPublication(ids[0], {
+      published: true,
+      telegram: { at: "x" },
+      registry: { phase: "conflict", ack: true },
+    });
+    const pk = await publishPending(store, sk, { maxRecords: 10, now: clock });
+    cell(
+      "an acknowledged registry incident is parked (not run each pass)",
+      pk.counts.parked === 1 && pk.counts.ran === 4,
+      pk.counts
     );
   } finally {
     rmSync(d, { recursive: true, force: true });

@@ -5,28 +5,59 @@
 import { ethers } from "ethers";
 import { Store } from "./store.mjs";
 import { publishRecord, PersistError } from "./publish.mjs";
+import { recordFile } from "./record-file.mjs";
 import { SafeError, safeText, guarded } from "./safe-error.mjs";
 import { assertWriterRole } from "../sinks/registry.mjs";
 
-/** Fully done: nothing left to run, unless a weekly reverify of the pins is due. */
-export function isDone(rec, st) {
+/**
+ * Fully done: nothing left to run, unless a weekly reverify of the pins is due. With `pinners`
+ * (configured names) every one must hold a current pin, so a failed pin keeps being repaired
+ * (Codex W2c R1 M5); with `cid` the journal must describe the record's current bytes, and a
+ * recorded bytes change is never done (M4).
+ */
+export function isDone(rec, st, { pinners, cid } = {}) {
   if (!st?.published || !st.telegram?.at) return false;
+  if (st.bytesChanged) return false;
+  if (cid !== undefined && st.cid !== cid) return false;
+  if (pinners && !pinners.every(n => st.pins?.[n]?.current)) return false;
   if (rec.route !== "bls") return true; // owner/guardian route: repo + Telegram only (M0 §5.3)
   return st.registry?.phase === "confirmed";
 }
 
 /** An unresolved, unacknowledged registry incident: publishRecord re-alerts it every run. */
 const openIncident = st =>
-  (st?.registry?.phase === "conflict" || st?.registry?.phase === "reverted") && !st.registry.ack;
+  ((st?.registry?.phase === "conflict" || st?.registry?.phase === "reverted") &&
+    !st.registry.ack) ||
+  !!st?.bytesChanged;
+
+/** An acknowledged registry incident: parked, nothing to run until the weekly reverify. */
+const parked = st =>
+  (st?.registry?.phase === "conflict" || st?.registry?.phase === "reverted") && !!st.registry.ack;
+
+/** Per-pass bounds (Codex W2c R1 H3): a sink outage cannot hold the next scan for long. */
+export const PASS_MAX_RECORDS = 25;
+export const PASS_MAX_MS = 120_000;
 
 /**
  * Run publication for every flagged record. Returns { alerts, counts }.
  * A PersistError stops the pass (state is no longer durable); any other error of one record is
  * an alert and the pass moves on: one bad record never blocks the others.
  */
-export async function publishPending(store, sinks, { reverify = false, maxPendingMs } = {}) {
+export async function publishPending(
+  store,
+  sinks,
+  {
+    reverify = false,
+    maxPendingMs,
+    maxRecords = PASS_MAX_RECORDS,
+    maxMs = PASS_MAX_MS,
+    now = Date.now,
+  } = {}
+) {
   const alerts = [];
-  const counts = { flagged: 0, done: 0, ran: 0, incidents: 0, failed: 0 };
+  const counts = { flagged: 0, done: 0, ran: 0, incidents: 0, failed: 0, parked: 0, deferred: 0 };
+  const pinners = (sinks.pinners ?? []).map(p => p.name);
+  const work = [];
   // One unreadable record or journal never blocks the others (Codex W2c R1 M7). An unreadable
   // journal is never reset: that record is not published (nor signed for) until it is repaired.
   const { records, corrupt } = store.listRecordsTolerant();
@@ -46,8 +77,31 @@ export async function publishPending(store, sinks, { reverify = false, maxPendin
       alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
       continue;
     }
-    if (isDone(rec, prev) && !reverify) {
+    let cid;
+    try {
+      cid = recordFile(rec).cid;
+    } catch {
+      cid = null; // publishRecord will fail on it and say so
+    }
+    if (!reverify && isDone(rec, prev, { pinners, cid })) {
       counts.done++;
+      continue;
+    }
+    if (!reverify && parked(prev)) {
+      counts.parked++;
+      continue;
+    }
+    work.push({ rec, id, prev, cid });
+  }
+  // Least recently run first, so a bounded pass rotates through a backlog instead of retrying
+  // the same head of the list every time.
+  work.sort((a, b) => (a.prev.lastRunAt ?? 0) - (b.prev.lastRunAt ?? 0));
+  const t0 = now();
+  for (const { rec, id, prev, cid } of work) {
+    // At least one record per pass, so a slow pass still makes progress.
+    if (counts.ran >= maxRecords || (counts.ran > 0 && now() - t0 >= maxMs)) {
+      counts.deferred++;
+      if (openIncident(prev)) counts.incidents++;
       continue;
     }
     counts.ran++;
@@ -58,7 +112,8 @@ export async function publishPending(store, sinks, { reverify = false, maxPendin
         maxPendingMs,
       });
       for (const a of r.alerts) alerts.push(`${id}: ${a}`);
-      if (isDone(rec, r.state)) counts.done++;
+      store.putPublication(id, { ...r.state, lastRunAt: now() });
+      if (isDone(rec, r.state, { pinners, cid })) counts.done++;
       if (openIncident(r.state)) counts.incidents++;
     } catch (e) {
       if (e instanceof PersistError) {

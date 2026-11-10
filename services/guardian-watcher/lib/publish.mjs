@@ -126,9 +126,15 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   }
   if (state.cid && state.cid !== file.cid) {
     // Records are immutable once stored; a different CID means the bytes changed underneath us.
+    // A durable, standing incident (Codex W2c R1 M4): it keeps the record out of "done" and is
+    // alerted on every pass until resolved by hand; it is never republished automatically.
     alerts.push(
-      `record bytes changed after first publication (${state.cid} -> ${file.cid}); not republishing`
+      `record bytes changed after first publication (${state.cid} -> ${file.cid}); not republishing; INCIDENT`
     );
+    if (state.bytesChanged?.to !== file.cid) {
+      state.bytesChanged = { from: state.cid, to: file.cid, at: new Date().toISOString() };
+      await persist(state);
+    }
     return { state, alerts };
   }
   state.cid = file.cid;
