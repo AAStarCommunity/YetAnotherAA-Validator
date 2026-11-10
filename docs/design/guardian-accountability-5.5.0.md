@@ -273,7 +273,11 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
   reports it as unverified. The second route lets the party an action actually
   named reply even when the entry is attributed to the wrong community. A
   GENERIC action names no reply party (its target is only a contract address);
-  its signers and the claimed community owner can reply.
+  its signers and the claimed community owner can reply. `subjectToken` is part
+  of `entryBinding` and cannot be amended, so a wrong `subjectToken` in the
+  first entry permanently gives that token's community owner the right of reply.
+  That is harmless: replies are append-only claims, and the parties the action
+  actually names keep their own reply route.
 - Emits `Replied(entryId, msg.sender, replyURI, replyHash)`. Cannot edit or
   delete anything.
 
