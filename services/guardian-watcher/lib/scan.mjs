@@ -10,6 +10,10 @@ import {
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice } from "./rules.mjs";
 import { attributeLogs } from "./attribute.mjs";
+import { SafeError, safeText } from "./safe-error.mjs";
+
+// Chain data in our own error text only when it is a well-formed hash (RPC answers are untrusted).
+const hx = v => (/^0x[0-9a-fA-F]{64}$/.test(String(v)) ? String(v) : "<malformed>");
 
 export const MAX_DEADLETTER_ATTEMPTS = 20;
 
@@ -18,7 +22,7 @@ async function header(chain, tag) {
     typeof tag === "number" ? ethers.toQuantity(tag) : tag,
     false,
   ]);
-  if (!b || !b.hash) throw new Error(`block ${tag} unavailable`);
+  if (!b || !b.hash) throw new SafeError(`block ${tag} unavailable`);
   return { number: Number(b.number), hash: b.hash };
 }
 
@@ -41,7 +45,7 @@ export async function pagedLogs(chain, address, topics, from, to, page = 5_000) 
   return out;
 }
 
-async function readPrice(chain, sp, blockTag) {
+export async function readPrice(chain, sp, blockTag) {
   try {
     const ret = await chain.call({
       to: sp,
@@ -51,7 +55,7 @@ async function readPrice(chain, sp, blockTag) {
     const r = spIface.decodeFunctionResult("cachedPrice", ret);
     return { price: r.price.toString(), updatedAt: r.updatedAt.toString(), block: blockTag };
   } catch (e) {
-    return { error: e.shortMessage ?? e.message, block: blockTag };
+    return { error: safeText("cachedPrice read", e), block: blockTag };
   }
 }
 
@@ -74,7 +78,7 @@ export function logPos(l) {
   const v = l.index ?? l.logIndex;
   const n = typeof v === "string" ? Number(BigInt(v)) : Number(v);
   if (!Number.isSafeInteger(n) || n < 0)
-    throw new Error(`log without a valid position in tx ${l.transactionHash}`);
+    throw new SafeError(`log without a valid position in tx ${hx(l.transactionHash)}`);
   return n;
 }
 
@@ -132,7 +136,7 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
       deadLetter: {
         ...base,
         status: "ERROR",
-        reasons: [`rebuild failed: ${e.shortMessage ?? e.message}`],
+        reasons: [`rebuild failed: ${safeText("rebuild", e)}`],
         verdict: evaluate(rs, cfg.roles, { ...base, kind: undefined }),
         spEvents,
       },
@@ -193,8 +197,8 @@ export async function tick(chain, cfg, store, rs, ctx) {
     // Finalized blocks cannot reorg; if the cursor's block changed anyway, stop and say so.
     const now = await header(chain, cursor.block);
     if (now.hash.toLowerCase() !== String(cursor.hash).toLowerCase()) {
-      throw new Error(
-        `cursor block ${cursor.block} hash changed (${cursor.hash} -> ${now.hash}): finality violated, not advancing`
+      throw new SafeError(
+        `cursor block ${cursor.block} hash changed (${hx(cursor.hash)} -> ${hx(now.hash)}): finality violated, not advancing`
       );
     }
   }

@@ -39,6 +39,10 @@ export function assertWriterRole(writer, roles) {
     );
 }
 
+// A record URI read from chain is untrusted text: only our own form leaves this sink; anything
+// else becomes a marker that can never equal ours (Codex W2b R3 M3).
+const uriOf = u => (/^ipfs:\/\/b[a-z2-7]{20,100}$/.test(String(u)) ? u : "invalid:uri");
+
 export const actionId = (kind, key) =>
   ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["uint8", "uint256"], [kind, key]));
 
@@ -95,10 +99,15 @@ export function registrySink({ provider, wallet, registry, fromBlock, roles, fee
           txHash: a.txHash,
           blockNumber: Number(a.blockNumber),
           rulesetCommit: a.rulesetCommit,
-          recordURI: a.recordURI,
+          recordURI: uriOf(a.recordURI),
           recordHash: a.recordHash,
         }));
-      return { binding, recordURI: rec.recordURI, recordHash: rec.recordHash, amendments: ams };
+      return {
+        binding,
+        recordURI: uriOf(rec.recordURI),
+        recordHash: rec.recordHash,
+        amendments: ams,
+      };
     },
     /**
      * Sign a disclose tx. With `replace`, `prevRaw` (the journalled raw tx being replaced) is

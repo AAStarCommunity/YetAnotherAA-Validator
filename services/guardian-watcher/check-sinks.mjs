@@ -8,6 +8,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ethers } from "ethers";
 import { readSecret } from "./lib/keychain.mjs";
+import { guarded, safeText } from "./lib/safe-error.mjs";
+import { readPrice } from "./lib/scan.mjs";
+import { storable } from "./lib/publish.mjs";
 import { cidV1Raw, MAX_RECORD_BYTES } from "./lib/cid.mjs";
 import { pinataPinner } from "./sinks/pinata.mjs";
 import { filebasePinner } from "./sinks/filebase.mjs";
@@ -47,6 +50,74 @@ const cell = (name, ok, got) => results.push({ name, ok: !!ok, got: ok ? "" : j(
     j(args) === j(["find-generic-password", "-s", "a b", "-a", "c;d", "-w"]),
     args
   );
+}
+
+// ---- the error rule outside the sinks (Codex W2b R3)
+{
+  const codes = [];
+  for (const code of ["RPCSECRET_0123456789", "CALL_EXCEPTION", 7]) {
+    try {
+      await guarded("op", async () => {
+        throw Object.assign(new Error("https://rpc/v2/KEYSECRET"), {
+          code,
+          shortMessage: "KEYSECRET",
+        });
+      });
+    } catch (e) {
+      codes.push(e.message);
+    }
+  }
+  cell(
+    "a foreign error's code passes only if it is on the allowlist; message never",
+    j(codes) === j(["op: error", "op: CALL_EXCEPTION", "op: error"]),
+    codes
+  );
+  const pr = await readPrice(
+    {
+      async call() {
+        throw Object.assign(new Error("x"), {
+          shortMessage: "call to https://rpc/v2/KEYSECRET failed",
+        });
+      },
+    },
+    ethers.ZeroAddress,
+    5
+  );
+  cell(
+    "price read: an RPC failure is recorded as a category, never its text (records are published)",
+    pr.error === "cachedPrice read: error" && !j(pr).includes("KEYSECRET"),
+    pr
+  );
+  let km = null;
+  try {
+    await readSecret("svc", "acct", (_c, _a, _o, cb) =>
+      cb(Object.assign(new Error("x"), { code: "KEYSECRET" }), "")
+    );
+  } catch (e) {
+    km = e.message;
+  }
+  cell(
+    "keychain: a non-numeric foreign code is not copied",
+    /unavailable \(error\)/.test(km ?? "") && !/KEYSECRET/.test(km ?? ""),
+    km
+  );
+  const st = storable({
+    recordURI: "https://rpc/v2/KEYSECRET",
+    recordHash: "0x" + "ab".repeat(32),
+  });
+  const ok = storable({
+    recordURI: "ipfs://bafkrei" + "a".repeat(52),
+    recordHash: "0x" + "ab".repeat(32),
+  });
+  cell(
+    "conflict state keeps an on-chain URI only in our own form, else only its digest",
+    st.recordURI === null &&
+      /^0x[0-9a-f]{64}$/.test(st.recordURIKeccak) &&
+      !j(st).includes("KEYSECRET") &&
+      ok.recordURI.startsWith("ipfs://b"),
+    { st, ok }
+  );
+  void safeText;
 }
 
 // ---- local HTTP mock
@@ -506,6 +577,21 @@ try {
         has(race2.commit, "records/bls/c.json"),
       { race1, race2 }
     );
+    const hook = join(bare, "hooks", "pre-receive");
+    writeFileSync(hook, "#!/bin/sh\necho 'denied by policy GITSECRET' >&2\nexit 1\n");
+    execFileSync("chmod", ["+x", hook]);
+    let hk = null;
+    try {
+      await m.commit("records/bls/h.json", rec, "h");
+    } catch (e) {
+      hk = e.message;
+    }
+    rmSync(hook);
+    cell(
+      "mirror: a hook rejection is 'push rejected by the remote', not 'the branch moved', no stderr",
+      /push: push rejected by the remote$/.test(hk ?? "") && !/GITSECRET/.test(hk ?? ""),
+      hk
+    );
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -697,6 +783,45 @@ try {
       le[1]?.m === "registry broadcast: NONCE_EXPIRED" &&
       le.every(x => x.short === undefined && x.cause === undefined && x.url === undefined),
     le
+  );
+  const badRec = regSinkIface.encodeEventLog("Disclosed", [
+    5n,
+    0,
+    7n,
+    7n,
+    ethers.id("m"),
+    [other],
+    [
+      ethers.ZeroAddress,
+      ethers.id("tx"),
+      100n,
+      true,
+      "0x" + "00".repeat(20),
+      "https://rpc/v2/KEYSECRET",
+      ethers.id("r"),
+    ],
+  ]);
+  const uriSink = registrySink({
+    provider: {
+      async call() {
+        return ethers.AbiCoder.defaultAbiCoder().encode(["bytes32"], [ethers.id("b")]);
+      },
+      async getLogs({ topics }) {
+        return topics[0] === regSinkIface.getEvent("Disclosed").topicHash
+          ? [{ address: REG, topics: badRec.topics, data: badRec.data, blockNumber: 1, index: 0 }]
+          : [];
+      },
+    },
+    wallet: w,
+    registry: REG,
+    fromBlock: 0,
+    roles,
+  });
+  const ent = await uriSink.entry(5n, { blockTag: 10 });
+  cell(
+    "registry entry(): an on-chain recordURI not in our form leaves the sink as a marker",
+    ent.recordURI === "invalid:uri" && !j(ent).includes("KEYSECRET"),
+    ent
   );
   // Writer-role separation is enforced BY THE SINK (Codex R1 H7): incomplete roles refuse
   // construction; a wallet that is a guardian is refused before anything is signed.

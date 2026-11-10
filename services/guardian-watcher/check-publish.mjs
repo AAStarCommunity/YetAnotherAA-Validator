@@ -812,7 +812,9 @@ function sinks(opts = {}) {
   }
   cell(
     "a persist failure propagates as PersistError (not swallowed as a sink failure)",
-    pe instanceof PersistError && /disk full/.test(pe.message),
+    pe instanceof PersistError &&
+      /^persist failed: /.test(pe.message) &&
+      !/disk full/.test(pe.message),
     pe?.message
   );
   let pe2 = null;

@@ -20,6 +20,7 @@ import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick } from "./lib/scan.mjs";
+import { safeText } from "./lib/safe-error.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -80,7 +81,7 @@ export async function runOnce(chain, cfg, store, rs, ident) {
     return { status, summary: s };
   } catch (e) {
     status.ok = false;
-    status.lastError = e.shortMessage ?? e.message;
+    status.lastError = safeText("tick", e); // never a foreign error's text (lib/safe-error.mjs)
     status.records = store.countRecords();
     status.deadLetters = store.listDeadLetters().length;
     status.cursor = store.getCursor()?.block ?? null;

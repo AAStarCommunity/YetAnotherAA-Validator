@@ -3,6 +3,7 @@
 // shell), never logged, never written to disk or env. A missing item is an error naming the item,
 // never its value.
 import { execFile } from "node:child_process";
+import { SafeError, safeCode } from "./safe-error.mjs";
 
 /** Read the generic password for (service, account). `run` is injectable for tests. */
 export function readSecret(service, account, run = execFile) {
@@ -14,10 +15,12 @@ export function readSecret(service, account, run = execFile) {
       (err, stdout) => {
         if (err)
           return reject(
-            new Error(`Keychain item ${service}/${account} unavailable (${err.code ?? "error"})`)
+            new SafeError(
+              `Keychain item ${service}/${account} unavailable (${Number.isInteger(err.code) ? `exit ${err.code}` : safeCode(err)})`
+            )
           );
         const v = String(stdout).replace(/\n$/, "");
-        if (!v) return reject(new Error(`Keychain item ${service}/${account} is empty`));
+        if (!v) return reject(new SafeError(`Keychain item ${service}/${account} is empty`));
         resolve(v);
       }
     );

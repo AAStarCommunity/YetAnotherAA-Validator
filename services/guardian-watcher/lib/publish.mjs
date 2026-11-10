@@ -34,25 +34,26 @@
 //               canonical(blockNumber, blockHash) -> bool,
 //               nonce() -> the writer's nonce at the FINALIZED block }
 import { ethers } from "ethers";
+import { SafeError, safeCode, safeText } from "./safe-error.mjs";
 import { Kind } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { recordFile, mirrorPath } from "./record-file.mjs";
 
 /** A failure to persist state: publication must stop, the returned state is NOT durable. */
-export class PersistError extends Error {
+export class PersistError extends SafeError {
   constructor(cause) {
-    super(`persist failed: ${cause?.message ?? cause}`);
+    super(`persist failed: ${safeCode(cause)}`); // the cause is not kept: its text is untrusted
     this.name = "PersistError";
-    this.cause = cause;
   }
 }
 
 const bytesEqual = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
-const errMsg = e => e?.shortMessage ?? e?.message ?? String(e);
+// Never e.shortMessage / e.message of a foreign error (Codex W2b R3): see lib/safe-error.mjs.
+const errMsg = e => safeText("unexpected", e);
 
 /** The disclose() arguments for a BLS record (registry ABI: Signed + record context). */
 export function discloseArgs(rec, file) {
   const kind = Kind[rec.kind];
-  if (kind === undefined) throw new Error(`record kind ${rec.kind} has no registry kind`);
+  if (kind === undefined) throw new SafeError(`record kind ${rec.kind} has no registry kind`);
   const commit =
     rec.ruleset?.verified && rec.ruleset?.commit
       ? `0x${rec.ruleset.commit}`
@@ -99,7 +100,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   // The journal is the crash-safety guarantee; without a durable persist there is none, so it is
   // required. Only an explicitly unsafe test mode may skip it.
   if (typeof opts.persist !== "function" && opts.unsafeNoJournal !== true) {
-    throw new Error(
+    throw new SafeError(
       "publishRecord needs opts.persist (durable state); unsafeNoJournal is for tests only"
     );
   }
@@ -244,6 +245,19 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
 
 export const DEFAULT_MAX_PENDING_MS = 30 * 60_000;
 
+/** On-chain content is untrusted text: keep a URI only in our own form, else only its digest. */
+export const RECORD_URI_RE = /^ipfs:\/\/b[a-z2-7]{20,100}$/;
+export function storable(c) {
+  const uriOk = typeof c.recordURI === "string" && RECORD_URI_RE.test(c.recordURI);
+  return {
+    recordURI: uriOk ? c.recordURI : null,
+    ...(uriOk || c.recordURI == null
+      ? {}
+      : { recordURIKeccak: ethers.keccak256(ethers.toUtf8Bytes(String(c.recordURI))) }),
+    recordHash: /^0x[0-9a-f]{64}$/.test(c.recordHash) ? c.recordHash : null,
+  };
+}
+
 /** Effective record content of an existing entry: the latest amendment wins, in order. */
 function effectiveContent(entry) {
   const last = (entry.amendments ?? []).at(-1);
@@ -270,7 +284,7 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     try {
       await reg.broadcast(r.raw);
     } catch (e) {
-      state.registry = { ...r, lastBroadcastError: String(e?.message ?? e) };
+      state.registry = { ...r, lastBroadcastError: errMsg(e) };
     }
     // A resumed in-flight journal (including one written before sentAt existed) gets its sentAt
     // once, so the stuck-tx timeout can elapse.
@@ -443,7 +457,7 @@ async function adoptExisting(rec, file, reg, state, persist, alerts) {
     entryId: id.toString(),
     conflict: why,
     storedBinding: e.binding,
-    storedContent: eff,
+    storedContent: storable(eff),
   };
   await persist(state);
   alerts.push(

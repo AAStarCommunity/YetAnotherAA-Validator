@@ -337,7 +337,10 @@ try {
     const dl = store.listDeadLetters().find(d => d.txHash === bad.hash);
     cell(
       "an action that throws becomes an ERROR dead letter",
-      rr.status.ok && dl?.status === "ERROR" && /node lost this tx/.test(dl.reasons[0]),
+      rr.status.ok &&
+        dl?.status === "ERROR" &&
+        dl.reasons[0] === "rebuild failed: rebuild: error" && // the RPC's own text never kept
+        !JSON.stringify(dl).includes("node lost this tx"),
       { s: rr.status, dl }
     );
     cell(
@@ -414,7 +417,9 @@ try {
   const r4 = await runOnce(broken, cfg, store, rs, ident);
   cell(
     "RPC failure: status not ok, error recorded",
-    !r4.status.ok && r4.status.lastError === "rpc down",
+    !r4.status.ok &&
+      r4.status.lastError === "tick: error" &&
+      !JSON.stringify(r4.status).includes("rpc down"),
     r4.status
   );
   cell(

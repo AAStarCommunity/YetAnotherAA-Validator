@@ -44,7 +44,7 @@ function git(cwd, args, { input, env } = {}) {
       // stderr is untrusted (it can carry a remote URL with credentials): it only selects one of
       // these fixed categories and is then dropped (Codex W2b R2 H2).
       const se = Buffer.concat(err).toString();
-      const cat = /non-fast-forward|fetch first|stale info|\[rejected\]|failed to push/i.test(se)
+      const cat = /non-fast-forward|fetch first|stale info/i.test(se)
         ? "rejected (the branch moved)"
         : /could not read from remote|permission denied|authentication|could not resolve|connection|timed out/i.test(
               se
@@ -52,7 +52,9 @@ function git(cwd, args, { input, env } = {}) {
           ? "remote unreachable or not authorized"
           : /couldn't find remote ref|not a valid object|unknown revision|bad revision/i.test(se)
             ? "ref or object not found"
-            : `exit ${Number.isInteger(code) ? code : "signal"}`;
+            : /\[remote rejected\]|\[rejected\]|failed to push|pre-receive hook declined/i.test(se)
+              ? "push rejected by the remote"
+              : `exit ${Number.isInteger(code) ? code : "signal"}`;
       rej(new SinkError(`git ${args[0]}: ${cat}`));
     });
     p.stdin.end(input ?? undefined);
