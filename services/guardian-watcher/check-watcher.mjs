@@ -3326,6 +3326,104 @@ try {
   }
 }
 
+// ---- Codex follow-up #2 R1: a huge raw answer (150 000 null entries) on the range read and on the
+// by-hash re-read is quarantined, and the cursor moves (no call-stack overflow before intake)
+{
+  const dH = mkdtempSync(join(tmpdir(), "guardian-watcher-huge-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dH);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const g = c.ownerTx([{ name: "GuardianSet", args: [addr("huge-a"), addr("huge-b")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const huge = new Array(150_000).fill(null);
+    let mode = "range";
+    const chain = {
+      ...c.chain,
+      send: async (m, p) => {
+        const r = await c.chain.send(m, p);
+        if (m !== "eth_getLogs" || String(p[0].address).toLowerCase() !== SP.toLowerCase())
+          return r;
+        const byHash = p[0].blockHash !== undefined;
+        if ((mode === "range" && !byHash) || (mode === "hash" && byHash)) {
+          mode = "done";
+          return [...r, ...huge];
+        }
+        return r;
+      },
+    };
+    const s1 = (await runOnce(chain, cfg, store, rs, ident)).status;
+    const g2 = c.ownerTx([{ name: "GuardianSet", args: [addr("huge-c"), addr("huge-d")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const r2 = await c.chain.getTransactionReceipt(g2.hash);
+    c.lagTopic(r2.blockNumber, spIface.getEvent("GuardianSet").topicHash);
+    mode = "hash";
+    const s2 = (await runOnce(chain, cfg, store, rs, ident)).status;
+    c.clearLag();
+    cell(
+      "huge raw answers (150 000 entries) on the range read and on the by-hash re-read are quarantined; the cursor moves",
+      s1.ok === true &&
+        s1.cursor !== null &&
+        s1.isolatedThisTick >= 150_000 &&
+        s2.ok === true &&
+        s2.bloom.recovered >= 1 &&
+        s2.isolatedThisTick >= 150_000 &&
+        // bounded: one quarantine dead letter per answer, not one per entry
+        store.listDeadLetters().filter(x => x.quarantine === true).length === 2 &&
+        store
+          .listDeadLetters()
+          .every(x => !x.quarantine || /150000 returned entries are not a log/.test(x.reasons[0])),
+      {
+        s1: [s1.ok, s1.lastError, s1.cursor, s1.isolatedThisTick],
+        s2: [s2.ok, s2.lastError, s2.isolatedThisTick, s2.bloom],
+      }
+    );
+    void g;
+  } finally {
+    rmSync(dH, { recursive: true, force: true });
+  }
+}
+
+// ---- quarantine samples are bounded: 30 distinct non-log entries -> one dead letter, 10 samples
+{
+  const dQ = mkdtempSync(join(tmpdir(), "guardian-watcher-qsamples-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dQ);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    for (let i = 0; i < 4; i++) c.mine();
+    for (let i = 0; i < 30; i++) c.injectRawResult(SP, i % 2 ? `junk-${i}` : i);
+    const st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    const q = store.listDeadLetters().filter(x => x.quarantine === true);
+    cell(
+      "quarantine is bounded: 30 distinct non-log entries make one dead letter keeping 10 samples, the total in its reason",
+      st.ok === true &&
+        q.length === 1 &&
+        q[0].watched.length === 10 &&
+        /^30 returned entries are not a log \(30 distinct, first 10 kept\)/.test(q[0].reasons[0]),
+      q.map(x => [x.watched.length, x.reasons])
+    );
+  } finally {
+    rmSync(dQ, { recursive: true, force: true });
+  }
+}
+
 // ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)
 {
   const got = [];

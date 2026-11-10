@@ -122,7 +122,7 @@ export function flattenTraceLogs(trace, aggregator, sp) {
           aggCall: here,
           spCall: spHere,
         });
-      if (k < calls.length) out.push(...childOut[k]);
+      if (k < calls.length) for (const x of childOut[k]) out.push(x);
     }
     return out;
   };

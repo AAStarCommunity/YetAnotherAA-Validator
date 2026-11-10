@@ -60,7 +60,10 @@ export async function pagedLogs(chain, address, topics, from, to, page = 5_000) 
   while (a <= to) {
     const b = Math.min(to, a + size - 1);
     try {
-      out.push(...(await rawGetLogs(chain, { address, topics, fromBlock: a, toBlock: b })));
+      // appended one by one: spreading a huge answer into push() overflows the call stack before
+      // any entry reaches the isolation (#403 follow-up, Codex R1)
+      for (const l of await rawGetLogs(chain, { address, topics, fromBlock: a, toBlock: b }))
+        out.push(l);
       a = b + 1;
       size = page;
     } catch (e) {
@@ -620,23 +623,35 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
 
 /** A returned entry that is not a log object at all: a quarantine dead letter keyed by its raw value
  * and query, retried to the cap, then an UNREADABLE record that names no tx. */
-function quarantineRaw(store, ctx, summary, x, source, from, to) {
-  let raw;
-  try {
-    raw = safeJson(x) ?? typeof x;
-  } catch {
-    raw = `<unserialisable ${typeof x}>`;
+function quarantineRaw(store, ctx, summary, bad, source, from, to) {
+  // Bounded (#403 follow-up, Codex R1): all non-log entries of one query answer become ONE
+  // quarantine dead letter, with the total and up to QUARANTINE_SAMPLES distinct raw values (each
+  // with its count): a flood of junk costs one write, not one fsynced file per entry.
+  const counts = new Map();
+  for (const x of bad) {
+    let raw;
+    try {
+      raw = safeJson(x) ?? typeof x;
+    } catch {
+      raw = `<unserialisable ${typeof x}>`;
+    }
+    counts.set(raw, (counts.get(raw) ?? 0) + 1);
   }
-  const evidence = [{ raw, source, range: [from, to] }];
-  const qid = ethers.keccak256(ethers.toUtf8Bytes(safeJson(evidence)));
-  summary.isolated = (summary.isolated ?? 0) + 1;
+  const evidence = [...counts.entries()]
+    .slice(0, QUARANTINE_SAMPLES)
+    .map(([raw, count]) => ({ raw, count, source, range: [from, to] }));
+  const distinct = counts.size;
+  const qid = ethers.keccak256(ethers.toUtf8Bytes(safeJson([evidence, bad.length, distinct])));
+  summary.isolated = (summary.isolated ?? 0) + bad.length;
   store.putDeadLetter({
     route: "tx",
     txHash: qid,
     quarantine: true,
     blockNumber: from,
     status: "ERROR",
-    reasons: ["returned entry is not a log"],
+    reasons: [
+      `${bad.length} returned entr${bad.length === 1 ? "y is" : "ies are"} not a log (${distinct} distinct${distinct > QUARANTINE_SAMPLES ? `, first ${QUARANTINE_SAMPLES} kept` : ""})`,
+    ],
     events: [],
     watched: typedEvidence(evidence),
     ruleset: ctx.ruleset,
@@ -644,6 +659,7 @@ function quarantineRaw(store, ctx, summary, x, source, from, to) {
   });
   summary.deadLetters++;
 }
+const QUARANTINE_SAMPLES = 10;
 
 /** JSON that never throws on RPC values: a BigInt keeps its type in the text, so identities
  * built from it stay distinct and stable (Codex follow-up R10). */
@@ -1222,7 +1238,7 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
         // raw comparison: a malformed position must not throw here, outside the per-tx isolation
         const fresh = got.filter(g => !logs.some(l => rawLogKey(l) === rawLogKey(g)));
         if (fresh.length) {
-          extra.push(...fresh);
+          for (const x of fresh) extra.push(x);
           summary.bloomRecovered++;
         }
         if (missing.some(topic => !got.some(g => lcEq(g?.topics?.[0], topic))))
@@ -1371,10 +1387,12 @@ export async function tick(chain, cfg, store, rs, ctx) {
   // quarantined at once with its raw value and query, never a reason to stop (Codex follow-up R3).
   const intake = (raw, source) => {
     const ok = [];
+    const bad = [];
     for (const x of raw ?? []) {
       if (x && typeof x === "object" && !Array.isArray(x)) ok.push(x);
-      else quarantineRaw(store, ctx, summary, x, source, from, to);
+      else bad.push(x);
     }
+    if (bad.length) quarantineRaw(store, ctx, summary, bad, source, from, to);
     return ok;
   };
   const aggLogs = intake(
