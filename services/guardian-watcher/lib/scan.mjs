@@ -10,7 +10,7 @@ import {
 } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.mjs";
-import { attributeLogs, receiptPos, validLog, parsePosition } from "./attribute.mjs";
+import { attributeLogs, receiptPos, validLog, parsePosition, traceDepthOk } from "./attribute.mjs";
 import { mayHaveLog } from "./bloom.mjs";
 import { Store } from "./store.mjs";
 
@@ -189,7 +189,7 @@ export async function verifyTrace(
       why = "trace call failed";
       return { state: "next" };
     }
-    if (!trace || typeof trace !== "object") {
+    if (!trace || typeof trace !== "object" || !traceDepthOk(trace)) {
       failed++;
       why = "malformed trace response";
       return { state: "next" };
@@ -272,7 +272,8 @@ async function traceAndReceipt(chain, txHash, stats = {}, expectLogs = false) {
       // getLogs already saw watched logs in this tx: a trace without any log proves withLog is not
       // honoured, whatever the receipt says (Codex #400-fix R6).
       // A null or non-object answer is a malformed response, inconclusive (Codex #400-fix R11).
-      if (!trace || typeof trace !== "object") {
+      // deeper than the EVM call-depth limit: not a real trace, refused before any walk (R8)
+      if (!trace || typeof trace !== "object" || !traceDepthOk(trace)) {
         trace = null;
         stats.failed = (stats.failed ?? 0) + 1;
       } else if ((expectLogs || rc?.logs?.length) && !traceHasLogs(trace))

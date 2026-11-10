@@ -1,5 +1,6 @@
 // Durable local state for the watcher: records, dead letters, cursor, status. Plain JSON files,
 // written atomically (temp file + rename) so a crash never leaves a half-written record.
+import { createHash } from "node:crypto";
 import {
   mkdirSync,
   readFileSync,
@@ -88,6 +89,40 @@ function fsyncDir(dir) {
   }
 }
 
+/**
+ * Reasons are diagnostics, and some grow with the RPC answer (a trace path per level): at most
+ * MAX_REASONS of at most MAX_REASON_CHARS each are stored, with the total and the sha256 of the
+ * full list when any was cut (follow-up #2 R8), so a dead letter stays small however deep the
+ * answer. Applied to `reasons` and `lastReasons`.
+ */
+const MAX_REASONS = 10;
+const MAX_REASON_CHARS = 512;
+export function boundReasons(rec) {
+  let out = rec;
+  for (const k of ["reasons", "lastReasons"]) {
+    const r = out?.[k];
+    if (!Array.isArray(r)) continue;
+    const cut =
+      r.length > MAX_REASONS || r.some(x => typeof x === "string" && x.length > MAX_REASON_CHARS);
+    if (!cut) continue;
+    const h = createHash("sha256");
+    for (const x of r) h.update(`${typeof x === "string" ? x : (JSON.stringify(x) ?? "")}\n`);
+    out = {
+      ...out,
+      [k]: r
+        .slice(0, MAX_REASONS)
+        .map(x =>
+          typeof x === "string" && x.length > MAX_REASON_CHARS
+            ? `${x.slice(0, MAX_REASON_CHARS)}…`
+            : x
+        ),
+      [`${k}Total`]: r.length,
+      [`${k}Sha256`]: `0x${h.digest("hex")}`,
+    };
+  }
+  return out;
+}
+
 export function readJson(path, fallback) {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
@@ -125,7 +160,8 @@ export class Store {
    * pipeline acts on it), unless the new one upgrades an UNRECOVERED placeholder for the same key.
    * Returns "new" | "same" | "upgraded".
    */
-  putRecord(rec) {
+  putRecord(recIn) {
+    const rec = boundReasons(recIn);
     const id = Store.recordId(rec);
     const path = join(this.dir, "records", `${id}.json`);
     // A file that exists but does not parse was never a valid record (#400 Low): rewrite it rather
@@ -159,7 +195,8 @@ export class Store {
   }
 
   /** Dead letter: an action seen but not authenticated; retried on later ticks, never dropped. */
-  putDeadLetter(rec) {
+  putDeadLetter(recIn) {
+    const rec = boundReasons(recIn);
     const id = Store.recordId({ ...rec, kind: undefined });
     const path = join(this.dir, "deadletters", `${id}.json`);
     let prev = null;

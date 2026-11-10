@@ -30,9 +30,15 @@ import {
   txOfEvidence,
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
-import { Store, writeAll, validAmendment, atomicWriteJson } from "./lib/store.mjs";
+import { Store, writeAll, validAmendment, atomicWriteJson, boundReasons } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
-import { attributeLogs, flattenTraceLogs, validLog, receiptPos } from "./lib/attribute.mjs";
+import {
+  attributeLogs,
+  flattenTraceLogs,
+  validLog,
+  receiptPos,
+  traceDepthOk,
+} from "./lib/attribute.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const rs = validateRuleset(JSON.parse(readFileSync(join(HERE, "ruleset.json"), "utf8")));
@@ -4527,6 +4533,85 @@ try {
       a: [out.a1.ok, out.a2.ok, out.a2.lastError, out.a3.ok, out.aAtt, out.aBytes, out.aW.length],
       b: [out.b.ok, out.bRecs, out.bQ.length, out.bQ[0]?.entries],
       e: [out.e.ok, out.e.lastError, out.eRecs, out.eT3, out.eQ.length, out.eQ[0]?.entries],
+    }
+  );
+}
+
+// ---- follow-up #2 R8: trace flattening is linear; traces past the EVM call-depth limit are
+// refused; persisted reasons are bounded
+{
+  const A = AGG;
+  const N = 30_000;
+  const big = {
+    type: "CALL",
+    from: addr("r8-from"),
+    to: SP,
+    input: "0x12345678",
+    calls: Array.from({ length: N }, () => ({
+      type: "CALL",
+      from: SP,
+      to: addr("r8-to"),
+      input: "0x",
+    })),
+    logs: Array.from({ length: N }, (_, i) => ({
+      address: SP,
+      topics: [ethers.id("t")],
+      data: "0x",
+      position: i,
+    })),
+  };
+  const t0 = Date.now();
+  const flat = flattenTraceLogs(big, A, SP);
+  const ms = Date.now() - t0;
+  const chain = n => {
+    let f = { type: "CALL", from: addr("r8-x"), to: addr("r8-y"), input: "0x" };
+    for (let i = 1; i < n; i++)
+      f = { type: "CALL", from: addr("r8-x"), to: addr("r8-y"), input: "0x", calls: [f] };
+    return f;
+  };
+  const many = Array.from({ length: 50 }, (_, i) => `step ${i}: ` + "p".repeat(10_000));
+  const br = boundReasons({ reasons: many, lastReasons: ["short"] });
+  const want = createHash("sha256");
+  for (const x of many) want.update(x + "\n");
+  // through the store: a dead letter keeps the bound
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-reasons-"));
+  let stored;
+  try {
+    const st = new Store(d);
+    st.putDeadLetter({
+      route: "tx",
+      txHash: ethers.id("r8-dl"),
+      blockNumber: 1,
+      reasons: many,
+      seenAt: "x",
+    });
+    stored = readFileSync(
+      join(d, "deadletters", `tx-${ethers.id("r8-dl").toLowerCase()}.json`)
+    ).length;
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R8: 30 000 logs beside 30 000 calls flatten in linear time; a trace of 1025 frames passes and 1026 is refused; persisted reasons keep 10 of at most 512 characters with the total and the sha256 of the full list",
+    flat?.length === N &&
+      ms < 3000 &&
+      traceDepthOk(chain(1025)) &&
+      !traceDepthOk(chain(1026)) &&
+      br.reasons.length === 10 &&
+      br.reasons.every(x => x.length <= 513) &&
+      br.reasonsTotal === 50 &&
+      br.reasonsSha256 === `0x${want.digest("hex")}` &&
+      br.lastReasons.length === 1 &&
+      br.lastReasonsTotal === undefined &&
+      stored < 20_000,
+    {
+      n: flat?.length,
+      ms,
+      d1025: traceDepthOk(chain(1025)),
+      d1026: traceDepthOk(chain(1026)),
+      r: br.reasons.length,
+      tot: br.reasonsTotal,
+      stored,
     }
   );
 }

@@ -530,6 +530,11 @@ aggregator-only.
     6000-deep value of 42 KB was a 72 MB dead letter). Stored evidence is
     decoded without recursion, and evidence that cannot be decoded spends a
     retry attempt, so no nesting depth fails a tick.
+  - A trace deeper than the EVM call-depth limit (1024 frames) cannot be real
+    and is refused before anything walks it; trace flattening is iterative and
+    linear in the trace. Persisted reasons are diagnostics: at most 10 of at
+    most 512 characters are kept, with the total and the sha256 of the full
+    list.
   - Identities stay distinct at any depth: a deep value is keyed by the sha256
     of its full text, and the placeholder it is stored as keeps that digest, so
     distinct deep observations are never merged and a retry never duplicates

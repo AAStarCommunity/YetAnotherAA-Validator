@@ -11,6 +11,18 @@
 //   getTransaction(hash), getTransactionReceipt(hash), getBlock(number), call({ to, data, blockTag })
 import { ethers } from "ethers";
 
+/** No deeper than the EVM call-depth limit (1024 frames below the root); iterative. */
+export function traceDepthOk(trace, max = 1025) {
+  const st = [[trace, 1]];
+  while (st.length) {
+    const [f, d] = st.pop();
+    if (!f || typeof f !== "object") continue;
+    if (d > max) return false;
+    if (Array.isArray(f.calls)) for (const c of f.calls) st.push([c, d + 1]);
+  }
+  return true;
+}
+
 const ABI = ethers.AbiCoder.defaultAbiCoder();
 
 export const TAG = {
@@ -429,6 +441,12 @@ export async function extractCandidates(
         trace = await chain.send("debug_traceTransaction", [tx.hash, { tracer: "callTracer" }]);
       } catch {
         trace = null;
+      }
+      // A trace deeper than the EVM's call-depth limit (1024) cannot be real: refused before the
+      // walk, whose per-level paths would otherwise grow with the square of the depth.
+      if (trace && !traceDepthOk(trace)) {
+        trace = null;
+        notes.push("trace deeper than the EVM call-depth limit; not followed");
       }
     }
     if (!trace) {
