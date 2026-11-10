@@ -112,6 +112,10 @@ export class Store {
     if (rec.route === "bls")
       return `bls-${rec.kind ?? "UNRECOVERED"}-${BigInt(rec.key).toString(16).padStart(64, "0")}`;
     if (rec.route === "tx") return `tx-${rec.txHash.toLowerCase()}`;
+    // a quarantine record names no tx: its own prefix, so it is counted from disk like every other
+    // total, even when the tick that wrote it failed later (follow-up #2 R4)
+    if (rec.route === "unattributed" && rec.quarantine === true)
+      return `quarantine-${rec.txHash.toLowerCase()}`;
     const route = rec.route === "public" || rec.route === "unattributed" ? rec.route : "owner";
     return `${route}-${rec.txHash.toLowerCase()}-${rec.logIndex}`;
   }
@@ -215,6 +219,32 @@ export class Store {
   }
 
   /** Unattributed records of txs whose answers never became readable (#400 review L1). */
+  /**
+   * Running totals that no file listing can recount (DSR log 2892c30f): ticks that hit the
+   * isolation budget (counted when the tick completes). Atomic and durable like every state write; an unreadable
+   * file restarts at zero rather than stopping the scan, and says so.
+   */
+  bumpCounters(delta) {
+    const path = join(this.dir, "counters.json");
+    let prev;
+    try {
+      prev = readJson(path, {});
+    } catch {
+      prev = { reset: true };
+    }
+    const next = { ...prev };
+    for (const [k, v] of Object.entries(delta))
+      next[k] = (Number.isSafeInteger(prev[k]) ? prev[k] : 0) + v;
+    atomicWriteJson(path, next);
+    return next;
+  }
+
+  countQuarantined() {
+    return readdirSync(join(this.dir, "records")).filter(
+      f => f.startsWith("quarantine-") && f.endsWith(".json")
+    ).length;
+  }
+
   countUnreadable() {
     return readdirSync(join(this.dir, "records")).filter(f => f.endsWith("-unreadable.json"))
       .length;

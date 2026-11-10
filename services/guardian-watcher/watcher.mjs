@@ -56,7 +56,17 @@ export function loadConfig(path) {
   for (const a of [c.aggregator, c.roles.superPaymaster, ...Object.values(c.forwarders ?? {})]) {
     if (!ethers.isAddress(a)) throw new Error(`config: bad address ${a}`);
   }
-  return { maxBlocksPerTick: 2000, page: 5000, intervalMs: 60_000, forwarders: {}, ...c };
+  if (c.maxLagBlocks !== undefined && !(Number.isSafeInteger(c.maxLagBlocks) && c.maxLagBlocks > 0))
+    throw new Error("config: maxLagBlocks must be a positive integer");
+  return {
+    maxBlocksPerTick: 2000,
+    page: 5000,
+    intervalMs: 60_000,
+    // the cursor this far behind finalized is degraded (about 1 h of Sepolia blocks): DSR 2892c30f
+    maxLagBlocks: 300,
+    forwarders: {},
+    ...c,
+  };
 }
 
 export const TRACE_VERIFY_MS = 3_600_000;
@@ -141,7 +151,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
   const status = { at: started, ruleset: ident, lastError: null };
-  const finish = async (stats, finalized, isolated = 0) => {
+  const finish = async (stats, finalized, isolated = 0, more = []) => {
     let h;
     try {
       h = await traceHealth(chain, cfg, store, stats, finalized, nowMs);
@@ -152,12 +162,14 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
     // A tick that had to isolate malformed RPC answers is not healthy: the data is being set aside,
     // not read (#403 review L-2). The scan still moved on; the reason and count say why.
     const extra = isolated ? [`${isolated} malformed RPC answer(s) isolated this tick`] : [];
+    for (const m of more) extra.push(m);
     status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
     status.healthy = status.ok === true && !status.degraded;
   };
   try {
     const s = await tick(chain, cfg, store, rs, { ruleset: ident, now: started });
     const cur = store.getCursor();
+    const totals = store.bumpCounters({ budgetStops: s.budgetStop ? 1 : 0 });
     Object.assign(status, {
       ok: true,
       finalized: s.finalized,
@@ -178,13 +190,26 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
       amendmentConflictsThisTick: s.amendmentConflicts ?? 0,
       amendmentConflictsTotal: store.countAmendmentConflicts(),
       exhaustedTotal: store.countExhausted(),
+      // ticks that hit the isolation budget (stopped early, or a block overflowed into quarantine)
+      // and quarantine records (set-aside answers, nobody accused): DSR log 2892c30f
+      budgetStopThisTick: !!s.budgetStop,
+      budgetStopsTotal: totals.budgetStops ?? 0,
+      quarantinedThisTick: s.quarantined ?? 0,
+      quarantinedTotal: store.countQuarantined(),
+      ...(totals.reset ? { countersReset: true } : {}),
       bloom: {
         recovered: s.bloomRecovered,
         falsePositives: s.bloomFalsePositives,
         unchecked: s.bloomUnchecked,
       },
     });
-    await finish(s.trace, s.finalized, s.isolated ?? 0);
+    const more = [];
+    if (s.budgetStop) more.push("isolation budget reached this tick (the rest is read next tick)");
+    const lag = cur ? s.finalized - cur.block : null;
+    const maxLag = cfg.maxLagBlocks ?? 300;
+    if (lag !== null && lag > maxLag)
+      more.push(`cursor ${lag} blocks behind finalized (> ${maxLag})`);
+    await finish(s.trace, s.finalized, s.isolated ?? 0, more);
     store.writeStatus(status);
     return { status, summary: s };
   } catch (e) {

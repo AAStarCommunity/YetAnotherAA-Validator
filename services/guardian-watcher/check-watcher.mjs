@@ -3,6 +3,7 @@
 // proves nothing).
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
@@ -37,6 +38,16 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const rs = validateRuleset(JSON.parse(readFileSync(join(HERE, "ruleset.json"), "utf8")));
 const results = [];
 const j = v => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
+/** Open dead letters plus quarantine records in dead-letter shape: since follow-up #2 R4 a
+ * quarantine is a final record at once (DSR log 2892c30f), not a dead letter waiting for its cap. */
+const withQ = store => [
+  ...store.listDeadLetters(),
+  ...readdirSync(join(store.dir, "records"))
+    .filter(f => f.endsWith(".json"))
+    .map(f => JSON.parse(readFileSync(join(store.dir, "records", f), "utf8")))
+    .filter(r => r.quarantine === true)
+    .map(r => ({ ...r, watched: r.evidence, reasons: r.lastReasons, finalRecord: true })),
+];
 const cell = (name, ok, got) => results.push({ name, ok: !!ok, got: ok ? "" : j(got) });
 
 const dir = mkdtempSync(join(tmpdir(), "guardian-watcher-"));
@@ -2307,7 +2318,7 @@ try {
       settle(g.c);
       const gs1 = (await runOnce(g.c.chain, g.cfg, g.store, rs, ident)).status;
       g.c.clearLag();
-      const gDls = g.store.listDeadLetters();
+      const gDls = withQ(g.store);
       cell(
         "follow-up R2: bloom recovery beside a malformed position, conflicting copies at one position, a log without a tx hash and a removed standalone event are each isolated; tick ok",
         gs1.ok === true &&
@@ -2455,7 +2466,7 @@ try {
       const ok3 = k.c.ownerTx([{ name: "GuardianSet", args: [addr("r3-g1"), addr("r3-g2")] }]);
       settle(k.c);
       const ks = (await runOnce(k.c.chain, k.cfg, k.store, rs, ident)).status;
-      const kd = k.store.listDeadLetters();
+      const kd = withQ(k.store);
       const hDl = kd.find(x => x.txHash === ethers.id("r3-height"));
       cell(
         "follow-up R3: copies disagreeing on their block, an invalid height and a null entry are isolated (tick ok, valid log recorded, raw height kept)",
@@ -2802,7 +2813,7 @@ try {
         "follow-up R9: a tx hash or topic that cannot be stringified is isolated; the scan never throws and moves on",
         us.ok === true &&
           us2.ok === true &&
-          u.store.listDeadLetters().some(x => x.quarantine === true) &&
+          withQ(u.store).some(x => x.quarantine === true) &&
           u.store.listDeadLetters().some(x => x.txHash === quiet.hash) &&
           u.recs().some(r => r.txHash === later.hash),
         { us: [us.ok, us.lastError], us2: [us2.ok, us2.lastError] }
@@ -2855,7 +2866,7 @@ try {
           bq?.watched?.length === 5 &&
           bq2?.watched?.length === 5 &&
           j(bq2.watched) === j(bq.watched) && // stored bytes unchanged by retries (idempotent)
-          b.store.listDeadLetters().some(x => x.quarantine === true) &&
+          withQ(b.store).some(x => x.quarantine === true) &&
           bad.ok === false &&
           j(curAfterBad) === j(curBefore) &&
           good.ok === true &&
@@ -3197,7 +3208,7 @@ try {
     byHashMalformed = true;
     const st2 = (await runOnce(prov, cfg, store, rs, ident)).status;
     c.clearLag();
-    const dls = store.listDeadLetters();
+    const dls = withQ(store);
     cell(
       "M-1: the bloom's by-hash re-read also takes the raw path: a malformed entry there is isolated, the tick completes",
       st2.ok === true &&
@@ -3376,11 +3387,18 @@ try {
         s2.ok === true &&
         s2.bloom.recovered >= 1 &&
         s2.isolatedThisTick >= 150_000 &&
-        // bounded: one quarantine dead letter per answer, not one per entry
-        store.listDeadLetters().filter(x => x.quarantine === true).length === 2 &&
-        store
-          .listDeadLetters()
-          .every(x => !x.quarantine || /150000 returned entries are not a log/.test(x.reasons[0])),
+        // bounded: one quarantine record per answer, not one per entry; each a final record
+        // carrying the sha256 of its whole payload
+        withQ(store).filter(x => x.quarantine === true).length === 2 &&
+        withQ(store)
+          .filter(x => x.quarantine)
+          .every(
+            x =>
+              x.finalRecord &&
+              /^0x[0-9a-f]{64}$/.test(x.payloadSha256) &&
+              x.entries === 150_000 &&
+              /150000 returned entries are not a log/.test(x.reasons[0])
+          ),
       {
         s1: [s1.ok, s1.lastError, s1.cursor, s1.isolatedThisTick],
         s2: [s2.ok, s2.lastError, s2.isolatedThisTick, s2.bloom],
@@ -3410,7 +3428,7 @@ try {
     for (let i = 0; i < 4; i++) c.mine();
     for (let i = 0; i < 30; i++) c.injectRawResult(SP, i % 2 ? `junk-${i}` : i);
     const st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
-    const q = store.listDeadLetters().filter(x => x.quarantine === true);
+    const q = withQ(store).filter(x => x.quarantine === true);
     cell(
       "quarantine is bounded: 30 distinct non-log entries make one dead letter keeping 10 samples, the total in its reason",
       st.ok === true &&
@@ -3456,7 +3474,7 @@ try {
     runs.push(a);
     for (let i = 0; i < 4000; i++) a.c.injectRawResult(SP, { logIndex: i });
     out.objFlood = await a.tick();
-    out.objFloodQ = a.store.listDeadLetters().filter(x => x.quarantine).length;
+    out.objFloodQ = withQ(a.store).filter(x => x.quarantine).length;
     // 150 malformed logs of distinct txs in ONE block: isolated per tx (a block is never split)
     const b = mkRun();
     runs.push(b);
@@ -3598,7 +3616,7 @@ try {
     // the tick stopped after block 101 (its budget); block 102 is read again on the next tick
     reserved();
     st2 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
-    dls = store.listDeadLetters();
+    dls = withQ(store);
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -3656,7 +3674,14 @@ try {
   const from = cfg.startBlock;
   const gs = spIface.encodeEventLog("GuardianSet", [addr("nh-a"), addr("nh-b")]);
   for (let i = 0; i < 2100; i++)
-    c.injectRawResult(SP, { address: SP, ...gs, index: i, transactionHash: ethers.id(`nh-${i}`) });
+    // half with no height, half claiming distinct heights past the range: one shared bucket
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      index: i,
+      ...(i % 2 ? { blockNumber: 1_000_000 + i } : {}),
+      transactionHash: ethers.id(`nh-${i}`),
+    });
   c.injectRawResult(SP, {
     address: SP,
     ...gs,
@@ -3669,7 +3694,7 @@ try {
   let st, dls;
   try {
     st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
-    dls = store.listDeadLetters();
+    dls = withQ(store);
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -3724,7 +3749,7 @@ try {
   let st, dls;
   try {
     st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
-    dls = store.listDeadLetters();
+    dls = withQ(store);
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -3735,6 +3760,247 @@ try {
       dls[0].quarantine &&
       /^3 returned entries are not a log/.test(dls[0].reasons?.join(" ") ?? ""),
     { ok: st?.ok, n: dls?.length, r: dls?.map(x => x.reasons) }
+  );
+}
+
+// ---- follow-up #2 R4: only an in-range height can stop a tick (it always advances); txs with no
+// height or outside the range are handled in the tick that read them, never deferred and lost
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r4-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r4-a"), addr("r4-b")]);
+  const out = {};
+  try {
+    // 150 isolating logs claiming the block before the range, beside one healthy owner tx
+    const a = mk();
+    const k = a.c.ownerTx([{ name: "SlashCancelled", args: [addr("r4-op")] }]);
+    for (let i = 0; i < 4; i++) a.c.mine();
+    for (let i = 0; i < 150; i++)
+      a.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: a.cfg.startBlock - 1,
+        index: 0,
+        transactionHash: ethers.id(`r4-prev-${i}`),
+      });
+    out.a = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.aRec = readdirSync(join(a.store.dir, "records")).some(f =>
+      f.includes(k.hash.toLowerCase().slice(2))
+    );
+    out.aDls = a.store.listDeadLetters().length;
+    // 120 isolating logs on distinct in-range blocks, plus 5 with no height: the tick stops at a
+    // block boundary, and the 5 are already dead letters (handled, not deferred)
+    const b = mk();
+    const first = b.cfg.startBlock;
+    for (let i = 0; i < 124; i++) b.c.mine();
+    for (let i = 0; i < 120; i++)
+      b.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: first + i,
+        index: "bad",
+        transactionHash: ethers.id(`r4-in-${i}`),
+      });
+    for (let i = 0; i < 5; i++)
+      b.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        index: 0,
+        transactionHash: ethers.id(`r4-nh-${i}`),
+      });
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    const bd = new Set(b.store.listDeadLetters().map(x => x.txHash));
+    out.bNh = [0, 1, 2, 3, 4].filter(i => bd.has(ethers.id(`r4-nh-${i}`))).length;
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R4: 150 isolating logs naming the block before the range cannot hold the cursor (the range completes, the healthy tx is recorded); after an early stop, txs with no height are already dead letters",
+    out.a.ok &&
+      out.a.cursor === out.a.finalized &&
+      out.aRec &&
+      out.aDls === 150 &&
+      !out.a.budgetStopThisTick &&
+      out.b.ok &&
+      out.b.cursor < out.b.finalized &&
+      out.b.budgetStopThisTick &&
+      out.bNh === 5,
+    {
+      a: [out.a.ok, out.a.cursor, out.a.finalized, out.aRec, out.aDls],
+      b: [out.b.ok, out.b.cursor, out.b.finalized, out.bNh],
+    }
+  );
+}
+
+// ---- DSR 2892c30f: quarantine is a final, unaccusing record with the payload's sha256; status counts
+// budget stops and quarantines (totals survive ticks); a budget stop and a cursor too far behind are
+// degraded
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-counters-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("ct-a"), addr("ct-b")]);
+  const first = cfg.startBlock;
+  for (let i = 0; i < 130; i++) c.mine();
+  const junk = [7, "x", { logIndex: 1 }];
+  const out = {};
+  try {
+    for (const x of junk) c.injectRawResult(SP, x);
+    for (let i = 0; i < 110; i++)
+      c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: first + i,
+        index: "bad",
+        transactionHash: ethers.id(`ct-${i}`),
+      });
+    out.t1 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    out.q = readdirSync(join(d, "records"))
+      .map(f => JSON.parse(readFileSync(join(d, "records", f), "utf8")))
+      .filter(r => r.quarantine);
+    out.dlQ = store.listDeadLetters().filter(x => x.quarantine).length;
+    // the next tick: more junk, a second budget stop
+    for (const x of ["y", 8]) c.injectRawResult(SP, x);
+    for (let i = 110; i < 125; i++)
+      c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: first + i,
+        index: "bad",
+        transactionHash: ethers.id(`ct-${i}`),
+      });
+    out.t2 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    // lag: a tick limited to 2 blocks, with more than maxLagBlocks still to go
+    const d2 = mkdtempSync(join(tmpdir(), "guardian-watcher-lag-"));
+    try {
+      const c2 = makeChain();
+      const cfg2 = { ...cfg, startBlock: c2.head() + 1, maxBlocksPerTick: 2, maxLagBlocks: 5 };
+      for (let i = 0; i < 20; i++) c2.mine();
+      out.lag = (await runOnce(c2.chain, cfg2, new Store(d2), rs, ident)).status;
+      const cfg3 = { ...cfg2, maxLagBlocks: 1000 };
+      out.noLag = (await runOnce(c2.chain, cfg3, new Store(d2), rs, ident)).status;
+    } finally {
+      rmSync(d2, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const want = createHash("sha256");
+  for (const x of junk) want.update(JSON.stringify(x) + "\n");
+  const q = out.q[0];
+  cell(
+    "quarantine is final at once (unattributed, UNREADABLE, caller null, never an accusation) with entries, samples and the sha256 of the whole payload; status counts budget stops and quarantines per tick and in total; budget stop and lag > maxLagBlocks are degraded",
+    out.q.length === 1 &&
+      out.dlQ === 0 &&
+      q.route === "unattributed" &&
+      q.event === "UNREADABLE" &&
+      q.caller === null &&
+      q.verdict.rule === "watcher.UNREADABLE" &&
+      q.entries === 3 &&
+      q.payloadSha256 === `0x${want.digest("hex")}` &&
+      q.evidence.length === 3 &&
+      out.t1.quarantinedThisTick === 1 &&
+      out.t1.quarantinedTotal === 1 &&
+      out.t1.budgetStopThisTick === true &&
+      out.t1.budgetStopsTotal === 1 &&
+      out.t1.healthy === false &&
+      out.t1.degraded.some(r => /isolation budget reached/.test(r)) &&
+      out.t2.quarantinedTotal === 2 &&
+      out.t2.budgetStopsTotal >= 1 &&
+      out.lag.ok &&
+      out.lag.degraded?.some(r => /blocks behind finalized \(> 5\)/.test(r)) &&
+      !(out.noLag.degraded ?? []).some(r => /behind finalized/.test(r)),
+    {
+      q: q && {
+        route: q.route,
+        event: q.event,
+        entries: q.entries,
+        sha: q.payloadSha256,
+        ev: q.evidence?.length,
+      },
+      dlQ: out.dlQ,
+      t1: out.t1 && [
+        out.t1.quarantinedThisTick,
+        out.t1.quarantinedTotal,
+        out.t1.budgetStopThisTick,
+        out.t1.budgetStopsTotal,
+        out.t1.degraded,
+      ],
+      t2: out.t2 && [out.t2.quarantinedTotal, out.t2.budgetStopsTotal],
+      lag: out.lag && [out.lag.lagBlocks, out.lag.degraded],
+      noLag: out.noLag?.degraded,
+    }
+  );
+}
+
+// ---- a tick that fails after its quarantine and re-reads the same range does not count it twice
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-qsame-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 6; i++) c.mine();
+  let t1, t2, recs, afterT1;
+  try {
+    // the tick fails at its last step (the cursor write), after the quarantine was written
+    const setCursor = store.setCursor.bind(store);
+    store.setCursor = () => {
+      store.setCursor = setCursor;
+      throw new Error("injected cursor write failure");
+    };
+    c.injectRawResult(SP, "junk");
+    t1 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    afterT1 = readdirSync(join(d, "records")).length;
+    c.injectRawResult(SP, "junk");
+    t2 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    recs = readdirSync(join(d, "records")).filter(f => f.endsWith(".json")).length;
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "a quarantine written by a tick that then failed is still counted in total; its re-read by the retried range is the same record (not new this tick)",
+    t1.ok === false &&
+      afterT1 === 1 &&
+      t2.ok === true &&
+      recs === 1 &&
+      t2.quarantinedThisTick === 0 &&
+      t2.quarantinedTotal === 1,
+    {
+      t1: [t1.ok, t1.lastError, afterT1],
+      t2: [t2.ok, t2.quarantinedThisTick, t2.quarantinedTotal, t2.scanned],
+      recs,
+    }
   );
 }
 

@@ -1,6 +1,7 @@
 // One watcher tick (M0 §5.2): scan finalized blocks for BLS-executed actions (SignersCommitted on
 // the pinned aggregator) and for owner/guardian-route actions on the SuperPaymaster proxy, build a
 // record for each, apply the pinned ruleset, and store it. No sending: disclosure sinks are W2.
+import { createHash } from "node:crypto";
 import { ethers } from "ethers";
 import {
   KIND_NAME,
@@ -631,13 +632,16 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
   }
 }
 
-/** A returned entry that is not a log object at all: a quarantine dead letter keyed by its raw value
- * and query, retried to the cap, then an UNREADABLE record that names no tx. */
-function quarantineRaw(store, ctx, summary, bad, source, from, to, why = "not a log") {
-  // Bounded (#403 follow-up, Codex R1): all non-log entries of one query answer become ONE
-  // quarantine dead letter, with the total and up to QUARANTINE_SAMPLES distinct raw values (each
-  // with its count): a flood of junk costs one write, not one fsynced file per entry.
+/** Entries that cannot be handled per tx (not a log object, no valid tx hash, or past a cap): one
+ * final quarantine record per answer, keyed by its contents. */
+function quarantineRaw(store, rs, ctx, summary, bad, source, from, to, why = "not a log") {
+  // Bounded (#403 follow-up, Codex R1): all set-aside entries of one query answer become ONE
+  // quarantine record, with the total, up to QUARANTINE_SAMPLES distinct raw values (each with its
+  // count) and the sha256 of the whole raw payload, so the gap can be audited without storing it.
+  // It is final at once (DSR log 2892c30f): it names no tx, so a retry could never read more; it is
+  // unattributed and never an accusation (follow-up #2 R4).
   const counts = new Map();
+  const hash = createHash("sha256");
   for (const x of bad) {
     let raw;
     try {
@@ -645,29 +649,50 @@ function quarantineRaw(store, ctx, summary, bad, source, from, to, why = "not a 
     } catch {
       raw = `<unserialisable ${typeof x}>`;
     }
+    hash.update(raw);
+    hash.update("\n");
     counts.set(raw, (counts.get(raw) ?? 0) + 1);
   }
+  const payloadSha256 = `0x${hash.digest("hex")}`;
   const evidence = [...counts.entries()]
     .slice(0, QUARANTINE_SAMPLES)
     .map(([raw, count]) => ({ raw, count, source, range: [from, to] }));
   const distinct = counts.size;
-  const qid = ethers.keccak256(ethers.toUtf8Bytes(safeJson([evidence, bad.length, distinct])));
+  const qid = ethers.keccak256(
+    ethers.toUtf8Bytes(safeJson([source, from, to, why, bad.length, payloadSha256]))
+  );
   summary.isolated = (summary.isolated ?? 0) + bad.length;
-  store.putDeadLetter({
-    route: "tx",
+  const rec = {
+    route: "unattributed",
+    label: "RPC answer quarantined (not a tx; nobody accused)",
+    event: "UNREADABLE",
     txHash: qid,
     quarantine: true,
+    logIndex: "unreadable",
     blockNumber: from,
-    status: "ERROR",
-    reasons: [
+    caller: null,
+    callerSource: "unknown",
+    source,
+    range: [from, to],
+    entries: bad.length,
+    distinct,
+    payloadSha256,
+    lastReasons: [
       `${bad.length} returned entr${bad.length === 1 ? "y is" : "ies are"} ${why} (${distinct} distinct${distinct > QUARANTINE_SAMPLES ? `, first ${QUARANTINE_SAMPLES} kept` : ""})`,
     ],
-    events: [],
-    watched: typedEvidence(evidence),
+    evidence: typedEvidence(evidence),
     ruleset: ctx.ruleset,
     seenAt: ctx.now,
-  });
-  summary.deadLetters++;
+    verdict: {
+      flagged: !!rs.publicRoute?.unattributed?.flag,
+      rule: "watcher.UNREADABLE",
+      reasons: ["an RPC answer could not be read (malformed or inconsistent); nobody accused"],
+    },
+  };
+  const res = store.putRecord(rec);
+  note(summary, res, rec);
+  // a re-read of the same answer (a tick retried after a later failure) is the same record
+  if (res !== "same") summary.quarantined = (summary.quarantined ?? 0) + 1;
 }
 const QUARANTINE_SAMPLES = 10;
 const MAX_PER_TX_ISOLATIONS = 100;
@@ -1440,7 +1465,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
       else if (!/^0x[0-9a-fA-F]{64}$/.test(str(x.transactionHash))) bad.push(x);
       else ok.push(stripReserved(x));
     }
-    if (bad.length) quarantineRaw(store, ctx, summary, bad, source, from, to);
+    if (bad.length) quarantineRaw(store, rs, ctx, summary, bad, source, from, to);
     return ok;
   };
   // The bloom check compares against the RAW answers (quarantined entries included), so an entry
@@ -1491,47 +1516,46 @@ export async function tick(chain, cfg, store, rs, ctx) {
   const ordered = [...byTx.entries()].sort((a, b) =>
     hOf(a[1]) === hOf(b[1]) ? 0 : hOf(a[1]) < hOf(b[1]) ? -1 : 1
   );
-  // The isolation budget is enforced where isolations happen (follow-up #2 R3): once more than
-  // MAX_PER_TX_ISOLATIONS txs were isolated in this tick, the current block is finished and the
-  // tick stops there; the cursor stops at that block, and the rest is read again next tick, so
-  // nothing is dropped. Within one block, isolations beyond what any real block can hold join the
-  // bounded quarantine.
-  let cutoff = to;
+  // The isolation budget is enforced where isolations happen (follow-up #2 R3): once
+  // MAX_PER_TX_ISOLATIONS txs of this range were isolated, the current block is finished and the
+  // cursor stops there; the later blocks of the range are read again next tick. Only a height inside
+  // [from, to] can set that stop, so the cursor always advances at least one block (follow-up #2
+  // R4). Txs whose height is missing or outside the range belong to no later block: they are
+  // handled in this tick whatever the stop (never deferred into a range that will not return them),
+  // sharing one capped bucket. Within a bucket, isolations beyond what any real block can hold
+  // join the bounded quarantine.
+  const inRange = b => b !== null && b >= from && b <= to;
   let stopAt = null;
-  // Only isolations of this range count: dead-letter retries above are bounded by the open dead
-  // letters, and counting them would leave a backlog advancing the cursor one block per tick.
-  const base = summary.txIsolations ?? 0;
-  const perBlock = new Map();
+  // Only isolations of in-range txs count towards the stop: dead-letter retries above are bounded
+  // by the open dead letters, and the outside bucket by its own cap; counting either would let a
+  // backlog or a repeated junk answer hold the cursor to one block per tick.
+  let inRangeIsolations = 0;
+  const perBucket = new Map();
   const overflow = { agg: [], sp: [] };
   for (const [txHash, t] of ordered) {
     const b = Number.isSafeInteger(t.block) ? t.block : null;
-    if (stopAt !== null && (b === null || b > stopAt)) {
-      cutoff = stopAt;
-      break;
-    }
-    const before = summary.txIsolations ?? 0;
-    // txs without a usable height share one bucket, capped like a block: they cannot be in any
-    // real block, and an uncapped bucket would let distinct hashes bypass the budget (R3)
-    const bucket = b ?? "none";
-    if ((perBlock.get(bucket) ?? 0) >= MAX_TXS_PER_BLOCK) {
+    if (stopAt !== null && inRange(b) && b > stopAt) continue; // read again next tick
+    const bucket = inRange(b) ? b : "outside";
+    if ((perBucket.get(bucket) ?? 0) >= MAX_TXS_PER_BLOCK) {
       for (const l of t.agg) overflow.agg.push(l);
       for (const l of t.sp) overflow.sp.push(l);
       continue;
     }
+    const before = summary.txIsolations ?? 0;
     await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
-    if ((summary.txIsolations ?? 0) > before) perBlock.set(bucket, (perBlock.get(bucket) ?? 0) + 1);
-    if (
-      stopAt === null &&
-      (summary.txIsolations ?? 0) - base >= MAX_PER_TX_ISOLATIONS &&
-      b !== null
-    )
-      stopAt = b;
+    if ((summary.txIsolations ?? 0) > before) {
+      perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + 1);
+      if (inRange(b)) inRangeIsolations++;
+    }
+    if (stopAt === null && inRange(b) && inRangeIsolations >= MAX_PER_TX_ISOLATIONS) stopAt = b;
   }
+  const cutoff = stopAt ?? to;
   // Evidence keeps the query that returned it; the reason names the overflow.
   for (const source of ["agg", "sp"])
     if (overflow[source].length)
       quarantineRaw(
         store,
+        rs,
         ctx,
         summary,
         overflow[source],
@@ -1540,6 +1564,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
         cutoff,
         `past ${MAX_TXS_PER_BLOCK} isolating txs in one block (or with no usable height)`
       );
+  if (cutoff < to || overflow.agg.length || overflow.sp.length) summary.budgetStop = true;
   summary.to = cutoff;
   if (cutoff < to) summary.stoppedEarly = true;
   const toHdr = await header(chain, cutoff);
