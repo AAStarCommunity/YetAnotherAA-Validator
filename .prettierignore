@@ -8,3 +8,6 @@ contracts/cache/
 # Generated x402 conformance fixtures (byte-exact generator output; see scripts/x402/)
 conformance/x402/fixtures.json
 contracts/broadcast/
+
+# Generated JS<->Solidity disclosure vectors (byte-exact generator output; see scripts/disclosure/gen-vectors.mjs)
+contracts/test/fixtures/disclosure-vectors.json
