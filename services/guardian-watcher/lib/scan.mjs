@@ -327,6 +327,33 @@ const selectorOf = data =>
     ? data.slice(0, 10).toLowerCase()
     : null;
 
+/** A watched log as stored evidence (plain JSON, full contents and position). */
+function evidenceLog(l) {
+  return {
+    address: l.address,
+    topics: [...(l.topics ?? [])],
+    data: l.data,
+    index: logPos(l),
+    blockNumber: Number(l.blockNumber),
+    transactionHash: l.transactionHash,
+  };
+}
+
+/** The watched logs of one tx, re-read from its block by hash (for dead letters without stored
+ * evidence). Throws when the block cannot be read. */
+async function watchedLogsOf(chain, cfg, txHash, blockNumber) {
+  const h = await header(chain, blockNumber);
+  const out = [];
+  for (const [address, topics] of [
+    [cfg.aggregator, [SIGNERS_COMMITTED()]],
+    [cfg.roles.superPaymaster, spTopics()],
+  ]) {
+    const got = await chain.getLogs({ address, topics: [topics], blockHash: h.hash });
+    for (const l of got) if (lcEq(l.transactionHash, txHash)) out.push(evidenceLog(l));
+  }
+  return out;
+}
+
 /** Split a tx's logs into watched aggregator / SuperPaymaster logs. */
 function splitLogs(logs, cfg, block) {
   const t = { block, agg: [], sp: [] };
@@ -439,6 +466,9 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       status: "ERROR",
       reasons: [reason],
       events: independent,
+      // The watched logs exactly as getLogs returned them: a retry is judged against THIS
+      // evidence, never against a receipt that may be the thing in dispute (Codex #400-fix R7).
+      watched: [...t.agg, ...t.sp].map(evidenceLog),
       // Records already classified, missing only their price (Codex #400-fix M3): exhaustion
       // keeps their route, caller and verdict, marked price.unavailable.
       ...(pendingRecords ? { pendingRecords } : {}),
@@ -713,14 +743,18 @@ export async function tick(chain, cfg, store, rs, ctx) {
       continue;
     }
     if (dl.route === "tx") {
-      let rc = null;
-      try {
-        rc = await chain.getTransactionReceipt(dl.txHash);
-      } catch {
-        rc = null;
+      // The watched logs come from the dead letter's own getLogs evidence; a dead letter written
+      // without it re-reads them from its block by hash (EIP-234), never from the receipt.
+      let watched = Array.isArray(dl.watched) && dl.watched.length ? dl.watched : null;
+      if (!watched) {
+        try {
+          watched = await watchedLogsOf(chain, cfg, dl.txHash, dl.blockNumber);
+        } catch {
+          watched = null;
+        }
       }
-      if (!rc?.logs) {
-        store.putDeadLetter({ ...dl, reasons: ["receipt unavailable"] });
+      if (!watched?.length) {
+        store.putDeadLetter({ ...dl, reasons: ["watched logs unavailable"] });
         continue;
       }
       await processTx(
@@ -731,7 +765,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
         store,
         summary,
         dl.txHash,
-        splitLogs(rc.logs, cfg, dl.blockNumber),
+        splitLogs(watched, cfg, dl.blockNumber),
         fin.number
       );
       continue;

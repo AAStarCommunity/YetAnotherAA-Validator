@@ -1406,7 +1406,62 @@ try {
     settle(r7.c);
     r7.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
     const r7a = (await runOnce(r7.c.chain, r7.cfg, r7.store, rs, ident, { now: T0 + 1 })).status;
-    const r7recs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+    const r7dir = dirs.at(-1);
+    const r7recs = readdirSync(join(r7dir, "records")).filter(f => f.endsWith(".json"));
+    // R7: the retry is judged against the stored getLogs evidence, not the disputed receipt
+    const r7b = (await runOnce(r7.c.chain, r7.cfg, r7.store, rs, ident, { now: T0 + 2 })).status;
+    const r7recs2 = readdirSync(join(r7dir, "records")).filter(f => f.endsWith(".json"));
+    const r7dl = r7.store.listDeadLetters().find(x => x.txHash === s7.hash);
+    const r6b = (await runOnce(r6.c.chain, r6.cfg, r6.store, rs, ident, { now: T0 + 2 })).status;
+    const r6dl = r6.store.listDeadLetters().find(x => x.txHash === s6.hash);
+    // R7: a tx dead letter without stored evidence re-reads its watched logs by block hash
+    const r8 = mk();
+    const s8 = r8.c.ownerTx(pause("r7-legacy"), { ...keeper, trace: false });
+    settle(r8.c);
+    await runOnce(r8.c.chain, r8.cfg, r8.store, rs, ident, { now: T0 });
+    {
+      // strip the stored evidence, as in a dead letter written before it existed
+      const dd = join(dirs.at(-1), "deadletters");
+      const f8 = readdirSync(dd).find(f => f.startsWith("tx-") && f.endsWith(".json"));
+      const v = JSON.parse(readFileSync(join(dd, f8), "utf8"));
+      delete v.watched;
+      writeFileSync(join(dd, f8), JSON.stringify(v));
+    }
+    {
+      const pz = spIface.encodeEventLog("OperatorPaused", [addr("r7-legacy")]);
+      r8.c.setTrace(s8.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: pz.topics, data: pz.data }],
+      });
+    }
+    const r8a = (await runOnce(r8.c.chain, r8.cfg, r8.store, rs, ident, { now: T0 + 1 })).status;
+    const r8recs = readdirSync(join(dirs.at(-1), "records"))
+      .filter(f => f.endsWith(".json"))
+      .map(f => JSON.parse(readFileSync(join(dirs.at(-1), "records", f), "utf8")))
+      .filter(r => r.txHash === s8.hash);
+    cell(
+      "trace R7: retries use the stored getLogs evidence (a disputed or empty receipt never closes the dead letter); a legacy dead letter re-reads by block hash",
+      r7b.healthy === false &&
+        r7recs2.length === 0 &&
+        r7dl?.watched?.length === 1 &&
+        r7b.trace.thisTick.inconsistent === 1 &&
+        r6b.healthy === false &&
+        r6dl?.watched?.length === 1 &&
+        r8a.ok === true &&
+        r8recs.length === 1 &&
+        r8recs[0].route === "public",
+      {
+        r7b: [r7b.trace, r7b.degraded],
+        r7recs2,
+        r7dl: r7dl && { w: r7dl.watched?.length, a: r7dl.attempts },
+        r6b: r6b.trace,
+        r6dl: r6dl && { w: r6dl.watched?.length },
+        r8: [r8a.ok, r8a.lastError, r8recs],
+      }
+    );
     cell(
       "trace R6: watched logs make a log-less trace unsupported even with an empty receipt; a receipt with other contents is inconsistent (no attribution, degraded, proof dropped)",
       r6a.healthy === false &&

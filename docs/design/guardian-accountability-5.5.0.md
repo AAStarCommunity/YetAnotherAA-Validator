@@ -462,6 +462,10 @@ aggregator-only.
   - a record whose price never read (an authenticated BLS action, or an SP event
     already classified) is kept with its route, caller and verdict, and
     `price.unavailable`.
+- A transaction dead letter stores the watched logs exactly as `getLogs`
+  returned them. Its retries are judged against that evidence, never against a
+  receipt that may be the thing in dispute; one written without it re-reads its
+  block's logs by hash.
 - Evidence a dead letter has established survives every later, weaker failure:
   an authenticated BLS record awaiting its price, and classified SP records
   awaiting theirs, are retried for the price only and never rebuilt. A BLS
