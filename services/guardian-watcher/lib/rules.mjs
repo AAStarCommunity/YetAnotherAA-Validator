@@ -22,6 +22,16 @@ export function validateRuleset(rs) {
   if (!rs.ownerRoute || typeof rs.ownerRoute.label !== "string" || !rs.ownerRoute.events) {
     throw new Error("ruleset: ownerRoute missing");
   }
+  const pr = rs.publicRoute;
+  if (!pr || typeof pr.label !== "string" || !pr.functions || !pr.unattributed) {
+    throw new Error("ruleset: publicRoute missing");
+  }
+  for (const [sig, f] of Object.entries(pr.functions)) {
+    if (!Array.isArray(f.events) || typeof f.reason !== "string")
+      throw new Error(`ruleset: publicRoute.functions.${sig} needs events and reason`);
+    if (f.flagIfCallAlsoEmits && typeof f.alsoReason !== "string")
+      throw new Error(`ruleset: publicRoute.functions.${sig}.alsoReason missing`);
+  }
   return rs;
 }
 
@@ -40,11 +50,54 @@ export function matchGeneric(rs, roles, target, callData) {
   return null;
 }
 
+/** The publicRoute entry whose selector is `selector`, as [signature, entry], or null. */
+export function publicFunction(rs, selector) {
+  if (typeof selector !== "string") return null;
+  for (const [sig, f] of Object.entries(rs.publicRoute.functions))
+    if (ethers.id(sig).slice(0, 10) === selector.toLowerCase()) return [sig, f];
+  return null;
+}
+
+/** Events that some permissionless function can emit: their caller decides the route. */
+export function ambiguousEvents(rs) {
+  return new Set(Object.values(rs.publicRoute.functions).flatMap(f => f.events));
+}
+
 /**
  * Verdict for one record: { flagged, reasons[], rule }.
  * record.route is "bls" (with kind, or kind === undefined when not authenticated) or "owner".
  */
 export function evaluate(rs, roles, record) {
+  if (record.route === "public") {
+    const pf = publicFunction(rs, record.selector);
+    if (!pf)
+      return {
+        flagged: true,
+        reasons: ["public route without a listed function"],
+        rule: "publicRoute.unlisted",
+      };
+    const [sig, f] = pf;
+    const also = (f.flagIfCallAlsoEmits ?? []).filter(e => (record.callEvents ?? []).includes(e));
+    if (also.length)
+      return {
+        flagged: true,
+        reasons: [`${f.alsoReason}: ${also.join(", ")}`],
+        rule: `publicRoute.functions.${sig}.also`,
+      };
+    return {
+      flagged: !!f.flag,
+      reasons: [`${rs.publicRoute.label}: ${sig}: ${f.reason}`],
+      rule: `publicRoute.functions.${sig}`,
+    };
+  }
+  if (record.route === "unattributed") {
+    const u = rs.publicRoute.unattributed;
+    return {
+      flagged: !!u.flag,
+      reasons: [`${u.reason}: ${record.event}`],
+      rule: "publicRoute.unattributed",
+    };
+  }
   if (record.route === "owner") {
     const r = rs.ownerRoute.events[record.event];
     if (!r)
@@ -81,7 +134,9 @@ export function evaluate(rs, roles, record) {
 
 /** Whether this record wants prices read before/after (price-update rules). */
 export function wantsPrice(rs, roles, record) {
-  if (record.route === "owner") return !!rs.ownerRoute.events[record.event]?.readPrice;
+  if (record.route === "public") return !!publicFunction(rs, record.selector)?.[1].readPrice;
+  if (record.route === "owner" || record.route === "unattributed")
+    return !!rs.ownerRoute.events[record.event]?.readPrice;
   if (record.kind !== "GENERIC") return false;
   return !!matchGeneric(rs, roles, record.fields?.target, record.fields?.callData)?.readPrice;
 }

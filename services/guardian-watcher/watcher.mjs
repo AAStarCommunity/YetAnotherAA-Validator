@@ -19,7 +19,7 @@ import { ethers } from "ethers";
 import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
-import { tick } from "./lib/scan.mjs";
+import { tick, verifyTrace } from "./lib/scan.mjs";
 import { safeText } from "./lib/safe-error.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -61,9 +61,99 @@ export function loadConfig(path) {
   return { maxBlocksPerTick: 2000, page: 5000, intervalMs: 60_000, forwarders: {}, ...c };
 }
 
-export async function runOnce(chain, cfg, store, rs, ident) {
-  const started = new Date().toISOString();
+export const TRACE_VERIFY_MS = 3_600_000;
+
+/**
+ * Trace capability (DSR, #400; Codex #400-fix R4): known only by positive verification, from a
+ * real trace aligned with its receipt, kept in the store. Re-verified actively when the last proof
+ * is older than traceVerifyMs (quiet ticks too) or this tick saw a sign of trouble. Healthy needs
+ * a proof younger than 2 x traceVerifyMs and no unsupported / log-less / all-failed traces now.
+ */
+export async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
+  const every = cfg.traceVerifyMs ?? TRACE_VERIFY_MS;
+  let cap = store.getTraceCapability();
+  const sampleTx = cap?.txHash ?? null;
+  // A trace this tick that shows the capability is missing outweighs any older proof (Codex
+  // #400-fix R5): the proof is dropped, and only a new positive verification restores health.
+  if (stats?.unsupported || stats?.noLogs || stats?.inconsistent) {
+    cap = null;
+    store.putTraceCapability(null);
+  } else if (stats?.verifiedTx) {
+    cap = { verifiedAt: nowMs, txHash: stats.verifiedTx, by: "scan" };
+    store.putTraceCapability(cap);
+  }
+  const trouble = !!(
+    stats?.unsupported ||
+    stats?.noLogs ||
+    stats?.inconsistent ||
+    stats?.unaligned ||
+    (stats?.failed && !stats?.verified)
+  );
+  let check = null;
+  if (finalized !== null && (trouble || !cap || nowMs - cap.verifiedAt >= every)) {
+    check = await verifyTrace(chain, cfg, finalized, { sampleTx });
+    if (check.state === "verified") {
+      cap = { verifiedAt: nowMs, txHash: check.txHash, by: "probe" };
+      store.putTraceCapability(cap);
+    } else if (check.state === "unsupported") {
+      cap = null;
+      store.putTraceCapability(null);
+    }
+  }
+  const degraded = [];
+  const fresh = !!cap && nowMs - cap.verifiedAt < 2 * every;
+  if (check?.state === "unsupported") degraded.push(`trace unsupported: ${check.reason}`);
+  else if (!fresh)
+    degraded.push(`trace capability unverified: ${check?.reason ?? "no recent verification"}`);
+  if (stats?.unsupported) degraded.push(`trace unsupported on ${stats.unsupported} tx(s)`);
+  if (stats?.noLogs)
+    degraded.push(`trace without logs on ${stats.noLogs} tx(s): withLog not honoured`);
+  if (stats?.failed && !stats?.verified)
+    degraded.push(`all ${stats.failed} trace call(s) this tick failed`);
+  if (stats?.inconsistent)
+    degraded.push(`receipt disagrees with getLogs on ${stats.inconsistent} tx(s)`);
+  if (stats?.unaligned)
+    degraded.push(
+      `trace did not align with a consistent receipt on ${stats.unaligned} tx(s) (${stats.unalignedWhy})`
+    );
+  if (check && check.state === "unverified" && check.failed > 0)
+    degraded.push(`verification: ${check.failed} sample trace call(s) failed`);
+  return {
+    trace: {
+      capability:
+        check?.state === "unsupported"
+          ? "unsupported"
+          : fresh
+            ? "verified"
+            : cap
+              ? "stale"
+              : "unverified",
+      verifiedAt: cap ? new Date(cap.verifiedAt).toISOString() : null,
+      sampleTx: cap?.txHash ?? null,
+      ...(check
+        ? { lastCheck: check.state, ...(check.reason ? { reason: check.reason } : {}) }
+        : {}),
+      thisTick: stats ?? {},
+    },
+    degraded: degraded.length ? degraded : null,
+  };
+}
+
+export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
+  const nowMs = now ?? Date.now();
+  const started = new Date(nowMs).toISOString();
   const status = { at: started, ruleset: ident, lastError: null };
+  const finish = async (stats, finalized) => {
+    let h;
+    try {
+      h = await traceHealth(chain, cfg, store, stats, finalized, nowMs);
+    } catch {
+      h = { trace: { capability: "unverified" }, degraded: ["trace capability check failed"] };
+    }
+    status.trace = h.trace;
+    status.degraded = h.degraded;
+    status.healthy = status.ok === true && !status.degraded;
+  };
   try {
     const s = await tick(chain, cfg, store, rs, { ruleset: ident, now: started });
     const cur = store.getCursor();
@@ -77,7 +167,16 @@ export async function runOnce(chain, cfg, store, rs, ident) {
       flaggedThisTick: s.flagged.length,
       records: store.countRecords(),
       deadLetters: store.listDeadLetters().length,
+      corruptDeadLetters: store.corruptDeadLetters,
+      exhaustedThisTick: s.exhausted,
+      exhaustedTotal: store.countExhausted(),
+      bloom: {
+        recovered: s.bloomRecovered,
+        falsePositives: s.bloomFalsePositives,
+        unchecked: s.bloomUnchecked,
+      },
     });
+    await finish(s.trace, s.finalized);
     store.writeStatus(status);
     return { status, summary: s };
   } catch (e) {
@@ -86,6 +185,7 @@ export async function runOnce(chain, cfg, store, rs, ident) {
     status.records = store.countRecords();
     status.deadLetters = store.listDeadLetters().length;
     status.cursor = store.getCursor()?.block ?? null;
+    await finish(null, null);
     store.writeStatus(status);
     return { status, summary: null };
   }
@@ -112,10 +212,13 @@ async function main() {
   const chain = makeProvider(process.env.RPC_URL);
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
+  let first = true;
   for (;;) {
     const { status } = await runOnce(chain, cfg, store, rs, ident);
+    if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
+    first = false;
     console.log(JSON.stringify(status));
-    if (once) process.exit(status.ok ? 0 : 1);
+    if (once) process.exit(status.healthy ? 0 : 1);
     await new Promise(r => setTimeout(r, cfg.intervalMs));
   }
 }
