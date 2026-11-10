@@ -309,7 +309,7 @@ contract DeployOverIssueVerifierScriptTest is Test {
 
     /// @notice An unparseable release string is treated as new (fail closed), even when expected.
     function test_Deploy_RefusesUnparseableReleaseEvenWhenExpected() public {
-        string[12] memory vs = [
+        string[18] memory vs = [
             "BLSAggregator-",
             "BLSAggregator-x.y",
             "Aggregator-4.11.0",
@@ -321,7 +321,13 @@ contract DeployOverIssueVerifierScriptTest is Test {
             "BLSAggregator-4.1234567.0", // over six digits
             "BLSAggregator-4.12.0x",
             "BLSAggregator-4.012.0", // leading zero on an otherwise-old minor
-            "BLSAggregator-4.12x5" // no "." before the patch
+            "BLSAggregator-4.12x5", // no "." before the patch
+            "BLSAggregator-3.1000000.0", // seven-digit minor
+            "BLSAggregator-4.12.1000000", // seven-digit patch
+            "BLSAggregator-4.12.0-", // empty suffix
+            "BLSAggregator-4.12.0-a b", // space in the suffix
+            "BLSAggregator-4.12.0-rc_1", // '_' not allowed
+            "BLSAggregator-4.12.0-\x00" // NUL in the suffix
         ];
         for (uint256 i = 0; i < vs.length; i++) {
             ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);

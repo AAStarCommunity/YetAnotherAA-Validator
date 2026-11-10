@@ -90,7 +90,8 @@ contract DeployOverIssueVerifier is Script {
     string internal constant SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.11.0";
 
     /// @dev True unless `v` is exactly "BLSAggregator-<major>.<minor>.<patch>" optionally followed by
-    ///      "-<suffix>", each number 1-6 digits with no leading zero (except "0" itself), and
+    ///      "-<suffix>" (non-empty, [0-9A-Za-z.-]), each number 1-6 digits with no leading zero
+    ///      (except "0" itself), and
     ///      (major, minor) < (4, 13). Anything that does not parse is treated as new (fail closed).
     function _isAnchoredCommitmentRelease(string memory v) internal pure returns (bool) {
         bytes memory b = bytes(v);
@@ -104,12 +105,23 @@ contract DeployOverIssueVerifier is Script {
         (bool ok2, uint256 minor, uint256 i2) = _readStrictUint(b, i1 + 1);
         if (!ok2 || i2 >= b.length || b[i2] != ".") return true;
         (bool ok3,, uint256 i3) = _readStrictUint(b, i2 + 1);
-        if (!ok3 || (i3 != b.length && b[i3] != "-")) return true;
+        if (!ok3) return true;
+        if (i3 != b.length) {
+            // "-<suffix>": non-empty, [0-9A-Za-z.-] only.
+            if (b[i3] != "-" || i3 + 1 == b.length) return true;
+            for (uint256 k = i3 + 1; k < b.length; k++) {
+                bytes1 c = b[k];
+                bool okc = (c >= "0" && c <= "9") || (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || c == "."
+                    || c == "-";
+                if (!okc) return true;
+            }
+        }
         return major > 4 || (major == 4 && minor >= 13);
     }
 
-    /// @dev Reads 1-6 decimal digits at `i` with no leading zero (a lone "0" is allowed). The cap only
-    ///      bounds the arithmetic: any 7+ digit component is >= 13 and would be refused anyway.
+    /// @dev Reads 1-6 decimal digits at `i` with no leading zero (a lone "0" is allowed). The six-digit
+    ///      limit is part of the grammar (it refuses e.g. "3.1000000.0" and "4.12.1000000"), and it also
+    ///      bounds the arithmetic.
     function _readStrictUint(bytes memory b, uint256 i) private pure returns (bool ok, uint256 n, uint256 end) {
         end = i;
         while (end < b.length && b[end] >= "0" && b[end] <= "9") {
