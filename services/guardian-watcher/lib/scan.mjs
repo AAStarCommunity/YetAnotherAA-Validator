@@ -562,7 +562,7 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
     const existing = prev ?? (okH ? store.getDeadLetter(`tx-${str(txHash).toLowerCase()}`) : null);
     let watched = [];
     try {
-      watched = mergeEvidence(existing?.watched, evidenceOf(t));
+      watched = mergeEvidence(nativeEvidence(existing?.watched), evidenceOf(t));
     } catch {
       // never only the old evidence: this observation is kept too, unmerged if need be (R10)
       let incoming;
@@ -571,7 +571,7 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
       } catch {
         incoming = [{ raw: safeJson([t.agg, t.sp]), source: "unmerged" }];
       }
-      watched = [...(existing?.watched ?? []), ...incoming];
+      watched = [...(nativeEvidence(existing?.watched) ?? []), ...incoming];
     }
     // An item without a usable tx hash gets a quarantine identity derived from its evidence: it
     // is retried and counted, never attributed to any tx (Codex follow-up R2).
@@ -627,7 +627,20 @@ function quarantineRaw(store, ctx, summary, x, source, from, to) {
  * built from it stay distinct and stable (Codex follow-up R10). */
 export function safeJson(v) {
   try {
-    return JSON.stringify(v, (_, x) => (typeof x === "bigint" ? { $bigint: x.toString() } : x));
+    // collision-free: a BigInt becomes { $bigint }, and a plain object that itself uses one of the
+    // tag keys is escaped as { $obj: {...} }, so a literal never equals a tag (Codex follow-up R12)
+    return JSON.stringify(v, function (k, x) {
+      if (typeof x === "bigint") return { $bigint: x.toString() };
+      if (
+        x &&
+        typeof x === "object" &&
+        !Array.isArray(x) &&
+        (Object.hasOwn(x, "$bigint") || Object.hasOwn(x, "$obj")) &&
+        !Object.hasOwn(this, "$obj")
+      )
+        return { $obj: { ...x } };
+      return x;
+    });
   } catch {
     return `<unserialisable ${typeof v}>`;
   }
@@ -642,6 +655,27 @@ function typedEvidence(watched) {
   } catch {
     return watched;
   }
+}
+
+/** Stored evidence back to the values it was seen with (the inverse of typedEvidence): every read of
+ * persisted evidence decodes, every write encodes, so persistence is idempotent and an observation
+ * keeps one identity across any number of retries (Codex follow-up R12). */
+function nativeEvidence(watched) {
+  const dec = x => {
+    if (Array.isArray(x)) return x.map(dec);
+    if (!x || typeof x !== "object") return x;
+    const keys = Object.keys(x);
+    if (keys.length === 1 && keys[0] === "$bigint" && typeof x.$bigint === "string")
+      try {
+        return BigInt(x.$bigint);
+      } catch {
+        return x;
+      }
+    if (keys.length === 1 && keys[0] === "$obj" && x.$obj && typeof x.$obj === "object")
+      return Object.fromEntries(Object.entries(x.$obj).map(([k, v]) => [k, dec(v)]));
+    return Object.fromEntries(Object.entries(x).map(([k, v]) => [k, dec(v)]));
+  };
+  return Array.isArray(watched) ? watched.map(dec) : watched;
 }
 
 /** A log's raw identity for de-duplication: every field as the RPC gave it, never parsed, so only
@@ -916,7 +950,9 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       events: independent,
       // The watched logs exactly as getLogs returned them: a retry is judged against THIS
       // evidence, never against a receipt that may be the thing in dispute (Codex #400-fix R7).
-      watched: typedEvidence(mergeEvidence(store.getDeadLetter(txDl)?.watched, evidenceOf(t))),
+      watched: typedEvidence(
+        mergeEvidence(nativeEvidence(store.getDeadLetter(txDl)?.watched), evidenceOf(t))
+      ),
       // Records already classified, missing only their price (Codex #400-fix M3): exhaustion
       // keeps their route, caller and verdict, marked price.unavailable.
       ...(pendingRecords ? { pendingRecords } : {}),
@@ -1243,7 +1279,8 @@ export async function tick(chain, cfg, store, rs, ctx) {
     if (dl.route === "tx") {
       // The watched logs come from the dead letter's own getLogs evidence; a dead letter written
       // without it re-reads them from its block by hash (EIP-234), never from the receipt.
-      let watched = Array.isArray(dl.watched) && dl.watched.length ? dl.watched : null;
+      let watched =
+        Array.isArray(dl.watched) && dl.watched.length ? nativeEvidence(dl.watched) : null;
       if (!watched) {
         try {
           watched = await watchedLogsOf(chain, cfg, dl.txHash, dl.blockNumber);

@@ -2817,10 +2817,12 @@ try {
         transactionHash: 1n,
       });
       b.c.injectRawResult(SP, { address: SP, ...gs, ...at, index: "1" }); // same text, another type
+      b.c.injectRawResult(SP, { address: SP, ...gs, ...at, index: { $bigint: "1" } }); // a literal tag
       const bs = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
       const bq = b.store.listDeadLetters().find(x => x.txHash === quiet.hash);
       // after persistence and a retry, 1n and "1" are still two observations (R11)
-      await runOnce(b.c.chain, b.cfg, b.store, rs, ident);
+      // several retries: persistence is idempotent (no growth, one identity per observation)
+      for (let i = 0; i < 3; i++) await runOnce(b.c.chain, b.cfg, b.store, rs, ident);
       const bq2 = b.store.listDeadLetters().find(x => x.txHash === quiet.hash);
       // a malformed hash in the final header read: the tick fails, the cursor is not poisoned
       b.c.mine();
@@ -2834,8 +2836,9 @@ try {
       cell(
         "follow-up R10: BigInt fields never throw (isolated, every observation kept); a malformed header hash fails the tick without poisoning the cursor",
         bs.ok === true &&
-          bq?.watched?.length === 4 &&
-          bq2?.watched?.length === 4 &&
+          bq?.watched?.length === 5 &&
+          bq2?.watched?.length === 5 &&
+          j(bq2.watched) === j(bq.watched) && // stored bytes unchanged by retries (idempotent)
           b.store.listDeadLetters().some(x => x.quarantine === true) &&
           bad.ok === false &&
           j(curAfterBad) === j(curBefore) &&
