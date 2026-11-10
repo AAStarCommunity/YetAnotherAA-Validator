@@ -89,8 +89,9 @@ contract DeployOverIssueVerifier is Script {
     ///         canonical-pin note at the domain-parity gate below.
     string internal constant SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.11.0";
 
-    /// @dev True for "BLSAggregator-<major>.<minor>..." with (major, minor) >= (4, 13), and for any
-    ///      string this cannot parse (fail closed: an unreadable release is not assumed old).
+    /// @dev True unless `v` is exactly "BLSAggregator-<major>.<minor>.<patch>" optionally followed by
+    ///      "-<suffix>", each number 1-6 digits with no leading zero (except "0" itself), and
+    ///      (major, minor) < (4, 13). Anything that does not parse is treated as new (fail closed).
     function _isAnchoredCommitmentRelease(string memory v) internal pure returns (bool) {
         bytes memory b = bytes(v);
         bytes memory prefix = bytes("BLSAggregator-");
@@ -98,20 +99,27 @@ contract DeployOverIssueVerifier is Script {
         for (uint256 i = 0; i < prefix.length; i++) {
             if (b[i] != prefix[i]) return true;
         }
-        uint256 p = prefix.length;
-        (uint256 major, uint256 q) = _readUint(b, p);
-        if (q == p || q >= b.length || b[q] != ".") return true;
-        (uint256 minor, uint256 r) = _readUint(b, q + 1);
-        if (r == q + 1) return true;
+        (bool ok1, uint256 major, uint256 i1) = _readStrictUint(b, prefix.length);
+        if (!ok1 || i1 >= b.length || b[i1] != ".") return true;
+        (bool ok2, uint256 minor, uint256 i2) = _readStrictUint(b, i1 + 1);
+        if (!ok2 || i2 >= b.length || b[i2] != ".") return true;
+        (bool ok3,, uint256 i3) = _readStrictUint(b, i2 + 1);
+        if (!ok3 || (i3 != b.length && b[i3] != "-")) return true;
         return major > 4 || (major == 4 && minor >= 13);
     }
 
-    function _readUint(bytes memory b, uint256 i) private pure returns (uint256 n, uint256 end) {
+    /// @dev Reads 1-6 decimal digits at `i` with no leading zero (a lone "0" is allowed). The cap only
+    ///      bounds the arithmetic: any 7+ digit component is >= 13 and would be refused anyway.
+    function _readStrictUint(bytes memory b, uint256 i) private pure returns (bool ok, uint256 n, uint256 end) {
         end = i;
-        while (end < b.length && b[end] >= "0" && b[end] <= "9" && end - i < 6) {
+        while (end < b.length && b[end] >= "0" && b[end] <= "9") {
+            if (end - i == 6) return (false, 0, end);
             n = n * 10 + (uint8(b[end]) - 48);
             end++;
         }
+        if (end == i) return (false, 0, end);
+        if (b[i] == "0" && end - i > 1) return (false, 0, end);
+        ok = true;
     }
 
     /// @notice Minimum acceptable on-chain arming delay for a fraud-proof verifier rotation.

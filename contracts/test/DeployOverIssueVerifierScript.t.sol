@@ -309,7 +309,20 @@ contract DeployOverIssueVerifierScriptTest is Test {
 
     /// @notice An unparseable release string is treated as new (fail closed), even when expected.
     function test_Deploy_RefusesUnparseableReleaseEvenWhenExpected() public {
-        string[3] memory vs = ["BLSAggregator-", "BLSAggregator-x.y", "Aggregator-4.11.0"];
+        string[12] memory vs = [
+            "BLSAggregator-",
+            "BLSAggregator-x.y",
+            "Aggregator-4.11.0",
+            "BLSAggregator-4.00000013.0", // leading zeros hiding 4.13
+            "BLSAggregator-4.013.0",
+            "BLSAggregator-4.1x",
+            "BLSAggregator-4.12.garbage",
+            "BLSAggregator-4.12",
+            "BLSAggregator-4.1234567.0", // over six digits
+            "BLSAggregator-4.12.0x",
+            "BLSAggregator-4.012.0", // leading zero on an otherwise-old minor
+            "BLSAggregator-4.12x5" // no "." before the patch
+        ];
         for (uint256 i = 0; i < vs.length; i++) {
             ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
             agg.setVersion(vs[i]);
@@ -320,6 +333,19 @@ contract DeployOverIssueVerifierScriptTest is Test {
                     "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
                 )
             );
+            deployScript.deploy(cfg);
+        }
+    }
+
+    /// @notice Well-formed pre-4.13 releases still deploy when named explicitly (the gate is not a
+    ///         blanket refusal).
+    function test_Deploy_AcceptsWellFormedOldReleaseWhenExpected() public {
+        string[3] memory vs = ["BLSAggregator-4.12.0", "BLSAggregator-4.12.3-rc1", "BLSAggregator-4.0.0"];
+        for (uint256 i = 0; i < vs.length; i++) {
+            ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
+            agg.setVersion(vs[i]);
+            DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
+            cfg.expectedAggregatorVersion = vs[i];
             deployScript.deploy(cfg);
         }
     }
