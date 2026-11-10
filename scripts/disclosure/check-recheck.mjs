@@ -86,7 +86,15 @@ async function expectCase(name, entryId, want, opts = {}) {
       );
   else if (want.diff)
     ok = r.status === "MISMATCH" && !r.ok && r.diffs.some(d => d.field === want.diff);
-  else ok = r.status === want.status && !r.ok && r.reasons.some(x => x.includes(want.reason));
+  else
+    ok =
+      r.status === want.status &&
+      !r.ok &&
+      r.reasons.some(x => x.includes(want.reason)) &&
+      (!want.absent ||
+        !JSON.stringify(r, (_, v) => (typeof v === "bigint" ? v.toString() : v)).includes(
+          want.absent
+        ));
   results.push({
     name,
     ok,
@@ -381,6 +389,15 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
   await expectCase("receipt without status is INCONCLUSIVE, not 'reverted'", eN, {
     status: "INCONCLUSIVE",
     reason: "no valid status",
+  });
+  // The RPC's status value is untrusted text and the reason is stored: it is never echoed.
+  const aX = execute(Kind.SLASH, 33n, slashF, 0b011n);
+  const eX = disclose(Kind.SLASH, 33n, slashIn, aX);
+  receiptWithoutStatus("RCPTSECRET");
+  await expectCase("a non-numeric receipt status is INCONCLUSIVE and is not echoed", eX, {
+    status: "INCONCLUSIVE",
+    reason: "no valid status",
+    absent: "RCPTSECRET",
   });
   const aT = execute(Kind.SLASH, 32n, slashF, 0b011n);
   const eT = disclose(Kind.SLASH, 32n, slashIn, aT);

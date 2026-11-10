@@ -575,7 +575,8 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
   if (st !== 1) {
     return {
       status: Status.INCONCLUSIVE,
-      reason: `action receipt has no valid status (${rc.status})`,
+      // Fixed text: the RPC's value is untrusted and this reason is stored (Codex W2b R4).
+      reason: "action receipt has no valid status",
     };
   }
 

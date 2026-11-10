@@ -5,7 +5,9 @@ import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+const HERE = dirname(fileURLToPath(import.meta.url));
 import { ethers } from "ethers";
 import { readSecret } from "./lib/keychain.mjs";
 import { guarded, safeText } from "./lib/safe-error.mjs";
@@ -101,21 +103,40 @@ const cell = (name, ok, got) => results.push({ name, ok: !!ok, got: ok ? "" : j(
     /unavailable \(error\)/.test(km ?? "") && !/KEYSECRET/.test(km ?? ""),
     km
   );
-  const st = storable({
-    recordURI: "https://rpc/v2/KEYSECRET",
-    recordHash: "0x" + "ab".repeat(32),
-  });
-  const ok = storable({
-    recordURI: "ipfs://bafkrei" + "a".repeat(52),
-    recordHash: "0x" + "ab".repeat(32),
-  });
+  const exp = "ipfs://bafkrei" + "a".repeat(52);
+  const shaped = "ipfs://b" + "keysecretkeysecretkeysecret".replace(/[^a-z2-7]/g, "a");
+  const st = storable({ recordURI: shaped, recordHash: "0x" + "ab".repeat(32) }, exp);
+  const st2 = storable({ recordURI: shaped + "b", recordHash: "0x" + "ab".repeat(32) }, exp);
+  const ok = storable({ recordURI: exp, recordHash: "0x" + "ab".repeat(32) }, exp);
   cell(
-    "conflict state keeps an on-chain URI only in our own form, else only its digest",
+    "conflict state keeps a URI in plain text only if it EQUALS ours; else the original's digest",
     st.recordURI === null &&
-      /^0x[0-9a-f]{64}$/.test(st.recordURIKeccak) &&
-      !j(st).includes("KEYSECRET") &&
-      ok.recordURI.startsWith("ipfs://b"),
+      st.recordURIKeccak === ethers.keccak256(ethers.toUtf8Bytes(shaped)) &&
+      st2.recordURIKeccak !== st.recordURIKeccak &&
+      !j(st).includes("keysecret") &&
+      ok.recordURI === exp,
     { st, ok }
+  );
+  const cd = mkdtempSync(join(tmpdir(), "fatal-"));
+  writeFileSync(join(cd, "config.json"), '{"aggregator": "FATALSECRET", oops');
+  let out = { status: null, err: "" };
+  try {
+    execFileSync(
+      process.execPath,
+      [join(HERE, "watcher.mjs"), "--config", join(cd, "config.json"), "--once"],
+      {
+        env: { ...process.env, RPC_URL: "http://127.0.0.1:1/FATALSECRET" },
+        stdio: "pipe",
+      }
+    );
+  } catch (e) {
+    out = { status: e.status, err: String(e.stderr) };
+  }
+  rmSync(cd, { recursive: true, force: true });
+  cell(
+    "watcher: a fatal startup error prints one category line and exits 1, no foreign text",
+    out.status === 1 && out.err.trim() === "watcher fatal: error" && !/FATALSECRET/.test(out.err),
+    out
   );
   void safeText;
 }
@@ -820,7 +841,9 @@ try {
   const ent = await uriSink.entry(5n, { blockTag: 10 });
   cell(
     "registry entry(): an on-chain recordURI not in our form leaves the sink as a marker",
-    ent.recordURI === "invalid:uri" && !j(ent).includes("KEYSECRET"),
+    ent.recordURI === "invalid:uri" &&
+      ent.recordURIKeccak === ethers.keccak256(ethers.toUtf8Bytes("https://rpc/v2/KEYSECRET")) &&
+      !j(ent).includes("KEYSECRET"),
     ent
   );
   // Writer-role separation is enforced BY THE SINK (Codex R1 H7): incomplete roles refuse

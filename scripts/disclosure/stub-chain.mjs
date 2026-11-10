@@ -620,10 +620,10 @@ function makeChain() {
       (onEntryCountRead = () =>
         blocks.set(head, { ...blocks.get(head), hash: ethers.id(`head-reorg-${head}`) })),
     /** Make the next receipt fetch answer without a status field. */
-    receiptWithoutStatus: () =>
+    receiptWithoutStatus: (value = null) =>
       (onReceipt = h => {
         const r = { ...txs.get(h).receipt };
-        r.status = null;
+        r.status = value;
         return r;
       }),
     reorg: n => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`reorged-${n}`) }),

@@ -245,15 +245,20 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
 
 export const DEFAULT_MAX_PENDING_MS = 30 * 60_000;
 
-/** On-chain content is untrusted text: keep a URI only in our own form, else only its digest. */
-export const RECORD_URI_RE = /^ipfs:\/\/b[a-z2-7]{20,100}$/;
-export function storable(c) {
-  const uriOk = typeof c.recordURI === "string" && RECORD_URI_RE.test(c.recordURI);
+/**
+ * On-chain content is untrusted text, and its shape proves nothing (a base32-shaped string can
+ * still carry a secret; Codex W2b R4). A URI is kept in plain text only when it EQUALS the URI we
+ * expect; otherwise only the digest of the original string is kept, which still tells two
+ * different conflicting values apart.
+ */
+export function storable(c, expectedURI) {
+  const same = c.recordURI != null && c.recordURI === expectedURI;
+  const digest =
+    c.recordURIKeccak ??
+    (c.recordURI == null ? null : ethers.keccak256(ethers.toUtf8Bytes(String(c.recordURI))));
   return {
-    recordURI: uriOk ? c.recordURI : null,
-    ...(uriOk || c.recordURI == null
-      ? {}
-      : { recordURIKeccak: ethers.keccak256(ethers.toUtf8Bytes(String(c.recordURI))) }),
+    recordURI: same ? c.recordURI : null,
+    recordURIKeccak: digest,
     recordHash: /^0x[0-9a-f]{64}$/.test(c.recordHash) ? c.recordHash : null,
   };
 }
@@ -263,6 +268,7 @@ function effectiveContent(entry) {
   const last = (entry.amendments ?? []).at(-1);
   return {
     recordURI: last?.recordURI ?? entry.recordURI,
+    recordURIKeccak: last ? last.recordURIKeccak : entry.recordURIKeccak,
     recordHash: String(last?.recordHash ?? entry.recordHash).toLowerCase(),
   };
 }
@@ -457,7 +463,7 @@ async function adoptExisting(rec, file, reg, state, persist, alerts) {
     entryId: id.toString(),
     conflict: why,
     storedBinding: e.binding,
-    storedContent: storable(eff),
+    storedContent: storable(eff, `ipfs://${file.cid}`),
   };
   await persist(state);
   alerts.push(

@@ -42,6 +42,8 @@ export function assertWriterRole(writer, roles) {
 // A record URI read from chain is untrusted text: only our own form leaves this sink; anything
 // else becomes a marker that can never equal ours (Codex W2b R3 M3).
 const uriOf = u => (/^ipfs:\/\/b[a-z2-7]{20,100}$/.test(String(u)) ? u : "invalid:uri");
+// The digest of the ORIGINAL string, so distinct rejected values stay distinguishable (R4 L5).
+const uriKeccak = u => ethers.keccak256(ethers.toUtf8Bytes(String(u)));
 
 export const actionId = (kind, key) =>
   ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["uint8", "uint256"], [kind, key]));
@@ -100,11 +102,13 @@ export function registrySink({ provider, wallet, registry, fromBlock, roles, fee
           blockNumber: Number(a.blockNumber),
           rulesetCommit: a.rulesetCommit,
           recordURI: uriOf(a.recordURI),
+          recordURIKeccak: uriKeccak(a.recordURI),
           recordHash: a.recordHash,
         }));
       return {
         binding,
         recordURI: uriOf(rec.recordURI),
+        recordURIKeccak: uriKeccak(rec.recordURI),
         recordHash: rec.recordHash,
         amendments: ams,
       };

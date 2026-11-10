@@ -418,7 +418,7 @@ try {
   cell(
     "RPC failure: status not ok, error recorded",
     !r4.status.ok &&
-      r4.status.lastError === "tick: error" &&
+      r4.status.lastError === "aggregator log read: error" && // the stage is named, the text dropped
       !JSON.stringify(r4.status).includes("rpc down"),
     r4.status
   );

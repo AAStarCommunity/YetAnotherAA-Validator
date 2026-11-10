@@ -10,7 +10,7 @@ import {
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice } from "./rules.mjs";
 import { attributeLogs } from "./attribute.mjs";
-import { SafeError, safeText } from "./safe-error.mjs";
+import { SafeError, safeText, guarded } from "./safe-error.mjs";
 
 // Chain data in our own error text only when it is a well-formed hash (RPC answers are untrusted).
 const hx = v => (/^0x[0-9a-fA-F]{64}$/.test(String(v)) ? String(v) : "<malformed>");
@@ -18,10 +18,13 @@ const hx = v => (/^0x[0-9a-fA-F]{64}$/.test(String(v)) ? String(v) : "<malformed
 export const MAX_DEADLETTER_ATTEMPTS = 20;
 
 async function header(chain, tag) {
-  const b = await chain.send("eth_getBlockByNumber", [
-    typeof tag === "number" ? ethers.toQuantity(tag) : tag,
-    false,
-  ]);
+  // Each RPC stage is named (Codex W2b R4): status says WHICH read failed and its allowlisted code.
+  const b = await guarded("block header read", () =>
+    chain.send("eth_getBlockByNumber", [
+      typeof tag === "number" ? ethers.toQuantity(tag) : tag,
+      false,
+    ])
+  );
   if (!b || !b.hash) throw new SafeError(`block ${tag} unavailable`);
   return { number: Number(b.number), hash: b.hash };
 }
@@ -231,16 +234,20 @@ export async function tick(chain, cfg, store, rs, ctx) {
 
   if (from > to) return summary;
 
-  const aggLogs = await pagedLogs(
-    chain,
-    cfg.aggregator,
-    [aggIface.getEvent("SignersCommitted").topicHash],
-    from,
-    to,
-    cfg.page
+  const aggLogs = await guarded("aggregator log read", () =>
+    pagedLogs(
+      chain,
+      cfg.aggregator,
+      [aggIface.getEvent("SignersCommitted").topicHash],
+      from,
+      to,
+      cfg.page
+    )
   );
   const spTopics = SP_WATCHED_EVENTS.map(n => spIface.getEvent(n).topicHash);
-  const spLogs = await pagedLogs(chain, cfg.roles.superPaymaster, [spTopics], from, to, cfg.page);
+  const spLogs = await guarded("superpaymaster log read", () =>
+    pagedLogs(chain, cfg.roles.superPaymaster, [spTopics], from, to, cfg.page)
+  );
 
   const byTx = new Map();
   for (const l of [...aggLogs, ...spLogs]) {
@@ -257,7 +264,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
     // owner/guardian-route record of its own, never swallowed and never shared between actions.
     let attr = { aligned: false, owner: new Map(), why: "no BLS action in tx" };
     if (t.agg.length && t.sp.length) {
-      const { trace, logs } = await traceAndReceipt(chain, txHash);
+      const { trace, logs } = await guarded("trace read", () => traceAndReceipt(chain, txHash));
       attr = logs
         ? attributeLogs(trace, logs, cfg.aggregator)
         : { aligned: false, owner: new Map(), why: "receipt unavailable" };

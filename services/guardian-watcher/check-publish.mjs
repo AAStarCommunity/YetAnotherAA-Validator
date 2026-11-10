@@ -803,7 +803,7 @@ function sinks(opts = {}) {
       {},
       {
         persist: async () => {
-          throw new Error("disk full");
+          throw Object.assign(new Error("disk full at /secret/path"), { code: "ENOSPC" });
         },
       }
     );
@@ -812,9 +812,7 @@ function sinks(opts = {}) {
   }
   cell(
     "a persist failure propagates as PersistError (not swallowed as a sink failure)",
-    pe instanceof PersistError &&
-      /^persist failed: /.test(pe.message) &&
-      !/disk full/.test(pe.message),
+    pe instanceof PersistError && pe.message === "persist failed: ENOSPC",
     pe?.message
   );
   let pe2 = null;
