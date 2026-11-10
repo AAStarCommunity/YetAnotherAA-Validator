@@ -10,6 +10,7 @@ import {
   writeSync,
   fsyncSync,
   closeSync,
+  statSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { SafeError } from "./safe-error.mjs";
@@ -252,8 +253,11 @@ export class Store {
   }
 
   /** One record file, parsed; throws when it is unreadable. */
-  readRecordFile(name) {
-    return JSON.parse(readFileSync(join(this.dir, "records", name), "utf8"));
+  readRecordFile(name, maxBytes = Infinity) {
+    const path = join(this.dir, "records", name);
+    // size first: an oversized or corrupt file is refused before it is read (Codex W2c R3)
+    if (statSync(path).size > maxBytes) throw new Error("record file too large");
+    return JSON.parse(readFileSync(path, "utf8"));
   }
 
   /** Publication scheduling (Codex W2c R2): rotation cursor, per-record progress, the reverify

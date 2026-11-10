@@ -517,7 +517,9 @@ const cfg = { aggregator: AGG };
       "R2: records that always fail still rotate (healthy one runs by the second pass); a parseable record with an unusable id is isolated",
       p1.counts.ran === 3 &&
         p1.counts.failed >= 3 &&
-        p1.alerts.some(a => /2 record file\(s\) unreadable or without a usable id/.test(a)) &&
+        p1.alerts.some(a =>
+          /2 record file\(s\) unreadable, oversized, duplicated or without a matching id/.test(a)
+        ) &&
         store.getPublication(hid)?.published === true,
       { p1: p1.counts, p2: p2.counts, healthy: !!store.getPublication(hid) }
     );
@@ -617,6 +619,187 @@ const cfg = { aggregator: AGG };
   }
 }
 
+// ---- W2c R3: generation needs a full sweep; schedule failure; real sink failures; orphans;
+// duplicates; alert details; oversized files
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const s = sinks();
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    for (let i = 0; i < 3; i++) store.putRecord({ ...owner, txHash: ethers.id(`sw-${i}`) });
+    let t = 1;
+    const clock = () => t++;
+    // a generation opened on a fresh schedule, with one file read and one record run per pass
+    const passes = [];
+    for (let i = 0; i < 6; i++)
+      passes.push(
+        await publishPending(store, sk, { reverifyGen: 9, maxParse: 1, maxRecords: 1, now: clock })
+      );
+    const firstClosable = passes.findIndex(p => p.reverifyRemaining === 0 && p.sweeps > 0);
+    cell(
+      "R3: a generation cannot close before a full sweep has registered every record (fresh schedule, bounded batches)",
+      firstClosable >= 2 &&
+        passes.slice(0, firstClosable).every(p => p.reverifyRemaining > 0 || p.sweeps === 0),
+      passes.map(p => [p.counts.ran, p.reverifyRemaining, p.sweeps])
+    );
+    // an orphan entry (its record removed) is retired by the next completed sweep
+    // a fresh Store (a restarted process): its schedule comes from disk, with an orphan in it
+    const st2 = new Store(d);
+    const sch = st2.getSchedule();
+    st2.putSchedule({ ...sch, entries: { ...sch.entries, "owner-0xgone-0": { done: true } } });
+    const st3 = new Store(d);
+    const hadIt = "owner-0xgone-0" in (st3.getSchedule().entries ?? {});
+    for (let i = 0; i < 4; i++) await publishPending(st3, sk, { maxParse: 1, now: clock });
+    cell(
+      "R3: an entry whose record is gone is retired when a sweep completes",
+      hadIt && !("owner-0xgone-0" in (st3.getSchedule().entries ?? {})),
+      { hadIt, entries: Object.keys(st3.getSchedule().entries ?? {}) }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const s = sinks();
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    for (let i = 0; i < 3; i++)
+      store.putRecord({ ...owner, txHash: ethers.id(`sf-huge-${i}`), pad: "x".repeat(300_000) });
+    const healthy = { ...owner, txHash: ethers.id("sf-healthy") };
+    store.putRecord(healthy);
+    const realPut = store.putSchedule.bind(store);
+    store.putSchedule = () => {
+      throw new Error("disk full");
+    };
+    let t = 1;
+    const clock = () => t++;
+    const q1 = await publishPending(store, sk, { maxRecords: 3, now: clock });
+    const q2 = await publishPending(store, sk, { maxRecords: 3, now: clock });
+    store.putSchedule = realPut;
+    cell(
+      "R3: a failing schedule write fails the pass (alerted) and rotation stays fair in memory (healthy record runs by pass 2)",
+      q1.counts.failed >= 1 &&
+        q1.alerts.some(a => /schedule not saved/.test(a)) &&
+        store.getPublication(Store.recordId(healthy))?.published === true,
+      { q1: q1.counts, q2: q2.counts }
+    );
+    // duplicate identity: a copy of the healthy record under another file name is isolated
+    const name = `${Store.recordId(healthy)}.json`;
+    writeFileSync(
+      join(d, "records", `zz-copy.json`),
+      readFileSync(join(d, "records", name), "utf8")
+    );
+    const tg0 = s.calls.telegram;
+    const q3 = await publishPending(store, sk, { maxRecords: 10, now: clock });
+    cell(
+      "R3: a second file with the same record identity is isolated (no duplicate publication)",
+      q3.alerts.some(a => /duplicated or without a matching id/.test(a) && /zz-copy/.test(a)) &&
+        s.calls.telegram === tg0,
+      { q3: q3.counts, alerts: q3.alerts }
+    );
+    // an oversized file is refused before it is parsed
+    writeFileSync(
+      join(d, "records", "owner-0xbig-0.json"),
+      JSON.stringify({ route: "owner", pad: "x".repeat(600_000) }) // valid JSON, unflagged, huge
+    );
+    const q4 = await publishPending(store, sk, { maxRecords: 10, now: clock });
+    cell(
+      "R3: a record file over the read bound is refused (unreadable), not parsed",
+      q4.alerts.some(a => /owner-0xbig-0/.test(a)),
+      q4.alerts
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  // publishPhase on a fresh store: with one record per pass, the generation closes only after
+  // every record was registered (by a full sweep) and re-checked
+  for (const [label, limits] of [
+    ["one file read per pass", { maxParse: 1, maxRecords: 1 }],
+    ["all files read, one record run per pass", { maxRecords: 1 }],
+  ]) {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      for (let i = 0; i < 3; i++)
+        store.putRecord({ ...owner, txHash: ethers.id(`gp-${label}-${i}`) });
+      const s = sinks();
+      const built = {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        wallet: writer,
+        registryFor: () => s.registry,
+      };
+      const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+      const PL = { ...P, limits };
+      const out = [];
+      for (let i = 0; i < 6; i++)
+        out.push(
+          await publishPhase(store, roleChain(roles), cfg, PL, built, {
+            now: P.reverifyEveryMs + 10 + i,
+          })
+        );
+      const closedAt = out.findIndex(r => r.reverified);
+      cell(
+        `R3 publishPhase (${label}): the generation closes no earlier than the third pass (three records, one run per pass)`,
+        closedAt >= 2,
+        out.map(r => [r.ran, r.reverifying?.remaining ?? null, r.reverified])
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+}
+{
+  // real sink failures (both pinners down) make the pass not ok and --once exit 1
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(owner);
+    const s = sinks({ pinata: { fail: true }, filebase: { fail: true } });
+    const built = {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      wallet: writer,
+      registryFor: () => s.registry,
+    };
+    const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+    const r = await publishPhase(store, roleChain(roles), cfg, P, built, { now: 7_000_000 });
+    cell(
+      "R3: sink failures caught inside publishRecord make the pass not ok, so --once exits 1",
+      r.ok === false && r.failed >= 1 && onceExitCode({ healthy: true, publication: r }) === 1,
+      r
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  // a shortened digest is not acknowledged when its full list could not be stored
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const texts = [];
+    const tg = { send: async x => texts.push(x) };
+    const alerts = Array.from({ length: 40 }, (_, i) => `b-${i}: ${"y".repeat(900)}`);
+    const r1 = await deliverAlerts(store, tg, alerts, { now: 1, maxParts: 3, detailsSaved: false });
+    const r2 = await deliverAlerts(store, tg, alerts, { now: 2, maxParts: 3, detailsSaved: true });
+    cell(
+      "R3: a truncated digest is acknowledged only when the full alert list is stored",
+      r1.sent === false && /details not stored/.test(r1.reason) && r2.sent === true,
+      { r1, r2 }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
 // ---- --once exit code: healthy scan AND an ok publication pass
 cell(
   "onceExitCode: 0 only when the scan is healthy and publication (if it ran) reported ok",
@@ -703,7 +886,9 @@ cell(
         journalKept &&
         s.calls.sign === 0 &&
         s.calls.texts.some(
-          t => /unreadable or without a usable id/.test(t) && /journal unreadable/.test(t)
+          t =>
+            /unreadable, oversized, duplicated or without a matching id/.test(t) &&
+            /journal unreadable/.test(t)
         ),
       { r, ownSt: !!ownSt, sign: s.calls.sign, texts: s.calls.texts.length }
     );

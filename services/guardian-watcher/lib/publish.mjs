@@ -115,6 +115,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   const file = recordFile(rec);
   const state = { ...prev, pins: { ...(prev.pins ?? {}) } };
   const alerts = [];
+  // Stage failures (a sink that errored or refused), as distinct from pending work: the pass is
+  // not "ok" while any stage failed (Codex W2c R3).
+  const failures = [];
   // Unresolved registry incidents are re-alerted on EVERY run, before anything can return early.
   const inc = prev.registry;
   if ((inc?.phase === "conflict" || inc?.phase === "reverted") && !inc.ack) {
@@ -130,7 +133,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     alerts.push(
       `record bytes changed after first publication (${state.bytesChanged.from} -> ${state.bytesChanged.to}); not republishing; INCIDENT until resolved by hand`
     );
-    return { state, alerts };
+    return { state, alerts, failures };
   }
   if (state.cid && state.cid !== file.cid) {
     // Records are immutable once stored; a different CID means the bytes changed underneath us.
@@ -143,7 +146,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
       state.bytesChanged = { from: state.cid, to: file.cid, at: new Date().toISOString() };
       await persist(state);
     }
-    return { state, alerts };
+    return { state, alerts, failures };
   }
   state.cid = file.cid;
   state.recordHash = file.recordHash;
@@ -179,6 +182,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           error: `provider CID differs from local ${file.cid}`,
         };
         alerts.push(`${p.name}: CID mismatch (local ${file.cid})`);
+        failures.push(`pin:${p.name}`);
         continue;
       }
       // Public readability by CID, byte for byte: a private or altered copy is not a publication.
@@ -194,6 +198,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           error: "public gateway did not serve the exact bytes",
         };
         alerts.push(`${p.name}: public fetch by CID did not return the record bytes`);
+        failures.push(`pin:${p.name}`);
         continue;
       }
       state.pins[p.name] = { current: true, everOk: true, at, checkedAt: at, cid: file.cid };
@@ -201,6 +206,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
       if (e instanceof PersistError) throw e;
       state.pins[p.name] = { ...state.pins[p.name], current: false, at, error: errMsg(e) };
       alerts.push(`${p.name}: ${errMsg(e)}`);
+      failures.push(`pin:${p.name}`);
     }
   }
   await persist(state);
@@ -214,6 +220,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     } catch (e) {
       if (e instanceof PersistError) throw e;
       alerts.push(`mirror: ${errMsg(e)}`);
+      failures.push("mirror");
     }
   }
 
@@ -227,7 +234,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     );
   }
   await persist(state);
-  if (!state.published) return { state, alerts };
+  if (!state.published) return { state, alerts, failures };
 
   if (sinks.telegram && !state.telegram?.at) {
     const retry = !!state.telegram?.attemptAt;
@@ -243,6 +250,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     } catch (e) {
       if (e instanceof PersistError) throw e;
       alerts.push(`telegram: ${errMsg(e)}`);
+      failures.push("telegram");
     }
   }
 
@@ -252,9 +260,10 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     } catch (e) {
       if (e instanceof PersistError) throw e;
       alerts.push(`registry: ${errMsg(e)}`);
+      failures.push("registry");
     }
   }
-  return { state, alerts };
+  return { state, alerts, failures };
 }
 
 export const DEFAULT_MAX_PENDING_MS = 30 * 60_000;

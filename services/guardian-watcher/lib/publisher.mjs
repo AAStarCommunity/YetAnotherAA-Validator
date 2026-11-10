@@ -6,6 +6,7 @@ import { ethers } from "ethers";
 import { Store } from "./store.mjs";
 import { publishRecord, PersistError } from "./publish.mjs";
 import { recordFile } from "./record-file.mjs";
+import { MAX_RECORD_BYTES } from "./cid.mjs";
 import { SafeError, safeText, guarded } from "./safe-error.mjs";
 import { assertWriterRole } from "../sinks/registry.mjs";
 
@@ -72,6 +73,8 @@ export async function publishPending(
     now = Date.now,
   } = {}
 ) {
+  // The budget covers preparation too (Codex W2c R3): it starts before the directory is read.
+  const t0 = now();
   const alerts = [];
   const counts = {
     flagged: 0,
@@ -84,9 +87,11 @@ export async function publishPending(
     unreadable: 0,
   };
   const pinners = (sinks.pinners ?? []).map(p => p.name);
-  const sched = store.getSchedule();
+  const sched = getSchedule(store);
   const entries = { ...(sched.entries ?? {}) };
-  // A bounded, rotating batch of record files: the cursor names the last file read.
+  // A bounded, rotating batch of record files: the cursor names the last file read. Listing the
+  // names (no contents) is the only full-directory step; ~45 ms for 50 000 files on the Mini-class
+  // laptop this was measured on.
   const names = store.recordFiles();
   let start = 0;
   if (sched.cursor) {
@@ -97,6 +102,7 @@ export async function publishPending(
   for (let i = 0; i < Math.min(maxParse, names.length); i++)
     batch.push(names[(start + i) % names.length]);
   const bad = [];
+  const seenIds = new Set();
   const work = [];
   for (const name of batch) {
     let rec;
@@ -104,13 +110,16 @@ export async function publishPending(
     let prev;
     let cid;
     try {
-      rec = store.readRecordFile(name);
+      rec = store.readRecordFile(name, 2 * MAX_RECORD_BYTES);
       if (!rec?.verdict?.flagged) continue;
       id = recordIdOf(rec);
-      if (!id) {
+      // the file name, the derived id and the stored id must agree, and one id is one record: a
+      // restored copy under another name would run on a stale journal (Codex W2c R3)
+      if (!id || name !== `${id}.json` || seenIds.has(id)) {
         bad.push(name);
         continue;
       }
+      seenIds.add(id);
       counts.flagged++;
       try {
         prev = store.getPublication(id) ?? {};
@@ -129,9 +138,9 @@ export async function publishPending(
       bad.push(name);
       continue;
     }
-    const e = entries[id] ?? {};
-    // Every known flagged record is re-checked once per generation, done or not (its current pins
-    // are otherwise skipped).
+    // Registered before any limit applies, so a deferred or newly found record still counts
+    // toward the reverify generation (Codex W2c R3).
+    const e = (entries[id] = { ...(entries[id] ?? {}) });
     const reverify = reverifyGen !== null && e.reverifiedGen !== reverifyGen;
     const isParked = parked(prev);
     if (!reverify && isDone(rec, prev, { pinners, cid, ignoreRegistry: isParked })) {
@@ -141,27 +150,35 @@ export async function publishPending(
       if (openIncident(prev)) counts.incidents++;
       continue;
     }
-    work.push({ rec, id, prev, cid, reverify, isParked });
+    work.push({ rec, id, cid, reverify, isParked, prev });
   }
   if (bad.length) {
     counts.unreadable += bad.length;
     counts.failed += bad.length;
     alerts.push(
-      `${bad.length} record file(s) unreadable or without a usable id; not published (first: ${bad.slice(0, 5).join(", ")})`
+      `${bad.length} record file(s) unreadable, oversized, duplicated or without a matching id; not published (first: ${bad.slice(0, 5).join(", ")})`
     );
   }
   // Least recently run first (failures included), so a bounded pass rotates through a backlog.
   work.sort((a, b) => (entries[a.id]?.lastRunAt ?? 0) - (entries[b.id]?.lastRunAt ?? 0));
-  const t0 = now();
   let stopped = false;
-  for (const { rec, id, prev, cid, reverify, isParked } of work) {
+  for (const { rec, id, cid, reverify, isParked, prev: listed } of work) {
     if (stopped || counts.ran >= maxRecords || (counts.ran > 0 && now() - t0 >= maxMs)) {
       counts.deferred++;
-      if (openIncident(prev)) counts.incidents++;
+      if (openIncident(listed)) counts.incidents++;
       continue;
     }
     counts.ran++;
     const e = entries[id] ?? {};
+    // the journal as it is now, not as it was when the batch was listed (Codex W2c R3)
+    let prev;
+    try {
+      prev = store.getPublication(id) ?? {};
+    } catch {
+      counts.failed++;
+      alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
+      continue;
+    }
     try {
       const r = await publishRecord(
         rec,
@@ -171,11 +188,15 @@ export async function publishPending(
       );
       for (const a of r.alerts) alerts.push(`${id}: ${a}`);
       const done = isDone(rec, r.state, { pinners, cid, ignoreRegistry: isParked });
+      const stageFailed = (r.failures ?? []).length > 0;
+      if (stageFailed) counts.failed++; // a sink failed or refused: the pass is not ok (R3)
       entries[id] = {
         ...e,
         lastRunAt: now(),
         done,
         failing: false,
+        // re-checked in this generation even if a stage failed: the failure is reported (ok =
+        // false, alerts), and a broken provider must not hold every generation open
         ...(reverify ? { reverifiedGen: reverifyGen } : {}),
       };
       if (done) counts.done++;
@@ -191,17 +212,46 @@ export async function publishPending(
       alerts.push(`${id}: ${safeText("publish", err)}`);
     }
   }
+  // Directory sweep: a full rotation of the cursor. When one completes, entries of records no
+  // longer present and flagged are retired (an orphan must not hold a generation open), and the
+  // sweep count lets a generation close only after a sweep that began after it opened (R3).
+  const sweep = { read: 0, seen: [], ...(sched.sweep ?? {}) };
+  sweep.read += batch.length;
+  sweep.seen = [...new Set([...sweep.seen, ...seenIds])];
+  let sweeps = sched.sweeps ?? 0;
+  let next = { ...sched, cursor: batch.at(-1) ?? null, entries, sweep };
+  if (sweep.read >= names.length) {
+    const live = new Set(sweep.seen);
+    for (const id of Object.keys(entries)) if (!live.has(id)) delete entries[id];
+    sweeps += 1;
+    next = { ...next, entries, sweeps, sweep: { read: 0, seen: [] } };
+  }
   const reverifyRemaining =
     reverifyGen === null
       ? 0
       : // a record that keeps failing is alerted on its own; it does not hold the generation open
         Object.values(entries).filter(x => !x.failing && x.reverifiedGen !== reverifyGen).length;
-  try {
-    store.putSchedule({ ...sched, cursor: batch.at(-1) ?? null, entries });
-  } catch {
-    alerts.push("publication schedule not saved (rotation order only; journals unaffected)");
+  if (!saveSchedule(store, next)) {
+    counts.failed++;
+    alerts.push("publication schedule not saved; rotation kept in memory, retried next pass");
   }
-  return { alerts, counts, stopped, reverifyRemaining };
+  return { alerts, counts, stopped, reverifyRemaining, sweeps };
+}
+
+// The schedule as last computed in this process, so a failing schedule write keeps rotation fair
+// in memory while it is retried (Codex W2c R3).
+const scheduleMemo = new WeakMap();
+function getSchedule(store) {
+  return scheduleMemo.get(store) ?? store.getSchedule();
+}
+function saveSchedule(store, s) {
+  scheduleMemo.set(store, s);
+  try {
+    store.putSchedule(s);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -214,7 +264,7 @@ export async function deliverAlerts(
   store,
   telegram,
   alerts,
-  { now = Date.now(), repeatMs = 3_600_000, maxParts = ALERT_MAX_PARTS } = {}
+  { now = Date.now(), repeatMs = 3_600_000, maxParts = ALERT_MAX_PARTS, detailsSaved = true } = {}
 ) {
   if (!alerts.length) {
     store.putAlertState({ ...(store.getAlertState() ?? {}), lastSetHash: null });
@@ -231,7 +281,8 @@ export async function deliverAlerts(
   // At most maxParts messages per pass (Codex W2c R2): beyond that the last part says how many
   // lines are not shown; the full list is in alerts-latest.json. Never a silent cut.
   let chunks = alertChunks(alerts);
-  if (chunks.length > maxParts) {
+  const truncated = chunks.length > maxParts;
+  if (truncated) {
     const shown = chunks.slice(0, maxParts - 1);
     const hidden = chunks.slice(maxParts - 1).reduce((n, c) => n + c.length, 0);
     chunks = [
@@ -248,6 +299,14 @@ export async function deliverAlerts(
       return { sent: false, reason: safeText("telegram", e), partsSent: i };
     }
   }
+  // A shortened digest points at alerts-latest.json: without that file it is not acknowledged, so
+  // the set goes out again next pass (Codex W2c R3).
+  if (truncated && !detailsSaved)
+    return {
+      sent: false,
+      reason: "alert details not stored; digest re-sent next pass",
+      parts: chunks.length,
+    };
   store.putAlertState({ ...last, lastSetHash: setHash, lastSentAt: now });
   return { sent: true, parts: chunks.length };
 }
@@ -362,33 +421,41 @@ export async function publishPhase(store, chain, cfg, p, built, { now = Date.now
   }
   // The weekly reverify is a generation: opened when due, closed only when every done record has
   // been re-checked in it, however many bounded passes that takes (Codex W2c R2).
+  // It closes only after a full directory sweep that began after it opened, so records the
+  // bounded batches had not reached yet are counted too (Codex W2c R3).
   const meta = store.getAlertState() ?? {};
-  let gen = store.getSchedule().reverifyGen ?? null;
+  let gen = getSchedule(store).reverifyGen ?? null;
   if (gen === null && now - (meta.lastReverifyAt ?? 0) >= p.reverifyEveryMs) {
     gen = now;
-    store.putSchedule({ ...store.getSchedule(), reverifyGen: gen });
+    const sc = getSchedule(store);
+    saveSchedule(store, { ...sc, reverifyGen: gen, reverifyGenSweeps: sc.sweeps ?? 0 });
   }
+  const genSweeps = getSchedule(store).reverifyGenSweeps ?? 0;
   const res = await publishPending(
     store,
     { pinners: built.pinners, mirror: built.mirror, telegram: built.telegram, registry },
     { reverifyGen: gen, maxPendingMs: p.maxPendingMs, ...(p.limits ?? {}) }
   );
-  const reverified = gen !== null && !res.stopped && res.reverifyRemaining === 0;
+  const reverified =
+    gen !== null && !res.stopped && res.reverifyRemaining === 0 && res.sweeps > genSweeps;
   if (reverified) {
     store.putAlertState({ ...(store.getAlertState() ?? {}), lastReverifyAt: gen });
-    const { reverifyGen, ...rest } = store.getSchedule();
+    const { reverifyGen, reverifyGenSweeps, ...rest } = getSchedule(store);
     void reverifyGen;
-    store.putSchedule(rest);
+    void reverifyGenSweeps;
+    saveSchedule(store, rest);
   }
   alerts.push(...res.alerts);
+  let detailsSaved = true;
   try {
     store.putAlertList(alerts);
   } catch {
-    // the digest still goes out; only the full list on disk is missing
+    detailsSaved = false;
   }
   const delivery = await deliverAlerts(store, built.telegram, alerts, {
     now,
     repeatMs: p.alertRepeatMs,
+    detailsSaved,
   });
   const deliveredOk =
     delivery.sent === true || delivery.reason === "none" || delivery.reason === "unchanged";
