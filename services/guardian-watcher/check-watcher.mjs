@@ -658,7 +658,13 @@ try {
     const dls = () =>
       readdirSync(join(d2, "deadletters"))
         .filter(f => f.endsWith(".json"))
-        .map(f => JSON.parse(readFileSync(join(d2, "deadletters", f), "utf8")));
+        .flatMap(f => {
+          try {
+            return [JSON.parse(readFileSync(join(d2, "deadletters", f), "utf8"))];
+          } catch {
+            return []; // K14 plants a corrupt one on purpose
+          }
+        });
     const [p1] = byTx(k1.hash);
     cell(
       "keeper updatePrice() emitting only PriceUpdated: public route, NOT flagged, caller and selector kept",
@@ -847,6 +853,176 @@ try {
         r14.status.corruptDeadLetters === 1 &&
         JSON.parse(readFileSync(join(d2, "records", `${id14}.json`), "utf8")).txHash === k14.hash,
       r14.status
+    );
+    // C1 (Codex #400-fix H1) a direct updatePrice() whose tx also has an OperatorPaused that
+    // updatePrice cannot emit: the root selector is not trusted for it; without a trace, retried
+    const c1 = c.ownerTx(
+      [
+        { name: "PriceUpdated", args: [257000000000n, 10n] },
+        { name: "OperatorPaused", args: [addr("nested-op")] },
+      ],
+      { from: KEEPER, data: sel("updatePrice()"), price: 257000000000n }
+    );
+    // C2 (H2-adjacent) a direct call whose calldata has no selector: ambiguous events are retried
+    const c2 = c.ownerTx([{ name: "OperatorPaused", args: [addr("noselector-op")] }], {
+      from: KEEPER,
+      data: "0x",
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    cell(
+      "a root selector is not trusted for an event its function cannot emit; calldata '0x' proves no function",
+      byTx(c1.hash).length === 0 &&
+        dls().some(x => x.txHash === c1.hash) &&
+        byTx(c2.hash).length === 0 &&
+        dls().some(x => x.txHash === c2.hash),
+      { c1: byTx(c1.hash), c2: byTx(c2.hash) }
+    );
+    {
+      const pu = spIface.encodeEventLog("PriceUpdated", [257000000000n, 10n]);
+      const pz = spIface.encodeEventLog("OperatorPaused", [addr("nested-op")]);
+      c.setTrace(c1.hash, {
+        type: "CALL",
+        from: KEEPER,
+        to: SP,
+        input: sel("updatePrice()"),
+        logs: [{ address: SP, topics: pu.topics, data: pu.data, position: 0 }],
+        calls: [
+          {
+            type: "CALL",
+            from: SP,
+            to: SP,
+            input: ethers.id("setOperatorPaused(address,bool)").slice(0, 10),
+            logs: [{ address: SP, topics: pz.topics, data: pz.data }],
+          },
+        ],
+      });
+    }
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c1r = byTx(c1.hash);
+    const c1p = c1r.find(r => r.event === "PriceUpdated");
+    const c1z = c1r.find(r => r.event === "OperatorPaused");
+    cell(
+      "with the trace, each event takes its own emitting call: nested privileged call = owner, root = public",
+      c1p?.route === "public" &&
+        !c1p.verdict.flagged &&
+        j(c1p.callEvents) === j(["PriceUpdated"]) &&
+        c1z?.route === "owner" &&
+        c1z.caller === SP &&
+        c1z.callerSource === "trace",
+      c1r
+    );
+    // C3 (M3) an SP record whose price never reads keeps its attribution at exhaustion
+    const c3 = c.ownerTx([{ name: "PriceUpdated", args: [258000000000n, 11n] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      price: 258000000000n,
+    });
+    {
+      const pu = spIface.encodeEventLog("PriceUpdated", [258000000000n, 11n]);
+      c.setTrace(c3.hash, {
+        type: "CALL",
+        from: KEEPER,
+        to: SP,
+        input: sel("updatePrice()"),
+        logs: [{ address: SP, topics: pu.topics, data: pu.data }],
+      });
+    }
+    // C4 (M4) an authenticated BLS price action whose price read fails while its tx lookup also
+    // fails: the verified evidence survives, and lands once the price reads
+    const priceG = {
+      target: SP,
+      callData: spIface.encodeFunctionData("updatePriceDVT", [259000000000n, 12n, "0x", 0]),
+      requiredThreshold: 2n,
+    };
+    const c4 = c.execute(Kind.GENERIC, 90n, priceG, 0b111n, { price: 259000000000n });
+    c.failPriceReads(1_000_000);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c4dl = dls().find(x => x.txHash === c4.hash);
+    c.failTx(c4.hash, 1_000_000); // the lookup keeps failing until exhaustion
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      await runOnce(c.chain, cfg, store, rs, ident);
+    c.failPriceReads(0);
+    c.failTx(c4.hash, 0);
+    const [c3r] = byTx(c3.hash);
+    cell(
+      "an SP record whose price never reads is kept with its route, caller and verdict (price.unavailable)",
+      c3r?.route === "public" &&
+        c3r.caller === KEEPER &&
+        !c3r.verdict.flagged &&
+        c3r.price?.unavailable === true,
+      c3r
+    );
+    const [c4r] = byTx(c4.hash);
+    cell(
+      "an authenticated BLS action whose price never reads keeps its verified evidence (not UNRECOVERED)",
+      c4dl?.status === "PRICE_UNAVAILABLE" &&
+        c4r?.kind === "GENERIC" &&
+        c4r.price?.unavailable === true &&
+        c4r.signers?.length === 3,
+      { c4dl: c4dl?.status, c4r: c4r && { kind: c4r.kind, price: c4r.price } }
+    );
+    // C5 (M5) a tx dead letter whose SP events the trace later proves to be BLS effects resolves
+    const c5 = c.execute(Kind.GENERIC, 91n, priceG, 0b111n, {
+      via: { route: "safe" },
+      spLogs: [{ name: "PriceUpdated", args: [260000000000n, 13n] }],
+      price: 260000000000n,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c5open = dls().some(x => x.txHash === c5.hash && x.route === "tx");
+    {
+      const pu = spIface.encodeEventLog("PriceUpdated", [260000000000n, 13n]);
+      c.setTrace(c5.hash, {
+        type: "CALL",
+        to: SAFE,
+        calls: [
+          {
+            type: "CALL",
+            to: AGG,
+            logs: [
+              {
+                address: AGG,
+                ...aggIface.encodeEventLog("SignersCommitted", [c5.key, c5.mask]),
+                position: 0,
+              },
+            ],
+            calls: [
+              {
+                type: "CALL",
+                from: AGG,
+                to: SP,
+                input: priceG.callData.slice(0, 10),
+                logs: [{ address: SP, topics: pu.topics, data: pu.data }],
+              },
+            ],
+          },
+        ],
+      });
+    }
+    await runOnce(c.chain, cfg, store, rs, ident);
+    cell(
+      "a tx dead letter resolves once the trace proves its SP events are BLS effects (no stray record)",
+      c5open &&
+        !dls().some(x => x.txHash === c5.hash && x.route === "tx") &&
+        !byTx(c5.hash).some(r => r.route !== "bls"),
+      {
+        c5open,
+        open: dls()
+          .filter(x => x.txHash === c5.hash)
+          .map(x => x.route),
+      }
+    );
+    // C6 (M6) one returned topic must not mask another missing topic in the same block
+    const c6 = c.ownerTx([
+      { name: "SlashCancelled", args: [addr("two-topics")] },
+      { name: "OperatorUnpaused", args: [addr("two-topics")] },
+    ]);
+    c.lagTopic(c6.block, spIface.getEvent("OperatorUnpaused").topicHash);
+    const r6 = await runOnce(c.chain, cfg, store, rs, ident);
+    c.clearLag();
+    cell(
+      "bloom per (address, topic): a missing topic is re-read by hash even when another topic of the block came back",
+      byTx(c6.hash).length === 2 && r6.status.bloom.recovered === 1,
+      { n: byTx(c6.hash).map(r => r.event), bloom: r6.status.bloom }
     );
     // K15 maxBlocksPerTick bounds each tick
     for (let i = 0; i < 5; i++) c.mine();

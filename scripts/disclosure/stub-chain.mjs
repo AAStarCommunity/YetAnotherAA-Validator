@@ -135,6 +135,7 @@ function makeChain() {
   let getLogsCalls = 0;
   let onReceipt = null; // one-shot hook around the next receipt fetch
   const laggingBlocks = new Set(); // range getLogs omits these blocks' logs (a lagging node)
+  const laggingTopics = new Map(); // block -> topic0 that the range getLogs omits
   let lagByHash = false; // ... and a by-hash re-read fails too (the node lacks the block)
   let noBloom = false; // headers without logsBloom
   const txFailures = new Map(); // hash -> remaining getTransaction failures
@@ -261,6 +262,7 @@ function makeChain() {
           l.blockNumber >= fromBlock &&
           l.blockNumber <= toBlock &&
           (blockHash !== undefined || !laggingBlocks.has(l.blockNumber)) &&
+          (blockHash !== undefined || laggingTopics.get(l.blockNumber) !== l.topics[0]) &&
           topics.every(
             (t, i) => t == null || (Array.isArray(t) ? t.includes(l.topics[i]) : l.topics[i] === t)
           )
@@ -691,7 +693,9 @@ function makeChain() {
       laggingBlocks.add(n);
       lagByHash = byHashFails;
     },
+    lagTopic: (n, topic) => laggingTopics.set(n, topic),
     clearLag: () => {
+      laggingTopics.clear();
       laggingBlocks.clear();
       lagByHash = false;
     },

@@ -152,6 +152,14 @@ export class Store {
     return readdirSync(join(this.dir, "deadletters")).filter(f => f.endsWith(".exhausted")).length;
   }
 
+  /** Whether any record exists for this BLS key (whatever its kind, UNRECOVERED included). */
+  hasBlsRecord(key) {
+    const suffix = `-${BigInt(key).toString(16).padStart(64, "0")}.json`;
+    return readdirSync(join(this.dir, "records")).some(
+      f => f.startsWith("bls-") && f.endsWith(suffix)
+    );
+  }
+
   countRecords() {
     return readdirSync(join(this.dir, "records")).filter(f => f.endsWith(".json")).length;
   }

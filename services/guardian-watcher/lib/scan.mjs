@@ -202,6 +202,11 @@ async function pricePair(chain, cfg, block) {
 const SIGNERS_COMMITTED = () => aggIface.getEvent("SignersCommitted").topicHash;
 const spTopics = () => SP_WATCHED_EVENTS.map(n => spIface.getEvent(n).topicHash);
 const lcEq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+/** A 4-byte selector, or null (calldata "0x" or shorter than a selector proves no function). */
+const selectorOf = data =>
+  typeof data === "string" && /^0x[0-9a-fA-F]{8}/.test(data)
+    ? data.slice(0, 10).toLowerCase()
+    : null;
 
 /** Split a tx's logs into watched aggregator / SuperPaymaster logs. */
 function splitLogs(logs, cfg, block) {
@@ -239,7 +244,10 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   let attr = { aligned: false, owner: new Map(), spCall: new Map(), why: "not traced" };
   const amb = ambiguousEvents(rs);
   const decoded = t.sp.map(l => ({ l, d: decodeSp(l) })).filter(x => x.d);
-  const needFrame = decoded.some(x => amb.has(x.d.event)) && !direct;
+  // The emitting call decides an ambiguous event's route (#400 M1). A direct tx's calldata names
+  // only the ROOT call; a nested SP call inside it would emit under another selector. So the trace
+  // is asked for whenever an ambiguous event is present, direct or not (Codex #400-fix H1).
+  const needFrame = decoded.some(x => amb.has(x.d.event));
   if ((t.agg.length && t.sp.length) || needFrame) {
     const { trace, logs } = await traceAndReceipt(chain, txHash);
     attr = logs
@@ -262,6 +270,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     } else independent.push(ev);
   }
   for (const l of t.agg) {
+    if (store.hasBlsRecord(BigInt(l.topics[1]))) continue; // completed before (tx retry, M5)
     const call = commitCall.get(logPos(l));
     const out = await blsRecord(chain, cfg, rs, ctx, l, effectsOf.get(call) ?? [], snapshot);
     if (out.record) note(summary, store.putRecord(out.record), out.record);
@@ -270,9 +279,13 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       summary.deadLetters++;
     }
   }
-  if (!independent.length) return { done: true };
+  const txDl = `tx-${String(txHash).toLowerCase()}`;
+  if (!independent.length) {
+    store.resolveDeadLetter(txDl); // all SP events proved to be BLS effects (Codex #400-fix M5)
+    return { done: true };
+  }
 
-  const fail = reason => {
+  const fail = (reason, pendingRecords) => {
     store.putDeadLetter({
       route: "tx",
       txHash,
@@ -280,6 +293,9 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       status: "ERROR",
       reasons: [reason],
       events: independent,
+      // Records already classified, missing only their price (Codex #400-fix M3): exhaustion
+      // keeps their route, caller and verdict, marked price.unavailable.
+      ...(pendingRecords ? { pendingRecords } : {}),
       ruleset: ctx.ruleset,
       seenAt: ctx.now,
     });
@@ -287,13 +303,17 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     return { done: false };
   };
   if (tx === undefined || tx === null) return fail("transaction unavailable");
-  const directFrame = direct
-    ? {
-        from: tx.from,
-        selector: typeof tx.data === "string" ? tx.data.slice(0, 10).toLowerCase() : null,
-      }
-    : null;
-  const frameOf = e => directFrame ?? (attr.aligned ? (attr.spCall.get(e.logIndex) ?? null) : null);
+  // Root-call attribution without a trace is accepted only when it is consistent: the root
+  // selector is a permissionless function and EVERY SP event of the tx is one it can emit, so no
+  // nested call can be hiding behind it (Codex #400-fix H1). A privileged root is the owner route
+  // whoever it calls. Otherwise only the aligned trace frame attributes an ambiguous event.
+  const rootSel = direct ? selectorOf(tx.data) : null;
+  const rootPub = rootSel ? publicFunction(rs, rootSel) : null;
+  const rootConsistent =
+    direct && rootSel && (!rootPub || decoded.every(x => rootPub[1].events.includes(x.d.event)));
+  const directFrame = rootConsistent ? { from: tx.from, selector: rootSel } : null;
+  const traced = e => (attr.aligned ? (attr.spCall.get(e.logIndex) ?? null) : null);
+  const frameOf = e => traced(e) ?? directFrame;
   // Events emitted by the same SP call, for verdicts that depend on what else the call did.
   const byFrame = new Map();
   for (const e of independent) {
@@ -301,9 +321,10 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     if (f) byFrame.set(f, [...(byFrame.get(f) ?? []), e.event]);
   }
   const recs = [];
+  let priceFailed = false;
   for (const e of independent) {
     const f = frameOf(e);
-    if (amb.has(e.event) && !f?.selector)
+    if (amb.has(e.event) && !selectorOf(f?.selector ?? ""))
       return fail(
         `caller of ${e.event} undeterminable (${direct ? "no selector" : (attr.why ?? "trace unaligned")})`
       );
@@ -320,7 +341,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       to: tx.to ? ethers.getAddress(tx.to) : null,
       caller: f?.from ? ethers.getAddress(f.from) : null,
       selector: f?.selector ?? null,
-      callerSource: directFrame ? "tx" : f ? "trace" : "unknown",
+      callerSource: traced(e) ? "trace" : f ? "tx" : "unknown",
       ...(pub ? { function: pub[0], callEvents: byFrame.get(f) ?? [e.event] } : {}),
       ruleset: ctx.ruleset,
       seenAt: ctx.now,
@@ -334,12 +355,16 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     rec.verdict = evaluate(rs, cfg.roles, rec);
     if (wantsPrice(rs, cfg.roles, rec)) {
       rec.price = await pricePair(chain, cfg, t.block);
-      if (rec.price.error) return fail("price read failed");
+      if (rec.price.error) {
+        priceFailed = true;
+        rec.price = undefined;
+      }
     }
     recs.push(rec);
   }
+  if (priceFailed) return fail("price read failed", recs);
   for (const rec of recs) note(summary, store.putRecord(rec), rec);
-  store.resolveDeadLetter(`tx-${String(txHash).toLowerCase()}`);
+  store.resolveDeadLetter(txDl);
   return { done: true };
 }
 
@@ -347,7 +372,12 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
  * is left without one (M0 §5.2, #400 Low): an unauthenticated BLS action is UNRECOVERED; an SP
  * event whose call could not be determined is "unattributed" (nobody accused). */
 function exhaust(store, rs, cfg, ctx, summary, dl) {
-  if (dl.route === "tx") {
+  if (dl.route === "tx" && dl.pendingRecords) {
+    for (const r of dl.pendingRecords) {
+      const rec = { ...r, price: { unavailable: true }, exhaustedAfter: dl.attempts };
+      note(summary, store.putRecord(rec), rec);
+    }
+  } else if (dl.route === "tx") {
     const amb = ambiguousEvents(rs);
     for (const e of dl.events ?? []) {
       const rec = {
@@ -412,12 +442,25 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
         [cfg.aggregator, [SIGNERS_COMMITTED()], aggLogs, extraAgg],
         [cfg.roles.superPaymaster, spTopics(), spLogs, extraSp],
       ]) {
-        const may = mayHaveLog(h.logsBloom, addr, topics);
-        if (may === null) {
+        // Per (address, topic): one returned topic must not mask another missing one in the same
+        // block (Codex #400-fix M6). A missing SECOND log of a topic already present cannot be
+        // seen in a bloom at all; that limit is documented (M0 §5.2b).
+        const missing = [];
+        let unchecked = false;
+        for (const topic of topics) {
+          const may = mayHaveLog(h.logsBloom, addr, [topic]);
+          if (may === null) {
+            unchecked = true;
+            break;
+          }
+          if (may && !logs.some(l => Number(l.blockNumber) === n && l.topics?.[0] === topic))
+            missing.push(topic);
+        }
+        if (unchecked) {
           summary.bloomUnchecked++;
           continue;
         }
-        if (!may || have(logs, n)) continue;
+        if (!missing.length) continue;
         let got;
         try {
           got = await chain.getLogs({ address: addr, topics: [topics], blockHash: h.hash });
@@ -426,10 +469,15 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
             `block ${n}: logsBloom shows a watched log that getLogs did not return, and the by-hash re-read failed; retrying`
           );
         }
-        if (got.length) {
-          extra.push(...got);
+        const fresh = got.filter(
+          g => !logs.some(l => l.transactionHash === g.transactionHash && logPos(l) === logPos(g))
+        );
+        if (fresh.length) {
+          extra.push(...fresh);
           summary.bloomRecovered++;
-        } else summary.bloomFalsePositives++;
+        }
+        if (missing.some(topic => !got.some(g => g.topics?.[0] === topic)))
+          summary.bloomFalsePositives++;
       }
     }
   }
@@ -498,6 +546,18 @@ export async function tick(chain, cfg, store, rs, ctx) {
         splitLogs(rc.logs, cfg, dl.blockNumber),
         fin.number
       );
+      continue;
+    }
+    if (dl.pendingRecord) {
+      // Authenticated already; only the price is missing. Retry just that, and keep the verified
+      // evidence whatever else fails (Codex #400-fix M4).
+      const price = await pricePair(chain, cfg, dl.pendingRecord.blockNumber);
+      if (price.error) store.putDeadLetter({ ...dl, reasons: ["price read failed"] });
+      else {
+        const rec = { ...dl.pendingRecord, price };
+        note(summary, store.putRecord(rec), rec);
+        store.resolveDeadLetter(dl.id);
+      }
       continue;
     }
     const log = {
