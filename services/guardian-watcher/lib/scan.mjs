@@ -625,12 +625,36 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   // but missing indexed topics, say) is a malformed answer, isolated, never silently dropped
   for (const l of t.sp) if (!decodeSp(l)) throw new Error("watched SP log does not decode");
   t.sp.sort((a, b) => logPos(a) - logPos(b));
+  // Inclusion, on every path (Codex follow-up R5): the block must be inside the range that was
+  // asked for and not past the finalized block, and every log must name the CANONICAL block at
+  // that height (a stale fork, or a backend lagging behind another, is refused here).
+  if (t.block > snapshot) throw new Error("watched log beyond the finalized block");
+  if (t.range && (t.block < t.range[0] || t.block > t.range[1]))
+    throw new Error("watched log outside the requested range");
+  const canon = (await header(chain, t.block)).hash;
+  for (const l of [...t.agg, ...t.sp])
+    if (l.blockHash !== undefined && l.blockHash !== null && !lcEq(l.blockHash, canon))
+      throw new Error("watched log from a non-canonical block");
   const SP = cfg.roles.superPaymaster;
   let tx;
   try {
     tx = await chain.getTransaction(txHash);
   } catch {
     tx = undefined;
+  }
+  // The tx response must be this tx, in this block: its sender, target and calldata are used for
+  // attribution on the direct path, where no receipt or trace cross-check runs.
+  if (tx) {
+    if (tx.hash !== undefined && tx.hash !== null && !lcEq(tx.hash, txHash))
+      throw new Error("transaction response names another tx");
+    if (tx.blockHash !== undefined && tx.blockHash !== null && !lcEq(tx.blockHash, canon))
+      throw new Error("transaction response from another block");
+    if (
+      tx.blockNumber !== undefined &&
+      tx.blockNumber !== null &&
+      parsePosition(tx.blockNumber) !== t.block
+    )
+      throw new Error("transaction response from another block");
   }
   const direct = tx && tx.to && lcEq(tx.to, SP);
   // SP events of a BLS tx count as an action's effects only when the trace, aligned log by log
@@ -647,32 +671,11 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     const watched = [...t.agg, ...t.sp];
     const stats = (summary.trace ??= {});
     const { trace, logs, rc } = await traceAndReceipt(chain, txHash, stats, watched.length > 0);
-    // The watched evidence fixes the inclusion: every watched log must name one block (Codex R13).
-    const wHashes = [
-      ...new Set(
-        watched
-          .map(w => w.blockHash)
-          .filter(Boolean)
-          .map(h => h.toLowerCase())
-      ),
-    ];
-    // Evidence without a block hash (a dead letter stored before it was kept): anchor on the
-    // canonical header at that height, never on whatever the receipt says (Codex #400-fix R14).
-    let anchor = wHashes[0] ?? null;
-    if (logs && !anchor && wHashes.length === 0) {
-      try {
-        anchor = (await header(chain, t.block)).hash;
-      } catch {
-        anchor = null;
-      }
-    }
-    const envelope = !logs
-      ? null
-      : wHashes.length > 1
-        ? "watched logs name different blocks"
-        : !anchor
-          ? "evidence block unavailable"
-          : envelopeProblem(txHash, tx, rc, trace, { blockNumber: t.block, blockHash: anchor });
+    // The inclusion is the canonical header at that height (every watched log was checked against
+    // it above), never the evidence's own claim (Codex follow-up R5).
+    const envelope = logs
+      ? envelopeProblem(txHash, tx, rc, trace, { blockNumber: t.block, blockHash: canon })
+      : null;
     // The receipt must contain every watched log getLogs returned for this tx, identical (address,
     // every topic, data) at the same position: an inconsistent receipt aligns with nothing it
     // should (Codex #400-fix R5, R6), and it is a health finding, not only a retry.
@@ -1212,7 +1215,12 @@ export async function tick(chain, cfg, store, rs, ctx) {
     ...extraSp.map(x => [x, "sp"]),
   ]) {
     const k = groupKey(l.transactionHash);
-    const t = byTx.get(k) ?? { block: parsePosition(l.blockNumber) ?? NaN, agg: [], sp: [] };
+    const t = byTx.get(k) ?? {
+      block: parsePosition(l.blockNumber) ?? NaN,
+      range: [from, to],
+      agg: [],
+      sp: [],
+    };
     const list = source === "agg" ? t.agg : t.sp;
     // Grouping never throws on log contents: a malformed position is judged inside the per-tx
     // isolation (Codex follow-up R1). Duplicates (bloom-recovered copies) are dropped by their

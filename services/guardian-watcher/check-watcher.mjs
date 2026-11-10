@@ -2584,6 +2584,37 @@ try {
       );
     }
 
+    // Codex follow-up R5: the tx response must be this tx; logs must be canonical and in range
+    {
+      const p = mk();
+      const ga = p.c.ownerTx([{ name: "GuardianSet", args: [addr("r5-a1"), addr("r5-a2")] }], {
+        from: KEEPER,
+      });
+      p.c.patchTx(ga.hash, { hash: ethers.id("r5-other-tx"), from: addr("r5-impostor") });
+      const gf = p.c.ownerTx([{ name: "GuardianSet", args: [addr("r5-f1"), addr("r5-f2")] }]);
+      p.c.patchLogs(gf.hash, { blockHash: ethers.id("r5-stale-fork") });
+      settle(p.c);
+      // a log past the finalized block, returned by the range query anyway
+      const gs = spIface.encodeEventLog("GuardianSet", [addr("r5-b1"), addr("r5-b2")]);
+      const beyond = p.c.ownerTx([]);
+      p.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: p.c.head() + 5,
+        index: 0,
+        transactionHash: beyond.hash,
+      });
+      const ps = (await runOnce(p.c.chain, p.cfg, p.store, rs, ident)).status;
+      const pd = p.store.listDeadLetters();
+      cell(
+        "follow-up R5: a tx response for another tx, a log from a stale fork, and a log past the finalized block are isolated, never attributed",
+        ps.ok === true &&
+          [ga.hash, gf.hash, beyond.hash].every(h => pd.some(x => x.txHash === h)) &&
+          !p.recs().some(r => [ga.hash, gf.hash, beyond.hash].includes(r.txHash)),
+        { ok: ps.ok, err: ps.lastError, dls: pd.map(x => [x.txHash.slice(0, 10), x.reasons]) }
+      );
+    }
+
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it
     const b = mk();

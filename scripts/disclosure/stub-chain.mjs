@@ -138,6 +138,7 @@ function makeChain() {
   const laggingTopics = new Map(); // block -> topic0 that the range getLogs omits
   let lagByHash = false; // ... and a by-hash re-read fails too (the node lacks the block)
   let noBloom = false; // headers without logsBloom
+  const txPatch = new Map(); // hash -> fields a mixed backend answers for getTransaction
   const receiptPatch = new Map(); // hash -> fields a stale backend answers differently
   const receiptLogs = new Map(); // hash -> logs a (inconsistent) RPC returns in the receipt instead
   const rawResults = []; // non-log values a broken RPC returns once in a range getLogs answer
@@ -173,7 +174,8 @@ function makeChain() {
         txFailures.set(h, left - 1);
         throw new Error("transient: tx lookup failed");
       }
-      return txs.get(h)?.tx ?? null;
+      const tx = txs.get(h)?.tx ?? null;
+      return tx && txPatch.has(h) ? { ...tx, ...txPatch.get(h) } : tx;
     },
     async getTransactionReceipt(h) {
       if (onReceipt) {
@@ -755,6 +757,7 @@ function makeChain() {
       logs.push({ blockNumber: n, blockHash: blocks.get(n).hash, index: 0, ...raw }),
     setReceiptLogs: (hash, l) => receiptLogs.set(hash, l),
     patchReceipt: (hash, p) => receiptPatch.set(hash, p),
+    patchTx: (hash, p) => txPatch.set(hash, p),
     failPriceReads: n => (priceFailures = n),
     /** Make block n's header bloom claim these logs ({ address, topics }) without them existing. */
     forceBloom: (n, fake) => forcedBlooms.set(n, bloomOf(fake)),
