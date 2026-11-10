@@ -734,6 +734,10 @@ function makeChain() {
     failTx: (hash, times) => txFailures.set(hash, times),
     setTraceMode: m => (traceMode = m),
     setUpperTopics: v => (upperTopics = v),
+    /** Patch the getLogs copy of a tx's logs (e.g. a contradictory position), not its receipt. */
+    patchLogs: (hash, patch) => {
+      for (const l of logs) if (l.transactionHash === hash) Object.assign(l, patch);
+    },
     /** A raw (possibly malformed) log the RPC returns from getLogs, at block n. */
     injectLog: (n, raw) =>
       logs.push({ blockNumber: n, blockHash: blocks.get(n).hash, index: 0, ...raw }),

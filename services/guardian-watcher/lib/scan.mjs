@@ -419,12 +419,17 @@ const selectorOf = data =>
 function evidenceLog(l) {
   // Best effort: a malformed log is kept as evidence as far as it can be (an isolated tx keeps
   // what the RPC said: #400 review L1), never a reason to lose the dead letter.
-  const pos = receiptPos(l);
+  // The RAW position fields and `removed` are kept as the RPC gave them: normalising here would
+  // turn contradictory evidence (index 0, logIndex 99) into valid evidence on retry (Codex
+  // follow-up R1).
+  const has = k => l?.[k] !== undefined && l?.[k] !== null;
   return {
     address: l?.address,
     topics: Array.isArray(l?.topics) ? [...l.topics] : l?.topics,
     data: l?.data,
-    index: pos ?? l?.index ?? l?.logIndex ?? null,
+    ...(has("index") ? { index: l.index } : {}),
+    ...(has("logIndex") ? { logIndex: l.logIndex } : {}),
+    ...(has("removed") ? { removed: l.removed } : {}),
     blockNumber: Number(l?.blockNumber),
     ...(l?.blockHash ? { blockHash: l.blockHash } : {}),
     transactionHash: l?.transactionHash,
@@ -515,6 +520,11 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   // else is a malformed RPC answer, isolated by the caller (#400 review L1).
   for (const l of [...t.agg, ...t.sp]) if (!validLog(l)) throw new Error("malformed watched log");
   for (const l of t.agg) if (l.topics.length < 2) throw new Error("aggregator log without a key");
+  // positions are judged here, inside the isolation, for every watched log
+  for (const l of [...t.agg, ...t.sp]) logPos(l);
+  // a watched SP log must decode against the pinned ABI: one that does not (a recognised topic
+  // but missing indexed topics, say) is a malformed answer, isolated, never silently dropped
+  for (const l of t.sp) if (!decodeSp(l)) throw new Error("watched SP log does not decode");
   t.sp.sort((a, b) => logPos(a) - logPos(b));
   const SP = cfg.roles.superPaymaster;
   let tx;
@@ -1057,7 +1067,11 @@ export async function tick(chain, cfg, store, rs, ctx) {
   for (const l of [...aggLogs, ...extraAgg, ...spLogs, ...extraSp]) {
     const t = byTx.get(l.transactionHash) ?? { block: Number(l.blockNumber), agg: [], sp: [] };
     const list = lcEq(l.address, cfg.aggregator) ? t.agg : t.sp;
-    if (!list.some(x => logPos(x) === logPos(l))) list.push(l);
+    // Grouping never throws on log contents: a malformed position is judged inside the per-tx
+    // isolation (Codex follow-up R1). Duplicates (bloom-recovered copies) are dropped by their
+    // raw position fields.
+    const key = x => JSON.stringify([x.index ?? null, x.logIndex ?? null]);
+    if (!list.some(x => key(x) === key(l))) list.push(l);
     byTx.set(l.transactionHash, t);
   }
   const ordered = [...byTx.entries()].sort((a, b) => a[1].block - b[1].block);

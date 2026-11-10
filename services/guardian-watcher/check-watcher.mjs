@@ -2196,6 +2196,67 @@ try {
       t1rec
     );
 
+    // Codex follow-up R1: malformed positions are isolated (not a halted scan), contradictory
+    // positions stay contradictory in the evidence, and an SP log that does not decode is isolated
+    const f1 = mk();
+    const blk = f1.c.mine();
+    const twoTx = ethers.id("fu-two");
+    const gsTopic = spIface.getEvent("GuardianSet").topicHash;
+    const pz = spIface.encodeEventLog("OperatorPaused", [addr("fu-two")]);
+    f1.c.injectLog(blk, { address: SP, ...pz, transactionHash: twoTx, index: 0 });
+    f1.c.injectLog(blk, { address: SP, ...pz, transactionHash: twoTx, index: "bad" });
+    f1.c.injectLog(blk, {
+      address: SP,
+      topics: [gsTopic],
+      data: "0x",
+      transactionHash: ethers.id("fu-undecodable"),
+    });
+    const contra = f1.c.ownerTx([{ name: "OperatorPaused", args: [addr("fu-contra")] }], {
+      from: KEEPER,
+      data: pauseSel,
+    });
+    f1.c.patchLogs(contra.hash, { logIndex: 99 }); // getLogs says index 0 AND logIndex 99
+    settle(f1.c);
+    const fs1 = (await runOnce(f1.c.chain, f1.cfg, f1.store, rs, ident)).status;
+    const fLater = f1.c.ownerTx([{ name: "GuardianSet", args: [addr("fu-g1"), addr("fu-g2")] }]);
+    settle(f1.c);
+    const fs2 = (await runOnce(f1.c.chain, f1.cfg, f1.store, rs, ident)).status;
+    const fDls = f1.store.listDeadLetters();
+    const contraDl = fDls.find(x => x.txHash === contra.hash);
+    cell(
+      "follow-up R1: a malformed position, a contradictory one and an undecodable SP log are each isolated (tick ok, cursor moves); evidence keeps the contradiction; no attribution on retry",
+      fs1.ok === true &&
+        fs1.isolatedThisTick === 3 &&
+        fs2.ok === true &&
+        f1.recs().some(r => r.txHash === fLater.hash) &&
+        fDls.some(x => x.txHash === twoTx) &&
+        fDls.some(x => x.txHash === ethers.id("fu-undecodable")) &&
+        contraDl?.watched?.[0]?.index === 0 &&
+        contraDl.watched[0].logIndex === 99 &&
+        !f1.recs().some(r => r.txHash === contra.hash),
+      {
+        fs1: [fs1.ok, fs1.isolatedThisTick, fs1.lastError],
+        fs2: fs2.ok,
+        contraDl: contraDl?.watched,
+      }
+    );
+
+    // a getLogs log marked removed stays removed in the evidence, so a retry still refuses it
+    const f2 = mk();
+    const rm1 = f2.c.ownerTx([{ name: "OperatorPaused", args: [addr("fu-removed")] }], {
+      from: KEEPER,
+      data: pauseSel,
+    });
+    f2.c.patchLogs(rm1.hash, { removed: true });
+    settle(f2.c);
+    for (let i = 0; i < 3; i++) await runOnce(f2.c.chain, f2.cfg, f2.store, rs, ident);
+    const rmDl = f2.store.listDeadLetters().find(x => x.txHash === rm1.hash);
+    cell(
+      "follow-up R1: a removed log is kept as removed in the evidence and never attributed on retry",
+      rmDl?.watched?.[0]?.removed === true && !f2.recs().some(r => r.txHash === rm1.hash),
+      { rmDl: rmDl?.watched, n: f2.recs().length }
+    );
+
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it
     const b = mk();
