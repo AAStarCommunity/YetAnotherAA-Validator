@@ -634,6 +634,46 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
 
 /** Entries that cannot be handled per tx (not a log object, no valid tx hash, or past a cap): one
  * final quarantine record per answer, keyed by its contents. */
+/** JSON text of a parsed JSON-RPC value without recursion, so nesting depth can never overflow the
+ * stack (follow-up #2 R5): a 10 000-deep array is encoded in full, never replaced by a placeholder.
+ * BigInt (not JSON, but a stub or a client may hand one over) is tagged as safeJson tags it. */
+class JsonLit {
+  constructor(s) {
+    this.s = s;
+  }
+}
+export function iterJson(root) {
+  const out = [];
+  const st = [root];
+  while (st.length) {
+    const x = st.pop();
+    if (x instanceof JsonLit) out.push(x.s);
+    else if (x === null || typeof x === "boolean") out.push(String(x));
+    else if (typeof x === "number") out.push(Number.isFinite(x) ? String(x) : "null");
+    else if (typeof x === "string") out.push(JSON.stringify(x));
+    else if (typeof x === "bigint") out.push(`{"$bigint":${JSON.stringify(x.toString())}}`);
+    else if (Array.isArray(x)) {
+      out.push("[");
+      st.push(new JsonLit("]"));
+      for (let k = x.length - 1; k >= 0; k--) {
+        st.push(x[k]);
+        if (k > 0) st.push(new JsonLit(","));
+      }
+    } else if (typeof x === "object") {
+      const keys = Object.keys(x);
+      out.push("{");
+      st.push(new JsonLit("}"));
+      for (let k = keys.length - 1; k >= 0; k--) {
+        st.push(x[keys[k]]);
+        st.push(new JsonLit(`${JSON.stringify(keys[k])}:`));
+        if (k > 0) st.push(new JsonLit(","));
+      }
+    } else out.push("null"); // undefined, function, symbol: what JSON would make of them
+  }
+  return out.join("");
+}
+const QUARANTINE_SAMPLE_CHARS = 2048;
+
 function quarantineRaw(store, rs, ctx, summary, bad, source, from, to, why = "not a log") {
   // Bounded (#403 follow-up, Codex R1): all set-aside entries of one query answer become ONE
   // quarantine record, with the total, up to QUARANTINE_SAMPLES distinct raw values (each with its
@@ -643,20 +683,28 @@ function quarantineRaw(store, rs, ctx, summary, bad, source, from, to, why = "no
   const counts = new Map();
   const hash = createHash("sha256");
   for (const x of bad) {
-    let raw;
-    try {
-      raw = safeJson(x) ?? typeof x;
-    } catch {
-      raw = `<unserialisable ${typeof x}>`;
-    }
+    // the full text of every entry is hashed (never a placeholder), whatever its depth
+    const raw = iterJson(x);
     hash.update(raw);
     hash.update("\n");
     counts.set(raw, (counts.get(raw) ?? 0) + 1);
   }
   const payloadSha256 = `0x${hash.digest("hex")}`;
-  const evidence = [...counts.entries()]
-    .slice(0, QUARANTINE_SAMPLES)
-    .map(([raw, count]) => ({ raw, count, source, range: [from, to] }));
+  // samples are bounded independently: a long entry keeps its first characters, its full length
+  // and its own sha256, so distinct entries stay distinct and each can be checked
+  const evidence = [...counts.entries()].slice(0, QUARANTINE_SAMPLES).map(([raw, count]) => ({
+    raw: raw.length > QUARANTINE_SAMPLE_CHARS ? raw.slice(0, QUARANTINE_SAMPLE_CHARS) : raw,
+    ...(raw.length > QUARANTINE_SAMPLE_CHARS
+      ? {
+          truncated: true,
+          rawLength: raw.length,
+          rawSha256: `0x${createHash("sha256").update(raw).digest("hex")}`,
+        }
+      : {}),
+    count,
+    source,
+    range: [from, to],
+  }));
   const distinct = counts.size;
   const qid = ethers.keccak256(
     ethers.toUtf8Bytes(safeJson([source, from, to, why, bad.length, payloadSha256]))
@@ -748,8 +796,23 @@ function typedEvidence(watched) {
       try {
         return JSON.parse(safeJson(item));
       } catch {
+        // what cannot be stored as JSON is kept as its full text's prefix, length and sha256
+        // (follow-up #2 R5), so distinct items stay distinct and each can be checked
+        let text = null;
+        try {
+          text = iterJson(item);
+        } catch {
+          text = null;
+        }
         return {
           raw: "<evidence too deep or too large to serialise>",
+          ...(text === null
+            ? {}
+            : {
+                rawPrefix: text.slice(0, QUARANTINE_SAMPLE_CHARS),
+                rawLength: text.length,
+                rawSha256: `0x${createHash("sha256").update(text).digest("hex")}`,
+              }),
           source: typeof item?.source === "string" ? item.source : null,
           range:
             Array.isArray(item?.range) &&
@@ -1541,9 +1604,11 @@ export async function tick(chain, cfg, store, rs, ctx) {
       for (const l of t.sp) overflow.sp.push(l);
       continue;
     }
-    const before = summary.txIsolations ?? 0;
+    // Any dead letter this tx wrote counts, thrown or not: a lookup that answers null writes one
+    // through fail() without throwing, and must spend the budget too (follow-up #2 R5).
+    const before = (summary.txIsolations ?? 0) + summary.deadLetters;
     await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
-    if ((summary.txIsolations ?? 0) > before) {
+    if ((summary.txIsolations ?? 0) + summary.deadLetters > before) {
       perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + 1);
       if (inRange(b)) inRangeIsolations++;
     }

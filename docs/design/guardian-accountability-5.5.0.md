@@ -501,16 +501,19 @@ aggregator-only.
     `UNREADABLE`, never an accusation and never dropped. One record per answer
     keeps the total, up to 10 distinct samples with their counts, the query
     source and range, and the sha256 of the whole raw payload, so the gap can be
-    audited. The payload itself is not stored: under the accepted RPC trust
-    model it records a node fault, not evidence against anyone, and unbounded
-    storage would be a new failure point.
-  - Per-tick budget: after 100 isolations of txs inside the scanned range, the
-    tick finishes the current block, stops, and sets the cursor there; the later
-    blocks are read again next tick. Only an in-range height can set the stop,
-    so the cursor always advances. Txs with no usable height, or a height
-    outside the range, belong to no later block: they are handled in the tick
-    that read them, never deferred. Dead-letter retries and those txs do not
-    count towards the budget.
+    audited. The payload is hashed in full, encoded without recursion, so no
+    nesting depth turns it into a placeholder; a sample longer than 2048
+    characters keeps its prefix, full length and own sha256, as does per-tx
+    evidence that cannot be stored as JSON. The payload itself is not stored:
+    under the accepted RPC trust model it records a node fault, not evidence
+    against anyone, and unbounded storage would be a new failure point.
+  - Per-tick budget: after 100 txs inside the scanned range wrote a dead letter
+    (thrown or not: a lookup that answers null counts), the tick finishes the
+    current block, stops, and sets the cursor there; the later blocks are read
+    again next tick. Only an in-range height can set the stop, so the cursor
+    always advances. Txs with no usable height, or a height outside the range,
+    belong to no later block: they are handled in the tick that read them, never
+    deferred. Dead-letter retries and those txs do not count towards the budget.
   - Per-block cap: past 2000 isolating txs in one block (more than any real
     block can carry), or in the shared bucket of txs outside the range, the
     excess goes into one quarantine record per query.

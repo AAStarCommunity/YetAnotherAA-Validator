@@ -3559,7 +3559,13 @@ try {
       out.manyDls === 150 &&
       out.deep.st.ok &&
       out.deepDls.length === 2 &&
-      /too deep or too large/.test(JSON.stringify(out.deepDls.map(x => x.watched))),
+      /too deep or too large/.test(JSON.stringify(out.deepDls.map(x => x.watched))) &&
+      // the placeholder keeps the full text's length and sha256 (follow-up #2 R5)
+      out.deepDls.some(x =>
+        (x.watched ?? []).some(
+          w => /^0x[0-9a-f]{64}$/.test(w.rawSha256 ?? "") && w.rawLength > 20_000
+        )
+      ),
     {
       objFlood: [out.objFlood.st.ok, out.objFlood.ms, out.objFloodQ],
       oneBlock: [out.oneBlock.st.ok, out.oneBlockDls],
@@ -4000,6 +4006,179 @@ try {
       t1: [t1.ok, t1.lastError, afterT1],
       t2: [t2.ok, t2.quarantinedThisTick, t2.quarantinedTotal, t2.scanned],
       recs,
+    }
+  );
+}
+
+// ---- follow-up #2 R5: dead letters written without a throw (a tx lookup answering null) spend
+// the budget and the per-block cap too
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r5-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("SlashCancelled", [addr("r5-op")]);
+  const out = {};
+  try {
+    const a = mk();
+    for (let i = 0; i < 160; i++) a.c.mine();
+    for (let i = 0; i < 150; i++)
+      a.c.injectLog(a.cfg.startBlock + i, {
+        address: SP,
+        ...gs,
+        transactionHash: ethers.id(`r5-many-${i}`),
+      });
+    for (let i = 0; i < 4; i++) a.c.mine();
+    out.a = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.aDls = a.store.listDeadLetters();
+    const b = mk();
+    for (let i = 0; i < 3; i++) b.c.mine();
+    for (let i = 0; i < 2100; i++)
+      b.c.injectLog(b.cfg.startBlock + 1, {
+        address: SP,
+        ...gs,
+        index: i,
+        transactionHash: ethers.id(`r5-one-${i}`),
+      });
+    for (let i = 0; i < 4; i++) b.c.mine();
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    out.bDls = b.store.listDeadLetters().length;
+    out.bQ = withQ(b.store).filter(x => x.quarantine).length;
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R5: null tx lookups (dead letters without a throw) spend the budget (150 over blocks: the tick stops at a block boundary) and the per-block cap (2100 in one block: 2000 dead letters + one quarantine)",
+    out.a.ok &&
+      out.a.budgetStopThisTick &&
+      out.a.cursor < out.a.finalized &&
+      out.aDls.length >= 100 &&
+      out.aDls.length < 150 &&
+      out.aDls.every(x => /transaction unavailable/.test(x.reasons.join(" "))) &&
+      out.b.ok &&
+      out.bDls === 2000 &&
+      out.bQ === 1,
+    {
+      a: [out.a.ok, out.a.cursor, out.a.finalized, out.aDls.length, out.aDls[0]?.reasons],
+      b: [out.b.ok, out.bDls, out.bQ],
+    }
+  );
+}
+
+// ---- follow-up #2 R5: deep JSON is hashed and sampled in full (no placeholder): distinct deep
+// entries stay distinct, the payload digest is of the real text
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-deepq-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const N = 10_000;
+  const nest = leaf => {
+    let v = leaf;
+    for (let i = 0; i < N; i++) v = [v];
+    return v;
+  };
+  const texts = ["a", "b"].map(l => "[".repeat(N) + JSON.stringify(l) + "]".repeat(N));
+  let st, q;
+  try {
+    c.injectRawResult(SP, nest("a"));
+    c.injectRawResult(SP, nest("b"));
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    q = withQ(store).find(x => x.quarantine);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const want = createHash("sha256");
+  for (const t of texts) want.update(t + "\n");
+  const sh = t => `0x${createHash("sha256").update(t).digest("hex")}`;
+  const ev = q?.evidence ?? [];
+  cell(
+    "two distinct 10 000-deep entries: one quarantine, two samples (prefix, full length, own sha256), payload sha256 of the full text",
+    st?.ok &&
+      q &&
+      q.distinct === 2 &&
+      ev.length === 2 &&
+      q.payloadSha256 === `0x${want.digest("hex")}` &&
+      ev.every(e => e.truncated && e.rawLength === texts[0].length && e.raw.length <= 2048) &&
+      new Set(ev.map(e => e.rawSha256)).size === 2 &&
+      ev.every(e => texts.map(sh).includes(e.rawSha256)) &&
+      !JSON.stringify(ev).includes("unserialisable"),
+    {
+      ok: st?.ok,
+      err: st?.lastError,
+      distinct: q?.distinct,
+      ev: ev.map(e => [e.truncated, e.rawLength, e.rawSha256?.slice(0, 10)]),
+    }
+  );
+}
+
+// ---- a busy, healthy range spends no budget: 150 healthy txs are recorded in one tick, not degraded
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-busy-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  let st, recs;
+  try {
+    // one failing tx first (a null lookup), so a dead letter already exists in this tick
+    c.mine();
+    c.injectLog(cfg.startBlock, {
+      address: SP,
+      ...spIface.encodeEventLog("SlashCancelled", [addr("busy-bad")]),
+      transactionHash: ethers.id("busy-bad"),
+    });
+    for (let i = 0; i < 150; i++)
+      c.ownerTx([{ name: "SlashCancelled", args: [addr(`busy-${i}`)] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    recs = store.countRecords();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "one failing tx then 150 healthy txs in one tick: all recorded, no budget stop (healthy txs spend nothing), the cursor reaches finalized",
+    st.ok &&
+      recs === 150 &&
+      !st.budgetStopThisTick &&
+      st.cursor === st.finalized &&
+      st.deadLetters === 1,
+    {
+      ok: st.ok,
+      recs,
+      budget: st.budgetStopThisTick,
+      cursor: st.cursor,
+      fin: st.finalized,
+      dls: st.deadLetters,
+      deg: st.degraded,
     }
   );
 }
