@@ -89,6 +89,51 @@ contract DeployOverIssueVerifier is Script {
     ///         canonical-pin note at the domain-parity gate below.
     string internal constant SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.11.0";
 
+    /// @dev True unless `v` is exactly "BLSAggregator-<major>.<minor>.<patch>" optionally followed by
+    ///      "-<suffix>" (non-empty, [0-9A-Za-z.-]), each number 1-6 digits with no leading zero
+    ///      (except "0" itself), and
+    ///      (major, minor) < (4, 13). Anything that does not parse is treated as new (fail closed).
+    function _isAnchoredCommitmentRelease(string memory v) internal pure returns (bool) {
+        bytes memory b = bytes(v);
+        bytes memory prefix = bytes("BLSAggregator-");
+        if (b.length <= prefix.length) return true;
+        for (uint256 i = 0; i < prefix.length; i++) {
+            if (b[i] != prefix[i]) return true;
+        }
+        (bool ok1, uint256 major, uint256 i1) = _readStrictUint(b, prefix.length);
+        if (!ok1 || i1 >= b.length || b[i1] != ".") return true;
+        (bool ok2, uint256 minor, uint256 i2) = _readStrictUint(b, i1 + 1);
+        if (!ok2 || i2 >= b.length || b[i2] != ".") return true;
+        (bool ok3,, uint256 i3) = _readStrictUint(b, i2 + 1);
+        if (!ok3) return true;
+        if (i3 != b.length) {
+            // "-<suffix>": non-empty, [0-9A-Za-z.-] only.
+            if (b[i3] != "-" || i3 + 1 == b.length) return true;
+            for (uint256 k = i3 + 1; k < b.length; k++) {
+                bytes1 c = b[k];
+                bool okc = (c >= "0" && c <= "9") || (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || c == "."
+                    || c == "-";
+                if (!okc) return true;
+            }
+        }
+        return major > 4 || (major == 4 && minor >= 13);
+    }
+
+    /// @dev Reads 1-6 decimal digits at `i` with no leading zero (a lone "0" is allowed). The six-digit
+    ///      limit is part of the grammar (it refuses e.g. "3.1000000.0" and "4.12.1000000"), and it also
+    ///      bounds the arithmetic.
+    function _readStrictUint(bytes memory b, uint256 i) private pure returns (bool ok, uint256 n, uint256 end) {
+        end = i;
+        while (end < b.length && b[end] >= "0" && b[end] <= "9") {
+            if (end - i == 6) return (false, 0, end);
+            n = n * 10 + (uint8(b[end]) - 48);
+            end++;
+        }
+        if (end == i) return (false, 0, end);
+        if (b[i] == "0" && end - i > 1) return (false, 0, end);
+        ok = true;
+    }
+
     /// @notice Minimum acceptable on-chain arming delay for a fraud-proof verifier rotation.
     ///         SP pins `VERIFIER_ROTATION_DELAY = GUARDIAN_SLASH_CASE_WINDOW = 4 days`
     ///         (BLSAggregator.sol:386/394). This script refuses to hand a verifier to an
@@ -194,6 +239,17 @@ contract DeployOverIssueVerifier is Script {
         require(
             keccak256(bytes(reportedVersion)) == keccak256(bytes(expectedVersion)),
             "AGGREGATOR.version() != expected: re-verify the fraud-proof ABI and the arming path for that release, then set EXPECTED_AGGREGATOR_VERSION"
+        );
+        // GATE A' — NO OVERRIDE PAST r3b. BLSAggregator-4.13.0 (SP rc.8 r3b) changed the signer
+        // commitment this verifier recomputes: it is now keyed per path and ends with
+        // blockhash(block.number - 1) (BLSAggregator.sol @ f00be603 :1376-1386). This verifier's
+        // `_commitmentMatches` predates that tuple, so on 4.13.0+ it can never verify a fraud proof:
+        // arming it would install a fraud-proof authority that silently never fires. 5.5.0 arms no
+        // verifier at all (M0 D9: fraudProofVerifier == 0); the 5.5.x historical-state verifier is
+        // a new contract. EXPECTED_AGGREGATOR_VERSION cannot lift this gate.
+        require(
+            !_isAnchoredCommitmentRelease(reportedVersion),
+            "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
         );
 
         // GATE B — ARMING DELAY. Independent of Gate A, and deliberately not implied by it: the

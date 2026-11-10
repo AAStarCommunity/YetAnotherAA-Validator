@@ -235,7 +235,8 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///      direction — a MINIMUM here proves nothing, which is why the earlier bound was removed.
     uint256 internal constant MAX_BLOCK_SECONDS = 24;
 
-    /// @dev SP's `GUARDIAN_EXIT_DELAY` (BLSAggregator.sol:387) — a constant, not governable. A frozen
+    /// @dev SP's `GUARDIAN_EXIT_DELAY` (2 days in BLSAggregator-4.11.0; still 2 days in 4.13.0, :437)
+    ///      — a constant, not governable. A frozen
     ///      set stays usable for exactly this long, which is the window inside which SP guarantees a
     ///      member that was staked at freeze time still has stake that can be slashed.
     uint256 internal constant GUARDIAN_EXIT_DELAY = 2 days;
@@ -651,12 +652,16 @@ contract AAStarCommitteeValidator is AAStarValidator {
     ///      combined across incompatible schedules.
     function _epochUsable(uint256 e) internal view returns (bool) {
         return epochPinned[e] && epochConfigVersion[e] == configVersion
-        // STRICTLY less than, not <=. SP's `consumeGuardianExit` admits an exit at
-        // `block.timestamp == readyAt` (BLSAggregator.sol:1803). A node that was clean at freeze time
-        // (readyAt == 0 is required) and filed in that same second matures at exactly
+        // STRICTLY less than, not <=. Up to BLSAggregator-4.12, SP's `consumeGuardianExit` admits an
+        // exit at `block.timestamp == readyAt`. A node that was clean at freeze time (readyAt == 0 is
+        // required) and filed in that same second matures at exactly
         // freezeTime + GUARDIAN_EXIT_DELAY == epochSetValidUntil — so at that instant it can already
-        // have withdrawn, while `validate` never re-reads the Registry. Reads only this contract's own
-        // storage, so validate() stays ERC-7562 clean.
+        // have withdrawn, while `validate` never re-reads the Registry. From 4.13.0 (SP rc.8) the
+        // node leaves signer masks at readyAt but can withdraw only at
+        // readyAt + GUARDIAN_FRAUD_CHALLENGE (1 day; BLSAggregator.sol @ f00be603 :1894), so this
+        // bound is then a day more conservative than it needs to be; it is kept so the contract is
+        // correct against either release. Reads only this contract's own storage, so validate()
+        // stays ERC-7562 clean.
         && block.timestamp < epochSetValidUntil[e];
     }
 
