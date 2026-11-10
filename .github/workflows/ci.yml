@@ -261,6 +261,14 @@ jobs:
       - name: Run tests
         run: forge test -vvv
 
+      - name: Release artifact identity (compiler, evmVersion, pinned hashes)
+        run: |
+          FOUNDRY_PROFILE=release forge build --force src/disclosure/DisclosureRegistry.sol
+          A=out-release/DisclosureRegistry.sol/DisclosureRegistry.json
+          jq -r '.metadata.compiler.version, .metadata.settings.evmVersion' "$A"
+          echo "creation $(cast keccak "$(jq -r .bytecode.object "$A")")"
+          echo "runtime  $(cast keccak "$(jq -r .deployedBytecode.object "$A")")"
+
       - name: Disclosure tests under the release profile (cancun, the deployed artifact)
         run: FOUNDRY_PROFILE=release forge test --match-path 'test/**/Disclosure*'
 

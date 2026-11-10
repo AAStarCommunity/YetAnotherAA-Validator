@@ -30,6 +30,13 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 evm_version = "cancun"
+# Reproducible pins (PR #402 review M1): the CBOR metadata embeds the auto-detected remappings,
+# which depend on the checkout's (nested) submodules, so CI and a laptop hashed differently.
+# The release artifact carries no metadata and an exact compiler: its hash covers code only.
+# The evmVersion is then checked from the artifact JSON by the deploy script.
+solc = "0.8.33"
+bytecode_hash = "none"
+cbor_metadata = false
 # The parity vectors, and the release artifact whose metadata (evmVersion) the deploy script reads.
 fs_permissions = [
   { access = "read", path = "./test/fixtures" },

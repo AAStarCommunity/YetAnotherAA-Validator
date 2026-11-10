@@ -42,6 +42,12 @@ contract DisclosureDeployGuardTest is Test {
         return keccak256(bytes(vm.envOr("FOUNDRY_PROFILE", string("default")))) == keccak256("release");
     }
 
+    /// Under the default profile out-release may not exist; the cells that reach the JSON are
+    /// release-only, so the default cells pass an empty document.
+    function _json() internal view returns (string memory) {
+        return _release() ? s.artifactJson() : "{}";
+    }
+
     function _runtime() internal view returns (bytes memory) {
         return vm.getDeployedCode("DisclosureRegistry.sol:DisclosureRegistry");
     }
@@ -52,7 +58,7 @@ contract DisclosureDeployGuardTest is Test {
         vm.skip(_release());
         bytes memory c = type(DisclosureRegistry).creationCode;
         vm.expectRevert(abi.encodeWithSelector(DeployDisclosureRegistry.WrongCreationCode.selector, keccak256(c)));
-        s.checkArtifact(c, _runtime());
+        s.checkArtifact(c, _runtime(), _json());
     }
 
     function test_default_osakaRuntimeDiffersFromPin() public {
@@ -65,23 +71,55 @@ contract DisclosureDeployGuardTest is Test {
 
     function test_release_pinnedArtifactAccepted() public {
         vm.skip(!_release());
-        s.checkArtifact(type(DisclosureRegistry).creationCode, _runtime());
+        s.checkArtifact(type(DisclosureRegistry).creationCode, _runtime(), _json());
     }
 
     function test_release_tamperedRuntimeRefused() public {
         vm.skip(!_release());
         bytes memory r = _runtime();
         r[100] = bytes1(uint8(r[100]) ^ 1);
+        string memory j = _json(); // before expectRevert: _json() is itself an external call
         vm.expectRevert(abi.encodeWithSelector(DeployDisclosureRegistry.WrongRuntimeCode.selector, keccak256(r)));
-        s.checkArtifact(type(DisclosureRegistry).creationCode, r);
+        s.checkArtifact(type(DisclosureRegistry).creationCode, r, j);
+    }
+
+    /// L1: the evmVersion check fires on its own (code is identical across forks without metadata).
+    function test_release_otherEvmVersionRefused() public {
+        vm.skip(!_release());
+        string memory j = vm.replace(_json(), '"evmVersion":"cancun"', '"evmVersion":"osaka"');
+        assertTrue(keccak256(bytes(j)) != keccak256(bytes(_json())), "fixture edit applied");
+        vm.expectRevert(abi.encodeWithSelector(DeployDisclosureRegistry.WrongEvmVersion.selector, "osaka"));
+        s.checkArtifact(type(DisclosureRegistry).creationCode, _runtime(), j);
+    }
+
+    function test_release_otherCompilerRefused() public {
+        vm.skip(!_release());
+        string memory j =
+            vm.replace(_json(), '"version":"0.8.33+commit.64118f21"', '"version":"0.8.34+commit.00000000"');
+        assertTrue(keccak256(bytes(j)) != keccak256(bytes(_json())), "fixture edit applied");
+        vm.expectRevert(
+            abi.encodeWithSelector(DeployDisclosureRegistry.WrongCompiler.selector, "0.8.34+commit.00000000")
+        );
+        s.checkArtifact(type(DisclosureRegistry).creationCode, _runtime(), j);
+    }
+
+    /// L2: run() end to end (env in, broadcast, read-back), not only its parts.
+    function test_release_runDeploysAndReadsBack() public {
+        vm.skip(!_release());
+        vm.setEnv("WRITER", vm.toString(writer));
+        vm.setEnv("AGGREGATOR", vm.toString(agg));
+        DisclosureRegistry reg = s.run();
+        assertEq(reg.WRITER(), writer);
+        assertEq(address(reg.AGGREGATOR()), agg);
     }
 
     function test_release_tamperedCreationRefused() public {
         vm.skip(!_release());
         bytes memory c = type(DisclosureRegistry).creationCode;
         c[10] = bytes1(uint8(c[10]) ^ 1);
+        string memory j = _json();
         vm.expectRevert(abi.encodeWithSelector(DeployDisclosureRegistry.WrongCreationCode.selector, keccak256(c)));
-        s.checkArtifact(c, _runtime());
+        s.checkArtifact(c, _runtime(), j);
     }
 
     function test_release_readBackMatchesDeployment() public {

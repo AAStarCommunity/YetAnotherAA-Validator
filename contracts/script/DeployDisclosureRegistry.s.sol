@@ -20,12 +20,14 @@ interface IValidatorSetView {
  * @dev Deploys the guardian-watcher DisclosureRegistry (M0 §4) ONLY from the pinned release
  *      artifact (DSR, 2026-11-10). The guard is mechanical, not a convention to remember:
  *        1. the creation code compiled into this script must hash to CREATION_HASH and the
- *           artifact's runtime code (immutables zeroed) to RUNTIME_HASH. Both pins include the
- *           CBOR metadata, which commits to the compiler settings, so a build with any other
- *           evmVersion, optimizer setting or source is refused. The default profile (osaka, for
- *           the gas-profile test) fails here by construction;
- *        2. the artifact's metadata must report evmVersion "cancun" (SP's release profile,
- *           SuperPaymaster foundry.toml [profile.default]:12, all three 5.5.0 chains);
+ *           artifact's runtime code (immutables zeroed) to RUNTIME_HASH. The release profile
+ *           emits no CBOR metadata (PR #402 review M1: the metadata embeds checkout-dependent
+ *           remappings), so the pins cover code only and reproduce on any checkout with solc
+ *           0.8.33. The default profile (osaka, with metadata) fails here by construction;
+ *        2. the artifact JSON must report evmVersion "cancun" (SP's release profile,
+ *           SuperPaymaster foundry.toml [profile.default]:12, all three 5.5.0 chains) and the
+ *           pinned compiler. With no metadata in the code this is the check that refuses a build
+ *           for another fork whose code happens to be identical;
  *        3. the writer must not be the deployer, the aggregator's owner or any registered guardian
  *           (validatorAtSlot[1..MAX_VALIDATORS]) (M0 §5.5); the aggregator must be a contract
  *           whose owner and validator set read (fail closed);
@@ -37,18 +39,20 @@ interface IValidatorSetView {
  *           script/DeployDisclosureRegistry.s.sol:DeployDisclosureRegistry --rpc-url .. --broadcast
  *
  *      The pins are those of DisclosureRegistry at master fda7e425 (DVT #401), built with solc
- *      0.8.33+commit.64118f21, viaIR, optimizer 200 runs, evmVersion cancun. A source change to
+ *      0.8.33+commit.64118f21, viaIR, optimizer 200 runs, evmVersion cancun, no CBOR metadata. A source change to
  *      the registry requires a new release build, new pins here and a new DSR sign-off.
  */
 contract DeployDisclosureRegistry is Script {
-    bytes32 public constant CREATION_HASH = 0x1a4ff2084116fdaba2ad66e1417f34d251b67356dae9159d1a0fcb61d069dacc;
-    bytes32 public constant RUNTIME_HASH = 0x92ad2cc5a985e348f602945570dc90d1382b4eeda2509440cadddb71ab5452ac;
+    bytes32 public constant CREATION_HASH = 0x7346e9b951528f96045e9690855eef00fb657f46a3b40ce134fbe46375bfa3d6;
+    bytes32 public constant RUNTIME_HASH = 0xa2f234d2bec41b73248711a8d9aa4f4be588c9ebeffd872277e8733809850a46;
     string public constant ARTIFACT = "out-release/DisclosureRegistry.sol/DisclosureRegistry.json";
     string public constant EVM_VERSION = "cancun";
+    string public constant COMPILER = "0.8.33+commit.64118f21";
 
     error WrongCreationCode(bytes32 got);
     error WrongRuntimeCode(bytes32 got);
     error WrongEvmVersion(string got);
+    error WrongCompiler(string got);
     error WriterIsDeployer();
     error WriterIsAggregatorOwner();
     error AggregatorHasNoCode();
@@ -57,16 +61,21 @@ contract DeployDisclosureRegistry is Script {
     error DeployedCodeMismatch(bytes32 got, bytes32 want);
     error GetterMismatch();
 
+    /// @notice The release artifact's JSON (compiler settings live here, not in the code).
+    function artifactJson() public view returns (string memory) {
+        return vm.readFile(string.concat(vm.projectRoot(), "/", ARTIFACT));
+    }
+
     /// @notice Steps 1 and 2: the artifact is the pinned release build.
-    function checkArtifact(bytes memory creation, bytes memory runtimeZeroed) public view {
+    function checkArtifact(bytes memory creation, bytes memory runtimeZeroed, string memory json) public pure {
         bytes32 c = keccak256(creation);
         if (c != CREATION_HASH) revert WrongCreationCode(c);
         bytes32 r = keccak256(runtimeZeroed);
         if (r != RUNTIME_HASH) revert WrongRuntimeCode(r);
-        string memory ev = vm.parseJsonString(
-            vm.readFile(string.concat(vm.projectRoot(), "/", ARTIFACT)), ".metadata.settings.evmVersion"
-        );
+        string memory ev = vm.parseJsonString(json, ".metadata.settings.evmVersion");
         if (keccak256(bytes(ev)) != keccak256(bytes(EVM_VERSION))) revert WrongEvmVersion(ev);
+        string memory cv = vm.parseJsonString(json, ".metadata.compiler.version");
+        if (keccak256(bytes(cv)) != keccak256(bytes(COMPILER))) revert WrongCompiler(cv);
     }
 
     /// @notice Step 3: role separation.
@@ -117,7 +126,7 @@ contract DeployDisclosureRegistry is Script {
         address writer = vm.envAddress("WRITER");
         address aggregator = vm.envAddress("AGGREGATOR");
         bytes memory runtimeZeroed = vm.getDeployedCode("DisclosureRegistry.sol:DisclosureRegistry");
-        checkArtifact(type(DisclosureRegistry).creationCode, runtimeZeroed);
+        checkArtifact(type(DisclosureRegistry).creationCode, runtimeZeroed, artifactJson());
         vm.startBroadcast();
         (, address deployer,) = vm.readCallers();
         checkRoles(writer, deployer, aggregator);
