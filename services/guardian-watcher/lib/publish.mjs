@@ -26,9 +26,12 @@
 //   pinners:  [{ name, upload(bytes) -> { cid }, fetchPublic(cid) -> Uint8Array | null }]
 //   mirror:   { commit(path, bytes, message) -> { commit, url } }   (idempotent, see above)
 //   telegram: { send(text) -> void }
-//   registry: { entryOf(kind, key) -> entryId (0 = none), binding(entryId) -> bytes32,
-//               sign(args) -> { raw, hash, nonce }, broadcast(raw) -> void,
-//               receipt(hash) -> { status, entryId } | null, nonce() -> number }
+//   registry: { finalized() -> block number,
+//               entryOf(kind, key, { blockTag }) -> entryId (0 = none),
+//               entry(entryId, { blockTag }) -> { binding, recordURI, recordHash, amendments[] },
+//               sign(args, { nonce?, replace? }) -> { raw, hash, nonce }, broadcast(raw) -> void,
+//               receipt(hash) -> { status, entryId, blockNumber } | null,
+//               nonce() -> the writer's nonce at the FINALIZED block }
 import { ethers } from "ethers";
 import { Kind } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { recordFile, mirrorPath } from "./record-file.mjs";
@@ -110,6 +113,15 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   const file = recordFile(rec);
   const state = { ...prev, pins: { ...(prev.pins ?? {}) } };
   const alerts = [];
+  // Unresolved registry incidents are re-alerted on EVERY run, before anything can return early.
+  const inc = prev.registry;
+  if ((inc?.phase === "conflict" || inc?.phase === "reverted") && !inc.ack) {
+    alerts.push(
+      inc.phase === "conflict"
+        ? `registry: entry ${inc.entryId} for this action has ${inc.conflict ?? "a conflict"}; INCIDENT, unresolved until acknowledged`
+        : `registry: disclose tx reverted (${inc.reason ?? "no reason recorded"}); unresolved until acknowledged`
+    );
+  }
   if (state.cid && state.cid !== file.cid) {
     // Records are immutable once stored; a different CID means the bytes changed underneath us.
     alerts.push(
@@ -220,7 +232,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
 
   if (rec.route === "bls" && sinks.registry && state.registry?.phase !== "confirmed") {
     try {
-      await advanceRegistry(rec, file, sinks.registry, state, persist, alerts);
+      await advanceRegistry(rec, file, sinks.registry, state, persist, alerts, opts);
     } catch (e) {
       if (e instanceof PersistError) throw e;
       alerts.push(`registry: ${errMsg(e)}`);
@@ -229,44 +241,55 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   return { state, alerts };
 }
 
-async function advanceRegistry(rec, file, reg, state, persist, alerts) {
+export const DEFAULT_MAX_PENDING_MS = 30 * 60_000;
+
+/** Effective record content of an existing entry: the latest amendment wins, in order. */
+function effectiveContent(entry) {
+  const last = (entry.amendments ?? []).at(-1);
+  return {
+    recordURI: last?.recordURI ?? entry.recordURI,
+    recordHash: String(last?.recordHash ?? entry.recordHash).toLowerCase(),
+  };
+}
+
+/**
+ * Registry stage. Every read that decides completion is taken at the FINALIZED block, so a reorg
+ * cannot leave a "confirmed" that is no longer on chain. Phases:
+ *   signed -> sent -> landed (receipt ok, not yet final) -> confirmed (final, content verified)
+ *   reverted | conflict (parked, re-alerted by publishRecord until acknowledged)
+ */
+async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
   const r = state.registry;
-  if (r?.phase === "conflict") {
-    if (!r.ack)
-      alerts.push(
-        `registry: entry ${r.entryId} for this action has a different binding; unresolved until acknowledged`
-      );
-    return;
-  }
-  if (r?.phase === "reverted") {
-    // Parked, not retried blindly (an out-of-gas or a bad input needs a human). Re-alerted every
-    // time until an operator acknowledges it (state.registry.ack), so it cannot go silent.
-    if (!r.ack)
-      alerts.push(
-        `registry: disclose tx ${r.hash} reverted (${r.reason ?? "no reason recorded"}); unresolved until acknowledged`
-      );
-    return;
-  }
-  if (r?.phase === "signed" || r?.phase === "sent") {
-    // Same raw tx, never a new one: rebroadcasting a known tx is harmless.
+  if (r?.phase === "conflict" || r?.phase === "reverted") return; // alerted by publishRecord
+  const maxPendingMs = opts.maxPendingMs ?? DEFAULT_MAX_PENDING_MS;
+
+  if (r?.phase === "signed" || r?.phase === "sent" || r?.phase === "landed") {
+    // Rebroadcast the latest raw of the journal (never a newly signed one for the same nonce
+    // unless replacing a stuck tx below); a known tx is harmless.
     try {
       await reg.broadcast(r.raw);
-    } catch {
-      /* "already known" / "nonce too low" are expected here; the receipt decides */
+    } catch (e) {
+      state.registry = { ...r, lastBroadcastError: String(e?.message ?? e) };
     }
-    if (r.phase === "signed") {
-      state.registry = { ...r, phase: "sent" };
-      await persist(state);
+    if (r.phase === "signed")
+      state.registry = {
+        ...state.registry,
+        phase: "sent",
+        sentAt: r.sentAt ?? new Date().toISOString(),
+      };
+    await persist(state);
+    // Any of the journalled hashes (original and replacements) may be the one that landed.
+    let rc = null;
+    for (const h of state.registry.hashes ?? [state.registry.hash]) {
+      rc = await reg.receipt(h);
+      if (rc) break;
     }
-    const rc = await reg.receipt(r.hash);
     if (rc && Number(rc.status) === 1 && rc.entryId != null) {
-      state.registry = { ...state.registry, phase: "confirmed", entryId: rc.entryId };
-      await persist(state);
-      return;
+      return settleLanded(rec, file, reg, state, persist, alerts, rc);
     }
     if (rc && Number(rc.status) !== 1) {
       // Reverted - possibly AlreadyDisclosed because another tx of ours landed first.
-      if (await adoptExisting(rec, reg, state, persist, alerts)) return;
+      if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
       state.registry = {
         ...state.registry,
         phase: "reverted",
@@ -275,39 +298,82 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts) {
       };
       await persist(state);
       alerts.push(
-        `registry: disclose tx ${r.hash} reverted (${state.registry.reason}); unresolved until acknowledged`
+        `registry: disclose tx reverted (${state.registry.reason}); unresolved until acknowledged`
       );
       return;
     }
     if (rc && rc.entryId == null) {
-      alerts.push(`registry: tx ${r.hash} succeeded without a Disclosed event`);
+      alerts.push(`registry: a disclose tx succeeded without a Disclosed event`);
       return;
     }
-    // No receipt yet. If our nonce is already used, this tx was replaced or dropped: start over.
-    // nonce() must be the writer's nonce at a FINALIZED block: a mined nonce, past reorgs, and with
-    // the receipt indexes caught up. A pending or latest view would misread a broadcast or a
-    // not-yet-indexed receipt as a drop.
-    if ((await reg.nonce()) > r.nonce) {
-      alerts.push(`registry: tx ${r.hash} (nonce ${r.nonce}) was dropped or replaced; re-signing`);
+    // No receipt. Nonce consumed at the FINALIZED block without any of our hashes landing: the
+    // journalled txs are dead. On-chain uniqueness makes a re-sign safe.
+    if ((await reg.nonce()) > state.registry.nonce) {
+      alerts.push(
+        `registry: disclose tx (nonce ${state.registry.nonce}) was dropped or replaced; re-signing`
+      );
       state.registry = null;
       await persist(state);
     } else {
-      return; // pending; next tick
+      const age = Date.now() - Date.parse(state.registry.sentAt ?? new Date().toISOString());
+      if (age < maxPendingMs) return; // pending; next tick
+      // Stuck (evicted or underpriced) with its nonce unused: replace it at the SAME nonce with a
+      // higher fee, journalled before broadcast like the original.
+      alerts.push(
+        `registry: disclose tx pending ${Math.round(age / 60000)} min; replacing at nonce ${state.registry.nonce}`
+      );
+      const rep = await reg.sign(discloseArgs(rec, file), {
+        nonce: state.registry.nonce,
+        replace: true,
+      });
+      const hashes = [...(state.registry.hashes ?? [state.registry.hash]), rep.hash];
+      state.registry = {
+        ...state.registry,
+        raw: rep.raw,
+        hash: rep.hash,
+        hashes,
+        sentAt: new Date().toISOString(),
+        replacements: (state.registry.replacements ?? 0) + 1,
+      };
+      await persist(state); // journal BEFORE broadcast
+      await reg.broadcast(rep.raw);
+      return;
     }
   }
   // Nothing in flight: an entry may already exist (an earlier publication completed elsewhere).
-  if (await adoptExisting(rec, reg, state, persist, alerts)) return;
+  if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
   const signed = await reg.sign(discloseArgs(rec, file));
-  state.registry = { phase: "signed", raw: signed.raw, hash: signed.hash, nonce: signed.nonce };
+  state.registry = {
+    phase: "signed",
+    raw: signed.raw,
+    hash: signed.hash,
+    hashes: [signed.hash],
+    nonce: signed.nonce,
+  };
   await persist(state); // journal BEFORE broadcast
   await reg.broadcast(signed.raw);
-  state.registry = { ...state.registry, phase: "sent" };
+  state.registry = { ...state.registry, phase: "sent", sentAt: new Date().toISOString() };
   await persist(state);
-  const rc = await reg.receipt(signed.hash);
-  if (rc && Number(rc.status) === 1 && rc.entryId != null) {
-    state.registry = { ...state.registry, phase: "confirmed", entryId: rc.entryId };
+}
+
+/** A successful receipt: confirmed only once final and the entry at the finalized block is ours. */
+async function settleLanded(rec, file, reg, state, persist, alerts, rc) {
+  const fin = await reg.finalized();
+  if (rc.blockNumber == null || Number(rc.blockNumber) > fin) {
+    state.registry = {
+      ...state.registry,
+      phase: "landed",
+      entryId: String(rc.entryId),
+      landedBlock: rc.blockNumber,
+    };
     await persist(state);
+    return;
   }
+  if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
+  // Final receipt but no entry at the finalized block: inconsistent RPC; stay landed, alert.
+  state.registry = { ...state.registry, phase: "landed", entryId: String(rc.entryId) };
+  await persist(state);
+  alerts.push(`registry: receipt final but entry ${rc.entryId} not visible at the finalized block`);
 }
 
 /** The binding the registry stores for this record's entry (DisclosureRegistry._append). */
@@ -320,20 +386,44 @@ export function expectedBinding(rec) {
   );
 }
 
-/** If the registry already holds this action's entry, adopt it (same binding) or flag a conflict. */
-async function adoptExisting(rec, reg, state, persist, alerts) {
-  const id = BigInt(await reg.entryOf(Kind[rec.kind], BigInt(rec.key)));
+/**
+ * If the registry already holds this action's entry AT THE FINALIZED BLOCK, adopt it only if both
+ * its binding and its effective record content (URI and hash, after amendments) are this record's.
+ * Anything else is an incident: a different binding, or the right binding with other content (for
+ * example written by a compromised writer key). Both are parked and re-alerted.
+ */
+async function adoptExisting(rec, file, reg, state, persist, alerts) {
+  const fin = await reg.finalized();
+  const id = BigInt(await reg.entryOf(Kind[rec.kind], BigInt(rec.key), { blockTag: fin }));
   if (id === 0n) return false;
-  const stored = String(await reg.binding(id)).toLowerCase();
-  if (stored === expectedBinding(rec).toLowerCase()) {
-    state.registry = { phase: "confirmed", entryId: id.toString(), recovered: true };
+  const e = await reg.entry(id, { blockTag: fin });
+  const bindingOk = String(e.binding).toLowerCase() === expectedBinding(rec).toLowerCase();
+  const eff = effectiveContent(e);
+  const contentOk =
+    eff.recordHash === file.recordHash.toLowerCase() && eff.recordURI === `ipfs://${file.cid}`;
+  if (bindingOk && contentOk) {
+    state.registry = {
+      ...(state.registry ?? {}),
+      phase: "confirmed",
+      entryId: id.toString(),
+      recovered: !state.registry?.hash,
+      finalizedAt: fin,
+    };
     await persist(state);
     return true;
   }
-  state.registry = { phase: "conflict", entryId: id.toString(), storedBinding: stored };
+  const why = !bindingOk ? "a different binding" : "the right binding but different record content";
+  state.registry = {
+    ...(state.registry ?? {}),
+    phase: "conflict",
+    entryId: id.toString(),
+    conflict: why,
+    storedBinding: e.binding,
+    storedContent: eff,
+  };
   await persist(state);
   alerts.push(
-    `registry: entry ${id} for this action has a different binding; unresolved until acknowledged`
+    `registry: entry ${id} for this action has ${why}; INCIDENT, unresolved until acknowledged`
   );
   return true;
 }

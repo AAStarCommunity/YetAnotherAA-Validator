@@ -1,34 +1,43 @@
-// CI self-test for W2 publication (lib/cid.mjs, lib/record-file.mjs, lib/publish.mjs) with mock
-// sinks. Live provider cells (Pinata, Filebase) are separate and wait for the author's accounts.
+// CI self-test for W2 publication (lib/cid.mjs, lib/record-file.mjs, lib/publish.mjs, lib/lock.mjs)
+// with mock sinks. Live provider cells (Pinata, Filebase) are separate and wait for the author's
+// accounts.
 import { ethers } from "ethers";
 import { MAX_RECORD_BYTES, cidV1Raw } from "./lib/cid.mjs";
 import { recordFile, mirrorPath } from "./lib/record-file.mjs";
 import { publishRecord, discloseArgs, expectedBinding, PersistError } from "./lib/publish.mjs";
 import { acquireLock } from "./lib/lock.mjs";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
-// Mock-sink runs that do not exercise the journal say so explicitly (the library refuses otherwise).
-const pub = (rec, s, prev = {}, opts = {}) =>
-  publishRecord(rec, s, prev, opts.persist ? opts : { ...opts, unsafeNoJournal: true });
 
 const results = [];
 const j = v => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
 const cell = (name, ok, got) => results.push({ name, ok: !!ok, got: ok ? "" : j(got) });
+// Mock-sink runs that do not exercise the journal say so explicitly (the library refuses otherwise).
+const pub = (rec, s, prev = {}, opts = {}) =>
+  publishRecord(rec, s, prev, opts.persist ? opts : { ...opts, unsafeNoJournal: true });
+/** Run publication until the registry settles (or `max` runs), as successive watcher ticks would. */
+async function settle(rec, s, prev = {}, opts = {}, max = 4) {
+  let r = await pub(rec, s, prev, opts);
+  for (
+    let i = 1;
+    i < max && !["confirmed", "conflict", "reverted"].includes(r.state.registry?.phase);
+    i++
+  ) {
+    r = await pub(rec, s, r.state, opts);
+  }
+  return r;
+}
 
 // ---- CID vectors, cross-checked with Kubo 0.41.0 `ipfs add --only-hash --cid-version 1 --raw-leaves`
 const pattern = n => Uint8Array.from({ length: n }, (_, i) => (i * 7 + 3) % 256);
 cell(
   "CID: empty file",
   cidV1Raw(new Uint8Array()) === "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
-  cidV1Raw(new Uint8Array())
+  null
 );
 cell(
   "CID: exactly 262,144 bytes (still one raw block)",
   cidV1Raw(pattern(MAX_RECORD_BYTES)) ===
     "bafkreih4mbpgbbmrcjifkrtxbk4fbp57ajbuqqkawqwr62xjkvv3vj3yjy",
-  cidV1Raw(pattern(MAX_RECORD_BYTES))
+  null
 );
 cell(
   "CID: a 27-byte JSON record",
@@ -97,7 +106,8 @@ cell(
   mirrorPath(bls, f1.cid)
 );
 
-// ---- mock sinks
+// ---- mock sinks. The mock registry follows DisclosureRegistry: one entry per (kind, key), the
+// binding keccak256(abi.encode(kind, key, subjectToken)), entries visible at a block, finality.
 function sinks(opts = {}) {
   const calls = { telegram: 0, sign: 0, broadcast: 0, mirror: 0, uploads: {}, texts: [] };
   const stored = new Map();
@@ -119,17 +129,31 @@ function sinks(opts = {}) {
       return stored.get(`${name}:${cid}`) ?? null;
     },
   });
-  const chainState = {
+  const chain = {
     nonce: 0,
+    block: 1000,
+    finalizedLag: 0, // finalized = block - finalizedLag
+    mined: opts.mine ?? "success", // success | revert | pending
+    entries: new Map(), // id -> { binding, recordURI, recordHash, amendments, block }
+    byAction: new Map(), // "kind:key" -> id
     receipts: new Map(),
-    mined: opts.mine ?? "success",
-    entryOf: opts.existing?.entryId,
-    binding: opts.existing?.binding,
+    signedArgs: new Map(),
   };
+  if (opts.existing) {
+    chain.entries.set(9n, { amendments: [], block: 1, ...opts.existing });
+    chain.byAction.set(`${opts.existing.kind ?? 0}:${opts.existing.key ?? 7n}`, 9n);
+  }
+  const bindingOf = a =>
+    ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(
+        ["uint8", "uint256", "address"],
+        [a.signed.kind, a.signed.proposalId, a.subjectToken]
+      )
+    );
   return {
     calls,
     pinOpts,
-    chainState,
+    chain,
     pinners: [mkPinner("pinata"), mkPinner("filebase")],
     mirror: {
       async commit(path) {
@@ -147,35 +171,54 @@ function sinks(opts = {}) {
       },
     },
     registry: {
-      async entryOf() {
-        return chainState.entryOf ?? 0n;
+      async finalized() {
+        return chain.block - chain.finalizedLag;
       },
-      async binding() {
-        return chainState.binding ?? ethers.ZeroHash;
+      async entryOf(kind, key, { blockTag } = {}) {
+        const id = chain.byAction.get(`${kind}:${key}`);
+        if (!id) return 0n;
+        return chain.entries.get(id).block <= (blockTag ?? chain.block) ? id : 0n;
       },
-      async sign(args) {
+      async entry(id) {
+        return chain.entries.get(BigInt(id));
+      },
+      async sign(args, o = {}) {
         calls.sign++;
         calls.lastArgs = args;
-        const nonce = chainState.nonce;
-        return { raw: `0xraw${calls.sign}`, hash: ethers.id(`disclose-${calls.sign}`), nonce };
+        calls.lastSignOpts = o;
+        const raw = `0xraw${calls.sign}`;
+        chain.signedArgs.set(raw, args);
+        return { raw, hash: ethers.id(`disclose-${calls.sign}`), nonce: o.nonce ?? chain.nonce };
       },
       async broadcast(raw) {
         calls.broadcast++;
         calls.lastRaw = raw;
-        if (chainState.mined === "success" || chainState.mined === "revert") {
-          const n = Number(raw.slice(5));
-          chainState.receipts.set(ethers.id(`disclose-${n}`), {
-            status: chainState.mined === "success" ? 1 : 0,
-            entryId: chainState.mined === "success" ? n : null,
+        const hash = ethers.id(`disclose-${raw.slice(5)}`);
+        if (chain.mined === "pending" || chain.receipts.has(hash)) return;
+        const a = chain.signedArgs.get(raw);
+        const act = `${a.signed.kind}:${a.signed.proposalId}`;
+        chain.block++;
+        if (chain.mined === "revert" || chain.byAction.has(act)) {
+          chain.receipts.set(hash, { status: 0, entryId: null, blockNumber: chain.block });
+        } else {
+          const id = BigInt(chain.entries.size + 1);
+          chain.entries.set(id, {
+            binding: bindingOf(a),
+            recordURI: a.recordURI,
+            recordHash: a.recordHash,
+            amendments: [],
+            block: chain.block,
           });
-          chainState.nonce = Math.max(chainState.nonce, 1);
+          chain.byAction.set(act, id);
+          chain.receipts.set(hash, { status: 1, entryId: id, blockNumber: chain.block });
         }
+        chain.nonce = Math.max(chain.nonce, 1);
       },
       async receipt(hash) {
-        return chainState.receipts.get(hash) ?? null;
+        return chain.receipts.get(hash) ?? null;
       },
       async nonce() {
-        return chainState.nonce;
+        return chain.nonce;
       },
     },
   };
@@ -183,9 +226,9 @@ function sinks(opts = {}) {
 
 {
   const s = sinks();
-  const r1 = await pub(bls, s);
+  const r1 = await settle(bls, s);
   cell(
-    "happy path: both pins current, mirror committed, published, Telegram once, registry confirmed",
+    "happy path: both pins current, mirror, published, Telegram once, registry confirmed at finality",
     r1.state.published &&
       r1.state.pins.pinata.current &&
       r1.state.pins.filebase.current &&
@@ -214,13 +257,12 @@ function sinks(opts = {}) {
   );
   const r2 = await pub(bls, s, r1.state);
   cell(
-    "re-run is idempotent: no new upload, Telegram, sign or broadcast",
+    "re-run after confirmation is idempotent: no new upload, Telegram, sign or broadcast",
     s.calls.telegram === 1 &&
       s.calls.sign === 1 &&
-      s.calls.broadcast === 1 &&
       s.calls.uploads.pinata === 1 &&
       s.calls.mirror === 1 &&
-      r2.state.published,
+      r2.state.registry.phase === "confirmed",
     s.calls
   );
 }
@@ -242,7 +284,6 @@ function sinks(opts = {}) {
     s.calls.uploads
   );
 }
-
 {
   const s = sinks({ pinata: { wrongCid: true }, filebase: { fail: true } });
   const r = await pub(bls, s);
@@ -298,39 +339,115 @@ function sinks(opts = {}) {
     s.calls
   );
 }
+
+// ---- adoption of an existing entry: binding AND content, at the finalized block
 {
-  const s = sinks({ existing: { entryId: 9n, binding: expectedBinding(bls) } });
+  const s = sinks({
+    existing: {
+      binding: expectedBinding(bls),
+      recordURI: `ipfs://${f1.cid}`,
+      recordHash: f1.recordHash,
+    },
+  });
   const r = await pub(bls, s);
   cell(
-    "an entry already in the registry with this record's binding is adopted, not re-signed",
-    s.calls.sign === 0 && r.state.registry.recovered && r.state.registry.entryId === "9",
+    "existing entry with this binding and this content: adopted, not re-signed",
+    s.calls.sign === 0 &&
+      r.state.registry.phase === "confirmed" &&
+      r.state.registry.entryId === "9",
     r.state.registry
-  );
-  const s2 = sinks({ existing: { entryId: 9n, binding: ethers.id("another action's binding") } });
-  const r2 = await pub(bls, s2);
-  const r3 = await pub(bls, s2, r2.state);
-  cell(
-    "an existing entry with a DIFFERENT binding is a conflict: not confirmed, not re-signed, re-alerted",
-    r3.state.registry.phase === "conflict" &&
-      s2.calls.sign === 0 &&
-      r3.alerts.some(x => /different binding/.test(x)),
-    { reg: r3.state.registry, alerts: r3.alerts }
   );
 }
 {
-  const s = sinks();
-  const r = await pub(bls, s, { cid: "bafkreiother" });
+  const s = sinks({
+    existing: {
+      binding: expectedBinding(bls),
+      recordURI: "ipfs://bafkreievil",
+      recordHash: ethers.id("evil"),
+    },
+  });
+  const r1 = await pub(bls, s);
+  const r2 = await pub(bls, s, r1.state);
   cell(
-    "record bytes changed after first publication: refused, alerted, nothing sent",
-    s.calls.mirror === 0 && s.calls.sign === 0 && r.alerts.some(x => /changed/.test(x)),
-    r
+    "existing entry with the RIGHT binding but OTHER content (e.g. compromised writer): incident, not adopted",
+    r2.state.registry.phase === "conflict" &&
+      /different record content/.test(r2.state.registry.conflict) &&
+      s.calls.sign === 0 &&
+      r2.alerts.some(x => /INCIDENT/.test(x)),
+    { reg: r2.state.registry, alerts: r2.alerts }
+  );
+}
+{
+  const s = sinks({
+    existing: {
+      binding: expectedBinding(bls),
+      recordURI: "ipfs://bafkreitypo",
+      recordHash: ethers.id("typo"),
+      amendments: [{ recordURI: `ipfs://${f1.cid}`, recordHash: f1.recordHash }],
+    },
+  });
+  const r = await pub(bls, s);
+  cell(
+    "an amended entry is compared on its effective (amended) content: adopted",
+    r.state.registry.phase === "confirmed",
+    r.state.registry
+  );
+}
+{
+  const s = sinks({
+    existing: {
+      binding: ethers.id("another action"),
+      recordURI: `ipfs://${f1.cid}`,
+      recordHash: f1.recordHash,
+    },
+  });
+  const r = await pub(bls, s);
+  cell(
+    "existing entry with a DIFFERENT binding: incident",
+    r.state.registry.phase === "conflict" && /different binding/.test(r.state.registry.conflict),
+    r.state.registry
+  );
+}
+{
+  // Entry exists but only above the finalized block: not adopted yet.
+  const s = sinks({
+    existing: {
+      binding: expectedBinding(bls),
+      recordURI: `ipfs://${f1.cid}`,
+      recordHash: f1.recordHash,
+      block: 5000,
+    },
+  });
+  s.chain.finalizedLag = 10; // head 1000, finalized 990: the entry at 995 is on chain but not final
+  s.chain.entries.get(9n).block = 995;
+  const r = await pub(bls, s);
+  cell(
+    "an entry not yet finalized is not adopted (a reorg could remove it)",
+    r.state.registry?.phase !== "confirmed",
+    r.state.registry
   );
 }
 
-// ---- crash points (Codex W2a review): the journal makes each stage repeatable
+// ---- finality, revert, drop, stuck
 {
-  // Crash right after broadcast: the state persisted last says "signed". On restart the SAME raw
-  // tx is rebroadcast; no second signature, hence no second entry.
+  const s = sinks();
+  s.chain.finalizedLag = 100; // receipts land above the finalized block
+  const r1 = await settle(bls, s, {}, {}, 3);
+  cell(
+    "receipt above the finalized block: 'landed', not confirmed",
+    r1.state.registry.phase === "landed",
+    r1.state.registry
+  );
+  s.chain.finalizedLag = 0;
+  const r2 = await pub(bls, s, r1.state);
+  cell(
+    "…confirmed once final, without re-signing",
+    r2.state.registry.phase === "confirmed" && s.calls.sign === 1,
+    { reg: r2.state.registry, calls: s.calls }
+  );
+}
+{
+  // Crash right after broadcast: on restart the SAME raw tx is rebroadcast; no second signature.
   const s = sinks({ mine: "pending" });
   let snapshot = null;
   let crash = true;
@@ -339,7 +456,7 @@ function sinks(opts = {}) {
     snapshot = JSON.parse(j(st));
   };
   try {
-    await pub(bls, s, {}, { persist });
+    await publishRecord(bls, s, {}, { persist });
   } catch {
     /* crashed */
   }
@@ -349,10 +466,10 @@ function sinks(opts = {}) {
     snapshot?.registry
   );
   crash = false;
-  s.chainState.mined = "success";
-  const r = await pub(bls, s, snapshot, { persist });
+  s.chain.mined = "success";
+  const r = await settle(bls, s, snapshot, { persist });
   cell(
-    "…restart rebroadcasts the same raw tx, never signs again, and confirms on the receipt",
+    "…restart rebroadcasts the same raw tx, never signs again, and confirms at finality",
     s.calls.sign === 1 && s.calls.lastRaw === "0xraw1" && r.state.registry.phase === "confirmed",
     { calls: s.calls, reg: r.state.registry }
   );
@@ -366,29 +483,97 @@ function sinks(opts = {}) {
     r2.state.registry.phase === "sent" && s.calls.sign === 1,
     { reg: r2.state.registry, calls: s.calls }
   );
-  s.chainState.nonce = 5; // our nonce was consumed by another tx: this one was dropped/replaced
+  s.chain.nonce = 5; // our nonce consumed at the finalized block, no receipt: dropped/replaced
   const r3 = await pub(bls, s, r2.state);
   cell(
-    "a dropped tx (nonce consumed, no receipt) is detected and re-signed once",
+    "a dropped tx is detected and re-signed once (on-chain uniqueness makes this safe)",
     s.calls.sign === 2 && r3.alerts.some(x => /dropped or replaced/.test(x)),
     { calls: s.calls, alerts: r3.alerts }
   );
 }
 {
-  const s = sinks({ mine: "revert" });
-  const r1 = await pub(bls, s);
-  const r2 = await pub(bls, s, r1.state);
-  const r3 = await pub(bls, s, r2.state);
+  // Stuck: no receipt, nonce never consumed. After maxPendingMs it is replaced at the same nonce.
+  const s = sinks({ mine: "pending" });
+  const r1 = await pub(bls, s, {}, { maxPendingMs: 0 });
+  const r2 = await pub(bls, s, r1.state, { maxPendingMs: 0 });
   cell(
-    "a reverted disclose tx: alerted, marked reverted, not blindly re-signed",
-    r3.state.registry.phase === "reverted" &&
-      s.calls.sign === 1 &&
-      r2.alerts.some(x => /reverted/.test(x)),
-    { reg: r3.state.registry, calls: s.calls, a: r2.alerts }
+    "a stuck tx (nonce unused) is replaced at the SAME nonce, alerted, with both hashes journalled",
+    s.calls.sign === 2 &&
+      s.calls.lastSignOpts.replace === true &&
+      s.calls.lastSignOpts.nonce === r1.state.registry.nonce &&
+      r2.state.registry.hashes.length === 2 &&
+      r2.alerts.some(x => /replacing at nonce/.test(x)),
+    { calls: s.calls, reg: r2.state.registry, alerts: r2.alerts }
+  );
+  s.chain.mined = "success";
+  const r3 = await settle(bls, s, r2.state, { maxPendingMs: 1e9 });
+  cell(
+    "…and whichever journalled hash lands is confirmed",
+    r3.state.registry.phase === "confirmed",
+    r3.state.registry
   );
 }
 {
-  // A pin verified earlier no longer serves: reverify demotes it and re-uploads.
+  const s = sinks({ mine: "revert" });
+  const r1 = await settle(bls, s);
+  const r2 = await pub(bls, s, r1.state);
+  const r3 = await pub(bls, s, r2.state);
+  const acked = { ...r3.state, registry: { ...r3.state.registry, ack: true } };
+  const r4 = await pub(bls, s, acked);
+  cell(
+    "reverted: parked, re-alerted on every run until acknowledged, then silent; never re-signed",
+    r1.state.registry.phase === "reverted" &&
+      r2.alerts.some(x => /unresolved/.test(x)) &&
+      r3.alerts.some(x => /unresolved/.test(x)) &&
+      !r4.alerts.some(x => /reverted/.test(x)) &&
+      s.calls.sign === 1,
+    { a2: r2.alerts, a3: r3.alerts, a4: r4.alerts, calls: s.calls }
+  );
+}
+{
+  // An unresolved incident is re-alerted even when publication returns early (no current pin).
+  const s = sinks({ pinata: { fail: true }, filebase: { fail: true } });
+  const prev = { registry: { phase: "conflict", entryId: "9", conflict: "a different binding" } };
+  const r = await pub(bls, s, prev);
+  cell(
+    "an unresolved incident is re-alerted even when nothing can be published this run",
+    !r.state.published && r.alerts.some(x => /INCIDENT/.test(x)),
+    r.alerts
+  );
+}
+{
+  // A revert because the action is already disclosed by another of our txs: adopted, not parked.
+  const s = sinks();
+  const args = discloseArgs(bls, f1);
+  s.chain.entries.set(1n, {
+    binding: expectedBinding(bls),
+    recordURI: args.recordURI,
+    recordHash: args.recordHash,
+    amendments: [],
+    block: 900,
+  });
+  s.chain.byAction.set("0:7", 1n);
+  // the journal says one of our txs was sent; the chain shows it reverted (AlreadyDisclosed)
+  s.chain.receipts.set(ethers.id("disclose-x"), { status: 0, entryId: null, blockNumber: 999 });
+  const r = await pub(bls, s, {
+    registry: {
+      phase: "sent",
+      raw: "0xrawx",
+      hash: ethers.id("disclose-x"),
+      hashes: [ethers.id("disclose-x")],
+      nonce: 0,
+      sentAt: new Date().toISOString(),
+    },
+  });
+  cell(
+    "revert because the action is already disclosed with our content: confirmed",
+    r.state.registry.phase === "confirmed",
+    r.state.registry
+  );
+}
+
+// ---- other stages
+{
   const s = sinks();
   const r1 = await pub(bls, s);
   s.pinOpts.pinata.gone = true;
@@ -411,14 +596,12 @@ function sinks(opts = {}) {
   );
 }
 {
-  // A provider no longer configured does not count.
   const s = sinks({ filebase: { fail: true } });
-  s.pinners = [s.pinners[1]]; // only filebase configured now, and it fails
+  s.pinners = [s.pinners[1]];
   const r = await pub(bls, s, { pins: { pinata: { current: true } }, cid: f1.cid });
   cell("a pin at a provider no longer configured is not counted", !r.state.published, r.state);
 }
 {
-  // Telegram accepted the message but the ack was lost: at-least-once, re-sent marked.
   const s = sinks({ telegramAckLost: true });
   const r1 = await pub(bls, s);
   const r2 = await pub(bls, s, r1.state);
@@ -429,33 +612,12 @@ function sinks(opts = {}) {
   );
 }
 {
-  // A revert caused by AlreadyDisclosed (another of our txs landed first): adopted, not parked.
-  const s = sinks({ mine: "revert" });
-  const r1 = await pub(bls, s);
-  s.chainState.entryOf = 1n;
-  s.chainState.binding = expectedBinding(bls);
-  const r2 = await pub(bls, s, r1.state);
+  const s = sinks();
+  const r = await pub(bls, s, { cid: "bafkreiother" });
   cell(
-    "revert because the action is already disclosed (same binding): confirmed",
-    r2.state.registry.phase === "confirmed" && r2.state.registry.recovered,
-    r2.state.registry
-  );
-}
-{
-  // A reverted tx stays parked and is re-alerted every run until acknowledged.
-  const s = sinks({ mine: "revert" });
-  const r1 = await pub(bls, s);
-  const r2 = await pub(bls, s, r1.state);
-  const r3 = await pub(bls, s, r2.state);
-  const acked = { ...r3.state, registry: { ...r3.state.registry, ack: true } };
-  const r4 = await pub(bls, s, acked);
-  cell(
-    "reverted: re-alerted on every run until acknowledged, then silent",
-    r2.alerts.some(x => /unresolved/.test(x)) &&
-      r3.alerts.some(x => /unresolved/.test(x)) &&
-      !r4.alerts.some(x => /reverted/.test(x)) &&
-      s.calls.sign === 1,
-    { a2: r2.alerts, a3: r3.alerts, a4: r4.alerts }
+    "record bytes changed after first publication: refused, alerted, nothing sent",
+    s.calls.mirror === 0 && s.calls.sign === 0 && r.alerts.some(x => /changed/.test(x)),
+    r
   );
 }
 {
@@ -512,35 +674,6 @@ function sinks(opts = {}) {
   );
 }
 {
-  const d = mkdtempSync(join(tmpdir(), "watcher-lock-"));
-  try {
-    const path = join(d, "publish.lock");
-    const release = acquireLock(path);
-    let second = null;
-    try {
-      acquireLock(path);
-    } catch (e) {
-      second = e.message;
-    }
-    cell(
-      "single-instance lock: a second holder is refused",
-      /another watcher holds/.test(second ?? ""),
-      second
-    );
-    release();
-    writeFileSync(path, JSON.stringify({ pid: 999999, startedAt: "long ago" }));
-    const again = acquireLock(path);
-    cell(
-      "single-instance lock: a stale lock (dead pid) is reclaimed",
-      typeof again === "function",
-      null
-    );
-    again();
-  } finally {
-    rmSync(d, { recursive: true, force: true });
-  }
-}
-{
   const unverified = { ...bls, ruleset: { commit: null, hash: ethers.id("rs"), verified: false } };
   const a = discloseArgs(unverified, recordFile(unverified));
   cell(
@@ -554,6 +687,30 @@ function sinks(opts = {}) {
     q.signed.kind === 2 && q.signed.proposalId === 0n,
     q.signed
   );
+}
+{
+  // Single-instance lock: an OS-held socket; a second holder is refused, release frees it.
+  const port = 47000 + Math.floor(Math.random() * 1000);
+  const release = await acquireLock(port);
+  let second = null;
+  try {
+    await acquireLock(port);
+  } catch (e) {
+    second = e.message;
+  }
+  cell(
+    "single-instance lock: a second holder is refused",
+    /another watcher holds the lock/.test(second ?? ""),
+    second
+  );
+  await release();
+  const again = await acquireLock(port);
+  cell(
+    "single-instance lock: free again after release (and on exit, by the kernel)",
+    typeof again === "function",
+    null
+  );
+  await again();
 }
 
 let failed = 0;

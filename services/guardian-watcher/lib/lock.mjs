@@ -1,51 +1,29 @@
-// Single-instance lock for the watcher's publication loop (Codex W2a R2): two processes must not
-// publish the same records (and must not share the writer's nonces). O_EXCL lockfile holding the
-// owner's pid and start time; a lock whose pid is no longer alive is reclaimed. The holder reloads
-// state after acquiring, so it never acts on a snapshot taken before another holder's writes.
-import { openSync, writeSync, closeSync, readFileSync, unlinkSync } from "node:fs";
+// Single-instance lock for the watcher's publication loop (Codex W2a R2/R3): two processes must not
+// publish the same records, share journals, or compete for the writer's nonces.
+//
+// The lock is an OS-held resource, not a file: a listening TCP socket on 127.0.0.1:<port>. Binding is
+// atomic (EADDRINUSE for every second holder), and the kernel releases it when the process exits,
+// however it exits, so there is no stale state to reclaim and no pid-reuse or unlink race. This is
+// a single-host mechanism by construction (the watcher runs only on the Mac Mini, M0 §5.1); a
+// multi-host deployment would need a distributed lock with fencing instead.
+import { createServer } from "node:net";
 
-function alive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e.code === "EPERM"; // exists but not ours: treat as alive
-  }
-}
+export const DEFAULT_LOCK_PORT = 47331;
 
-/** Acquire `path` or throw. Returns release(). */
-export function acquireLock(path) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(path, "wx", 0o600);
-      writeSync(
-        fd,
-        JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + "\n"
-      );
-      closeSync(fd);
-      return () => {
-        try {
-          const cur = JSON.parse(readFileSync(path, "utf8"));
-          if (cur.pid === process.pid) unlinkSync(path);
-        } catch {
-          /* already gone */
-        }
-      };
-    } catch (e) {
-      if (e.code !== "EEXIST") throw e;
-      let holder = null;
-      try {
-        holder = JSON.parse(readFileSync(path, "utf8"));
-      } catch {
-        holder = null;
-      }
-      if (holder && Number.isSafeInteger(holder.pid) && alive(holder.pid)) {
-        throw new Error(
-          `another watcher holds ${path} (pid ${holder.pid}, since ${holder.startedAt})`
-        );
-      }
-      unlinkSync(path); // stale: its owner is gone
-    }
-  }
-  throw new Error(`could not acquire ${path}`);
+/** Acquire the lock or throw. Resolves to release(). */
+export function acquireLock(port = DEFAULT_LOCK_PORT) {
+  return new Promise((resolve, reject) => {
+    const srv = createServer(sock => sock.destroy());
+    srv.once("error", e =>
+      reject(
+        e.code === "EADDRINUSE"
+          ? new Error(`another watcher holds the lock (127.0.0.1:${port} in use)`)
+          : e
+      )
+    );
+    srv.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+      srv.unref(); // never keeps the process alive on its own
+      resolve(() => new Promise(r => srv.close(() => r())));
+    });
+  });
 }
