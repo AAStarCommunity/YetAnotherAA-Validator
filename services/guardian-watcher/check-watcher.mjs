@@ -20,11 +20,17 @@ import {
 } from "../../scripts/disclosure/stub-chain.mjs";
 import { spIface } from "./lib/sp-abi.mjs";
 import { validateRuleset, evaluate, matchGeneric } from "./lib/rules.mjs";
-import { MAX_DEADLETTER_ATTEMPTS, traceUnsupported, verifyTrace, sameLog } from "./lib/scan.mjs";
+import {
+  MAX_DEADLETTER_ATTEMPTS,
+  traceUnsupported,
+  verifyTrace,
+  sameLog,
+  envelopeProblem,
+} from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
-import { attributeLogs, flattenTraceLogs } from "./lib/attribute.mjs";
+import { attributeLogs, flattenTraceLogs, validLog, receiptPos } from "./lib/attribute.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const rs = validateRuleset(JSON.parse(readFileSync(join(HERE, "ruleset.json"), "utf8")));
@@ -1526,6 +1532,42 @@ try {
       !caseR.trace.thisTick.inconsistent && caseR.trace.thisTick.verified === 1 && caseR.healthy,
       caseR.trace
     );
+    // R11: a trace whose root is not the tx (input or sender differ) is inconsistent
+    const rootCase = async (patch, tag) => {
+      const r = mk();
+      const sx = r.c.ownerTx(pause(`r11-${tag}`), keeper);
+      const a = spIface.encodeEventLog("OperatorPaused", [addr(`r11-${tag}`)]);
+      r.c.setTrace(sx.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: a.topics, data: a.data }],
+        ...patch,
+      });
+      settle(r.c);
+      r.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+      const st = (await runOnce(r.c.chain, r.cfg, r.store, rs, ident, { now: T0 + 1 })).status;
+      const recs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+      return { st, recs };
+    };
+    const rootIn = await rootCase({ input: "0xdeadbeef" }, "input");
+    const rootFrom = await rootCase({ from: addr("r11-other") }, "from");
+    const rootOk = await rootCase({}, "ok");
+    cell(
+      "trace R11: a trace root that is not the tx (input or sender differ) is inconsistent: no record, no proof, degraded",
+      [rootIn, rootFrom].every(
+        x =>
+          x.st.trace.thisTick.inconsistent === 1 &&
+          !x.st.trace.thisTick.verified &&
+          x.recs.length === 0 &&
+          x.st.healthy === false
+      ) &&
+        rootOk.st.healthy === true &&
+        rootOk.st.trace.thisTick.verified === 1 &&
+        rootOk.recs.length === 1,
+      { rootIn: rootIn.st.trace, rootFrom: rootFrom.st.trace, rootOk: rootOk.st.trace }
+    );
     cell(
       "trace R8: a receipt with an extra watched log, or a duplicated position on any log, is inconsistent",
       extraW.trace.thisTick.inconsistent === 1 &&
@@ -1756,6 +1798,147 @@ try {
         good.aligned === true &&
         good.spCall.get(0)?.from === addr("child"),
       { bad, good: [...good.spCall] }
+    );
+  }
+  {
+    const pz = spIface.encodeEventLog("OperatorPaused", [addr("r11u")]);
+    const L = { address: SP, topics: pz.topics, data: pz.data };
+    cell(
+      "validLog: string 20-byte address, <=4 32-byte topics, even-length hex data; LOG0 ok",
+      validLog(L) &&
+        validLog({ ...L, topics: [] }) &&
+        !validLog({ ...L, address: [SP] }) &&
+        !validLog({ ...L, address: "0x1" }) &&
+        !validLog({ ...L, topics: [[pz.topics[0]]] }) &&
+        !validLog({ ...L, topics: ["0x1"] }) &&
+        !validLog({ ...L, topics: Array(5).fill(pz.topics[0]) }) &&
+        !validLog({ ...L, data: "0x1" }) &&
+        !validLog({ ...L, data: ["0x"] }) &&
+        !validLog({ ...L, data: undefined }) &&
+        attributeLogs(
+          { type: "CALL", to: SP, logs: [{ ...L, address: [SP] }] },
+          [{ ...L, index: 0 }],
+          AGG,
+          SP
+        ).aligned === false,
+      null
+    );
+    const bads = [false, true, [], [0], "", " 1", "1e0", "0b1", -1, 1.5].map(v =>
+      receiptPos({ index: v })
+    );
+    const t2 = n => ({ type: "CALL", to: SP, logs: Array(n).fill(L) });
+    cell(
+      "receiptPos strict (aliases must agree); receipt positions must be unique and contiguous (a nonzero offset is fine)",
+      bads.every(x => x === null) &&
+        receiptPos({ index: 0, logIndex: 99 }) === null &&
+        receiptPos({ index: 3, logIndex: "0x3" }) === 3 &&
+        receiptPos({ logIndex: "0x2" }) === 2 &&
+        attributeLogs(
+          t2(2),
+          [
+            { ...L, index: 0 },
+            { ...L, index: 2 },
+          ],
+          AGG,
+          SP
+        ).aligned === false &&
+        attributeLogs(
+          t2(2),
+          [
+            { ...L, index: 5 },
+            { ...L, index: 6 },
+          ],
+          AGG,
+          SP
+        ).aligned === true,
+      { bads }
+    );
+    const H0 = ethers.id("tx-0");
+    const ok = { from: addr("u"), to: SP, data: "0x12345678" };
+    const tr = { type: "CALL", from: addr("u"), to: SP, input: "0x12345678" };
+    const rc = (x = {}) => ({ status: 1, logs: [{ ...L, index: 0 }], ...x });
+    cell(
+      "envelopeProblem: receipt for another tx, failed receipt with logs, removed / foreign logs, and a trace root that is not the tx are refused",
+      envelopeProblem(H0, ok, rc(), tr) === null &&
+        envelopeProblem(H0, { ...ok, to: null }, rc(), { ...tr, type: "CREATE", to: addr("c") }) ===
+          null &&
+        /another tx/.test(envelopeProblem(H0, ok, rc({ transactionHash: ethers.id("x") }), tr)) &&
+        /failed receipt/.test(envelopeProblem(H0, ok, rc({ status: 0 }), tr)) &&
+        /removed/.test(
+          envelopeProblem(H0, ok, rc({ logs: [{ ...L, index: 0, removed: true }] }), tr)
+        ) &&
+        /another tx/.test(
+          envelopeProblem(
+            H0,
+            ok,
+            rc({ logs: [{ ...L, index: 0, transactionHash: ethers.id("y") }] }),
+            tr
+          )
+        ) &&
+        /sender/.test(envelopeProblem(H0, ok, rc(), { ...tr, from: addr("v") })) &&
+        /destination/.test(envelopeProblem(H0, ok, rc(), { ...tr, to: addr("v") })) &&
+        /destination/.test(envelopeProblem(H0, { ...ok, to: null }, rc(), tr)) &&
+        /input/.test(envelopeProblem(H0, ok, rc(), { ...tr, input: "0x12345679" })),
+      null
+    );
+    const noPosParent = child =>
+      attributeLogs(
+        {
+          type: "CALL",
+          to: SP,
+          logs: [L],
+          calls: [{ type: "CALL", from: SP, to: AGG, logs: child }],
+        },
+        child.length
+          ? [
+              { ...L, index: 0 },
+              { ...L, index: 1 },
+            ]
+          : [{ ...L, index: 0 }],
+        AGG,
+        SP
+      ).aligned;
+    cell(
+      "positionless logs (geth before positions) are accepted when no child has a surviving log, refused when ambiguous",
+      noPosParent([]) === true && noPosParent([L]) === false,
+      null
+    );
+    const nullTrace = await verifyTrace(
+      {
+        send: async m =>
+          m === "eth_getBlockByNumber" ? { transactions: [ethers.id("s1")] } : null,
+        getTransactionReceipt: async () => ({ status: 1, logs: [{ ...L, index: 0 }] }),
+        getTransaction: async () => ok,
+      },
+      { aggregator: AGG, roles: { superPaymaster: SP } },
+      10,
+      { blocks: 1 }
+    );
+    const vt = input =>
+      verifyTrace(
+        {
+          send: async m =>
+            m === "eth_getBlockByNumber"
+              ? { transactions: [ethers.id("s2")] }
+              : { type: "CALL", from: ok.from, to: SP, input, logs: [L] },
+          getTransactionReceipt: async () => ({ status: 1, logs: [{ ...L, index: 0 }] }),
+          getTransaction: async () => ok,
+        },
+        { aggregator: AGG, roles: { superPaymaster: SP } },
+        10,
+        { blocks: 1 }
+      );
+    const vMis = await vt("0xdeadbeef");
+    const vOk = await vt(ok.data);
+    cell(
+      "verifyTrace: a sample whose trace root is not its tx proves nothing; the matching root verifies",
+      vMis.state === "unverified" && /input differs/.test(vMis.reason) && vOk.state === "verified",
+      { vMis, vOk }
+    );
+    cell(
+      "verifyTrace: a null trace answer is inconclusive (unverified, counted failed), not 'unsupported'",
+      nullTrace.state === "unverified" && nullTrace.failed === 1,
+      nullTrace
     );
   }
   cell(

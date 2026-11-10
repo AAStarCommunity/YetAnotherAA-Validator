@@ -9,7 +9,7 @@ import {
 } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.mjs";
-import { attributeLogs } from "./attribute.mjs";
+import { attributeLogs, receiptPos } from "./attribute.mjs";
 import { mayHaveLog } from "./bloom.mjs";
 import { Store } from "./store.mjs";
 
@@ -73,10 +73,8 @@ function decodeSp(log) {
 
 /** ethers v6 `Log` carries its position as `index`; other providers use `logIndex`. */
 export function logPos(l) {
-  const v = l.index ?? l.logIndex;
-  const n = typeof v === "string" ? Number(BigInt(v)) : Number(v);
-  if (!Number.isSafeInteger(n) || n < 0)
-    throw new Error(`log without a valid position in tx ${l.transactionHash}`);
+  const n = receiptPos(l); // strict, and `index` / `logIndex` must agree when both are present
+  if (n === null) throw new Error(`log without a valid position in tx ${l.transactionHash}`);
   return n;
 }
 
@@ -156,6 +154,22 @@ export async function verifyTrace(
       why = "trace call failed";
       return { state: "next" };
     }
+    if (!trace || typeof trace !== "object") {
+      failed++;
+      why = "malformed trace response";
+      return { state: "next" };
+    }
+    let tx = null;
+    try {
+      tx = await chain.getTransaction(hash);
+    } catch {
+      tx = null;
+    }
+    const env = tx ? envelopeProblem(hash, tx, rc, trace) : "transaction unavailable";
+    if (env) {
+      why = `sample not usable (${env})`;
+      return { state: "next" };
+    }
     if (!traceHasLogs(trace))
       return {
         state: "unsupported",
@@ -208,7 +222,11 @@ async function traceAndReceipt(chain, txHash, stats = {}, expectLogs = false) {
       trace = await chain.send("debug_traceTransaction", [txHash, TRACE_OPTS]);
       // getLogs already saw watched logs in this tx: a trace without any log proves withLog is not
       // honoured, whatever the receipt says (Codex #400-fix R6).
-      if ((expectLogs || rc?.logs?.length) && !traceHasLogs(trace))
+      // A null or non-object answer is a malformed response, inconclusive (Codex #400-fix R11).
+      if (!trace || typeof trace !== "object") {
+        trace = null;
+        stats.failed = (stats.failed ?? 0) + 1;
+      } else if ((expectLogs || rc?.logs?.length) && !traceHasLogs(trace))
         stats.noLogs = (stats.noLogs ?? 0) + 1;
       else stats.ok = (stats.ok ?? 0) + 1;
     } catch (e) {
@@ -217,7 +235,35 @@ async function traceAndReceipt(chain, txHash, stats = {}, expectLogs = false) {
       else stats.failed = (stats.failed ?? 0) + 1;
     }
   } else stats.unsupported = (stats.unsupported ?? 0) + 1;
-  return { trace, logs: rc?.logs ?? null };
+  return { trace, logs: rc?.logs ?? null, rc };
+}
+
+const failedStatus = s => s === 0 || s === "0x0" || s === 0n || s === "0";
+
+/**
+ * Cross-checks of a receipt and a trace against the tx they claim to describe (an honest but
+ * inconsistent RPC: lagging backends, mixed responses; Codex #400-fix R11). null when consistent,
+ * else the reason. The trace root must be the tx itself: its sender, destination (CREATE when the
+ * tx has none) and full input.
+ */
+export function envelopeProblem(txHash, tx, rc, trace) {
+  if (rc) {
+    if (rc.transactionHash && !lcEq(rc.transactionHash, txHash)) return "receipt names another tx";
+    if (failedStatus(rc.status) && rc.logs?.length) return "failed receipt carries logs";
+    for (const l of rc.logs ?? []) {
+      if (l?.transactionHash && !lcEq(l.transactionHash, txHash))
+        return "receipt log of another tx";
+      if (l?.removed === true) return "receipt log marked removed";
+    }
+  }
+  if (trace && tx) {
+    if (!tx.from || !lcEq(trace.from, tx.from)) return "trace root sender differs from the tx";
+    if (tx.to ? !lcEq(trace.to, tx.to) : !/^CREATE2?$/i.test(String(trace.type)))
+      return "trace root destination differs from the tx";
+    if (String(trace.input ?? "").toLowerCase() !== String(tx.data ?? tx.input ?? "").toLowerCase())
+      return "trace root input differs from the tx";
+  }
+  return null;
 }
 
 /** Build the record for one SignersCommitted log. Returns { record } or { deadLetter }. */
@@ -400,7 +446,8 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   if ((t.agg.length && t.sp.length) || needFrame) {
     const watched = [...t.agg, ...t.sp];
     const stats = (summary.trace ??= {});
-    const { trace, logs } = await traceAndReceipt(chain, txHash, stats, watched.length > 0);
+    const { trace, logs, rc } = await traceAndReceipt(chain, txHash, stats, watched.length > 0);
+    const envelope = logs ? envelopeProblem(txHash, tx, rc, trace) : null;
     // The receipt must contain every watched log getLogs returned for this tx, identical (address,
     // every topic, data) at the same position: an inconsistent receipt aligns with nothing it
     // should (Codex #400-fix R5, R6), and it is a health finding, not only a retry.
@@ -408,11 +455,15 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     // one, no more and no fewer (Codex #400-fix R8: an extra log at a taken position must fail).
     const rs2 = logs ? splitLogs(logs, cfg, t.block) : { agg: [], sp: [] };
     const rw = [...rs2.agg, ...rs2.sp];
+    const rpos = logs ? logs.map(receiptPos) : [];
     const consistent =
       !!logs &&
+      !envelope &&
+      !watched.some(w => w.removed === true) &&
       rw.length === watched.length &&
       watched.every(w => rw.some(r => sameLog(r, w))) &&
-      new Set(logs.map(l => logPos(l))).size === logs.length;
+      rpos.every(p => p !== null) &&
+      new Set(rpos).size === logs.length;
     if (logs && !consistent) stats.inconsistent = (stats.inconsistent ?? 0) + 1;
     attr = !logs
       ? { aligned: false, owner: new Map(), spCall: new Map(), why: "receipt unavailable" }
@@ -421,9 +472,12 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
             aligned: false,
             owner: new Map(),
             spCall: new Map(),
-            why: "receipt disagrees with getLogs",
+            why: envelope ?? "receipt disagrees with getLogs",
           }
-        : attributeLogs(trace, logs, cfg.aggregator, SP);
+        : trace && !tx
+          ? // the root cannot be checked yet: retried, not attributed (and not a health finding)
+            { aligned: false, owner: new Map(), spCall: new Map(), why: "transaction unavailable" }
+          : attributeLogs(trace, logs, cfg.aggregator, SP);
     // Consistent + aligned implies the receipt holds the watched logs and the trace carries them,
     // so an empty or log-less pair can never count as proof.
     if (attr.aligned && trace) {

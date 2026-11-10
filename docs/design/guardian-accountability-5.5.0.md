@@ -447,6 +447,22 @@ aggregator-only.
   event that only privileged functions can emit is the owner route whatever the
   trace says. Its caller is recorded when known.
 
+- **Scope of the trace and receipt checks.** They defend against an RPC that is
+  honest but inconsistent, lagging or only partly supporting the tracer, and
+  against client format differences:
+  - the receipt must name the tx, succeed and carry no removed or foreign log;
+  - the trace root must be the tx itself (sender, destination, full input);
+  - positions are parsed strictly and must be unique and contiguous;
+  - logs must be well formed;
+  - traces from geth before log positions are accepted where the order is
+    unambiguous.
+
+  They do **not** defend against an RPC that fabricates a well-formed trace (for
+  example a different caller frame, or a log placed in a static call), because
+  such an RPC could equally omit an event from `getLogs`, which no trace check
+  can detect. The RPC is a deployment trust assumption: an operator-chosen node.
+  Comparing several independent RPCs is backlog after 5.5.0.
+
 #### 5.2b Dead letters, exhaustion and read integrity
 
 - A transient read failure is a retried dead letter, never a permanent gap:

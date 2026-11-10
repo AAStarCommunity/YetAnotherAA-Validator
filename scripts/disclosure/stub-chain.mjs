@@ -732,7 +732,11 @@ function makeChain() {
     forceBloom: (n, fake) => forcedBlooms.set(n, bloomOf(fake)),
     mine: () => mine(),
     /** Install a callTracer trace for a tx (frames may carry `logs`, as with withLog). */
-    setTrace: (hash, frame) => traces.set(hash, frame),
+    // A real callTracer root always names the tx: from, to and input default to the tx's own.
+    setTrace: (hash, frame) => {
+      const tx = txs.get(hash)?.tx;
+      traces.set(hash, tx ? { from: tx.from, to: tx.to, input: tx.data, ...frame } : frame);
+    },
     /** Install a prestateTracer result for a tx ({ address: { storage: { slot: word } } }). */
     setPrestate: (hash, pre) => prestates.set(hash, pre),
     setFinalityLag: k => (finalityLag = k),
