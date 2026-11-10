@@ -97,13 +97,15 @@ const srv = createServer(async (req, res) => {
     const chunk = Buffer.alloc(64 * 1024, 0x41);
     let sent = 0;
     const pump = () => {
-      while (sent < 64 && res.write(chunk)) sent++;
-      if (sent < 64) res.once("drain", pump);
-      else res.end();
+      while (sent < 64) {
+        sent++;
+        if (!res.write(chunk)) return res.once("drain", pump);
+      }
+      res.end();
     };
     pump();
     return;
-  } else if (req.url.startsWith("/tgecho/bot")) {
+  } else if (req.url.startsWith("/tgecho")) {
     // A hostile/buggy upstream that echoes the request path (with the token) everywhere.
     res.statusCode = req.url.includes("500") ? 500 : 200;
     return res.end(
@@ -248,10 +250,12 @@ try {
     big.bytes === null && big.status === 500 && /HTTP 500/.test(he ?? ""),
     { status: big.status, n: big.bytes?.length, he }
   );
+  const before = seen.length;
+  const odd = [await p.fetchPublic("../../admin"), await p.fetchPublic("bafy?x=1")];
   cell(
-    "fetchPublic refuses anything but a base32 CIDv1 in the URL",
-    (await p.fetchPublic("../../admin")) === null,
-    null
+    "fetchPublic refuses anything but a base32 CIDv1 without sending a request",
+    odd.every(v => v === null) && seen.length === before,
+    seen.slice(before).map(x => x.url)
   );
 } finally {
   srv.close();
