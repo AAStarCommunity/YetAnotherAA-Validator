@@ -171,6 +171,30 @@ export async function readRoles(provider, aggregator, deployer, blockTag = "fina
 }
 
 /**
+ * Roles at the newest state the node will show: "latest" must answer; "pending" is added when the
+ * node serves it (a role being granted in the mempool is then refused too). The union is returned,
+ * so a writer appointed in either is refused. A residual remains: a role granted after this read
+ * and mined before our tx. Closing it needs an on-chain constraint (M0 §5.5), not a watcher check.
+ */
+export async function currentRoles(provider, aggregator, deployer) {
+  const latest = await readRoles(provider, aggregator, deployer, "latest");
+  let pending = null;
+  try {
+    pending = await readRoles(provider, aggregator, deployer, "pending");
+  } catch {
+    pending = null; // a node without pending state: latest alone (still fresh at sign time)
+  }
+  if (!pending) return latest;
+  const owners = [latest.aggregatorOwner, pending.aggregatorOwner];
+  return {
+    deployer,
+    aggregatorOwner: latest.aggregatorOwner,
+    // every address that holds the owner role at either state is refused as a guardian would be
+    guardians: [...new Set([...latest.guardians, ...pending.guardians, ...owners])],
+  };
+}
+
+/**
  * One publication pass, after a scan. `built` comes from buildSinks (startup). The writer's roles
  * are re-read from chain on every pass; if they cannot be read, or the writer holds one, the
  * registry stage is skipped this pass (pins, mirror and Telegram still run) and that is alerted.
@@ -183,7 +207,11 @@ export async function publishPhase(store, chain, cfg, p, built, { now = Date.now
   try {
     const roles = await readRoles(chain, cfg.aggregator, p.registry.deployer);
     assertWriterRole(await built.wallet.getAddress(), roles);
-    registry = built.registryFor(roles);
+    // The pass's set (finalized) gates the stage; the sink re-reads the roles at the latest AND
+    // pending state right before each signature, and refuses if either holds the writer.
+    registry = built.registryFor(roles, () =>
+      currentRoles(chain, cfg.aggregator, p.registry.deployer)
+    );
     out.guardians = roles.guardians.length;
   } catch (e) {
     out.registrySkipped = safeText("writer role check", e);

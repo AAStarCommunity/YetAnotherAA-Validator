@@ -12,6 +12,7 @@ import {
   publishPhase,
   deliverAlerts,
   readRoles,
+  currentRoles,
   isDone,
 } from "./lib/publisher.mjs";
 import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
@@ -35,15 +36,16 @@ function roleChain(state) {
     async call(tx) {
       state.calls = (state.calls ?? 0) + 1;
       state.tags = [...(state.tags ?? []), tx.blockTag];
-      if (state.fail)
+      if (state.fail || state.failTags?.includes(tx.blockTag))
         throw Object.assign(new Error("https://rpc/ROLESECRET"), { code: "SERVER_ERROR" });
       const d = roleIface.parseTransaction({ data: tx.data });
-      if (d.name === "owner") return roleIface.encodeFunctionResult("owner", [state.owner]);
+      const st = state.byTag?.[tx.blockTag] ?? state;
+      if (d.name === "owner") return roleIface.encodeFunctionResult("owner", [st.owner]);
       if (d.name === "MAX_VALIDATORS")
-        return roleIface.encodeFunctionResult("MAX_VALIDATORS", [state.max]);
+        return roleIface.encodeFunctionResult("MAX_VALIDATORS", [st.max]);
       const slot = Number(d.args[0]);
       return roleIface.encodeFunctionResult("validatorAtSlot", [
-        state.slots[slot] ?? ethers.ZeroAddress,
+        st.slots[slot] ?? ethers.ZeroAddress,
       ]);
     },
   };
@@ -99,6 +101,35 @@ const cfg = { aggregator: AGG };
   cell("readRoles: MAX_VALIDATORS out of range is refused", /out of range/.test(e2 ?? ""), e2);
 }
 
+// ---- currentRoles (Codex W2c R1 H2): latest required, pending added when served, union refused
+{
+  const O = ethers.getAddress("0x" + "5a".repeat(20));
+  const O2 = ethers.getAddress("0x" + "5b".repeat(20));
+  const base = { owner: O, max: 3, slots: { 1: G1 } };
+  const both = {
+    ...base,
+    byTag: { pending: { owner: O2, max: 3, slots: { 1: G1, 2: writer.address } } },
+  };
+  const u = await currentRoles(roleChain(both), AGG, DEPLOYER);
+  const noPend = await currentRoles(roleChain({ ...base, failTags: ["pending"] }), AGG, DEPLOYER);
+  let latestFail = null;
+  try {
+    await currentRoles(roleChain({ ...base, failTags: ["latest"] }), AGG, DEPLOYER);
+  } catch (e) {
+    latestFail = e.message;
+  }
+  cell(
+    "currentRoles: a guardian or owner at pending is refused with latest's; no pending = latest; no latest = refusal",
+    u.guardians.includes(writer.address) &&
+      u.guardians.includes(O2) &&
+      u.aggregatorOwner === O &&
+      j(noPend.guardians) === j([G1]) &&
+      typeof latestFail === "string" &&
+      !/ROLESECRET/.test(latestFail),
+    { u, noPend, latestFail }
+  );
+}
+
 // ---- publishPhase end to end: two flagged records and one unflagged, through to done
 {
   const d = tmp();
@@ -122,8 +153,12 @@ const cfg = { aggregator: AGG };
       mirror: s.mirror,
       telegram: s.telegram,
       wallet: writer,
-      registryFor: () => s.registry,
+      registryFor: (r, cur) => {
+        gotCurrent = cur;
+        return s.registry;
+      },
     };
+    let gotCurrent = null;
     let now = 1_000_000;
     const runs = [];
     for (let i = 0; i < 4; i++)
@@ -141,6 +176,12 @@ const cfg = { aggregator: AGG };
         blsSt.registry.phase === "confirmed" &&
         runs.at(-1).done === 2,
       { last: runs.at(-1), bls: blsSt?.registry?.phase }
+    );
+    const cur = typeof gotCurrent === "function" ? await gotCurrent() : null;
+    cell(
+      "publishPhase hands the registry sink a sign-time role reader (latest state)",
+      cur?.guardians.includes(G1) && cur.guardians.includes(G2) && roles.tags.includes("latest"),
+      { cur, tags: roles.tags }
     );
     cell(
       "publishPhase: an unflagged record is never published (no journal)",

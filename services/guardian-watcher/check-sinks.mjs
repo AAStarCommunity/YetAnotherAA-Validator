@@ -897,6 +897,44 @@ try {
     gs
   );
 
+  // Codex W2c R1 H2: roles are re-read immediately before each signature, and a failure refuses
+  const late = {};
+  for (const [name, cur] of [
+    ["appointed since", async () => ({ ...roles, guardians: [...roles.guardians, w.address] })],
+    [
+      "unreadable",
+      async () => {
+        throw new Error("rpc down");
+      },
+    ],
+    ["unchanged", async () => roles],
+  ]) {
+    let calls = 0;
+    try {
+      await registrySink({
+        provider,
+        wallet: w,
+        registry: REG,
+        fromBlock: 0,
+        roles,
+        currentRoles: () => {
+          calls++;
+          return cur();
+        },
+      }).sign(args);
+      late[name] = `signed:${calls}`;
+    } catch (e) {
+      late[name] = `${e.message}:${calls}`;
+    }
+  }
+  cell(
+    "registrySink: roles re-read at sign time; a writer appointed since the pass's read, or unreadable roles, is refused",
+    /also the guardian/.test(late["appointed since"]) &&
+      /current roles unreadable; refusing to sign:1/.test(late.unreadable) &&
+      late.unchanged === "signed:1",
+    late
+  );
+
   const foreign = regSinkIface.encodeEventLog("Disclosed", [
     99n,
     0,

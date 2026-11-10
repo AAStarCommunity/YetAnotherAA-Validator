@@ -110,13 +110,14 @@ export async function buildSinks(p, provider, { readSecret = keychainRead } = {}
     if (e instanceof SafeError) throw e;
     throw new SafeError("registry keystore could not be decrypted");
   }
-  const registryFor = roles =>
+  const registryFor = (roles, currentRoles) =>
     registrySink({
       provider,
       wallet,
       registry: p.registry.address,
       fromBlock: p.registry.fromBlock,
       roles,
+      currentRoles,
     });
   return { pinners, telegram, mirror, wallet, registryFor };
 }

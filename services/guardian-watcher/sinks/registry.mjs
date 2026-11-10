@@ -53,7 +53,15 @@ export const actionId = (kind, key) =>
  * fromBlock: the registry's deploy block (log scans); roles: { deployer, aggregatorOwner, guardians }
  * (required: the wallet is checked against them before anything is signed).
  */
-export function registrySink({ provider, wallet, registry, fromBlock, roles, feeBump = 1.25 }) {
+export function registrySink({
+  provider,
+  wallet,
+  registry,
+  fromBlock,
+  roles,
+  currentRoles,
+  feeBump = 1.25,
+}) {
   const addr = ethers.getAddress(registry);
   if (!(feeBump >= 1.125))
     throw new SinkError("registry: feeBump must be >= 1.125 (replacement rule)");
@@ -131,6 +139,18 @@ export function registrySink({ provider, wallet, registry, fromBlock, roles, fee
       ]);
       const from = await wallet.getAddress();
       assertWriterRole(from, roles);
+      // Roles change between the pass's read and this signature (Codex W2c R1 H2): re-read them
+      // now, at the current state, immediately before EVERY signature, replacements included. Any
+      // failure to read them is a refusal, never a fallback to the older set.
+      if (currentRoles) {
+        let now;
+        try {
+          now = await currentRoles();
+        } catch {
+          throw new SinkError("writer role check: current roles unreadable; refusing to sign");
+        }
+        assertWriterRole(from, now);
+      }
       const n = nonce ?? (await provider.getTransactionCount(from, "pending"));
       const fee = await provider.getFeeData();
       let maxFee = big(fee.maxFeePerGas);
