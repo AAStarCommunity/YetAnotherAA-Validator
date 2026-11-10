@@ -697,6 +697,43 @@ function sinks(opts = {}) {
   );
 }
 
+{
+  // Codex W2a R5: a failed receipt passes canonical() while unfinalized, its branch is then reorged
+  // out and the other branch finalizes. It must not be parked as reverted.
+  const s = sinks();
+  s.chain.receipts.set(ethers.id("disclose-z"), {
+    status: 0,
+    entryId: null,
+    blockNumber: 995,
+    blockHash: ethers.id("bz"),
+  });
+  let calls = 0;
+  s.registry.canonical = async (_n, h) => {
+    if (h !== ethers.id("bz")) return true;
+    calls++;
+    return calls === 1; // canonical on the first look, orphaned on the second
+  };
+  const prev = {
+    registry: {
+      phase: "sent",
+      raw: "0xrawz",
+      hash: ethers.id("disclose-z"),
+      hashes: [ethers.id("disclose-z")],
+      nonce: 0,
+      sentAt: new Date().toISOString(),
+    },
+  };
+  s.chain.signedArgs.set("0xrawz", discloseArgs(bls, f1));
+  s.chain.mined = "pending";
+  const r = await pub(bls, s, prev);
+  cell(
+    "a failed receipt reorged out between the canonical and finality reads is not parked",
+    r.state.registry.phase !== "reverted" &&
+      r.alerts.some(x => /reorged out before finality/.test(x)),
+    { reg: r.state.registry, alerts: r.alerts }
+  );
+}
+
 // ---- other stages
 {
   const s = sinks();

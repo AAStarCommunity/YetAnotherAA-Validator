@@ -301,6 +301,14 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       // A failure is final only once its block is finalized; until then it may still reorg away,
       // or the competing entry (AlreadyDisclosed) may not be final yet.
       if (Number(rc.blockNumber) > (await reg.finalized())) return;
+      // Finality established; only now is canonicality decisive. Re-check it: the receipt's branch
+      // may have been reorged out before the replacement branch finalized.
+      if (!(await reg.canonical(rc.blockNumber, rc.blockHash))) {
+        alerts.push(
+          `registry: failed receipt's block was reorged out before finality; not parking`
+        );
+        return;
+      }
       // Reverted - possibly AlreadyDisclosed because another tx of ours landed first.
       if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
       state.registry = {
