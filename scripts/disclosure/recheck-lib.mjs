@@ -187,6 +187,7 @@ export function decodeAction(data) {
       fields: {
         target: a.target,
         callDataHash: ethers.keccak256(a.callData),
+        callData: a.callData, // kept for the watcher's rules (selector); not part of any hash
         requiredThreshold: a.requiredThreshold,
       },
     };
@@ -592,6 +593,7 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
       messageHash: c.messageHash,
       messageInputs: encodeMessageInputs(c.kind, c.fields),
     });
+    facts.fields = c.fields;
   };
   const proven = distinct.filter(c => c.proven);
 

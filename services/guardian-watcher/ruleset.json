@@ -1,0 +1,57 @@
+{
+  "schema": "dvt.guardian-watcher.ruleset.v1",
+  "comment": "M0 §5.2. Pinned in git: every record and every registry entry carries the commit SHA of this file. Targets are release-manifest ROLES, resolved to addresses from the watcher config.",
+  "bls": {
+    "SLASH": {
+      "flag": true,
+      "reason": "BLS operator slash executed (impossible through DVTValidator in 5.5.0: empty evidence allowlist; so this came by the owner route)"
+    },
+    "REPUTATION": {
+      "flag": true,
+      "reason": "BLS reputation batch (5.5.0 does no reputation scoring)"
+    },
+    "QUEUE": {
+      "flag": true,
+      "reason": "operator frozen by a guardian quorum (queueSlashWithConsensus)"
+    },
+    "GENERIC": {
+      "expected": [
+        {
+          "target": "superPaymaster",
+          "signature": "updatePriceDVT(int256,uint256,bytes,uint8)",
+          "flag": true,
+          "reason": "BLS price update: threshold is caller-chosen (>= minThreshold); SP caps each update but not a chain of updates",
+          "readPrice": true
+        }
+      ],
+      "unexpected": {
+        "flag": true,
+        "reason": "generic BLS call outside the expected target/selector set"
+      }
+    },
+    "UNRECOVERED": {
+      "flag": true,
+      "reason": "BLS-executed action whose message could not be authenticated from the transaction"
+    }
+  },
+  "ownerRoute": {
+    "label": "owner/guardian route: not BLS, no on-chain signer verification",
+    "events": {
+      "PriceUpdated": { "flag": true, "readPrice": true },
+      "PriceModeChanged": { "flag": true },
+      "EmergencyPriceQueued": { "flag": true },
+      "EmergencyPriceExecuted": { "flag": true, "readPrice": true },
+      "EmergencyPriceCancelled": { "flag": true },
+      "SlashQueued": { "flag": true },
+      "SlashCancelled": { "flag": true },
+      "OperatorSlashed": { "flag": true },
+      "SlashExecutedWithProof": { "flag": true },
+      "OperatorPaused": { "flag": true },
+      "OperatorUnpaused": { "flag": true },
+      "GlobalPauseSet": { "flag": true },
+      "GuardianSet": { "flag": true },
+      "BLSAggregatorQueued": { "flag": true },
+      "BLSAggregatorUpdated": { "flag": true }
+    }
+  }
+}
