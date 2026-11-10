@@ -128,6 +128,7 @@ function makeChain() {
   let maxRange = Infinity; // emulate a range-capped RPC
   let getLogsCalls = 0;
   let onReceipt = null; // one-shot hook around the next receipt fetch
+  let onEntryCountRead = null; // one-shot hook right after a by-hash eth_call returns
   let afterSends = null; // { left, fn }: run fn once `left` more raw sends have returned
 
   const chain = {
@@ -151,6 +152,19 @@ function makeChain() {
     },
     /** Raw JSON-RPC, never cached (what an ethers provider's `send` is). */
     async send(method, params) {
+      if (method === "eth_call") {
+        // EIP-1898: state at the block with this hash; unknown (orphaned) hash => error, as a node does.
+        const [{ to, data }, { blockHash }] = params;
+        const n = [...blocks.entries()].find(([, b]) => b.hash === blockHash)?.[0];
+        if (n === undefined) throw new Error("header not found");
+        const out = await chain.call({ to, data, blockTag: n });
+        if (onEntryCountRead) {
+          const f = onEntryCountRead;
+          onEntryCountRead = null;
+          f();
+        }
+        return out;
+      }
       if (method !== "eth_getBlockByNumber") throw new Error(`stub send: ${method}`);
       const b = blocks.get(Number(params[0]));
       const out = b ? { hash: b.hash, parentHash: b.parentHash } : null;
@@ -365,6 +379,17 @@ function makeChain() {
         left: k,
         fn: () => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`late-reorg-${n}`) }),
       }),
+    /** Replace the head block right after the next by-hash counter read. */
+    reorgHeadAfterCountRead: () =>
+      (onEntryCountRead = () =>
+        blocks.set(head, { ...blocks.get(head), hash: ethers.id(`head-reorg-${head}`) })),
+    /** Make the next receipt fetch answer without a status field. */
+    receiptWithoutStatus: () =>
+      (onReceipt = h => {
+        const r = { ...txs.get(h).receipt };
+        r.status = null;
+        return r;
+      }),
     reorg: n => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`reorged-${n}`) }),
     disclosureBlock: entryId => logs.find(l => BigInt(l.topics[1]) === BigInt(entryId)).blockNumber,
     capRange: r => (maxRange = r),
@@ -444,6 +469,8 @@ const {
   reorgDuringReceipt,
   revertedOnOrphan,
   reorgAfterSends,
+  reorgHeadAfterCountRead,
+  receiptWithoutStatus,
 } = makeChain();
 const results = [];
 // want: "PASS" | { diff } (MISMATCH on that field) | { status, reason } | { unverified: {...} } (MATCH,
@@ -541,7 +568,7 @@ await expectCase(
 );
 await expectCase("never-issued entry id is MISMATCH", 999n, {
   status: "MISMATCH",
-  reason: "was never issued",
+  reason: "not issued as of block",
 });
 
 const aW = execute(Kind.SLASH, 11n, slashF, 0b011n, { to: WRAPPER });
@@ -751,6 +778,34 @@ await expectCase(
     status: "INCONCLUSIVE",
     reason: "no parentHash",
   });
+}
+
+// Codex round 4: the "not issued" verdict is reorg-safe; a missing receipt status or a missing
+// parentHash on a TOP-LEVEL action is missing data, never an accusation or a crash.
+reorgHeadAfterCountRead();
+await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
+  status: "INCONCLUSIVE",
+  reason: "canonical chain changed during the check",
+});
+{
+  const aN = execute(Kind.SLASH, 31n, slashF, 0b011n);
+  const eN = disclose(Kind.SLASH, 31n, slashIn, aN);
+  receiptWithoutStatus();
+  await expectCase("receipt without status is INCONCLUSIVE, not 'reverted'", eN, {
+    status: "INCONCLUSIVE",
+    reason: "no valid status",
+  });
+  const aT = execute(Kind.SLASH, 32n, slashF, 0b011n);
+  const eT = disclose(Kind.SLASH, 32n, slashIn, aT);
+  dropParentHash(aT.block);
+  await expectCase("top-level action with no parent header is INCONCLUSIVE", eT, {
+    status: "INCONCLUSIVE",
+    reason: "no parentHash",
+  });
+  const aT2 = execute(Kind.SLASH, 33n, slashF, 0b011n);
+  const eT2 = disclose(Kind.SLASH, 33n, slashIn, aT2, { proposalId: 34n });
+  dropParentHash(aT2.block);
+  await expectCase("…and a wrong proposalId there is still MISMATCH", eT2, { diff: "proposalId" });
 }
 
 // Codex L4: a range-capped RPC still finds the entry (pages halve until they fit), across pages.

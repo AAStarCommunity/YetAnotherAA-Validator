@@ -284,7 +284,15 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
       ? { status: Status.MISMATCH, reason }
       : { status: Status.INCONCLUSIVE, reason: "canonical chain changed during the check" };
   // Only a canonical receipt's status is evidence.
-  if (Number(rc.status) !== 1) return mismatch("action tx reverted");
+  // Only an explicit status is evidence: 0 = reverted, 1 = success; anything else is a bad answer.
+  const st = rc.status === null || rc.status === undefined ? NaN : Number(rc.status);
+  if (st === 0) return mismatch("action tx reverted");
+  if (st !== 1) {
+    return {
+      status: Status.INCONCLUSIVE,
+      reason: `action receipt has no valid status (${rc.status})`,
+    };
+  }
 
   const commits = rc.logs
     .filter(
@@ -345,6 +353,9 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
     messageHash,
     messageInputs: encodeMessageInputs(action.kind, action.fields),
   });
+
+  // Without the anchor the commitment cannot be rebuilt; return the message facts for comparison.
+  if (facts.anchor === undefined) return { status: null, facts };
 
   const onchain = await view(chain, agg, "proposalSignersCommitment", [commit.key], snapshot);
   // The aggregator resolved slots during the tx. Pre-block state equals that unless an earlier tx in
@@ -456,16 +467,26 @@ export async function recheckEntry(
   }
   // No log found anywhere up to head. Only the registry's own counter can turn that into proof:
   // an id above entryCount was never issued (MISMATCH); otherwise the log search missed it.
+  // The counter is read at the head block BY HASH where the chain allows it (EIP-1898), and the head
+  // must still be canonical afterwards, so a reorg cannot turn an orphaned branch into proof.
   const noLogVerdict = async () => {
-    const ret = await chain.call({
-      to: registry,
-      data: regIface.encodeFunctionData("entryCount", []),
-      blockTag: head,
-    });
+    const headHash = (await canonicalHeader(chain, head))?.hash;
+    if (!headHash)
+      return done(Status.INCONCLUSIVE, { reasons: [`head block ${head} header unavailable`] });
+    const data = regIface.encodeFunctionData("entryCount", []);
+    const ret =
+      typeof chain.send === "function"
+        ? await chain.send("eth_call", [{ to: registry, data }, { blockHash: headHash }])
+        : await chain.call({ to: registry, data, blockTag: head });
     const count = regIface.decodeFunctionResult("entryCount", ret)[0];
+    if (!(await canonical(chain, head, headHash))) {
+      return done(Status.INCONCLUSIVE, { reasons: ["canonical chain changed during the check"] });
+    }
     return BigInt(entryId) > count || BigInt(entryId) === 0n
       ? done(Status.MISMATCH, {
-          reasons: [`entry ${entryId} was never issued (entryCount ${count} at block ${head})`],
+          reasons: [
+            `entry ${entryId} not issued as of block ${head} ${headHash} (entryCount ${count})`,
+          ],
         })
       : done(Status.INCONCLUSIVE, {
           reasons: [
