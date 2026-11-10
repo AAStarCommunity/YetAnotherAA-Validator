@@ -24,17 +24,27 @@ co-sign responder is unarmed (`src/modules/audit/audit.service.ts:42-46, :455`).
 
 ## 1. What we are protecting against
 
-| Actor                                                               | Risk                                                                                                                                              | 5.5.0 handling                                                                                                                                    |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Community / operator                                                | Over-issues xPNTs                                                                                                                                 | Unchanged: on-chain views `isOverIssued()` / `credibilityScore()`; DVT does nothing.                                                              |
-| **Guardians** (the BLS signer set)                                  | A quorum signs an action it should not: a false slash, a false reputation batch, or a generic proposal (e.g. `Registry.updateOperatorBlacklist`). | **This document.** Operator slash impossible by construction (empty allowlist, §3); every BLS-executed action is detected and disclosed (§4, §5). |
-| Operator already slashed below `minStake` by Registry/GTokenStaking | Keeps operating                                                                                                                                   | Watcher calls `pauseUnderstakedOperator(op)` (§5.4).                                                                                              |
+| Actor                                                               | Risk                                                                                                                                               | 5.5.0 handling                                                                                                                                                                                                                    |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Community / operator                                                | Over-issues xPNTs                                                                                                                                  | Unchanged: on-chain views `isOverIssued()` / `credibilityScore()`; DVT does nothing.                                                                                                                                              |
+| **Guardians** (the BLS signer set)                                  | A quorum signs an action it should not: a false slash, a false reputation batch, or a generic proposal (e.g. `Registry.updateOperatorBlacklist`).  | **This document.** No operator slash can execute _through DVTValidator_ (empty allowlist, §3); the owner route below is a named trust assumption; every BLS-executed action, on either route, is detected and disclosed (§4, §5). |
+| **Aggregator `owner()`** (the Safe, per SP)                         | Calls `verifyAndExecute` / `queueSlashWithConsensus` / `executeProposal` directly with a guardian quorum, skipping DVTValidator and its allowlist. | Trust assumption, not prevented: the Safe's signers are trusted in 5.5.0. Made checkable: the manifest pins `owner()` and §9 item 7 reads it back; the watcher flags any operator slash regardless of caller (§5.2).              |
+| Operator already slashed below `minStake` by Registry/GTokenStaking | Keeps operating                                                                                                                                    | Watcher calls `pauseUnderstakedOperator(op)` (§5.4).                                                                                                                                                                              |
 
 Every guardian power goes through `BLSAggregator.verifyAndExecute`,
 `queueSlashWithConsensus` or `executeProposal`, and all three accept only
 `DVT_VALIDATOR` or `owner()` as caller (SuperPaymaster `origin/main` afe405fa,
-`BLSAggregator.sol` around :959, :980, :1089). So the watcher's surface is
-exactly: the events of those three entry points.
+`BLSAggregator.sol` :963, :990, :1097). So the watcher's surface is exactly: the
+events of those three entry points.
+
+The `owner()` caller is a second route that never reaches DVTValidator. Per SP
+the 5.5.0 aggregator owner is the protocol Safe (not a timelock), and
+`setDVTValidator` is immediate. Slash thresholds are WARNING=2, MINOR=3, MAJOR=3
+(`:673-675`), so with N=3 the Safe plus a 2–3 guardian quorum can execute a
+slash directly. 5.5.0 does not remove this route; it treats the Safe as trusted
+(consistent with the trusted-operator bootstrap phase) and makes the route
+observable. Every claim below of the form "no slash" means "no slash through
+DVTValidator".
 
 ## 2. Measured facts (2026-11-09, read-only)
 
@@ -61,7 +71,8 @@ exactly: the events of those three entry points.
 
 Goal (D6, D8): no penalty can execute unless its evidence is supplied in full
 and passes an on-chain check fixed at deployment. In 5.5.0 the allowlist is
-empty, so no BLS operator slash can execute at all (D1).
+empty, so no BLS operator slash can execute through DVTValidator (D1). The owner
+route (§1) bypasses this framework; it is a trust assumption, not covered here.
 
 ### 3.1 Encoding
 
@@ -156,77 +167,88 @@ watcher flags, whose factual fields are verified on-chain at write time.
 
 ### 4.2 Primary entry
 
+As implemented in PR #396 (`contracts/src/disclosure/DisclosureRegistry.sol`):
+
 ```
-function disclose(
-    uint256 proposalId, uint8 kind,            // 0 = slash/rep (verifyAndExecute), 1 = generic (executeProposal),
-                                               // 2 = queue (queueSlashWithConsensus) — reserved, see 4.2a
-    bytes calldata messageInputs,              // kind 1: abi.encode(target, callDataHash, requiredThreshold)
-                                               // kind 0: abi.encode of the aggregator's execute-slash fields
-    address subjectToken,                      // community token the entry concerns, or 0
-    uint256 signerMask, address[] calldata signers,
-    bytes32 anchor,                            // once SP's anchor lands; else 0
-    bytes32 txHash, uint64 blockNumber,
-    bytes32 evidenceHash, bytes20 rulesetCommit,   // git SHA of the pinned ruleset (§5.2)
-    string calldata recordURI, bytes32 recordHash
-) external returns (uint256 entryId)
+enum Kind { SLASH, GENERIC, QUEUE, REPUTATION }
+struct Signed {
+    Kind kind;
+    uint256 proposalId;      // 0 for QUEUE; non-zero otherwise; < 2^128 for SLASH and REPUTATION
+    bytes messageInputs;     // per kind, below
+    uint256 signerMask;
+    address[] signers;       // ascending by uint160
+    bytes32 anchor;          // blockhash(N-1) from the commitment
+}
+function disclose(Signed calldata s, address subjectToken, bytes32 txHash, uint64 blockNumber,
+                  bytes20 rulesetCommit,       // git SHA of the pinned ruleset (§5.2)
+                  string calldata recordURI, bytes32 recordHash) external returns (uint256 entryId)
 ```
+
+`messageInputs` per kind, each mirroring one aggregator pre-image:
+
+| Kind       | Entry point                              | `messageInputs`                                 | Signed message                                                                           |
+| ---------- | ---------------------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| SLASH      | `verifyAndExecute`, `repUsers` empty     | `(operator, slashLevel, epoch, evidenceHash)`   | `keccak(ds, TAG_EXECUTE_SLASH, id, operator, level, epoch, evidenceHash)`                |
+| REPUTATION | `verifyAndExecute`, `repUsers` non-empty | `(address[] users, uint256[] newScores, epoch)` | `keccak(ds, TAG_REPUTATION, id, users, newScores, epoch)` (threshold `defaultThreshold`) |
+| GENERIC    | `executeProposal`                        | `(target, callDataHash, requiredThreshold)`     | `keccak(ds, TAG_PROPOSAL, id, target, callDataHash, threshold)`                          |
+| QUEUE      | `queueSlashWithConsensus`                | `(operator, slashLevel, epoch)`                 | `keccak(ds, TAG_QUEUE_SLASH, operator, level, epoch)`                                    |
 
 On-chain checks, all must pass or revert:
 
 1. `msg.sender == WRITER`.
-2. Recompute `messageHash` from the supplied inputs exactly as the aggregator
-   does for `kind` (generic:
-   `keccak256(abi.encode(domainSeparator, TAG_PROPOSAL, proposalId, target, callDataHash, requiredThreshold))`;
-   slash: the aggregator's execute-slash preimage). So `target`, `callDataHash`
-   and thresholds are verified, not claimed.
+2. Recompute `messageHash` from `messageInputs` exactly as the aggregator does
+   for `kind` (table above). So `target`, `callDataHash`, thresholds, the
+   reputation arrays and the slash fields are verified, not claimed.
 3. `signers` strictly ascending by `uint160`, length == popcount(`signerMask`).
-4. `keccak256(abi.encode(domainSeparator, TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, signers [, anchor]))`
-   == `AGGREGATOR.proposalSignersCommitment(key)`, where `key` is the per-path
-   namespaced key SP settles (§7 item 3; **pending**). The registry derives it
-   from `kind` and the on-chain tag constants, and must not assume the raw id on
-   either path. The final tuple and key scheme come from SP's implemented code.
+4. `keccak256(abi.encode(domainSeparator, TAG_SIGNERS_COMMITMENT, key, messageHash, signerMask, signers, anchor))`
+   == `AGGREGATOR.proposalSignersCommitment(key)`, with the key per path from
+   SP's BLSAggregator-4.13.0 (rc.8 r3b, §7 item 3):
+   - SLASH and REPUTATION: the raw `proposalId`, which must be `< 2^128` (SP
+     reverts `InvalidProposalId` otherwise; the registry enforces the same
+     bound);
+   - GENERIC: `uint256(keccak256(abi.encode(TAG_PROPOSAL, proposalId)))`;
+   - QUEUE: `uint256(messageHash)`.
+
    A non-zero commitment is required (an unexecuted key has commitment 0 and is
-   rejected).
+   rejected). Re-checked against SP's committed source SHA before the interface
+   freezes.
+
 5. Block binding (once the anchor is in the commitment): if `blockNumber - 1` is
    inside the EIP-2935 window as seen now, require
    `EIP2935.get(blockNumber - 1) == anchor` and set `blockVerified = true`.
    Outside the window, set `blockVerified = false`; do not revert. The watcher
    writes within minutes, so the normal case is verified.
-6. Emit
-   `Disclosed(entryId, proposalId, kind, signers, txHash, blockNumber, blockVerified, evidenceHash, rulesetCommit, recordURI, recordHash)`.
+6. Store
+   `entryBinding[entryId] = keccak256(abi.encode(kind, key, subjectToken))` and
+   emit
+   `Disclosed(entryId, kind, key, proposalId, messageHash, signers, subjectToken, txHash, blockNumber, blockVerified, rulesetCommit, recordURI, recordHash)`.
 
 What stays a **claim**: `txHash`, `blockNumber` when `blockVerified = false`,
 the `recordURI` content, and the interpretation of why the action is
 misbehaviour. The recheck script confirms the first two. Readers treat an entry
 as a claim to recheck; the paper says so.
 
-### 4.2a The queue path (kind 2) — blocking, pending SP
+### 4.2a The queue path (QUEUE) — settled by SP r3b
 
 `queueSlashWithConsensus` is a guardian-quorum action too: it freezes an
-operator. It does **not** write `proposalSignersCommitment` (SuperPaymaster
-`origin/main`: it checks the signatures, calls `SUPERPAYMASTER.queueSlash`, and
-emits `SlashPreQueued`). A disclosure of a quorum freeze therefore cannot have
-its signer set verified on-chain today. There are two ways forward:
-
-- SP adds a commitment on the queue path under its own typed key (for example
-  `keccak256(abi.encode(TAG_QUEUE, messageHash))`). The registry then verifies
-  kind 2 exactly like kinds 0 and 1.
-- If SP cannot add it, kind 2 entries carry `signersVerified = false`, and the
-  paper states that queue disclosures are unverified claims.
-
-`kind = 2` is reserved in the enum either way. The registry interface is not
-frozen until this is settled.
+operator. On SuperPaymaster `origin/main` it writes no commitment (`:959-977`:
+it checks the signatures, calls `SUPERPAYMASTER.queueSlash`, and emits
+`SlashPreQueued`). SP rc.8 r3b adds one, with the same tuple as the other paths,
+keyed at `uint256(messageHash)` (no extra `TAG_QUEUE` wrap; the queue message is
+already domain- and tag-separated). The registry verifies QUEUE entries exactly
+like the other kinds. Because the key carries no proposal id, `proposalId` must
+be 0 for QUEUE.
 
 ### 4.3 Reply entry (right of reply)
 
 ```
-function reply(uint256 entryId, uint8 kind, uint256 proposalId, address subjectToken,
-               bytes32 messageHash, uint256 signerMask, address[] calldata signers, bytes32 anchor,
+function reply(uint256 entryId, Signed calldata s, address subjectToken,
                string calldata replyURI, bytes32 replyHash) external
 ```
 
-- `keccak256(abi.encode(kind, proposalId, subjectToken)) == entryBinding[entryId]`
-  (so the entry exists and the reply cites the same proposal).
+- `s` passes the same checks as §4.2 steps 2–4, and
+  `keccak256(abi.encode(s.kind, key, subjectToken)) == entryBinding[entryId]`
+  (so the entry exists and the reply cites the same action).
 - The caller is either a member of `signers`, where `signers` reproduces the
   commitment exactly as in §4.2 step 4, or
   `IxPNTsToken(subjectToken).communityOwner()` when `subjectToken != 0`.
@@ -235,9 +257,12 @@ function reply(uint256 entryId, uint8 kind, uint256 proposalId, address subjectT
 
 ### 4.4 Tests (each mutation-checked on the implementation)
 
-- Correct signer set accepted; one signer swapped, wrong `messageHash`, wrong
-  anchor → revert.
-- A wrong `target` or `callDataHash` → revert (via recompute).
+- Correct signer set accepted for each of the four kinds, including a reputation
+  batch; one signer swapped, wrong `messageHash`, wrong anchor → revert.
+- A wrong `target`, `callDataHash`, slash field or reputation array → revert
+  (via recompute).
+- A slash/reputation id ≥ 2^128 → revert, including one equal to a live generic
+  key (cross-path claim); a QUEUE entry with a non-zero id → revert.
 - A non-writer primary write → revert; the constructor writer is the only
   primary writer.
 - Accused signer replies → ok; stranger replies → revert; reply to a missing
@@ -257,21 +282,23 @@ disabled.
 
 ### 5.2 Detection
 
-- Persisted cursor over the aggregator's `SlashExecuted`, `ProposalExecuted`,
-  `ReputationEpochTriggered`, `SlashConsensusReached` events, with configurable
-  confirmations.
-- Signer set from `signerMask` in the event (SP rc.8 round 3a) resolved through
-  `validatorAtSlot` at the execution block; self-checked against
-  `proposalSignersCommitment` before anything is written. Until the event
-  carries the mask, top-level `verifyAndExecute`/`executeProposal` calldata is
-  decoded; wrapped calls are dead-lettered and alerted (the known gap closes
-  when the event lands).
+- Persisted cursor over the aggregator's `SignersCommitted(key, signerMask)` (SP
+  rc.8 r3b; one per BLS-executed action on every path and either caller), joined
+  in the same tx with `SlashExecuted`, `ProposalExecuted`,
+  `ReputationEpochTriggered`, `SlashPreQueued` / `SlashConsensusReached` to
+  classify the kind, with configurable confirmations.
+- Signer set from that `signerMask`, resolved through `validatorAtSlot` at the
+  execution block; self-checked against `proposalSignersCommitment(key)` before
+  anything is written. The message fields come from the tx's calldata; a wrapped
+  call (not a top-level call to the aggregator) is read from the trace, or
+  dead-lettered and alerted if the trace is unavailable. The tx's `from`/caller
+  is recorded so an owner-route action is identified.
 - Every BLS-executed action produces a record. A record is flagged
   **suspicious** when a rule says so (5.5.0 rules: any operator slash at all —
-  impossible under the empty allowlist, so its appearance is itself the finding;
-  any generic call whose target/selector is outside the expected set; any
-  reputation batch; any queue freeze). Unflagged actions are still recorded as
-  routine.
+  impossible through DVTValidator under the empty allowlist, so its appearance
+  (necessarily via the owner route) is itself the finding; any generic call
+  whose target/selector is outside the expected set; any reputation batch; any
+  queue freeze). Unflagged actions are still recorded as routine.
 - The expected set of generic targets and selectors, and every flag rule, live
   in one pinned file in this repo (`services/guardian-watcher/ruleset.json`).
   Every record, and the registry event (`rulesetCommit`), carries the commit SHA
@@ -324,28 +351,34 @@ detection time, pause tx time.
 
 ## 7. Dependencies on SP (rc.8)
 
-1. Anchor `blockhash(block.number-1)` in the commitment — round 3a. Final
-   `abi.encode` tuple to DVT.
-2. `signerMask` in `SlashExecuted` / `ProposalExecuted` — round 3a. Priority
-   over the anchor if bytes are short.
-3. **C4-L-01 commitment collision — key scheme pending from SP.** Today both
-   paths share `executedProposals[proposalId]`, so an id executes once. Once
-   C4-L-01 separates the replay bits, a raw id on one path can collide with a
-   namespaced key on the other and overwrite `proposalSignersCommitment`. This
-   holds in both directions: DSR found that a slash whose raw id equals
-   `keccak256(abi.encode(TAG_PROPOSAL, id'))` overwrites the generic commitment
-   of `id'`. SP's plan, pending byte measurement:
-   - slash key `keccak256(abi.encode(TAG_SLASH, id))`;
-   - generic key `keccak256(abi.encode(TAG_PROPOSAL, id))`;
-   - the same key for both `executedProposals` and `proposalSignersCommitment`.
+Status as SP reported it from its implementation (BLSAggregator-4.13.0, 24,542
+B, rc.8 r3b; **not yet on `origin/main`** — DVT re-checks against the committed
+SHA before freezing the registry):
 
-   Fallback: the raw slash id with `require(id < 2**128)`. SP rejected "require
-   the slot empty", because a generic id executed first would pre-consume a
-   slash id. DVT builds on whichever scheme SP ships. Also open: whether the
-   `proposalId` field _inside_ the commitment tuple is the raw id or the key.
+1. Anchor `blockhash(block.number-1)` as the last element of the commitment
+   tuple, identical on all paths:
+   `keccak256(abi.encode(domainSeparator, TAG_SIGNERS_COMMITMENT, key, messageHash, signerMask, signers, blockhash(N-1)))`.
+2. `SignersCommitted(uint256 indexed key, uint256 signerMask)` emitted with
+   every commitment. The watcher detects from this event (§5.2).
+3. **C4-L-01 commitment collision — settled.** Once C4-L-01 separates the replay
+   bits, a raw id on one path could collide with a namespaced key on the other
+   and overwrite `proposalSignersCommitment` (DSR found the reverse case: a
+   slash whose raw id equals `keccak256(abi.encode(TAG_PROPOSAL, id'))`). SP's
+   choice (the pre-approved fallback; the typed slash key did not fit in bytes):
+   - slash and reputation (`verifyAndExecute`): the raw id,
+     `require(id < 2**128)` on the whole function (DVT confirmed it generates no
+     reputation ids and its slash ids are DVTValidator's auto-increment
+     counter);
+   - generic: `keccak256(abi.encode(TAG_PROPOSAL, id))`, same as its replay
+     slot;
+   - queue: `uint256(messageHash)`;
+   - the commitment tuple carries the storage key, not the raw id.
 
 4. `MAX_VALIDATORS` 13 → 64; signerMask width unchanged (uint256).
 5. DVTValidator raw evidence per §3, empty allowlist in the 5.5.0 manifest.
+6. The manifest pins the aggregator's `owner()` (the Safe) so the owner-route
+   trust assumption (§1) is checkable. Removing the owner caller from the three
+   entry points is not planned for 5.5.0.
 
 ## 8. Deferred (not in 5.5.0)
 
@@ -355,8 +388,8 @@ detection time, pause tx time.
   semantics, differential fuzz against `isOverIssued()`, EIP-1967 implementation
   slots for SP (UUPS; the factories are not proxies, the tokens are EIP-1167
   clones), an immutable known-implementation set, and real-header RLP tests. An
-  owner-route execution outside the window must make the verifier return false,
-  never a fraud verdict.
+  owner-route (Safe) execution outside the window must make the verifier return
+  false, never a fraud verdict.
 - Queue/execute submission by the watcher and OP forced inclusion: not needed
   while D1 holds.
 
@@ -372,18 +405,29 @@ On the A7 fork, archived under `docs/evidence/guardian-watcher-rehearsal/`:
    then RECOVERED.
 5. `pauseUnderstakedOperator` gap: injected staking slash below min → slash,
    detection, pause times.
-6. Rebuild one record from an RPC with no DVT state. 6a. A queue-path (kind 2)
-   disclosure, once §4.2a is settled.
+6. Rebuild one record from an RPC with no DVT state. 6a. A queue-path (QUEUE)
+   disclosure. 6b. A reputation-batch (REPUTATION) disclosure.
 7. Deployment facts: Mini only, keystore EOA distinct from
    guardian/owner/deployer, committee keeper disabled,
-   `fraudProofVerifier == 0`, `categoryCount() == 0`.
+   `fraudProofVerifier == 0`, `categoryCount() == 0`, and the aggregator's
+   `owner()` read back equal to the manifest's Safe.
+8. Owner-route detection: an operator slash executed with `owner()` as caller
+   (fork only, no real guardian key) is detected and flagged.
+
+Prerequisite: the fraud-drill proposal id in `deploy/reregister-guardians.mjs`
+is keccak-derived (≥ 2^128) and would revert under the r3b bound; it is changed
+to an id < 2^128 or retired before the rehearsal.
 
 ## 10. Facts for the paper (DSR owns wording)
 
-- 5.5.0 has no on-chain slashing and no on-chain reputation scoring;
-  misbehaviour is recorded in an append-only on-chain registry whose signer-set
-  and message fields are verified on-chain against the BLS commitment; the
-  interpretation is a checkable claim by an open-source watcher.
+- 5.5.0 executes no operator slash through DVTValidator (empty evidence
+  allowlist) and does no on-chain reputation scoring. The aggregator owner (the
+  Safe) can still call the BLS entry points directly with a guardian quorum;
+  that route is a trust assumption of the bootstrap phase, pinned in the
+  manifest and watched, not prevented. Misbehaviour is recorded in an
+  append-only on-chain registry whose signer-set and message fields are verified
+  on-chain against the BLS commitment; the interpretation is a checkable claim
+  by an open-source watcher.
 - DVT initiates no slash in the early stage; N=3 is the bootstrap size.
 - The watcher runs on one host (single point of failure); node-local capture is
   redundancy only.
