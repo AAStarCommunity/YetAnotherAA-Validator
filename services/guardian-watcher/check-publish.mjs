@@ -138,6 +138,7 @@ function sinks(opts = {}) {
     byAction: new Map(), // "kind:key" -> id
     receipts: new Map(),
     signedArgs: new Map(),
+    orphans: new Set(), // block hashes no longer canonical
   };
   if (opts.existing) {
     chain.entries.set(9n, { amendments: [], block: 1, ...opts.existing });
@@ -199,7 +200,12 @@ function sinks(opts = {}) {
         const act = `${a.signed.kind}:${a.signed.proposalId}`;
         chain.block++;
         if (chain.mined === "revert" || chain.byAction.has(act)) {
-          chain.receipts.set(hash, { status: 0, entryId: null, blockNumber: chain.block });
+          chain.receipts.set(hash, {
+            status: 0,
+            entryId: null,
+            blockNumber: chain.block,
+            blockHash: ethers.id(`b${chain.block}`),
+          });
         } else {
           const id = BigInt(chain.entries.size + 1);
           chain.entries.set(id, {
@@ -210,12 +216,20 @@ function sinks(opts = {}) {
             block: chain.block,
           });
           chain.byAction.set(act, id);
-          chain.receipts.set(hash, { status: 1, entryId: id, blockNumber: chain.block });
+          chain.receipts.set(hash, {
+            status: 1,
+            entryId: id,
+            blockNumber: chain.block,
+            blockHash: ethers.id(`b${chain.block}`),
+          });
         }
         chain.nonce = Math.max(chain.nonce, 1);
       },
       async receipt(hash) {
         return chain.receipts.get(hash) ?? null;
+      },
+      async canonical(_n, h) {
+        return !chain.orphans.has(h);
       },
       async nonce() {
         return chain.nonce;
@@ -554,7 +568,12 @@ function sinks(opts = {}) {
   });
   s.chain.byAction.set("0:7", 1n);
   // the journal says one of our txs was sent; the chain shows it reverted (AlreadyDisclosed)
-  s.chain.receipts.set(ethers.id("disclose-x"), { status: 0, entryId: null, blockNumber: 999 });
+  s.chain.receipts.set(ethers.id("disclose-x"), {
+    status: 0,
+    entryId: null,
+    blockNumber: 999,
+    blockHash: ethers.id("b999"),
+  });
   const r = await pub(bls, s, {
     registry: {
       phase: "sent",
@@ -569,6 +588,112 @@ function sinks(opts = {}) {
     "revert because the action is already disclosed with our content: confirmed",
     r.state.registry.phase === "confirmed",
     r.state.registry
+  );
+}
+
+// ---- Codex W2a R4: provisional failures, orphaned receipts, legacy journals
+{
+  // A failed receipt above the finalized block is not final: not parked. Once final, the
+  // competing entry (AlreadyDisclosed) is adopted.
+  const s = sinks();
+  const args = discloseArgs(bls, f1);
+  s.chain.entries.set(1n, {
+    binding: expectedBinding(bls),
+    recordURI: args.recordURI,
+    recordHash: args.recordHash,
+    amendments: [],
+    block: 1001,
+  });
+  s.chain.byAction.set("0:7", 1n);
+  s.chain.block = 1002;
+  s.chain.finalizedLag = 5; // finalized 997: neither the revert nor the entry is final
+  s.chain.receipts.set(ethers.id("disclose-y"), {
+    status: 0,
+    entryId: null,
+    blockNumber: 1002,
+    blockHash: ethers.id("b1002"),
+  });
+  const prev = {
+    registry: {
+      phase: "sent",
+      raw: "0xrawy",
+      hash: ethers.id("disclose-y"),
+      hashes: [ethers.id("disclose-y")],
+      nonce: 0,
+      sentAt: new Date().toISOString(),
+    },
+  };
+  const r1 = await pub(bls, s, prev);
+  cell(
+    "a failed receipt above the finalized block is not parked as reverted",
+    r1.state.registry.phase === "sent",
+    r1.state.registry
+  );
+  s.chain.finalizedLag = 0;
+  const r2 = await pub(bls, s, r1.state);
+  cell(
+    "…once final, the competing entry with our content is adopted",
+    r2.state.registry.phase === "confirmed",
+    r2.state.registry
+  );
+}
+{
+  // An orphaned receipt is ignored: the replacement hash is checked, pending recovery resumes.
+  const s = sinks();
+  const args = discloseArgs(bls, f1);
+  s.chain.signedArgs.set("0xraw77", args);
+  s.chain.receipts.set(ethers.id("disclose-old"), {
+    status: 1,
+    entryId: 5n,
+    blockNumber: 990,
+    blockHash: ethers.id("orphan"),
+  });
+  s.chain.orphans.add(ethers.id("orphan"));
+  const prev = {
+    registry: {
+      phase: "landed",
+      raw: "0xraw77",
+      hash: ethers.id("disclose-77"),
+      hashes: [ethers.id("disclose-old"), ethers.id("disclose-77")],
+      nonce: 0,
+      sentAt: new Date().toISOString(),
+    },
+  };
+  const r0 = await pub(bls, s, prev);
+  cell(
+    "an orphaned receipt is ignored and alerted",
+    r0.alerts.some(x => /orphaned block/.test(x)),
+    { a: r0.alerts, reg: r0.state.registry }
+  );
+  const r = await settle(bls, s, r0.state);
+  cell(
+    "…the other journalled hash lands and is confirmed",
+    r.state.registry.phase === "confirmed",
+    r.state.registry
+  );
+}
+{
+  // A legacy 'sent' journal without sentAt still reaches the stuck-tx timeout.
+  const s = sinks({ mine: "pending" });
+  s.chain.signedArgs.set("0xraw1", discloseArgs(bls, f1));
+  const legacy = {
+    registry: { phase: "sent", raw: "0xraw1", hash: ethers.id("disclose-1"), nonce: 0 },
+  };
+  const r1 = await pub(bls, s, legacy, { maxPendingMs: 60_000 });
+  cell(
+    "a legacy sent journal gets its sentAt once",
+    typeof r1.state.registry.sentAt === "string",
+    r1.state.registry
+  );
+  const old = {
+    ...r1.state,
+    registry: { ...r1.state.registry, sentAt: new Date(Date.now() - 120_000).toISOString() },
+  };
+  const r2 = await pub(bls, s, old, { maxPendingMs: 60_000 });
+  cell(
+    "…and is replaced once it has been pending past the timeout",
+    s.calls.lastSignOpts?.replace === true && r2.state.registry.replacements === 1,
+    r2.state.registry
   );
 }
 
@@ -690,7 +815,7 @@ function sinks(opts = {}) {
 }
 {
   // Single-instance lock: an OS-held socket; a second holder is refused, release frees it.
-  const port = 47000 + Math.floor(Math.random() * 1000);
+  const port = 40000 + Math.floor(Math.random() * 5000); // never the production port 47331
   const release = await acquireLock(port);
   let second = null;
   try {
@@ -700,7 +825,7 @@ function sinks(opts = {}) {
   }
   cell(
     "single-instance lock: a second holder is refused",
-    /another watcher holds the lock/.test(second ?? ""),
+    /is occupied/.test(second ?? ""),
     second
   );
   await release();

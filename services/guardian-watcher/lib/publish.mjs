@@ -30,7 +30,8 @@
 //               entryOf(kind, key, { blockTag }) -> entryId (0 = none),
 //               entry(entryId, { blockTag }) -> { binding, recordURI, recordHash, amendments[] },
 //               sign(args, { nonce?, replace? }) -> { raw, hash, nonce }, broadcast(raw) -> void,
-//               receipt(hash) -> { status, entryId, blockNumber } | null,
+//               receipt(hash) -> { status, entryId, blockNumber, blockHash } | null,
+//               canonical(blockNumber, blockHash) -> bool,
 //               nonce() -> the writer's nonce at the FINALIZED block }
 import { ethers } from "ethers";
 import { Kind } from "../../../scripts/disclosure/recheck-lib.mjs";
@@ -271,23 +272,35 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     } catch (e) {
       state.registry = { ...r, lastBroadcastError: String(e?.message ?? e) };
     }
-    if (r.phase === "signed")
-      state.registry = {
-        ...state.registry,
-        phase: "sent",
-        sentAt: r.sentAt ?? new Date().toISOString(),
-      };
+    // A resumed in-flight journal (including one written before sentAt existed) gets its sentAt
+    // once, so the stuck-tx timeout can elapse.
+    state.registry = {
+      ...state.registry,
+      phase: r.phase === "signed" ? "sent" : r.phase,
+      sentAt: r.sentAt ?? new Date().toISOString(),
+    };
     await persist(state);
-    // Any of the journalled hashes (original and replacements) may be the one that landed.
+    // Any of the journalled hashes (original and replacements) may be the one that landed. A
+    // receipt counts only if its block is canonical: an orphaned receipt is ignored, the other
+    // hashes are checked, and pending/dropped recovery resumes.
     let rc = null;
     for (const h of state.registry.hashes ?? [state.registry.hash]) {
-      rc = await reg.receipt(h);
-      if (rc) break;
+      const c = await reg.receipt(h);
+      if (!c) continue;
+      if (!(await reg.canonical(c.blockNumber, c.blockHash))) {
+        alerts.push(`registry: receipt of ${h} is on an orphaned block; ignored`);
+        continue;
+      }
+      rc = c;
+      break;
     }
     if (rc && Number(rc.status) === 1 && rc.entryId != null) {
       return settleLanded(rec, file, reg, state, persist, alerts, rc);
     }
     if (rc && Number(rc.status) !== 1) {
+      // A failure is final only once its block is finalized; until then it may still reorg away,
+      // or the competing entry (AlreadyDisclosed) may not be final yet.
+      if (Number(rc.blockNumber) > (await reg.finalized())) return;
       // Reverted - possibly AlreadyDisclosed because another tx of ours landed first.
       if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
       state.registry = {

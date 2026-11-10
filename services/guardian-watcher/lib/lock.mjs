@@ -17,7 +17,9 @@ export function acquireLock(port = DEFAULT_LOCK_PORT) {
     srv.once("error", e =>
       reject(
         e.code === "EADDRINUSE"
-          ? new Error(`another watcher holds the lock (127.0.0.1:${port} in use)`)
+          ? new Error(
+              `lock port 127.0.0.1:${port} is occupied (another watcher, or another program on that port); not starting`
+            )
           : e
       )
     );
