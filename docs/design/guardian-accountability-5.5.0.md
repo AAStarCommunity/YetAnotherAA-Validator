@@ -170,8 +170,14 @@ watcher flags, whose factual fields are verified on-chain at write time.
   full. A corrected `blockNumber` is a claim (not re-verified against EIP-2935).
   `subjectToken` is part of the binding and cannot be amended (§4.3). The
   on-chain-verified fields (signers, message, key) cannot be wrong and are never
-  amended. Before `disclose`, the watcher rechecks its own entry with the
-  recheck tool, so an amendment is the exception.
+  amended. The watcher builds every entry from `rebuildFromAction` (the recheck
+  library), so its verified fields already reproduce the commitment before
+  `disclose`; amendments are for its claim fields and are the exception. The
+  recheck tool currently reads the original claims of an entry; applying
+  amendments (an amended `txHash`/`blockNumber` changes which tx it rebuilds
+  from) is a follow-up, and until then an amended entry is rechecked against its
+  original claims. An amended `blockNumber` never inherits the entry's
+  `blockVerified`.
 - `version()` returns `"DisclosureRegistry-1.0.0"` (SP's IVersioned shape), read
   back by the release manifest.
 - `WRITER` (the watcher EOA) and `AGGREGATOR` are immutable constructor

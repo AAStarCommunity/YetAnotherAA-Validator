@@ -699,4 +699,56 @@ contract DisclosureRegistryTest is Test {
     function test_version() public view {
         assertEq(reg.version(), "DisclosureRegistry-1.0.0");
     }
+
+    /// Consumers decode Amended by its canonical signature; pin topic and data layout independently
+    /// of the contract's own declaration, and show that a later amendment fully replaces an earlier one.
+    function test_amendedEventEncodingAndSequence() public {
+        uint256 id = _disclose(_executed(DisclosureRegistry.Kind.SLASH, 51, _slashInputs(), 0x7));
+        bytes32 topic = keccak256("Amended(uint256,(bytes32,uint64,bytes20,string,bytes32),bytes32)");
+        vm.recordLogs();
+        vm.startPrank(writer);
+        reg.amend(
+            id,
+            DisclosureRegistry.Amendment(keccak256("tx-a"), 11, bytes20(uint160(1)), "ipfs://a", keccak256("a")),
+            keccak256("first")
+        );
+        reg.amend(id, DisclosureRegistry.Amendment(bytes32(0), 0, bytes20(0), "", bytes32(0)), keccak256("second"));
+        vm.stopPrank();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2);
+        for (uint256 i = 0; i < 2; i++) {
+            assertEq(logs[i].topics[0], topic, "canonical Amended topic");
+            assertEq(uint256(logs[i].topics[1]), id, "entryId indexed");
+        }
+        // data = abi.encode(Amendment, bytes32 reasonHash), decoded with plain types, not the contract's struct
+        (bytes32 tx0, uint64 bn0, bytes20 rc0, string memory uri0, bytes32 rh0) = _decodeAmendment(logs[0].data);
+        assertEq(tx0, keccak256("tx-a"));
+        assertEq(bn0, 11);
+        assertEq(rc0, bytes20(uint160(1)));
+        assertEq(uri0, "ipfs://a");
+        assertEq(rh0, keccak256("a"));
+        (bytes32 tx1, uint64 bn1, bytes20 rc1, string memory uri1, bytes32 rh1) = _decodeAmendment(logs[1].data);
+        assertEq(tx1, bytes32(0), "a later amendment replaces every claim field, also with zero values");
+        assertEq(bn1, 0);
+        assertEq(rc1, bytes20(0));
+        assertEq(bytes(uri1).length, 0);
+        assertEq(rh1, bytes32(0));
+    }
+
+    struct PlainAmendment {
+        bytes32 txHash;
+        uint64 blockNumber;
+        bytes20 rulesetCommit;
+        string recordURI;
+        bytes32 recordHash;
+    }
+
+    function _decodeAmendment(bytes memory data)
+        internal
+        pure
+        returns (bytes32, uint64, bytes20, string memory, bytes32)
+    {
+        (PlainAmendment memory a,) = abi.decode(data, (PlainAmendment, bytes32));
+        return (a.txHash, a.blockNumber, a.rulesetCommit, a.recordURI, a.recordHash);
+    }
 }
