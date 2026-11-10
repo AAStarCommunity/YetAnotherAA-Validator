@@ -307,9 +307,11 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
     `callTracer` trace, decoding only error-free CALL frames into the pinned
     aggregator or DVTValidator. The route rules apply inside the trace: module
     calls are pruned; a DELEGATECALL is followed only as the owner Safe's own
-    proxy hop into its actual singleton (read from the Safe's storage slot 0 at
-    block N-1) or into the pinned MultiSendCallOnly with all-CALL children.
-    Without a trace, INCONCLUSIVE.
+    proxy hop into its singleton (slot 0 read from the pre-tx state via
+    `prestateTracer`, and at blocks N-1 and N; a Safe that re-points its
+    singleton inside the same tx before the hop is a known INCONCLUSIVE case) or
+    into the pinned MultiSendCallOnly with all-CALL children. Without a trace,
+    INCONCLUSIVE.
 
   Whatever the route, a recovered call's message counts only if it reproduces
   the stored commitment, or if the call is proven to have succeeded (the

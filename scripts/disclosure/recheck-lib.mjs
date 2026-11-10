@@ -448,13 +448,28 @@ export async function extractCandidates(
       // The owner Safe is a proxy: callTracer shows CALL Safe -> DELEGATECALL <singleton>. That one
       // hop is followed only into the Safe's ACTUAL singleton, read from its storage slot 0 at
       // block N-1; a delegatecall from the Safe to anything else is pruned like any other.
-      // The Safe's singleton is read at the parent block and at the block itself: a Safe deployed
-      // or re-pointed earlier in the same block shows only in the latter. The hop is followed if
-      // the delegatecall target is either; otherwise it is pruned (INCONCLUSIVE, never MISMATCH).
+      // The Safe's singleton: slot 0 just before THIS tx (prestateTracer, which also sees a change
+      // made by an earlier tx of the same block), and at the parent block and at the block as a
+      // fallback. The hop is followed if the delegatecall target is any of them; otherwise it is
+      // pruned (INCONCLUSIVE, never MISMATCH). Known limit: a Safe that re-points its singleton
+      // inside this same tx before the hop is not seen, which also ends INCONCLUSIVE.
       let singletons;
       const safeSingletons = async () => {
         if (singletons !== undefined) return singletons;
         singletons = [];
+        try {
+          const pre = await chain.send("debug_traceTransaction", [
+            tx.hash,
+            { tracer: "prestateTracer" },
+          ]);
+          const acct = pre && Object.entries(pre).find(([a]) => eqAddr(a, fw.ownerSafe))?.[1];
+          const word =
+            acct?.storage && Object.entries(acct.storage).find(([k]) => BigInt(k) === 0n)?.[1];
+          if (word)
+            singletons.push(ethers.getAddress(ethers.dataSlice(ethers.zeroPadValue(word, 32), 12)));
+        } catch {
+          /* no prestate tracer: block-boundary reads only */
+        }
         for (const tag of [blockNumber - 1, blockNumber]) {
           try {
             const word = await chain.send("eth_getStorageAt", [
@@ -599,20 +614,106 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
   const ds = await view(chain, agg, "domainSeparator", [], blockNumber);
   let found = await extractCandidates(chain, tx, agg, forwarders, blockNumber);
   facts.route = null;
-  const keyMatches = list =>
-    list.some(c => {
+  // Decide on one candidate set, on a fresh copy of the facts.
+  const decide = async found => {
+    const f = { ...facts, incomplete: [...facts.incomplete] };
+    const matching = [];
+    for (const c of found.candidates) {
       if (
         (c.kind === Kind.SLASH || c.kind === Kind.REPUTATION) &&
         BigInt(c.proposalId) >= RAW_ID_BOUND
-      )
-        return false;
-      return (
-        commitmentKey(c.kind, c.proposalId, messageHashOf(ds, c.kind, c.proposalId, c.fields)) ===
-        commit.key
+      ) {
+        continue; // the aggregator reverts these (InvalidProposalId), so it cannot be the committed call
+      }
+      const mh = messageHashOf(ds, c.kind, c.proposalId, c.fields);
+      if (commitmentKey(c.kind, c.proposalId, mh) === commit.key)
+        matching.push({ ...c, messageHash: mh });
+    }
+    if (matching.length === 0) {
+      f.incomplete.push(...found.notes);
+      f.incomplete.push(
+        found.candidates.length
+          ? "no recovered aggregator call reproduces the SignersCommitted key"
+          : "no aggregator call recoverable from this tx (wrapped through a contract the manifest does not pin)"
       );
-    });
-  // The direct path may recover other calls of a batch but not this one: then ask the trace too.
-  if (!found.traced && !keyMatches(found.candidates)) {
+      return { status: null, facts: f };
+    }
+    // A recovered call's message becomes a FACT only if it is authenticated: it reproduces the stored
+    // commitment, or the call is proven to have succeeded (`proven`: a top-level call to the pinned
+    // aggregator/DVTValidator in a successful tx, or an error-free trace path). A Safe inner call is
+    // not proven — execTransaction does not revert when its inner call fails — so until it matches
+    // the commitment it is never compared, and it can neither accuse nor hide an honest entry.
+    const distinct = [];
+    for (const m of matching) {
+      const d = distinct.find(x => x.messageHash === m.messageHash);
+      if (d) d.proven = d.proven || m.proven;
+      else distinct.push({ ...m });
+    }
+    const useMessage = c => {
+      f.route = c.route;
+      Object.assign(f, {
+        kind: c.kind,
+        proposalId: BigInt(c.proposalId),
+        messageHash: c.messageHash,
+        messageInputs: encodeMessageInputs(c.kind, c.fields),
+      });
+      f.fields = c.fields;
+    };
+    const proven = distinct.filter(c => c.proven);
+
+    if (f.anchor !== undefined) {
+      const onchain = await view(chain, agg, "proposalSignersCommitment", [commit.key], snapshot);
+      // The aggregator resolved slots during the tx. Pre-block state equals that unless an earlier
+      // tx in the same block re-registered a slot, so try the parent block first, then the block
+      // itself. A change undone later in the same block is visible in neither.
+      const signerSets = [];
+      for (const tag of [blockNumber - 1, blockNumber]) {
+        signerSets.push({ tag, s: await resolveSigners(chain, agg, commit.signerMask, tag) });
+      }
+      const authenticated = [];
+      for (const c of distinct) {
+        const hit = signerSets.find(
+          x =>
+            expectedCommitment(ds, commit.key, c.messageHash, commit.signerMask, x.s, f.anchor) ===
+            onchain
+        );
+        if (hit) authenticated.push({ c, hit });
+      }
+      if (authenticated.length === 1) {
+        useMessage(authenticated[0].c);
+        f.signers = authenticated[0].hit.s;
+        f.slotBlock = authenticated[0].hit.tag;
+        return { status: null, facts: f, authenticated: true };
+      }
+      if (authenticated.length > 1) {
+        f.incomplete.push("several recovered calls reproduce the commitment");
+        return { status: null, facts: f };
+      }
+    }
+    // Not authenticated by the commitment (no anchor, or the slot table changed inside the block).
+    // Only a proven call's message may still be compared; the signer set stays undecided.
+    if (proven.length === 1) {
+      useMessage(proven[0]);
+      f.incomplete.push(
+        f.anchor === undefined
+          ? "commitment not rebuilt (no anchor); signers undecided"
+          : "signers at the parent block and at the block do not reproduce proposalSignersCommitment " +
+              "(slot table changed inside the block, or the commitment was overwritten); replay the block to decide"
+      );
+      return { status: null, facts: f, authenticated: true };
+    }
+    f.incomplete.push(...found.notes);
+    f.incomplete.push(
+      proven.length > 1
+        ? "several proven calls claim the same key with different messages"
+        : "no recovered call is authenticated (none reproduces the commitment, and none is a proven top-level call)"
+    );
+    return { status: null, facts: f };
+  };
+  let out = await decide(found);
+  // Nothing authenticated (e.g. the direct path saw only a failed decoy under the same key) and the
+  // trace not yet consulted: ask it, merge, decide again.
+  if (!out.authenticated && !found.traced) {
     const viaTrace = await extractCandidates(chain, tx, agg, forwarders, blockNumber, {
       forceTrace: true,
     });
@@ -621,105 +722,9 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
       notes: [...found.notes, ...viaTrace.notes],
       traced: viaTrace.traced,
     };
+    out = await decide(found);
   }
-  const matching = [];
-  for (const c of found.candidates) {
-    if (
-      (c.kind === Kind.SLASH || c.kind === Kind.REPUTATION) &&
-      BigInt(c.proposalId) >= RAW_ID_BOUND
-    ) {
-      continue; // the aggregator reverts these (InvalidProposalId), so it cannot be the committed call
-    }
-    const mh = messageHashOf(ds, c.kind, c.proposalId, c.fields);
-    if (commitmentKey(c.kind, c.proposalId, mh) === commit.key)
-      matching.push({ ...c, messageHash: mh });
-  }
-  if (matching.length === 0) {
-    facts.incomplete.push(...found.notes);
-    facts.incomplete.push(
-      found.candidates.length
-        ? "no recovered aggregator call reproduces the SignersCommitted key"
-        : "no aggregator call recoverable from this tx (wrapped through a contract the manifest does not pin)"
-    );
-    return { status: null, facts };
-  }
-  // A recovered call's message becomes a FACT only if it is authenticated: it reproduces the stored
-  // commitment, or the call is proven to have succeeded (`proven`: a top-level call to the pinned
-  // aggregator/DVTValidator in a successful tx, or an error-free trace path). A Safe inner call is
-  // not proven — execTransaction does not revert when its inner call fails — so until it matches
-  // the commitment it is never compared, and it can neither accuse nor hide an honest entry.
-  const distinct = [];
-  for (const m of matching) {
-    const d = distinct.find(x => x.messageHash === m.messageHash);
-    if (d) d.proven = d.proven || m.proven;
-    else distinct.push({ ...m });
-  }
-  const useMessage = c => {
-    facts.route = c.route;
-    Object.assign(facts, {
-      kind: c.kind,
-      proposalId: BigInt(c.proposalId),
-      messageHash: c.messageHash,
-      messageInputs: encodeMessageInputs(c.kind, c.fields),
-    });
-    facts.fields = c.fields;
-  };
-  const proven = distinct.filter(c => c.proven);
-
-  if (facts.anchor !== undefined) {
-    const onchain = await view(chain, agg, "proposalSignersCommitment", [commit.key], snapshot);
-    // The aggregator resolved slots during the tx. Pre-block state equals that unless an earlier
-    // tx in the same block re-registered a slot, so try the parent block first, then the block
-    // itself. A change undone later in the same block is visible in neither.
-    const signerSets = [];
-    for (const tag of [blockNumber - 1, blockNumber]) {
-      signerSets.push({ tag, s: await resolveSigners(chain, agg, commit.signerMask, tag) });
-    }
-    const authenticated = [];
-    for (const c of distinct) {
-      const hit = signerSets.find(
-        x =>
-          expectedCommitment(
-            ds,
-            commit.key,
-            c.messageHash,
-            commit.signerMask,
-            x.s,
-            facts.anchor
-          ) === onchain
-      );
-      if (hit) authenticated.push({ c, hit });
-    }
-    if (authenticated.length === 1) {
-      useMessage(authenticated[0].c);
-      facts.signers = authenticated[0].hit.s;
-      facts.slotBlock = authenticated[0].hit.tag;
-      return { status: null, facts };
-    }
-    if (authenticated.length > 1) {
-      facts.incomplete.push("several recovered calls reproduce the commitment");
-      return { status: null, facts };
-    }
-  }
-  // Not authenticated by the commitment (no anchor, or the slot table changed inside the block).
-  // Only a proven call's message may still be compared; the signer set stays undecided.
-  if (proven.length === 1) {
-    useMessage(proven[0]);
-    facts.incomplete.push(
-      facts.anchor === undefined
-        ? "commitment not rebuilt (no anchor); signers undecided"
-        : "signers at the parent block and at the block do not reproduce proposalSignersCommitment " +
-            "(slot table changed inside the block, or the commitment was overwritten); replay the block to decide"
-    );
-    return { status: null, facts };
-  }
-  facts.incomplete.push(...found.notes);
-  facts.incomplete.push(
-    proven.length > 1
-      ? "several proven calls claim the same key with different messages"
-      : "no recovered call is authenticated (none reproduces the commitment, and none is a proven top-level call)"
-  );
-  return { status: null, facts };
+  return { status: out.status, facts: out.facts };
 }
 
 /**

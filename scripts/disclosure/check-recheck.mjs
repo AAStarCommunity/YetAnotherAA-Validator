@@ -56,6 +56,7 @@ const {
   receiptWithoutStatus,
   setTrace,
   setStorage,
+  setPrestate,
 } = makeChain();
 const results = [];
 // want: "PASS" | { diff } (MISMATCH on that field) | { status, reason } | { unverified: {...} } (MATCH,
@@ -760,6 +761,80 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
       "PASS"
     );
     setStorage(SAFE, 0, ethers.zeroPadValue(SINGLETON, 32), m3.block + 1); // restore for later cells
+  }
+
+  // Codex W1 R3 M2: a singleton set by an earlier tx of the block and reverted by a later one is in
+  // neither boundary snapshot; the pre-tx state (prestateTracer) shows it.
+  {
+    const TRANSIENT = addr("safe-singleton-transient");
+    const m3b = execute(Kind.SLASH, 86n, slashF, 0b011n, { to: WRAPPER });
+    setTrace(m3b.hash, viaSafeProxy(86n, TRANSIENT));
+    setPrestate(m3b.hash, {
+      [SAFE.toLowerCase()]: {
+        storage: { [ethers.zeroPadValue("0x00", 32)]: ethers.zeroPadValue(TRANSIENT, 32) },
+      },
+    });
+    await expectCase(
+      "trace: transient singleton seen through the pre-tx state is followed",
+      disclose(Kind.SLASH, 86n, slashIn, m3b),
+      "PASS"
+    );
+  }
+
+  // Codex W1 R3 M1: the direct path sees only a failed decoy under the SAME key; since it does not
+  // authenticate, the trace must still be asked, and recovers the genuine call.
+  {
+    const decoy = aggIface.encodeFunctionData("verifyAndExecute", [
+      92n,
+      slashF.operator,
+      2,
+      [],
+      [],
+      slashF.epoch,
+      ethers.id("decoy"),
+      "0x",
+    ]);
+    const nestedDecoy = {
+      op: 0,
+      to: SAFE,
+      data: safeIface.encodeFunctionData("execTransaction", [
+        AGG,
+        0,
+        decoy,
+        0,
+        100000,
+        0,
+        0,
+        ethers.ZeroAddress,
+        ethers.ZeroAddress,
+        "0x",
+      ]),
+    };
+    const m5 = execute(Kind.SLASH, 92n, slashF, 0b011n, {
+      via: { route: "multisend", subs: [], extraSub: nestedDecoy },
+    });
+    setTrace(m5.hash, {
+      type: "CALL",
+      to: SAFE,
+      calls: [
+        {
+          type: "DELEGATECALL",
+          to: SINGLETON,
+          calls: [
+            {
+              type: "CALL",
+              to: addr("opaque2"),
+              calls: [{ type: "CALL", to: AGG, input: slashCall(92n) }],
+            },
+          ],
+        },
+      ],
+    });
+    await expectCase(
+      "same-key failed decoy on the direct path: trace still consulted, genuine call recovered",
+      disclose(Kind.SLASH, 92n, slashIn, m5),
+      "PASS"
+    );
   }
 
   // Codex W1 R2 M4: a pinned Safe batch whose direct path decodes another call, not this one: the

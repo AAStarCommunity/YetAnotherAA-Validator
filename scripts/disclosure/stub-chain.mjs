@@ -135,6 +135,7 @@ function makeChain() {
   let onReceipt = null; // one-shot hook around the next receipt fetch
   let finalityLag = 0; // "finalized" = head - finalityLag
   const storage = new Map(); // `${address}:${slot}` -> [{ block, word }] (block-versioned)
+  const prestates = new Map(); // tx hash -> prestateTracer result
   const prices = []; // SuperPaymaster cachedPrice history: [{ block, price }]
   /** Append a tx's receipt logs to the chain-wide log index (getLogs), with positions. */
   const indexLogs = (hash, n, rlogs) =>
@@ -193,6 +194,11 @@ function makeChain() {
           h => h.block <= at
         );
         return hist.length ? hist[hist.length - 1].word : ethers.ZeroHash;
+      }
+      if (method === "debug_traceTransaction" && params[1]?.tracer === "prestateTracer") {
+        const pre = prestates.get(params[0]);
+        if (!pre) throw new Error("prestate unavailable");
+        return pre;
       }
       if (method === "debug_traceTransaction") {
         const t = traces.get(params[0]);
@@ -643,6 +649,8 @@ function makeChain() {
     setPrice: (block, price) => prices.push({ block, price }),
     /** Install a callTracer trace for a tx (frames may carry `logs`, as with withLog). */
     setTrace: (hash, frame) => traces.set(hash, frame),
+    /** Install a prestateTracer result for a tx ({ address: { storage: { slot: word } } }). */
+    setPrestate: (hash, pre) => prestates.set(hash, pre),
     setFinalityLag: k => (finalityLag = k),
     setStorage: (who, slot, word, fromBlock = 0) => {
       const k = `${ethers.getAddress(who)}:${BigInt(slot)}`;
