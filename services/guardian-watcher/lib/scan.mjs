@@ -605,6 +605,15 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   for (const l of [...t.agg, ...t.sp])
     if (l.removed === true) throw new Error("removed watched log");
   for (const l of t.agg) if (l.topics.length < 2) throw new Error("aggregator log without a key");
+  // a log must match the query that returned it: the configured emitter and a watched topic
+  // (an RPC whose address filter is wrong must not get another contract's event attributed)
+  const spT = new Set(spTopics().map(x => x.toLowerCase()));
+  for (const l of t.agg)
+    if (!lcEq(l.address, cfg.aggregator) || !lcEq(l.topics[0], SIGNERS_COMMITTED()))
+      throw new Error("aggregator query returned a log of another emitter or topic");
+  for (const l of t.sp)
+    if (!lcEq(l.address, cfg.roles.superPaymaster) || !spT.has(String(l.topics[0]).toLowerCase()))
+      throw new Error("SP query returned a log of another emitter or topic");
   // positions are judged here, inside the isolation, for every watched log
   {
     // one position, one log: conflicting copies at a position are a malformed answer
@@ -729,7 +738,8 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       // Completed before (tx retry, M5). Effects the trace proves only now are kept beside the
       // record, not lost when the tx dead letter resolves (#400 review L4).
       const effects = effectsOf.get(commitCall.get(logPos(l))) ?? [];
-      if (effects.length)
+      if (
+        effects.length &&
         store.putBlsAmendment(BigInt(l.topics[1]), {
           key: BigInt(l.topics[1]).toString(),
           txHash,
@@ -737,7 +747,10 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
           provenAt: ctx.now,
           spEvents: effects,
           ruleset: ctx.ruleset,
-        });
+        }) === "conflict"
+      )
+        // a different valid proof already stands for this action: both kept, and counted
+        summary.amendmentConflicts = (summary.amendmentConflicts ?? 0) + 1;
       continue;
     }
     // A BLS action with an open dead letter is retried by that dead letter only, once per tick,
@@ -972,7 +985,6 @@ function exhaust(store, rs, cfg, ctx, summary, dl) {
  * Logs that come back are merged in; an empty answer by hash confirms a bloom false positive.
  */
 async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
-  const have = (logs, n) => logs.some(l => Number(l.blockNumber) === n);
   const extraAgg = [];
   const extraSp = [];
   for (let a = from; a <= to; a += 100) {
@@ -998,7 +1010,9 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
           }
           if (
             may &&
-            !logs.some(l => Number(l.blockNumber) === n && lcEq(String(l.topics?.[0] ?? ""), topic))
+            !logs.some(
+              l => parsePosition(l.blockNumber) === n && lcEq(String(l.topics?.[0] ?? ""), topic)
+            )
           )
             missing.push(topic);
         }
@@ -1184,14 +1198,27 @@ export async function tick(chain, cfg, store, rs, ctx) {
   const extraSp = intake(bc.extraSp, "sp");
 
   const byTx = new Map();
-  for (const l of [...aggLogs, ...extraAgg, ...spLogs, ...extraSp]) {
-    const t = byTx.get(l.transactionHash) ?? { block: Number(l.blockNumber), agg: [], sp: [] };
-    const list = lcEq(l.address, cfg.aggregator) ? t.agg : t.sp;
+  // Each log is grouped by the query that returned it (aggregator or SP), never by re-reading its
+  // own address: whether it really matches its query is judged inside the isolation (Codex
+  // follow-up R4). Valid tx hashes are canonicalised (lower case) so one tx is one group, whatever
+  // casing the RPC used; the original hash stays in the evidence. Heights are parsed without
+  // coercion (a value that is not a number never throws here).
+  const groupKey = h =>
+    typeof h === "string" && /^0x[0-9a-fA-F]{64}$/.test(h) ? h.toLowerCase() : h;
+  for (const [l, source] of [
+    ...aggLogs.map(x => [x, "agg"]),
+    ...extraAgg.map(x => [x, "agg"]),
+    ...spLogs.map(x => [x, "sp"]),
+    ...extraSp.map(x => [x, "sp"]),
+  ]) {
+    const k = groupKey(l.transactionHash);
+    const t = byTx.get(k) ?? { block: parsePosition(l.blockNumber) ?? NaN, agg: [], sp: [] };
+    const list = source === "agg" ? t.agg : t.sp;
     // Grouping never throws on log contents: a malformed position is judged inside the per-tx
     // isolation (Codex follow-up R1). Duplicates (bloom-recovered copies) are dropped by their
     // raw position fields.
     if (!list.some(x => rawLogKey(x) === rawLogKey(l))) list.push(l);
-    byTx.set(l.transactionHash, t);
+    byTx.set(k, t);
   }
   const ordered = [...byTx.entries()].sort((a, b) => a[1].block - b[1].block);
   for (const [txHash, t] of ordered)

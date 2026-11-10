@@ -29,7 +29,7 @@ import {
   txOfEvidence,
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
-import { Store, writeAll } from "./lib/store.mjs";
+import { Store, writeAll, validAmendment } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
 import { attributeLogs, flattenTraceLogs, validLog, receiptPos } from "./lib/attribute.mjs";
 
@@ -2476,6 +2476,111 @@ try {
           readdirSync(join(k.d, "amendments")).some(f => f.endsWith(".invalid.1")) &&
           k.store.putBlsAmendment(key, good) === "same",
         { r2, files: readdirSync(join(k.d, "amendments")) }
+      );
+    }
+
+    // Codex follow-up R4
+    {
+      const m = mk();
+      const n = m.c.mine();
+      const gs = spIface.encodeEventLog("GuardianSet", [addr("r4-a"), addr("r4-b")]);
+      const blkHash = (await m.c.chain.send("eth_getBlockByNumber", [ethers.toQuantity(n), false]))
+        .hash;
+      const base = { blockNumber: n, blockHash: blkHash, index: 0 };
+      // (b) a height that is an object
+      m.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        ...base,
+        transactionHash: ethers.id("r4-objh"),
+        blockNumber: { toString: null },
+      });
+      // (c) one tx in two casings, two different malformed copies
+      const hx = ethers.id("r4-case");
+      m.c.injectRawResult(SP, {
+        address: SP,
+        topics: [gs.topics[0]],
+        data: "0x",
+        ...base,
+        transactionHash: hx,
+      });
+      m.c.injectRawResult(SP, {
+        address: SP,
+        topics: [gs.topics[0]],
+        data: "0x00",
+        ...base,
+        transactionHash: "0x" + hx.slice(2).toUpperCase(),
+      });
+      // (d) the SP query returns another contract's decodable event, and an aggregator-shaped log,
+      // both naming a REAL tx that emitted nothing watched
+      const quiet = m.c.ownerTx([]);
+      const quiet2 = m.c.ownerTx([]);
+      const r1 = await m.c.chain.getTransactionReceipt(quiet.hash);
+      const r2 = await m.c.chain.getTransactionReceipt(quiet2.hash);
+      m.c.injectRawResult(SP, {
+        address: addr("r4-other"),
+        ...gs,
+        blockNumber: r1.blockNumber,
+        blockHash: r1.blockHash,
+        index: 0,
+        transactionHash: quiet.hash,
+      });
+      m.c.injectRawResult(SP, {
+        address: AGG,
+        ...aggIface.encodeEventLog("SignersCommitted", [123n, 3n]),
+        blockNumber: r2.blockNumber,
+        blockHash: r2.blockHash,
+        index: 0,
+        transactionHash: quiet2.hash,
+      });
+      settle(m.c);
+      const ms = (await runOnce(m.c.chain, m.cfg, m.store, rs, ident)).status;
+      const md = m.store.listDeadLetters();
+      cell(
+        "follow-up R4: an object height, one tx in two hash casings, and another emitter in the SP query are isolated; tick ok; nothing attributed",
+        ms.ok === true &&
+          md.some(x => x.txHash === ethers.id("r4-objh")) &&
+          md.some(x => x.txHash === hx && x.watched.length === 2) &&
+          md.some(x => x.txHash === quiet.hash && x.route === "tx") &&
+          md.some(x => x.txHash === quiet2.hash && x.route === "tx") &&
+          !md.some(x => x.txHash === quiet2.hash && x.route === "bls") &&
+          !m
+            .recs()
+            .some(r => [ethers.id("r4-objh"), hx, quiet.hash, quiet2.hash].includes(r.txHash)),
+        {
+          ok: ms.ok,
+          err: ms.lastError,
+          dls: md.map(x => [x.txHash.slice(0, 10), x.watched?.length, x.reasons]),
+        }
+      );
+      // (a) amendments: strict validity, and a different valid proof is a conflict, not "same"
+      const okA = {
+        key: "5",
+        txHash: ethers.id("r4-am"),
+        provenBy: "trace",
+        spEvents: [{ event: "PriceUpdated", logIndex: 1 }],
+      };
+      const badOnes = [
+        { ...okA, provenBy: "" },
+        ...[null, false, "", -1].map(v => ({
+          ...okA,
+          spEvents: [{ event: "PriceUpdated", logIndex: v }],
+        })),
+      ];
+      const k5 = 5n;
+      m.store.putBlsAmendment(k5, okA);
+      const other = { ...okA, txHash: ethers.id("r4-am-2") };
+      const rc = m.store.putBlsAmendment(k5, other);
+      const keyHex = k5.toString(16).padStart(64, "0");
+      cell(
+        "follow-up R4: amendment validity is strict, and a different valid proof is kept as a conflict, never reported as persisted",
+        validAmendment(okA, k5) &&
+          badOnes.every(b => !validAmendment(b, k5)) &&
+          rc === "conflict" &&
+          m.store.getBlsAmendment(k5)?.txHash === okA.txHash &&
+          readdirSync(join(m.d, "amendments")).includes(`bls-${keyHex}.json.conflict.1`) &&
+          m.store.putBlsAmendment(k5, okA) === "same",
+        { rc, valid: badOnes.map(b => validAmendment(b, k5)) }
       );
     }
 

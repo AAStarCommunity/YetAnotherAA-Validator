@@ -172,6 +172,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
       isolatedThisTick: s.isolated ?? 0,
       unreadableTotal: store.countUnreadable(),
       blsAmendments: store.countAmendments(),
+      amendmentConflictsThisTick: s.amendmentConflicts ?? 0,
       exhaustedTotal: store.countExhausted(),
       bloom: {
         recovered: s.bloomRecovered,

@@ -29,7 +29,7 @@ export function validAmendment(a, key) {
     typeof a === "object" &&
     String(a.key) === BigInt(key).toString() &&
     /^0x[0-9a-fA-F]{64}$/.test(String(a.txHash)) &&
-    typeof a.provenBy === "string" &&
+    a.provenBy === "trace" && // the only supported proof
     Array.isArray(a.spEvents) &&
     a.spEvents.length > 0 &&
     a.spEvents.every(
@@ -37,8 +37,11 @@ export function validAmendment(a, key) {
         e &&
         typeof e === "object" &&
         typeof e.event === "string" &&
-        e.event.length > 0 &&
-        Number.isSafeInteger(Number(e.logIndex))
+        /^[A-Z][A-Za-z0-9]{0,63}$/.test(e.event) &&
+        typeof e.logIndex === "number" &&
+        Number.isSafeInteger(e.logIndex) &&
+        e.logIndex >= 0 &&
+        (e.args === undefined || (e.args && typeof e.args === "object"))
     )
   );
 }
@@ -220,10 +223,24 @@ export class Store {
     if (existsSync(path)) {
       // an existing amendment counts only if it is a valid one for this key; a truncated or
       // foreign file is repaired, never trusted (Codex follow-up R2)
+      let cur = null;
       try {
-        if (validAmendment(JSON.parse(readFileSync(path, "utf8")), key)) return "same";
+        cur = JSON.parse(readFileSync(path, "utf8"));
       } catch {
-        // falls through to the repair
+        cur = null;
+      }
+      if (validAmendment(cur, key)) {
+        // persisted only if it is THIS proof: the same tx and the same events
+        const same =
+          String(cur.txHash).toLowerCase() === String(amendment.txHash).toLowerCase() &&
+          JSON.stringify(cur.spEvents, bigintSafe) ===
+            JSON.stringify(amendment.spEvents, bigintSafe);
+        if (same) return "same";
+        // a different valid proof for the same action: both kept, never one overwriting the other
+        let c = 1;
+        while (existsSync(`${path}.conflict.${c}`)) c++;
+        atomicWriteJson(`${path}.conflict.${c}`, amendment);
+        return "conflict";
       }
       // keep the invalid bytes for inspection, then persist the valid proof (Codex follow-up R3)
       let k = 1;
