@@ -18,6 +18,12 @@ import {
 import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
 import { runOnce, onceExitCode } from "./watcher.mjs";
 import { bls, owner, sinks } from "./mock-sinks.mjs";
+import { createServer } from "node:http";
+import { pinataPinner } from "./sinks/pinata.mjs";
+import { filebasePinner } from "./sinks/filebase.mjs";
+import { telegramSink } from "./sinks/telegram.mjs";
+import { gitMirror } from "./sinks/git-mirror.mjs";
+import { cidV1Raw } from "./lib/cid.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const results = [];
@@ -1047,6 +1053,220 @@ const cfg = { aggregator: AGG };
       out.map(r => [r.reverified, r.reverifying])
     );
   } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- DSR: no sink secret in anything the publication layer writes or sends. One sentinel per
+// secret (Pinata JWT, Filebase token, GitHub token in the remote URL, Telegram bot token in the URL
+// path). Pass 1: every sink fails, echoing its secret in the message / URL / body (Telegram by a
+// closed port, so the URL itself is in the failing request). Pass 2: Telegram 401 echoing its URL,
+// pins 4xx/5xx with the secret in the body. Pass 3: everything works. Then the data dir, statuses,
+// the uploaded IPFS bytes, the mirror's commits (contents and messages) and every Telegram text are
+// searched for every sentinel.
+{
+  const S = {
+    pin: "SENTPINATAjwt7a1",
+    fb: "SENTFILEBASEtok2b",
+    gh: "SENTGITHUBtok3c",
+    tg: "SENTTELEGRAMbot4d",
+  };
+  const all = Object.values(S);
+  const got = { uploads: [], texts: [] };
+  let pass = 1;
+  let tgMode = "ok"; // ok | 401 | 200false
+  const blobs = new Map();
+  const fileBytes = body => {
+    const t = body.toString("latin1");
+    const i = t.indexOf("\r\n\r\n", t.indexOf('filename="record.json"'));
+    const k = t.indexOf("\r\n--", i + 4);
+    return Buffer.from(t.slice(i + 4, k), "latin1");
+  };
+  const srv = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = Buffer.concat(chunks);
+    const echo = `${req.url} ${req.headers.authorization ?? ""}`;
+    if (req.url.startsWith("/pin")) {
+      if (pass === 1)
+        return res.end(JSON.stringify({ data: { cid: `Bearer ${req.headers.authorization}` } }));
+      if (pass === 2) {
+        res.statusCode = 401;
+        return res.end(JSON.stringify({ error: `invalid token ${echo}` }));
+      }
+      const b = fileBytes(body);
+      got.uploads.push(b);
+      const cid = cidV1Raw(b);
+      blobs.set(cid, b);
+      return res.end(JSON.stringify({ data: { cid } }));
+    }
+    if (req.url.startsWith("/fb")) {
+      if (pass === 1) return res.end(JSON.stringify({ Hash: String(req.headers.authorization) }));
+      if (pass === 2) {
+        res.statusCode = 500;
+        return res.end(`internal error ${echo}`);
+      }
+      const b = fileBytes(body);
+      got.uploads.push(b);
+      const cid = cidV1Raw(b);
+      blobs.set(cid, b);
+      return res.end(JSON.stringify({ Hash: cid }));
+    }
+    if (req.url.startsWith("/gw/ipfs/")) {
+      const b = blobs.get(req.url.split("/").pop());
+      if (!b) {
+        res.statusCode = 404;
+        return res.end(`not found ${echo}`);
+      }
+      return res.end(b);
+    }
+    if (req.url.startsWith("/tg/bot")) {
+      const m = JSON.parse(body.toString() || "{}");
+      if (tgMode === "200false")
+        return res.end(
+          JSON.stringify({ ok: false, error_code: 400, description: `Bad Request: ${req.url}` })
+        );
+      if (tgMode === "401") {
+        res.statusCode = 401;
+        return res.end(
+          JSON.stringify({ ok: false, error_code: 401, description: `Unauthorized ${req.url}` })
+        );
+      }
+      got.texts.push(String(m.text));
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    res.statusCode = 404;
+    res.end(echo);
+  });
+  await new Promise(r => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const d = tmp();
+  try {
+    const g = (cwd, ...a) =>
+      execFileSync("git", ["-C", cwd, ...a], { stdio: "pipe" })
+        .toString()
+        .trim();
+    const bare = join(d, "mirror.git");
+    const seed = join(d, "seed");
+    const clone = join(d, "clone.git");
+    const bad = join(d, "bad.git");
+    execFileSync("git", ["init", "--quiet", "--bare", bare]);
+    execFileSync("git", ["clone", "--quiet", bare, seed], { stdio: "pipe" });
+    g(
+      seed,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@invalid",
+      "commit",
+      "--quiet",
+      "--allow-empty",
+      "-m",
+      "init"
+    );
+    g(seed, "push", "--quiet", "origin", "HEAD:refs/heads/disclosure-records");
+    execFileSync("git", ["clone", "--quiet", "--bare", bare, clone], { stdio: "pipe" });
+    execFileSync("git", ["init", "--quiet", "--bare", bad]);
+    g(bad, "remote", "add", "origin", `http://user:${S.gh}@127.0.0.1:1/${S.gh}/r.git`);
+    const store = new Store(join(d, "data"));
+    store.putRecord(owner);
+    const pinners = () => [
+      pinataPinner({ token: S.pin, gateway: `${base}/gw`, uploadUrl: `${base}/pin` }),
+      filebasePinner({ token: S.fb, gateway: `${base}/gw`, rpcUrl: `${base}/fb` }),
+    ];
+    const tgUp = telegramSink({ token: S.tg, chatId: "1", apiBase: `${base}/tg` });
+    const tgDown = telegramSink({ token: S.tg, chatId: "1", apiBase: "http://127.0.0.1:1/tg" });
+    const builtFor = (telegram, mirrorClone) => ({
+      pinners: pinners(),
+      mirror: gitMirror({ clone: mirrorClone, repoUrl: `https://github.com/o/r` }),
+      telegram,
+      wallet: writer,
+      registryFor: () => null,
+    });
+    const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+    const statuses = [];
+    // every file of the data dir after every pass (later passes overwrite journals and alerts)
+    const snaps = [];
+    const snap = () => {
+      const w = p => {
+        for (const n of readdirSync(p, { withFileTypes: true })) {
+          const q = join(p, n.name);
+          if (n.isDirectory()) w(q);
+          else snaps.push(readFileSync(q, "latin1"));
+        }
+      };
+      w(join(d, "data"));
+    };
+    pass = 1;
+    statuses.push(
+      await publishPhase(store, roleChain(roles), cfg, P, builtFor(tgDown, bad), { now: 10_000 })
+    );
+    snap();
+    pass = 2;
+    tgMode = "401";
+    statuses.push(
+      await publishPhase(store, roleChain(roles), cfg, P, builtFor(tgUp, bad), { now: 20_000 })
+    );
+    snap();
+    tgMode = "200false";
+    statuses.push(
+      await publishPhase(store, roleChain(roles), cfg, P, builtFor(tgUp, bad), { now: 25_000 })
+    );
+    snap();
+    // pins and mirror still failing, Telegram back: the digest of the sink-failure alerts goes out
+    tgMode = "ok";
+    statuses.push(
+      await publishPhase(store, roleChain(roles), cfg, P, builtFor(tgUp, bad), { now: 30_000 })
+    );
+    pass = 3;
+    statuses.push(
+      await publishPhase(store, roleChain(roles), cfg, P, builtFor(tgUp, clone), {
+        now: 30_000 + P.alertRepeatMs + 1,
+      })
+    );
+    // everything the publication layer wrote or sent
+    const files = [];
+    const walk = p => {
+      for (const n of readdirSync(p, { withFileTypes: true })) {
+        const q = join(p, n.name);
+        if (n.isDirectory()) walk(q);
+        else files.push(q);
+      }
+    };
+    walk(join(d, "data"));
+    const mirrorText = g(bare, "log", "-p", "--all", "--format=%H%n%B");
+    const hay = [
+      ...files.map(f => readFileSync(f, "latin1")),
+      ...snaps,
+      ...statuses.map(x => JSON.stringify(x)),
+      ...got.uploads.map(b => b.toString("latin1")),
+      mirrorText,
+      ...got.texts,
+    ].join("\n");
+    const leaked = all.filter(x => hay.includes(x));
+    const published = !!store.getPublication(Store.recordId(owner))?.published;
+    cell(
+      "DSR: no Pinata / Filebase / GitHub / Telegram secret in records, IPFS bytes, mirror commits, status, alerts or any written file (every sink fails once with its secret in message, URL and body)",
+      leaked.length === 0 &&
+        statuses[0].ok === false &&
+        statuses[1].ok === false &&
+        statuses[2].ok === false &&
+        statuses[3].ok === false &&
+        published &&
+        got.uploads.length >= 2 &&
+        /disclosure/.test(mirrorText) &&
+        got.texts.length >= 1 &&
+        got.texts.some(t => /alert/.test(t) && /pinata|filebase|mirror/.test(t)),
+      {
+        leaked,
+        ok: statuses.map(x => x.ok),
+        published,
+        uploads: got.uploads.length,
+        texts: got.texts.length,
+      }
+    );
+  } finally {
+    srv.close();
     rmSync(d, { recursive: true, force: true });
   }
 }
