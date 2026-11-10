@@ -32,8 +32,10 @@ interface ICommunityToken {
  *         No admin, no owner, no upgrade, no delete, no edit. A lost writer key or a new aggregator
  *         means a new registry; the release manifest pins the current one.
  *
- * @dev Key scheme and commitment tuple follow SP's BLSAggregator-4.13.0 (rc.8 r3b) as reported
- *      from its implementation; PENDING re-check against SP's committed source SHA before freeze.
+ * @dev Key scheme and commitment tuple are BLSAggregator-4.13.0 (rc.8 r3b), checked line by line
+ *      against SuperPaymaster cc125/rc8-bls @ f00be60374c5cc1d2c4c928a73cee90cf0e12e6c
+ *      (contracts/src/modules/monitoring/BLSAggregator.sol: tuple :1376-1386, single write/emit in
+ *      _commitSigners :1389-1391, keys :987 / :1072 / :1135, id bound :1006-1009, mask :1267/:1359).
  *      They live only in `commitmentKey` and `expectedCommitment`.
  */
 contract DisclosureRegistry {
@@ -263,7 +265,7 @@ contract DisclosureRegistry {
     }
 
     // ------------------------------------------------------------------------------------------
-    //                       aggregator mirrors (byte-identical; see PENDING above)
+    //                       aggregator mirrors (byte-identical; see @dev above)
     // ------------------------------------------------------------------------------------------
 
     /// @notice The message the guardians signed on each path, as BLSAggregator builds it.

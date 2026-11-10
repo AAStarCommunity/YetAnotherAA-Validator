@@ -2,7 +2,8 @@
 // from the ACTION transaction alone — RPC reads of the chain and the aggregator, nothing from DVT
 // state, nothing from the registry's own view functions — and compare field by field.
 //
-// The encoding here is a second implementation of SuperPaymaster BLSAggregator-4.13.0 (rc.8 r3b),
+// The encoding here is a second implementation of SuperPaymaster BLSAggregator-4.13.0 (rc.8 r3b,
+// checked against cc125/rc8-bls @ f00be60374c5cc1d2c4c928a73cee90cf0e12e6c),
 // written from SP source, not from DisclosureRegistry.sol. contracts/test/DisclosureRecheckParity.t.sol
 // checks the two against the shared vectors in contracts/test/fixtures/disclosure-vectors.json.
 //

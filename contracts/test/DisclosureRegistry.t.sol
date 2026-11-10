@@ -7,8 +7,9 @@ import {DisclosureRegistry} from "../src/disclosure/DisclosureRegistry.sol";
 /// @dev Stands in for SuperPaymaster's BLSAggregator. It computes the signer commitment the way SP
 ///      does — signers resolved from `signerMask` through a slot table, then insertion-sorted — so
 ///      the registry (which takes a caller-supplied sorted list) is checked against an independent
-///      derivation, not against its own code. Key and tuple follow SP's stated rc.8 intent; when SP
-///      lands the implemented tuple, this mock and DisclosureRegistry change together.
+///      derivation, not against its own code. Mirrors BLSAggregator-4.13.0 _computeSignersCommitment
+///      (SuperPaymaster cc125/rc8-bls @ f00be60374c5cc1d2c4c928a73cee90cf0e12e6c, :1340-1386):
+///      mask bits above MAX_VALIDATORS (64) revert, bit (slot-1) -> validatorAtSlot[slot].
 contract MockAggregator {
     bytes32 public constant DOMAIN_NAME = keccak256("SuperPaymaster.BLSConsensus.v1");
     bytes32 public constant TAG_SIGNERS_COMMITMENT = keccak256("SuperPaymaster.BLS.SignersCommitment.v1");
@@ -36,7 +37,8 @@ contract MockAggregator {
         }
         address[] memory signers = new address[](n);
         uint256 k;
-        for (uint16 slot = 1; slot <= 255; slot++) {
+        require(signerMask >> 64 == 0, "mask above MAX_VALIDATORS");
+        for (uint16 slot = 1; slot <= 64; slot++) {
             if ((signerMask >> (slot - 1)) & 1 == 1) signers[k++] = validatorAtSlot[uint8(slot)];
         }
         for (uint256 i = 1; i < n; i++) {
@@ -176,8 +178,7 @@ contract DisclosureRegistryTest is Test {
         return keccak256(abi.encode(ds, keccak256("SuperPaymaster.BLS.Reputation.v1"), id, u, sc, e));
     }
 
-    /// Storage key per path — BLSAggregator-4.13.0 r3b as SP reported it from code
-    /// (PENDING re-check against SP's committed SHA).
+    /// Storage key per path — BLSAggregator-4.13.0 at f00be603 (:987 queue, :1072 raw id, :1135 generic).
     function _spKey(DisclosureRegistry.Kind kind, uint256 id, bytes32 mh) internal pure returns (uint256) {
         if (kind == DisclosureRegistry.Kind.GENERIC) {
             return uint256(keccak256(abi.encode(keccak256("SuperPaymaster.BLS.Proposal.v1"), id)));

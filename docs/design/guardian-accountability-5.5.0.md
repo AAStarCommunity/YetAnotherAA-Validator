@@ -316,7 +316,14 @@ disabled.
   impossible through DVTValidator under the empty allowlist, so its appearance
   (necessarily via the owner route) is itself the finding; any generic call
   whose target/selector is outside the expected set; any reputation batch; any
-  queue freeze). Unflagged actions are still recorded as routine.
+  queue freeze; every BLS price update, i.e. an `executeProposal` calling
+  `SuperPaymaster.updatePriceDVT`). Unflagged actions are still recorded as
+  routine.
+- Price updates are flagged even though they are expected: `executeProposal`
+  takes a caller-chosen threshold (at least `minThreshold` = 2), and SP bounds
+  each update to 20% but not a chain of updates inside `[MIN, MAX]`. The record
+  carries the price before and after (read at the parent block and at the
+  execution block) and the signer set.
 - The expected set of generic targets and selectors, and every flag rule, live
   in one pinned file in this repo (`services/guardian-watcher/ruleset.json`).
   Every record, and the registry event (`rulesetCommit`), carries the commit SHA
@@ -418,7 +425,9 @@ On the A7 fork, archived under `docs/evidence/guardian-watcher-rehearsal/`:
 1. Detection of each BLS-executed action, signer set from `signerMask`, target
    and calldata.
 2. A disclosure record published to the repo, Telegram and the registry.
-3. Negative control: a routine action is recorded but not flagged.
+3. Negative control: a routine action is recorded but not flagged. 3a. Positive
+   control: one `updatePriceDVT` via `executeProposal` is detected and disclosed
+   with old price, new price and signer set.
 4. Kill-alert: watcher killed, external alert delivered (Telegram `ok:true`),
    then RECOVERED.
 5. `pauseUnderstakedOperator` gap: injected staking slash below min → slash,
