@@ -28,7 +28,7 @@ import {
   envelopeProblem,
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
-import { Store } from "./lib/store.mjs";
+import { Store, writeAll } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
 import { attributeLogs, flattenTraceLogs, validLog, receiptPos } from "./lib/attribute.mjs";
 
@@ -2093,6 +2093,29 @@ try {
     "verifyTrace: a chain without send() is unsupported",
     (await verifyTrace({}, { roles: {} }, 10)).state === "unsupported",
     null
+  );
+}
+
+// ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)
+{
+  const got = [];
+  const short = (fd, b, off, len) => {
+    const n = Math.min(3, len);
+    got.push(...b.subarray(off, off + n));
+    return n;
+  };
+  const buf = Buffer.from("0123456789abcdef");
+  writeAll(0, buf, short);
+  let refused = null;
+  try {
+    writeAll(0, buf, () => 0);
+  } catch (e) {
+    refused = e.message;
+  }
+  cell(
+    "writeAll: completes short writes byte for byte, refuses zero progress",
+    Buffer.from(got).equals(buf) && /short write: 0 of 16/.test(refused ?? ""),
+    { got: Buffer.from(got).toString(), refused }
   );
 }
 

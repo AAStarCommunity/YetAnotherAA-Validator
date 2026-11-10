@@ -21,11 +21,25 @@ const bigintSafe = (_, v) => (typeof v === "bigint" ? v.toString() : v);
  * directory after it, so a power cut leaves either the old file or the complete new one, never an
  * empty file, and a returned write survives the crash (the W2 journal relies on that).
  */
+/** Write every byte of `buf` to `fd`; `write` is injectable for a fault test. */
+export function writeAll(fd, buf, write = writeSync) {
+  let off = 0;
+  while (off < buf.length) {
+    const n = write(fd, buf, off, buf.length - off);
+    if (!(n > 0)) throw new Error(`short write: ${off} of ${buf.length} bytes`);
+    off += n;
+  }
+}
+
 export function atomicWriteJson(path, obj) {
   const tmp = `${path}.tmp-${process.pid}`;
+  const buf = Buffer.from(JSON.stringify(obj, bigintSafe, 2) + "\n", "utf8");
   const fd = openSync(tmp, "w", 0o600);
   try {
-    writeSync(fd, JSON.stringify(obj, bigintSafe, 2) + "\n");
+    // writeSync may write fewer bytes than asked (e.g. a full disk): loop until every byte is
+    // written, and refuse zero progress, so a short file is never fsynced and renamed into place
+    // (Codex W2c R2).
+    writeAll(fd, buf);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
