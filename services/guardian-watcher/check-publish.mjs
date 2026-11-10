@@ -91,11 +91,13 @@ cell(
 
 // ---- mock sinks
 function sinks(opts = {}) {
-  const calls = { telegram: 0, disclose: 0, mirror: 0, uploads: {} };
+  const calls = { telegram: 0, sign: 0, broadcast: 0, mirror: 0, uploads: {}, texts: [] };
   const stored = new Map();
-  const mkPinner = (name, o = {}) => ({
+  const pinOpts = { pinata: { ...(opts.pinata ?? {}) }, filebase: { ...(opts.filebase ?? {}) } };
+  const mkPinner = name => ({
     name,
     async upload(bytes) {
+      const o = pinOpts[name];
       calls.uploads[name] = (calls.uploads[name] ?? 0) + 1;
       if (o.fail) throw new Error(`${name} down`);
       const real = cidV1Raw(bytes);
@@ -104,13 +106,17 @@ function sinks(opts = {}) {
       return { cid };
     },
     async fetchPublic(cid) {
-      if (o.private) return null; // e.g. a Pinata upload left at the default network=private
+      const o = pinOpts[name];
+      if (o.private || o.gone) return null; // private upload, or unpinned later
       return stored.get(`${name}:${cid}`) ?? null;
     },
   });
+  const chainState = { nonce: 0, receipts: new Map(), mined: opts.mine ?? "success" };
   return {
     calls,
-    pinners: [mkPinner("pinata", opts.pinata), mkPinner("filebase", opts.filebase)],
+    pinOpts,
+    chainState,
+    pinners: [mkPinner("pinata"), mkPinner("filebase")],
     mirror: {
       async commit(path) {
         calls.mirror++;
@@ -121,17 +127,38 @@ function sinks(opts = {}) {
     telegram: {
       async send(t) {
         calls.telegram++;
-        calls.lastText = t;
+        calls.texts.push(t);
+        if (opts.telegramAckLost && calls.telegram === 1)
+          throw new Error("connection reset after delivery");
       },
     },
     registry: {
       async findEntry() {
         return opts.existing ?? null;
       },
-      async disclose(args) {
-        calls.disclose++;
+      async sign(args) {
+        calls.sign++;
         calls.lastArgs = args;
-        return { txHash: ethers.id("disclose-tx"), entryId: 1 };
+        const nonce = chainState.nonce;
+        return { raw: `0xraw${calls.sign}`, hash: ethers.id(`disclose-${calls.sign}`), nonce };
+      },
+      async broadcast(raw) {
+        calls.broadcast++;
+        calls.lastRaw = raw;
+        if (chainState.mined === "success" || chainState.mined === "revert") {
+          const n = Number(raw.slice(5));
+          chainState.receipts.set(ethers.id(`disclose-${n}`), {
+            status: chainState.mined === "success" ? 1 : 0,
+            entryId: chainState.mined === "success" ? n : null,
+          });
+          chainState.nonce = Math.max(chainState.nonce, 1);
+        }
+      },
+      async receipt(hash) {
+        return chainState.receipts.get(hash) ?? null;
+      },
+      async nonce() {
+        return chainState.nonce;
       },
     },
   };
@@ -141,12 +168,13 @@ function sinks(opts = {}) {
   const s = sinks();
   const r1 = await publishRecord(bls, s);
   cell(
-    "happy path: both pins verified, mirror committed, published, Telegram and registry once",
+    "happy path: both pins current, mirror committed, published, Telegram once, registry confirmed",
     r1.state.published &&
-      r1.state.pins.pinata.ok &&
-      r1.state.pins.filebase.ok &&
+      r1.state.pins.pinata.current &&
+      r1.state.pins.filebase.current &&
       s.calls.telegram === 1 &&
-      s.calls.disclose === 1 &&
+      s.calls.sign === 1 &&
+      r1.state.registry.phase === "confirmed" &&
       r1.alerts.length === 0,
     { st: r1.state, alerts: r1.alerts, calls: s.calls }
   );
@@ -164,14 +192,15 @@ function sinks(opts = {}) {
   );
   cell(
     "Telegram text names the record CID and the mirror URL",
-    s.calls.lastText.includes(`ipfs://${f1.cid}`) && s.calls.lastText.includes("github.com"),
-    s.calls.lastText
+    s.calls.texts[0].includes(`ipfs://${f1.cid}`) && s.calls.texts[0].includes("github.com"),
+    s.calls.texts[0]
   );
   const r2 = await publishRecord(bls, s, r1.state);
   cell(
-    "re-run is idempotent: no new upload, Telegram or disclose",
+    "re-run is idempotent: no new upload, Telegram, sign or broadcast",
     s.calls.telegram === 1 &&
-      s.calls.disclose === 1 &&
+      s.calls.sign === 1 &&
+      s.calls.broadcast === 1 &&
       s.calls.uploads.pinata === 1 &&
       s.calls.mirror === 1 &&
       r2.state.published,
@@ -183,28 +212,29 @@ function sinks(opts = {}) {
   const s = sinks({ filebase: { fail: true } });
   const r1 = await publishRecord(bls, s);
   cell(
-    "one provider down: still published (one verified pin + mirror), alerted",
-    r1.state.published && !r1.state.pins.filebase.ok && r1.alerts.some(x => /1\/2 pins/.test(x)),
+    "one provider down: still published (one current pin + mirror), alerted",
+    r1.state.published &&
+      !r1.state.pins.filebase.current &&
+      r1.alerts.some(x => /1\/2 current pins/.test(x)),
     r1
   );
-  const r2 = await publishRecord(bls, s, r1.state);
+  await publishRecord(bls, s, r1.state);
   cell(
     "…the failed pin is retried, the good one is not re-uploaded",
-    s.calls.uploads.filebase === 2 && s.calls.uploads.pinata === 1 && s.calls.disclose === 1,
+    s.calls.uploads.filebase === 2 && s.calls.uploads.pinata === 1 && s.calls.sign === 1,
     s.calls.uploads
   );
-  void r2;
 }
 
 {
   const s = sinks({ pinata: { wrongCid: true }, filebase: { fail: true } });
   const r = await publishRecord(bls, s);
   cell(
-    "provider returning a different CID is not a pin; nothing verified -> not published, no Telegram/registry",
+    "provider returning a different CID is not a pin; nothing current -> not published, no Telegram/registry",
     !r.state.published &&
-      !r.state.pins.pinata.ok &&
+      !r.state.pins.pinata.current &&
       s.calls.telegram === 0 &&
-      s.calls.disclose === 0,
+      s.calls.sign === 0,
     r
   );
 }
@@ -222,7 +252,7 @@ function sinks(opts = {}) {
   const r = await publishRecord(bls, s);
   cell(
     "uploaded but not publicly fetchable (private): not a pin",
-    !r.state.published && !r.state.pins.pinata.ok,
+    !r.state.published && !r.state.pins.pinata.current,
     r.state.pins
   );
 }
@@ -232,9 +262,9 @@ function sinks(opts = {}) {
   cell(
     "mirror commit failed: not published even with both pins",
     !r.state.published &&
-      r.state.pins.pinata.ok &&
+      r.state.pins.pinata.current &&
       s.calls.telegram === 0 &&
-      s.calls.disclose === 0,
+      s.calls.sign === 0,
     r
   );
 }
@@ -245,7 +275,7 @@ function sinks(opts = {}) {
     "owner/guardian-route record: published to IPFS+mirror+Telegram, NO registry entry",
     r.state.published &&
       s.calls.telegram === 1 &&
-      s.calls.disclose === 0 &&
+      s.calls.sign === 0 &&
       !r.state.registry &&
       !r.alerts.some(x => /registry/.test(x)),
     s.calls
@@ -255,8 +285,8 @@ function sinks(opts = {}) {
   const s = sinks({ existing: { entryId: 9, txHash: ethers.id("earlier") } });
   const r = await publishRecord(bls, s);
   cell(
-    "an entry already in the registry (crash after broadcast) is recovered, not re-sent",
-    s.calls.disclose === 0 && r.state.registry.recovered && r.state.registry.entryId === 9,
+    "an entry already in the registry is recovered, not re-signed",
+    s.calls.sign === 0 && r.state.registry.recovered && r.state.registry.entryId === 9,
     r.state.registry
   );
 }
@@ -265,8 +295,110 @@ function sinks(opts = {}) {
   const r = await publishRecord(bls, s, { cid: "bafkreiother" });
   cell(
     "record bytes changed after first publication: refused, alerted, nothing sent",
-    s.calls.mirror === 0 && s.calls.disclose === 0 && r.alerts.some(x => /changed/.test(x)),
+    s.calls.mirror === 0 && s.calls.sign === 0 && r.alerts.some(x => /changed/.test(x)),
     r
+  );
+}
+
+// ---- crash points (Codex W2a review): the journal makes each stage repeatable
+{
+  // Crash right after broadcast: the state persisted last says "signed". On restart the SAME raw
+  // tx is rebroadcast; no second signature, hence no second entry.
+  const s = sinks({ mine: "pending" });
+  let snapshot = null;
+  let crash = true;
+  const persist = async st => {
+    if (crash && st.registry?.phase === "sent") throw new Error("power cut");
+    snapshot = JSON.parse(j(st));
+  };
+  try {
+    await publishRecord(bls, s, {}, { persist });
+  } catch {
+    /* crashed */
+  }
+  cell(
+    "crash after broadcast: the journal holds the signed raw tx",
+    snapshot?.registry?.phase === "signed" && snapshot.registry.raw === "0xraw1",
+    snapshot?.registry
+  );
+  crash = false;
+  s.chainState.mined = "success";
+  const r = await publishRecord(bls, s, snapshot, { persist });
+  cell(
+    "…restart rebroadcasts the same raw tx, never signs again, and confirms on the receipt",
+    s.calls.sign === 1 && s.calls.lastRaw === "0xraw1" && r.state.registry.phase === "confirmed",
+    { calls: s.calls, reg: r.state.registry }
+  );
+}
+{
+  const s = sinks({ mine: "pending" });
+  const r1 = await publishRecord(bls, s);
+  const r2 = await publishRecord(bls, s, r1.state);
+  cell(
+    "a pending disclose tx stays pending: not confirmed, not re-signed",
+    r2.state.registry.phase === "sent" && s.calls.sign === 1,
+    { reg: r2.state.registry, calls: s.calls }
+  );
+  s.chainState.nonce = 5; // our nonce was consumed by another tx: this one was dropped/replaced
+  const r3 = await publishRecord(bls, s, r2.state);
+  cell(
+    "a dropped tx (nonce consumed, no receipt) is detected and re-signed once",
+    s.calls.sign === 2 && r3.alerts.some(x => /dropped or replaced/.test(x)),
+    { calls: s.calls, alerts: r3.alerts }
+  );
+}
+{
+  const s = sinks({ mine: "revert" });
+  const r1 = await publishRecord(bls, s);
+  const r2 = await publishRecord(bls, s, r1.state);
+  const r3 = await publishRecord(bls, s, r2.state);
+  cell(
+    "a reverted disclose tx: alerted, marked reverted, not blindly re-signed",
+    r3.state.registry.phase === "reverted" &&
+      s.calls.sign === 1 &&
+      r2.alerts.some(x => /reverted/.test(x)),
+    { reg: r3.state.registry, calls: s.calls, a: r2.alerts }
+  );
+}
+{
+  // A pin verified earlier no longer serves: reverify demotes it and re-uploads.
+  const s = sinks();
+  const r1 = await publishRecord(bls, s);
+  s.pinOpts.pinata.gone = true;
+  s.pinOpts.filebase.gone = true;
+  s.pinOpts.filebase.fail = true;
+  const r2 = await publishRecord(bls, s, r1.state, { reverify: true });
+  cell(
+    "reverify: pins that no longer serve are demoted; with none current the record is not published",
+    !r2.state.pins.pinata.current &&
+      !r2.state.published &&
+      r2.alerts.some(x => /no longer serves/.test(x)),
+    { pins: r2.state.pins, alerts: r2.alerts }
+  );
+  s.pinOpts.pinata.gone = false;
+  const r3 = await publishRecord(bls, s, r2.state);
+  cell(
+    "…and the demoted pin is uploaded again and becomes current",
+    r3.state.pins.pinata.current && r3.state.published,
+    r3.state.pins
+  );
+}
+{
+  // A provider no longer configured does not count.
+  const s = sinks({ filebase: { fail: true } });
+  s.pinners = [s.pinners[1]]; // only filebase configured now, and it fails
+  const r = await publishRecord(bls, s, { pins: { pinata: { current: true } }, cid: f1.cid });
+  cell("a pin at a provider no longer configured is not counted", !r.state.published, r.state);
+}
+{
+  // Telegram accepted the message but the ack was lost: at-least-once, re-sent marked.
+  const s = sinks({ telegramAckLost: true });
+  const r1 = await publishRecord(bls, s);
+  const r2 = await publishRecord(bls, s, r1.state);
+  cell(
+    "Telegram ack lost: re-sent once, marked as a possible duplicate",
+    s.calls.telegram === 2 && /may be a duplicate/.test(s.calls.texts[1]) && r2.state.telegram.at,
+    s.calls.texts
   );
 }
 {
