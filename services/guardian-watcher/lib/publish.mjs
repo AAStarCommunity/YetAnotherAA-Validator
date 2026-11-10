@@ -16,19 +16,31 @@
 // - Registry: exactly-once by a journal. The tx is SIGNED and persisted (raw, hash, nonce) before
 //   it is broadcast; a restart rebroadcasts the same raw tx, never a new one. It is complete only
 //   when its receipt succeeded and carries the Disclosed event. A reverted tx is alerted and not
-//   retried blindly; a tx whose nonce was consumed by another tx is cleared and, after a fresh
-//   findEntry(kind, key), re-signed.
+//   retried blindly; a tx whose nonce was consumed by another tx is cleared and re-signed. The
+//   registry itself refuses a second entry for the same action (AlreadyDisclosed), so a misjudged
+//   drop or a second process costs at most a reverted tx. An existing entry counts as ours only if
+//   its stored binding equals keccak256(abi.encode(kind, key, subjectToken)) of this record;
+//   otherwise it is a CONFLICT, parked and re-alerted like a revert.
 //
 // Sinks are injected (tests use mocks):
 //   pinners:  [{ name, upload(bytes) -> { cid }, fetchPublic(cid) -> Uint8Array | null }]
 //   mirror:   { commit(path, bytes, message) -> { commit, url } }   (idempotent, see above)
 //   telegram: { send(text) -> void }
-//   registry: { findEntry(kind, key) -> { entryId, txHash } | null,
+//   registry: { entryOf(kind, key) -> entryId (0 = none), binding(entryId) -> bytes32,
 //               sign(args) -> { raw, hash, nonce }, broadcast(raw) -> void,
 //               receipt(hash) -> { status, entryId } | null, nonce() -> number }
 import { ethers } from "ethers";
 import { Kind } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { recordFile, mirrorPath } from "./record-file.mjs";
+
+/** A failure to persist state: publication must stop, the returned state is NOT durable. */
+export class PersistError extends Error {
+  constructor(cause) {
+    super(`persist failed: ${cause?.message ?? cause}`);
+    this.name = "PersistError";
+    this.cause = cause;
+  }
+}
 
 const bytesEqual = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 const errMsg = e => e?.shortMessage ?? e?.message ?? String(e);
@@ -80,7 +92,21 @@ export function telegramText(rec, file, mirror) {
  * opts.persist(state) is awaited after every stage; opts.reverify re-checks pins already current.
  */
 export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
-  const persist = opts.persist ?? (async () => {});
+  // The journal is the crash-safety guarantee; without a durable persist there is none, so it is
+  // required. Only an explicitly unsafe test mode may skip it.
+  if (typeof opts.persist !== "function" && opts.unsafeNoJournal !== true) {
+    throw new Error(
+      "publishRecord needs opts.persist (durable state); unsafeNoJournal is for tests only"
+    );
+  }
+  const rawPersist = opts.persist ?? (async () => {});
+  const persist = async st => {
+    try {
+      await rawPersist(st);
+    } catch (e) {
+      throw new PersistError(e); // never mistaken for a sink failure: the caller must stop
+    }
+  };
   const file = recordFile(rec);
   const state = { ...prev, pins: { ...(prev.pins ?? {}) } };
   const alerts = [];
@@ -144,6 +170,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
       }
       state.pins[p.name] = { current: true, everOk: true, at, checkedAt: at, cid: file.cid };
     } catch (e) {
+      if (e instanceof PersistError) throw e;
       state.pins[p.name] = { ...state.pins[p.name], current: false, at, error: errMsg(e) };
       alerts.push(`${p.name}: ${errMsg(e)}`);
     }
@@ -157,6 +184,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
       state.mirror = { commit: m.commit, url: m.url, path };
       await persist(state);
     } catch (e) {
+      if (e instanceof PersistError) throw e;
       alerts.push(`mirror: ${errMsg(e)}`);
     }
   }
@@ -185,6 +213,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
       state.telegram = { ...state.telegram, at: new Date().toISOString() };
       await persist(state);
     } catch (e) {
+      if (e instanceof PersistError) throw e;
       alerts.push(`telegram: ${errMsg(e)}`);
     }
   }
@@ -193,6 +222,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     try {
       await advanceRegistry(rec, file, sinks.registry, state, persist, alerts);
     } catch (e) {
+      if (e instanceof PersistError) throw e;
       alerts.push(`registry: ${errMsg(e)}`);
     }
   }
@@ -201,7 +231,22 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
 
 async function advanceRegistry(rec, file, reg, state, persist, alerts) {
   const r = state.registry;
-  if (r?.phase === "reverted") return; // alerted when it happened; needs a human, not a blind retry
+  if (r?.phase === "conflict") {
+    if (!r.ack)
+      alerts.push(
+        `registry: entry ${r.entryId} for this action has a different binding; unresolved until acknowledged`
+      );
+    return;
+  }
+  if (r?.phase === "reverted") {
+    // Parked, not retried blindly (an out-of-gas or a bad input needs a human). Re-alerted every
+    // time until an operator acknowledges it (state.registry.ack), so it cannot go silent.
+    if (!r.ack)
+      alerts.push(
+        `registry: disclose tx ${r.hash} reverted (${r.reason ?? "no reason recorded"}); unresolved until acknowledged`
+      );
+    return;
+  }
   if (r?.phase === "signed" || r?.phase === "sent") {
     // Same raw tx, never a new one: rebroadcasting a known tx is harmless.
     try {
@@ -220,9 +265,18 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts) {
       return;
     }
     if (rc && Number(rc.status) !== 1) {
-      state.registry = { ...state.registry, phase: "reverted" };
+      // Reverted - possibly AlreadyDisclosed because another tx of ours landed first.
+      if (await adoptExisting(rec, reg, state, persist, alerts)) return;
+      state.registry = {
+        ...state.registry,
+        phase: "reverted",
+        reason: rc.reason ?? "status 0",
+        revertedAt: new Date().toISOString(),
+      };
       await persist(state);
-      alerts.push(`registry: disclose tx ${r.hash} reverted`);
+      alerts.push(
+        `registry: disclose tx ${r.hash} reverted (${state.registry.reason}); unresolved until acknowledged`
+      );
       return;
     }
     if (rc && rc.entryId == null) {
@@ -230,6 +284,9 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts) {
       return;
     }
     // No receipt yet. If our nonce is already used, this tx was replaced or dropped: start over.
+    // nonce() must be the writer's nonce at a FINALIZED block: a mined nonce, past reorgs, and with
+    // the receipt indexes caught up. A pending or latest view would misread a broadcast or a
+    // not-yet-indexed receipt as a drop.
     if ((await reg.nonce()) > r.nonce) {
       alerts.push(`registry: tx ${r.hash} (nonce ${r.nonce}) was dropped or replaced; re-signing`);
       state.registry = null;
@@ -239,17 +296,7 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts) {
     }
   }
   // Nothing in flight: an entry may already exist (an earlier publication completed elsewhere).
-  const existing = await reg.findEntry(Kind[rec.kind], BigInt(rec.key));
-  if (existing) {
-    state.registry = {
-      phase: "confirmed",
-      entryId: existing.entryId,
-      txHash: existing.txHash,
-      recovered: true,
-    };
-    await persist(state);
-    return;
-  }
+  if (await adoptExisting(rec, reg, state, persist, alerts)) return;
   const signed = await reg.sign(discloseArgs(rec, file));
   state.registry = { phase: "signed", raw: signed.raw, hash: signed.hash, nonce: signed.nonce };
   await persist(state); // journal BEFORE broadcast
@@ -261,4 +308,32 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts) {
     state.registry = { ...state.registry, phase: "confirmed", entryId: rc.entryId };
     await persist(state);
   }
+}
+
+/** The binding the registry stores for this record's entry (DisclosureRegistry._append). */
+export function expectedBinding(rec) {
+  return ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["uint8", "uint256", "address"],
+      [Kind[rec.kind], BigInt(rec.key), rec.subjectToken ?? ethers.ZeroAddress]
+    )
+  );
+}
+
+/** If the registry already holds this action's entry, adopt it (same binding) or flag a conflict. */
+async function adoptExisting(rec, reg, state, persist, alerts) {
+  const id = BigInt(await reg.entryOf(Kind[rec.kind], BigInt(rec.key)));
+  if (id === 0n) return false;
+  const stored = String(await reg.binding(id)).toLowerCase();
+  if (stored === expectedBinding(rec).toLowerCase()) {
+    state.registry = { phase: "confirmed", entryId: id.toString(), recovered: true };
+    await persist(state);
+    return true;
+  }
+  state.registry = { phase: "conflict", entryId: id.toString(), storedBinding: stored };
+  await persist(state);
+  alerts.push(
+    `registry: entry ${id} for this action has a different binding; unresolved until acknowledged`
+  );
+  return true;
 }
