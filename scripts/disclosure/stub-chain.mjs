@@ -134,7 +134,7 @@ function makeChain() {
   let getLogsCalls = 0;
   let onReceipt = null; // one-shot hook around the next receipt fetch
   let finalityLag = 0; // "finalized" = head - finalityLag
-  const storage = new Map(); // `${address}:${slot}` -> bytes32 (not block-versioned)
+  const storage = new Map(); // `${address}:${slot}` -> [{ block, word }] (block-versioned)
   const prices = []; // SuperPaymaster cachedPrice history: [{ block, price }]
   /** Append a tx's receipt logs to the chain-wide log index (getLogs), with positions. */
   const indexLogs = (hash, n, rlogs) =>
@@ -187,8 +187,12 @@ function makeChain() {
         return out;
       }
       if (method === "eth_getStorageAt") {
-        const [who, slot] = params;
-        return storage.get(`${ethers.getAddress(who)}:${BigInt(slot)}`) ?? ethers.ZeroHash;
+        const [who, slot, tag] = params;
+        const at = tag === undefined || tag === "latest" ? head : Number(tag);
+        const hist = (storage.get(`${ethers.getAddress(who)}:${BigInt(slot)}`) ?? []).filter(
+          h => h.block <= at
+        );
+        return hist.length ? hist[hist.length - 1].word : ethers.ZeroHash;
       }
       if (method === "debug_traceTransaction") {
         const t = traces.get(params[0]);
@@ -499,6 +503,7 @@ function makeChain() {
       { address: AGG, topics: ev.topics, data: ev.data },
       ...spLogs.map(x => ({ address: SP, ...spIface.encodeEventLog(x.name, x.args) })),
     ];
+    rlogs.forEach((l, i) => (l.index = i)); // receipt logs carry their position, as in ethers
     if (price !== undefined) prices.push({ block: n, price });
     txs.set(hash, {
       tx: { hash, to, from, data },
@@ -626,6 +631,7 @@ function makeChain() {
       const n = mine();
       const hash = ethers.id(`owner-${n}`);
       const rlogs = spLogsIn.map(x => ({ address: SP, ...spIface.encodeEventLog(x.name, x.args) }));
+      rlogs.forEach((l, i) => (l.index = i)); // receipt logs carry their position, as in ethers
       if (price !== undefined) prices.push({ block: n, price });
       txs.set(hash, {
         tx: { hash, to: SP, from, data: "0x" },
@@ -638,7 +644,13 @@ function makeChain() {
     /** Install a callTracer trace for a tx (frames may carry `logs`, as with withLog). */
     setTrace: (hash, frame) => traces.set(hash, frame),
     setFinalityLag: k => (finalityLag = k),
-    setStorage: (who, slot, word) => storage.set(`${ethers.getAddress(who)}:${BigInt(slot)}`, word),
+    setStorage: (who, slot, word, fromBlock = 0) => {
+      const k = `${ethers.getAddress(who)}:${BigInt(slot)}`;
+      storage.set(
+        k,
+        [...(storage.get(k) ?? []), { block: fromBlock, word }].sort((a, b) => a.block - b.block)
+      );
+    },
     reorgDuringNextCheck: n =>
       (onCommitRead = () => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`mid-reorg-${n}`) })),
     logCalls: () => getLogsCalls,

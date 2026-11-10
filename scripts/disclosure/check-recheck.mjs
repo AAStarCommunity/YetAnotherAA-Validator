@@ -747,6 +747,58 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
     "PASS"
   );
 
+  // Codex W1 R2 M3: a singleton re-pointed earlier in the same block (slot 0 differs at N-1 and N)
+  // is still the Safe's own hop.
+  {
+    const NEW_SINGLETON = addr("safe-singleton-v2");
+    const m3 = execute(Kind.SLASH, 85n, slashF, 0b011n, { to: WRAPPER });
+    setStorage(SAFE, 0, ethers.zeroPadValue(NEW_SINGLETON, 32), m3.block);
+    setTrace(m3.hash, viaSafeProxy(85n, NEW_SINGLETON));
+    await expectCase(
+      "trace: singleton re-pointed in the same block is followed (slot 0 at N)",
+      disclose(Kind.SLASH, 85n, slashIn, m3),
+      "PASS"
+    );
+    setStorage(SAFE, 0, ethers.zeroPadValue(SINGLETON, 32), m3.block + 1); // restore for later cells
+  }
+
+  // Codex W1 R2 M4: a pinned Safe batch whose direct path decodes another call, not this one: the
+  // trace is still consulted for the wanted key.
+  {
+    const other = aggIface.encodeFunctionData("executeProposal", [
+      91n,
+      genF.target,
+      "0x55",
+      3n,
+      "0x",
+    ]);
+    const m4 = execute(Kind.SLASH, 90n, slashF, 0b011n, {
+      via: { route: "multisend", subs: [], extraAgg: other },
+    });
+    setTrace(m4.hash, {
+      type: "CALL",
+      to: SAFE,
+      calls: [
+        {
+          type: "DELEGATECALL",
+          to: SINGLETON,
+          calls: [
+            {
+              type: "CALL",
+              to: addr("opaque"),
+              calls: [{ type: "CALL", to: AGG, input: slashCall(90n) }],
+            },
+          ],
+        },
+      ],
+    });
+    await expectCase(
+      "batch: direct path finds another call; the wanted one is recovered by the trace",
+      disclose(Kind.SLASH, 90n, slashIn, m4),
+      "PASS"
+    );
+  }
+
   // L1a: a reverted aggregator frame must never become a proven candidate. B (reverted) carries the
   // honest action's id with another message; the honest call sits under a pruned module route. With
   // the error guard removed, B would be the only proven candidate and accuse the honest entry.

@@ -9,6 +9,7 @@ import {
 } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice } from "./rules.mjs";
+import { attributeLogs } from "./attribute.mjs";
 
 export const MAX_DEADLETTER_ATTEMPTS = 20;
 
@@ -77,45 +78,27 @@ export function logPos(l) {
   return n;
 }
 
-/**
- * SP logs of `txHash` that a trace proves were emitted inside a successful CALL into the pinned
- * aggregator (callTracer withLog). Returns a Set of "topics|data" keys, or null with no trace.
- * Co-occurrence in a tx proves nothing; only the call tree does.
- */
-async function blsAttributedSpLogs(chain, cfg, txHash) {
-  if (typeof chain.send !== "function") return null;
-  let trace;
+/** Full receipt + callTracer (withLog) trace of a tx, for attribution; null parts when unavailable. */
+async function traceAndReceipt(chain, txHash) {
+  let trace = null;
+  let rc = null;
   try {
-    trace = await chain.send("debug_traceTransaction", [
-      txHash,
-      { tracer: "callTracer", tracerConfig: { withLog: true } },
-    ]);
+    rc = await chain.getTransactionReceipt(txHash);
   } catch {
-    return null;
+    rc = null;
   }
-  if (!trace) return null;
-  const sp = cfg.roles.superPaymaster.toLowerCase();
-  const agg = cfg.aggregator.toLowerCase();
-  const out = new Set();
-  const collect = f => {
-    if (!f || f.error) return;
-    for (const l of f.logs || []) {
-      if (String(l.address).toLowerCase() === sp)
-        out.add(`${(l.topics || []).join(",").toLowerCase()}|${String(l.data).toLowerCase()}`);
+  if (typeof chain.send === "function") {
+    try {
+      trace = await chain.send("debug_traceTransaction", [
+        txHash,
+        { tracer: "callTracer", tracerConfig: { withLog: true } },
+      ]);
+    } catch {
+      trace = null;
     }
-    for (const c of f.calls || []) collect(c);
-  };
-  const walk = f => {
-    if (!f || f.error) return;
-    if (String(f.type).toUpperCase() === "CALL" && String(f.to).toLowerCase() === agg)
-      return collect(f);
-    for (const c of f.calls || []) walk(c);
-  };
-  walk(trace);
-  return out;
+  }
+  return { trace, logs: rc?.logs ?? null };
 }
-
-const spLogKey = l => `${l.topics.join(",").toLowerCase()}|${String(l.data).toLowerCase()}`;
 
 /** Build the record for one SignersCommitted log. Returns { record } or { deadLetter }. */
 async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
@@ -265,28 +248,36 @@ export async function tick(chain, cfg, store, rs, ctx) {
 
   for (const [txHash, t] of ordered) {
     t.sp.sort((a, b) => logPos(a) - logPos(b));
-    // SP events of a BLS tx count as that action's effects only when a trace places them inside
-    // the aggregator call; everything else is an owner/guardian-route record of its own.
-    let attributed = new Set();
-    let traced = false;
+    // SP events of a BLS tx count as an action's effects only when the trace, aligned log by log
+    // with the receipt, places them inside THAT action's aggregator call. Everything else is an
+    // owner/guardian-route record of its own, never swallowed and never shared between actions.
+    let attr = { aligned: false, owner: new Map(), why: "no BLS action in tx" };
     if (t.agg.length && t.sp.length) {
-      const a = await blsAttributedSpLogs(chain, cfg, txHash);
-      if (a) {
-        attributed = a;
-        traced = true;
-      }
+      const { trace, logs } = await traceAndReceipt(chain, txHash);
+      attr = logs
+        ? attributeLogs(trace, logs, cfg.aggregator)
+        : { aligned: false, owner: new Map(), why: "receipt unavailable" };
     }
-    const effects = [];
+    const commitCall = new Map(
+      t.agg.map(l => [logPos(l), attr.aligned ? attr.owner.get(logPos(l)) : undefined])
+    );
+    const callsWithCommit = new Set(
+      [...commitCall.values()].filter(v => v !== undefined && v !== null)
+    );
+    const effectsOf = new Map(); // aggCall -> [sp event]
     const independent = [];
     for (const l of t.sp) {
       const d = decodeSp(l);
       if (!d) continue;
       const ev = { ...d, logIndex: logPos(l) };
-      if (t.agg.length && attributed.has(spLogKey(l))) effects.push(ev);
-      else independent.push(ev);
+      const call = attr.aligned ? attr.owner.get(logPos(l)) : undefined;
+      if (call !== undefined && call !== null && callsWithCommit.has(call)) {
+        effectsOf.set(call, [...(effectsOf.get(call) ?? []), ev]);
+      } else independent.push(ev);
     }
     for (const l of t.agg) {
-      const out = await blsRecord(chain, cfg, rs, ctx, l, effects, fin.number);
+      const call = commitCall.get(logPos(l));
+      const out = await blsRecord(chain, cfg, rs, ctx, l, effectsOf.get(call) ?? [], fin.number);
       if (out.record) note(summary, store.putRecord(out.record), out.record);
       else {
         store.putDeadLetter(out.deadLetter);
@@ -316,9 +307,9 @@ export async function tick(chain, cfg, store, rs, ctx) {
       };
       if (t.agg.length) {
         // Same tx as a BLS action, not proven to be its effect: keep it, and say what is unknown.
-        rec.routeUncertain = traced
-          ? "same tx as a BLS action; the trace places it outside the aggregator call"
-          : "same tx as a BLS action; no trace, so whether it is that action's effect is unproven";
+        rec.routeUncertain = attr.aligned
+          ? "same tx as a BLS action; the trace places it outside that action's aggregator call"
+          : `same tx as a BLS action; not attributable (${attr.why}), so whether it is that action's effect is unproven`;
       }
       rec.verdict = evaluate(rs, cfg.roles, rec);
       if (wantsPrice(rs, cfg.roles, rec)) {

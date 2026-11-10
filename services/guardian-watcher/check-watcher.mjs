@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { Kind } from "../../scripts/disclosure/recheck-lib.mjs";
+import { Kind, aggIface } from "../../scripts/disclosure/recheck-lib.mjs";
 import {
   AGG,
   SAFE,
@@ -22,6 +22,7 @@ import { spIface } from "./lib/sp-abi.mjs";
 import { validateRuleset, evaluate } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity } from "./watcher.mjs";
+import { attributeLogs } from "./lib/attribute.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const rs = validateRuleset(JSON.parse(readFileSync(join(HERE, "ruleset.json"), "utf8")));
@@ -71,6 +72,13 @@ try {
         {
           type: "CALL",
           to: AGG,
+          logs: [
+            {
+              address: AGG,
+              ...aggIface.encodeEventLog("SignersCommitted", [a2.key, a2.mask]),
+              position: 0,
+            },
+          ],
           calls: [
             { type: "CALL", to: SP, logs: [{ address: SP, topics: pu.topics, data: pu.data }] },
           ],
@@ -119,6 +127,13 @@ try {
         {
           type: "CALL",
           to: AGG,
+          logs: [
+            {
+              address: AGG,
+              ...aggIface.encodeEventLog("SignersCommitted", [a10.key, a10.mask]),
+              position: 0,
+            },
+          ],
           calls: [{ type: "CALL", to: SP, error: "execution reverted", logs: [lg] }],
         },
         { type: "CALL", to: SP, logs: [lg] },
@@ -212,7 +227,7 @@ try {
     "an event seen only in a reverted subcall of the aggregator is not attributed to it",
     p10 &&
       p10.event === "OperatorPaused" &&
-      /outside the aggregator call/.test(p10.routeUncertain ?? ""),
+      /outside that action's aggregator call/.test(p10.routeUncertain ?? ""),
     p10
   );
   cell(
@@ -407,6 +422,113 @@ try {
     store.getCursor().block === curBefore.block,
     store.getCursor()
   );
+
+  // Attribution is per aggregator call and per log occurrence (Codex W1 R2 H1, M2).
+  {
+    const L = (address, tag, position) => ({
+      address,
+      topics: [ethers.id(tag)],
+      data: "0x",
+      position,
+    });
+    const rl = list =>
+      list.map((l, i) => ({ address: l.address, topics: l.topics, data: l.data, index: i }));
+    // H1: two identical SP logs, one inside the aggregator call, one outside
+    const t1 = {
+      type: "CALL",
+      to: SAFE,
+      calls: [
+        {
+          type: "CALL",
+          to: AGG,
+          logs: [L(AGG, "commit", 0)],
+          calls: [{ type: "CALL", to: SP, logs: [L(SP, "paused")] }],
+        },
+        { type: "CALL", to: SP, logs: [L(SP, "paused")] },
+      ],
+    };
+    const a1x = attributeLogs(t1, rl([L(AGG, "commit"), L(SP, "paused"), L(SP, "paused")]), AGG);
+    cell(
+      "identical SP logs: only the occurrence inside the aggregator call is attributed",
+      a1x.aligned && a1x.owner.get(1) === 0 && a1x.owner.get(2) === null,
+      [...a1x.owner]
+    );
+    // M2: two aggregator calls in one tx, each with its own effect
+    const t2 = {
+      type: "CALL",
+      to: SAFE,
+      calls: [
+        {
+          type: "CALL",
+          to: AGG,
+          logs: [L(AGG, "commitA", 0)],
+          calls: [{ type: "CALL", to: SP, logs: [L(SP, "effA")] }],
+        },
+        {
+          type: "CALL",
+          to: AGG,
+          logs: [L(AGG, "commitB", 0)],
+          calls: [{ type: "CALL", to: SP, logs: [L(SP, "effB")] }],
+        },
+      ],
+    };
+    const a2x = attributeLogs(
+      t2,
+      rl([L(AGG, "commitA"), L(SP, "effA"), L(AGG, "commitB"), L(SP, "effB")]),
+      AGG
+    );
+    cell(
+      "two BLS actions in one tx: each effect belongs to its own aggregator call",
+      a2x.aligned &&
+        a2x.owner.get(0) === a2x.owner.get(1) &&
+        a2x.owner.get(2) === a2x.owner.get(3) &&
+        a2x.owner.get(0) !== a2x.owner.get(2),
+      [...a2x.owner]
+    );
+    // misalignment and missing positions attribute nothing
+    const a3x = attributeLogs(
+      t2,
+      rl([L(AGG, "commitA"), L(SP, "effB"), L(AGG, "commitB"), L(SP, "effA")]),
+      AGG
+    );
+    cell(
+      "trace and receipt disagree: nothing attributed",
+      !a3x.aligned && a3x.owner.size === 0,
+      a3x
+    );
+    const t4 = {
+      type: "CALL",
+      to: AGG,
+      logs: [L(AGG, "commit")],
+      calls: [{ type: "CALL", to: SP, logs: [L(SP, "e")] }],
+    };
+    const a4x = attributeLogs(t4, rl([L(AGG, "commit"), L(SP, "e")]), AGG);
+    cell(
+      "a log without position in a frame with subcalls: nothing attributed",
+      !a4x.aligned && /positions/.test(a4x.why),
+      a4x
+    );
+    const t5 = {
+      type: "CALL",
+      to: SAFE,
+      calls: [
+        { type: "CALL", to: AGG, error: "reverted", logs: [L(AGG, "commit", 0)] },
+        { type: "CALL", to: SP, logs: [L(SP, "e")] },
+      ],
+    };
+    const a6x = attributeLogs(t2, rl([L(AGG, "commitA"), L(SP, "effA"), L(AGG, "commitB")]), AGG);
+    cell(
+      "trace with more logs than the receipt: nothing attributed",
+      !a6x.aligned && a6x.owner.size === 0,
+      a6x
+    );
+    const a5x = attributeLogs(t5, rl([L(SP, "e")]), AGG);
+    cell(
+      "logs of a reverted call are dropped before alignment",
+      a5x.aligned && a5x.owner.get(0) === null,
+      [...a5x.owner]
+    );
+  }
 
   // rules: unexpected generic and unlisted owner event are flagged
   cell(

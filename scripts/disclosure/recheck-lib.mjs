@@ -285,7 +285,14 @@ export function parseMultiSend(transactions) {
  * followed. Anything else falls back to a callTracer trace limited to the pinned aggregator and
  * DVTValidator. `notes` says why something was not followed.
  */
-export async function extractCandidates(chain, tx, aggregator, forwarders = {}, blockNumber) {
+export async function extractCandidates(
+  chain,
+  tx,
+  aggregator,
+  forwarders = {},
+  blockNumber,
+  opts = {}
+) {
   const fw = forwarders || {};
   const candidates = [];
   const notes = [];
@@ -412,7 +419,10 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
     tx.to && [aggregator, fw.dvtValidator, fw.ownerSafe].some(a => eqAddr(a, tx.to));
   // Trace fallback: for a wrapper the manifest does not pin, and also when a pinned top-level
   // forwarder led to no decodable aggregator call (e.g. the Safe called an unpinned wrapper).
-  if (!pinnedTop || candidates.length === 0) {
+  // Also when the caller asks (`forceTrace`): the direct path found calls, but not the one wanted.
+  let traced = false;
+  if (opts.forceTrace || !pinnedTop || candidates.length === 0) {
+    if (opts.forceTrace) candidates.length = 0; // the trace sees every call; avoid double counting
     let trace = null;
     if (typeof chain.send === "function") {
       try {
@@ -438,21 +448,26 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
       // The owner Safe is a proxy: callTracer shows CALL Safe -> DELEGATECALL <singleton>. That one
       // hop is followed only into the Safe's ACTUAL singleton, read from its storage slot 0 at
       // block N-1; a delegatecall from the Safe to anything else is pruned like any other.
-      let singleton;
-      const safeSingleton = async () => {
-        if (singleton !== undefined) return singleton;
-        singleton = null;
-        try {
-          const word = await chain.send("eth_getStorageAt", [
-            fw.ownerSafe,
-            "0x0",
-            ethers.toQuantity(blockNumber - 1),
-          ]);
-          singleton = ethers.getAddress(ethers.dataSlice(ethers.zeroPadValue(word, 32), 12));
-        } catch {
-          singleton = null;
+      // The Safe's singleton is read at the parent block and at the block itself: a Safe deployed
+      // or re-pointed earlier in the same block shows only in the latter. The hop is followed if
+      // the delegatecall target is either; otherwise it is pruned (INCONCLUSIVE, never MISMATCH).
+      let singletons;
+      const safeSingletons = async () => {
+        if (singletons !== undefined) return singletons;
+        singletons = [];
+        for (const tag of [blockNumber - 1, blockNumber]) {
+          try {
+            const word = await chain.send("eth_getStorageAt", [
+              fw.ownerSafe,
+              "0x0",
+              ethers.toQuantity(tag),
+            ]);
+            singletons.push(ethers.getAddress(ethers.dataSlice(ethers.zeroPadValue(word, 32), 12)));
+          } catch {
+            /* unreadable: that block contributes no singleton */
+          }
         }
-        return singleton;
+        return singletons;
       };
       // A frame without `error` whose ancestors have none either did succeed, so what it decodes
       // to is proven. The direct path's route rules hold here too: a DELEGATECALL subtree is pruned
@@ -466,7 +481,8 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
             parent &&
             String(parent.type).toUpperCase() === "CALL" &&
             eqAddr(parent.to, fw.ownerSafe);
-          const isSingletonHop = parentIsSafe && eqAddr(f.to, await safeSingleton());
+          const isSingletonHop =
+            parentIsSafe && (await safeSingletons()).some(a => eqAddr(f.to, a));
           if (!isSingletonHop) {
             if (!eqAddr(f.to, fw.multiSendCallOnly))
               return notes.push(`${path}: DELEGATECALL subtree not followed`);
@@ -487,9 +503,10 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
         for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`, f);
       };
       await walk(trace, "trace", null);
+      traced = true;
     }
   }
-  return { candidates, notes };
+  return { candidates, notes, traced };
 }
 
 /**
@@ -580,8 +597,31 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
   // forwarders, or from a trace. A candidate counts only if it reproduces the SignersCommitted key;
   // the stored commitment is then the final gate, so a decoding mistake can never make a MATCH.
   const ds = await view(chain, agg, "domainSeparator", [], blockNumber);
-  const found = await extractCandidates(chain, tx, agg, forwarders, blockNumber);
+  let found = await extractCandidates(chain, tx, agg, forwarders, blockNumber);
   facts.route = null;
+  const keyMatches = list =>
+    list.some(c => {
+      if (
+        (c.kind === Kind.SLASH || c.kind === Kind.REPUTATION) &&
+        BigInt(c.proposalId) >= RAW_ID_BOUND
+      )
+        return false;
+      return (
+        commitmentKey(c.kind, c.proposalId, messageHashOf(ds, c.kind, c.proposalId, c.fields)) ===
+        commit.key
+      );
+    });
+  // The direct path may recover other calls of a batch but not this one: then ask the trace too.
+  if (!found.traced && !keyMatches(found.candidates)) {
+    const viaTrace = await extractCandidates(chain, tx, agg, forwarders, blockNumber, {
+      forceTrace: true,
+    });
+    found = {
+      candidates: [...found.candidates, ...viaTrace.candidates],
+      notes: [...found.notes, ...viaTrace.notes],
+      traced: viaTrace.traced,
+    };
+  }
   const matching = [];
   for (const c of found.candidates) {
     if (
