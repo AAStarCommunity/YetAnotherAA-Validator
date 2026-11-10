@@ -7,10 +7,21 @@ import {DeployDisclosureRegistry} from "../script/DeployDisclosureRegistry.s.sol
 
 contract OwnedAgg {
     address public owner;
+    uint256 public constant MAX_VALIDATORS = 13;
+    mapping(uint8 => address) public validatorAtSlot;
 
     constructor(address o) {
         owner = o;
     }
+
+    function setSlot(uint8 s, address v) external {
+        validatorAtSlot[s] = v;
+    }
+}
+
+/// @dev Has an owner but no validator-set views: must be refused (fail closed).
+contract OwnerOnlyAgg {
+    address public owner = address(1);
 }
 
 /// @dev DSR guard cells. CI runs this file under BOTH profiles: the default (osaka) run proves an
@@ -106,6 +117,19 @@ contract DisclosureDeployGuardTest is Test {
     function test_writerIsAggregatorOwnerRefused() public {
         vm.expectRevert(DeployDisclosureRegistry.WriterIsAggregatorOwner.selector);
         s.checkRoles(makeAddr("safe"), makeAddr("deployer"), agg);
+    }
+
+    function test_writerIsGuardianRefused() public {
+        OwnedAgg(agg).setSlot(1, makeAddr("g1"));
+        OwnedAgg(agg).setSlot(13, writer); // the last slot: the scan must reach MAX_VALIDATORS
+        vm.expectRevert(abi.encodeWithSelector(DeployDisclosureRegistry.WriterIsGuardian.selector, uint8(13)));
+        s.checkRoles(writer, makeAddr("deployer"), agg);
+    }
+
+    function test_unreadableGuardianSetRefused() public {
+        address a = address(new OwnerOnlyAgg());
+        vm.expectRevert();
+        s.checkRoles(writer, makeAddr("deployer"), a);
     }
 
     function test_aggregatorWithoutCodeRefused() public {

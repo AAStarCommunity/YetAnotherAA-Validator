@@ -8,6 +8,13 @@ interface IOwnableView {
     function owner() external view returns (address);
 }
 
+/// @dev BLSAggregator's registered validator (guardian) slots, 1-indexed (SP BLSAggregator.sol
+///      `validatorAtSlot` :204, `MAX_VALIDATORS` :219 — 13 on 4.11.0, 64 on 4.13.0).
+interface IValidatorSetView {
+    function MAX_VALIDATORS() external view returns (uint256);
+    function validatorAtSlot(uint8 slot) external view returns (address);
+}
+
 /**
  * @title DeployDisclosureRegistry
  * @dev Deploys the guardian-watcher DisclosureRegistry (M0 §4) ONLY from the pinned release
@@ -19,8 +26,9 @@ interface IOwnableView {
  *           the gas-profile test) fails here by construction;
  *        2. the artifact's metadata must report evmVersion "cancun" (SP's release profile,
  *           SuperPaymaster foundry.toml [profile.default]:12, all three 5.5.0 chains);
- *        3. the writer must not be the deployer or the aggregator's owner (M0 §5.5); the
- *           aggregator must be a contract whose owner() reads (fail closed);
+ *        3. the writer must not be the deployer, the aggregator's owner or any registered guardian
+ *           (validatorAtSlot[1..MAX_VALIDATORS]) (M0 §5.5); the aggregator must be a contract
+ *           whose owner and validator set read (fail closed);
  *        4. after deployment, the on-chain code must equal the pinned runtime with WRITER and
  *           AGGREGATOR written at their immutableReferences offsets, and both getters must read
  *           back the inputs.
@@ -44,6 +52,8 @@ contract DeployDisclosureRegistry is Script {
     error WriterIsDeployer();
     error WriterIsAggregatorOwner();
     error AggregatorHasNoCode();
+    error WriterIsGuardian(uint8 slot);
+    error BadValidatorSetSize(uint256 max);
     error DeployedCodeMismatch(bytes32 got, bytes32 want);
     error GetterMismatch();
 
@@ -65,6 +75,15 @@ contract DeployDisclosureRegistry is Script {
         // Fail closed: the aggregator must be a contract whose owner can be read.
         if (aggregator.code.length == 0) revert AggregatorHasNoCode();
         if (IOwnableView(aggregator).owner() == writer) revert WriterIsAggregatorOwner();
+        // Every registered guardian slot. Both views are called directly: an aggregator that
+        // cannot answer them reverts here, so an unreadable set refuses the deploy.
+        uint256 max = IValidatorSetView(aggregator).MAX_VALIDATORS();
+        if (max == 0 || max > type(uint8).max) revert BadValidatorSetSize(max);
+        for (uint256 slot = 1; slot <= max; ++slot) {
+            if (IValidatorSetView(aggregator).validatorAtSlot(uint8(slot)) == writer) {
+                revert WriterIsGuardian(uint8(slot));
+            }
+        }
     }
 
     /// @notice The expected on-chain runtime: the pinned code with both immutables written in.
