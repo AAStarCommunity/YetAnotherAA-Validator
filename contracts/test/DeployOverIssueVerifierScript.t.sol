@@ -288,6 +288,81 @@ contract DeployOverIssueVerifierScriptTest is Test {
         deployScript.deploy(_config(address(agg)));
     }
 
+    /// @notice 4.13.0+ changed the signer commitment (key + anchor); this verifier can never verify
+    ///         there, so not even an explicit EXPECTED_AGGREGATOR_VERSION may deploy against it.
+    function test_Deploy_RefusesAnchoredReleaseEvenWhenExpected() public {
+        string[4] memory vs =
+            ["BLSAggregator-4.13.0", "BLSAggregator-4.13.1-rc", "BLSAggregator-4.20.0", "BLSAggregator-5.0.0"];
+        for (uint256 i = 0; i < vs.length; i++) {
+            ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 5 days);
+            agg.setVersion(vs[i]);
+            DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
+            cfg.expectedAggregatorVersion = vs[i];
+            vm.expectRevert(
+                bytes(
+                    "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
+                )
+            );
+            deployScript.deploy(cfg);
+        }
+    }
+
+    /// @notice An unparseable release string is treated as new (fail closed), even when expected.
+    function test_Deploy_RefusesUnparseableReleaseEvenWhenExpected() public {
+        string[18] memory vs = [
+            "BLSAggregator-",
+            "BLSAggregator-x.y",
+            "Aggregator-4.11.0",
+            "BLSAggregator-4.00000013.0", // leading zeros hiding 4.13
+            "BLSAggregator-4.013.0",
+            "BLSAggregator-4.1x",
+            "BLSAggregator-4.12.garbage",
+            "BLSAggregator-4.12",
+            "BLSAggregator-4.1234567.0", // over six digits
+            "BLSAggregator-4.12.0x",
+            "BLSAggregator-4.012.0", // leading zero on an otherwise-old minor
+            "BLSAggregator-4.12x5", // no "." before the patch
+            "BLSAggregator-3.1000000.0", // seven-digit minor
+            "BLSAggregator-4.12.1000000", // seven-digit patch
+            "BLSAggregator-4.12.0-", // empty suffix
+            "BLSAggregator-4.12.0-a b", // space in the suffix
+            "BLSAggregator-4.12.0-rc_1", // '_' not allowed
+            "BLSAggregator-4.12.0-\x00" // NUL in the suffix
+        ];
+        for (uint256 i = 0; i < vs.length; i++) {
+            ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
+            agg.setVersion(vs[i]);
+            DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
+            cfg.expectedAggregatorVersion = vs[i];
+            vm.expectRevert(
+                bytes(
+                    "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
+                )
+            );
+            deployScript.deploy(cfg);
+        }
+    }
+
+    /// @notice Well-formed pre-4.13 releases still deploy when named explicitly (the gate is not a
+    ///         blanket refusal).
+    function test_Deploy_AcceptsWellFormedOldReleaseWhenExpected() public {
+        string[6] memory vs = [
+            "BLSAggregator-4.12.0",
+            "BLSAggregator-4.12.3-rc1",
+            "BLSAggregator-4.0.0",
+            "BLSAggregator-4.12.0-AZaz09.-", // every allowed suffix class
+            "BLSAggregator-4.12.0--",
+            "BLSAggregator-4.12.0-."
+        ];
+        for (uint256 i = 0; i < vs.length; i++) {
+            ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
+            agg.setVersion(vs[i]);
+            DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
+            cfg.expectedAggregatorVersion = vs[i];
+            deployScript.deploy(cfg);
+        }
+    }
+
     /// @notice ...and the operator can accept that newer release only by naming it explicitly.
     function test_Deploy_AcceptsNewerVersionWhenExplicitlyExpected() public {
         ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
