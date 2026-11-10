@@ -95,7 +95,7 @@ export function traceUnsupported(e) {
 
 /** The same log: position, address, every topic and the data (case-insensitive hex). */
 export function sameLog(a, b) {
-  const h = x => String(x ?? "").toLowerCase();
+  const h = x => str(x).toLowerCase();
   const ta = a.topics ?? [];
   const tb = b.topics ?? [];
   const pa = receiptPos(a);
@@ -276,13 +276,13 @@ export function envelopeProblem(txHash, tx, rc, trace, at = {}) {
   };
   if (present(at.blockHash) && rc && !present(rc.blockHash))
     return "receipt does not name its block";
-  let firstHash = present(at.blockHash) ? String(at.blockHash) : null;
+  let firstHash = present(at.blockHash) ? str(at.blockHash) : null;
   for (const [what, o] of sources) {
     if (!o) continue;
     if (present(o.blockNumber) && present(want.number) && num(o.blockNumber) !== want.number)
       return `${what} is from another block`;
     if (present(o.blockHash)) {
-      if (firstHash === null) firstHash = String(o.blockHash);
+      if (firstHash === null) firstHash = str(o.blockHash);
       else if (!lcEq(o.blockHash, firstHash)) return `${what} is from another block`;
     }
   }
@@ -300,9 +300,9 @@ export function envelopeProblem(txHash, tx, rc, trace, at = {}) {
   }
   if (trace && tx) {
     if (!tx.from || !lcEq(trace.from, tx.from)) return "trace root sender differs from the tx";
-    if (tx.to ? !lcEq(trace.to, tx.to) : !/^CREATE2?$/i.test(String(trace.type)))
+    if (tx.to ? !lcEq(trace.to, tx.to) : !/^CREATE2?$/i.test(str(trace.type)))
       return "trace root destination differs from the tx";
-    if (String(trace.input ?? "").toLowerCase() !== String(tx.data ?? tx.input ?? "").toLowerCase())
+    if (str(trace.input).toLowerCase() !== str(tx.data ?? tx.input).toLowerCase())
       return "trace root input differs from the tx";
   }
   return null;
@@ -466,7 +466,11 @@ async function pricePair(chain, cfg, block) {
 
 const SIGNERS_COMMITTED = () => aggIface.getEvent("SignersCommitted").topicHash;
 const spTopics = () => SP_WATCHED_EVENTS.map(n => spIface.getEvent(n).topicHash);
-const lcEq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+// RPC values are compared WITHOUT coercion (Codex follow-up R9): String() on an object whose
+// toString is not callable throws, and that must never happen outside the per-tx isolation.
+const str = x => (typeof x === "string" ? x : "");
+const lcEq = (a, b) =>
+  typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
 /** A 4-byte selector, or null (calldata "0x" or shorter than a selector proves no function). */
 const selectorOf = data =>
   typeof data === "string" && /^0x[0-9a-fA-F]{8}/.test(data)
@@ -549,9 +553,8 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
   } catch (e) {
     summary.isolated = (summary.isolated ?? 0) + 1;
     // what this tx's dead letter already holds is merged with this observation, never replaced
-    const okH = /^0x[0-9a-fA-F]{64}$/.test(String(txHash));
-    const existing =
-      prev ?? (okH ? store.getDeadLetter(`tx-${String(txHash).toLowerCase()}`) : null);
+    const okH = /^0x[0-9a-fA-F]{64}$/.test(str(txHash));
+    const existing = prev ?? (okH ? store.getDeadLetter(`tx-${str(txHash).toLowerCase()}`) : null);
     let watched = [];
     try {
       watched = mergeEvidence(existing?.watched, evidenceOf(t));
@@ -560,7 +563,7 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
     }
     // An item without a usable tx hash gets a quarantine identity derived from its evidence: it
     // is retried and counted, never attributed to any tx (Codex follow-up R2).
-    const okHash = /^0x[0-9a-fA-F]{64}$/.test(String(txHash));
+    const okHash = /^0x[0-9a-fA-F]{64}$/.test(str(txHash));
     const qid = okHash ? null : ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(watched)));
     store.putDeadLetter({
       ...(existing ?? {}),
@@ -586,9 +589,9 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
 function quarantineRaw(store, ctx, summary, x, source, from, to) {
   let raw;
   try {
-    raw = JSON.stringify(x) ?? String(x);
+    raw = JSON.stringify(x) ?? typeof x;
   } catch {
-    raw = String(x);
+    raw = `<unserialisable ${typeof x}>`;
   }
   const evidence = [{ raw, source, range: [from, to] }];
   const qid = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(evidence)));
@@ -651,7 +654,7 @@ function splitLogs(logs, cfg, block) {
   const spT = new Set(spTopics().map(x => x.toLowerCase()));
   const agT = SIGNERS_COMMITTED().toLowerCase();
   for (const l of logs) {
-    const t0 = String(l.topics?.[0] ?? "").toLowerCase();
+    const t0 = str(l?.topics?.[0]).toLowerCase();
     if (lcEq(l.address, cfg.aggregator) && t0 === agT) t.agg.push(l);
     else if (lcEq(l.address, cfg.roles.superPaymaster) && spT.has(t0)) t.sp.push(l);
   }
@@ -675,7 +678,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   for (const l of [...t.agg, ...t.sp])
     if (parsePosition(l.blockNumber) !== t.block)
       throw new Error("watched logs name different blocks");
-  if (!/^0x[0-9a-fA-F]{64}$/.test(String(txHash))) throw new Error("watched log without a tx hash");
+  if (!/^0x[0-9a-fA-F]{64}$/.test(str(txHash))) throw new Error("watched log without a tx hash");
   for (const l of [...t.agg, ...t.sp]) if (!validLog(l)) throw new Error("malformed watched log");
   // a log the RPC marks removed is never evidence, on any path (Codex follow-up R2)
   for (const l of [...t.agg, ...t.sp])
@@ -688,7 +691,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     if (!lcEq(l.address, cfg.aggregator) || !lcEq(l.topics[0], SIGNERS_COMMITTED()))
       throw new Error("aggregator query returned a log of another emitter or topic");
   for (const l of t.sp)
-    if (!lcEq(l.address, cfg.roles.superPaymaster) || !spT.has(String(l.topics[0]).toLowerCase()))
+    if (!lcEq(l.address, cfg.roles.superPaymaster) || !spT.has(str(l.topics[0]).toLowerCase()))
       throw new Error("SP query returned a log of another emitter or topic");
   // positions are judged here, inside the isolation, for every watched log
   {
@@ -864,7 +867,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       summary.deadLetters++;
     }
   }
-  const txDl = `tx-${String(txHash).toLowerCase()}`;
+  const txDl = `tx-${str(txHash).toLowerCase()}`;
   if (!independent.length) {
     store.resolveDeadLetter(txDl); // all SP events proved to be BLS effects (Codex #400-fix M5)
     return { done: true };
@@ -1096,9 +1099,7 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
           }
           if (
             may &&
-            !logs.some(
-              l => parsePosition(l.blockNumber) === n && lcEq(String(l.topics?.[0] ?? ""), topic)
-            )
+            !logs.some(l => parsePosition(l.blockNumber) === n && lcEq(l?.topics?.[0], topic))
           )
             missing.push(topic);
         }
@@ -1121,7 +1122,7 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
           extra.push(...fresh);
           summary.bloomRecovered++;
         }
-        if (missing.some(topic => !got.some(g => lcEq(String(g?.topics?.[0] ?? ""), topic))))
+        if (missing.some(topic => !got.some(g => lcEq(g?.topics?.[0], topic))))
           summary.bloomFalsePositives++;
       }
     }
@@ -1140,7 +1141,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
   if (cursor) {
     // Finalized blocks cannot reorg; if the cursor's block changed anyway, stop and say so.
     const now = await header(chain, cursor.block);
-    if (now.hash.toLowerCase() !== String(cursor.hash).toLowerCase()) {
+    if (!lcEq(now.hash, cursor.hash)) {
       throw new Error(
         `cursor block ${cursor.block} hash changed (${cursor.hash} -> ${now.hash}): finality violated, not advancing`
       );

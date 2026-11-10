@@ -2749,6 +2749,50 @@ try {
       );
     }
 
+    // Codex follow-up R9: values whose toString is not callable never throw outside the isolation
+    {
+      const u = mk();
+      const quiet = u.c.ownerTx([]);
+      // a block whose bloom DOES show a watched topic, so the bloom check compares topics there
+      const later = u.c.ownerTx([{ name: "GuardianSet", args: [addr("r9-g1"), addr("r9-g2")] }]);
+      settle(u.c);
+      const rq = await u.c.chain.getTransactionReceipt(quiet.hash);
+      const rl = await u.c.chain.getTransactionReceipt(later.hash);
+      const gs = spIface.encodeEventLog("GuardianSet", [addr("r9-a"), addr("r9-b")]);
+      const evil = { toString: null };
+      u.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: rq.blockNumber,
+        blockHash: rq.blockHash,
+        index: 0,
+        transactionHash: evil,
+      });
+      u.c.injectRawResult(SP, {
+        address: SP,
+        topics: [evil],
+        data: "0x",
+        blockNumber: rl.blockNumber,
+        blockHash: rl.blockHash,
+        index: 1,
+        transactionHash: quiet.hash,
+      });
+      // the range answer lacks the real log, so the bloom check has only the malformed one to compare
+      u.c.lagTopic(rl.blockNumber, gs.topics[0]);
+      const us = (await runOnce(u.c.chain, u.cfg, u.store, rs, ident)).status;
+      u.c.clearLag();
+      const us2 = (await runOnce(u.c.chain, u.cfg, u.store, rs, ident)).status;
+      cell(
+        "follow-up R9: a tx hash or topic that cannot be stringified is isolated; the scan never throws and moves on",
+        us.ok === true &&
+          us2.ok === true &&
+          u.store.listDeadLetters().some(x => x.quarantine === true) &&
+          u.store.listDeadLetters().some(x => x.txHash === quiet.hash) &&
+          u.recs().some(r => r.txHash === later.hash),
+        { us: [us.ok, us.lastError], us2: [us2.ok, us2.lastError] }
+      );
+    }
+
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it
     const b = mk();
