@@ -21,6 +21,14 @@ const same = (t, r) =>
  * { from, selector } of the call that emitted the log, i.e. who called SP and which function
  * (#400 M1). A DELEGATECALL from SP into its own module is not a new entry and is looked through.
  */
+/** A trace log position: a non-negative safe integer, or a decimal / 0x-hex string of one. */
+function parsePosition(v) {
+  if (typeof v === "number") return Number.isSafeInteger(v) && v >= 0 ? v : null;
+  if (typeof v !== "string" || !/^(0x[0-9a-fA-F]+|[0-9]+)$/.test(v)) return null;
+  const n = Number(v);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 export function flattenTraceLogs(trace, aggregator, sp) {
   let nextId = 0;
   let unsure = false;
@@ -40,16 +48,22 @@ export function flattenTraceLogs(trace, aggregator, sp) {
     if (calls.length && logs.some(l => l.position === undefined || l.position === null))
       unsure = true;
     // An explicit position must place the log between child calls: an integer in
-    // [0, calls.length]. Any other value would silently drop the log (Codex #400-fix R9).
-    if (
-      logs.some(l => {
-        if (l.position === undefined || l.position === null) return false;
-        const p = Number(l.position);
-        return !Number.isSafeInteger(p) || p < 0 || p > calls.length;
-      })
-    )
-      unsure = true;
-    const at = k => logs.filter(l => Number(l.position ?? calls.length) === k);
+    // [0, calls.length], given as a number or a decimal/0x string (no booleans, arrays, empty
+    // strings), and a frame's positions never decrease in emission order. Anything else is a
+    // malformed trace, never silently repaired (Codex #400-fix R9, R10).
+    let prev = 0;
+    for (const l of logs) {
+      if (l.position === undefined || l.position === null) continue;
+      const p = parsePosition(l.position);
+      if (p === null || p > calls.length || p < prev) unsure = true;
+      else prev = p;
+    }
+    const at = k =>
+      logs.filter(l =>
+        l.position === undefined || l.position === null
+          ? k === calls.length
+          : parsePosition(l.position) === k
+      );
     const out = [];
     for (let k = 0; k <= calls.length; k++) {
       for (const l of at(k))

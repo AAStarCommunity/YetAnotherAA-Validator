@@ -24,7 +24,7 @@ import { MAX_DEADLETTER_ATTEMPTS, traceUnsupported, verifyTrace, sameLog } from 
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
-import { attributeLogs } from "./lib/attribute.mjs";
+import { attributeLogs, flattenTraceLogs } from "./lib/attribute.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const rs = validateRuleset(JSON.parse(readFileSync(join(HERE, "ruleset.json"), "utf8")));
@@ -1725,13 +1725,34 @@ try {
       { ...lg, index: 1 },
     ];
     // a single-log receipt: a dropped root log would leave the child's identical log to align
-    const bad = [2, -1, 0.5, "x"].map(
+    const bad = [2, -1, 0.5, "x", true, false, "", [0], {}, "0x"].map(
       p => attributeLogs(tr(p), [{ ...lg, index: 0 }], AGG, SP).aligned
     );
     const good = attributeLogs(tr("0x1"), rc, AGG, SP);
+    // positions that decrease within a frame are contradictory, never reordered
+    const dec = attributeLogs(
+      {
+        type: "CALL",
+        from: addr("root"),
+        to: SP,
+        input: "0x11111111",
+        logs: [
+          { ...lg, position: 1 },
+          { ...lg, position: 0 },
+        ],
+        calls: [{ type: "CALL", from: addr("child"), to: SP, input: "0x22222222", logs: [lg] }],
+      },
+      [0, 1, 2].map(i => ({ ...lg, index: i })),
+      AGG,
+      SP
+    );
     cell(
-      "attribution: an out-of-range or non-integer trace log position makes the trace unusable; a hex position is read",
+      "attribution: a trace log position that is not an in-range integer (number or decimal/0x string), or that decreases within a frame, makes the trace unusable; a hex position is read",
       bad.every(a => a === false) &&
+        [2, -1, 0.5, "x", true, false, "", [0], {}, "0x"].every(
+          p => flattenTraceLogs(tr(p), AGG, SP) === null
+        ) &&
+        dec.aligned === false &&
         good.aligned === true &&
         good.spCall.get(0)?.from === addr("child"),
       { bad, good: [...good.spCall] }
