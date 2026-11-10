@@ -13,6 +13,8 @@ via_ir = true
 # pricing the test's schedule constants assume; the test asserts this in-repo
 # (rfc9380Glue in the osaka band), so a wrong-fork run fails loudly instead of silently.
 evm_version = "osaka"
+# DisclosureRecheckParity.t.sol reads the JS<->Solidity vectors.
+fs_permissions = [{ access = "read", path = "./test/fixtures" }]
 
 # Deployment profile (DSR, 2026-11-10): the artifacts that are DEPLOYED, and whose bytecode
 # hashes are pinned, are built for the fork every target chain has. SP's release profile is
@@ -28,7 +30,10 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 evm_version = "cancun"
-# DisclosureRecheckParity.t.sol reads the JS<->Solidity vectors.
-fs_permissions = [{ access = "read", path = "./test/fixtures" }]
+# The parity vectors, and the release artifact whose metadata (evmVersion) the deploy script reads.
+fs_permissions = [
+  { access = "read", path = "./test/fixtures" },
+  { access = "read", path = "./out-release" },
+]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
