@@ -64,7 +64,7 @@ export function readJson(path, fallback) {
 export class Store {
   constructor(dir) {
     this.dir = dir;
-    for (const d of ["records", "deadletters"])
+    for (const d of ["records", "deadletters", "amendments"])
       mkdirSync(join(dir, d), { recursive: true, mode: 0o700 });
   }
 
@@ -171,11 +171,53 @@ export class Store {
   /** A dead letter that used every retry and was turned into a record (exhaust). */
   retireDeadLetter(id) {
     const path = join(this.dir, "deadletters", `${id}.json`);
-    if (existsSync(path)) renameSync(path, `${path}.exhausted`);
+    if (!existsSync(path)) return;
+    // never overwrite an earlier retirement of the same id (#400 review L2): number them
+    let target = `${path}.exhausted`;
+    for (let k = 2; existsSync(target); k++) target = `${path}.exhausted.${k}`;
+    renameSync(path, target);
+  }
+
+  /** Unattributed records of txs whose answers never became readable (#400 review L1). */
+  countUnreadable() {
+    return readdirSync(join(this.dir, "records")).filter(f => f.endsWith("-unreadable.json"))
+      .length;
+  }
+
+  /**
+   * SP effects proven to belong to a BLS action only after its record was written (#400 review
+   * L4). The record itself is first-write-wins (its bytes may be published), so the later proof is
+   * kept beside it, also first-write-wins. Returns "new" | "same".
+   */
+  putBlsAmendment(key, amendment) {
+    const path = join(
+      this.dir,
+      "amendments",
+      `bls-${BigInt(key).toString(16).padStart(64, "0")}.json`
+    );
+    if (existsSync(path)) return "same";
+    atomicWriteJson(path, amendment);
+    return "new";
+  }
+
+  getBlsAmendment(key) {
+    try {
+      return readJson(
+        join(this.dir, "amendments", `bls-${BigInt(key).toString(16).padStart(64, "0")}.json`),
+        null
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  countAmendments() {
+    return readdirSync(join(this.dir, "amendments")).filter(f => f.endsWith(".json")).length;
   }
 
   countExhausted() {
-    return readdirSync(join(this.dir, "deadletters")).filter(f => f.endsWith(".exhausted")).length;
+    return readdirSync(join(this.dir, "deadletters")).filter(f => /\.exhausted(\.\d+)?$/.test(f))
+      .length;
   }
 
   /**
@@ -194,6 +236,20 @@ export class Store {
         return false;
       }
     });
+  }
+
+  /** Update fields of an open dead letter without counting an attempt (no-op when absent). */
+  patchDeadLetter(id, patch) {
+    const path = join(this.dir, "deadletters", `${id}.json`);
+    let cur = null;
+    try {
+      cur = readJson(path, null);
+    } catch {
+      cur = null;
+    }
+    if (!cur) return false;
+    atomicWriteJson(path, { ...cur, ...patch, id: cur.id ?? id, attempts: cur.attempts });
+    return true;
   }
 
   /** The open dead letter with this id, or null. */

@@ -17,6 +17,8 @@ const lc = x => String(x).toLowerCase();
  * getLogs. The RPC is a deployment trust assumption (operator-chosen node).
  */
 
+const isAddr = a => /^0x[0-9a-fA-F]{40}$/.test(a);
+
 /** A well-formed log: 20-byte address, at most four 32-byte topics, even-length hex data. */
 export function validLog(l) {
   return (
@@ -70,6 +72,10 @@ export function flattenTraceLogs(trace, aggregator, sp) {
   const walk = (f, aggCall, spCall) => {
     if (!f || f.error) return [];
     const isCall = String(f.type).toUpperCase() === "CALL";
+    // A frame's addresses are used for attribution: malformed ones make the trace unusable rather
+    // than throwing later (#400 review L1).
+    const addrOk = a => a === undefined || a === null || (typeof a === "string" && isAddr(a));
+    if (!addrOk(f.from) || !addrOk(f.to)) unsure = true;
     const here = isCall && lc(f.to) === lc(aggregator) ? nextId++ : aggCall;
     const spHere =
       sp && isCall && lc(f.to) === lc(sp)

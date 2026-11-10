@@ -167,6 +167,11 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
       deadLetters: store.listDeadLetters().length,
       corruptDeadLetters: store.corruptDeadLetters,
       exhaustedThisTick: s.exhausted,
+      // txs isolated this tick (a malformed answer: #400 review L1), and unreadable txs that ended
+      // as unattributed records, in total
+      isolatedThisTick: s.isolated ?? 0,
+      unreadableTotal: store.countUnreadable(),
+      blsAmendments: store.countAmendments(),
       exhaustedTotal: store.countExhausted(),
       bloom: {
         recovered: s.bloomRecovered,

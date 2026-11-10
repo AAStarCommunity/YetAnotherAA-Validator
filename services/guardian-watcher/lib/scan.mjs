@@ -9,7 +9,7 @@ import {
 } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.mjs";
-import { attributeLogs, receiptPos } from "./attribute.mjs";
+import { attributeLogs, receiptPos, validLog } from "./attribute.mjs";
 import { mayHaveLog } from "./bloom.mjs";
 import { Store } from "./store.mjs";
 
@@ -417,15 +417,59 @@ const selectorOf = data =>
 
 /** A watched log as stored evidence (plain JSON, full contents and position). */
 function evidenceLog(l) {
+  // Best effort: a malformed log is kept as evidence as far as it can be (an isolated tx keeps
+  // what the RPC said: #400 review L1), never a reason to lose the dead letter.
+  const pos = receiptPos(l);
   return {
-    address: l.address,
-    topics: [...(l.topics ?? [])],
-    data: l.data,
-    index: logPos(l),
-    blockNumber: Number(l.blockNumber),
-    ...(l.blockHash ? { blockHash: l.blockHash } : {}),
-    transactionHash: l.transactionHash,
+    address: l?.address,
+    topics: Array.isArray(l?.topics) ? [...l.topics] : l?.topics,
+    data: l?.data,
+    index: pos ?? l?.index ?? l?.logIndex ?? null,
+    blockNumber: Number(l?.blockNumber),
+    ...(l?.blockHash ? { blockHash: l.blockHash } : {}),
+    transactionHash: l?.transactionHash,
   };
+}
+
+/** A safe reason for an exception thrown while processing one tx: our own wording and the error's
+ * category, never a foreign message (RPC answers are untrusted text). */
+function isolatedReason(e) {
+  const code = typeof e?.code === "string" && /^[A-Z_]{2,40}$/.test(e.code) ? e.code : null;
+  const name = typeof e?.name === "string" && /^[A-Za-z]{2,40}$/.test(e.name) ? e.name : "Error";
+  return `tx processing failed (${code ?? name})`;
+}
+
+/**
+ * Process one tx in isolation (#400 review L1, DSR): any exception, for example a malformed RPC
+ * answer, becomes that tx's dead letter with its watched evidence, so the retry cap applies and the
+ * scan (and its cursor) moves on. At the cap the dead letter becomes an unattributed record.
+ */
+async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot, prev) {
+  try {
+    return await processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot);
+  } catch (e) {
+    summary.isolated = (summary.isolated ?? 0) + 1;
+    let watched = [];
+    try {
+      watched = [...t.agg, ...t.sp].map(evidenceLog);
+    } catch {
+      watched = prev?.watched ?? [];
+    }
+    store.putDeadLetter({
+      ...(prev ?? {}),
+      route: "tx",
+      txHash,
+      blockNumber: t.block,
+      status: "ERROR",
+      reasons: [isolatedReason(e)],
+      events: prev?.events ?? [],
+      watched: prev?.watched?.length ? prev.watched : watched,
+      ruleset: ctx.ruleset,
+      seenAt: ctx.now,
+    });
+    summary.deadLetters++;
+    return { done: false };
+  }
 }
 
 /** The watched logs of one tx, re-read from its block by hash (for dead letters without stored
@@ -467,6 +511,10 @@ function splitLogs(logs, cfg, block) {
  * becomes a dead letter and is retried (route "tx").
  */
 async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot) {
+  // A watched log must be well formed, and an aggregator log must carry its 32-byte key: anything
+  // else is a malformed RPC answer, isolated by the caller (#400 review L1).
+  for (const l of [...t.agg, ...t.sp]) if (!validLog(l)) throw new Error("malformed watched log");
+  for (const l of t.agg) if (l.topics.length < 2) throw new Error("aggregator log without a key");
   t.sp.sort((a, b) => logPos(a) - logPos(b));
   const SP = cfg.roles.superPaymaster;
   let tx;
@@ -577,13 +625,40 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     } else independent.push(ev);
   }
   for (const l of t.agg) {
-    if (store.hasBlsRecord(BigInt(l.topics[1]))) continue; // completed before (tx retry, M5)
-    // An authenticated action awaiting only its price is retried by its own dead letter, never
-    // rebuilt here (a rebuild failure must not replace verified evidence; R2 M4).
+    if (store.hasBlsRecord(BigInt(l.topics[1]))) {
+      // Completed before (tx retry, M5). Effects the trace proves only now are kept beside the
+      // record, not lost when the tx dead letter resolves (#400 review L4).
+      const effects = effectsOf.get(commitCall.get(logPos(l))) ?? [];
+      if (effects.length)
+        store.putBlsAmendment(BigInt(l.topics[1]), {
+          key: BigInt(l.topics[1]).toString(),
+          txHash,
+          provenBy: "trace",
+          provenAt: ctx.now,
+          spEvents: effects,
+          ruleset: ctx.ruleset,
+        });
+      continue;
+    }
+    // A BLS action with an open dead letter is retried by that dead letter only, once per tick,
+    // never rebuilt here as well (a rebuild failure must not replace verified evidence: R2 M4; and
+    // two retries per tick would halve the attempt cap: #400 review L2).
     const pend = store.getDeadLetter(
       Store.recordId({ route: "bls", key: BigInt(l.topics[1]).toString(), kind: undefined })
     );
-    if (pend?.pendingRecord) continue;
+    if (pend) {
+      // ...but effects the trace proves now go into that dead letter, so its own retry (and its
+      // record) carries them (#400 review L4). No attempt is spent.
+      const effects = effectsOf.get(commitCall.get(logPos(l))) ?? [];
+      if (effects.length && !(pend.spEvents ?? []).length)
+        store.patchDeadLetter(pend.id, {
+          spEvents: effects,
+          ...(pend.pendingRecord && !(pend.pendingRecord.spEvents ?? []).length
+            ? { pendingRecord: { ...pend.pendingRecord, spEvents: effects } }
+            : {}),
+        });
+      continue;
+    }
     const call = commitCall.get(logPos(l));
     const out = await blsRecord(chain, cfg, rs, ctx, l, effectsOf.get(call) ?? [], snapshot);
     if (out.record) note(summary, store.putRecord(out.record), out.record);
@@ -612,6 +687,15 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       // Records already classified, missing only their price (Codex #400-fix M3): exhaustion
       // keeps their route, caller and verdict, marked price.unavailable.
       ...(pendingRecords ? { pendingRecords } : {}),
+      // What is known of the tx itself, kept for an unattributed record at exhaustion (#400 review
+      // nit): its sender, target and root selector (not the emitting call's).
+      ...(tx
+        ? {
+            txFrom: tx.from ? ethers.getAddress(tx.from) : null,
+            txTo: tx.to ? ethers.getAddress(tx.to) : null,
+            rootSelector: selectorOf(tx.data),
+          }
+        : {}),
       ruleset: ctx.ruleset,
       seenAt: ctx.now,
     });
@@ -640,7 +724,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     const f = frameOf(e);
     if (amb.has(e.event) && !selectorOf(f?.selector ?? ""))
       return fail(
-        `caller of ${e.event} undeterminable (${direct ? "no selector" : (attr.why ?? "trace unaligned")})`
+        `caller of ${e.event} undeterminable (${attr.why && attr.why !== "not traced" ? attr.why : direct ? "no selector" : "trace unaligned"})`
       );
     // Only an ambiguous event can be public: an event no permissionless function emits is the owner
     // route whatever the root call was (Codex #400-fix R3 H1: a root updatePrice() selector must not
@@ -709,6 +793,27 @@ function exhaust(store, rs, cfg, ctx, summary, dl) {
       };
       note(summary, store.putRecord(rec), rec);
     }
+  } else if (dl.route === "tx" && !(dl.events ?? []).length) {
+    // An isolated tx whose answers never became readable (#400 review L1, DSR): one unattributed
+    // record, nobody accused, carrying the stored evidence and the last reasons.
+    const rec = {
+      route: "unattributed",
+      label: "RPC answer unreadable",
+      event: "UNREADABLE",
+      txHash: dl.txHash,
+      logIndex: "unreadable",
+      blockNumber: dl.blockNumber,
+      caller: null,
+      callerSource: "unknown",
+      evidence: dl.watched ?? [],
+      exhaustedAfter: dl.attempts,
+      lastReasons: dl.reasons,
+      ruleset: dl.ruleset ?? ctx.ruleset,
+      seenAt: ctx.now,
+    };
+    rec.verdict = evaluate(rs, cfg.roles, rec);
+    note(summary, store.putRecord(rec), rec);
+    summary.unreadable = (summary.unreadable ?? 0) + 1;
   } else if (dl.route === "tx") {
     const amb = ambiguousEvents(rs);
     for (const e of dl.events ?? []) {
@@ -722,6 +827,10 @@ function exhaust(store, rs, cfg, ctx, summary, dl) {
         blockNumber: dl.blockNumber,
         caller: null,
         callerSource: "unknown",
+        // known of the tx itself, not of the emitting call (so never the caller)
+        from: dl.txFrom ?? null,
+        to: dl.txTo ?? null,
+        rootSelector: dl.rootSelector ?? null,
         exhaustedAfter: dl.attempts,
         lastReasons: dl.reasons,
         ruleset: dl.ruleset ?? ctx.ruleset,
@@ -785,7 +894,10 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
             unchecked = true;
             break;
           }
-          if (may && !logs.some(l => Number(l.blockNumber) === n && l.topics?.[0] === topic))
+          if (
+            may &&
+            !logs.some(l => Number(l.blockNumber) === n && lcEq(String(l.topics?.[0] ?? ""), topic))
+          )
             missing.push(topic);
         }
         if (unchecked) {
@@ -897,7 +1009,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
         store.putDeadLetter({ ...dl, reasons: ["watched logs unavailable"] });
         continue;
       }
-      await processTx(
+      await processTxIsolated(
         chain,
         cfg,
         rs,
@@ -906,7 +1018,8 @@ export async function tick(chain, cfg, store, rs, ctx) {
         summary,
         dl.txHash,
         splitLogs(watched, cfg, dl.blockNumber),
-        fin.number
+        fin.number,
+        dl
       );
       continue;
     }
@@ -949,7 +1062,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
   }
   const ordered = [...byTx.entries()].sort((a, b) => a[1].block - b[1].block);
   for (const [txHash, t] of ordered)
-    await processTx(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number);
+    await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
 
   const toHdr = await header(chain, to);
   store.setCursor({ block: to, hash: toHdr.hash });

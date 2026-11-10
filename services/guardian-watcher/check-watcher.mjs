@@ -2091,6 +2091,306 @@ try {
   );
 }
 
+// ---- #400 review L1–L5 and nits
+{
+  const dirs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-rev-"));
+    dirs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const recs = () =>
+      readdirSync(join(d, "records"))
+        .filter(f => f.endsWith(".json"))
+        .map(f => JSON.parse(readFileSync(join(d, "records", f), "utf8")));
+    return { d, c, cfg, store: new Store(d), recs };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const KEEPER = addr("rev-keeper");
+  const pauseSel = ethers.id("pauseUnderstakedOperator(address)").slice(0, 10);
+  const settle = c => {
+    for (let i = 0; i < 4; i++) c.mine();
+  };
+  const priceG = {
+    target: SP,
+    callData: spIface.encodeFunctionData("updatePriceDVT", [261000000000n, 20n, "0x", 0]),
+    requiredThreshold: 2n,
+  };
+  try {
+    // L1: an inner frame with a malformed `from` makes the trace unusable (a retried dead letter),
+    // never an exception that stops the scan; a malformed aggregator log (no key) is isolated as a
+    // dead letter with its evidence, ends as an unattributed record, and the scan moves on
+    const a = mk();
+    const t1 = a.c.ownerTx([{ name: "OperatorPaused", args: [addr("rev-l1")] }], {
+      from: KEEPER,
+      data: pauseSel,
+    });
+    {
+      const pz = spIface.encodeEventLog("OperatorPaused", [addr("rev-l1")]);
+      a.c.setTrace(t1.hash, {
+        type: "CALL",
+        from: KEEPER,
+        to: SP,
+        input: pauseSel,
+        calls: [
+          {
+            type: "CALL",
+            from: "0x1234",
+            to: SP,
+            input: pauseSel,
+            logs: [{ address: SP, topics: pz.topics, data: pz.data }],
+          },
+        ],
+      });
+    }
+    const bad = a.c.mine();
+    a.c.injectLog(bad, {
+      address: AGG,
+      topics: [aggIface.getEvent("SignersCommitted").topicHash],
+      data: "0x",
+      transactionHash: ethers.id("rev-malformed"),
+    });
+    settle(a.c);
+    const s1 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    const dl1 = a.store.listDeadLetters();
+    const later = a.c.ownerTx([{ name: "GuardianSet", args: [addr("rev-g1"), addr("rev-g2")] }]);
+    settle(a.c);
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      await runOnce(a.c.chain, a.cfg, a.store, rs, ident);
+    const sEnd = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    const unread = a.recs().find(r => r.txHash === ethers.id("rev-malformed"));
+    cell(
+      "L1: a malformed frame or aggregator log is isolated per tx (tick ok, dead letter with evidence), ends unattributed and counted; the scan moves on",
+      s1.ok === true &&
+        s1.isolatedThisTick === 1 &&
+        dl1.some(x => x.txHash === t1.hash && x.route === "tx") &&
+        dl1.some(
+          x =>
+            x.txHash === ethers.id("rev-malformed") &&
+            x.watched?.length === 1 &&
+            /tx processing failed/.test(x.reasons[0])
+        ) &&
+        a.recs().some(r => r.txHash === later.hash && r.event === "GuardianSet") &&
+        unread?.route === "unattributed" &&
+        unread.event === "UNREADABLE" &&
+        unread.evidence?.length === 1 &&
+        sEnd.unreadableTotal === 1 &&
+        sEnd.ok === true,
+      { s1: [s1.ok, s1.isolatedThisTick, s1.lastError], dl1, unread, sEnd: sEnd.unreadableTotal }
+    );
+    const t1rec = a.recs().find(r => r.txHash === t1.hash);
+    cell(
+      "nit: an exhausted, undeterminable SP event keeps the tx's sender, target and root selector (never as the caller)",
+      t1rec?.route === "unattributed" &&
+        t1rec.from === KEEPER &&
+        t1rec.to === SP &&
+        t1rec.rootSelector === pauseSel &&
+        t1rec.caller === null,
+      t1rec
+    );
+
+    // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
+    // letter; UNRECOVERED lands at the cap, not at half of it
+    const b = mk();
+    const ub = b.c.execute(Kind.SLASH, 4242n, slashF, 0b011n, {
+      to: WRAPPER,
+      spLogs: [{ name: "OperatorPaused", args: [addr("rev-l2")] }],
+    });
+    settle(b.c);
+    for (let i = 0; i < 3; i++) await runOnce(b.c.chain, b.cfg, b.store, rs, ident);
+    const bdl = b.store.listDeadLetters().find(x => x.txHash === ub.hash && x.route === "bls");
+    let landedAt = null;
+    for (let i = 4; i <= MAX_DEADLETTER_ATTEMPTS + 3 && landedAt === null; i++) {
+      await runOnce(b.c.chain, b.cfg, b.store, rs, ident);
+      if (b.recs().some(r => r.txHash === ub.hash && r.route === "bls")) landedAt = i;
+    }
+    const exh = readdirSync(join(b.d, "deadletters")).filter(f => /\.exhausted(\.\d+)?$/.test(f));
+    cell(
+      "L2: one attempt per tick for a BLS dead letter beside a tx dead letter; UNRECOVERED at the cap; retirements never overwritten",
+      bdl?.attempts === 3 &&
+        landedAt !== null &&
+        landedAt >= MAX_DEADLETTER_ATTEMPTS &&
+        new Set(exh).size === exh.length,
+      { attempts: bdl?.attempts, landedAt, exh }
+    );
+
+    // L3: an aggregator call WITHOUT a commitment that emits SlashQueued, in the same Safe tx as a
+    // BLS action: the event is not that action's effect, so it is its own record
+    const cc = mk();
+    const s3 = cc.c.execute(Kind.GENERIC, 4343n, priceG, 0b111n, {
+      via: { route: "safe" },
+      spLogs: [{ name: "SlashQueued", args: [addr("rev-l3")] }],
+      price: 261000000000n,
+    });
+    {
+      const sq = spIface.encodeEventLog("SlashQueued", [addr("rev-l3")]);
+      cc.c.setTrace(s3.hash, {
+        type: "CALL",
+        to: SAFE,
+        calls: [
+          {
+            type: "CALL",
+            to: AGG,
+            logs: [
+              {
+                address: AGG,
+                ...aggIface.encodeEventLog("SignersCommitted", [s3.key, s3.mask]),
+                position: 0,
+              },
+            ],
+          },
+          {
+            type: "CALL",
+            to: AGG,
+            calls: [
+              {
+                type: "CALL",
+                from: AGG,
+                to: SP,
+                input: "0x12345678",
+                logs: [{ address: SP, topics: sq.topics, data: sq.data }],
+              },
+            ],
+          },
+        ],
+      });
+    }
+    settle(cc.c);
+    await runOnce(cc.c.chain, cc.cfg, cc.store, rs, ident);
+    const sqRec = cc.recs().find(r => r.txHash === s3.hash && r.event === "SlashQueued");
+    const blsRec = cc.recs().find(r => r.txHash === s3.hash && r.route === "bls");
+    cell(
+      "L3: an SP event inside an aggregator call with no commitment is its own record, not swallowed as the BLS action's effect",
+      sqRec?.route === "owner" &&
+        blsRec &&
+        !(blsRec.spEvents ?? []).some(e => e.event === "SlashQueued"),
+      { sqRec, blsSp: blsRec?.spEvents }
+    );
+
+    // L4: an effect the trace proves only after the BLS record exists is kept beside it; one proven
+    // while the action's dead letter is open goes into that dead letter, then into the record
+    const dd = mk();
+    const s4 = dd.c.execute(Kind.GENERIC, 4444n, priceG, 0b111n, {
+      via: { route: "safe" },
+      spLogs: [{ name: "PriceUpdated", args: [261000000000n, 20n] }],
+      price: 261000000000n,
+    });
+    const effTrace = (x, hash) => {
+      const pu = spIface.encodeEventLog("PriceUpdated", [261000000000n, 20n]);
+      dd.c.setTrace(hash, {
+        type: "CALL",
+        to: SAFE,
+        calls: [
+          {
+            type: "CALL",
+            to: AGG,
+            logs: [
+              {
+                address: AGG,
+                ...aggIface.encodeEventLog("SignersCommitted", [x.key, x.mask]),
+                position: 0,
+              },
+            ],
+            calls: [
+              {
+                type: "CALL",
+                from: AGG,
+                to: SP,
+                input: priceG.callData.slice(0, 10),
+                logs: [{ address: SP, topics: pu.topics, data: pu.data }],
+              },
+            ],
+          },
+        ],
+      });
+    };
+    settle(dd.c);
+    await runOnce(dd.c.chain, dd.cfg, dd.store, rs, ident);
+    const before4 = dd.recs().find(r => r.txHash === s4.hash && r.route === "bls");
+    effTrace(s4, s4.hash);
+    await runOnce(dd.c.chain, dd.cfg, dd.store, rs, ident);
+    const am = dd.store.getBlsAmendment(s4.key);
+    // the open-dead-letter case
+    const s4b = dd.c.execute(Kind.GENERIC, 4445n, priceG, 0b111n, {
+      via: { route: "safe" },
+      spLogs: [{ name: "PriceUpdated", args: [261000000000n, 20n] }],
+      price: 261000000000n,
+    });
+    settle(dd.c);
+    dd.c.failPriceReads(1_000_000);
+    await runOnce(dd.c.chain, dd.cfg, dd.store, rs, ident);
+    effTrace(s4b, s4b.hash);
+    await runOnce(dd.c.chain, dd.cfg, dd.store, rs, ident);
+    const pend = dd.store.listDeadLetters().find(x => x.txHash === s4b.hash && x.route === "bls");
+    dd.c.failPriceReads(0);
+    await runOnce(dd.c.chain, dd.cfg, dd.store, rs, ident);
+    const rec4b = dd.recs().find(r => r.txHash === s4b.hash && r.route === "bls");
+    cell(
+      "L4: later-proven effects are kept: an amendment beside an existing BLS record, or carried by the open dead letter into the record",
+      before4 &&
+        !(before4.spEvents ?? []).length &&
+        am?.spEvents?.[0]?.event === "PriceUpdated" &&
+        pend?.spEvents?.[0]?.event === "PriceUpdated" &&
+        rec4b?.spEvents?.[0]?.event === "PriceUpdated" &&
+        !dd.store.listDeadLetters().some(x => x.txHash === s4.hash),
+      { am, pend: pend?.spEvents, rec4b: rec4b?.spEvents }
+    );
+
+    // L5: a client answering topics in upper-case hex causes no bloom re-read or false positive
+    const e5 = mk();
+    e5.c.ownerTx([{ name: "GuardianSet", args: [addr("rev-l5a"), addr("rev-l5b")] }]);
+    settle(e5.c);
+    e5.c.setUpperTopics(true);
+    const s5 = (await runOnce(e5.c.chain, e5.cfg, e5.store, rs, ident)).status;
+    e5.c.setUpperTopics(false);
+    cell(
+      "L5: bloom topics compared case-insensitively (no false re-read for upper-case hex)",
+      s5.ok === true &&
+        s5.bloom.recovered === 0 &&
+        s5.bloom.falsePositives === 0 &&
+        e5.recs().length === 1,
+      { bloom: s5.bloom, n: e5.recs().length, err: s5.lastError }
+    );
+  } finally {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- L2: a second retirement of the same dead-letter id never overwrites the first
+{
+  const d7 = mkdtempSync(join(tmpdir(), "guardian-watcher-ret-"));
+  try {
+    const st = new Store(d7);
+    const dl = {
+      route: "tx",
+      txHash: ethers.id("ret"),
+      blockNumber: 1,
+      status: "ERROR",
+      reasons: ["x"],
+      events: [],
+      seenAt: "t",
+    };
+    st.putDeadLetter(dl);
+    st.retireDeadLetter(`tx-${dl.txHash.toLowerCase()}`);
+    st.putDeadLetter(dl);
+    st.retireDeadLetter(`tx-${dl.txHash.toLowerCase()}`);
+    cell(
+      "L2: retirements of one id are numbered, never overwritten, and all counted",
+      st.countExhausted() === 2,
+      readdirSync(join(d7, "deadletters"))
+    );
+  } finally {
+    rmSync(d7, { recursive: true, force: true });
+  }
+}
+
 // ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)
 {
   const got = [];

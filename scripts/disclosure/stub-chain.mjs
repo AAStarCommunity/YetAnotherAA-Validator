@@ -140,6 +140,7 @@ function makeChain() {
   let noBloom = false; // headers without logsBloom
   const receiptPatch = new Map(); // hash -> fields a stale backend answers differently
   const receiptLogs = new Map(); // hash -> logs a (inconsistent) RPC returns in the receipt instead
+  let upperTopics = false; // a client answering getLogs topics in upper-case hex
   let traceMode = "ok"; // ok | unsupported (no debug namespace) | noLogs (withLog ignored)
   const txFailures = new Map(); // hash -> remaining getTransaction failures
   let priceFailures = 0; // next N cachedPrice reads fail
@@ -273,17 +274,21 @@ function makeChain() {
         fromBlock = n;
         toBlock = n;
       } else if (toBlock - fromBlock + 1 > maxRange) throw new Error("block range too large");
-      return logs.filter(
-        l =>
-          l.address === address &&
-          l.blockNumber >= fromBlock &&
-          l.blockNumber <= toBlock &&
-          (blockHash !== undefined || !laggingBlocks.has(l.blockNumber)) &&
-          (blockHash !== undefined || laggingTopics.get(l.blockNumber) !== l.topics[0]) &&
-          topics.every(
-            (t, i) => t == null || (Array.isArray(t) ? t.includes(l.topics[i]) : l.topics[i] === t)
-          )
-      );
+      const up = x => "0x" + x.slice(2).toUpperCase();
+      return logs
+        .filter(
+          l =>
+            l.address === address &&
+            l.blockNumber >= fromBlock &&
+            l.blockNumber <= toBlock &&
+            (blockHash !== undefined || !laggingBlocks.has(l.blockNumber)) &&
+            (blockHash !== undefined || laggingTopics.get(l.blockNumber) !== l.topics[0]) &&
+            topics.every(
+              (t, i) =>
+                t == null || (Array.isArray(t) ? t.includes(l.topics[i]) : l.topics[i] === t)
+            )
+        )
+        .map(l => (upperTopics ? { ...l, topics: l.topics.map(up) } : l));
     },
     async call({ to, data, blockTag }) {
       if (to === SP) {
@@ -728,6 +733,10 @@ function makeChain() {
     setNoBloom: v => (noBloom = v),
     failTx: (hash, times) => txFailures.set(hash, times),
     setTraceMode: m => (traceMode = m),
+    setUpperTopics: v => (upperTopics = v),
+    /** A raw (possibly malformed) log the RPC returns from getLogs, at block n. */
+    injectLog: (n, raw) =>
+      logs.push({ blockNumber: n, blockHash: blocks.get(n).hash, index: 0, ...raw }),
     setReceiptLogs: (hash, l) => receiptLogs.set(hash, l),
     patchReceipt: (hash, p) => receiptPatch.set(hash, p),
     failPriceReads: n => (priceFailures = n),
