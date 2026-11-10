@@ -305,8 +305,8 @@ function makeChain() {
       case "fake-dvt": // DVTValidator calldata at an address the manifest does not pin
         if (kind !== Kind.QUEUE) proposals.set(BigInt(id), { block: n - 1, ...f });
         return { to: FAKE_DVT, data: dvtData() };
-      case "safe":
-        return { to: SAFE, data: safeExec(AGG, aggData, 0) };
+      case "safe": // `inner` replaces the Safe's inner call (e.g. a different message under the same key)
+        return { to: SAFE, data: safeExec(AGG, via.inner ?? aggData, 0) };
       case "safe-delegate":
         return { to: SAFE, data: safeExec(WRAPPER, aggData, 1) };
       case "multisend":
@@ -323,6 +323,47 @@ function makeChain() {
             ]),
             1
           ),
+        };
+      case "trace-delegate": // unpinned wrapper -> DELEGATECALL (not MultiSendCallOnly) -> aggregator
+        return {
+          to: WRAPPER,
+          data: "0xdeadbeef",
+          trace: {
+            type: "CALL",
+            to: WRAPPER,
+            input: "0xdeadbeef",
+            calls: [
+              {
+                type: "DELEGATECALL",
+                to: addr("some-library"),
+                input: "0x01",
+                calls: [{ type: "CALL", to: AGG, input: aggData }],
+              },
+            ],
+          },
+        };
+      case "trace-module": // unpinned wrapper -> pinned Safe module route -> aggregator, seen by trace
+        return {
+          to: WRAPPER,
+          data: "0xdeadbeef",
+          trace: {
+            type: "CALL",
+            to: WRAPPER,
+            input: "0xdeadbeef",
+            calls: [
+              {
+                type: "CALL",
+                to: SAFE,
+                input: safeIface.encodeFunctionData("execTransactionFromModule", [
+                  AGG,
+                  0,
+                  aggData,
+                  0,
+                ]),
+                calls: [{ type: "CALL", to: AGG, input: aggData }],
+              },
+            ],
+          },
         };
       case "module":
         return {
@@ -1070,6 +1111,76 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
     "MultiSend with a second, non-matching aggregator call",
     disclose(Kind.GENERIC, 54n, genIn, aM3),
     "PASS"
+  );
+  // Codex review of 022d80db.
+  // H: a Safe inner call is not proven (execTransaction does not revert on inner failure). One
+  // carrying a different message under the honest action's key must not accuse the honest entry.
+  const otherMsg = aggIface.encodeFunctionData("executeProposal", [
+    60n,
+    genF.target,
+    "0x99",
+    3n,
+    "0x",
+  ]);
+  const aH = execute(Kind.GENERIC, 60n, genF, 0b111n, r("safe", { inner: otherMsg }));
+  await expectCase(
+    "unauthenticated Safe inner call cannot accuse an honest entry",
+    disclose(Kind.GENERIC, 60n, genIn, aH),
+    {
+      status: "INCONCLUSIVE",
+      reason: "no recovered call is authenticated",
+    }
+  );
+  // M1: two candidates under one key, only one authenticates -> that one is used.
+  const aTwo = execute(
+    Kind.GENERIC,
+    61n,
+    genF,
+    0b111n,
+    r("multisend", {
+      subs: [0],
+      extraAgg: aggIface.encodeFunctionData("executeProposal", [
+        61n,
+        genF.target,
+        "0x77",
+        3n,
+        "0x",
+      ]),
+    })
+  );
+  await expectCase(
+    "same-key candidates: the one that reproduces the commitment is used",
+    disclose(Kind.GENERIC, 61n, genIn, aTwo),
+    "PASS"
+  );
+  // M3: a batch with any non-CALL sub-tx is skipped whole (MultiSendCallOnly would revert it).
+  const aMix = execute(Kind.GENERIC, 62n, genF, 0b111n, r("multisend", { subs: [0, 1] }));
+  await expectCase(
+    "mixed CALL/DELEGATECALL MultiSend batch is skipped whole",
+    disclose(Kind.GENERIC, 62n, genIn, aMix),
+    {
+      status: "INCONCLUSIVE",
+      reason: "batch skipped",
+    }
+  );
+  // M2: the trace walk enforces the module-route rule too.
+  const aTm = execute(Kind.GENERIC, 63n, genF, 0b111n, r("trace-module"));
+  await expectCase(
+    "trace through a Safe module route is INCONCLUSIVE",
+    disclose(Kind.GENERIC, 63n, genIn, aTm),
+    {
+      status: "INCONCLUSIVE",
+      reason: "module route not followed",
+    }
+  );
+  const aTdg = execute(Kind.GENERIC, 64n, genF, 0b111n, r("trace-delegate"));
+  await expectCase(
+    "trace: aggregator call under a non-MultiSend DELEGATECALL is INCONCLUSIVE",
+    disclose(Kind.GENERIC, 64n, genIn, aTdg),
+    {
+      status: "INCONCLUSIVE",
+      reason: "DELEGATECALL subtree not followed",
+    }
   );
   const aM2 = execute(Kind.GENERIC, 49n, genF, 0b111n, r("multisend", { subs: [1] }));
   await expectCase(
