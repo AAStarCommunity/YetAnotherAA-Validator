@@ -502,7 +502,9 @@ function evidenceLog(l, source, range) {
 /** Observations of one tx, merged: every distinct observation (content and query range) is kept,
  * so a later sighting never replaces an earlier one (Codex follow-up R7). */
 function mergeEvidence(a, b) {
-  const key = e => rawLogKey(e) + JSON.stringify(e?.range ?? null) + String(e?.raw ?? "");
+  // identity = raw contents, the query that returned it, and its range (Codex follow-up R8)
+  const key = e =>
+    rawLogKey(e) + JSON.stringify([e?.source ?? null, e?.range ?? null]) + String(e?.raw ?? "");
   const out = [];
   for (const e of [...(a ?? []), ...(b ?? [])]) if (!out.some(x => key(x) === key(e))) out.push(e);
   return out;

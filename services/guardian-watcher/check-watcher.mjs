@@ -2723,6 +2723,32 @@ try {
       );
     }
 
+    // Codex follow-up R8: the same log returned by both queries is two observations, both kept
+    {
+      const v = mk();
+      const quiet = v.c.ownerTx([]);
+      settle(v.c);
+      const rq = await v.c.chain.getTransactionReceipt(quiet.hash);
+      const gs = spIface.encodeEventLog("GuardianSet", [addr("r8-a"), addr("r8-b")]);
+      const lg = {
+        address: SP,
+        ...gs,
+        blockNumber: rq.blockNumber,
+        blockHash: rq.blockHash,
+        index: 0,
+        transactionHash: quiet.hash,
+      };
+      v.c.injectRawResult(AGG, lg);
+      v.c.injectRawResult(SP, lg);
+      await runOnce(v.c.chain, v.cfg, v.store, rs, ident);
+      const vq = v.store.listDeadLetters().find(x => x.txHash === quiet.hash);
+      cell(
+        "follow-up R8: one log returned by both the aggregator and the SP query is kept as two observations (source is part of the evidence identity)",
+        new Set((vq?.watched ?? []).map(e => e.source)).size === 2,
+        vq?.watched
+      );
+    }
+
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it
     const b = mk();
