@@ -401,7 +401,15 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     // The receipt must contain every watched log getLogs returned for this tx, identical (address,
     // every topic, data) at the same position: an inconsistent receipt aligns with nothing it
     // should (Codex #400-fix R5, R6), and it is a health finding, not only a retry.
-    const consistent = !!logs && watched.every(w => logs.some(r => sameLog(r, w)));
+    // Exact: the receipt's watched logs (by address and topic) are the getLogs evidence, one to
+    // one, no more and no fewer (Codex #400-fix R8: an extra log at a taken position must fail).
+    const rs2 = logs ? splitLogs(logs, cfg, t.block) : { agg: [], sp: [] };
+    const rw = [...rs2.agg, ...rs2.sp];
+    const consistent =
+      !!logs &&
+      rw.length === watched.length &&
+      watched.every(w => rw.some(r => sameLog(r, w))) &&
+      new Set(logs.map(l => logPos(l))).size === logs.length;
     if (logs && !consistent) stats.inconsistent = (stats.inconsistent ?? 0) + 1;
     attr = !logs
       ? { aligned: false, owner: new Map(), spCall: new Map(), why: "receipt unavailable" }

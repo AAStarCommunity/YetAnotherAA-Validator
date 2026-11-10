@@ -421,26 +421,26 @@ aggregator-only.
   known only by **positive verification**: a real transaction with logs whose
   trace aligns log by log with its receipt, either one the scan traced (its
   receipt must contain every watched log `getLogs` returned, identical in
-  address, topics and data at the same position) or a sample: the stored sample
-  transaction first, then the newest finalized blocks. A lookup miss proves
-  nothing, since a node resolves the transaction before it builds the tracer.
-  The proof is stored and re-checked when older than `traceVerifyMs` (1 h), on
-  quiet ticks too; any trace showing the method missing or `withLog` ignored (a
-  watched log seen by `getLogs` makes a log-less trace conclusive, whatever the
-  receipt says), or a receipt that disagrees with `getLogs`, drops it, and only
-  a new positive verification restores health. The watcher is in an explicitly
-  labelled **degraded** mode (`status.degraded` lists why, `status.healthy` is
-  false, `--once` exits non-zero) when the method or tracer is missing, a trace
-  of a transaction with logs carries none, a receipt disagrees with `getLogs`,
-  the proof is older than twice the interval, or every trace call of the tick,
-  or of a verification attempt, failed. It is never shown as healthy. Checking
-  this on the production RPC is a Phase D pre-deploy item. A fallback that
-  attributes without a trace is backlog after 5.5.0. A selector shorter than 4
-  bytes proves no function. A selector listed in `ruleset.json`
-  `publicRoute.functions` gives the **public** route. Any other selector gives
-  the **owner** route. Every record carries `caller`, `selector`, `from`, `to`
-  and `callerSource` (`tx` | `trace` | `unknown`), so the ruleset can change
-  later without re-scanning.
+  address, topics and data at the same position, and no other watched log; every
+  receipt log at its own position) or a sample: the stored sample transaction
+  first, then the newest finalized blocks. A lookup miss proves nothing, since a
+  node resolves the transaction before it builds the tracer. The proof is stored
+  and re-checked when older than `traceVerifyMs` (1 h), on quiet ticks too; any
+  trace showing the method missing or `withLog` ignored (a watched log seen by
+  `getLogs` makes a log-less trace conclusive, whatever the receipt says), or a
+  receipt that disagrees with `getLogs`, drops it, and only a new positive
+  verification restores health. The watcher is in an explicitly labelled
+  **degraded** mode (`status.degraded` lists why, `status.healthy` is false,
+  `--once` exits non-zero) when the method or tracer is missing, a trace of a
+  transaction with logs carries none, a receipt disagrees with `getLogs`, the
+  proof is older than twice the interval, or every trace call of the tick, or of
+  a verification attempt, failed. It is never shown as healthy. Checking this on
+  the production RPC is a Phase D pre-deploy item. A fallback that attributes
+  without a trace is backlog after 5.5.0. A selector shorter than 4 bytes proves
+  no function. A selector listed in `ruleset.json` `publicRoute.functions` gives
+  the **public** route. Any other selector gives the **owner** route. Every
+  record carries `caller`, `selector`, `from`, `to` and `callerSource` (`tx` |
+  `trace` | `unknown`), so the ruleset can change later without re-scanning.
 - An event that a permissionless function _can_ emit, whose call cannot be
   determined (no trace, unaligned trace, tx unavailable), is never guessed. The
   transaction becomes a dead letter (route `tx`) and is retried each tick. An

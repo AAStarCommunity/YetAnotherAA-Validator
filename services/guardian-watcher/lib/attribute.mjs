@@ -67,6 +67,11 @@ export function attributeLogs(trace, receiptLogs, aggregator, sp) {
   const owner = new Map();
   const spCall = new Map();
   if (!trace) return { aligned: false, owner, spCall, why: "no trace" };
+  // Every receipt log needs its own position: a duplicated or invalid one would let a later log's
+  // frame overwrite an earlier one's (Codex #400-fix R8).
+  const pos = receiptLogs.map(l => Number(l.index ?? l.logIndex));
+  if (!pos.every(p => Number.isSafeInteger(p) && p >= 0) || new Set(pos).size !== pos.length)
+    return { aligned: false, owner, spCall, why: "receipt log positions invalid or duplicated" };
   const seq = flattenTraceLogs(trace, aggregator, sp);
   if (!seq) return { aligned: false, owner, spCall, why: "trace logs lack positions" };
   const rl = [...receiptLogs].sort(

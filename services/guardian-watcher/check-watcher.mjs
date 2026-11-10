@@ -1442,6 +1442,101 @@ try {
       .filter(f => f.endsWith(".json"))
       .map(f => JSON.parse(readFileSync(join(dirs.at(-1), "records", f), "utf8")))
       .filter(r => r.txHash === s8.hash);
+    // R8: the receipt holds A and a different B at the same position; the trace matches both
+    const r9 = mk();
+    const s9 = r9.c.ownerTx(pause("r8-A"), keeper);
+    {
+      const a = spIface.encodeEventLog("OperatorPaused", [addr("r8-A")]);
+      const b = spIface.encodeEventLog("OperatorPaused", [addr("r8-B")]);
+      const kp = ethers.id("updatePrice()").slice(0, 10);
+      r9.c.setReceiptLogs(s9.hash, [
+        { address: SP, topics: a.topics, data: a.data, index: 0, blockNumber: s9.block },
+        { address: SP, topics: b.topics, data: b.data, index: 0, blockNumber: s9.block },
+      ]);
+      r9.c.setTrace(s9.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: a.topics, data: a.data, position: 0 }],
+        calls: [
+          {
+            type: "CALL",
+            from: addr("r8-other"),
+            to: SP,
+            input: kp,
+            logs: [{ address: SP, topics: b.topics, data: b.data }],
+          },
+        ],
+      });
+    }
+    settle(r9.c);
+    const r9dir = dirs.at(-1);
+    r9.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+    const r9a = (await runOnce(r9.c.chain, r9.cfg, r9.store, rs, ident, { now: T0 + 1 })).status;
+    const r9b = (await runOnce(r9.c.chain, r9.cfg, r9.store, rs, ident, { now: T0 + 2 })).status;
+    const r9recs = readdirSync(join(r9dir, "records")).filter(f => f.endsWith(".json"));
+    // R8: an extra watched log at a free position, and a duplicated position on an unwatched log
+    const extraCase = async (mkLogs, tag) => {
+      const r = mk();
+      const sx = r.c.ownerTx(pause(`r8-${tag}`), keeper);
+      const a = spIface.encodeEventLog("OperatorPaused", [addr(`r8-${tag}`)]);
+      const rl = mkLogs(a, sx.block);
+      r.c.setReceiptLogs(sx.hash, rl);
+      r.c.setTrace(sx.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: rl.map(l => ({ address: l.address, topics: l.topics, data: l.data })),
+      });
+      settle(r.c);
+      r.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+      return (await runOnce(r.c.chain, r.cfg, r.store, rs, ident, { now: T0 + 1 })).status;
+    };
+    const extraW = await extraCase((a, blk) => {
+      const b = spIface.encodeEventLog("OperatorPaused", [addr("r8-extra-B")]);
+      return [
+        { address: SP, topics: a.topics, data: a.data, index: 0, blockNumber: blk },
+        { address: SP, topics: b.topics, data: b.data, index: 1, blockNumber: blk },
+      ];
+    }, "extra");
+    const dupU = await extraCase(
+      (a, blk) => [
+        { address: SP, topics: a.topics, data: a.data, index: 0, blockNumber: blk },
+        { address: AGG, topics: [ethers.ZeroHash], data: "0x", index: 0, blockNumber: blk },
+      ],
+      "dup"
+    );
+    cell(
+      "trace R8: a receipt with an extra watched log, or a duplicated position on any log, is inconsistent",
+      extraW.trace.thisTick.inconsistent === 1 &&
+        !extraW.trace.thisTick.verified &&
+        dupU.trace.thisTick.inconsistent === 1 &&
+        !dupU.trace.thisTick.verified,
+      { extraW: extraW.trace, dupU: dupU.trace }
+    );
+    const dupAttr = attributeLogs(
+      { type: "CALL", to: SP, logs: [] },
+      [
+        { address: SP, topics: [], data: "0x", index: 0 },
+        { address: SP, topics: [], data: "0x", index: 0 },
+      ],
+      AGG,
+      SP
+    );
+    cell(
+      "trace R8: duplicated receipt positions or extra watched logs are inconsistent (first tick and retry); attributeLogs refuses duplicate positions",
+      r9a.trace.thisTick.inconsistent === 1 &&
+        r9b.trace.thisTick.inconsistent === 1 &&
+        !r9a.trace.thisTick.verified &&
+        !r9b.trace.thisTick.verified &&
+        r9recs.length === 0 &&
+        r9b.healthy === false &&
+        dupAttr.aligned === false &&
+        /duplicated/.test(dupAttr.why),
+      { r9a: r9a.trace, r9b: r9b.trace, r9recs, dupAttr: dupAttr.why }
+    );
     cell(
       "trace R7: retries use the stored getLogs evidence (a disputed or empty receipt never closes the dead letter); a legacy dead letter re-reads by block hash",
       r7b.healthy === false &&
