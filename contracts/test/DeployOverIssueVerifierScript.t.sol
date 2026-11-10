@@ -288,6 +288,42 @@ contract DeployOverIssueVerifierScriptTest is Test {
         deployScript.deploy(_config(address(agg)));
     }
 
+    /// @notice 4.13.0+ changed the signer commitment (key + anchor); this verifier can never verify
+    ///         there, so not even an explicit EXPECTED_AGGREGATOR_VERSION may deploy against it.
+    function test_Deploy_RefusesAnchoredReleaseEvenWhenExpected() public {
+        string[4] memory vs =
+            ["BLSAggregator-4.13.0", "BLSAggregator-4.13.1-rc", "BLSAggregator-4.20.0", "BLSAggregator-5.0.0"];
+        for (uint256 i = 0; i < vs.length; i++) {
+            ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 5 days);
+            agg.setVersion(vs[i]);
+            DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
+            cfg.expectedAggregatorVersion = vs[i];
+            vm.expectRevert(
+                bytes(
+                    "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
+                )
+            );
+            deployScript.deploy(cfg);
+        }
+    }
+
+    /// @notice An unparseable release string is treated as new (fail closed), even when expected.
+    function test_Deploy_RefusesUnparseableReleaseEvenWhenExpected() public {
+        string[3] memory vs = ["BLSAggregator-", "BLSAggregator-x.y", "Aggregator-4.11.0"];
+        for (uint256 i = 0; i < vs.length; i++) {
+            ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
+            agg.setVersion(vs[i]);
+            DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
+            cfg.expectedAggregatorVersion = vs[i];
+            vm.expectRevert(
+                bytes(
+                    "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
+                )
+            );
+            deployScript.deploy(cfg);
+        }
+    }
+
     /// @notice ...and the operator can accept that newer release only by naming it explicitly.
     function test_Deploy_AcceptsNewerVersionWhenExplicitlyExpected() public {
         ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);

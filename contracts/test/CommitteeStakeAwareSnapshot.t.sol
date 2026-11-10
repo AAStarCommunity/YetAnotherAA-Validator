@@ -43,8 +43,10 @@ contract ExitNoticeAggregator {
     function guardianExitRequests(address guardian) external view returns (uint64, uint64) {
         uint64 r = readyAt[guardian];
         if (r == 0) return (0, 0);
-        // SP's GUARDIAN_EXIT_WINDOW is 1 day; saturate rather than overflow at uint64 extremes.
-        uint64 expires = r > type(uint64).max - uint64(1 days) ? type(uint64).max : r + uint64(1 days);
+        // BLSAggregator-4.13.0: expiresAt = readyAt + GUARDIAN_FRAUD_CHALLENGE (1 day) +
+        // GUARDIAN_EXIT_WINDOW (1 day) (:1762). The snapshot reads only readyAt; expiresAt is
+        // modelled for fidelity. Saturate rather than overflow at uint64 extremes.
+        uint64 expires = r > type(uint64).max - uint64(2 days) ? type(uint64).max : r + uint64(2 days);
         return (r, expires);
     }
 }

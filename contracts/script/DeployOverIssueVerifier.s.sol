@@ -89,6 +89,31 @@ contract DeployOverIssueVerifier is Script {
     ///         canonical-pin note at the domain-parity gate below.
     string internal constant SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.11.0";
 
+    /// @dev True for "BLSAggregator-<major>.<minor>..." with (major, minor) >= (4, 13), and for any
+    ///      string this cannot parse (fail closed: an unreadable release is not assumed old).
+    function _isAnchoredCommitmentRelease(string memory v) internal pure returns (bool) {
+        bytes memory b = bytes(v);
+        bytes memory prefix = bytes("BLSAggregator-");
+        if (b.length <= prefix.length) return true;
+        for (uint256 i = 0; i < prefix.length; i++) {
+            if (b[i] != prefix[i]) return true;
+        }
+        uint256 p = prefix.length;
+        (uint256 major, uint256 q) = _readUint(b, p);
+        if (q == p || q >= b.length || b[q] != ".") return true;
+        (uint256 minor, uint256 r) = _readUint(b, q + 1);
+        if (r == q + 1) return true;
+        return major > 4 || (major == 4 && minor >= 13);
+    }
+
+    function _readUint(bytes memory b, uint256 i) private pure returns (uint256 n, uint256 end) {
+        end = i;
+        while (end < b.length && b[end] >= "0" && b[end] <= "9" && end - i < 6) {
+            n = n * 10 + (uint8(b[end]) - 48);
+            end++;
+        }
+    }
+
     /// @notice Minimum acceptable on-chain arming delay for a fraud-proof verifier rotation.
     ///         SP pins `VERIFIER_ROTATION_DELAY = GUARDIAN_SLASH_CASE_WINDOW = 4 days`
     ///         (BLSAggregator.sol:386/394). This script refuses to hand a verifier to an
@@ -194,6 +219,17 @@ contract DeployOverIssueVerifier is Script {
         require(
             keccak256(bytes(reportedVersion)) == keccak256(bytes(expectedVersion)),
             "AGGREGATOR.version() != expected: re-verify the fraud-proof ABI and the arming path for that release, then set EXPECTED_AGGREGATOR_VERSION"
+        );
+        // GATE A' — NO OVERRIDE PAST r3b. BLSAggregator-4.13.0 (SP rc.8 r3b) changed the signer
+        // commitment this verifier recomputes: it is now keyed per path and ends with
+        // blockhash(block.number - 1) (BLSAggregator.sol @ f00be603 :1376-1386). This verifier's
+        // `_commitmentMatches` predates that tuple, so on 4.13.0+ it can never verify a fraud proof:
+        // arming it would install a fraud-proof authority that silently never fires. 5.5.0 arms no
+        // verifier at all (M0 D9: fraudProofVerifier == 0); the 5.5.x historical-state verifier is
+        // a new contract. EXPECTED_AGGREGATOR_VERSION cannot lift this gate.
+        require(
+            !_isAnchoredCommitmentRelease(reportedVersion),
+            "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
         );
 
         // GATE B — ARMING DELAY. Independent of Gate A, and deliberately not implied by it: the
