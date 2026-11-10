@@ -1551,6 +1551,26 @@ try {
         gap.degraded.some(x => /did not align/.test(x)),
       { badPos: [badPos.ok, badPos.lastError, badPos.trace], gap: [gap.trace, gap.degraded] }
     );
+    // R13: a stale backend answers receipt + trace from an orphaned earlier inclusion
+    const orphan = mk();
+    const so = orphan.c.ownerTx(pause("r13-orphan"), keeper);
+    orphan.c.patchReceipt(so.hash, { blockNumber: so.block - 1, blockHash: ethers.id("orphan") });
+    settle(orphan.c);
+    orphan.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+    const sOr = (
+      await runOnce(orphan.c.chain, orphan.cfg, orphan.store, rs, ident, { now: T0 + 1 })
+    ).status;
+    const orRecs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+    const orDl = orphan.store.listDeadLetters().find(x => x.txHash === so.hash);
+    cell(
+      "trace R13: a receipt from another inclusion (block) is inconsistent: no record, no proof, degraded; the dead letter keeps the block hash",
+      sOr.trace.thisTick.inconsistent === 1 &&
+        !sOr.trace.thisTick.verified &&
+        orRecs.length === 0 &&
+        sOr.healthy === false &&
+        typeof orDl?.watched?.[0]?.blockHash === "string",
+      { trace: sOr.trace, orRecs, w: orDl?.watched }
+    );
     cell(
       "trace R9: a receipt differing from getLogs only in hex case is consistent (supporting node stays healthy)",
       !caseR.trace.thisTick.inconsistent && caseR.trace.thisTick.verified === 1 && caseR.healthy,
@@ -1912,6 +1932,27 @@ try {
         /input/.test(envelopeProblem(H0, ok, rc(), { ...tr, input: "0x12345679" })),
       null
     );
+    const B = { blockNumber: 7, blockHash: ethers.id("b7") };
+    const rcB = (x = {}) => rc({ ...B, ...x });
+    cell(
+      "envelopeProblem: receipt, its logs and the tx must name the evidence's block",
+      envelopeProblem(H0, ok, rcB(), tr, B) === null &&
+        envelopeProblem(H0, { ...ok, ...B }, rcB(), tr, B) === null &&
+        /another block/.test(
+          envelopeProblem(H0, ok, rcB({ blockHash: ethers.id("b7x") }), tr, B)
+        ) &&
+        /another block/.test(envelopeProblem(H0, ok, rcB({ blockNumber: 6 }), tr, B)) &&
+        /does not name its block/.test(
+          envelopeProblem(H0, ok, rcB({ blockHash: undefined }), tr, B)
+        ) &&
+        /another block/.test(
+          envelopeProblem(H0, { ...ok, blockHash: ethers.id("b7y") }, rcB(), tr, B)
+        ) &&
+        /another block/.test(
+          envelopeProblem(H0, ok, rcB({ logs: [{ ...L, index: 0, blockNumber: 8 }] }), tr, B)
+        ),
+      null
+    );
     const noPosParent = child =>
       attributeLogs(
         {
@@ -1969,6 +2010,37 @@ try {
       "verifyTrace: a sample whose trace root is not its tx proves nothing; the matching root verifies",
       vMis.state === "unverified" && /input differs/.test(vMis.reason) && vOk.state === "verified",
       { vMis, vOk }
+    );
+    const vs = canon =>
+      verifyTrace(
+        {
+          send: async (m, p) =>
+            m === "eth_getBlockByNumber"
+              ? p[0] === ethers.toQuantity(9)
+                ? { number: "0x9", hash: canon, transactions: [] }
+                : { transactions: [] }
+              : { type: "CALL", from: ok.from, to: SP, input: ok.data, logs: [L] },
+          getTransactionReceipt: async () => ({
+            transactionHash: ethers.id("s3"),
+            status: 1,
+            blockNumber: 9,
+            blockHash: ethers.id("b9"),
+            logs: [{ ...L, index: 0 }],
+          }),
+          getTransaction: async () => ok,
+        },
+        { aggregator: AGG, roles: { superPaymaster: SP } },
+        20,
+        { blocks: 1, sampleTx: ethers.id("s3") }
+      );
+    const vCanon = await vs(ethers.id("b9"));
+    const vStale = await vs(ethers.id("b9-reorged"));
+    cell(
+      "verifyTrace: the stored sample proves only while its receipt's block is still canonical",
+      vCanon.state === "verified" &&
+        vStale.state === "unverified" &&
+        /another block/.test(vStale.reason),
+      { vCanon, vStale }
     );
     cell(
       "verifyTrace: a null trace answer is inconclusive (unverified, counted failed), not 'unsupported'",

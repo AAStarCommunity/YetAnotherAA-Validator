@@ -450,7 +450,10 @@ aggregator-only.
 - **Scope of the trace and receipt checks.** They defend against an RPC that is
   honest but inconsistent, lagging or only partly supporting the tracer, and
   against client format differences:
-  - the receipt must name the tx, succeed and carry no removed or foreign log;
+  - the receipt must name the tx and its block, succeed explicitly and carry no
+    removed or foreign log, and the receipt, its logs and the tx must all name
+    the block the `getLogs` evidence came from (a stale backend can answer from
+    an orphaned earlier inclusion);
   - the trace root must be the tx itself (sender, destination, full input);
   - positions are parsed strictly and must be unique and contiguous;
   - logs must be well formed;

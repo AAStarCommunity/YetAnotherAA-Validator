@@ -139,7 +139,7 @@ export async function verifyTrace(
   let failed = 0;
   let why = "no transaction with logs in the sampled blocks";
   // One candidate: null = not a usable sample (no receipt logs), else a verdict or "keep looking".
-  const check = async hash => {
+  const check = async (hash, blockOf = null) => {
     let rc = null;
     try {
       rc = await chain.getTransactionReceipt(hash);
@@ -168,7 +168,21 @@ export async function verifyTrace(
     } catch {
       tx = null;
     }
-    const env = tx ? envelopeProblem(hash, tx, rc, trace) : "transaction unavailable";
+    let at = blockOf ?? null;
+    if (!at && rc?.blockNumber !== undefined && rc?.blockNumber !== null) {
+      // the stored sample: its receipt's block must still be the canonical one
+      try {
+        const h = await header(chain, Number(rc.blockNumber));
+        at = { blockNumber: Number(rc.blockNumber), blockHash: h.hash };
+      } catch {
+        at = null;
+      }
+    }
+    const env = !tx
+      ? "transaction unavailable"
+      : !at
+        ? "sample block unavailable"
+        : envelopeProblem(hash, tx, rc, trace, at);
     if (env) {
       why = `sample not usable (${env})`;
       return { state: "next" };
@@ -202,7 +216,7 @@ export async function verifyTrace(
       if (tried >= maxTx) break;
       const hash = typeof t === "string" ? t : t?.hash;
       if (typeof hash !== "string" || hash === sampleTx) continue;
-      const r = await check(hash);
+      const r = await check(hash, { blockNumber: b, blockHash: blk.hash });
       if (done(r)) return { ...r, tried, failed };
     }
   }
@@ -250,7 +264,28 @@ const okStatus = s => s === 1 || s === "0x1" || s === 1n || s === "1";
  * else the reason. The trace root must be the tx itself: its sender, destination (CREATE when the
  * tx has none) and full input.
  */
-export function envelopeProblem(txHash, tx, rc, trace) {
+export function envelopeProblem(txHash, tx, rc, trace, at = {}) {
+  // Inclusion: the receipt, its logs and the tx must all name the same block, and that block must
+  // be the one the watched evidence came from (a stale backend can answer from an orphaned earlier
+  // inclusion with identical payloads; Codex #400-fix R13).
+  const present = x => x !== undefined && x !== null;
+  const num = x => (present(x) ? Number(x) : undefined);
+  const sources = [["receipt", rc], ["tx", tx], ...(rc?.logs ?? []).map(l => ["receipt log", l])];
+  const want = {
+    number: present(at.blockNumber) ? Number(at.blockNumber) : num(rc?.blockNumber),
+  };
+  if (present(at.blockHash) && rc && !present(rc.blockHash))
+    return "receipt does not name its block";
+  let firstHash = present(at.blockHash) ? String(at.blockHash) : null;
+  for (const [what, o] of sources) {
+    if (!o) continue;
+    if (present(o.blockNumber) && present(want.number) && num(o.blockNumber) !== want.number)
+      return `${what} is from another block`;
+    if (present(o.blockHash)) {
+      if (firstHash === null) firstHash = String(o.blockHash);
+      else if (!lcEq(o.blockHash, firstHash)) return `${what} is from another block`;
+    }
+  }
   if (rc) {
     // ethers v6 names the receipt's tx `hash`; raw JSON-RPC names it `transactionHash`.
     const ids = [rc.transactionHash, rc.hash].filter(x => x !== undefined && x !== null);
@@ -388,6 +423,7 @@ function evidenceLog(l) {
     data: l.data,
     index: logPos(l),
     blockNumber: Number(l.blockNumber),
+    ...(l.blockHash ? { blockHash: l.blockHash } : {}),
     transactionHash: l.transactionHash,
   };
 }
@@ -454,7 +490,20 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     const watched = [...t.agg, ...t.sp];
     const stats = (summary.trace ??= {});
     const { trace, logs, rc } = await traceAndReceipt(chain, txHash, stats, watched.length > 0);
-    const envelope = logs ? envelopeProblem(txHash, tx, rc, trace) : null;
+    // The watched evidence fixes the inclusion: every watched log must name one block (Codex R13).
+    const wHashes = [
+      ...new Set(
+        watched
+          .map(w => w.blockHash)
+          .filter(Boolean)
+          .map(h => h.toLowerCase())
+      ),
+    ];
+    const envelope = !logs
+      ? null
+      : wHashes.length > 1
+        ? "watched logs name different blocks"
+        : envelopeProblem(txHash, tx, rc, trace, { blockNumber: t.block, blockHash: wHashes[0] });
     // The receipt must contain every watched log getLogs returned for this tx, identical (address,
     // every topic, data) at the same position: an inconsistent receipt aligns with nothing it
     // should (Codex #400-fix R5, R6), and it is a health finding, not only a retry.
