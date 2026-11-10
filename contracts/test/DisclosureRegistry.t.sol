@@ -650,4 +650,29 @@ contract DisclosureRegistryTest is Test {
         vm.expectRevert(DisclosureRegistry.NotWriter.selector);
         reg.amend(id, "ipfs://x", bytes32(0), bytes32(0));
     }
+
+    function test_duplicateRefusedForEveryKind() public {
+        DisclosureRegistry.Signed[4] memory list = [
+            _executed(DisclosureRegistry.Kind.SLASH, 41, _slashInputs(), 0x7),
+            _executed(DisclosureRegistry.Kind.GENERIC, 42, _genericInputs(), 0x7),
+            _executed(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs(), 0x3),
+            _executed(DisclosureRegistry.Kind.REPUTATION, 43, _repInputs(), 0x7)
+        ];
+        for (uint256 i = 0; i < 4; i++) {
+            uint256 id = _disclose(list[i]);
+            vm.prank(writer);
+            vm.expectRevert(abi.encodeWithSelector(DisclosureRegistry.AlreadyDisclosed.selector, id));
+            reg.disclose(list[i], address(0), bytes32(0), EXEC_BLOCK, bytes20(0), "", bytes32(0));
+        }
+    }
+
+    function test_queueWithANewEpochIsANewAction() public {
+        uint256 a = _disclose(
+            _executed(DisclosureRegistry.Kind.QUEUE, 0, abi.encode(makeAddr("operator"), uint8(1), uint256(42)), 0x3)
+        );
+        uint256 b = _disclose(
+            _executed(DisclosureRegistry.Kind.QUEUE, 0, abi.encode(makeAddr("operator"), uint8(1), uint256(43)), 0x3)
+        );
+        assertTrue(a != b, "a re-queue with a new epoch is its own entry");
+    }
 }
