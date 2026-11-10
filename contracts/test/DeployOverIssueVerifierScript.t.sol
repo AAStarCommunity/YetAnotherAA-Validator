@@ -346,7 +346,14 @@ contract DeployOverIssueVerifierScriptTest is Test {
     /// @notice Well-formed pre-4.13 releases still deploy when named explicitly (the gate is not a
     ///         blanket refusal).
     function test_Deploy_AcceptsWellFormedOldReleaseWhenExpected() public {
-        string[3] memory vs = ["BLSAggregator-4.12.0", "BLSAggregator-4.12.3-rc1", "BLSAggregator-4.0.0"];
+        string[6] memory vs = [
+            "BLSAggregator-4.12.0",
+            "BLSAggregator-4.12.3-rc1",
+            "BLSAggregator-4.0.0",
+            "BLSAggregator-4.12.0-AZaz09.-", // every allowed suffix class
+            "BLSAggregator-4.12.0--",
+            "BLSAggregator-4.12.0-."
+        ];
         for (uint256 i = 0; i < vs.length; i++) {
             ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
             agg.setVersion(vs[i]);
