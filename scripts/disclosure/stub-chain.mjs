@@ -616,6 +616,14 @@ function makeChain() {
         fn: () => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`late-reorg-${n}`) }),
       }),
     /** Replace the head block right after the next by-hash counter read. */
+    /** Make the head header carry an arbitrary (malformed) hash value. */
+    /** Returns a function that restores the original hash. */
+    corruptHeadHash: v => {
+      const n = head;
+      const orig = blocks.get(n).hash;
+      blocks.set(n, { ...blocks.get(n), hash: v });
+      return () => blocks.set(n, { ...blocks.get(n), hash: orig });
+    },
     reorgHeadAfterCountRead: () =>
       (onEntryCountRead = () =>
         blocks.set(head, { ...blocks.get(head), hash: ethers.id(`head-reorg-${head}`) })),

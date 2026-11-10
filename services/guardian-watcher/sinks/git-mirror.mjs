@@ -15,6 +15,7 @@
 //   and the commit's blob at the path must equal the bytes, before success is returned.
 // All git calls are argv-only (no shell).
 import { spawn } from "node:child_process";
+import { ethers } from "ethers";
 import { mkdtempSync, rmSync } from "node:fs";
 import { SinkError, guarded } from "./errors.mjs";
 import { join, posix } from "node:path";
@@ -74,7 +75,11 @@ export function checkMirrorPath(path) {
     segs.every(
       s => s !== "" && s !== "." && s !== ".." && !s.startsWith("-") && s.toLowerCase() !== ".git"
     );
-  if (!ok) throw new SinkError(`mirror: path escapes or is not a plain record path: ${p}`);
+  // Fixed text: the rejected value is not ours to echo (Codex W2b R5); its digest tells cases apart.
+  if (!ok)
+    throw new SinkError(
+      `mirror: path escapes or is not a plain record path (keccak ${ethers.keccak256(ethers.toUtf8Bytes(p)).slice(0, 18)})`
+    );
   return p;
 }
 

@@ -53,6 +53,7 @@ const {
   revertedOnOrphan,
   reorgAfterSends,
   reorgHeadAfterCountRead,
+  corruptHeadHash,
   receiptWithoutStatus,
   setTrace,
   setStorage,
@@ -165,6 +166,16 @@ await expectCase("never-issued entry id is MISMATCH", 999n, {
   status: "MISMATCH",
   reason: "not issued as of block",
 });
+{
+  // A malformed head hash is never trusted nor echoed into the (stored) reason (Codex W2b R5).
+  const restore = corruptHeadHash("HASHSECRET-not-a-bytes32");
+  await expectCase("a malformed head hash is INCONCLUSIVE and never echoed", 999n, {
+    status: "INCONCLUSIVE",
+    reason: "header unavailable",
+    absent: "HASHSECRET",
+  });
+  restore();
+}
 
 const aW = execute(Kind.SLASH, 11n, slashF, 0b011n, { to: WRAPPER });
 await expectCase("wrapped action call is INCONCLUSIVE", disclose(Kind.SLASH, 11n, slashIn, aW), {

@@ -459,6 +459,17 @@ try {
       escapes.length === 0,
       escapes
     );
+    let pe = null;
+    try {
+      await m.commit("records/../../PATHSECRET", rec, "x");
+    } catch (e) {
+      pe = safeText("publish", e);
+    }
+    cell(
+      "mirror: a rejected path is not echoed, even after both error boundaries",
+      /plain record path \(keccak 0x[0-9a-f]{16}\)$/.test(pe ?? "") && !/PATHSECRET/.test(pe ?? ""),
+      pe
+    );
     const sym = await refuse("records/link.json", rec, /exists as 120000/);
     cell("mirror: a path that is a symlink in the remote tree is refused", sym === true, sym);
     const pre = await refuse("records/afile/x.json", rec, /not a directory/);
