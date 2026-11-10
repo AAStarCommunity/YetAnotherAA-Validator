@@ -1133,8 +1133,9 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
     }
   );
   // M1: two candidates under one key, only one authenticates -> that one is used. The second is a
-  // nested Safe execTransaction whose inner call fails: Safe returns false without reverting, so
-  // the batch (and the honest call before it) still succeeds.
+  // nested Safe execTransaction whose inner call fails: with a nonzero safeTxGas (Safe v1.3.0
+  // GnosisSafe.sol L168-170 reverts GS013 only when safeTxGas == 0 && gasPrice == 0) it returns
+  // false without reverting, so the batch (and the honest call before it) still succeeds.
   const nestedFail = {
     op: 0,
     to: SAFE,
@@ -1143,7 +1144,7 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
       0,
       aggIface.encodeFunctionData("executeProposal", [61n, genF.target, "0x77", 3n, "0x"]),
       0,
-      0,
+      100000,
       0,
       0,
       ethers.ZeroAddress,
