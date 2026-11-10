@@ -488,15 +488,25 @@ aggregator-only.
 - One malformed item never stops the scan. Logs are read through raw
   `eth_getLogs` (range and by hash), not the provider's `getLogs`, whose
   formatter throws on an entry it cannot format before any isolation could see
-  it. An entry that is not a log object is quarantined at intake; any exception
-  while processing a tx (a malformed or inconsistent RPC answer) makes that tx a
-  dead letter with its watched evidence, and the cursor moves on. At the attempt
-  cap it becomes an `unattributed` record (`UNREADABLE`, its own verdict, nobody
-  accused) carrying that evidence. A tick that isolated anything is reported
-  degraded (`status.healthy` false, with the count), and `status.json` counts
-  unreadable txs in total. A tick still fails, and is retried with the cursor
-  unchanged, when a read it cannot do without fails (a header, a non-array log
-  answer).
+  it. An entry that is not an object, or names no valid tx hash, is quarantined
+  at intake: one dead letter per answer, with the total and up to 10 distinct
+  samples, each with its count. Fields the RPC returns under the watcher's own
+  evidence names (`source`, `range`, `raw`, `count`, `quarantine`) are stripped
+  before use. Any exception while processing a tx (a malformed or inconsistent
+  RPC answer) makes that tx a dead letter with its watched evidence, and the
+  cursor moves on. Work per tick is bounded without dropping evidence: after 100
+  new per-tx isolations the tick finishes the current block, stops, and sets the
+  cursor there, so the rest is read again next tick (dead-letter retries do not
+  count towards this). A block with more than 2000 isolating txs, more than any
+  real block can carry, puts the excess into one bounded quarantine per query;
+  txs whose logs carry no usable height share one such bucket. The logsBloom
+  cross-check runs on the raw answers, so an entry quarantined at intake is not
+  mistaken for a missing log. At the attempt cap a tx dead letter becomes an
+  `unattributed` record (`UNREADABLE`, its own verdict, nobody accused) carrying
+  that evidence. A tick that isolated anything is reported degraded
+  (`status.healthy` false, with the count), and `status.json` counts unreadable
+  txs in total. A tick still fails, and is retried with the cursor unchanged,
+  when a read it cannot do without fails (a header, a non-array log answer).
 - A BLS action with an open dead letter is retried by that dead letter alone,
   once per tick; retirements of one id are numbered, never overwritten.
 - An SP effect that the trace proves to belong to a BLS action only after the

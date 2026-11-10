@@ -3424,85 +3424,317 @@ try {
   }
 }
 
-// ---- follow-up #2 R2: floods of object-shaped junk stay linear and bounded; deep JSON is stored
+// ---- follow-up #2 R2/R3: floods stay bounded per tick without losing evidence; deep JSON is stored
 {
-  const run = async (inject, label) => {
+  const mkRun = () => {
     const d = mkdtempSync(join(tmpdir(), "guardian-watcher-flood-"));
-    try {
-      const c = makeChain();
-      const cfg = {
-        aggregator: AGG,
-        roles: { superPaymaster: SP },
-        forwarders: FORWARDERS,
-        startBlock: c.head() + 1,
-        maxBlocksPerTick: 1000,
-        page: 5000,
-      };
-      const store = new Store(d);
-      const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
-      for (let i = 0; i < 4; i++) c.mine();
-      inject(c);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(d);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    for (let i = 0; i < 4; i++) c.mine();
+    const tick = async () => {
       const t0 = Date.now();
       const st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
-      return { st, ms: Date.now() - t0, dls: store.listDeadLetters(), label };
-    } finally {
-      rmSync(d, { recursive: true, force: true });
-    }
+      return { st, ms: Date.now() - t0 };
+    };
+    return { d, c, store, tick };
   };
   const gs = spIface.encodeEventLog("GuardianSet", [addr("fl-a"), addr("fl-b")]);
-  const objFlood = await run(c => {
-    for (let i = 0; i < 4000; i++) c.injectRawResult(SP, { logIndex: i });
-  }, "4000 {logIndex}");
-  const few = await run(c => {
-    for (let i = 0; i < 50; i++)
-      c.injectRawResult(SP, {
+  const out = {};
+  const runs = [];
+  try {
+    // 4000 object-shaped entries naming no tx: one bounded quarantine
+    const a = mkRun();
+    runs.push(a);
+    for (let i = 0; i < 4000; i++) a.c.injectRawResult(SP, { logIndex: i });
+    out.objFlood = await a.tick();
+    out.objFloodQ = a.store.listDeadLetters().filter(x => x.quarantine).length;
+    // 150 malformed logs of distinct txs in ONE block: isolated per tx (a block is never split)
+    const b = mkRun();
+    runs.push(b);
+    for (let i = 0; i < 150; i++)
+      b.c.injectRawResult(SP, {
         address: SP,
         ...gs,
         blockNumber: 101,
         index: "bad",
-        transactionHash: ethers.id(`fl-few-${i}`),
+        transactionHash: ethers.id(`fl-one-${i}`),
       });
-  }, "50 malformed");
-  const many = await run(c => {
+    out.oneBlock = await b.tick();
+    out.oneBlockDls = b.store.listDeadLetters().filter(x => !x.quarantine).length;
+    // 150 malformed logs spread over 150 blocks: the tick stops at a block boundary after the
+    // budget; the next tick finishes them; none is dropped
+    const m = mkRun();
+    runs.push(m);
+    const first = m.c.head() + 1;
+    for (let i = 0; i < 150; i++) m.c.mine();
+    for (let i = 0; i < 4; i++) m.c.mine();
     for (let i = 0; i < 150; i++)
-      c.injectRawResult(SP, {
+      m.c.injectRawResult(SP, {
         address: SP,
         ...gs,
-        blockNumber: 101,
+        blockNumber: first + i,
         index: "bad",
         transactionHash: ethers.id(`fl-many-${i}`),
       });
-  }, "150 malformed");
-  let deepData = "x";
-  for (let i = 0; i < 10_000; i++) deepData = [deepData];
-  const deep = await run(c => {
-    c.injectRawResult(SP, {
+    out.many1 = await m.tick();
+    out.many1Dls = m.store.listDeadLetters().filter(x => !x.quarantine).length;
+    // the stub hands injected answers out once: re-inject the tail the second tick reads again
+    for (let i = 0; i < 150; i++)
+      if (first + i > out.many1.st.cursor)
+        m.c.injectRawResult(SP, {
+          address: SP,
+          ...gs,
+          blockNumber: first + i,
+          index: "bad",
+          transactionHash: ethers.id(`fl-many-${i}`),
+        });
+    out.many2 = await m.tick();
+    out.manyDls = m.store.listDeadLetters().filter(x => !x.quarantine).length;
+    // a log whose `data` is nested 10 000 deep, and one carrying a deeply nested `range` field
+    const dd = mkRun();
+    runs.push(dd);
+    let deep = "x";
+    for (let i = 0; i < 10_000; i++) deep = [deep];
+    dd.c.injectRawResult(SP, {
       address: SP,
       ...gs,
-      data: deepData,
+      data: deep,
       blockNumber: 101,
       index: 0,
       transactionHash: ethers.id("fl-deep"),
     });
-  }, "deep data");
+    dd.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: "0x1",
+      blockNumber: 101,
+      index: 1,
+      transactionHash: ethers.id("fl-range"),
+      range: [deep, 1],
+    });
+    out.deep = await dd.tick();
+    out.deepDls = dd.store.listDeadLetters();
+  } finally {
+    for (const r of runs) rmSync(r.d, { recursive: true, force: true });
+  }
   cell(
-    "floods stay linear and bounded: 4000 object-shaped junk entries and 150 malformed logs make one quarantine each; 50 are isolated per tx; deeply nested data is stored as a placeholder; every tick completes",
-    [objFlood, few, many, deep].every(x => x.st.ok === true && x.st.cursor !== null) &&
-      objFlood.ms < 10_000 &&
-      objFlood.dls.filter(x => x.quarantine).length === 1 &&
-      many.dls.filter(x => x.quarantine).length === 1 &&
-      many.dls.length === 1 &&
-      few.dls.filter(x => !x.quarantine).length === 50 &&
-      deep.dls.length === 1 &&
-      /too deep or too large/.test(JSON.stringify(deep.dls[0].watched)),
-    [objFlood, few, many, deep].map(x => [
-      x.label,
-      x.st.ok,
-      x.st.lastError,
-      x.ms,
-      x.dls.length,
-      x.dls.filter(d => d.quarantine).length,
-    ])
+    "floods are bounded per tick without dropping evidence: junk naming no tx is one quarantine; one block's 150 malformed txs are isolated per tx; 150 spread over blocks stop at a block boundary and finish next tick; deep data / a returned deep `range` never escape",
+    out.objFlood.st.ok &&
+      out.objFlood.ms < 10_000 &&
+      out.objFloodQ === 1 &&
+      out.oneBlock.st.ok &&
+      out.oneBlockDls === 150 &&
+      out.many1.st.ok &&
+      out.many1.st.cursor < out.many2.st.cursor &&
+      out.many1Dls >= 100 &&
+      out.many1Dls < 150 &&
+      out.many2.st.ok &&
+      out.manyDls === 150 &&
+      out.deep.st.ok &&
+      out.deepDls.length === 2 &&
+      /too deep or too large/.test(JSON.stringify(out.deepDls.map(x => x.watched))),
+    {
+      objFlood: [out.objFlood.st.ok, out.objFlood.ms, out.objFloodQ],
+      oneBlock: [out.oneBlock.st.ok, out.oneBlockDls],
+      many: [out.many1.st.cursor, out.many1Dls, out.many2.st.cursor, out.manyDls],
+      deep: [out.deep.st.ok, out.deep.st.lastError, out.deepDls?.length],
+    }
+  );
+}
+
+// ---- follow-up #2 R3: one block past any real size joins a bounded quarantine; RPC fields that
+// collide with the watcher's own evidence fields never reach the evidence
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-overflow-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("ov-a"), addr("ov-b")]);
+  for (let i = 0; i < 2100; i++)
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      blockNumber: 101,
+      index: i,
+      removed: true,
+      transactionHash: ethers.id(`ov-${i}`),
+    });
+  const reserved = () =>
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      blockNumber: 102,
+      index: 0,
+      removed: true,
+      transactionHash: ethers.id("ov-reserved"),
+      source: "agg",
+      quarantine: true,
+      count: 7,
+    });
+  reserved();
+  let st, st2, dls, ms;
+  try {
+    const t0 = Date.now();
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    ms = Date.now() - t0;
+    // the tick stopped after block 101 (its budget); block 102 is read again on the next tick
+    reserved();
+    st2 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    dls = store.listDeadLetters();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const perTx = dls.filter(x => !x.quarantine);
+  const q = dls.filter(x => x.quarantine);
+  const res = perTx.find(x => x.txHash === ethers.id("ov-reserved"));
+  const resEv = JSON.stringify(res?.watched ?? null);
+  cell(
+    "a block past MAX_TXS_PER_BLOCK isolates 2000 txs and quarantines the rest in one bounded letter (query source kept); the tick stops at that block and the next one continues; reserved fields (source, quarantine, count) returned by the RPC are stripped from evidence",
+    st?.ok &&
+      st.cursor === 101 &&
+      st2?.ok &&
+      st2.cursor > 102 &&
+      perTx.length === 2001 &&
+      q.length === 1 &&
+      /"source":"sp"/.test(JSON.stringify(q[0].watched)) &&
+      /^100 returned entries are past 2000 isolating txs in one block/.test(
+        q[0].reasons?.join(" ") ?? ""
+      ) &&
+      res &&
+      !res.quarantine &&
+      !/"count":7/.test(resEv) &&
+      !/"source":"agg"/.test(resEv) &&
+      /"source":"sp"/.test(resEv),
+    {
+      ok: st?.ok,
+      err: st?.lastError,
+      c1: st?.cursor,
+      c2: st2?.cursor,
+      ms,
+      perTx: perTx.length,
+      q: q.length,
+      qReason: q[0]?.reasons,
+      resEv: resEv.slice(0, 300),
+    }
+  );
+}
+
+// ---- follow-up #2 R3 (mutants): txs with no usable height are capped like a block; a `range`
+// the RPC returns never becomes the stored query range
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-noheight-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const from = cfg.startBlock;
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("nh-a"), addr("nh-b")]);
+  for (let i = 0; i < 2100; i++)
+    c.injectRawResult(SP, { address: SP, ...gs, index: i, transactionHash: ethers.id(`nh-${i}`) });
+  c.injectRawResult(SP, {
+    address: SP,
+    ...gs,
+    blockNumber: from,
+    index: 0,
+    removed: true,
+    transactionHash: ethers.id("nh-range"),
+    range: [1, 2],
+  });
+  let st, dls;
+  try {
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    dls = store.listDeadLetters();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const perTx = dls.filter(x => !x.quarantine);
+  const q = dls.filter(x => x.quarantine);
+  const fake = perTx.find(x => x.txHash === ethers.id("nh-range"));
+  const ranges = (fake?.watched ?? []).map(w => w.range);
+  cell(
+    "2100 logs of distinct txs with no height: 2000 isolated, the rest one bounded quarantine (never one write each); a `range` field returned by the RPC is not stored as the query range",
+    st?.ok &&
+      perTx.length === 2001 &&
+      q.length === 1 &&
+      /no usable height/.test(q[0].reasons?.join(" ") ?? "") &&
+      ranges.length > 0 &&
+      ranges.every(r => Array.isArray(r) && r[0] === from && r[1] !== 2),
+    {
+      ok: st?.ok,
+      err: st?.lastError,
+      perTx: perTx.length,
+      q: q.length,
+      qr: q[0]?.reasons,
+      ranges,
+      from,
+    }
+  );
+}
+
+// ---- follow-up #2 R3: entries naming no usable tx hash share one bulk quarantine at intake
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-nohash-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("nx-a"), addr("nx-b")]);
+  for (const h of ["x1", "0x12", 7])
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+  let st, dls;
+  try {
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    dls = store.listDeadLetters();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "three logs with distinct unusable tx hashes: one bulk quarantine at intake, no per-tx dead letter",
+    st?.ok &&
+      dls.length === 1 &&
+      dls[0].quarantine &&
+      /^3 returned entries are not a log/.test(dls[0].reasons?.join(" ") ?? ""),
+    { ok: st?.ok, n: dls?.length, r: dls?.map(x => x.reasons) }
   );
 }
 

@@ -591,6 +591,7 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
     return await processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot);
   } catch (e) {
     summary.isolated = (summary.isolated ?? 0) + 1;
+    summary.txIsolations = (summary.txIsolations ?? 0) + 1;
     // what this tx's dead letter already holds is merged with this observation, never replaced
     const okH = /^0x[0-9a-fA-F]{64}$/.test(str(txHash));
     const existing = prev ?? (okH ? store.getDeadLetter(`tx-${str(txHash).toLowerCase()}`) : null);
@@ -632,7 +633,7 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
 
 /** A returned entry that is not a log object at all: a quarantine dead letter keyed by its raw value
  * and query, retried to the cap, then an UNREADABLE record that names no tx. */
-function quarantineRaw(store, ctx, summary, bad, source, from, to) {
+function quarantineRaw(store, ctx, summary, bad, source, from, to, why = "not a log") {
   // Bounded (#403 follow-up, Codex R1): all non-log entries of one query answer become ONE
   // quarantine dead letter, with the total and up to QUARANTINE_SAMPLES distinct raw values (each
   // with its count): a flood of junk costs one write, not one fsynced file per entry.
@@ -659,7 +660,7 @@ function quarantineRaw(store, ctx, summary, bad, source, from, to) {
     blockNumber: from,
     status: "ERROR",
     reasons: [
-      `${bad.length} returned entr${bad.length === 1 ? "y is" : "ies are"} not a log (${distinct} distinct${distinct > QUARANTINE_SAMPLES ? `, first ${QUARANTINE_SAMPLES} kept` : ""})`,
+      `${bad.length} returned entr${bad.length === 1 ? "y is" : "ies are"} ${why} (${distinct} distinct${distinct > QUARANTINE_SAMPLES ? `, first ${QUARANTINE_SAMPLES} kept` : ""})`,
     ],
     events: [],
     watched: typedEvidence(evidence),
@@ -671,14 +672,18 @@ function quarantineRaw(store, ctx, summary, bad, source, from, to) {
 const QUARANTINE_SAMPLES = 10;
 const MAX_PER_TX_ISOLATIONS = 100;
 
-/** A cheap, non-throwing shape check of one returned log (the full checks run inside processTx). */
-function looksMalformed(l) {
-  return (
-    !validLog(l) ||
-    !/^0x[0-9a-fA-F]{64}$/.test(str(l.transactionHash)) ||
-    receiptPos(l) === null ||
-    parsePosition(l.blockNumber) === null
-  );
+/** A tx whose block holds more isolating txs than any real block can carry (30M gas / 21 000):
+ * the excess joins the bounded quarantine (it cannot be a real block's content). */
+const MAX_TXS_PER_BLOCK = 2000;
+const RESERVED = ["source", "range", "raw", "count", "quarantine"];
+
+/** A fresh RPC log never brings our own evidence fields (a returned `range` must not stand in for
+ * the query's: follow-up #2 R3). */
+function stripReserved(l) {
+  if (!RESERVED.some(k => Object.hasOwn(l, k))) return l;
+  const out = {};
+  for (const [k, v] of Object.entries(l)) if (!RESERVED.includes(k)) out[k] = v;
+  return out;
 }
 
 /** JSON that never throws on RPC values: a BigInt keeps its type in the text, so identities
@@ -721,7 +726,12 @@ function typedEvidence(watched) {
         return {
           raw: "<evidence too deep or too large to serialise>",
           source: typeof item?.source === "string" ? item.source : null,
-          range: Array.isArray(item?.range) ? item.range.slice(0, 2) : null,
+          range:
+            Array.isArray(item?.range) &&
+            item.range.length === 2 &&
+            item.range.every(n => Number.isSafeInteger(n))
+              ? [item.range[0], item.range[1]]
+              : null,
         };
       }
     });
@@ -1251,7 +1261,7 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
           }
           if (
             may &&
-            !logs.some(l => parsePosition(l.blockNumber) === n && lcEq(l?.topics?.[0], topic))
+            !logs.some(l => parsePosition(l?.blockNumber) === n && lcEq(l?.topics?.[0], topic))
           )
             missing.push(topic);
         }
@@ -1422,31 +1432,26 @@ export async function tick(chain, cfg, store, rs, ctx) {
   const intake = (raw, source) => {
     const ok = [];
     const bad = [];
-    const suspect = [];
     for (const x of raw ?? []) {
+      // An entry that is not an object, or names no valid tx, cannot be handled per tx: it joins
+      // the bounded quarantine. Every other log is grouped by its tx; the per-tick isolation budget
+      // (below) bounds the work, never by dropping evidence (follow-up #2 R3).
       if (!(x && typeof x === "object" && !Array.isArray(x))) bad.push(x);
-      else if (looksMalformed(x)) suspect.push(x);
-      else ok.push(x);
+      else if (!/^0x[0-9a-fA-F]{64}$/.test(str(x.transactionHash))) bad.push(x);
+      else ok.push(stripReserved(x));
     }
-    // A few malformed logs are isolated per tx, with full evidence; a flood of them (more than
-    // MAX_PER_TX_ISOLATIONS in one answer) joins the bounded quarantine instead, so junk cannot
-    // turn one tick into thousands of fsynced dead letters (follow-up #2 R2).
-    const flood = suspect.length > MAX_PER_TX_ISOLATIONS;
-    for (const x of suspect) (flood ? bad : ok).push(x);
     if (bad.length) quarantineRaw(store, ctx, summary, bad, source, from, to);
     return ok;
   };
-  const aggLogs = intake(
-    await pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page),
-    "agg"
-  );
-  const spLogs = intake(
-    await pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page),
-    "sp"
-  );
-  const bc = await bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary);
-  const extraAgg = intake(bc.extraAgg, "agg");
-  const extraSp = intake(bc.extraSp, "sp");
+  // The bloom check compares against the RAW answers (quarantined entries included), so an entry
+  // set aside at intake is not mistaken for a missing log and read again (follow-up #2 R3).
+  const rawAgg = await pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page);
+  const rawSp = await pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page);
+  const bc = await bloomCheck(chain, cfg, from, to, rawAgg, rawSp, summary);
+  const aggLogs = intake(rawAgg.concat(bc.extraAgg), "agg");
+  const spLogs = intake(rawSp.concat(bc.extraSp), "sp");
+  const extraAgg = [];
+  const extraSp = [];
 
   const byTx = new Map();
   // Each log is grouped by the query that returned it (aggregator or SP), never by re-reading its
@@ -1481,11 +1486,63 @@ export async function tick(chain, cfg, store, rs, ctx) {
     }
     byTx.set(k, t);
   }
-  const ordered = [...byTx.entries()].sort((a, b) => a[1].block - b[1].block);
-  for (const [txHash, t] of ordered)
+  // Txs without a usable height go last (a NaN comparison would leave the order undefined).
+  const hOf = t => (Number.isSafeInteger(t.block) ? t.block : Infinity);
+  const ordered = [...byTx.entries()].sort((a, b) =>
+    hOf(a[1]) === hOf(b[1]) ? 0 : hOf(a[1]) < hOf(b[1]) ? -1 : 1
+  );
+  // The isolation budget is enforced where isolations happen (follow-up #2 R3): once more than
+  // MAX_PER_TX_ISOLATIONS txs were isolated in this tick, the current block is finished and the
+  // tick stops there; the cursor stops at that block, and the rest is read again next tick, so
+  // nothing is dropped. Within one block, isolations beyond what any real block can hold join the
+  // bounded quarantine.
+  let cutoff = to;
+  let stopAt = null;
+  // Only isolations of this range count: dead-letter retries above are bounded by the open dead
+  // letters, and counting them would leave a backlog advancing the cursor one block per tick.
+  const base = summary.txIsolations ?? 0;
+  const perBlock = new Map();
+  const overflow = { agg: [], sp: [] };
+  for (const [txHash, t] of ordered) {
+    const b = Number.isSafeInteger(t.block) ? t.block : null;
+    if (stopAt !== null && (b === null || b > stopAt)) {
+      cutoff = stopAt;
+      break;
+    }
+    const before = summary.txIsolations ?? 0;
+    // txs without a usable height share one bucket, capped like a block: they cannot be in any
+    // real block, and an uncapped bucket would let distinct hashes bypass the budget (R3)
+    const bucket = b ?? "none";
+    if ((perBlock.get(bucket) ?? 0) >= MAX_TXS_PER_BLOCK) {
+      for (const l of t.agg) overflow.agg.push(l);
+      for (const l of t.sp) overflow.sp.push(l);
+      continue;
+    }
     await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
-
-  const toHdr = await header(chain, to);
-  store.setCursor({ block: to, hash: toHdr.hash });
+    if ((summary.txIsolations ?? 0) > before) perBlock.set(bucket, (perBlock.get(bucket) ?? 0) + 1);
+    if (
+      stopAt === null &&
+      (summary.txIsolations ?? 0) - base >= MAX_PER_TX_ISOLATIONS &&
+      b !== null
+    )
+      stopAt = b;
+  }
+  // Evidence keeps the query that returned it; the reason names the overflow.
+  for (const source of ["agg", "sp"])
+    if (overflow[source].length)
+      quarantineRaw(
+        store,
+        ctx,
+        summary,
+        overflow[source],
+        source,
+        from,
+        cutoff,
+        `past ${MAX_TXS_PER_BLOCK} isolating txs in one block (or with no usable height)`
+      );
+  summary.to = cutoff;
+  if (cutoff < to) summary.stoppedEarly = true;
+  const toHdr = await header(chain, cutoff);
+  store.setCursor({ block: cutoff, hash: toHdr.hash });
   return summary;
 }
