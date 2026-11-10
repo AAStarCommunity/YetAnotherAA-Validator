@@ -195,6 +195,19 @@ export class Store {
     return readdirSync(join(this.dir, "records")).filter(f => f.endsWith(".json")).length;
   }
 
+  /** The last positive trace-capability verification ({ verifiedAt (ms), txHash, by }), or null. */
+  getTraceCapability() {
+    try {
+      return readJson(join(this.dir, "trace-capability.json"), null);
+    } catch {
+      return null; // unreadable counts as never verified: degraded, never healthy
+    }
+  }
+
+  putTraceCapability(v) {
+    atomicWriteJson(join(this.dir, "trace-capability.json"), v);
+  }
+
   getCursor() {
     return readJson(join(this.dir, "cursor.json"), null);
   }

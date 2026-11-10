@@ -417,13 +417,18 @@ aggregator-only.
   emitting the same event. So an event a permissionless function _can_ emit is
   attributed **only** by its aligned emitting frame in the trace, for direct
   calls too. A tracing RPC (`debug_traceTransaction`, `callTracer` with
-  `withLog`) is therefore a requirement, not an optimisation. Each tick probes
-  it and counts what real trace calls returned (`status.trace`). A node without
-  the method, one whose traces carry no logs (`withLog` ignored), or a probe
-  that cannot be verified puts the watcher in an explicitly labelled
-  **degraded** mode: `status.degraded` lists why, `status.healthy` is false, and
-  `--once` exits non-zero. It is never shown as healthy. Checking this on the
-  production RPC is a Phase D pre-deploy item. A fallback that attributes
+  `withLog`) is therefore a requirement, not an optimisation. The capability is
+  known only by **positive verification**: a real transaction with logs whose
+  trace aligns log by log with its receipt, either one the scan traced or a
+  sample from the newest finalized blocks. A lookup miss proves nothing, since a
+  node resolves the transaction before it builds the tracer. The proof is stored
+  and re-checked when older than `traceVerifyMs` (1 h), on quiet ticks too. The
+  watcher is in an explicitly labelled **degraded** mode (`status.degraded`
+  lists why, `status.healthy` is false, `--once` exits non-zero) when the method
+  or tracer is missing, a trace of a transaction with logs carries none
+  (`withLog` ignored), the proof is older than twice the interval, or every
+  trace call of the tick failed. It is never shown as healthy. Checking this on
+  the production RPC is a Phase D pre-deploy item. A fallback that attributes
   without a trace is backlog after 5.5.0. A selector shorter than 4 bytes proves
   no function. A selector listed in `ruleset.json` `publicRoute.functions` gives
   the **public** route. Any other selector gives the **owner** route. Every

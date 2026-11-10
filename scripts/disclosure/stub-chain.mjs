@@ -241,6 +241,9 @@ function makeChain() {
             hash: b.hash,
             parentHash: b.parentHash,
             number: ethers.toQuantity(num),
+            transactions: [...txs]
+              .filter(([, v]) => Number(v.receipt?.blockNumber) === num)
+              .map(([h]) => h),
             ...(noBloom
               ? {}
               : {

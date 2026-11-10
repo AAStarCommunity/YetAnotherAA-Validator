@@ -20,7 +20,7 @@ import {
 } from "../../scripts/disclosure/stub-chain.mjs";
 import { spIface } from "./lib/sp-abi.mjs";
 import { validateRuleset, evaluate, matchGeneric } from "./lib/rules.mjs";
-import { MAX_DEADLETTER_ATTEMPTS, traceUnsupported, probeTrace } from "./lib/scan.mjs";
+import { MAX_DEADLETTER_ATTEMPTS, traceUnsupported, verifyTrace } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity } from "./watcher.mjs";
@@ -1185,10 +1185,12 @@ try {
   }
 }
 
-// ---- trace capability (DSR, #400): reported every tick; without it the watcher is DEGRADED
+// ---- trace capability (DSR, #400; Codex #400-fix R4): known only by positive verification
 {
-  const d5 = mkdtempSync(join(tmpdir(), "guardian-watcher-trace-"));
-  try {
+  const dirs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-trace-"));
+    dirs.push(d);
     const c = makeChain();
     const cfg = {
       aggregator: AGG,
@@ -1198,75 +1200,152 @@ try {
       maxBlocksPerTick: 1000,
       page: 5000,
     };
-    const store = new Store(d5);
-    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
-    const pause = n => [{ name: "OperatorPaused", args: [addr(n)] }];
-    const keeper = {
-      from: addr("keeper-eoa"),
-      data: ethers.id("pauseUnderstakedOperator(address)").slice(0, 10),
-    };
-    c.ownerTx(pause("t-ok"), keeper);
-    const ok = (await runOnce(c.chain, cfg, store, rs, ident)).status;
-    c.setTraceMode("unsupported");
-    c.ownerTx(pause("t-unsup"), keeper);
-    const un = (await runOnce(c.chain, cfg, store, rs, ident)).status;
-    c.setTraceMode("noLogs");
-    c.ownerTx(pause("t-nologs"), keeper);
-    const nl = (await runOnce(c.chain, cfg, store, rs, ident)).status;
-    c.setTraceMode("ok");
-    const flaky = {
-      ...c.chain,
-      send: async (m, p) => {
-        if (m === "debug_traceTransaction" && p[0] === ethers.toBeHex(1n, 32))
-          throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
-        return c.chain.send(m, p);
-      },
-    };
-    const unk = (await runOnce(flaky, cfg, store, rs, ident)).status;
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const H = 3_600_000;
+  const T0 = 1_900_000_000_000;
+  const keeper = {
+    from: addr("keeper-eoa"),
+    data: ethers.id("pauseUnderstakedOperator(address)").slice(0, 10),
+  };
+  const pause = n => [{ name: "OperatorPaused", args: [addr(n)] }];
+  const guardianSet = n => [{ name: "GuardianSet", args: [addr(`${n}-a`), addr(`${n}-b`)] }];
+  const settle = c => {
+    for (let i = 0; i < 4; i++) c.mine();
+  };
+  try {
+    // A: a real aligned trace during the scan verifies the capability
+    const a = mk();
+    a.c.ownerTx(pause("t-a"), keeper);
+    settle(a.c);
+    const sa = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 })).status;
+    // B: quiet ticks keep a fresh proof; once stale, the node is re-verified and found unsupported
+    const sb1 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + H / 2 })).status;
+    a.c.setTraceMode("unsupported");
+    const sb2 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + H + 1 })).status;
+    a.c.setTraceMode("ok");
+    // the unsupported verdict cleared the old proof: with no sample in reach, still unverified
+    for (let i = 0; i < 6; i++) a.c.mine();
+    const sb3 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + H + 2 })).status;
     cell(
-      "trace capability: a tracing node is healthy; no debug method, withLog ignored, or an unverifiable probe is DEGRADED (never healthy)",
-      ok.healthy === true &&
-        ok.trace.probe === "supported" &&
-        ok.degraded === null &&
-        ok.trace.thisTick.ok >= 1 &&
-        un.ok === true &&
-        un.healthy === false &&
-        un.trace.probe === "unsupported" &&
-        un.trace.thisTick.unsupported >= 1 &&
-        nl.healthy === false &&
-        nl.trace.probe === "supported" &&
-        nl.trace.thisTick.noLogs >= 1 &&
-        nl.degraded.some(x => /withLog/.test(x)) &&
-        unk.healthy === false &&
-        unk.trace.probe === "unknown",
-      { ok: ok.trace, un: [un.trace, un.degraded], nl: [nl.trace, nl.degraded], unk: unk.trace }
+      "trace: an aligned scan trace verifies; a quiet tick keeps a fresh proof; a stale proof is re-checked and a missing method is DEGRADED",
+      sa.healthy === true &&
+        sa.trace.capability === "verified" &&
+        sa.trace.thisTick.verified >= 1 &&
+        sa.trace.lastCheck === undefined &&
+        typeof sa.trace.sampleTx === "string" &&
+        sa.trace.sampleTx.length === 66 &&
+        sb1.healthy === true &&
+        sb1.trace.lastCheck === undefined &&
+        sb2.ok === true &&
+        sb2.healthy === false &&
+        sb2.trace.capability === "unsupported" &&
+        sb2.degraded.some(x => /method or tracer missing/.test(x)) &&
+        sb3.healthy === false &&
+        sb3.trace.capability === "unverified",
+      { sa: sa.trace, sb1: sb1.trace, sb2: [sb2.trace, sb2.degraded], sb3: sb3.trace }
+    );
+    // C: a supporting node with no prior proof and no ambiguous traffic is verified by a sample tx
+    const cc = mk();
+    cc.c.ownerTx(guardianSet("t-c"));
+    settle(cc.c);
+    const sc = (await runOnce(cc.c.chain, cc.cfg, cc.store, rs, ident, { now: T0 })).status;
+    // D: the same, on a node that ignores withLog: never healthy, even on a quiet tick
+    const dd = mk();
+    dd.c.ownerTx(guardianSet("t-d"));
+    settle(dd.c);
+    dd.c.setTraceMode("noLogs");
+    const sd = (await runOnce(dd.c.chain, dd.cfg, dd.store, rs, ident, { now: T0 })).status;
+    // D2: a sample whose trace carries logs that do not match its receipt proves nothing
+    const d2 = mk();
+    const mis = d2.c.ownerTx(guardianSet("t-d2"), { trace: false });
+    {
+      const other = spIface.encodeEventLog("OperatorPaused", [addr("not-this-tx")]);
+      d2.c.setTrace(mis.hash, {
+        type: "CALL",
+        to: SP,
+        logs: [{ address: SP, topics: other.topics, data: other.data }],
+      });
+    }
+    settle(d2.c);
+    const sd2 = (await runOnce(d2.c.chain, d2.cfg, d2.store, rs, ident, { now: T0 })).status;
+    // E: no sample transaction anywhere: unverified, so degraded
+    const ee = mk();
+    settle(ee.c);
+    const se = (await runOnce(ee.c.chain, ee.cfg, ee.store, rs, ident, { now: T0 })).status;
+    cell(
+      "trace: a supporting quiet node is verified by sampling a real tx; withLog ignored or no evidence is DEGRADED",
+      sc.healthy === true &&
+        sc.trace.capability === "verified" &&
+        sc.trace.lastCheck === "verified" &&
+        sd.healthy === false &&
+        sd.trace.capability === "unsupported" &&
+        sd.degraded.some(x => /withLog/.test(x)) &&
+        se.healthy === false &&
+        se.trace.capability === "unverified" &&
+        sd2.healthy === false &&
+        sd2.trace.capability === "unverified" &&
+        /align/.test(sd2.trace.reason ?? ""),
+      {
+        sc: sc.trace,
+        sd: [sd.trace, sd.degraded],
+        sd2: sd2.trace,
+        se: [se.trace, se.degraded],
+      }
+    );
+    // F: a fresh proof, but every real trace this tick fails: degraded with the reason
+    a.store.putTraceCapability({ verifiedAt: T0 + 2 * H, txHash: "0x", by: "test" });
+    a.c.ownerTx(pause("t-f"), { ...keeper, trace: false });
+    settle(a.c);
+    const sf = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + 2 * H + 1 }))
+      .status;
+    cell(
+      "trace: when every real trace of the tick fails, the watcher is DEGRADED even with a fresh proof",
+      sf.ok === true &&
+        sf.healthy === false &&
+        sf.trace.thisTick.failed >= 1 &&
+        sf.degraded.some(x => /trace call\(s\) this tick failed/.test(x)),
+      { sf: [sf.trace, sf.degraded] }
+    );
+    // G: a proof older than 2 x traceVerifyMs, and nothing to re-verify with: DEGRADED
+    for (let i = 0; i < 6; i++) a.c.mine();
+    const sg = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + 5 * H })).status;
+    cell(
+      "trace: a proof older than twice the verify interval, with no fresh evidence, is DEGRADED",
+      sg.ok === true &&
+        sg.healthy === false &&
+        sg.trace.lastCheck === "unverified" &&
+        sg.trace.capability === "stale",
+      sg.trace
     );
     const failed = (
       await runOnce(
         {
-          ...c.chain,
+          ...a.c.chain,
           send: async (m, p) => {
             if (m === "eth_getBlockByNumber") throw new Error("down");
-            return c.chain.send(m, p);
+            return a.c.chain.send(m, p);
           },
         },
-        cfg,
-        store,
+        a.cfg,
+        a.store,
         rs,
-        ident
+        ident,
+        { now: T0 + 5 * H + 1 }
       )
     ).status;
     cell(
-      "a failed tick is never healthy, and still reports the trace probe",
-      failed.ok === false && failed.healthy === false && failed.trace?.probe === "supported",
+      "a failed tick is never healthy, and still reports the trace capability",
+      failed.ok === false && failed.healthy === false && failed.trace?.capability === "stale",
       failed
     );
   } finally {
-    rmSync(d5, { recursive: true, force: true });
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
   }
   const e = (code, message) => Object.assign(new Error(message), { error: { code, message } });
   cell(
-    "traceUnsupported: method-missing answers are unsupported; tx-not-found and transport errors are not",
+    "traceUnsupported: method-missing answers are unsupported; lookup misses and transport errors are not",
     traceUnsupported(e(-32601, "x")) &&
       traceUnsupported(
         new Error("the method debug_traceTransaction does not exist/is not available")
@@ -1275,13 +1354,14 @@ try {
       traceUnsupported(new Error("debug namespace is disabled")) &&
       traceUnsupported(new Error('unknown tracer "callTracer"')) &&
       !traceUnsupported(new Error("transaction not found")) &&
-      !traceUnsupported(new Error("timeout")) &&
+      !traceUnsupported(new Error("Cannot find block hash for transaction 0x01")) &&
+      !traceUnsupported(new Error("execution timeout")) &&
       !traceUnsupported(Object.assign(new Error("x"), { code: "ECONNRESET" })),
     null
   );
   cell(
-    "probeTrace: a chain without send() is unsupported",
-    (await probeTrace({})).state === "unsupported",
+    "verifyTrace: a chain without send() is unsupported",
+    (await verifyTrace({}, { roles: {} }, 10)).state === "unsupported",
     null
   );
 }

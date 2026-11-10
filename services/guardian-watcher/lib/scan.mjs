@@ -103,28 +103,61 @@ function traceHasLogs(node) {
 }
 
 /**
- * Trace capability of the RPC (DSR, #400): ambiguous SP events are attributed only by the trace,
- * so a node without debug_traceTransaction + callTracer withLog leaves them all as dead letters.
- * Probed with a hash that names no transaction: a node that has the method answers "transaction
- * not found" (or a result); one that lacks it says so. Returns { state, reason }:
- * "supported" | "unsupported" | "unknown" (any other answer: never reported as supported).
+ * Positive verification of the RPC's trace capability (DSR, #400; Codex #400-fix R4): ambiguous SP
+ * events are attributed only by the trace, so the watcher must KNOW the node returns callTracer
+ * traces whose logs (withLog) align with the receipt. A lookup miss proves nothing (a node resolves
+ * the tx before it builds the tracer), so a real transaction with logs is traced, from the newest
+ * `blocks` finalized blocks, at most `maxTx` of them. Returns { state, reason?, txHash?, block? }:
+ *   "verified"    a trace aligned log by log with its receipt;
+ *   "unsupported" the method or tracer is missing, or a trace of a tx with logs carries none
+ *                 (withLog not honoured);
+ *   "unverified"  nothing conclusive (no sample, transient failures, misaligned traces).
  */
-export const TRACE_PROBE_HASH = "0x" + "00".repeat(31) + "01";
-
-export async function probeTrace(chain) {
+export async function verifyTrace(chain, cfg, fromBlock, { blocks = 5, maxTx = 8 } = {}) {
   if (typeof chain.send !== "function") return { state: "unsupported", reason: "no send()" };
-  try {
-    await chain.send("debug_traceTransaction", [TRACE_PROBE_HASH, TRACE_OPTS]);
-    return { state: "supported", reason: "answered" };
-  } catch (e) {
-    if (traceUnsupported(e)) return { state: "unsupported", reason: "method or tracer missing" };
-    const msg = [e?.error?.message, e?.info?.error?.message, e?.shortMessage, e?.message]
-      .filter(x => typeof x === "string")
-      .join(" ");
-    if (/transaction\b.{0,20}\bnot found|unknown transaction|not found: transaction/i.test(msg))
-      return { state: "supported", reason: "transaction not found" };
-    return { state: "unknown", reason: "probe failed" };
+  let tried = 0;
+  let why = "no transaction with logs in the sampled blocks";
+  for (let b = fromBlock; b > fromBlock - blocks && b >= 0 && tried < maxTx; b--) {
+    let blk = null;
+    try {
+      blk = await chain.send("eth_getBlockByNumber", [ethers.toQuantity(b), false]);
+    } catch {
+      why = "sample block unavailable";
+      continue;
+    }
+    for (const t of blk?.transactions ?? []) {
+      if (tried >= maxTx) break;
+      const hash = typeof t === "string" ? t : t?.hash;
+      if (typeof hash !== "string") continue;
+      let rc = null;
+      try {
+        rc = await chain.getTransactionReceipt(hash);
+      } catch {
+        rc = null;
+      }
+      if (!rc?.logs?.length) continue;
+      tried++;
+      let trace;
+      try {
+        trace = await chain.send("debug_traceTransaction", [hash, TRACE_OPTS]);
+      } catch (e) {
+        if (traceUnsupported(e))
+          return { state: "unsupported", reason: "method or tracer missing" };
+        why = "trace call failed";
+        continue;
+      }
+      if (!traceHasLogs(trace))
+        return {
+          state: "unsupported",
+          reason: "trace of a tx with logs carries none (withLog not honoured)",
+          txHash: hash,
+        };
+      const a = attributeLogs(trace, rc.logs, cfg.aggregator, cfg.roles.superPaymaster);
+      if (a.aligned) return { state: "verified", txHash: hash, block: b };
+      why = `trace does not align with its receipt (${a.why})`;
+    }
   }
+  return { state: "unverified", reason: why };
 }
 
 /** Full receipt + callTracer (withLog) trace of a tx, for attribution; null parts when unavailable.
@@ -304,6 +337,11 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     attr = logs
       ? attributeLogs(trace, logs, cfg.aggregator, SP)
       : { aligned: false, owner: new Map(), spCall: new Map(), why: "receipt unavailable" };
+    if (attr.aligned && trace) {
+      // A real trace aligned with its receipt is positive proof of the capability (status.trace).
+      summary.trace.verified = (summary.trace.verified ?? 0) + 1;
+      summary.trace.verifiedTx = txHash;
+    }
   }
   const commitCall = new Map(
     t.agg.map(l => [logPos(l), attr.aligned ? attr.owner.get(logPos(l)) : undefined])

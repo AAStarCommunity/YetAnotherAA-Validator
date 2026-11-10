@@ -19,7 +19,7 @@ import { ethers } from "ethers";
 import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
-import { tick, probeTrace } from "./lib/scan.mjs";
+import { tick, verifyTrace } from "./lib/scan.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -59,20 +59,77 @@ export function loadConfig(path) {
   return { maxBlocksPerTick: 2000, page: 5000, intervalMs: 60_000, forwarders: {}, ...c };
 }
 
-export async function runOnce(chain, cfg, store, rs, ident) {
-  const started = new Date().toISOString();
+export const TRACE_VERIFY_MS = 3_600_000;
+
+/**
+ * Trace capability (DSR, #400; Codex #400-fix R4): known only by positive verification, from a
+ * real trace aligned with its receipt, kept in the store. Re-verified actively when the last proof
+ * is older than traceVerifyMs (quiet ticks too) or this tick saw a sign of trouble. Healthy needs
+ * a proof younger than 2 x traceVerifyMs and no unsupported / log-less / all-failed traces now.
+ */
+async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
+  const every = cfg.traceVerifyMs ?? TRACE_VERIFY_MS;
+  let cap = store.getTraceCapability();
+  if (stats?.verifiedTx) {
+    cap = { verifiedAt: nowMs, txHash: stats.verifiedTx, by: "scan" };
+    store.putTraceCapability(cap);
+  }
+  const trouble = !!(stats?.unsupported || stats?.noLogs || (stats?.failed && !stats?.verified));
+  let check = null;
+  if (finalized !== null && (trouble || !cap || nowMs - cap.verifiedAt >= every)) {
+    check = await verifyTrace(chain, cfg, finalized);
+    if (check.state === "verified") {
+      cap = { verifiedAt: nowMs, txHash: check.txHash, by: "probe" };
+      store.putTraceCapability(cap);
+    } else if (check.state === "unsupported") {
+      cap = null;
+      store.putTraceCapability(null);
+    }
+  }
+  const degraded = [];
+  const fresh = !!cap && nowMs - cap.verifiedAt < 2 * every;
+  if (check?.state === "unsupported") degraded.push(`trace unsupported: ${check.reason}`);
+  else if (!fresh)
+    degraded.push(`trace capability unverified: ${check?.reason ?? "no recent verification"}`);
+  if (stats?.unsupported) degraded.push(`trace unsupported on ${stats.unsupported} tx(s)`);
+  if (stats?.noLogs)
+    degraded.push(`trace without logs on ${stats.noLogs} tx(s): withLog not honoured`);
+  if (stats?.failed && !stats?.verified)
+    degraded.push(`all ${stats.failed} trace call(s) this tick failed`);
+  return {
+    trace: {
+      capability:
+        check?.state === "unsupported"
+          ? "unsupported"
+          : fresh
+            ? "verified"
+            : cap
+              ? "stale"
+              : "unverified",
+      verifiedAt: cap ? new Date(cap.verifiedAt).toISOString() : null,
+      sampleTx: cap?.txHash ?? null,
+      ...(check
+        ? { lastCheck: check.state, ...(check.reason ? { reason: check.reason } : {}) }
+        : {}),
+      thisTick: stats ?? {},
+    },
+    degraded: degraded.length ? degraded : null,
+  };
+}
+
+export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
+  const nowMs = now ?? Date.now();
+  const started = new Date(nowMs).toISOString();
   const status = { at: started, ruleset: ident, lastError: null };
-  // Trace capability, every tick (DSR, #400): without debug_traceTransaction + callTracer withLog,
-  // every ambiguous SP event stays a dead letter, so such a node is DEGRADED, never healthy.
-  const probe = await probeTrace(chain);
-  const degraded = probe.state === "supported" ? [] : [`trace ${probe.state}: ${probe.reason}`];
-  const finish = traceStats => {
-    if (traceStats?.unsupported)
-      degraded.push(`trace unsupported on ${traceStats.unsupported} tx(s)`);
-    if (traceStats?.noLogs)
-      degraded.push(`trace without logs on ${traceStats.noLogs} tx(s): withLog not honoured`);
-    status.trace = { probe: probe.state, reason: probe.reason, thisTick: traceStats ?? {} };
-    status.degraded = degraded.length ? degraded : null;
+  const finish = async (stats, finalized) => {
+    let h;
+    try {
+      h = await traceHealth(chain, cfg, store, stats, finalized, nowMs);
+    } catch {
+      h = { trace: { capability: "unverified" }, degraded: ["trace capability check failed"] };
+    }
+    status.trace = h.trace;
+    status.degraded = h.degraded;
     status.healthy = status.ok === true && !status.degraded;
   };
   try {
@@ -97,7 +154,7 @@ export async function runOnce(chain, cfg, store, rs, ident) {
         unchecked: s.bloomUnchecked,
       },
     });
-    finish(s.trace);
+    await finish(s.trace, s.finalized);
     store.writeStatus(status);
     return { status, summary: s };
   } catch (e) {
@@ -106,7 +163,7 @@ export async function runOnce(chain, cfg, store, rs, ident) {
     status.records = store.countRecords();
     status.deadLetters = store.listDeadLetters().length;
     status.cursor = store.getCursor()?.block ?? null;
-    finish(null);
+    await finish(null, null);
     store.writeStatus(status);
     return { status, summary: null };
   }
