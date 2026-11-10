@@ -23,6 +23,31 @@ const bigintSafe = (_, v) => (typeof v === "bigint" ? v.toString() : v);
  * empty file, and a returned write survives the crash (the W2 journal relies on that).
  */
 /** Write every byte of `buf` to `fd`; `write` is injectable for a fault test. */
+/** A well-formed amendment for `key`: its key, a tx hash, how it was proven, and at least one
+ * event, each with a name and a position. */
+export function validAmendment(a, key) {
+  return (
+    !!a &&
+    typeof a === "object" &&
+    String(a.key) === BigInt(key).toString() &&
+    /^0x[0-9a-fA-F]{64}$/.test(String(a.txHash)) &&
+    a.provenBy === "trace" && // the only supported proof
+    Array.isArray(a.spEvents) &&
+    a.spEvents.length > 0 &&
+    a.spEvents.every(
+      e =>
+        e &&
+        typeof e === "object" &&
+        typeof e.event === "string" &&
+        /^[A-Z][A-Za-z0-9]{0,63}$/.test(e.event) &&
+        typeof e.logIndex === "number" &&
+        Number.isSafeInteger(e.logIndex) &&
+        e.logIndex >= 0 &&
+        (e.args === undefined || (e.args && typeof e.args === "object"))
+    )
+  );
+}
+
 export function writeAll(fd, buf, write = writeSync) {
   let off = 0;
   while (off < buf.length) {
@@ -66,7 +91,7 @@ export function readJson(path, fallback) {
 export class Store {
   constructor(dir) {
     this.dir = dir;
-    for (const d of ["records", "deadletters", "publications"])
+    for (const d of ["records", "deadletters", "publications", "amendments"])
       mkdirSync(join(dir, d), { recursive: true, mode: 0o700 });
   }
 
@@ -173,11 +198,81 @@ export class Store {
   /** A dead letter that used every retry and was turned into a record (exhaust). */
   retireDeadLetter(id) {
     const path = join(this.dir, "deadletters", `${id}.json`);
-    if (existsSync(path)) renameSync(path, `${path}.exhausted`);
+    if (!existsSync(path)) return;
+    // never overwrite an earlier retirement of the same id (#400 review L2): number them
+    let target = `${path}.exhausted`;
+    for (let k = 2; existsSync(target); k++) target = `${path}.exhausted.${k}`;
+    renameSync(path, target);
+  }
+
+  /** Unattributed records of txs whose answers never became readable (#400 review L1). */
+  countUnreadable() {
+    return readdirSync(join(this.dir, "records")).filter(f => f.endsWith("-unreadable.json"))
+      .length;
+  }
+
+  /**
+   * SP effects proven to belong to a BLS action only after its record was written (#400 review
+   * L4). The record itself is first-write-wins (its bytes may be published), so the later proof is
+   * kept beside it, also first-write-wins. Returns "new" | "same".
+   */
+  putBlsAmendment(key, amendment) {
+    const path = join(
+      this.dir,
+      "amendments",
+      `bls-${BigInt(key).toString(16).padStart(64, "0")}.json`
+    );
+    if (existsSync(path)) {
+      // an existing amendment counts only if it is a valid one for this key; a truncated or
+      // foreign file is repaired, never trusted (Codex follow-up R2)
+      let cur = null;
+      try {
+        cur = JSON.parse(readFileSync(path, "utf8"));
+      } catch {
+        cur = null;
+      }
+      if (validAmendment(cur, key)) {
+        // persisted only if it is THIS proof: the same tx and the same events
+        const same =
+          String(cur.txHash).toLowerCase() === String(amendment.txHash).toLowerCase() &&
+          JSON.stringify(cur.spEvents, bigintSafe) ===
+            JSON.stringify(amendment.spEvents, bigintSafe);
+        if (same) return "same";
+        // a different valid proof for the same action: both kept, never one overwriting the other
+        let c = 1;
+        while (existsSync(`${path}.conflict.${c}`)) c++;
+        atomicWriteJson(`${path}.conflict.${c}`, amendment);
+        return "conflict";
+      }
+      // keep the invalid bytes for inspection, then persist the valid proof (Codex follow-up R3)
+      let k = 1;
+      while (existsSync(`${path}.invalid.${k}`)) k++;
+      renameSync(path, `${path}.invalid.${k}`);
+      atomicWriteJson(path, amendment);
+      return "repaired";
+    }
+    atomicWriteJson(path, amendment);
+    return "new";
+  }
+
+  getBlsAmendment(key) {
+    try {
+      return readJson(
+        join(this.dir, "amendments", `bls-${BigInt(key).toString(16).padStart(64, "0")}.json`),
+        null
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  countAmendments() {
+    return readdirSync(join(this.dir, "amendments")).filter(f => f.endsWith(".json")).length;
   }
 
   countExhausted() {
-    return readdirSync(join(this.dir, "deadletters")).filter(f => f.endsWith(".exhausted")).length;
+    return readdirSync(join(this.dir, "deadletters")).filter(f => /\.exhausted(\.\d+)?$/.test(f))
+      .length;
   }
 
   /**
@@ -196,6 +291,28 @@ export class Store {
         return false;
       }
     });
+  }
+
+  /** Update fields of an open dead letter without counting an attempt (no-op when absent). */
+  patchDeadLetter(id, patch) {
+    const path = join(this.dir, "deadletters", `${id}.json`);
+    let cur = null;
+    try {
+      cur = readJson(path, null);
+    } catch {
+      cur = null;
+    }
+    if (!cur) return false;
+    atomicWriteJson(path, { ...cur, ...patch, id: cur.id ?? id, attempts: cur.attempts });
+    return true;
+  }
+
+  /** Ids of the open dead letters (file names), sorted. */
+  listDeadLetterIds() {
+    return readdirSync(join(this.dir, "deadletters"))
+      .filter(f => f.endsWith(".json"))
+      .map(f => f.slice(0, -5))
+      .sort();
   }
 
   /** The open dead letter with this id, or null. */
