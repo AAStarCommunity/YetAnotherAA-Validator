@@ -13,6 +13,21 @@ via_ir = true
 # pricing the test's schedule constants assume; the test asserts this in-repo
 # (rfc9380Glue in the osaka band), so a wrong-fork run fails loudly instead of silently.
 evm_version = "osaka"
+
+# Deployment profile (DSR, 2026-11-10): the artifacts that are DEPLOYED, and whose bytecode
+# hashes are pinned, are built for the fork every target chain has. SP's release profile is
+# cancun (SuperPaymaster foundry.toml [profile.default] :12, the same for Sepolia L1, OP Sepolia
+# and OP Mainnet), so ours is too. The default profile stays osaka for the gas-profile test above.
+# Build and deploy with FOUNDRY_PROFILE=release; CI runs the disclosure tests under it.
+[profile.release]
+src = "src"
+out = "out-release"
+cache_path = "cache-release"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+evm_version = "cancun"
 # DisclosureRecheckParity.t.sol reads the JS<->Solidity vectors.
 fs_permissions = [{ access = "read", path = "./test/fixtures" }]
 

@@ -15,4 +15,5 @@ docs/
 
 src/demo
 
-/deployments
+/deploymentscache-release/
+out-release/

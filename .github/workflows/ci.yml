@@ -261,6 +261,9 @@ jobs:
       - name: Run tests
         run: forge test -vvv
 
+      - name: Disclosure tests under the release profile (cancun, the deployed artifact)
+        run: FOUNDRY_PROFILE=release forge test --match-path 'test/**/Disclosure*'
+
       - name: Check contract sizes
         run: forge build --sizes
 
