@@ -117,6 +117,32 @@ export class Store {
       .filter(Boolean);
   }
 
+  /** Every readable record, and the names of record files that do not parse (Codex W2c R1 M7). */
+  listRecordsTolerant() {
+    const records = [];
+    const corrupt = [];
+    for (const f of readdirSync(join(this.dir, "records"))
+      .filter(f => f.endsWith(".json"))
+      .sort()) {
+      try {
+        const v = JSON.parse(readFileSync(join(this.dir, "records", f), "utf8"));
+        if (v) records.push(v);
+      } catch {
+        corrupt.push(f);
+      }
+    }
+    return { records, corrupt };
+  }
+
+  /** The last status written, or null (unreadable counts as none). */
+  readStatus() {
+    try {
+      return readJson(join(this.dir, "status.json"), null);
+    } catch {
+      return null;
+    }
+  }
+
   /** The publication journal of a record (publishRecord's state), or null. */
   getPublication(id) {
     return readJson(join(this.dir, "publications", `${Store.safeId(id)}.json`), null);

@@ -56,6 +56,7 @@ export function sinks(opts = {}) {
     },
     async fetchPublic(cid) {
       const o = pinOpts[name];
+      calls.fetches = (calls.fetches ?? 0) + 1;
       if (o.private || o.gone) return null; // private upload, or unpinned later
       return stored.get(`${name}:${cid}`) ?? null;
     },

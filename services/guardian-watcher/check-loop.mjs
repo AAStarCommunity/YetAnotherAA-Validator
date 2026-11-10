@@ -15,6 +15,7 @@ import {
   isDone,
 } from "./lib/publisher.mjs";
 import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
+import { runOnce } from "./watcher.mjs";
 import { bls, owner, sinks } from "./mock-sinks.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -158,13 +159,26 @@ const cfg = { aggregator: AGG };
         s.calls.telegram === before.telegram,
       { again, before, after: s.calls }
     );
+    // A pin that was valid is gone by the weekly pass: the reverify must read it and repair it.
+    s.pinOpts.pinata.gone = true;
+    const fetchesBefore = s.calls.fetches ?? 0;
+    const pinataBefore = s.calls.uploads.pinata ?? 0;
     const week = await publishPhase(store, roleChain(roles), cfg, P, built, {
       now: now + P.reverifyEveryMs + 1,
     });
     cell(
-      "publishPhase: after reverifyEveryMs the pins are re-checked (records run again, nothing re-signed)",
-      week.reverified === true && week.ran === 2 && s.calls.sign === before.sign,
-      { week, sign: s.calls.sign }
+      "publishPhase: after reverifyEveryMs the pins are read again and a lost pin is detected (nothing re-signed)",
+      week.reverified === true &&
+        week.ran === 2 &&
+        s.calls.sign === before.sign &&
+        (s.calls.fetches ?? 0) > fetchesBefore &&
+        ((s.calls.uploads.pinata ?? 0) > pinataBefore || week.alerts > 0),
+      {
+        week,
+        sign: s.calls.sign,
+        fetches: [fetchesBefore, s.calls.fetches],
+        pinata: [pinataBefore, s.calls.uploads.pinata],
+      }
     );
   } finally {
     rmSync(d, { recursive: true, force: true });
@@ -272,6 +286,122 @@ const cfg = { aggregator: AGG };
         r.alerts.length === 1 &&
         /persist failed: ENOSPC; publication pass stopped/.test(r.alerts[0]),
       r
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- M6: a large alert set is delivered whole, in chunks, and acknowledged only when all land
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const texts = [];
+    let failAt = 2;
+    const tg = {
+      async send(t) {
+        if (texts.length + 1 === failAt) {
+          failAt = 0;
+          throw Object.assign(new Error("x"), { code: "ECONNRESET" });
+        }
+        texts.push(t);
+      },
+    };
+    const alerts = Array.from({ length: 40 }, (_, i) => `rec-${i}: ${"z".repeat(200)} END${i}`);
+    alerts.push(`huge: ${"q".repeat(9000)} TAIL`);
+    const r1 = await deliverAlerts(store, tg, alerts, { now: 1 });
+    const after1 = texts.length;
+    const r2 = await deliverAlerts(store, tg, alerts, { now: 2 });
+    const all = texts.slice(after1).join("\n");
+    cell(
+      "alerts: every chunk is under the sink's cut; a failure part-way is not acked; the retry delivers every alert",
+      r1.sent === false &&
+        r1.partsSent === 1 &&
+        r2.sent === true &&
+        r2.parts > 2 &&
+        texts.every(t => t.length <= 4000) &&
+        alerts.slice(0, 40).every((_, i) => all.includes(`END${i}`)) &&
+        all.includes("TAIL") &&
+        (all.match(/q/g) ?? []).length === 9000,
+      { r1, r2, lens: texts.map(t => t.length) }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- M7: one corrupt record or journal does not block the others, and a journal is never reset
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(bls);
+    store.putRecord(owner);
+    writeFileSync(join(d, "records", "owner-0xbad-0.json"), "{not json");
+    const s = sinks();
+    const built = {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      wallet: writer,
+      registryFor: () => s.registry,
+    };
+    const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+    const blsId = Store.recordId(bls);
+    writeFileSync(join(d, "publications", `${Store.safeId(blsId)}.json`), "{broken");
+    const r = await publishPhase(store, roleChain(roles), cfg, P, built, { now: 5_000_000 });
+    const ownSt = store.getPublication(Store.recordId(owner));
+    let journalKept = false;
+    try {
+      store.getPublication(blsId);
+    } catch {
+      journalKept = true;
+    }
+    cell(
+      "a corrupt record and a corrupt journal are alerted and skipped; healthy records still publish; nothing signed for the broken one",
+      ownSt?.published &&
+        r.failed === 2 &&
+        journalKept &&
+        s.calls.sign === 0 &&
+        s.calls.texts.some(t => /record file unreadable/.test(t) && /journal unreadable/.test(t)),
+      { r, ownSt: !!ownSt, sign: s.calls.sign, texts: s.calls.texts.length }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- M8: the scan's status keeps the last publication result, marked in progress
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const broken = {
+      async getBlock() {
+        throw Object.assign(new Error("down"), { code: "SERVER_ERROR" });
+      },
+      async send() {
+        throw Object.assign(new Error("down"), { code: "SERVER_ERROR" });
+      },
+    };
+    const last = { at: "t0", failed: 1, alerts: 3 };
+    const { status } = await runOnce(
+      broken,
+      { aggregator: AGG, roles: { superPaymaster: AGG }, startBlock: 0, forwarders: {} },
+      store,
+      {},
+      { verified: true },
+      { carry: { publication: { ...last, inProgress: true, since: "t1" } } }
+    );
+    const onDisk = store.readStatus();
+    cell(
+      "status written by the scan keeps the previous publication result (in progress) until the pass replaces it",
+      status.ok === false &&
+        onDisk?.publication?.failed === 1 &&
+        onDisk.publication.inProgress === true &&
+        onDisk.publication.since === "t1",
+      onDisk
     );
   } finally {
     rmSync(d, { recursive: true, force: true });

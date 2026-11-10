@@ -27,11 +27,25 @@ const openIncident = st =>
 export async function publishPending(store, sinks, { reverify = false, maxPendingMs } = {}) {
   const alerts = [];
   const counts = { flagged: 0, done: 0, ran: 0, incidents: 0, failed: 0 };
-  for (const rec of store.listRecords()) {
+  // One unreadable record or journal never blocks the others (Codex W2c R1 M7). An unreadable
+  // journal is never reset: that record is not published (nor signed for) until it is repaired.
+  const { records, corrupt } = store.listRecordsTolerant();
+  for (const f of corrupt) {
+    counts.failed++;
+    alerts.push(`${f}: record file unreadable; not published`);
+  }
+  for (const rec of records) {
     if (!rec?.verdict?.flagged) continue;
     counts.flagged++;
     const id = rec.id ?? Store.recordId(rec);
-    const prev = store.getPublication(id) ?? {};
+    let prev;
+    try {
+      prev = store.getPublication(id) ?? {};
+    } catch {
+      counts.failed++;
+      alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
+      continue;
+    }
     if (isDone(rec, prev) && !reverify) {
       counts.done++;
       continue;
@@ -80,14 +94,53 @@ export async function deliverAlerts(
   const due = last.lastSetHash !== setHash || now - (last.lastSentAt ?? 0) >= repeatMs;
   if (!due) return { sent: false, reason: "unchanged" };
   if (!telegram) return { sent: false, reason: "no telegram sink" };
-  const text = [`DVT guardian watcher: ${alerts.length} alert(s)`, ...alerts].join("\n");
-  try {
-    await telegram.send(text);
-  } catch (e) {
-    return { sent: false, reason: safeText("telegram", e) };
+  // Every chunk must be delivered before the set counts as sent (Codex W2c R1 M6): the Telegram
+  // sink truncates at 4000 characters, so one long message would silently lose its tail. A failure
+  // part-way leaves the set unsent; the next run sends all of it again (at least once).
+  const chunks = alertChunks(alerts);
+  for (let i = 0; i < chunks.length; i++) {
+    const head = `DVT guardian watcher: ${alerts.length} alert(s)`;
+    const part = chunks.length > 1 ? ` (part ${i + 1}/${chunks.length})` : "";
+    try {
+      await telegram.send([head + part, ...chunks[i]].join("\n"));
+    } catch (e) {
+      return { sent: false, reason: safeText("telegram", e), partsSent: i };
+    }
   }
   store.putAlertState({ ...last, lastSetHash: setHash, lastSentAt: now });
-  return { sent: true };
+  return { sent: true, parts: chunks.length };
+}
+
+/** Telegram text budget per message, under the sink's 4000-character cut with room for a header. */
+export const ALERT_CHUNK_CHARS = 3500;
+
+/** Alerts grouped into messages of at most `max` characters; an alert longer than that is split
+ * into numbered pieces, so nothing is ever cut off. */
+export function alertChunks(alerts, max = ALERT_CHUNK_CHARS) {
+  const lines = [];
+  for (const a of alerts) {
+    const t = String(a);
+    if (t.length <= max) lines.push(t);
+    else {
+      const n = Math.ceil(t.length / (max - 16));
+      for (let i = 0; i < n; i++)
+        lines.push(`[${i + 1}/${n}] ${t.slice(i * (max - 16), (i + 1) * (max - 16))}`);
+    }
+  }
+  const out = [];
+  let cur = [];
+  let len = 0;
+  for (const l of lines) {
+    if (cur.length && len + l.length + 1 > max) {
+      out.push(cur);
+      cur = [];
+      len = 0;
+    }
+    cur.push(l);
+    len += l.length + 1;
+  }
+  if (cur.length) out.push(cur);
+  return out;
 }
 
 const ROLE_ABI = [

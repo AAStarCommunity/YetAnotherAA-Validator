@@ -66,9 +66,11 @@ export function loadConfig(path) {
   return { maxBlocksPerTick: 2000, page: 5000, intervalMs: 60_000, forwarders: {}, ...c };
 }
 
-export async function runOnce(chain, cfg, store, rs, ident) {
+export async function runOnce(chain, cfg, store, rs, ident, { carry } = {}) {
   const started = new Date().toISOString();
-  const status = { at: started, ruleset: ident, lastError: null };
+  // `carry`: fields kept from the previous status while this run has not replaced them yet (the
+  // last publication result, marked in progress: Codex W2c R1 M8).
+  const status = { at: started, ruleset: ident, lastError: null, ...(carry ?? {}) };
   try {
     const s = await tick(chain, cfg, store, rs, { ruleset: ident, now: started });
     const cur = store.getCursor();
@@ -124,14 +126,20 @@ async function main() {
   const pub = p ? { p, built: await buildSinks(p, chain) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
+  let lastPub = store.readStatus()?.publication ?? null;
   for (;;) {
-    const { status } = await runOnce(chain, cfg, store, rs, ident);
+    // The last publication result stays visible, marked in progress, until this pass replaces it.
+    const carry = pub
+      ? { publication: { ...(lastPub ?? {}), inProgress: true, since: new Date().toISOString() } }
+      : undefined;
+    const { status } = await runOnce(chain, cfg, store, rs, ident, { carry });
     if (pub) {
       try {
         status.publication = await publishPhase(store, chain, cfg, pub.p, pub.built);
       } catch (e) {
         status.publication = { error: safeText("publication", e) };
       }
+      lastPub = status.publication;
       store.writeStatus(status);
     }
     console.log(JSON.stringify(status));
