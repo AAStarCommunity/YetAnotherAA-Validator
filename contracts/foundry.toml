@@ -13,5 +13,7 @@ via_ir = true
 # pricing the test's schedule constants assume; the test asserts this in-repo
 # (rfc9380Glue in the osaka band), so a wrong-fork run fails loudly instead of silently.
 evm_version = "osaka"
+# DisclosureRecheckParity.t.sol reads the JS<->Solidity vectors.
+fs_permissions = [{ access = "read", path = "./test/fixtures" }]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

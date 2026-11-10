@@ -221,7 +221,11 @@ On-chain checks, all must pass or revert:
 6. Store
    `entryBinding[entryId] = keccak256(abi.encode(kind, key, subjectToken))` and
    emit
-   `Disclosed(entryId, kind, key, proposalId, messageHash, signers, subjectToken, txHash, blockNumber, blockVerified, rulesetCommit, recordURI, recordHash)`.
+   `Disclosed(entryId, kind, key, proposalId, messageHash, signers, record)`,
+   where
+   `record = (subjectToken, txHash, blockNumber, blockVerified, rulesetCommit, recordURI, recordHash)`.
+   `messageInputs` must be the canonical ABI encoding of the decoded fields
+   (trailing bytes or non-canonical offsets revert `NonCanonicalInputs`).
 
 What stays a **claim**: `txHash`, `blockNumber` when `blockVerified = false`,
 the `recordURI` content, and the interpretation of why the action is
@@ -249,9 +253,17 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
 - `s` passes the same checks as §4.2 steps 2–4, and
   `keccak256(abi.encode(s.kind, key, subjectToken)) == entryBinding[entryId]`
   (so the entry exists and the reply cites the same action).
-- The caller is either a member of `signers`, where `signers` reproduces the
-  commitment exactly as in §4.2 step 4, or
-  `IxPNTsToken(subjectToken).communityOwner()` when `subjectToken != 0`.
+- The caller is one of:
+  - a member of `signers`, where `signers` reproduces the commitment exactly as
+    in §4.2 step 4;
+  - a party the signed message names, which the commitment therefore covers: the
+    `operator` of a SLASH or QUEUE action, or a user of a REPUTATION batch;
+  - `IxPNTsToken(subjectToken).communityOwner()` when `subjectToken != 0`.
+- `subjectToken` is the writer's claim: no commitment covers it, and the recheck
+  reports it as unverified. The second route lets the party an action actually
+  named reply even when the entry is attributed to the wrong community. A
+  GENERIC action names no reply party (its target is only a contract address);
+  its signers and the claimed community owner can reply.
 - Emits `Replied(entryId, msg.sender, replyURI, replyHash)`. Cannot edit or
   delete anything.
 
@@ -269,6 +281,16 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
   entry → revert.
 - An independent script rebuilds an entry from the tx alone (RPC only, no DVT
   state) and matches; a deliberately wrong entry is flagged by the same script.
+  Its verdict has three values: MATCH (the verified fields agree; claims such as
+  `subjectToken` are listed as unverified), MISMATCH (provably wrong), and
+  INCONCLUSIVE (not decidable from the tx's own data: a wrapped call, a
+  non-canonical block, or a slot table that changed inside the block). Every
+  read is pinned to one confirmed snapshot, and canonical inclusion is checked
+  before and after (`scripts/disclosure/recheck-entry.mjs`). Absent evidence (a
+  tx or receipt the RPC does not return, a header without `parentHash`, a
+  receipt without an explicit status) is INCONCLUSIVE, never MISMATCH. Two trust
+  premises: the registry and aggregator addresses come from the release
+  manifest, and consumers treat INCONCLUSIVE as unverified.
 
 ## 5. Watcher service (DVT repo, Mac Mini only)
 
@@ -298,7 +320,14 @@ disabled.
   impossible through DVTValidator under the empty allowlist, so its appearance
   (necessarily via the owner route) is itself the finding; any generic call
   whose target/selector is outside the expected set; any reputation batch; any
-  queue freeze). Unflagged actions are still recorded as routine.
+  queue freeze; every BLS price update, i.e. an `executeProposal` calling
+  `SuperPaymaster.updatePriceDVT`). Unflagged actions are still recorded as
+  routine.
+- Price updates are flagged even though they are expected: `executeProposal`
+  takes a caller-chosen threshold (at least `minThreshold` = 2), and SP bounds
+  each update to 20% but not a chain of updates inside `[MIN, MAX]`. The record
+  carries the price before and after (read at the parent block and at the
+  execution block) and the signer set.
 - The expected set of generic targets and selectors, and every flag rule, live
   in one pinned file in this repo (`services/guardian-watcher/ruleset.json`).
   Every record, and the registry event (`rulesetCommit`), carries the commit SHA
@@ -400,7 +429,9 @@ On the A7 fork, archived under `docs/evidence/guardian-watcher-rehearsal/`:
 1. Detection of each BLS-executed action, signer set from `signerMask`, target
    and calldata.
 2. A disclosure record published to the repo, Telegram and the registry.
-3. Negative control: a routine action is recorded but not flagged.
+3. Negative control: a routine action is recorded but not flagged. 3a. Positive
+   control: one `updatePriceDVT` via `executeProposal` is detected and disclosed
+   with old price, new price and signer set.
 4. Kill-alert: watcher killed, external alert delivered (Telegram `ok:true`),
    then RECOVERED.
 5. `pauseUnderstakedOperator` gap: injected staking slash below min → slash,

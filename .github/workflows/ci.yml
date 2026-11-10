@@ -174,6 +174,12 @@ jobs:
       - name: Check the validator-resolution precedence
         run: npm run check:precedence
 
+      # DisclosureRegistry recheck (M0 §4.4): honest entries must rebuild from the action tx alone and
+      # every forged entry must be flagged by the check it targets; the JS encoding must match the
+      # committed vectors that DisclosureRecheckParity.t.sol checks against the contract.
+      - name: Check the disclosure-entry recheck
+        run: npm run check:disclosure
+
   # Job 3: Build project
   build:
     name: Build
