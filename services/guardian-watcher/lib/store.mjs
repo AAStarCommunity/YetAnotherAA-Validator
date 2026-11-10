@@ -49,24 +49,25 @@ export class Store {
   putRecord(rec) {
     const id = Store.recordId(rec);
     const path = join(this.dir, "records", `${id}.json`);
-    if (existsSync(path)) return "same";
+    const existed = existsSync(path);
+    if (!existed) atomicWriteJson(path, { id, ...rec });
+    // Reconcile the dead letter for this key even if the record was already written: a crash
+    // between the two writes must not leave a resolved action being retried forever.
+    let resolved = false;
     if (rec.route === "bls" && rec.kind !== undefined) {
       const placeholder = join(
         this.dir,
         "deadletters",
-        `bls-UNRECOVERED-${BigInt(rec.key).toString(16).padStart(64, "0")}.json`
+        `${Store.recordId({ ...rec, kind: undefined })}.json`
       );
-      const had = existsSync(placeholder);
-      atomicWriteJson(path, { id, ...rec });
-      if (had) {
+      if (existsSync(placeholder)) {
         atomicWriteJson(`${placeholder}.resolved`, { resolvedBy: id });
         renameSync(placeholder, `${placeholder}.done`);
-        return "upgraded";
+        resolved = true;
       }
-      return "new";
     }
-    atomicWriteJson(path, { id, ...rec });
-    return "new";
+    if (existed) return "same";
+    return resolved ? "upgraded" : "new";
   }
 
   /** Dead letter: an action seen but not authenticated; retried on later ticks, never dropped. */

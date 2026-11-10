@@ -303,12 +303,24 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
   - owner Safe `execTransaction` with operation CALL is followed; a DELEGATECALL
     is followed only into the pinned MultiSendCallOnly, and only through
     sub-transactions that are all CALLs; module routes are not followed.
-  - any other wrapper: a `callTracer` trace, decoding only CALL frames into the
-    pinned aggregator or DVTValidator; without a trace, INCONCLUSIVE.
+  - any other wrapper, and a pinned forwarder that led to no decodable call: a
+    `callTracer` trace, decoding only error-free CALL frames into the pinned
+    aggregator or DVTValidator. The route rules apply inside the trace: module
+    calls are pruned; a DELEGATECALL is followed only as the owner Safe's own
+    proxy hop into its actual singleton (read from the Safe's storage slot 0 at
+    block N-1) or into the pinned MultiSendCallOnly with all-CALL children.
+    Without a trace, INCONCLUSIVE.
 
-  Whatever the route, a recovered call counts only if it yields the
-  `SignersCommitted` key and the stored commitment, so a decoding error ends in
-  INCONCLUSIVE or MISMATCH, never MATCH.
+  Whatever the route, a recovered call's message counts only if it reproduces
+  the stored commitment, or if the call is proven to have succeeded (the
+  top-level call of a successful tx into the pinned aggregator, or an error-free
+  trace frame into it). A call proven to have succeeded also counts without the
+  commitment, which is sound because SuperPaymaster allows each key to succeed
+  only once (`executedProposals`, `usedSlashQueueHashes`, every entry point
+  `nonReentrant`). A Safe inner call or a DVTValidator-derived call is not
+  proven, so it counts only through the commitment. A decoding error therefore
+  ends in INCONCLUSIVE or MISMATCH, never MATCH, and an unauthenticated
+  recovered call is not evidence.
 
 ## 5. Watcher service (DVT repo, Mac Mini only)
 

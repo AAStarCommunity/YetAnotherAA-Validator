@@ -68,6 +68,55 @@ function decodeSp(log) {
   }
 }
 
+/** ethers v6 `Log` carries its position as `index`; other providers use `logIndex`. */
+export function logPos(l) {
+  const v = l.index ?? l.logIndex;
+  const n = typeof v === "string" ? Number(BigInt(v)) : Number(v);
+  if (!Number.isSafeInteger(n) || n < 0)
+    throw new Error(`log without a valid position in tx ${l.transactionHash}`);
+  return n;
+}
+
+/**
+ * SP logs of `txHash` that a trace proves were emitted inside a successful CALL into the pinned
+ * aggregator (callTracer withLog). Returns a Set of "topics|data" keys, or null with no trace.
+ * Co-occurrence in a tx proves nothing; only the call tree does.
+ */
+async function blsAttributedSpLogs(chain, cfg, txHash) {
+  if (typeof chain.send !== "function") return null;
+  let trace;
+  try {
+    trace = await chain.send("debug_traceTransaction", [
+      txHash,
+      { tracer: "callTracer", tracerConfig: { withLog: true } },
+    ]);
+  } catch {
+    return null;
+  }
+  if (!trace) return null;
+  const sp = cfg.roles.superPaymaster.toLowerCase();
+  const agg = cfg.aggregator.toLowerCase();
+  const out = new Set();
+  const collect = f => {
+    if (!f || f.error) return;
+    for (const l of f.logs || []) {
+      if (String(l.address).toLowerCase() === sp)
+        out.add(`${(l.topics || []).join(",").toLowerCase()}|${String(l.data).toLowerCase()}`);
+    }
+    for (const c of f.calls || []) collect(c);
+  };
+  const walk = f => {
+    if (!f || f.error) return;
+    if (String(f.type).toUpperCase() === "CALL" && String(f.to).toLowerCase() === agg)
+      return collect(f);
+    for (const c of f.calls || []) walk(c);
+  };
+  walk(trace);
+  return out;
+}
+
+const spLogKey = l => `${l.topics.join(",").toLowerCase()}|${String(l.data).toLowerCase()}`;
+
 /** Build the record for one SignersCommitted log. Returns { record } or { deadLetter }. */
 async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
   const key = BigInt(log.topics[1]);
@@ -80,27 +129,41 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
     signerMask: signerMask.toString(),
     txHash: log.transactionHash,
     blockNumber: Number(log.blockNumber),
-    logIndex: Number(log.logIndex),
-    rulesetCommit: ctx.rulesetCommit,
+    logIndex: logPos(log),
+    ruleset: ctx.ruleset,
     seenAt: ctx.now,
   };
-  const r = await rebuildFromAction(
-    chain,
-    cfg.aggregator,
-    log.transactionHash,
-    key,
-    snapshot,
-    cfg.forwarders
-  );
-  const facts = r.facts;
-  if (r.status || !facts || facts.kind === undefined) {
-    const v = evaluate(rs, cfg.roles, { ...base, kind: undefined });
+  let r;
+  try {
+    r = await rebuildFromAction(
+      chain,
+      cfg.aggregator,
+      log.transactionHash,
+      key,
+      snapshot,
+      cfg.forwarders
+    );
+  } catch (e) {
+    // One action that cannot be rebuilt must not stop the scan: keep it, retry it, move on.
     return {
       deadLetter: {
         ...base,
-        status: r.status ?? "INCONCLUSIVE",
+        status: "ERROR",
+        reasons: [`rebuild failed: ${e.shortMessage ?? e.message}`],
+        verdict: evaluate(rs, cfg.roles, { ...base, kind: undefined }),
+        spEvents,
+      },
+    };
+  }
+  const facts = r.facts;
+  // A record needs the message AND the signer set verified against the commitment (M0 §5.2).
+  if (r.status || !facts || facts.kind === undefined || !facts.signers) {
+    return {
+      deadLetter: {
+        ...base,
+        status: r.status ?? (facts?.kind === undefined ? "INCONCLUSIVE" : "SIGNERS_UNVERIFIED"),
         reasons: [r.reason, ...(facts?.incomplete ?? [])].filter(Boolean),
-        verdict: v,
+        verdict: evaluate(rs, cfg.roles, { ...base, kind: undefined }),
         spEvents,
       },
     };
@@ -112,13 +175,11 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
     messageHash: facts.messageHash,
     messageInputs: facts.messageInputs,
     fields: facts.fields,
-    signers: facts.signers ?? null,
-    signersVerified: !!facts.signers,
-    anchor: facts.anchor ?? null,
+    signers: facts.signers,
+    anchor: facts.anchor,
     blockHash: facts.blockHash,
     caller: facts.caller,
     callRoute: facts.route,
-    incomplete: facts.incomplete,
     spEvents,
   };
   rec.verdict = evaluate(rs, cfg.roles, rec);
@@ -131,10 +192,16 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
   return { record: rec };
 }
 
+function note(summary, res, rec) {
+  if (res === "new") summary.newRecords++;
+  if (res === "upgraded") summary.upgraded++;
+  if (rec.verdict.flagged && (res === "new" || res === "upgraded")) summary.flagged.push(rec);
+}
+
 /**
  * Scan (cursor, finalized] (at most cfg.maxBlocksPerTick blocks) and store what it finds.
- * Returns a summary; throws on an RPC failure (the caller records it and retries next tick, and the
- * cursor has not moved, so nothing is skipped).
+ * Throws only when the scan itself cannot proceed (header or log fetch): the caller records it, the
+ * cursor has not moved, nothing is skipped. A single action that fails is a dead letter instead.
  */
 export async function tick(chain, cfg, store, rs, ctx) {
   const fin = await header(chain, "finalized");
@@ -160,7 +227,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
     flagged: [],
   };
 
-  // Retry dead letters first (e.g. a trace that was unavailable may now answer).
+  // Retry dead letters first (a trace, a slot read or an RPC that failed may now answer).
   for (const dl of store.listDeadLetters()) {
     if (dl.attempts >= MAX_DEADLETTER_ATTEMPTS) continue;
     const log = {
@@ -168,15 +235,11 @@ export async function tick(chain, cfg, store, rs, ctx) {
       data: ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [BigInt(dl.signerMask)]),
       transactionHash: dl.txHash,
       blockNumber: dl.blockNumber,
-      logIndex: dl.logIndex,
+      index: dl.logIndex,
     };
     const out = await blsRecord(chain, cfg, rs, ctx, log, dl.spEvents ?? [], fin.number);
-    if (out.record) {
-      if (store.putRecord(out.record) === "upgraded") summary.upgraded++;
-      if (out.record.verdict.flagged) summary.flagged.push(out.record);
-    } else {
-      store.putDeadLetter(out.deadLetter);
-    }
+    if (out.record) note(summary, store.putRecord(out.record), out.record);
+    else store.putDeadLetter(out.deadLetter);
   }
 
   if (from > to) return summary;
@@ -201,29 +264,43 @@ export async function tick(chain, cfg, store, rs, ctx) {
   const ordered = [...byTx.entries()].sort((a, b) => a[1].block - b[1].block);
 
   for (const [txHash, t] of ordered) {
-    const spEvents = t.sp
-      .sort((a, b) => Number(a.logIndex) - Number(b.logIndex))
-      .map(l => ({ ...decodeSp(l), logIndex: Number(l.logIndex) }))
-      .filter(x => x.event);
-    if (t.agg.length) {
-      // BLS-executed: the SP events in the same tx are its effects, recorded as context.
-      for (const l of t.agg) {
-        const out = await blsRecord(chain, cfg, rs, ctx, l, spEvents, fin.number);
-        if (out.record) {
-          const res = store.putRecord(out.record);
-          if (res === "new") summary.newRecords++;
-          if (res === "upgraded") summary.upgraded++;
-          if (out.record.verdict.flagged && res !== "same") summary.flagged.push(out.record);
-        } else {
-          store.putDeadLetter(out.deadLetter);
-          summary.deadLetters++;
-        }
+    t.sp.sort((a, b) => logPos(a) - logPos(b));
+    // SP events of a BLS tx count as that action's effects only when a trace places them inside
+    // the aggregator call; everything else is an owner/guardian-route record of its own.
+    let attributed = new Set();
+    let traced = false;
+    if (t.agg.length && t.sp.length) {
+      const a = await blsAttributedSpLogs(chain, cfg, txHash);
+      if (a) {
+        attributed = a;
+        traced = true;
       }
-      continue;
     }
-    // No BLS commitment in this tx: every watched SP event is an owner/guardian-route action.
-    const tx = await chain.getTransaction(txHash);
-    for (const e of spEvents) {
+    const effects = [];
+    const independent = [];
+    for (const l of t.sp) {
+      const d = decodeSp(l);
+      if (!d) continue;
+      const ev = { ...d, logIndex: logPos(l) };
+      if (t.agg.length && attributed.has(spLogKey(l))) effects.push(ev);
+      else independent.push(ev);
+    }
+    for (const l of t.agg) {
+      const out = await blsRecord(chain, cfg, rs, ctx, l, effects, fin.number);
+      if (out.record) note(summary, store.putRecord(out.record), out.record);
+      else {
+        store.putDeadLetter(out.deadLetter);
+        summary.deadLetters++;
+      }
+    }
+    if (!independent.length) continue;
+    let tx = null;
+    try {
+      tx = await chain.getTransaction(txHash);
+    } catch {
+      tx = null;
+    }
+    for (const e of independent) {
       const rec = {
         route: "owner",
         label: rs.ownerRoute.label,
@@ -234,9 +311,15 @@ export async function tick(chain, cfg, store, rs, ctx) {
         blockNumber: t.block,
         from: tx?.from ? ethers.getAddress(tx.from) : null,
         to: tx?.to ? ethers.getAddress(tx.to) : null,
-        rulesetCommit: ctx.rulesetCommit,
+        ruleset: ctx.ruleset,
         seenAt: ctx.now,
       };
+      if (t.agg.length) {
+        // Same tx as a BLS action, not proven to be its effect: keep it, and say what is unknown.
+        rec.routeUncertain = traced
+          ? "same tx as a BLS action; the trace places it outside the aggregator call"
+          : "same tx as a BLS action; no trace, so whether it is that action's effect is unproven";
+      }
       rec.verdict = evaluate(rs, cfg.roles, rec);
       if (wantsPrice(rs, cfg.roles, rec)) {
         rec.price = {
@@ -244,9 +327,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
           after: await readPrice(chain, cfg.roles.superPaymaster, t.block),
         };
       }
-      const res = store.putRecord(rec);
-      if (res === "new") summary.newRecords++;
-      if (rec.verdict.flagged && res !== "same") summary.flagged.push(rec);
+      note(summary, store.putRecord(rec), rec);
     }
   }
 

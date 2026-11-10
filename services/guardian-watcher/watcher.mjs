@@ -23,21 +23,27 @@ import { tick } from "./lib/scan.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-/** git commit of ruleset.json, and whether the working copy differs from it. */
-export function rulesetIdentity(dir = HERE) {
+/**
+ * Identity of the ruleset the watcher actually evaluates: its keccak256 content hash always, plus the
+ * git commit whose ruleset.json has exactly those bytes. Outside a checkout, or with local edits,
+ * the commit is null and `verified` is false: a record never names a commit it was not judged by.
+ */
+export function rulesetIdentity(bytes, dir = HERE) {
+  const hash = ethers.keccak256(bytes);
   try {
     const commit = execFileSync(
       "git",
       ["-C", dir, "log", "-1", "--format=%H", "--", "ruleset.json"],
-      { encoding: "utf8" }
-    ).trim();
-    const dirty =
-      execFileSync("git", ["-C", dir, "status", "--porcelain", "--", "ruleset.json"], {
+      {
         encoding: "utf8",
-      }).trim() !== "";
-    return { commit: commit || null, dirty };
+      }
+    ).trim();
+    if (!/^[0-9a-f]{40}$/.test(commit)) return { commit: null, hash, verified: false };
+    const committed = execFileSync("git", ["-C", dir, "show", `${commit}:./ruleset.json`]);
+    const same = ethers.keccak256(committed) === hash;
+    return same ? { commit, hash, verified: true } : { commit: null, hash, verified: false };
   } catch {
-    return { commit: null, dirty: true };
+    return { commit: null, hash, verified: false };
   }
 }
 
@@ -55,14 +61,9 @@ export function loadConfig(path) {
 
 export async function runOnce(chain, cfg, store, rs, ident) {
   const started = new Date().toISOString();
-  const status = {
-    at: started,
-    rulesetCommit: ident.commit,
-    rulesetDirty: ident.dirty,
-    lastError: null,
-  };
+  const status = { at: started, ruleset: ident, lastError: null };
   try {
-    const s = await tick(chain, cfg, store, rs, { rulesetCommit: ident.commit, now: started });
+    const s = await tick(chain, cfg, store, rs, { ruleset: ident, now: started });
     const cur = store.getCursor();
     Object.assign(status, {
       ok: true,
@@ -99,11 +100,12 @@ async function main() {
     process.exit(2);
   }
   const cfg = loadConfig(cfgPath);
-  const rs = validateRuleset(JSON.parse(readFileSync(join(HERE, "ruleset.json"), "utf8")));
-  const ident = rulesetIdentity();
-  if (!ident.commit || ident.dirty)
+  const bytes = readFileSync(join(HERE, "ruleset.json"));
+  const rs = validateRuleset(JSON.parse(bytes.toString("utf8")));
+  const ident = rulesetIdentity(bytes);
+  if (!ident.verified)
     console.error(
-      "WARNING: ruleset.json is not a clean committed file; records carry rulesetDirty"
+      "WARNING: ruleset.json does not match a committed version; records carry ruleset.verified = false"
     );
   const chain = makeProvider(process.env.RPC_URL);
   const store = new Store(cfg.dataDir);

@@ -410,8 +410,9 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
   if (tx.to) await follow(tx.to, tx.data, "tx", 0, true);
   const pinnedTop =
     tx.to && [aggregator, fw.dvtValidator, fw.ownerSafe].some(a => eqAddr(a, tx.to));
-  if (!pinnedTop) {
-    // Trace fallback: decode only CALL frames whose target is the pinned aggregator or DVTValidator.
+  // Trace fallback: for a wrapper the manifest does not pin, and also when a pinned top-level
+  // forwarder led to no decodable aggregator call (e.g. the Safe called an unpinned wrapper).
+  if (!pinnedTop || candidates.length === 0) {
     let trace = null;
     if (typeof chain.send === "function") {
       try {
@@ -422,7 +423,9 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
     }
     if (!trace) {
       notes.push(
-        "action is wrapped by a contract the manifest does not pin, and no callTracer trace is available"
+        pinnedTop
+          ? "the pinned forwarder did not lead to a decodable aggregator call, and no callTracer trace is available"
+          : "action is wrapped by a contract the manifest does not pin, and no callTracer trace is available"
       );
     } else {
       const selectorOf = d =>
@@ -432,18 +435,44 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
           n => safeIface.getFunction(n).selector
         )
       );
+      // The owner Safe is a proxy: callTracer shows CALL Safe -> DELEGATECALL <singleton>. That one
+      // hop is followed only into the Safe's ACTUAL singleton, read from its storage slot 0 at
+      // block N-1; a delegatecall from the Safe to anything else is pruned like any other.
+      let singleton;
+      const safeSingleton = async () => {
+        if (singleton !== undefined) return singleton;
+        singleton = null;
+        try {
+          const word = await chain.send("eth_getStorageAt", [
+            fw.ownerSafe,
+            "0x0",
+            ethers.toQuantity(blockNumber - 1),
+          ]);
+          singleton = ethers.getAddress(ethers.dataSlice(ethers.zeroPadValue(word, 32), 12));
+        } catch {
+          singleton = null;
+        }
+        return singleton;
+      };
       // A frame without `error` whose ancestors have none either did succeed, so what it decodes
       // to is proven. The direct path's route rules hold here too: a DELEGATECALL subtree is pruned
-      // unless it enters the pinned MultiSendCallOnly with all-CALL children, and a Safe module
-      // call subtree is pruned.
-      const walk = async (f, path) => {
+      // unless it is the owner Safe's own singleton hop or enters the pinned MultiSendCallOnly with
+      // all-CALL children, and a Safe module call subtree is pruned.
+      const walk = async (f, path, parent) => {
         if (!f || f.error) return;
         const type = String(f.type).toUpperCase();
         if (type === "DELEGATECALL") {
-          if (!eqAddr(f.to, fw.multiSendCallOnly))
-            return notes.push(`${path}: DELEGATECALL subtree not followed`);
-          if ((f.calls || []).some(c => String(c.type).toUpperCase() !== "CALL"))
-            return notes.push(`${path}: MultiSend with a non-CALL sub-transaction not followed`);
+          const parentIsSafe =
+            parent &&
+            String(parent.type).toUpperCase() === "CALL" &&
+            eqAddr(parent.to, fw.ownerSafe);
+          const isSingletonHop = parentIsSafe && eqAddr(f.to, await safeSingleton());
+          if (!isSingletonHop) {
+            if (!eqAddr(f.to, fw.multiSendCallOnly))
+              return notes.push(`${path}: DELEGATECALL subtree not followed`);
+            if ((f.calls || []).some(c => String(c.type).toUpperCase() !== "CALL"))
+              return notes.push(`${path}: MultiSend with a non-CALL sub-transaction not followed`);
+          }
         }
         if (eqAddr(f.to, fw.ownerSafe) && moduleSelectors.has(selectorOf(f.input)))
           return notes.push(`${path}: Safe module route not followed`);
@@ -455,9 +484,9 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
             await fromDvt(f.input, `${path}.dvtValidator`);
           }
         }
-        for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`);
+        for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`, f);
       };
-      await walk(trace, "trace");
+      await walk(trace, "trace", null);
     }
   }
   return { candidates, notes };

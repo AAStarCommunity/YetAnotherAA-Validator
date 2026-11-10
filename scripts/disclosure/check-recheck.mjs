@@ -54,6 +54,8 @@ const {
   reorgAfterSends,
   reorgHeadAfterCountRead,
   receiptWithoutStatus,
+  setTrace,
+  setStorage,
 } = makeChain();
 const results = [];
 // want: "PASS" | { diff } (MISMATCH on that field) | { status, reason } | { unverified: {...} } (MATCH,
@@ -646,6 +648,165 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
     {
       status: "INCONCLUSIVE",
       reason: "no aggregator call recoverable",
+    }
+  );
+}
+
+// ---------------------------------------------------------------- #399 review follow-ups (F1, F2, L1)
+{
+  const SINGLETON = addr("safe-singleton");
+  setStorage(SAFE, 0, ethers.zeroPadValue(SINGLETON, 32));
+  const slashCall = (id, ev = slashF.evidenceHash) =>
+    aggIface.encodeFunctionData("verifyAndExecute", [
+      id,
+      slashF.operator,
+      slashF.slashLevel,
+      [],
+      [],
+      slashF.epoch,
+      ev,
+      "0x",
+    ]);
+  const safeCall = (to, data) =>
+    safeIface.encodeFunctionData("execTransaction", [
+      to,
+      0,
+      data,
+      0,
+      100000,
+      0,
+      0,
+      ethers.ZeroAddress,
+      ethers.ZeroAddress,
+      "0x",
+    ]);
+  const viaSafeProxy = (id, implTo) => ({
+    type: "CALL",
+    to: WRAPPER,
+    input: "0xdeadbeef",
+    calls: [
+      {
+        type: "CALL",
+        to: SAFE,
+        input: safeCall(AGG, slashCall(id)),
+        calls: [
+          {
+            type: "DELEGATECALL",
+            to: implTo,
+            input: safeCall(AGG, slashCall(id)),
+            calls: [{ type: "CALL", to: AGG, input: slashCall(id) }],
+          },
+        ],
+      },
+    ],
+  });
+
+  // F1: a real Safe is a proxy; its singleton hop is followed, a delegatecall elsewhere is not.
+  const f1a = execute(Kind.SLASH, 80n, slashF, 0b011n, { to: WRAPPER });
+  setTrace(f1a.hash, viaSafeProxy(80n, SINGLETON));
+  await expectCase(
+    "trace: owner Safe proxy -> its real singleton -> aggregator is followed",
+    disclose(Kind.SLASH, 80n, slashIn, f1a),
+    "PASS"
+  );
+  const f1b = execute(Kind.SLASH, 81n, slashF, 0b011n, { to: WRAPPER });
+  setTrace(f1b.hash, viaSafeProxy(81n, addr("not-the-singleton")));
+  await expectCase(
+    "trace: owner Safe delegatecalling anything but its singleton is pruned",
+    disclose(Kind.SLASH, 81n, slashIn, f1b),
+    {
+      status: "INCONCLUSIVE",
+      reason: "DELEGATECALL subtree not followed",
+    }
+  );
+
+  // F2: top-level pinned Safe whose inner call goes to an unpinned wrapper: the trace fallback runs.
+  const f2 = execute(Kind.SLASH, 82n, slashF, 0b011n, { to: SAFE });
+  // `to: SAFE` gives the tx Safe calldata the direct decoder cannot follow (deadbeef-prefixed)
+  setTrace(f2.hash, {
+    type: "CALL",
+    to: SAFE,
+    input: "0xdeadbeef",
+    calls: [
+      {
+        type: "DELEGATECALL",
+        to: SINGLETON,
+        calls: [
+          {
+            type: "CALL",
+            to: addr("inner-wrapper"),
+            calls: [{ type: "CALL", to: AGG, input: slashCall(82n) }],
+          },
+        ],
+      },
+    ],
+  });
+  await expectCase(
+    "pinned top-level Safe -> unpinned wrapper -> aggregator: recovered by the trace",
+    disclose(Kind.SLASH, 82n, slashIn, f2),
+    "PASS"
+  );
+
+  // L1a: a reverted aggregator frame must never become a proven candidate. B (reverted) carries the
+  // honest action's id with another message; the honest call sits under a pruned module route. With
+  // the error guard removed, B would be the only proven candidate and accuse the honest entry.
+  const l1a = execute(Kind.SLASH, 83n, slashF, 0b011n, { to: WRAPPER });
+  setTrace(l1a.hash, {
+    type: "CALL",
+    to: WRAPPER,
+    input: "0xdeadbeef",
+    calls: [
+      {
+        type: "CALL",
+        to: AGG,
+        input: slashCall(83n, ethers.id("other evidence")),
+        error: "execution reverted",
+      },
+      {
+        type: "CALL",
+        to: SAFE,
+        input: safeIface.encodeFunctionData("execTransactionFromModule", [
+          AGG,
+          0,
+          slashCall(83n),
+          0,
+        ]),
+        calls: [{ type: "CALL", to: AGG, input: slashCall(83n) }],
+      },
+    ],
+  });
+  await expectCase(
+    "trace: a reverted aggregator frame cannot accuse an honest entry",
+    disclose(Kind.SLASH, 83n, slashIn, l1a),
+    {
+      status: "INCONCLUSIVE",
+      reason: "Safe module route not followed",
+    }
+  );
+
+  // L1b: in a trace, a MultiSend with a non-CALL child is pruned whole.
+  const l1b = execute(Kind.SLASH, 84n, slashF, 0b011n, { to: WRAPPER });
+  setTrace(l1b.hash, {
+    type: "CALL",
+    to: WRAPPER,
+    input: "0xdeadbeef",
+    calls: [
+      {
+        type: "DELEGATECALL",
+        to: MULTISEND,
+        calls: [
+          { type: "CALL", to: AGG, input: slashCall(84n) },
+          { type: "DELEGATECALL", to: addr("lib"), calls: [] },
+        ],
+      },
+    ],
+  });
+  await expectCase(
+    "trace: MultiSend with a non-CALL child is pruned whole",
+    disclose(Kind.SLASH, 84n, slashIn, l1b),
+    {
+      status: "INCONCLUSIVE",
+      reason: "MultiSend with a non-CALL sub-transaction",
     }
   );
 }

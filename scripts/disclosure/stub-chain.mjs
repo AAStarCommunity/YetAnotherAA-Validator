@@ -134,6 +134,7 @@ function makeChain() {
   let getLogsCalls = 0;
   let onReceipt = null; // one-shot hook around the next receipt fetch
   let finalityLag = 0; // "finalized" = head - finalityLag
+  const storage = new Map(); // `${address}:${slot}` -> bytes32 (not block-versioned)
   const prices = []; // SuperPaymaster cachedPrice history: [{ block, price }]
   /** Append a tx's receipt logs to the chain-wide log index (getLogs), with positions. */
   const indexLogs = (hash, n, rlogs) =>
@@ -143,7 +144,7 @@ function makeChain() {
         blockNumber: n,
         blockHash: blocks.get(n).hash,
         transactionHash: hash,
-        logIndex: i,
+        index: i, // as an ethers v6 Log names it (not logIndex)
       })
     );
   const proposals = new Map(); // DVTValidator id -> { block, operator, slashLevel, evidenceHash }
@@ -184,6 +185,10 @@ function makeChain() {
           f();
         }
         return out;
+      }
+      if (method === "eth_getStorageAt") {
+        const [who, slot] = params;
+        return storage.get(`${ethers.getAddress(who)}:${BigInt(slot)}`) ?? ethers.ZeroHash;
       }
       if (method === "debug_traceTransaction") {
         const t = traces.get(params[0]);
@@ -630,7 +635,10 @@ function makeChain() {
       return { hash, block: n };
     },
     setPrice: (block, price) => prices.push({ block, price }),
+    /** Install a callTracer trace for a tx (frames may carry `logs`, as with withLog). */
+    setTrace: (hash, frame) => traces.set(hash, frame),
     setFinalityLag: k => (finalityLag = k),
+    setStorage: (who, slot, word) => storage.set(`${ethers.getAddress(who)}:${BigInt(slot)}`, word),
     reorgDuringNextCheck: n =>
       (onCommitRead = () => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`mid-reorg-${n}`) })),
     logCalls: () => getLogsCalls,
