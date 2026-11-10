@@ -1508,6 +1508,24 @@ try {
       ],
       "dup"
     );
+    const upper = x => "0x" + x.slice(2).toUpperCase();
+    const caseR = await extraCase(
+      (a, blk) => [
+        {
+          address: SP,
+          topics: a.topics.map(upper),
+          data: upper(a.data),
+          index: 0,
+          blockNumber: blk,
+        },
+      ],
+      "case"
+    );
+    cell(
+      "trace R9: a receipt differing from getLogs only in hex case is consistent (supporting node stays healthy)",
+      !caseR.trace.thisTick.inconsistent && caseR.trace.thisTick.verified === 1 && caseR.healthy,
+      caseR.trace
+    );
     cell(
       "trace R8: a receipt with an extra watched log, or a duplicated position on any log, is inconsistent",
       extraW.trace.thisTick.inconsistent === 1 &&
@@ -1688,6 +1706,35 @@ try {
         }) &&
         !sameLog(l, { ...l, topics: [...l.topics, ethers.ZeroHash] }),
       null
+    );
+  }
+  {
+    // R9: a trace log whose explicit position is outside [0, calls.length] makes the trace unsure
+    const pz = spIface.encodeEventLog("OperatorPaused", [addr("r9")]);
+    const lg = { address: SP, topics: pz.topics, data: pz.data };
+    const tr = pos => ({
+      type: "CALL",
+      from: addr("root"),
+      to: SP,
+      input: "0x11111111",
+      logs: [{ ...lg, position: pos }],
+      calls: [{ type: "CALL", from: addr("child"), to: SP, input: "0x22222222", logs: [lg] }],
+    });
+    const rc = [
+      { ...lg, index: 0 },
+      { ...lg, index: 1 },
+    ];
+    // a single-log receipt: a dropped root log would leave the child's identical log to align
+    const bad = [2, -1, 0.5, "x"].map(
+      p => attributeLogs(tr(p), [{ ...lg, index: 0 }], AGG, SP).aligned
+    );
+    const good = attributeLogs(tr("0x1"), rc, AGG, SP);
+    cell(
+      "attribution: an out-of-range or non-integer trace log position makes the trace unusable; a hex position is read",
+      bad.every(a => a === false) &&
+        good.aligned === true &&
+        good.spCall.get(0)?.from === addr("child"),
+      { bad, good: [...good.spCall] }
     );
   }
   cell(

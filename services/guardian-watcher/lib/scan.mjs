@@ -357,10 +357,13 @@ async function watchedLogsOf(chain, cfg, txHash, blockNumber) {
 /** Split a tx's logs into watched aggregator / SuperPaymaster logs. */
 function splitLogs(logs, cfg, block) {
   const t = { block, agg: [], sp: [] };
-  const spT = new Set(spTopics());
+  // Topics compared case-insensitively: hex case is not content (Codex #400-fix R9).
+  const spT = new Set(spTopics().map(x => x.toLowerCase()));
+  const agT = SIGNERS_COMMITTED().toLowerCase();
   for (const l of logs) {
-    if (lcEq(l.address, cfg.aggregator) && l.topics?.[0] === SIGNERS_COMMITTED()) t.agg.push(l);
-    else if (lcEq(l.address, cfg.roles.superPaymaster) && spT.has(l.topics?.[0])) t.sp.push(l);
+    const t0 = String(l.topics?.[0] ?? "").toLowerCase();
+    if (lcEq(l.address, cfg.aggregator) && t0 === agT) t.agg.push(l);
+    else if (lcEq(l.address, cfg.roles.superPaymaster) && spT.has(t0)) t.sp.push(l);
   }
   return t;
 }
