@@ -198,6 +198,14 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
   }
 }
 
+/** `--once` exit code: 0 only for a healthy scan (trace capability verified, DSR #400) AND, when
+ * publication ran, a pass that reported ok (no failed record, stop, skipped registry stage or
+ * undelivered alerts: Codex W2c R2). */
+export function onceExitCode(status) {
+  const pubOk = !status.publication || status.publication.ok === true;
+  return status.healthy === true && pubOk ? 0 : 1;
+}
+
 async function main() {
   const arg = n => {
     const i = process.argv.indexOf(`--${n}`);
@@ -246,9 +254,7 @@ async function main() {
       store.writeStatus(status);
     }
     console.log(JSON.stringify(status));
-    const pubOk = !status.publication || (!status.publication.error && !status.publication.stopped);
-    // Healthy scan (trace capability verified, DSR #400) AND a publication pass that did not fail.
-    if (once) process.exit(status.healthy && pubOk ? 0 : 1);
+    if (once) process.exit(onceExitCode(status));
     await new Promise(r => setTimeout(r, cfg.intervalMs));
   }
 }

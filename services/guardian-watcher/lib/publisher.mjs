@@ -13,119 +13,195 @@ import { assertWriterRole } from "../sinks/registry.mjs";
  * Fully done: nothing left to run, unless a weekly reverify of the pins is due. With `pinners`
  * (configured names) every one must hold a current pin, so a failed pin keeps being repaired
  * (Codex W2c R1 M5); with `cid` the journal must describe the record's current bytes, and a
- * recorded bytes change is never done (M4).
+ * recorded bytes change is never done (M4). `ignoreRegistry`: everything but the registry stage
+ * (an acknowledged registry incident parks only that stage: R2).
  */
-export function isDone(rec, st, { pinners, cid } = {}) {
+export function isDone(rec, st, { pinners, cid, ignoreRegistry = false } = {}) {
   if (!st?.published || !st.telegram?.at) return false;
   if (st.bytesChanged) return false;
   if (cid !== undefined && st.cid !== cid) return false;
   if (pinners && !pinners.every(n => st.pins?.[n]?.current)) return false;
-  if (rec.route !== "bls") return true; // owner/guardian route: repo + Telegram only (M0 §5.3)
+  if (rec.route !== "bls" || ignoreRegistry) return true; // owner route: repo + Telegram only
   return st.registry?.phase === "confirmed";
 }
 
-/** An unresolved, unacknowledged registry incident: publishRecord re-alerts it every run. */
+/** An unresolved, unacknowledged registry incident, or a recorded bytes change: alerted on every
+ * run. */
 const openIncident = st =>
   ((st?.registry?.phase === "conflict" || st?.registry?.phase === "reverted") &&
     !st.registry.ack) ||
   !!st?.bytesChanged;
 
-/** An acknowledged registry incident: parked, nothing to run until the weekly reverify. */
+/** An acknowledged registry incident: the registry stage is parked; everything else still runs. */
 const parked = st =>
   (st?.registry?.phase === "conflict" || st?.registry?.phase === "reverted") && !!st.registry.ack;
 
-/** Per-pass bounds (Codex W2c R1 H3): a sink outage cannot hold the next scan for long. */
+/** Per-pass bounds (Codex W2c R1 H3, R2): a sink outage or a large history cannot hold the next
+ * scan for long. At most PASS_MAX_PARSE record files are read per pass (rotating), at most
+ * PASS_MAX_RECORDS are published, and none is started after PASS_MAX_MS (always at least one). */
 export const PASS_MAX_RECORDS = 25;
 export const PASS_MAX_MS = 120_000;
+export const PASS_MAX_PARSE = 500;
+
+/** A record's id, validated, or null (a parseable file with an unusable identity: R2 M7). */
+function recordIdOf(rec) {
+  try {
+    const id = rec.id ?? Store.recordId(rec);
+    return typeof id === "string" && /^[A-Za-z0-9._-]+$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
- * Run publication for every flagged record. Returns { alerts, counts }.
- * A PersistError stops the pass (state is no longer durable); any other error of one record is
- * an alert and the pass moves on: one bad record never blocks the others.
+ * Run publication for the flagged records of this pass's batch. Returns { alerts, counts,
+ * stopped, reverifyRemaining }. A PersistError stops the pass (state is no longer durable); any
+ * other error of one record is an alert and the pass moves on: one bad record never blocks the
+ * others. `reverifyGen`: the open weekly reverify generation (a done record whose pins were not
+ * yet re-checked in it runs again, with reverify), or null.
  */
 export async function publishPending(
   store,
   sinks,
   {
-    reverify = false,
+    reverifyGen = null,
     maxPendingMs,
     maxRecords = PASS_MAX_RECORDS,
     maxMs = PASS_MAX_MS,
+    maxParse = PASS_MAX_PARSE,
     now = Date.now,
   } = {}
 ) {
   const alerts = [];
-  const counts = { flagged: 0, done: 0, ran: 0, incidents: 0, failed: 0, parked: 0, deferred: 0 };
+  const counts = {
+    flagged: 0,
+    done: 0,
+    ran: 0,
+    incidents: 0,
+    failed: 0,
+    parked: 0,
+    deferred: 0,
+    unreadable: 0,
+  };
   const pinners = (sinks.pinners ?? []).map(p => p.name);
-  const work = [];
-  // One unreadable record or journal never blocks the others (Codex W2c R1 M7). An unreadable
-  // journal is never reset: that record is not published (nor signed for) until it is repaired.
-  const { records, corrupt } = store.listRecordsTolerant();
-  for (const f of corrupt) {
-    counts.failed++;
-    alerts.push(`${f}: record file unreadable; not published`);
+  const sched = store.getSchedule();
+  const entries = { ...(sched.entries ?? {}) };
+  // A bounded, rotating batch of record files: the cursor names the last file read.
+  const names = store.recordFiles();
+  let start = 0;
+  if (sched.cursor) {
+    const k = names.findIndex(n => n > sched.cursor);
+    start = k < 0 ? 0 : k;
   }
-  for (const rec of records) {
-    if (!rec?.verdict?.flagged) continue;
-    counts.flagged++;
-    const id = rec.id ?? Store.recordId(rec);
+  const batch = [];
+  for (let i = 0; i < Math.min(maxParse, names.length); i++)
+    batch.push(names[(start + i) % names.length]);
+  const bad = [];
+  const work = [];
+  for (const name of batch) {
+    let rec;
+    let id;
     let prev;
-    try {
-      prev = store.getPublication(id) ?? {};
-    } catch {
-      counts.failed++;
-      alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
-      continue;
-    }
     let cid;
     try {
-      cid = recordFile(rec).cid;
+      rec = store.readRecordFile(name);
+      if (!rec?.verdict?.flagged) continue;
+      id = recordIdOf(rec);
+      if (!id) {
+        bad.push(name);
+        continue;
+      }
+      counts.flagged++;
+      try {
+        prev = store.getPublication(id) ?? {};
+      } catch {
+        // never reset: not published (nor signed for) until repaired by hand
+        counts.failed++;
+        alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
+        continue;
+      }
+      try {
+        cid = recordFile(rec).cid;
+      } catch {
+        cid = null; // publishRecord fails on it, and says so
+      }
     } catch {
-      cid = null; // publishRecord will fail on it and say so
-    }
-    if (!reverify && isDone(rec, prev, { pinners, cid })) {
-      counts.done++;
+      bad.push(name);
       continue;
     }
-    if (!reverify && parked(prev)) {
-      counts.parked++;
+    const e = entries[id] ?? {};
+    // Every known flagged record is re-checked once per generation, done or not (its current pins
+    // are otherwise skipped).
+    const reverify = reverifyGen !== null && e.reverifiedGen !== reverifyGen;
+    const isParked = parked(prev);
+    if (!reverify && isDone(rec, prev, { pinners, cid, ignoreRegistry: isParked })) {
+      if (isParked) counts.parked++;
+      else counts.done++;
+      entries[id] = { ...e, done: true };
+      if (openIncident(prev)) counts.incidents++;
       continue;
     }
-    work.push({ rec, id, prev, cid });
+    work.push({ rec, id, prev, cid, reverify, isParked });
   }
-  // Least recently run first, so a bounded pass rotates through a backlog instead of retrying
-  // the same head of the list every time.
-  work.sort((a, b) => (a.prev.lastRunAt ?? 0) - (b.prev.lastRunAt ?? 0));
+  if (bad.length) {
+    counts.unreadable += bad.length;
+    counts.failed += bad.length;
+    alerts.push(
+      `${bad.length} record file(s) unreadable or without a usable id; not published (first: ${bad.slice(0, 5).join(", ")})`
+    );
+  }
+  // Least recently run first (failures included), so a bounded pass rotates through a backlog.
+  work.sort((a, b) => (entries[a.id]?.lastRunAt ?? 0) - (entries[b.id]?.lastRunAt ?? 0));
   const t0 = now();
-  for (const { rec, id, prev, cid } of work) {
-    // At least one record per pass, so a slow pass still makes progress.
-    if (counts.ran >= maxRecords || (counts.ran > 0 && now() - t0 >= maxMs)) {
+  let stopped = false;
+  for (const { rec, id, prev, cid, reverify, isParked } of work) {
+    if (stopped || counts.ran >= maxRecords || (counts.ran > 0 && now() - t0 >= maxMs)) {
       counts.deferred++;
       if (openIncident(prev)) counts.incidents++;
       continue;
     }
     counts.ran++;
+    const e = entries[id] ?? {};
     try {
-      const r = await publishRecord(rec, sinks, prev, {
-        persist: st => store.putPublication(id, st),
-        reverify,
-        maxPendingMs,
-      });
+      const r = await publishRecord(
+        rec,
+        isParked ? { ...sinks, registry: null } : sinks, // a parked incident stops only the registry
+        prev,
+        { persist: st => store.putPublication(id, st), reverify, maxPendingMs }
+      );
       for (const a of r.alerts) alerts.push(`${id}: ${a}`);
-      store.putPublication(id, { ...r.state, lastRunAt: now() });
-      if (isDone(rec, r.state, { pinners, cid })) counts.done++;
+      const done = isDone(rec, r.state, { pinners, cid, ignoreRegistry: isParked });
+      entries[id] = {
+        ...e,
+        lastRunAt: now(),
+        done,
+        failing: false,
+        ...(reverify ? { reverifiedGen: reverifyGen } : {}),
+      };
+      if (done) counts.done++;
       if (openIncident(r.state)) counts.incidents++;
-    } catch (e) {
-      if (e instanceof PersistError) {
-        alerts.push(`${id}: ${e.message}; publication pass stopped`);
-        counts.failed++;
-        return { alerts, counts, stopped: true };
-      }
+    } catch (err) {
+      entries[id] = { ...e, lastRunAt: now(), failing: true }; // a failure still rotates (R2)
       counts.failed++;
-      alerts.push(`${id}: ${safeText("publish", e)}`);
+      if (err instanceof PersistError) {
+        alerts.push(`${id}: ${err.message}; publication pass stopped`);
+        stopped = true;
+        continue;
+      }
+      alerts.push(`${id}: ${safeText("publish", err)}`);
     }
   }
-  return { alerts, counts, stopped: false };
+  const reverifyRemaining =
+    reverifyGen === null
+      ? 0
+      : // a record that keeps failing is alerted on its own; it does not hold the generation open
+        Object.values(entries).filter(x => !x.failing && x.reverifiedGen !== reverifyGen).length;
+  try {
+    store.putSchedule({ ...sched, cursor: batch.at(-1) ?? null, entries });
+  } catch {
+    alerts.push("publication schedule not saved (rotation order only; journals unaffected)");
+  }
+  return { alerts, counts, stopped, reverifyRemaining };
 }
 
 /**
@@ -138,7 +214,7 @@ export async function deliverAlerts(
   store,
   telegram,
   alerts,
-  { now = Date.now(), repeatMs = 3_600_000 } = {}
+  { now = Date.now(), repeatMs = 3_600_000, maxParts = ALERT_MAX_PARTS } = {}
 ) {
   if (!alerts.length) {
     store.putAlertState({ ...(store.getAlertState() ?? {}), lastSetHash: null });
@@ -152,7 +228,17 @@ export async function deliverAlerts(
   // Every chunk must be delivered before the set counts as sent (Codex W2c R1 M6): the Telegram
   // sink truncates at 4000 characters, so one long message would silently lose its tail. A failure
   // part-way leaves the set unsent; the next run sends all of it again (at least once).
-  const chunks = alertChunks(alerts);
+  // At most maxParts messages per pass (Codex W2c R2): beyond that the last part says how many
+  // lines are not shown; the full list is in alerts-latest.json. Never a silent cut.
+  let chunks = alertChunks(alerts);
+  if (chunks.length > maxParts) {
+    const shown = chunks.slice(0, maxParts - 1);
+    const hidden = chunks.slice(maxParts - 1).reduce((n, c) => n + c.length, 0);
+    chunks = [
+      ...shown,
+      [`... and ${hidden} more alert line(s) not shown; full list in alerts-latest.json`],
+    ];
+  }
   for (let i = 0; i < chunks.length; i++) {
     const head = `DVT guardian watcher: ${alerts.length} alert(s)`;
     const part = chunks.length > 1 ? ` (part ${i + 1}/${chunks.length})` : "";
@@ -168,6 +254,8 @@ export async function deliverAlerts(
 
 /** Telegram text budget per message, under the sink's 4000-character cut with room for a header. */
 export const ALERT_CHUNK_CHARS = 3500;
+/** Telegram messages per pass, at most. */
+export const ALERT_MAX_PARTS = 5;
 
 /** Alerts grouped into messages of at most `max` characters; an alert longer than that is split
  * into numbered pieces, so nothing is ever cut off. */
@@ -272,26 +360,48 @@ export async function publishPhase(store, chain, cfg, p, built, { now = Date.now
     out.registrySkipped = safeText("writer role check", e);
     alerts.push(`registry stage skipped this pass: ${out.registrySkipped}`);
   }
+  // The weekly reverify is a generation: opened when due, closed only when every done record has
+  // been re-checked in it, however many bounded passes that takes (Codex W2c R2).
   const meta = store.getAlertState() ?? {};
-  const reverify = now - (meta.lastReverifyAt ?? 0) >= p.reverifyEveryMs;
+  let gen = store.getSchedule().reverifyGen ?? null;
+  if (gen === null && now - (meta.lastReverifyAt ?? 0) >= p.reverifyEveryMs) {
+    gen = now;
+    store.putSchedule({ ...store.getSchedule(), reverifyGen: gen });
+  }
   const res = await publishPending(
     store,
     { pinners: built.pinners, mirror: built.mirror, telegram: built.telegram, registry },
-    { reverify, maxPendingMs: p.maxPendingMs }
+    { reverifyGen: gen, maxPendingMs: p.maxPendingMs, ...(p.limits ?? {}) }
   );
-  if (reverify && !res.stopped)
-    store.putAlertState({ ...(store.getAlertState() ?? {}), lastReverifyAt: now });
+  const reverified = gen !== null && !res.stopped && res.reverifyRemaining === 0;
+  if (reverified) {
+    store.putAlertState({ ...(store.getAlertState() ?? {}), lastReverifyAt: gen });
+    const { reverifyGen, ...rest } = store.getSchedule();
+    void reverifyGen;
+    store.putSchedule(rest);
+  }
   alerts.push(...res.alerts);
+  try {
+    store.putAlertList(alerts);
+  } catch {
+    // the digest still goes out; only the full list on disk is missing
+  }
   const delivery = await deliverAlerts(store, built.telegram, alerts, {
     now,
     repeatMs: p.alertRepeatMs,
   });
+  const deliveredOk =
+    delivery.sent === true || delivery.reason === "none" || delivery.reason === "unchanged";
   return {
     ...out,
     ...res.counts,
     stopped: res.stopped,
-    reverified: reverify && !res.stopped,
+    reverifying: gen !== null && !reverified ? { gen, remaining: res.reverifyRemaining } : null,
+    reverified,
     alerts: alerts.length,
     delivery,
+    // Explicit pass result (Codex W2c R2): no failed record, no stop, no skipped registry stage,
+    // and the alerts delivered. Deferred work is pending, not a failure.
+    ok: !res.stopped && res.counts.failed === 0 && !out.registrySkipped && deliveredOk,
   };
 }

@@ -230,6 +230,37 @@ export class Store {
       .filter(Boolean);
   }
 
+  /** Record file names, sorted (the publisher reads them in bounded, rotating batches). */
+  recordFiles() {
+    return readdirSync(join(this.dir, "records"))
+      .filter(f => f.endsWith(".json"))
+      .sort();
+  }
+
+  /** One record file, parsed; throws when it is unreadable. */
+  readRecordFile(name) {
+    return JSON.parse(readFileSync(join(this.dir, "records", name), "utf8"));
+  }
+
+  /** Publication scheduling (Codex W2c R2): rotation cursor, per-record progress, the reverify
+   * generation. Kept apart from the journals; unreadable counts as empty (only order is lost). */
+  getSchedule() {
+    try {
+      return readJson(join(this.dir, "publish-schedule.json"), null) ?? {};
+    } catch {
+      return {};
+    }
+  }
+
+  putSchedule(s) {
+    atomicWriteJson(join(this.dir, "publish-schedule.json"), s);
+  }
+
+  /** The full alert list of the last pass (the Telegram digest may say "N more"). */
+  putAlertList(alerts) {
+    atomicWriteJson(join(this.dir, "alerts-latest.json"), { alerts });
+  }
+
   /** Every readable record, and the names of record files that do not parse (Codex W2c R1 M7). */
   listRecordsTolerant() {
     const records = [];

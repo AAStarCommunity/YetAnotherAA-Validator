@@ -16,7 +16,7 @@ import {
   isDone,
 } from "./lib/publisher.mjs";
 import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
-import { runOnce } from "./watcher.mjs";
+import { runOnce, onceExitCode } from "./watcher.mjs";
 import { bls, owner, sinks } from "./mock-sinks.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -174,7 +174,8 @@ const cfg = { aggregator: AGG };
       isDone(bls, blsSt) &&
         isDone(owner, ownSt) &&
         blsSt.registry.phase === "confirmed" &&
-        runs.at(-1).done === 2,
+        runs.at(-1).done === 2 &&
+        runs.at(-1).ok === true,
       { last: runs.at(-1), bls: blsSt?.registry?.phase }
     );
     const cur = typeof gotCurrent === "function" ? await gotCurrent() : null;
@@ -220,6 +221,23 @@ const cfg = { aggregator: AGG };
         fetches: [fetchesBefore, s.calls.fetches],
         pinata: [pinataBefore, s.calls.uploads.pinata],
       }
+    );
+    // R2: with one record per pass, the weekly generation closes only after both are re-checked
+    s.pinOpts.pinata.gone = false;
+    const P1 = { ...P, limits: { maxRecords: 1 } };
+    const tW = now + 3 * P.reverifyEveryMs;
+    const w1 = await publishPhase(store, roleChain(roles), cfg, P1, built, { now: tW });
+    const w2 = await publishPhase(store, roleChain(roles), cfg, P1, built, { now: tW + 1 });
+    const w3 = await publishPhase(store, roleChain(roles), cfg, P1, built, { now: tW + 2 });
+    cell(
+      "publishPhase: the weekly reverify generation stays open across bounded passes and closes when all were re-checked",
+      w1.reverified === false &&
+        w1.reverifying?.remaining === 1 &&
+        w2.reverified === true &&
+        (store.getAlertState()?.lastReverifyAt ?? 0) === tW &&
+        w3.ran === 0 &&
+        w3.reverifying === null,
+      { w1: [w1.ran, w1.reverifying, w1.reverified], w2: [w2.ran, w2.reverified], w3: w3.ran }
     );
   } finally {
     rmSync(d, { recursive: true, force: true });
@@ -404,7 +422,8 @@ const cfg = { aggregator: AGG };
     const a = await publishPending(store, sk, { maxRecords: 2, now: clock });
     const b = await publishPending(store, sk, { maxRecords: 2, now: clock });
     const c = await publishPending(store, sk, { maxRecords: 2, now: clock });
-    const ran = ids.filter(x => store.getPublication(x)?.lastRunAt).length;
+    const sch = store.getSchedule().entries ?? {};
+    const ran = ids.filter(x => sch[x]?.lastRunAt).length;
     let slow = 0;
     const tick = () => (slow += 200_000);
     const timed = await publishPending(store, sk, { now: tick });
@@ -420,21 +439,195 @@ const cfg = { aggregator: AGG };
       { a: a.counts, b: b.counts, c: c.counts, ran, timed: timed.counts }
     );
     // an acknowledged registry incident is parked: not run every pass
-    store.putPublication(ids[0], {
-      published: true,
-      telegram: { at: "x" },
-      registry: { phase: "conflict", ack: true },
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+// ---- R2: an acknowledged registry incident parks only the registry stage
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(bls);
+    const id = Store.recordId(bls);
+    const s = sinks();
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
+    await publishPending(store, sk);
+    await publishPending(store, sk);
+    const st = store.getPublication(id);
+    store.putPublication(id, { ...st, registry: { phase: "conflict", ack: true } });
+    const signBefore = s.calls.sign;
+    const pk = await publishPending(store, sk);
+    // a pin is lost: it is repaired, and the registry is still not touched
+    const st2 = store.getPublication(id);
+    store.putPublication(id, {
+      ...st2,
+      pins: { ...st2.pins, filebase: { ...st2.pins.filebase, current: false } },
     });
-    const pk = await publishPending(store, sk, { maxRecords: 10, now: clock });
+    const upBefore = s.calls.uploads.filebase ?? 0;
+    const pk2 = await publishPending(store, sk);
     cell(
-      "an acknowledged registry incident is parked (not run each pass)",
-      pk.counts.parked === 1 && pk.counts.ran === 4,
-      pk.counts
+      "an acknowledged registry incident parks only the registry stage: done otherwise = parked; a lost pin is still repaired; nothing signed",
+      pk.counts.parked === 1 &&
+        pk.counts.ran === 0 &&
+        pk2.counts.ran === 1 &&
+        (s.calls.uploads.filebase ?? 0) > upBefore &&
+        store.getPublication(id).pins.filebase.current === true &&
+        s.calls.sign === signBefore,
+      { pk: pk.counts, pk2: pk2.counts, sign: [signBefore, s.calls.sign] }
     );
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
 }
+
+// ---- W2c R2: bounded parsing, failing records rotate, bad identities isolated, reverify
+// generation, restored bytes still an incident
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const s = sinks();
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    // three records that always throw (over the CID cap), one healthy, one with an unusable id
+    for (let i = 0; i < 3; i++)
+      store.putRecord({ ...owner, txHash: ethers.id(`huge-${i}`), pad: "x".repeat(300_000) });
+    const healthy = { ...owner, txHash: ethers.id("healthy") };
+    store.putRecord(healthy);
+    writeFileSync(
+      join(d, "records", "bls-SLASH-zz.json"),
+      JSON.stringify({ route: "bls", kind: "SLASH", key: "bad", verdict: { flagged: true } })
+    );
+    writeFileSync(
+      join(d, "records", "owner-zz-evil.json"),
+      JSON.stringify({
+        route: "owner",
+        id: "../evil",
+        txHash: "0x01",
+        logIndex: 0,
+        verdict: { flagged: true },
+      })
+    );
+    let t = 10;
+    const clock = () => t++;
+    const p1 = await publishPending(store, sk, { maxRecords: 3, now: clock });
+    const p2 = await publishPending(store, sk, { maxRecords: 3, now: clock });
+    const hid = Store.recordId(healthy);
+    cell(
+      "R2: records that always fail still rotate (healthy one runs by the second pass); a parseable record with an unusable id is isolated",
+      p1.counts.ran === 3 &&
+        p1.counts.failed >= 3 &&
+        p1.alerts.some(a => /2 record file\(s\) unreadable or without a usable id/.test(a)) &&
+        store.getPublication(hid)?.published === true,
+      { p1: p1.counts, p2: p2.counts, healthy: !!store.getPublication(hid) }
+    );
+    // bounded parsing: only maxParse files are read per pass, the cursor rotates through all
+    const reads = [];
+    const orig = store.readRecordFile.bind(store);
+    store.readRecordFile = n => {
+      reads.push(n);
+      return orig(n);
+    };
+    const total = store.recordFiles().length;
+    for (let i = 0; i < 3; i++) await publishPending(store, sk, { maxParse: 2, now: clock });
+    const passes = [reads.slice(0, 2), reads.slice(2, 4), reads.slice(4, 6)];
+    store.readRecordFile = orig;
+    cell(
+      "R2: at most maxParse record files are read per pass, and successive passes rotate through the directory",
+      reads.length === 6 &&
+        passes.every(p => p.length === 2) &&
+        new Set(reads).size === Math.min(6, total),
+      { reads, total }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const s = sinks();
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    const ids = [];
+    for (let i = 0; i < 3; i++) {
+      const r = { ...owner, txHash: ethers.id(`rv-${i}`) };
+      store.putRecord(r);
+      ids.push(Store.recordId(r));
+    }
+    let t = 100;
+    const clock = () => t++;
+    await publishPending(store, sk, { now: clock });
+    const f0 = s.calls.fetches ?? 0;
+    const g1 = await publishPending(store, sk, { reverifyGen: 7, maxRecords: 2, now: clock });
+    const g2 = await publishPending(store, sk, { reverifyGen: 7, maxRecords: 2, now: clock });
+    const g3 = await publishPending(store, sk, { reverifyGen: 7, maxRecords: 2, now: clock });
+    cell(
+      "R2: a reverify generation stays open until every done record was re-checked in it, across bounded passes",
+      g1.counts.ran === 2 &&
+        g1.reverifyRemaining === 1 &&
+        g2.counts.ran === 1 &&
+        g2.reverifyRemaining === 0 &&
+        g3.counts.ran === 0 &&
+        (s.calls.fetches ?? 0) > f0,
+      {
+        g1: [g1.counts, g1.reverifyRemaining],
+        g2: [g2.counts, g2.reverifyRemaining],
+        g3: g3.counts,
+      }
+    );
+    // restored bytes: the recorded incident still stands and is alerted, nothing else runs
+    const id = ids[0];
+    const file = join(d, "records", `${id}.json`);
+    const original = readFileSync(file, "utf8");
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(original), tampered: true }));
+    await publishPending(store, sk, { now: clock });
+    writeFileSync(file, original);
+    const before = { ...s.calls };
+    const back = await publishPending(store, sk, { now: clock });
+    cell(
+      "R2: a recorded bytes change stands after the bytes change back: alerted, not done, no further publication effects",
+      back.alerts.some(a => a.startsWith(id) && /bytes changed.*INCIDENT/.test(a)) &&
+        back.counts.incidents >= 1 &&
+        s.calls.mirror === before.mirror &&
+        s.calls.telegram === before.telegram,
+      { back: back.counts, alerts: back.alerts }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const texts = [];
+    const tg = { send: async x => texts.push(x) };
+    const alerts = Array.from({ length: 40 }, (_, i) => `a-${i}: ${"y".repeat(900)}`);
+    const r = await deliverAlerts(store, tg, alerts, { now: 1, maxParts: 3 });
+    cell(
+      "R2: at most maxParts messages per pass; the last says how many lines are not shown",
+      r.sent === true &&
+        texts.length === 3 &&
+        /and \d+ more alert line\(s\) not shown/.test(texts[2]),
+      { n: texts.length, last: texts.at(-1)?.slice(0, 120) }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- --once exit code: healthy scan AND an ok publication pass
+cell(
+  "onceExitCode: 0 only when the scan is healthy and publication (if it ran) reported ok",
+  onceExitCode({ healthy: true }) === 0 &&
+    onceExitCode({ healthy: true, publication: { ok: true } }) === 0 &&
+    onceExitCode({ healthy: true, publication: { ok: false, failed: 1 } }) === 1 &&
+    onceExitCode({ healthy: true, publication: { error: "x" } }) === 1 &&
+    onceExitCode({ healthy: false, publication: { ok: true } }) === 1 &&
+    onceExitCode({ ok: true }) === 1,
+  null
+);
 
 // ---- M6: a large alert set is delivered whole, in chunks, and acknowledged only when all land
 {
@@ -454,9 +647,9 @@ const cfg = { aggregator: AGG };
     };
     const alerts = Array.from({ length: 40 }, (_, i) => `rec-${i}: ${"z".repeat(200)} END${i}`);
     alerts.push(`huge: ${"q".repeat(9000)} TAIL`);
-    const r1 = await deliverAlerts(store, tg, alerts, { now: 1 });
+    const r1 = await deliverAlerts(store, tg, alerts, { now: 1, maxParts: 100 });
     const after1 = texts.length;
-    const r2 = await deliverAlerts(store, tg, alerts, { now: 2 });
+    const r2 = await deliverAlerts(store, tg, alerts, { now: 2, maxParts: 100 });
     const all = texts.slice(after1).join("\n");
     cell(
       "alerts: every chunk is under the sink's cut; a failure part-way is not acked; the retry delivers every alert",
@@ -506,9 +699,12 @@ const cfg = { aggregator: AGG };
       "a corrupt record and a corrupt journal are alerted and skipped; healthy records still publish; nothing signed for the broken one",
       ownSt?.published &&
         r.failed === 2 &&
+        r.ok === false &&
         journalKept &&
         s.calls.sign === 0 &&
-        s.calls.texts.some(t => /record file unreadable/.test(t) && /journal unreadable/.test(t)),
+        s.calls.texts.some(
+          t => /unreadable or without a usable id/.test(t) && /journal unreadable/.test(t)
+        ),
       { r, ownSt: !!ownSt, sign: s.calls.sign, texts: s.calls.texts.length }
     );
   } finally {

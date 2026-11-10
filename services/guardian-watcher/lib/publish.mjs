@@ -124,6 +124,14 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
         : `registry: disclose tx reverted (${inc.reason ?? "no reason recorded"}); unresolved until acknowledged`
     );
   }
+  if (state.bytesChanged) {
+    // A recorded bytes change stands until resolved by hand (the marker is removed), even if the
+    // bytes have changed back: alerted on every pass, and nothing else runs (Codex W2c R2).
+    alerts.push(
+      `record bytes changed after first publication (${state.bytesChanged.from} -> ${state.bytesChanged.to}); not republishing; INCIDENT until resolved by hand`
+    );
+    return { state, alerts };
+  }
   if (state.cid && state.cid !== file.cid) {
     // Records are immutable once stored; a different CID means the bytes changed underneath us.
     // A durable, standing incident (Codex W2c R1 M4): it keeps the record out of "done" and is
