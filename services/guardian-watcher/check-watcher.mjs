@@ -1,7 +1,7 @@
 // CI self-test for the guardian watcher core (W1) against the shared stub chain. Each cell asserts a
 // specific outcome; must-pass and must-fail cells are both present (a self-test of only one kind
 // proves nothing).
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,10 +19,18 @@ import {
   repF,
 } from "../../scripts/disclosure/stub-chain.mjs";
 import { spIface } from "./lib/sp-abi.mjs";
-import { validateRuleset, evaluate } from "./lib/rules.mjs";
+import { validateRuleset, evaluate, matchGeneric } from "./lib/rules.mjs";
+import {
+  MAX_DEADLETTER_ATTEMPTS,
+  traceUnsupported,
+  verifyTrace,
+  sameLog,
+  envelopeProblem,
+} from "./lib/scan.mjs";
+import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store } from "./lib/store.mjs";
-import { runOnce, rulesetIdentity } from "./watcher.mjs";
-import { attributeLogs } from "./lib/attribute.mjs";
+import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
+import { attributeLogs, flattenTraceLogs, validLog, receiptPos } from "./lib/attribute.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const rs = validateRuleset(JSON.parse(readFileSync(join(HERE, "ruleset.json"), "utf8")));
@@ -88,9 +96,11 @@ try {
   }
   // 3. reputation batch through DVTValidator
   const a3 = c.execute(Kind.REPUTATION, 102n, repF, 0b111n, { via: { route: "dvt" } });
-  // 4. owner price update straight to SP (no BLS)
+  // 4. owner price update straight to SP (no BLS): the owner calls updatePriceDVT itself, a
+  // privileged selector, so the owner route (#400 M1: classified by the emitting call)
   const o1 = c.ownerTx([{ name: "PriceUpdated", args: [310000000000n, 2n] }], {
     price: 310000000000n,
+    data: spIface.encodeFunctionData("updatePriceDVT", [310000000000n, 2n, "0x", 0]),
   });
   // 5. owner slash: queue + slash, no BLS (two events in one tx: both must survive)
   const opr = addr("operator-x");
@@ -136,7 +146,13 @@ try {
           ],
           calls: [{ type: "CALL", to: SP, error: "execution reverted", logs: [lg] }],
         },
-        { type: "CALL", to: SP, logs: [lg] },
+        {
+          type: "CALL",
+          from: SAFE,
+          to: SP,
+          input: ethers.id("setOperatorPaused(address,bool)").slice(0, 10),
+          logs: [lg],
+        },
       ],
     });
   }
@@ -554,6 +570,1648 @@ try {
   cell("ruleset validation rejects a missing rule", threw, null);
 } finally {
   rmSync(dir, { recursive: true, force: true });
+}
+
+// ---- #400 M1: classify SuperPaymaster events by the call that emitted them; dead letters;
+// exhaustion; logsBloom cross-check; the branches the review found untested.
+{
+  const d2 = mkdtempSync(join(tmpdir(), "guardian-watcher-m1-"));
+  try {
+    const c = makeChain();
+    const start = c.head() + 1;
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: start,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(d2);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const KEEPER = addr("keeper-eoa");
+    const KCONTRACT = addr("keeper-contract");
+    const sel = sig => ethers.id(sig).slice(0, 10);
+    c.setPrice(start - 1, 250000000000n);
+    // K1 keeper: direct updatePrice(), only PriceUpdated
+    const k1 = c.ownerTx([{ name: "PriceUpdated", args: [251000000000n, 3n] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      price: 251000000000n,
+    });
+    // K2 keeper: updatePrice() that also switches the price mode
+    const k2 = c.ownerTx(
+      [
+        { name: "PriceModeChanged", args: [1, 0] },
+        { name: "PriceUpdated", args: [252000000000n, 4n] },
+      ],
+      { from: KEEPER, data: sel("updatePrice()"), price: 252000000000n }
+    );
+    // K3 anyone: executeEmergencyPrice() after the owner queued it
+    const k3 = c.ownerTx(
+      [
+        { name: "EmergencyPriceExecuted", args: [200000000000n] },
+        { name: "PriceUpdated", args: [200000000000n, 5n] },
+      ],
+      { from: KEEPER, data: sel("executeEmergencyPrice()"), price: 200000000000n }
+    );
+    // K4 anyone: pauseUnderstakedOperator(address)
+    const weakOp = addr("weak-op");
+    const k4 = c.ownerTx([{ name: "OperatorPaused", args: [weakOp] }], {
+      from: KEEPER,
+      data: sel("pauseUnderstakedOperator(address)") + "00".repeat(32),
+    });
+    // K5 keeper through a contract, no trace yet: the caller of PriceUpdated is undeterminable
+    const k5 = c.ownerTx([{ name: "PriceUpdated", args: [253000000000n, 6n] }], {
+      from: KEEPER,
+      to: KCONTRACT,
+      data: "0xdeadbeef",
+      price: 253000000000n,
+    });
+    // K6 owner through its Safe: the trace shows the Safe calling updatePriceDVT on SP
+    const k6 = c.ownerTx([{ name: "PriceUpdated", args: [254000000000n, 7n] }], {
+      from: addr("safe-signer"),
+      to: SAFE,
+      data: "0x6a761202",
+      price: 254000000000n,
+    });
+    {
+      const pu = spIface.encodeEventLog("PriceUpdated", [254000000000n, 7n]);
+      c.setTrace(k6.hash, {
+        type: "CALL",
+        from: addr("safe-signer"),
+        to: SAFE,
+        calls: [
+          {
+            type: "CALL",
+            from: SAFE,
+            to: SP,
+            input: spIface.encodeFunctionData("updatePriceDVT", [254000000000n, 7n, "0x", 0]),
+            logs: [{ address: SP, topics: pu.topics, data: pu.data }],
+          },
+        ],
+      });
+    }
+    // K7 a transient getTransaction failure
+    const k7 = c.ownerTx([{ name: "SlashCancelled", args: [weakOp] }]);
+    c.failTx(k7.hash, 1);
+    const r1 = await runOnce(c.chain, cfg, store, rs, ident);
+    const recs = () =>
+      readdirSync(join(d2, "records"))
+        .filter(f => f.endsWith(".json"))
+        .map(f => JSON.parse(readFileSync(join(d2, "records", f), "utf8")));
+    const byTx = h => recs().filter(r => r.txHash === h);
+    const dls = () =>
+      readdirSync(join(d2, "deadletters"))
+        .filter(f => f.endsWith(".json"))
+        .flatMap(f => {
+          try {
+            return [JSON.parse(readFileSync(join(d2, "deadletters", f), "utf8"))];
+          } catch {
+            return []; // K14 plants a corrupt one on purpose
+          }
+        });
+    const [p1] = byTx(k1.hash);
+    cell(
+      "keeper updatePrice() emitting only PriceUpdated: public route, NOT flagged, caller and selector kept",
+      r1.status.ok &&
+        p1?.route === "public" &&
+        p1.verdict.flagged === false &&
+        p1.caller === KEEPER &&
+        p1.selector === sel("updatePrice()") &&
+        p1.function === "updatePrice()" &&
+        p1.callerSource === "trace",
+      p1
+    );
+    const p2 = byTx(k2.hash);
+    cell(
+      "keeper updatePrice() that also changes the price mode: flagged as informational, caller not accused",
+      p2.length === 2 &&
+        p2.every(
+          r =>
+            r.route === "public" &&
+            r.verdict.flagged &&
+            /caller not accused/.test(r.verdict.reasons[0])
+        ) &&
+        p2.every(r => j(r.callEvents.sort()) === j(["PriceModeChanged", "PriceUpdated"])),
+      p2.map(r => ({ route: r.route, v: r.verdict, ce: r.callEvents }))
+    );
+    const p3 = byTx(k3.hash).find(r => r.event === "PriceUpdated");
+    cell(
+      "executeEmergencyPrice() by anyone: flagged, caller not accused, price before and after",
+      p3?.route === "public" &&
+        p3.verdict.flagged &&
+        /not accused/.test(p3.verdict.reasons[0]) &&
+        p3.price?.before?.price === "252000000000" &&
+        p3.price?.after?.price === "200000000000",
+      p3
+    );
+    const [p4] = byTx(k4.hash);
+    cell(
+      "pauseUnderstakedOperator() by anyone: public route, routine, not flagged, caller recorded",
+      p4?.route === "public" && !p4.verdict.flagged && p4.caller === KEEPER,
+      p4
+    );
+    const dl5 = dls().find(x => x.txHash === k5.hash);
+    cell(
+      "an ambiguous event whose call cannot be determined (no trace) is a dead letter, never a guess",
+      byTx(k5.hash).length === 0 && dl5?.route === "tx" && /undeterminable/.test(dl5.reasons[0]),
+      { recs: byTx(k5.hash), dl5 }
+    );
+    const [p6] = byTx(k6.hash);
+    cell(
+      "the owner through its Safe (trace): owner route, the Safe as caller, updatePriceDVT selector",
+      p6?.route === "owner" &&
+        p6.verdict.flagged &&
+        p6.caller === SAFE &&
+        p6.callerSource === "trace" &&
+        p6.selector === sel("updatePriceDVT(int256,uint256,bytes,uint8)"),
+      p6
+    );
+    cell(
+      "a transient tx lookup failure is a dead letter (not a record with from:null)",
+      byTx(k7.hash).length === 0 && dls().some(x => x.txHash === k7.hash),
+      { recs: byTx(k7.hash) }
+    );
+    // Next tick: the tx answers and K5's trace appears; both dead letters resolve into records.
+    {
+      const pu = spIface.encodeEventLog("PriceUpdated", [253000000000n, 6n]);
+      c.setTrace(k5.hash, {
+        type: "CALL",
+        from: KEEPER,
+        to: KCONTRACT,
+        calls: [
+          {
+            type: "CALL",
+            from: KCONTRACT,
+            to: SP,
+            input: sel("updatePrice()"),
+            logs: [{ address: SP, topics: pu.topics, data: pu.data }],
+          },
+        ],
+      });
+    }
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const [p5] = byTx(k5.hash);
+    const [p7] = byTx(k7.hash);
+    cell(
+      "retried dead letters resolve: the contract-routed keeper call is public (caller = the contract), the tx lookup has a sender",
+      p5?.route === "public" &&
+        p5.caller === KCONTRACT &&
+        p5.from === KEEPER &&
+        !p5.verdict.flagged &&
+        p7?.route === "owner" &&
+        p7.from === SAFE &&
+        !dls().some(x => x.txHash === k5.hash || x.txHash === k7.hash),
+      { p5, p7, open: dls().map(x => x.txHash) }
+    );
+    // K8 a failed price read is a dead letter, then a record with both prices
+    const k8 = c.ownerTx([{ name: "PriceUpdated", args: [255000000000n, 8n] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      price: 255000000000n,
+    });
+    c.failPriceReads(1);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const before8 = byTx(k8.hash).length;
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const [p8] = byTx(k8.hash);
+    cell(
+      "a failed price read is retried, not stored: the record lands next tick with both prices",
+      before8 === 0 &&
+        p8?.price?.before?.price === "254000000000" &&
+        p8.price.after.price === "255000000000",
+      { before8, p8: p8?.price }
+    );
+    // K9 a dead letter that never resolves: after every attempt, an unattributed record (nobody accused)
+    const k9 = c.ownerTx([{ name: "PriceUpdated", args: [256000000000n, 9n] }], {
+      from: KEEPER,
+      to: KCONTRACT,
+      data: "0xdeadbeef",
+      price: 256000000000n,
+    });
+    let last;
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      last = await runOnce(c.chain, cfg, store, rs, ident);
+    const [p9] = byTx(k9.hash);
+    cell(
+      "an unresolvable SP dead letter becomes an 'unattributed' record after the attempt cap (flagged, nobody accused)",
+      p9?.route === "unattributed" &&
+        p9.verdict.flagged &&
+        p9.caller === null &&
+        p9.exhaustedAfter >= MAX_DEADLETTER_ATTEMPTS &&
+        !dls().some(x => x.txHash === k9.hash) &&
+        last.status.exhaustedTotal >= 1,
+      { p9, status: last.status }
+    );
+    // K10 bloom: a lagging node omits a block's logs from the range read; the by-hash re-read has them
+    const k10 = c.ownerTx([{ name: "SlashCancelled", args: [addr("lag-op")] }]);
+    c.lagBlock(k10.block);
+    const r10 = await runOnce(c.chain, cfg, store, rs, ident);
+    c.clearLag();
+    cell(
+      "logsBloom says a watched log is in a block the range read omitted: re-read by hash, recovered",
+      r10.status.ok && byTx(k10.hash).length === 1 && r10.status.bloom.recovered === 1,
+      r10.status
+    );
+    // K11 ... and when the node does not have the block at all, the tick fails and is retried
+    const k11 = c.ownerTx([{ name: "SlashCancelled", args: [addr("lag-op2")] }]);
+    c.lagBlock(k11.block, { byHashFails: true });
+    const r11 = await runOnce(c.chain, cfg, store, rs, ident);
+    const cur11 = store.getCursor().block;
+    c.clearLag();
+    const r11b = await runOnce(c.chain, cfg, store, rs, ident);
+    cell(
+      "a block the node cannot serve by hash fails the tick (cursor stays), and the next tick records it",
+      !r11.status.ok && cur11 < k11.block && r11b.status.ok && byTx(k11.hash).length === 1,
+      { r11: r11.status.lastError, cur11, b: k11.block }
+    );
+    // K12 a bloom false positive (the header claims a watched log; by-hash says none): accepted
+    const fpBlock = c.mine();
+    c.forceBloom(fpBlock, [
+      { address: SP, topics: [spIface.getEvent("OperatorSlashed").topicHash] },
+    ]);
+    const r12 = await runOnce(c.chain, cfg, store, rs, ident);
+    cell(
+      "a bloom false positive confirmed by a by-hash read is counted, and the scan advances",
+      r12.status.ok && r12.status.bloom.falsePositives === 1 && store.getCursor().block >= fpBlock,
+      r12.status
+    );
+    // K13 headers without a bloom: nothing can be cross-checked, counted, the scan advances
+    c.setNoBloom(true);
+    c.mine();
+    const r13 = await runOnce(c.chain, cfg, store, rs, ident);
+    c.setNoBloom(false);
+    cell(
+      "headers without logsBloom: unchecked is counted, never a stop",
+      r13.status.ok && r13.status.bloom.unchecked >= 2,
+      r13.status
+    );
+    // K14 a corrupt dead letter never stops the scan; a corrupt record file is rewritten
+    writeFileSync(join(d2, "deadletters", "tx-0xbad.json"), "");
+    const k14 = c.ownerTx([{ name: "SlashCancelled", args: [addr("corrupt-op")] }]);
+    const id14 = Store.recordId({ route: "owner", txHash: k14.hash, logIndex: 0 });
+    writeFileSync(join(d2, "records", `${id14}.json`), "");
+    const r14 = await runOnce(c.chain, cfg, store, rs, ident);
+    cell(
+      "a corrupt dead letter is counted, not fatal; an empty record file is rewritten, not 'the same'",
+      r14.status.ok &&
+        r14.status.corruptDeadLetters === 1 &&
+        JSON.parse(readFileSync(join(d2, "records", `${id14}.json`), "utf8")).txHash === k14.hash,
+      r14.status
+    );
+    // C1 (Codex #400-fix H1) a direct updatePrice() whose tx also has an OperatorPaused that
+    // updatePrice cannot emit: the root selector is not trusted for it; without a trace, retried
+    const c1 = c.ownerTx(
+      [
+        { name: "PriceUpdated", args: [257000000000n, 10n] },
+        { name: "OperatorPaused", args: [addr("nested-op")] },
+      ],
+      { from: KEEPER, data: sel("updatePrice()"), price: 257000000000n, trace: false }
+    );
+    // C2 (H2-adjacent) a direct call whose calldata has no selector: ambiguous events are retried
+    const c2 = c.ownerTx([{ name: "OperatorPaused", args: [addr("noselector-op")] }], {
+      from: KEEPER,
+      data: "0x",
+    });
+    // C1b (R2 H1) a direct updatePrice() WITHOUT a trace whose events are all ones updatePrice can
+    // emit: matching names do not prove the emitting call, so it is retried, not attributed
+    const c1b = c.ownerTx([{ name: "PriceUpdated", args: [257500000000n, 10n] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      price: 257500000000n,
+      trace: false,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    cell(
+      "a root selector is not trusted for an event its function cannot emit; calldata '0x' proves no function",
+      byTx(c1.hash).length === 0 &&
+        dls().some(x => x.txHash === c1.hash) &&
+        byTx(c2.hash).length === 0 &&
+        dls().some(x => x.txHash === c2.hash) &&
+        byTx(c1b.hash).length === 0 &&
+        dls().some(x => x.txHash === c1b.hash),
+      { c1: byTx(c1.hash), c2: byTx(c2.hash) }
+    );
+    {
+      const pu = spIface.encodeEventLog("PriceUpdated", [257000000000n, 10n]);
+      const pz = spIface.encodeEventLog("OperatorPaused", [addr("nested-op")]);
+      c.setTrace(c1.hash, {
+        type: "CALL",
+        from: KEEPER,
+        to: SP,
+        input: sel("updatePrice()"),
+        logs: [{ address: SP, topics: pu.topics, data: pu.data, position: 0 }],
+        calls: [
+          {
+            type: "CALL",
+            from: SP,
+            to: SP,
+            input: ethers.id("setOperatorPaused(address,bool)").slice(0, 10),
+            logs: [{ address: SP, topics: pz.topics, data: pz.data }],
+          },
+        ],
+      });
+    }
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c1r = byTx(c1.hash);
+    const c1p = c1r.find(r => r.event === "PriceUpdated");
+    const c1z = c1r.find(r => r.event === "OperatorPaused");
+    cell(
+      "with the trace, each event takes its own emitting call: nested privileged call = owner, root = public",
+      c1p?.route === "public" &&
+        !c1p.verdict.flagged &&
+        j(c1p.callEvents) === j(["PriceUpdated"]) &&
+        c1z?.route === "owner" &&
+        c1z.caller === SP &&
+        c1z.callerSource === "trace",
+      c1r
+    );
+    // C3 (M3) an SP record whose price never reads keeps its attribution at exhaustion
+    const c3 = c.ownerTx([{ name: "PriceUpdated", args: [258000000000n, 11n] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      price: 258000000000n,
+    });
+    {
+      const pu = spIface.encodeEventLog("PriceUpdated", [258000000000n, 11n]);
+      c.setTrace(c3.hash, {
+        type: "CALL",
+        from: KEEPER,
+        to: SP,
+        input: sel("updatePrice()"),
+        logs: [{ address: SP, topics: pu.topics, data: pu.data }],
+      });
+    }
+    // C4 (M4) an authenticated BLS price action whose price read fails while its tx lookup also
+    // fails: the verified evidence survives, and lands once the price reads
+    const priceG = {
+      target: SP,
+      callData: spIface.encodeFunctionData("updatePriceDVT", [259000000000n, 12n, "0x", 0]),
+      requiredThreshold: 2n,
+    };
+    const c4 = c.execute(Kind.GENERIC, 90n, priceG, 0b111n, { price: 259000000000n });
+    c.failPriceReads(1_000_000);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c4dl = dls().find(x => x.txHash === c4.hash);
+    c.failTx(c4.hash, 1_000_000); // the lookup keeps failing until exhaustion
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      await runOnce(c.chain, cfg, store, rs, ident);
+    c.failPriceReads(0);
+    c.failTx(c4.hash, 0);
+    const [c3r] = byTx(c3.hash);
+    cell(
+      "an SP record whose price never reads is kept with its route, caller and verdict (price.unavailable)",
+      c3r?.route === "public" &&
+        c3r.caller === KEEPER &&
+        !c3r.verdict.flagged &&
+        c3r.price?.unavailable === true,
+      c3r
+    );
+    const [c4r] = byTx(c4.hash);
+    cell(
+      "an authenticated BLS action whose price never reads keeps its verified evidence (not UNRECOVERED)",
+      c4dl?.status === "PRICE_UNAVAILABLE" &&
+        c4r?.kind === "GENERIC" &&
+        c4r.price?.unavailable === true &&
+        c4r.signers?.length === 3,
+      { c4dl: c4dl?.status, c4r: c4r && { kind: c4r.kind, price: c4r.price } }
+    );
+    // C5 (M5) a tx dead letter whose SP events the trace later proves to be BLS effects resolves
+    const c5 = c.execute(Kind.GENERIC, 91n, priceG, 0b111n, {
+      via: { route: "safe" },
+      spLogs: [{ name: "PriceUpdated", args: [260000000000n, 13n] }],
+      price: 260000000000n,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c5open = dls().some(x => x.txHash === c5.hash && x.route === "tx");
+    {
+      const pu = spIface.encodeEventLog("PriceUpdated", [260000000000n, 13n]);
+      c.setTrace(c5.hash, {
+        type: "CALL",
+        to: SAFE,
+        calls: [
+          {
+            type: "CALL",
+            to: AGG,
+            logs: [
+              {
+                address: AGG,
+                ...aggIface.encodeEventLog("SignersCommitted", [c5.key, c5.mask]),
+                position: 0,
+              },
+            ],
+            calls: [
+              {
+                type: "CALL",
+                from: AGG,
+                to: SP,
+                input: priceG.callData.slice(0, 10),
+                logs: [{ address: SP, topics: pu.topics, data: pu.data }],
+              },
+            ],
+          },
+        ],
+      });
+    }
+    await runOnce(c.chain, cfg, store, rs, ident);
+    cell(
+      "a tx dead letter resolves once the trace proves its SP events are BLS effects (no stray record)",
+      c5open &&
+        !dls().some(x => x.txHash === c5.hash && x.route === "tx") &&
+        !byTx(c5.hash).some(r => r.route !== "bls"),
+      {
+        c5open,
+        open: dls()
+          .filter(x => x.txHash === c5.hash)
+          .map(x => x.route),
+      }
+    );
+    // C6 (M6) one returned topic must not mask another missing topic in the same block
+    const c6 = c.ownerTx([
+      { name: "SlashCancelled", args: [addr("two-topics")] },
+      { name: "OperatorUnpaused", args: [addr("two-topics")] },
+    ]);
+    c.lagTopic(c6.block, spIface.getEvent("OperatorUnpaused").topicHash);
+    const r6 = await runOnce(c.chain, cfg, store, rs, ident);
+    c.clearLag();
+    cell(
+      "bloom per (address, topic): a missing topic is re-read by hash even when another topic of the block came back",
+      byTx(c6.hash).length === 2 && r6.status.bloom.recovered === 1,
+      { n: byTx(c6.hash).map(r => r.event), bloom: r6.status.bloom }
+    );
+    // C7 (R2 M3) an SP record classified already and awaiting only its price lands once the price
+    // reads, even while the tx lookup fails: the retry re-reads prices only, never re-attributes
+    const c7 = c.ownerTx([{ name: "PriceUpdated", args: [261000000000n, 14n] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      price: 261000000000n,
+    });
+    c.failPriceReads(1_000_000);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c7dl = dls().find(x => x.txHash === c7.hash);
+    c.failPriceReads(0);
+    c.failTx(c7.hash, 1_000_000);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    c.failTx(c7.hash, 0);
+    const [c7r] = byTx(c7.hash);
+    cell(
+      "a classified SP record awaiting its price lands when the price reads, without re-reading the tx",
+      c7dl?.pendingRecords?.length === 1 &&
+        c7r?.route === "public" &&
+        c7r.callerSource === "trace" &&
+        c7r.price &&
+        !c7r.price.unavailable &&
+        !c7r.price.error &&
+        !("priceMissing" in c7r) &&
+        !dls().some(x => x.txHash === c7.hash),
+      { c7dl: c7dl && { reasons: c7dl.reasons, pending: !!c7dl.pendingRecords }, c7r }
+    );
+    // C8 (R2 M4) a mixed tx: an authenticated BLS action awaiting its price, and an SP event whose
+    // caller is undeterminable (no trace). Retrying the tx must not rebuild the BLS action, so its
+    // dead letter takes exactly one attempt per tick (the attempt cap counts ticks).
+    const c8 = c.execute(Kind.GENERIC, 92n, priceG, 0b111n, {
+      via: { route: "safe" },
+      spLogs: [{ name: "OperatorPaused", args: [addr("c8-op")] }],
+      price: 262000000000n,
+    });
+    c.failPriceReads(1_000_000);
+    for (let i = 0; i < 3; i++) await runOnce(c.chain, cfg, store, rs, ident);
+    const c8bls = dls().find(x => x.txHash === c8.hash && x.route === "bls");
+    const c8tx = dls().find(x => x.txHash === c8.hash && x.route === "tx");
+    c.failPriceReads(0);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c8r = byTx(c8.hash).find(r => r.route === "bls");
+    cell(
+      "a tx retry never rebuilds a BLS action already awaiting its price (one attempt per tick)",
+      c8bls?.pendingRecord?.kind === "GENERIC" &&
+        c8bls.attempts === 3 &&
+        c8tx?.attempts === 3 &&
+        c8r?.kind === "GENERIC" &&
+        c8r.price &&
+        !c8r.price.unavailable,
+      { bls: c8bls?.attempts, tx: c8tx?.attempts, c8r: c8r && { kind: c8r.kind, price: c8r.price } }
+    );
+    // C9 (R3 H1) an event no permissionless function emits stays the owner route even when the root
+    // call's selector is a public one and no trace is available
+    const c9 = c.ownerTx([{ name: "GuardianSet", args: [addr("c9-old"), addr("c9-new")] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      trace: false,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const [c9r] = byTx(c9.hash);
+    cell(
+      "a privileged-only event under a public root selector is the owner route, flagged (never public)",
+      c9r?.route === "owner" && c9r.verdict.flagged && c9r.function === undefined,
+      c9r
+    );
+    // C10 (R3 M) a pending SP record persisted without the priceMissing marker still gets its price
+    const legacyTx = ethers.id("legacy-pending");
+    store.putDeadLetter({
+      route: "tx",
+      txHash: legacyTx,
+      blockNumber: c3.block,
+      status: "ERROR",
+      reasons: ["price read failed"],
+      events: [],
+      pendingRecords: [
+        {
+          route: "public",
+          label: rs.publicRoute.label,
+          event: "PriceUpdated",
+          args: ["258000000000", "11"],
+          txHash: legacyTx,
+          logIndex: 0,
+          blockNumber: c3.block,
+          caller: KEEPER,
+          selector: sel("updatePrice()"),
+          callerSource: "trace",
+          function: "updatePrice()",
+          callEvents: ["PriceUpdated"],
+          verdict: { flagged: false, reasons: [] },
+        },
+      ],
+      seenAt: "legacy",
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const [c10r] = byTx(legacyTx);
+    cell(
+      "a pending record without the priceMissing marker is still priced when the ruleset wants a price",
+      c10r?.price?.before !== undefined && c10r.price.after !== undefined && !c10r.price.error,
+      c10r
+    );
+    // K15 maxBlocksPerTick bounds each tick
+    for (let i = 0; i < 5; i++) c.mine();
+    const from15 = store.getCursor().block + 1;
+    const r15 = await runOnce(c.chain, { ...cfg, maxBlocksPerTick: 2 }, store, rs, ident);
+    cell(
+      "maxBlocksPerTick bounds the scanned range",
+      j(r15.status.scanned) === j([from15, from15 + 1]) && store.getCursor().block === from15 + 1,
+      r15.status
+    );
+  } finally {
+    rmSync(d2, { recursive: true, force: true });
+  }
+}
+
+// ---- an unauthenticated BLS action that never resolves becomes an UNRECOVERED record
+{
+  const d3 = mkdtempSync(join(tmpdir(), "guardian-watcher-unrec-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(d3);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const a = c.execute(Kind.SLASH, 777n, slashF, 0b011n, { to: WRAPPER });
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      await runOnce(c.chain, cfg, store, rs, ident);
+    const recs = readdirSync(join(d3, "records"))
+      .filter(f => f.endsWith(".json"))
+      .map(f => JSON.parse(readFileSync(join(d3, "records", f), "utf8")));
+    const u = recs.find(r => r.txHash === a.hash);
+    cell(
+      "every BLS-executed action ends with a record: UNRECOVERED after the attempt cap (flagged per ruleset)",
+      u?.route === "bls" &&
+        u.kind === undefined &&
+        u.verdict.rule === "bls.UNRECOVERED" &&
+        u.verdict.flagged &&
+        u.exhaustedAfter >= MAX_DEADLETTER_ATTEMPTS,
+      u
+    );
+  } finally {
+    rmSync(d3, { recursive: true, force: true });
+  }
+}
+
+// ---- trace capability (DSR, #400; Codex #400-fix R4): known only by positive verification
+{
+  const dirs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-trace-"));
+    dirs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const H = 3_600_000;
+  const T0 = 1_900_000_000_000;
+  const keeper = {
+    from: addr("keeper-eoa"),
+    data: ethers.id("pauseUnderstakedOperator(address)").slice(0, 10),
+  };
+  const pause = n => [{ name: "OperatorPaused", args: [addr(n)] }];
+  const guardianSet = n => [{ name: "GuardianSet", args: [addr(`${n}-a`), addr(`${n}-b`)] }];
+  const settle = c => {
+    for (let i = 0; i < 4; i++) c.mine();
+  };
+  try {
+    // A: a real aligned trace during the scan verifies the capability
+    const a = mk();
+    a.c.ownerTx(pause("t-a"), keeper);
+    settle(a.c);
+    const sa = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 })).status;
+    // B: quiet ticks keep a fresh proof; once stale, the node is re-verified and found unsupported
+    const sb1 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + H / 2 })).status;
+    a.c.setTraceMode("unsupported");
+    const sb2 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + H + 1 })).status;
+    a.c.setTraceMode("ok");
+    // the unsupported verdict cleared the old proof: with no sample in reach, still unverified
+    for (let i = 0; i < 6; i++) a.c.mine();
+    const sb3 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + H + 2 })).status;
+    cell(
+      "trace: an aligned scan trace verifies; a quiet tick keeps a fresh proof; a stale proof is re-checked and a missing method is DEGRADED",
+      sa.healthy === true &&
+        sa.trace.capability === "verified" &&
+        sa.trace.thisTick.verified >= 1 &&
+        sa.trace.lastCheck === undefined &&
+        typeof sa.trace.sampleTx === "string" &&
+        sa.trace.sampleTx.length === 66 &&
+        sb1.healthy === true &&
+        sb1.trace.lastCheck === undefined &&
+        sb2.ok === true &&
+        sb2.healthy === false &&
+        sb2.trace.capability === "unsupported" &&
+        sb2.degraded.some(x => /method or tracer missing/.test(x)) &&
+        sb3.healthy === false &&
+        sb3.trace.capability === "unverified",
+      { sa: sa.trace, sb1: sb1.trace, sb2: [sb2.trace, sb2.degraded], sb3: sb3.trace }
+    );
+    // C: a supporting node with no prior proof and no ambiguous traffic is verified by a sample tx
+    const cc = mk();
+    cc.c.ownerTx(guardianSet("t-c"));
+    settle(cc.c);
+    const sc = (await runOnce(cc.c.chain, cc.cfg, cc.store, rs, ident, { now: T0 })).status;
+    // D: the same, on a node that ignores withLog: never healthy, even on a quiet tick
+    const dd = mk();
+    dd.c.ownerTx(guardianSet("t-d"));
+    settle(dd.c);
+    dd.c.setTraceMode("noLogs");
+    const sd = (await runOnce(dd.c.chain, dd.cfg, dd.store, rs, ident, { now: T0 })).status;
+    // D2: a sample whose trace carries logs that do not match its receipt proves nothing
+    const d2 = mk();
+    const mis = d2.c.ownerTx(guardianSet("t-d2"), { trace: false });
+    {
+      const other = spIface.encodeEventLog("OperatorPaused", [addr("not-this-tx")]);
+      d2.c.setTrace(mis.hash, {
+        type: "CALL",
+        to: SP,
+        logs: [{ address: SP, topics: other.topics, data: other.data }],
+      });
+    }
+    settle(d2.c);
+    const sd2 = (await runOnce(d2.c.chain, d2.cfg, d2.store, rs, ident, { now: T0 })).status;
+    // E: no sample transaction anywhere: unverified, so degraded
+    const ee = mk();
+    settle(ee.c);
+    const se = (await runOnce(ee.c.chain, ee.cfg, ee.store, rs, ident, { now: T0 })).status;
+    cell(
+      "trace: a supporting quiet node is verified by sampling a real tx; withLog ignored or no evidence is DEGRADED",
+      sc.healthy === true &&
+        sc.trace.capability === "verified" &&
+        sc.trace.lastCheck === "verified" &&
+        sd.healthy === false &&
+        sd.trace.capability === "unsupported" &&
+        sd.degraded.some(x => /withLog/.test(x)) &&
+        se.healthy === false &&
+        se.trace.capability === "unverified" &&
+        sd2.healthy === false &&
+        sd2.trace.capability === "unverified" &&
+        /align/.test(sd2.trace.reason ?? ""),
+      {
+        sc: sc.trace,
+        sd: [sd.trace, sd.degraded],
+        sd2: sd2.trace,
+        se: [se.trace, se.degraded],
+      }
+    );
+    // F: a fresh proof, but every real trace this tick fails: degraded with the reason
+    a.store.putTraceCapability({ verifiedAt: T0 + 2 * H, txHash: "0x", by: "test" });
+    a.c.ownerTx(pause("t-f"), { ...keeper, trace: false });
+    settle(a.c);
+    const sf = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + 2 * H + 1 }))
+      .status;
+    cell(
+      "trace: when every real trace of the tick fails, the watcher is DEGRADED even with a fresh proof",
+      sf.ok === true &&
+        sf.healthy === false &&
+        sf.trace.thisTick.failed >= 1 &&
+        sf.degraded.some(x => /trace call\(s\) this tick failed/.test(x)),
+      { sf: [sf.trace, sf.degraded] }
+    );
+    // G: a proof older than 2 x traceVerifyMs, and nothing to re-verify with: DEGRADED
+    for (let i = 0; i < 6; i++) a.c.mine();
+    const sg = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident, { now: T0 + 5 * H })).status;
+    cell(
+      "trace: a proof older than twice the verify interval, with no fresh evidence, is DEGRADED",
+      sg.ok === true &&
+        sg.healthy === false &&
+        sg.trace.lastCheck === "unverified" &&
+        sg.trace.capability === "stale",
+      sg.trace
+    );
+    // R5: a scan trace showing the method missing drops the proof; the next quiet tick, with no
+    // sample in reach, is not healthy again
+    const r1 = mk();
+    r1.c.ownerTx(pause("r5-1a"), keeper);
+    settle(r1.c);
+    const r1a = (await runOnce(r1.c.chain, r1.cfg, r1.store, rs, ident, { now: T0 })).status;
+    r1.c.setTraceMode("unsupported");
+    r1.c.ownerTx(pause("r5-1b"), keeper);
+    settle(r1.c);
+    const r1b = (await runOnce(r1.c.chain, r1.cfg, r1.store, rs, ident, { now: T0 + 1 })).status;
+    r1.c.setTraceMode("ok");
+    for (let i = 0; i < 6; i++) r1.c.mine();
+    // no trace call at all on the next tick: its dead letter is gone (as after exhaustion)
+    {
+      const dd = join(dirs.at(-1), "deadletters");
+      for (const f of readdirSync(dd).filter(f => f.endsWith(".json"))) rmSync(join(dd, f));
+    }
+    const r1c = (await runOnce(r1.c.chain, r1.cfg, r1.store, rs, ident, { now: T0 + 2 })).status;
+    // R5: on a quiet chain the stored sample, out of the discovery window, re-proves the capability
+    const r2 = mk();
+    const s2 = r2.c.ownerTx(guardianSet("r5-2"));
+    for (let i = 0; i < 12; i++) r2.c.mine();
+    r2.store.putTraceCapability({ verifiedAt: T0, txHash: s2.hash, by: "test" });
+    const r2a = (await runOnce(r2.c.chain, r2.cfg, r2.store, rs, ident, { now: T0 + 2 * H + 1 }))
+      .status;
+    // R5: every verification trace fails while the proof is still within 2x: degraded
+    const r3 = mk();
+    const s3 = r3.c.ownerTx(guardianSet("r5-3"), { trace: false });
+    settle(r3.c);
+    r3.store.putTraceCapability({ verifiedAt: T0, txHash: s3.hash, by: "test" });
+    const r3a = (await runOnce(r3.c.chain, r3.cfg, r3.store, rs, ident, { now: T0 + H + 1 }))
+      .status;
+    // R5: a receipt with no logs (disagreeing with getLogs) and a log-less trace prove nothing
+    const r4 = mk();
+    const s4 = r4.c.ownerTx(pause("r5-4"), keeper);
+    r4.c.setReceiptLogs(s4.hash, []);
+    r4.c.setTraceMode("noLogs");
+    settle(r4.c);
+    const r4a = (await runOnce(r4.c.chain, r4.cfg, r4.store, rs, ident, { now: T0 })).status;
+    r4.c.setTraceMode("ok");
+    // a receipt that disagrees with getLogs, but agrees with its trace, is no scan proof either
+    const r5 = mk();
+    const s5 = r5.c.ownerTx(pause("r5-5"), keeper);
+    {
+      const g = spIface.encodeEventLog("GuardianSet", [addr("r5-5a"), addr("r5-5b")]);
+      const blk = s5.block;
+      r5.c.setReceiptLogs(s5.hash, [
+        { address: SP, topics: g.topics, data: g.data, index: 0, blockNumber: blk },
+      ]);
+      r5.c.setTrace(s5.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: g.topics, data: g.data }],
+      });
+    }
+    settle(r5.c);
+    const r5a = (await runOnce(r5.c.chain, r5.cfg, r5.store, rs, ident, { now: T0 })).status;
+    // R6: a fresh proof exists; the node now ignores withLog and the receipt comes back empty
+    const r6 = mk();
+    const s6 = r6.c.ownerTx(pause("r6-1"), keeper);
+    r6.c.setReceiptLogs(s6.hash, []);
+    r6.c.setTraceMode("noLogs");
+    settle(r6.c);
+    r6.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+    const r6a = (await runOnce(r6.c.chain, r6.cfg, r6.store, rs, ident, { now: T0 + 1 })).status;
+    r6.c.setTraceMode("ok");
+    // R6: receipt and trace carry OperatorPaused(B) where getLogs saw OperatorPaused(A)
+    const r7 = mk();
+    const s7 = r7.c.ownerTx(pause("r6-A"), keeper);
+    {
+      const b = spIface.encodeEventLog("OperatorPaused", [addr("r6-B")]);
+      r7.c.setReceiptLogs(s7.hash, [
+        { address: SP, topics: b.topics, data: b.data, index: 0, blockNumber: s7.block },
+      ]);
+      r7.c.setTrace(s7.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: b.topics, data: b.data }],
+      });
+    }
+    settle(r7.c);
+    r7.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+    const r7a = (await runOnce(r7.c.chain, r7.cfg, r7.store, rs, ident, { now: T0 + 1 })).status;
+    const r7dir = dirs.at(-1);
+    const r7recs = readdirSync(join(r7dir, "records")).filter(f => f.endsWith(".json"));
+    // R7: the retry is judged against the stored getLogs evidence, not the disputed receipt
+    const r7b = (await runOnce(r7.c.chain, r7.cfg, r7.store, rs, ident, { now: T0 + 2 })).status;
+    const r7recs2 = readdirSync(join(r7dir, "records")).filter(f => f.endsWith(".json"));
+    const r7dl = r7.store.listDeadLetters().find(x => x.txHash === s7.hash);
+    const r6b = (await runOnce(r6.c.chain, r6.cfg, r6.store, rs, ident, { now: T0 + 2 })).status;
+    const r6dl = r6.store.listDeadLetters().find(x => x.txHash === s6.hash);
+    // R7: a tx dead letter without stored evidence re-reads its watched logs by block hash
+    const r8 = mk();
+    const s8 = r8.c.ownerTx(pause("r7-legacy"), { ...keeper, trace: false });
+    settle(r8.c);
+    await runOnce(r8.c.chain, r8.cfg, r8.store, rs, ident, { now: T0 });
+    {
+      // strip the stored evidence, as in a dead letter written before it existed
+      const dd = join(dirs.at(-1), "deadletters");
+      const f8 = readdirSync(dd).find(f => f.startsWith("tx-") && f.endsWith(".json"));
+      const v = JSON.parse(readFileSync(join(dd, f8), "utf8"));
+      delete v.watched;
+      writeFileSync(join(dd, f8), JSON.stringify(v));
+    }
+    {
+      const pz = spIface.encodeEventLog("OperatorPaused", [addr("r7-legacy")]);
+      r8.c.setTrace(s8.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: pz.topics, data: pz.data }],
+      });
+    }
+    const r8a = (await runOnce(r8.c.chain, r8.cfg, r8.store, rs, ident, { now: T0 + 1 })).status;
+    const r8recs = readdirSync(join(dirs.at(-1), "records"))
+      .filter(f => f.endsWith(".json"))
+      .map(f => JSON.parse(readFileSync(join(dirs.at(-1), "records", f), "utf8")))
+      .filter(r => r.txHash === s8.hash);
+    // R8: the receipt holds A and a different B at the same position; the trace matches both
+    const r9 = mk();
+    const s9 = r9.c.ownerTx(pause("r8-A"), keeper);
+    {
+      const a = spIface.encodeEventLog("OperatorPaused", [addr("r8-A")]);
+      const b = spIface.encodeEventLog("OperatorPaused", [addr("r8-B")]);
+      const kp = ethers.id("updatePrice()").slice(0, 10);
+      r9.c.setReceiptLogs(s9.hash, [
+        { address: SP, topics: a.topics, data: a.data, index: 0, blockNumber: s9.block },
+        { address: SP, topics: b.topics, data: b.data, index: 0, blockNumber: s9.block },
+      ]);
+      r9.c.setTrace(s9.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: a.topics, data: a.data, position: 0 }],
+        calls: [
+          {
+            type: "CALL",
+            from: addr("r8-other"),
+            to: SP,
+            input: kp,
+            logs: [{ address: SP, topics: b.topics, data: b.data }],
+          },
+        ],
+      });
+    }
+    settle(r9.c);
+    const r9dir = dirs.at(-1);
+    r9.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+    const r9a = (await runOnce(r9.c.chain, r9.cfg, r9.store, rs, ident, { now: T0 + 1 })).status;
+    const r9b = (await runOnce(r9.c.chain, r9.cfg, r9.store, rs, ident, { now: T0 + 2 })).status;
+    const r9recs = readdirSync(join(r9dir, "records")).filter(f => f.endsWith(".json"));
+    // R8: an extra watched log at a free position, and a duplicated position on an unwatched log
+    const extraCase = async (mkLogs, tag) => {
+      const r = mk();
+      const sx = r.c.ownerTx(pause(`r8-${tag}`), keeper);
+      const a = spIface.encodeEventLog("OperatorPaused", [addr(`r8-${tag}`)]);
+      const rl = mkLogs(a, sx.block);
+      r.c.setReceiptLogs(sx.hash, rl);
+      r.c.setTrace(sx.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: rl.map(l => ({ address: l.address, topics: l.topics, data: l.data })),
+      });
+      settle(r.c);
+      r.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+      return (await runOnce(r.c.chain, r.cfg, r.store, rs, ident, { now: T0 + 1 })).status;
+    };
+    const extraW = await extraCase((a, blk) => {
+      const b = spIface.encodeEventLog("OperatorPaused", [addr("r8-extra-B")]);
+      return [
+        { address: SP, topics: a.topics, data: a.data, index: 0, blockNumber: blk },
+        { address: SP, topics: b.topics, data: b.data, index: 1, blockNumber: blk },
+      ];
+    }, "extra");
+    const dupU = await extraCase(
+      (a, blk) => [
+        { address: SP, topics: a.topics, data: a.data, index: 0, blockNumber: blk },
+        { address: AGG, topics: [ethers.ZeroHash], data: "0x", index: 0, blockNumber: blk },
+      ],
+      "dup"
+    );
+    const upper = x => "0x" + x.slice(2).toUpperCase();
+    const caseR = await extraCase(
+      (a, blk) => [
+        {
+          address: SP,
+          topics: a.topics.map(upper),
+          data: upper(a.data),
+          index: 0,
+          blockNumber: blk,
+        },
+      ],
+      "case"
+    );
+    // R12: an invalid receipt position is handled per tx (inconsistent), never aborts the tick;
+    // a consistent receipt whose trace cannot align (noncontiguous positions) is a health finding
+    const badPos = await extraCase(
+      (a, blk) => [{ address: SP, topics: a.topics, data: a.data, index: false, blockNumber: blk }],
+      "badpos"
+    );
+    const gap = await extraCase(
+      (a, blk) => [
+        { address: SP, topics: a.topics, data: a.data, index: 0, blockNumber: blk },
+        { address: AGG, topics: [ethers.ZeroHash], data: "0x", index: 2, blockNumber: blk },
+      ],
+      "gap"
+    );
+    cell(
+      "trace R12: an invalid receipt position is a per-tx inconsistency (tick ok); a consistent receipt that cannot align degrades",
+      badPos.ok === true &&
+        badPos.trace.thisTick.inconsistent === 1 &&
+        gap.ok === true &&
+        gap.trace.thisTick.unaligned === 1 &&
+        !gap.trace.thisTick.verified &&
+        gap.healthy === false &&
+        gap.degraded.some(x => /did not align/.test(x)),
+      { badPos: [badPos.ok, badPos.lastError, badPos.trace], gap: [gap.trace, gap.degraded] }
+    );
+    // R13: a stale backend answers receipt + trace from an orphaned earlier inclusion
+    const orphan = mk();
+    const so = orphan.c.ownerTx(pause("r13-orphan"), keeper);
+    orphan.c.patchReceipt(so.hash, { blockNumber: so.block - 1, blockHash: ethers.id("orphan") });
+    settle(orphan.c);
+    orphan.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+    const sOr = (
+      await runOnce(orphan.c.chain, orphan.cfg, orphan.store, rs, ident, { now: T0 + 1 })
+    ).status;
+    const orRecs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+    const orDl = orphan.store.listDeadLetters().find(x => x.txHash === so.hash);
+    // R14: a legacy dead letter (evidence without blockHash) is anchored on the canonical header
+    const leg = mk();
+    const sl = leg.c.ownerTx(pause("r14-legacy"), { ...keeper, trace: false });
+    settle(leg.c);
+    await runOnce(leg.c.chain, leg.cfg, leg.store, rs, ident, { now: T0 });
+    {
+      const dd = join(dirs.at(-1), "deadletters");
+      const fl = readdirSync(dd).find(f => f.startsWith("tx-") && f.endsWith(".json"));
+      const v = JSON.parse(readFileSync(join(dd, fl), "utf8"));
+      for (const w of v.watched) delete w.blockHash;
+      writeFileSync(join(dd, fl), JSON.stringify(v));
+    }
+    {
+      const pz = spIface.encodeEventLog("OperatorPaused", [addr("r14-legacy")]);
+      leg.c.setTrace(sl.hash, {
+        type: "CALL",
+        logs: [{ address: SP, topics: pz.topics, data: pz.data }],
+      });
+    }
+    // same height, orphaned inclusion: hash differs from the canonical header
+    leg.c.patchReceipt(sl.hash, { blockHash: ethers.id("r14-orphan") });
+    const sLeg = (await runOnce(leg.c.chain, leg.cfg, leg.store, rs, ident, { now: T0 + 1 }))
+      .status;
+    const legRecs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+    leg.c.patchReceipt(sl.hash, {});
+    const sLeg2 = (await runOnce(leg.c.chain, leg.cfg, leg.store, rs, ident, { now: T0 + 2 }))
+      .status;
+    const legRecs2 = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+    cell(
+      "trace R14: a legacy dead letter is anchored on the canonical header: an orphaned same-height receipt is refused, the canonical one attributes",
+      sLeg.trace.thisTick.inconsistent === 1 &&
+        legRecs.length === 0 &&
+        sLeg2.trace.thisTick.verified === 1 &&
+        legRecs2.length === 1,
+      { sLeg: sLeg.trace, legRecs, sLeg2: sLeg2.trace, legRecs2 }
+    );
+    cell(
+      "trace R13: a receipt from another inclusion (block) is inconsistent: no record, no proof, degraded; the dead letter keeps the block hash",
+      sOr.trace.thisTick.inconsistent === 1 &&
+        !sOr.trace.thisTick.verified &&
+        orRecs.length === 0 &&
+        sOr.healthy === false &&
+        typeof orDl?.watched?.[0]?.blockHash === "string",
+      { trace: sOr.trace, orRecs, w: orDl?.watched }
+    );
+    cell(
+      "trace R9: a receipt differing from getLogs only in hex case is consistent (supporting node stays healthy)",
+      !caseR.trace.thisTick.inconsistent && caseR.trace.thisTick.verified === 1 && caseR.healthy,
+      caseR.trace
+    );
+    // R11: a trace whose root is not the tx (input or sender differ) is inconsistent
+    const rootCase = async (patch, tag) => {
+      const r = mk();
+      const sx = r.c.ownerTx(pause(`r11-${tag}`), keeper);
+      const a = spIface.encodeEventLog("OperatorPaused", [addr(`r11-${tag}`)]);
+      r.c.setTrace(sx.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: a.topics, data: a.data }],
+        ...patch,
+      });
+      settle(r.c);
+      r.store.putTraceCapability({ verifiedAt: T0, txHash: null, by: "test" });
+      const st = (await runOnce(r.c.chain, r.cfg, r.store, rs, ident, { now: T0 + 1 })).status;
+      const recs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+      return { st, recs };
+    };
+    const rootIn = await rootCase({ input: "0xdeadbeef" }, "input");
+    const rootFrom = await rootCase({ from: addr("r11-other") }, "from");
+    const rootOk = await rootCase({}, "ok");
+    cell(
+      "trace R11: a trace root that is not the tx (input or sender differ) is inconsistent: no record, no proof, degraded",
+      [rootIn, rootFrom].every(
+        x =>
+          x.st.trace.thisTick.inconsistent === 1 &&
+          !x.st.trace.thisTick.verified &&
+          x.recs.length === 0 &&
+          x.st.healthy === false
+      ) &&
+        rootOk.st.healthy === true &&
+        rootOk.st.trace.thisTick.verified === 1 &&
+        rootOk.recs.length === 1,
+      { rootIn: rootIn.st.trace, rootFrom: rootFrom.st.trace, rootOk: rootOk.st.trace }
+    );
+    cell(
+      "trace R8: a receipt with an extra watched log, or a duplicated position on any log, is inconsistent",
+      extraW.trace.thisTick.inconsistent === 1 &&
+        !extraW.trace.thisTick.verified &&
+        dupU.trace.thisTick.inconsistent === 1 &&
+        !dupU.trace.thisTick.verified,
+      { extraW: extraW.trace, dupU: dupU.trace }
+    );
+    const dupAttr = attributeLogs(
+      { type: "CALL", to: SP, logs: [] },
+      [
+        { address: SP, topics: [], data: "0x", index: 0 },
+        { address: SP, topics: [], data: "0x", index: 0 },
+      ],
+      AGG,
+      SP
+    );
+    cell(
+      "trace R8: duplicated receipt positions or extra watched logs are inconsistent (first tick and retry); attributeLogs refuses duplicate positions",
+      r9a.trace.thisTick.inconsistent === 1 &&
+        r9b.trace.thisTick.inconsistent === 1 &&
+        !r9a.trace.thisTick.verified &&
+        !r9b.trace.thisTick.verified &&
+        r9recs.length === 0 &&
+        r9b.healthy === false &&
+        dupAttr.aligned === false &&
+        /duplicated/.test(dupAttr.why),
+      { r9a: r9a.trace, r9b: r9b.trace, r9recs, dupAttr: dupAttr.why }
+    );
+    cell(
+      "trace R7: retries use the stored getLogs evidence (a disputed or empty receipt never closes the dead letter); a legacy dead letter re-reads by block hash",
+      r7b.healthy === false &&
+        r7recs2.length === 0 &&
+        r7dl?.watched?.length === 1 &&
+        r7b.trace.thisTick.inconsistent === 1 &&
+        r6b.healthy === false &&
+        r6dl?.watched?.length === 1 &&
+        r8a.ok === true &&
+        r8recs.length === 1 &&
+        r8recs[0].route === "public",
+      {
+        r7b: [r7b.trace, r7b.degraded],
+        r7recs2,
+        r7dl: r7dl && { w: r7dl.watched?.length, a: r7dl.attempts },
+        r6b: r6b.trace,
+        r6dl: r6dl && { w: r6dl.watched?.length },
+        r8: [r8a.ok, r8a.lastError, r8recs],
+      }
+    );
+    cell(
+      "trace R6: watched logs make a log-less trace unsupported even with an empty receipt; a receipt with other contents is inconsistent (no attribution, degraded, proof dropped)",
+      r6a.healthy === false &&
+        r6a.trace.thisTick.noLogs >= 1 &&
+        r6a.trace.capability !== "verified" &&
+        r7a.healthy === false &&
+        r7a.trace.thisTick.inconsistent === 1 &&
+        !r7a.trace.thisTick.verified &&
+        r7a.degraded.some(x => /disagrees with getLogs/.test(x)) &&
+        r7recs.length === 0,
+      { r6: [r6a.trace, r6a.degraded], r7: [r7a.trace, r7a.degraded], r7recs }
+    );
+    cell(
+      "trace R5: unsupported in the scan drops the proof; a stored sample re-proves a quiet chain; failed verification traces degrade; an empty receipt proves nothing",
+      r1a.healthy === true &&
+        r1b.healthy === false &&
+        r1c.healthy === false &&
+        r1c.trace.capability === "unverified" &&
+        r2a.healthy === true &&
+        r2a.trace.lastCheck === "verified" &&
+        r2a.trace.sampleTx === s2.hash &&
+        r3a.healthy === false &&
+        r3a.degraded.some(x => /verification: 1 sample trace/.test(x)) &&
+        r4a.healthy === false &&
+        r4a.trace.capability !== "verified" &&
+        !r4a.trace.thisTick.verified &&
+        !r5a.trace.thisTick.verified,
+      {
+        r1: [r1a.trace, r1b.degraded, r1c.trace],
+        r2: r2a.trace,
+        r3: [r3a.trace, r3a.degraded],
+        r4: [r4a.trace, r4a.degraded],
+        r5: r5a.trace,
+      }
+    );
+    const failed = (
+      await runOnce(
+        {
+          ...a.c.chain,
+          send: async (m, p) => {
+            if (m === "eth_getBlockByNumber") throw new Error("down");
+            return a.c.chain.send(m, p);
+          },
+        },
+        a.cfg,
+        a.store,
+        rs,
+        ident,
+        { now: T0 + 5 * H + 1 }
+      )
+    ).status;
+    cell(
+      "a failed tick is never healthy, and still reports the trace capability",
+      failed.ok === false && failed.healthy === false && failed.trace?.capability === "stale",
+      failed
+    );
+  } finally {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  }
+  {
+    // traceHealth alone, on a chain with no sample: a scan trace that shows the capability missing
+    // drops the fresh proof, so the next quiet tick (no trace calls at all) is not healthy
+    const d6 = mkdtempSync(join(tmpdir(), "guardian-watcher-th-"));
+    try {
+      const st = new Store(d6);
+      const empty = {
+        send: async m => (m === "eth_getBlockByNumber" ? { transactions: [] } : null),
+        getTransactionReceipt: async () => null,
+      };
+      const thCfg = { aggregator: AGG, roles: { superPaymaster: SP } };
+      st.putTraceCapability({ verifiedAt: 1000, txHash: null, by: "test" });
+      const h0 = await traceHealth(empty, thCfg, st, {}, 50, 2000);
+      const h1 = await traceHealth(empty, thCfg, st, { unsupported: 1 }, 50, 3000);
+      const h2 = await traceHealth(empty, thCfg, st, {}, 50, 4000);
+      const h3 = await traceHealth(empty, thCfg, st, { noLogs: 1 }, 50, 5000);
+      cell(
+        "traceHealth: unsupported or log-less scan traces drop the proof; a quiet tick after that is not healthy",
+        h0.degraded === null &&
+          h1.degraded !== null &&
+          h2.degraded !== null &&
+          h2.trace.capability === "unverified" &&
+          h3.degraded !== null,
+        { h0, h1: h1.degraded, h2: [h2.trace, h2.degraded] }
+      );
+      st.putTraceCapability({ verifiedAt: 1000, txHash: null, by: "test" });
+      await traceHealth(empty, thCfg, st, { noLogs: 1 }, 50, 6000);
+      const h4 = await traceHealth(empty, thCfg, st, {}, 50, 7000);
+      cell("traceHealth: a log-less scan trace also drops the proof", h4.degraded !== null, h4);
+      st.putTraceCapability({ verifiedAt: 1000, txHash: null, by: "test" });
+      await traceHealth(empty, thCfg, st, { inconsistent: 1 }, 50, 8000);
+      const h5 = await traceHealth(empty, thCfg, st, {}, 50, 9000);
+      cell(
+        "traceHealth: a receipt that disagrees with getLogs also drops the proof",
+        h5.degraded !== null && h5.trace.capability === "unverified",
+        h5
+      );
+    } finally {
+      rmSync(d6, { recursive: true, force: true });
+    }
+  }
+  const e = (code, message) => Object.assign(new Error(message), { error: { code, message } });
+  cell(
+    "traceUnsupported: method-missing answers are unsupported; lookup misses and transport errors are not",
+    traceUnsupported(e(-32601, "x")) &&
+      traceUnsupported(
+        new Error("the method debug_traceTransaction does not exist/is not available")
+      ) &&
+      traceUnsupported(new Error("Method not found")) &&
+      traceUnsupported(new Error("debug namespace is disabled")) &&
+      traceUnsupported(new Error('unknown tracer "callTracer"')) &&
+      !traceUnsupported(new Error("transaction not found")) &&
+      !traceUnsupported(new Error("Cannot find block hash for transaction 0x01")) &&
+      !traceUnsupported(new Error("execution timeout")) &&
+      !traceUnsupported(Object.assign(new Error("x"), { code: "ECONNRESET" })),
+    null
+  );
+  {
+    const pu = spIface.encodeEventLog("PriceUpdated", [1n, 2n]);
+    const l = { address: SP, topics: pu.topics, data: pu.data, index: 3 };
+    const up = x => ({ ...x, address: x.address.toUpperCase().replace("0X", "0x") });
+    cell(
+      "sameLog: position, address, every topic and data must all match (hex case ignored)",
+      sameLog(l, up(l)) &&
+        !sameLog(l, { ...l, index: 4 }) &&
+        !sameLog(l, { ...l, address: AGG }) &&
+        !sameLog(l, {
+          ...l,
+          data: ethers.AbiCoder.defaultAbiCoder().encode(["int256", "uint256"], [1n, 3n]),
+        }) &&
+        !sameLog(l, { ...l, topics: [...l.topics, ethers.ZeroHash] }) &&
+        !sameLog({ ...l, index: false }, l) &&
+        !sameLog({ ...l, index: 3, logIndex: 4 }, l),
+      null
+    );
+  }
+  {
+    // R9: a trace log whose explicit position is outside [0, calls.length] makes the trace unsure
+    const pz = spIface.encodeEventLog("OperatorPaused", [addr("r9")]);
+    const lg = { address: SP, topics: pz.topics, data: pz.data };
+    const tr = pos => ({
+      type: "CALL",
+      from: addr("root"),
+      to: SP,
+      input: "0x11111111",
+      logs: [{ ...lg, position: pos }],
+      calls: [{ type: "CALL", from: addr("child"), to: SP, input: "0x22222222", logs: [lg] }],
+    });
+    const rc = [
+      { ...lg, index: 0 },
+      { ...lg, index: 1 },
+    ];
+    // a single-log receipt: a dropped root log would leave the child's identical log to align
+    const bad = [2, -1, 0.5, "x", true, false, "", [0], {}, "0x"].map(
+      p => attributeLogs(tr(p), [{ ...lg, index: 0 }], AGG, SP).aligned
+    );
+    const good = attributeLogs(tr("0x1"), rc, AGG, SP);
+    // positions that decrease within a frame are contradictory, never reordered
+    const dec = attributeLogs(
+      {
+        type: "CALL",
+        from: addr("root"),
+        to: SP,
+        input: "0x11111111",
+        logs: [
+          { ...lg, position: 1 },
+          { ...lg, position: 0 },
+        ],
+        calls: [{ type: "CALL", from: addr("child"), to: SP, input: "0x22222222", logs: [lg] }],
+      },
+      [0, 1, 2].map(i => ({ ...lg, index: i })),
+      AGG,
+      SP
+    );
+    cell(
+      "attribution: a trace log position that is not an in-range integer (number or decimal/0x string), or that decreases within a frame, makes the trace unusable; a hex position is read",
+      bad.every(a => a === false) &&
+        [2, -1, 0.5, "x", true, false, "", [0], {}, "0x"].every(
+          p => flattenTraceLogs(tr(p), AGG, SP) === null
+        ) &&
+        dec.aligned === false &&
+        good.aligned === true &&
+        good.spCall.get(0)?.from === addr("child"),
+      { bad, good: [...good.spCall] }
+    );
+  }
+  {
+    const pz = spIface.encodeEventLog("OperatorPaused", [addr("r11u")]);
+    const L = { address: SP, topics: pz.topics, data: pz.data };
+    cell(
+      "validLog: string 20-byte address, <=4 32-byte topics, even-length hex data; LOG0 ok",
+      validLog(L) &&
+        validLog({ ...L, topics: [] }) &&
+        !validLog({ ...L, address: [SP] }) &&
+        !validLog({ ...L, address: "0x1" }) &&
+        !validLog({ ...L, topics: [[pz.topics[0]]] }) &&
+        !validLog({ ...L, topics: ["0x1"] }) &&
+        !validLog({ ...L, topics: Array(5).fill(pz.topics[0]) }) &&
+        !validLog({ ...L, data: "0x1" }) &&
+        !validLog({ ...L, data: ["0x"] }) &&
+        !validLog({ ...L, data: undefined }) &&
+        attributeLogs(
+          { type: "CALL", to: SP, logs: [{ ...L, address: [SP] }] },
+          [{ ...L, index: 0 }],
+          AGG,
+          SP
+        ).aligned === false,
+      null
+    );
+    const bads = [false, true, [], [0], "", " 1", "1e0", "0b1", -1, 1.5].map(v =>
+      receiptPos({ index: v })
+    );
+    const t2 = n => ({ type: "CALL", to: SP, logs: Array(n).fill(L) });
+    cell(
+      "receiptPos strict (aliases must agree); receipt positions must be unique and contiguous (a nonzero offset is fine)",
+      bads.every(x => x === null) &&
+        receiptPos({ index: 0, logIndex: 99 }) === null &&
+        receiptPos({ index: 3, logIndex: "0x3" }) === 3 &&
+        receiptPos({ logIndex: "0x2" }) === 2 &&
+        attributeLogs(
+          t2(2),
+          [
+            { ...L, index: 0 },
+            { ...L, index: 2 },
+          ],
+          AGG,
+          SP
+        ).aligned === false &&
+        attributeLogs(
+          t2(2),
+          [
+            { ...L, index: 5 },
+            { ...L, index: 6 },
+          ],
+          AGG,
+          SP
+        ).aligned === true,
+      { bads }
+    );
+    const H0 = ethers.id("tx-0");
+    const ok = { from: addr("u"), to: SP, data: "0x12345678" };
+    const tr = { type: "CALL", from: addr("u"), to: SP, input: "0x12345678" };
+    const rc = (x = {}) => ({ transactionHash: H0, status: 1, logs: [{ ...L, index: 0 }], ...x });
+    cell(
+      "envelopeProblem: receipt for another tx, failed receipt with logs, removed / foreign logs, and a trace root that is not the tx are refused",
+      envelopeProblem(H0, ok, rc(), tr) === null &&
+        envelopeProblem(H0, { ...ok, to: null }, rc(), { ...tr, type: "CREATE", to: addr("c") }) ===
+          null &&
+        /another tx/.test(envelopeProblem(H0, ok, rc({ transactionHash: ethers.id("x") }), tr)) &&
+        /explicit success/.test(envelopeProblem(H0, ok, rc({ status: 0 }), tr)) &&
+        /explicit success/.test(envelopeProblem(H0, ok, rc({ status: undefined }), tr)) &&
+        /does not name/.test(envelopeProblem(H0, ok, rc({ transactionHash: undefined }), tr)) &&
+        envelopeProblem(H0, ok, rc({ transactionHash: undefined, hash: H0, status: "0x1" }), tr) ===
+          null &&
+        /another tx/.test(envelopeProblem(H0, ok, rc({ hash: ethers.id("z") }), tr)) &&
+        /removed/.test(
+          envelopeProblem(H0, ok, rc({ logs: [{ ...L, index: 0, removed: true }] }), tr)
+        ) &&
+        /another tx/.test(
+          envelopeProblem(
+            H0,
+            ok,
+            rc({ logs: [{ ...L, index: 0, transactionHash: ethers.id("y") }] }),
+            tr
+          )
+        ) &&
+        /sender/.test(envelopeProblem(H0, ok, rc(), { ...tr, from: addr("v") })) &&
+        /destination/.test(envelopeProblem(H0, ok, rc(), { ...tr, to: addr("v") })) &&
+        /destination/.test(envelopeProblem(H0, { ...ok, to: null }, rc(), tr)) &&
+        /input/.test(envelopeProblem(H0, ok, rc(), { ...tr, input: "0x12345679" })),
+      null
+    );
+    const B = { blockNumber: 7, blockHash: ethers.id("b7") };
+    const rcB = (x = {}) => rc({ ...B, ...x });
+    cell(
+      "envelopeProblem: receipt, its logs and the tx must name the evidence's block",
+      envelopeProblem(H0, ok, rcB(), tr, B) === null &&
+        envelopeProblem(H0, { ...ok, ...B }, rcB(), tr, B) === null &&
+        /another block/.test(
+          envelopeProblem(H0, ok, rcB({ blockHash: ethers.id("b7x") }), tr, B)
+        ) &&
+        /another block/.test(envelopeProblem(H0, ok, rcB({ blockNumber: 6 }), tr, B)) &&
+        /does not name its block/.test(
+          envelopeProblem(H0, ok, rcB({ blockHash: undefined }), tr, B)
+        ) &&
+        /another block/.test(
+          envelopeProblem(H0, { ...ok, blockHash: ethers.id("b7y") }, rcB(), tr, B)
+        ) &&
+        /another block/.test(
+          envelopeProblem(H0, ok, rcB({ logs: [{ ...L, index: 0, blockNumber: 8 }] }), tr, B)
+        ),
+      null
+    );
+    const noPosParent = child =>
+      attributeLogs(
+        {
+          type: "CALL",
+          to: SP,
+          logs: [L],
+          calls: [{ type: "CALL", from: SP, to: AGG, logs: child }],
+        },
+        child.length
+          ? [
+              { ...L, index: 0 },
+              { ...L, index: 1 },
+            ]
+          : [{ ...L, index: 0 }],
+        AGG,
+        SP
+      ).aligned;
+    cell(
+      "positionless logs (geth before positions) are accepted when no child has a surviving log, refused when ambiguous",
+      noPosParent([]) === true && noPosParent([L]) === false,
+      null
+    );
+    const nullTrace = await verifyTrace(
+      {
+        send: async m =>
+          m === "eth_getBlockByNumber" ? { transactions: [ethers.id("s1")] } : null,
+        getTransactionReceipt: async () => ({ status: 1, logs: [{ ...L, index: 0 }] }),
+        getTransaction: async () => ok,
+      },
+      { aggregator: AGG, roles: { superPaymaster: SP } },
+      10,
+      { blocks: 1 }
+    );
+    const vt = input =>
+      verifyTrace(
+        {
+          send: async m =>
+            m === "eth_getBlockByNumber"
+              ? { transactions: [ethers.id("s2")] }
+              : { type: "CALL", from: ok.from, to: SP, input, logs: [L] },
+          getTransactionReceipt: async () => ({
+            transactionHash: ethers.id("s2"),
+            status: 1,
+            logs: [{ ...L, index: 0 }],
+          }),
+          getTransaction: async () => ok,
+        },
+        { aggregator: AGG, roles: { superPaymaster: SP } },
+        10,
+        { blocks: 1 }
+      );
+    const vMis = await vt("0xdeadbeef");
+    const vOk = await vt(ok.data);
+    cell(
+      "verifyTrace: a sample whose trace root is not its tx proves nothing; the matching root verifies",
+      vMis.state === "unverified" && /input differs/.test(vMis.reason) && vOk.state === "verified",
+      { vMis, vOk }
+    );
+    const vs = canon =>
+      verifyTrace(
+        {
+          send: async (m, p) =>
+            m === "eth_getBlockByNumber"
+              ? p[0] === ethers.toQuantity(9)
+                ? { number: "0x9", hash: canon, transactions: [] }
+                : { transactions: [] }
+              : { type: "CALL", from: ok.from, to: SP, input: ok.data, logs: [L] },
+          getTransactionReceipt: async () => ({
+            transactionHash: ethers.id("s3"),
+            status: 1,
+            blockNumber: 9,
+            blockHash: ethers.id("b9"),
+            logs: [{ ...L, index: 0 }],
+          }),
+          getTransaction: async () => ok,
+        },
+        { aggregator: AGG, roles: { superPaymaster: SP } },
+        20,
+        { blocks: 1, sampleTx: ethers.id("s3") }
+      );
+    const vCanon = await vs(ethers.id("b9"));
+    const vStale = await vs(ethers.id("b9-reorged"));
+    cell(
+      "verifyTrace: the stored sample proves only while its receipt's block is still canonical",
+      vCanon.state === "verified" &&
+        vStale.state === "unverified" &&
+        /another block/.test(vStale.reason),
+      { vCanon, vStale }
+    );
+    cell(
+      "verifyTrace: a null trace answer is inconclusive (unverified, counted failed), not 'unsupported'",
+      nullTrace.state === "unverified" && nullTrace.failed === 1,
+      nullTrace
+    );
+  }
+  cell(
+    "verifyTrace: a chain without send() is unsupported",
+    (await verifyTrace({}, { roles: {} }, 10)).state === "unsupported",
+    null
+  );
+}
+
+// ---- store: dead letters keep established evidence; only an authenticated record counts as done
+{
+  const d4 = mkdtempSync(join(tmpdir(), "guardian-watcher-store-"));
+  try {
+    const s = new Store(d4);
+    const h = ethers.id("store-unit");
+    const base = { txHash: h, blockNumber: 1, seenAt: "t0" };
+    s.putDeadLetter({
+      ...base,
+      route: "tx",
+      status: "ERROR",
+      reasons: ["price read failed"],
+      events: [],
+      pendingRecords: [{ route: "public", txHash: h, logIndex: 0, priceMissing: true }],
+    });
+    s.putDeadLetter({
+      ...base,
+      route: "tx",
+      status: "ERROR",
+      reasons: ["transaction unavailable"],
+      events: [],
+    });
+    const t = s.getDeadLetter(`tx-${h.toLowerCase()}`);
+    s.putDeadLetter({
+      ...base,
+      route: "bls",
+      key: "5",
+      status: "PRICE_UNAVAILABLE",
+      reasons: ["price read failed"],
+      pendingRecord: { route: "bls", kind: "GENERIC", key: "5" },
+    });
+    s.putDeadLetter({
+      ...base,
+      route: "bls",
+      key: "5",
+      status: "ERROR",
+      reasons: ["transaction unavailable"],
+    });
+    const b = s.getDeadLetter(Store.recordId({ route: "bls", key: "5" }));
+    cell(
+      "a dead letter keeps established evidence across a weaker later failure (pendingRecords; pendingRecord + status)",
+      t?.pendingRecords?.length === 1 &&
+        t.reasons[0] === "transaction unavailable" &&
+        t.attempts === 2 &&
+        b?.pendingRecord?.kind === "GENERIC" &&
+        b.status === "PRICE_UNAVAILABLE" &&
+        b.attempts === 2,
+      { t, b }
+    );
+    s.putRecord({ ...base, route: "bls", key: "6", kind: undefined });
+    const unrec = s.hasBlsRecord(6n);
+    writeFileSync(
+      join(d4, "records", `${Store.recordId({ route: "bls", kind: "SLASH", key: "7" })}.json`),
+      "{not json"
+    );
+    const corrupt = s.hasBlsRecord(7n);
+    s.putRecord({ ...base, route: "bls", key: "8", kind: "SLASH" });
+    const real = s.hasBlsRecord(8n);
+    cell(
+      "hasBlsRecord: only a parseable authenticated record counts (not UNRECOVERED, not corrupt)",
+      !unrec && !corrupt && real,
+      { unrec, corrupt, real }
+    );
+  } finally {
+    rmSync(d4, { recursive: true, force: true });
+  }
+}
+
+// ---- matchGeneric needs target AND selector; callsWithCommit filters effect attribution; bloom unit
+{
+  const e = matchGeneric(rs, { superPaymaster: SP }, SP, ethers.id("updatePrice()").slice(0, 10));
+  const ok = matchGeneric(
+    rs,
+    { superPaymaster: SP },
+    SP,
+    spIface.encodeFunctionData("updatePriceDVT", [1n, 1n, "0x", 0])
+  );
+  cell(
+    "matchGeneric: right target, wrong selector is NOT the expected entry; right selector is",
+    e === null && ok?.signature === "updatePriceDVT(int256,uint256,bytes,uint8)",
+    { e, ok }
+  );
+  const pz = spIface.encodeEventLog("OperatorPaused", [addr("x")]);
+  const sc = aggIface.encodeEventLog("SignersCommitted", [1n, 3n]);
+  const trace = {
+    type: "CALL",
+    to: SAFE,
+    calls: [
+      { type: "CALL", to: AGG, logs: [{ address: AGG, ...sc, position: 0 }] },
+      // a second aggregator call WITHOUT a commitment emits the SP event: not an action's effect
+      {
+        type: "CALL",
+        to: AGG,
+        calls: [
+          { type: "CALL", from: AGG, to: SP, input: "0x12345678", logs: [{ address: SP, ...pz }] },
+        ],
+      },
+    ],
+  };
+  const a = attributeLogs(
+    trace,
+    [
+      { address: AGG, ...sc, index: 0 },
+      { address: SP, ...pz, index: 1 },
+    ],
+    AGG,
+    SP
+  );
+  cell(
+    "attribution: an SP log inside an aggregator call that has no commitment belongs to that call, not the committed one",
+    a.aligned && a.owner.get(0) === 0 && a.owner.get(1) === 1 && a.spCall.get(1)?.from === AGG,
+    { owner: [...a.owner], sp: [...a.spCall] }
+  );
+  const bl = bloomOf([{ address: SP, topics: [pz.topics[0]] }]);
+  cell(
+    "bloom: present (address, topic) is 'may', absent topic is 'no', unreadable is null",
+    mayHaveLog(bl, SP, [pz.topics[0]]) === true &&
+      mayHaveLog(bl, SP, [spIface.getEvent("GuardianSet").topicHash]) === false &&
+      mayHaveLog(undefined, SP, [pz.topics[0]]) === null,
+    null
+  );
 }
 
 let failed = 0;
