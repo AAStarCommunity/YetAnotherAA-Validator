@@ -9,7 +9,7 @@ import {
 } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.mjs";
-import { attributeLogs, receiptPos } from "./attribute.mjs";
+import { attributeLogs, receiptPos, validLog, parsePosition } from "./attribute.mjs";
 import { mayHaveLog } from "./bloom.mjs";
 import { Store } from "./store.mjs";
 import { SafeError, safeText, guarded } from "./safe-error.mjs";
@@ -28,7 +28,14 @@ async function header(chain, tag) {
     ])
   );
   if (!b || !b.hash) throw new SafeError(`block ${tag} unavailable`);
-  return { number: Number(b.number), hash: b.hash, logsBloom: b.logsBloom };
+  // A header is accepted only with a 32-byte hash and a parseable height: a malformed one fails the
+  // tick (the cursor is never set from it) and is never interpolated (Codex follow-up R10).
+  const number = parsePosition(b.number);
+  if (typeof b.hash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(b.hash) || number === null)
+    throw new SafeError("malformed block header");
+  if (typeof tag === "number" && number !== tag)
+    throw new SafeError("block header for another height");
+  return { number, hash: b.hash, logsBloom: b.logsBloom };
 }
 
 /** getLogs over [from, to], paged; a failing page halves down to one block before giving up. */
@@ -103,7 +110,7 @@ export function traceUnsupported(e) {
 
 /** The same log: position, address, every topic and the data (case-insensitive hex). */
 export function sameLog(a, b) {
-  const h = x => String(x ?? "").toLowerCase();
+  const h = x => str(x).toLowerCase();
   const ta = a.topics ?? [];
   const tb = b.topics ?? [];
   const pa = receiptPos(a);
@@ -284,13 +291,13 @@ export function envelopeProblem(txHash, tx, rc, trace, at = {}) {
   };
   if (present(at.blockHash) && rc && !present(rc.blockHash))
     return "receipt does not name its block";
-  let firstHash = present(at.blockHash) ? String(at.blockHash) : null;
+  let firstHash = present(at.blockHash) ? str(at.blockHash) : null;
   for (const [what, o] of sources) {
     if (!o) continue;
     if (present(o.blockNumber) && present(want.number) && num(o.blockNumber) !== want.number)
       return `${what} is from another block`;
     if (present(o.blockHash)) {
-      if (firstHash === null) firstHash = String(o.blockHash);
+      if (firstHash === null) firstHash = str(o.blockHash);
       else if (!lcEq(o.blockHash, firstHash)) return `${what} is from another block`;
     }
   }
@@ -308,12 +315,49 @@ export function envelopeProblem(txHash, tx, rc, trace, at = {}) {
   }
   if (trace && tx) {
     if (!tx.from || !lcEq(trace.from, tx.from)) return "trace root sender differs from the tx";
-    if (tx.to ? !lcEq(trace.to, tx.to) : !/^CREATE2?$/i.test(String(trace.type)))
+    if (tx.to ? !lcEq(trace.to, tx.to) : !/^CREATE2?$/i.test(str(trace.type)))
       return "trace root destination differs from the tx";
-    if (String(trace.input ?? "").toLowerCase() !== String(tx.data ?? tx.input ?? "").toLowerCase())
+    if (str(trace.input).toLowerCase() !== str(tx.data ?? tx.input).toLowerCase())
       return "trace root input differs from the tx";
   }
   return null;
+}
+
+/**
+ * The chain as BLS reconstruction sees it, with every tx and receipt response checked against the
+ * request (Codex follow-up R6): reconstruction fetches its own copies, and a mixed backend must
+ * not hand it another tx's sender. A response that names another tx, or no tx, or (for the
+ * action's own block) another block, throws: the action becomes a retried dead letter.
+ */
+function identityGuard(chain, block) {
+  const same = (got, want) => typeof got === "string" && lcEq(got, want);
+  const inBlock = o =>
+    o?.blockNumber === undefined ||
+    o?.blockNumber === null ||
+    parsePosition(o.blockNumber) === block;
+  return new Proxy(chain, {
+    get(target, prop) {
+      if (prop === "getTransaction")
+        return async h => {
+          const tx = await target.getTransaction(h);
+          if (tx && (!same(tx.hash, h) || !inBlock(tx)))
+            throw new SafeError("transaction response names another tx or block");
+          return tx;
+        };
+      if (prop === "getTransactionReceipt")
+        return async h => {
+          const rc = await target.getTransactionReceipt(h);
+          if (rc) {
+            const ids = [rc.transactionHash, rc.hash].filter(x => x !== undefined && x !== null);
+            if (!ids.length || !ids.every(x => same(x, h)) || !inBlock(rc))
+              throw new SafeError("receipt names another tx or block");
+          }
+          return rc;
+        };
+      const v = target[prop];
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
 }
 
 /** Build the record for one SignersCommitted log. Returns { record } or { deadLetter }. */
@@ -332,10 +376,31 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
     ruleset: ctx.ruleset,
     seenAt: ctx.now,
   };
+  // The commitment getLogs reported must be in the receipt reconstruction will read, identical
+  // (position, emitter, key, mask): a backend answering the two differently must not let one
+  // mask be recorded with the signers authenticated for another (Codex follow-up R7).
+  const guarded = identityGuard(chain, Number(log.blockNumber));
+  let commitInReceipt = false;
+  try {
+    const rc = await guarded.getTransactionReceipt(log.transactionHash);
+    commitInReceipt = !!rc?.logs?.some(x => sameLog(x, log));
+  } catch {
+    commitInReceipt = false;
+  }
+  if (!commitInReceipt)
+    return {
+      deadLetter: {
+        ...base,
+        status: "ERROR",
+        reasons: ["commitment log not found unchanged in the tx receipt"],
+        verdict: evaluate(rs, cfg.roles, { ...base, kind: undefined }),
+        spEvents,
+      },
+    };
   let r;
   try {
     r = await rebuildFromAction(
-      chain,
+      guarded,
       cfg.aggregator,
       log.transactionHash,
       key,
@@ -416,7 +481,11 @@ async function pricePair(chain, cfg, block) {
 
 const SIGNERS_COMMITTED = () => aggIface.getEvent("SignersCommitted").topicHash;
 const spTopics = () => SP_WATCHED_EVENTS.map(n => spIface.getEvent(n).topicHash);
-const lcEq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+// RPC values are compared WITHOUT coercion (Codex follow-up R9): String() on an object whose
+// toString is not callable throws, and that must never happen outside the per-tx isolation.
+const str = x => (typeof x === "string" ? x : "");
+const lcEq = (a, b) =>
+  typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
 /** A 4-byte selector, or null (calldata "0x" or shorter than a selector proves no function). */
 const selectorOf = data =>
   typeof data === "string" && /^0x[0-9a-fA-F]{8}/.test(data)
@@ -424,16 +493,219 @@ const selectorOf = data =>
     : null;
 
 /** A watched log as stored evidence (plain JSON, full contents and position). */
-function evidenceLog(l) {
+function evidenceLog(l, source, range) {
+  // Best effort: a malformed log is kept as evidence as far as it can be (an isolated tx keeps
+  // what the RPC said: #400 review L1), never a reason to lose the dead letter.
+  // The RAW position fields and `removed` are kept as the RPC gave them: normalising here would
+  // turn contradictory evidence (index 0, logIndex 99) into valid evidence on retry (Codex
+  // follow-up R1).
+  const has = k => l?.[k] !== undefined && l?.[k] !== null;
   return {
-    address: l.address,
-    topics: [...(l.topics ?? [])],
-    data: l.data,
-    index: logPos(l),
-    blockNumber: Number(l.blockNumber),
-    ...(l.blockHash ? { blockHash: l.blockHash } : {}),
-    transactionHash: l.transactionHash,
+    address: l?.address,
+    topics: Array.isArray(l?.topics) ? [...l.topics] : l?.topics,
+    data: l?.data,
+    ...(has("index") ? { index: l.index } : {}),
+    ...(has("logIndex") ? { logIndex: l.logIndex } : {}),
+    ...(has("removed") ? { removed: l.removed } : {}),
+    blockNumber: l?.blockNumber, // raw: an invalid height stays as the RPC gave it
+    ...(l?.blockHash ? { blockHash: l.blockHash } : {}),
+    transactionHash: l?.transactionHash,
+    // which query returned it (aggregator or SuperPaymaster): a retry classifies by this, never by
+    // re-filtering a possibly malformed log out of existence (Codex follow-up R2)
+    ...(source ? { source } : {}),
+    // the query range this observation came from (kept per observation: Codex follow-up R7)
+    ...(Array.isArray(l?.range) ? { range: l.range } : range ? { range } : {}),
   };
+}
+
+/** Observations of one tx, merged: every distinct observation (content and query range) is kept,
+ * so a later sighting never replaces an earlier one (Codex follow-up R7). */
+function mergeEvidence(a, b) {
+  // identity = raw contents, the query that returned it, and its range (Codex follow-up R8)
+  const key = e => rawLogKey(e) + safeJson([e?.source ?? null, e?.range ?? null]) + str(e?.raw);
+  const out = [];
+  for (const e of [...(a ?? []), ...(b ?? [])]) if (!out.some(x => key(x) === key(e))) out.push(e);
+  return out;
+}
+
+/** Evidence of a tx: its aggregator and SP logs, each tagged with its source query. */
+const evidenceOf = t => [
+  ...t.agg.map(l => evidenceLog(l, "agg", t.range)),
+  ...t.sp.map(l => evidenceLog(l, "sp", t.range)),
+];
+
+/** The tx shape of stored evidence: by source when recorded; legacy evidence is split by
+ * address/topic, and any log that would fall out of that split marks the tx malformed. */
+export function txOfEvidence(watched, cfg, block) {
+  if (watched.every(w => w.source === "agg" || w.source === "sp"))
+    return {
+      block,
+      agg: watched.filter(w => w.source === "agg"),
+      sp: watched.filter(w => w.source === "sp"),
+    };
+  const t = splitLogs(watched, cfg, block);
+  if (t.agg.length + t.sp.length !== watched.length) t.malformed = true;
+  return t;
+}
+
+/** A safe reason for an exception thrown while processing one tx: our own wording and the error's
+ * category, never a foreign message (RPC answers are untrusted text). */
+function isolatedReason(e) {
+  // our own wording (a SafeError never carries foreign text: lib/safe-error.mjs) is kept as is
+  if (e instanceof SafeError) return `tx processing failed: ${e.message}`;
+  const code = typeof e?.code === "string" && /^[A-Z_]{2,40}$/.test(e.code) ? e.code : null;
+  const name = typeof e?.name === "string" && /^[A-Za-z]{2,40}$/.test(e.name) ? e.name : "Error";
+  return `tx processing failed (${code ?? name})`;
+}
+
+/**
+ * Process one tx in isolation (#400 review L1, DSR): any exception, for example a malformed RPC
+ * answer, becomes that tx's dead letter with its watched evidence, so the retry cap applies and the
+ * scan (and its cursor) moves on. At the cap the dead letter becomes an unattributed record.
+ */
+async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot, prev) {
+  try {
+    return await processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot);
+  } catch (e) {
+    summary.isolated = (summary.isolated ?? 0) + 1;
+    // what this tx's dead letter already holds is merged with this observation, never replaced
+    const okH = /^0x[0-9a-fA-F]{64}$/.test(str(txHash));
+    const existing = prev ?? (okH ? store.getDeadLetter(`tx-${str(txHash).toLowerCase()}`) : null);
+    let watched = [];
+    try {
+      watched = mergeEvidence(nativeEvidence(existing?.watched), evidenceOf(t));
+    } catch {
+      // never only the old evidence: this observation is kept too, unmerged if need be (R10)
+      let incoming;
+      try {
+        incoming = evidenceOf(t);
+      } catch {
+        incoming = [{ raw: safeJson([t.agg, t.sp]), source: "unmerged" }];
+      }
+      watched = [...(nativeEvidence(existing?.watched) ?? []), ...incoming];
+    }
+    // An item without a usable tx hash gets a quarantine identity derived from its evidence: it
+    // is retried and counted, never attributed to any tx (Codex follow-up R2).
+    const okHash = /^0x[0-9a-fA-F]{64}$/.test(str(txHash));
+    const qid = okHash ? null : ethers.keccak256(ethers.toUtf8Bytes(safeJson(watched)));
+    store.putDeadLetter({
+      ...(existing ?? {}),
+      route: "tx",
+      txHash: okHash ? txHash : qid,
+      ...(okHash ? {} : { quarantine: true }),
+      blockNumber: t.block,
+      status: "ERROR",
+      reasons: [isolatedReason(e)],
+      ...(t.range ? { range: t.range } : {}),
+      events: existing?.events ?? [],
+      watched: typedEvidence(watched),
+      ruleset: ctx.ruleset,
+      seenAt: ctx.now,
+    });
+    summary.deadLetters++;
+    return { done: false };
+  }
+}
+
+/** A returned entry that is not a log object at all: a quarantine dead letter keyed by its raw value
+ * and query, retried to the cap, then an UNREADABLE record that names no tx. */
+function quarantineRaw(store, ctx, summary, x, source, from, to) {
+  let raw;
+  try {
+    raw = safeJson(x) ?? typeof x;
+  } catch {
+    raw = `<unserialisable ${typeof x}>`;
+  }
+  const evidence = [{ raw, source, range: [from, to] }];
+  const qid = ethers.keccak256(ethers.toUtf8Bytes(safeJson(evidence)));
+  summary.isolated = (summary.isolated ?? 0) + 1;
+  store.putDeadLetter({
+    route: "tx",
+    txHash: qid,
+    quarantine: true,
+    blockNumber: from,
+    status: "ERROR",
+    reasons: ["returned entry is not a log"],
+    events: [],
+    watched: typedEvidence(evidence),
+    ruleset: ctx.ruleset,
+    seenAt: ctx.now,
+  });
+  summary.deadLetters++;
+}
+
+/** JSON that never throws on RPC values: a BigInt keeps its type in the text, so identities
+ * built from it stay distinct and stable (Codex follow-up R10). */
+export function safeJson(v) {
+  try {
+    // collision-free: a BigInt becomes { $bigint }, and a plain object that itself uses one of the
+    // tag keys is escaped as { $obj: {...} }, so a literal never equals a tag (Codex follow-up R12)
+    return JSON.stringify(v, function (k, x) {
+      if (typeof x === "bigint") return { $bigint: x.toString() };
+      if (
+        x &&
+        typeof x === "object" &&
+        !Array.isArray(x) &&
+        (Object.hasOwn(x, "$bigint") || Object.hasOwn(x, "$obj")) &&
+        !Object.hasOwn(this, "$obj")
+      )
+        return { $obj: { ...x } };
+      return x;
+    });
+  } catch {
+    return `<unserialisable ${typeof v}>`;
+  }
+}
+
+/** Evidence as it is persisted: BigInt values tagged ({ $bigint }) rather than flattened to
+ * strings, so a stored observation keeps the identity it had when seen (1n and "1" stay two
+ * observations through a retry: Codex follow-up R11). */
+function typedEvidence(watched) {
+  try {
+    return JSON.parse(safeJson(watched));
+  } catch {
+    return watched;
+  }
+}
+
+/** Stored evidence back to the values it was seen with (the inverse of typedEvidence): every read of
+ * persisted evidence decodes, every write encodes, so persistence is idempotent and an observation
+ * keeps one identity across any number of retries (Codex follow-up R12). */
+function nativeEvidence(watched) {
+  const dec = x => {
+    if (Array.isArray(x)) return x.map(dec);
+    if (!x || typeof x !== "object") return x;
+    const keys = Object.keys(x);
+    if (keys.length === 1 && keys[0] === "$bigint" && typeof x.$bigint === "string")
+      try {
+        return BigInt(x.$bigint);
+      } catch {
+        return x;
+      }
+    if (keys.length === 1 && keys[0] === "$obj" && x.$obj && typeof x.$obj === "object")
+      return Object.fromEntries(Object.entries(x.$obj).map(([k, v]) => [k, dec(v)]));
+    return Object.fromEntries(Object.entries(x).map(([k, v]) => [k, dec(v)]));
+  };
+  return Array.isArray(watched) ? watched.map(dec) : watched;
+}
+
+/** A log's raw identity for de-duplication: every field as the RPC gave it, never parsed, so only
+ * identical copies collapse and conflicting ones at one position survive (Codex follow-up R2). */
+export function rawLogKey(l) {
+  const h = x => (typeof x === "string" ? x.toLowerCase() : x);
+  return safeJson([
+    h(l?.address),
+    Array.isArray(l?.topics) ? l.topics.map(h) : l?.topics,
+    h(l?.data),
+    l?.index ?? null,
+    l?.logIndex ?? null,
+    l?.removed ?? null,
+    h(l?.transactionHash),
+    // block identity too: copies that disagree on their block are a conflict, not duplicates
+    // (Codex follow-up R3)
+    h(l?.blockHash),
+    l?.blockNumber ?? null,
+  ]);
 }
 
 /** The watched logs of one tx, re-read from its block by hash (for dead letters without stored
@@ -446,7 +718,9 @@ async function watchedLogsOf(chain, cfg, txHash, blockNumber) {
     [cfg.roles.superPaymaster, spTopics()],
   ]) {
     const got = await chain.getLogs({ address, topics: [topics], blockHash: h.hash });
-    for (const l of got) if (lcEq(l.transactionHash, txHash)) out.push(evidenceLog(l));
+    for (const l of got)
+      if (lcEq(l.transactionHash, txHash))
+        out.push(evidenceLog(l, lcEq(address, cfg.aggregator) ? "agg" : "sp"));
   }
   return out;
 }
@@ -458,7 +732,7 @@ function splitLogs(logs, cfg, block) {
   const spT = new Set(spTopics().map(x => x.toLowerCase()));
   const agT = SIGNERS_COMMITTED().toLowerCase();
   for (const l of logs) {
-    const t0 = String(l.topics?.[0] ?? "").toLowerCase();
+    const t0 = str(l?.topics?.[0]).toLowerCase();
     if (lcEq(l.address, cfg.aggregator) && t0 === agT) t.agg.push(l);
     else if (lcEq(l.address, cfg.roles.superPaymaster) && spT.has(t0)) t.sp.push(l);
   }
@@ -475,13 +749,77 @@ function splitLogs(logs, cfg, block) {
  * becomes a dead letter and is retried (route "tx").
  */
 async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot) {
+  // A watched log must be well formed, and an aggregator log must carry its 32-byte key: anything
+  // else is a malformed RPC answer, isolated by the caller (#400 review L1).
+  if (t.malformed) throw new SafeError("malformed or unclassifiable watched log");
+  if (!Number.isSafeInteger(t.block) || t.block < 0) throw new SafeError("invalid block number");
+  for (const l of [...t.agg, ...t.sp])
+    if (parsePosition(l.blockNumber) !== t.block)
+      throw new SafeError("watched logs name different blocks");
+  if (!/^0x[0-9a-fA-F]{64}$/.test(str(txHash)))
+    throw new SafeError("watched log without a tx hash");
+  for (const l of [...t.agg, ...t.sp])
+    if (!validLog(l)) throw new SafeError("malformed watched log");
+  // a log the RPC marks removed is never evidence, on any path (Codex follow-up R2)
+  for (const l of [...t.agg, ...t.sp])
+    if (l.removed === true) throw new SafeError("removed watched log");
+  for (const l of t.agg)
+    if (l.topics.length < 2) throw new SafeError("aggregator log without a key");
+  // a log must match the query that returned it: the configured emitter and a watched topic
+  // (an RPC whose address filter is wrong must not get another contract's event attributed)
+  const spT = new Set(spTopics().map(x => x.toLowerCase()));
+  for (const l of t.agg)
+    if (!lcEq(l.address, cfg.aggregator) || !lcEq(l.topics[0], SIGNERS_COMMITTED()))
+      throw new SafeError("aggregator query returned a log of another emitter or topic");
+  for (const l of t.sp)
+    if (!lcEq(l.address, cfg.roles.superPaymaster) || !spT.has(str(l.topics[0]).toLowerCase()))
+      throw new SafeError("SP query returned a log of another emitter or topic");
+  // positions are judged here, inside the isolation, for every watched log
+  {
+    // one position, one log: conflicting copies at a position are a malformed answer
+    const pos = [...t.agg, ...t.sp].map(l => logPos(l));
+    if (new Set(pos).size !== pos.length)
+      throw new SafeError("conflicting watched logs at one position");
+  }
+  // a watched SP log must decode against the pinned ABI: one that does not (a recognised topic
+  // but missing indexed topics, say) is a malformed answer, isolated, never silently dropped
+  for (const l of t.sp) if (!decodeSp(l)) throw new SafeError("watched SP log does not decode");
   t.sp.sort((a, b) => logPos(a) - logPos(b));
+  // Inclusion, on every path (Codex follow-up R5): the block must be inside the range that was
+  // asked for and not past the finalized block, and every log must name the CANONICAL block at
+  // that height (a stale fork, or a backend lagging behind another, is refused here).
+  if (t.block > snapshot) throw new SafeError("watched log beyond the finalized block");
+  if (t.range && (t.block < t.range[0] || t.block > t.range[1]))
+    throw new SafeError("watched log outside the requested range");
+  // each observation also against the range it came from (merged evidence keeps one per log)
+  for (const l of [...t.agg, ...t.sp])
+    if (Array.isArray(l.range) && (t.block < l.range[0] || t.block > l.range[1]))
+      throw new SafeError("watched log outside the requested range");
+  const canon = (await header(chain, t.block)).hash;
+  for (const l of [...t.agg, ...t.sp])
+    if (l.blockHash !== undefined && l.blockHash !== null && !lcEq(l.blockHash, canon))
+      throw new SafeError("watched log from a non-canonical block");
   const SP = cfg.roles.superPaymaster;
   let tx;
   try {
     tx = await chain.getTransaction(txHash);
   } catch {
     tx = undefined;
+  }
+  // The tx response must be this tx, in this block: its sender, target and calldata are used for
+  // attribution on the direct path, where no receipt or trace cross-check runs.
+  if (tx) {
+    // a response must name this tx: one without a hash is not trusted either (Codex follow-up R6)
+    if (typeof tx.hash !== "string" || !lcEq(tx.hash, txHash))
+      throw new SafeError("transaction response names another tx");
+    if (tx.blockHash !== undefined && tx.blockHash !== null && !lcEq(tx.blockHash, canon))
+      throw new SafeError("transaction response from another block");
+    if (
+      tx.blockNumber !== undefined &&
+      tx.blockNumber !== null &&
+      parsePosition(tx.blockNumber) !== t.block
+    )
+      throw new SafeError("transaction response from another block");
   }
   const direct = tx && tx.to && lcEq(tx.to, SP);
   // SP events of a BLS tx count as an action's effects only when the trace, aligned log by log
@@ -498,32 +836,11 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     const watched = [...t.agg, ...t.sp];
     const stats = (summary.trace ??= {});
     const { trace, logs, rc } = await traceAndReceipt(chain, txHash, stats, watched.length > 0);
-    // The watched evidence fixes the inclusion: every watched log must name one block (Codex R13).
-    const wHashes = [
-      ...new Set(
-        watched
-          .map(w => w.blockHash)
-          .filter(Boolean)
-          .map(h => h.toLowerCase())
-      ),
-    ];
-    // Evidence without a block hash (a dead letter stored before it was kept): anchor on the
-    // canonical header at that height, never on whatever the receipt says (Codex #400-fix R14).
-    let anchor = wHashes[0] ?? null;
-    if (logs && !anchor && wHashes.length === 0) {
-      try {
-        anchor = (await header(chain, t.block)).hash;
-      } catch {
-        anchor = null;
-      }
-    }
-    const envelope = !logs
-      ? null
-      : wHashes.length > 1
-        ? "watched logs name different blocks"
-        : !anchor
-          ? "evidence block unavailable"
-          : envelopeProblem(txHash, tx, rc, trace, { blockNumber: t.block, blockHash: anchor });
+    // The inclusion is the canonical header at that height (every watched log was checked against
+    // it above), never the evidence's own claim (Codex follow-up R5).
+    const envelope = logs
+      ? envelopeProblem(txHash, tx, rc, trace, { blockNumber: t.block, blockHash: canon })
+      : null;
     // The receipt must contain every watched log getLogs returned for this tx, identical (address,
     // every topic, data) at the same position: an inconsistent receipt aligns with nothing it
     // should (Codex #400-fix R5, R6), and it is a health finding, not only a retry.
@@ -585,13 +902,44 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     } else independent.push(ev);
   }
   for (const l of t.agg) {
-    if (store.hasBlsRecord(BigInt(l.topics[1]))) continue; // completed before (tx retry, M5)
-    // An authenticated action awaiting only its price is retried by its own dead letter, never
-    // rebuilt here (a rebuild failure must not replace verified evidence; R2 M4).
+    if (store.hasBlsRecord(BigInt(l.topics[1]))) {
+      // Completed before (tx retry, M5). Effects the trace proves only now are kept beside the
+      // record, not lost when the tx dead letter resolves (#400 review L4).
+      const effects = effectsOf.get(commitCall.get(logPos(l))) ?? [];
+      if (
+        effects.length &&
+        store.putBlsAmendment(BigInt(l.topics[1]), {
+          key: BigInt(l.topics[1]).toString(),
+          txHash,
+          provenBy: "trace",
+          provenAt: ctx.now,
+          spEvents: effects,
+          ruleset: ctx.ruleset,
+        }) === "conflict"
+      )
+        // a different valid proof already stands for this action: both kept, and counted
+        summary.amendmentConflicts = (summary.amendmentConflicts ?? 0) + 1;
+      continue;
+    }
+    // A BLS action with an open dead letter is retried by that dead letter only, once per tick,
+    // never rebuilt here as well (a rebuild failure must not replace verified evidence: R2 M4; and
+    // two retries per tick would halve the attempt cap: #400 review L2).
     const pend = store.getDeadLetter(
       Store.recordId({ route: "bls", key: BigInt(l.topics[1]).toString(), kind: undefined })
     );
-    if (pend?.pendingRecord) continue;
+    if (pend) {
+      // ...but effects the trace proves now go into that dead letter, so its own retry (and its
+      // record) carries them (#400 review L4). No attempt is spent.
+      const effects = effectsOf.get(commitCall.get(logPos(l))) ?? [];
+      if (effects.length && !(pend.spEvents ?? []).length)
+        store.patchDeadLetter(pend.id, {
+          spEvents: effects,
+          ...(pend.pendingRecord && !(pend.pendingRecord.spEvents ?? []).length
+            ? { pendingRecord: { ...pend.pendingRecord, spEvents: effects } }
+            : {}),
+        });
+      continue;
+    }
     const call = commitCall.get(logPos(l));
     const out = await blsRecord(chain, cfg, rs, ctx, l, effectsOf.get(call) ?? [], snapshot);
     if (out.record) note(summary, store.putRecord(out.record), out.record);
@@ -600,7 +948,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       summary.deadLetters++;
     }
   }
-  const txDl = `tx-${String(txHash).toLowerCase()}`;
+  const txDl = `tx-${str(txHash).toLowerCase()}`;
   if (!independent.length) {
     store.resolveDeadLetter(txDl); // all SP events proved to be BLS effects (Codex #400-fix M5)
     return { done: true };
@@ -616,10 +964,23 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       events: independent,
       // The watched logs exactly as getLogs returned them: a retry is judged against THIS
       // evidence, never against a receipt that may be the thing in dispute (Codex #400-fix R7).
-      watched: [...t.agg, ...t.sp].map(evidenceLog),
+      watched: typedEvidence(
+        mergeEvidence(nativeEvidence(store.getDeadLetter(txDl)?.watched), evidenceOf(t))
+      ),
       // Records already classified, missing only their price (Codex #400-fix M3): exhaustion
       // keeps their route, caller and verdict, marked price.unavailable.
       ...(pendingRecords ? { pendingRecords } : {}),
+      // the query range the evidence came from, restored on every retry (Codex follow-up R6)
+      ...(t.range ? { range: t.range } : {}),
+      // What is known of the tx itself, kept for an unattributed record at exhaustion (#400 review
+      // nit): its sender, target and root selector (not the emitting call's).
+      ...(tx
+        ? {
+            txFrom: tx.from ? ethers.getAddress(tx.from) : null,
+            txTo: tx.to ? ethers.getAddress(tx.to) : null,
+            rootSelector: selectorOf(tx.data),
+          }
+        : {}),
       ruleset: ctx.ruleset,
       seenAt: ctx.now,
     });
@@ -648,7 +1009,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     const f = frameOf(e);
     if (amb.has(e.event) && !selectorOf(f?.selector ?? ""))
       return fail(
-        `caller of ${e.event} undeterminable (${direct ? "no selector" : (attr.why ?? "trace unaligned")})`
+        `caller of ${e.event} undeterminable (${attr.why && attr.why !== "not traced" ? attr.why : direct ? "no selector" : "trace unaligned"})`
       );
     // Only an ambiguous event can be public: an event no permissionless function emits is the owner
     // route whatever the root call was (Codex #400-fix R3 H1: a root updatePrice() selector must not
@@ -717,6 +1078,29 @@ function exhaust(store, rs, cfg, ctx, summary, dl) {
       };
       note(summary, store.putRecord(rec), rec);
     }
+  } else if (dl.route === "tx" && !(dl.events ?? []).length) {
+    // An isolated tx whose answers never became readable (#400 review L1, DSR): one unattributed
+    // record, nobody accused, carrying the stored evidence and the last reasons.
+    const rec = {
+      route: "unattributed",
+      label: dl.quarantine
+        ? "RPC answer unreadable (no tx hash; quarantine id, not a tx)"
+        : "RPC answer unreadable",
+      event: "UNREADABLE",
+      txHash: dl.txHash,
+      logIndex: "unreadable",
+      blockNumber: dl.blockNumber,
+      caller: null,
+      callerSource: "unknown",
+      evidence: dl.watched ?? [],
+      exhaustedAfter: dl.attempts,
+      lastReasons: dl.reasons,
+      ruleset: dl.ruleset ?? ctx.ruleset,
+      seenAt: ctx.now,
+    };
+    rec.verdict = evaluate(rs, cfg.roles, rec);
+    note(summary, store.putRecord(rec), rec);
+    summary.unreadable = (summary.unreadable ?? 0) + 1;
   } else if (dl.route === "tx") {
     const amb = ambiguousEvents(rs);
     for (const e of dl.events ?? []) {
@@ -730,6 +1114,10 @@ function exhaust(store, rs, cfg, ctx, summary, dl) {
         blockNumber: dl.blockNumber,
         caller: null,
         callerSource: "unknown",
+        // known of the tx itself, not of the emitting call (so never the caller)
+        from: dl.txFrom ?? null,
+        to: dl.txTo ?? null,
+        rootSelector: dl.rootSelector ?? null,
         exhaustedAfter: dl.attempts,
         lastReasons: dl.reasons,
         ruleset: dl.ruleset ?? ctx.ruleset,
@@ -769,7 +1157,6 @@ function exhaust(store, rs, cfg, ctx, summary, dl) {
  * Logs that come back are merged in; an empty answer by hash confirms a bloom false positive.
  */
 async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
-  const have = (logs, n) => logs.some(l => Number(l.blockNumber) === n);
   const extraAgg = [];
   const extraSp = [];
   for (let a = from; a <= to; a += 100) {
@@ -793,7 +1180,10 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
             unchecked = true;
             break;
           }
-          if (may && !logs.some(l => Number(l.blockNumber) === n && l.topics?.[0] === topic))
+          if (
+            may &&
+            !logs.some(l => parsePosition(l.blockNumber) === n && lcEq(l?.topics?.[0], topic))
+          )
             missing.push(topic);
         }
         if (unchecked) {
@@ -809,14 +1199,13 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
             `block ${n}: logsBloom shows a watched log that getLogs did not return, and the by-hash re-read failed; retrying`
           );
         }
-        const fresh = got.filter(
-          g => !logs.some(l => l.transactionHash === g.transactionHash && logPos(l) === logPos(g))
-        );
+        // raw comparison: a malformed position must not throw here, outside the per-tx isolation
+        const fresh = got.filter(g => !logs.some(l => rawLogKey(l) === rawLogKey(g)));
         if (fresh.length) {
           extra.push(...fresh);
           summary.bloomRecovered++;
         }
-        if (missing.some(topic => !got.some(g => g.topics?.[0] === topic)))
+        if (missing.some(topic => !got.some(g => lcEq(g?.topics?.[0], topic))))
           summary.bloomFalsePositives++;
       }
     }
@@ -835,7 +1224,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
   if (cursor) {
     // Finalized blocks cannot reorg; if the cursor's block changed anyway, stop and say so.
     const now = await header(chain, cursor.block);
-    if (now.hash.toLowerCase() !== String(cursor.hash).toLowerCase()) {
+    if (!lcEq(now.hash, cursor.hash)) {
       throw new SafeError(
         `cursor block ${cursor.block} hash changed (${hx(cursor.hash)} -> ${hx(now.hash)}): finality violated, not advancing`
       );
@@ -860,7 +1249,13 @@ export async function tick(chain, cfg, store, rs, ctx) {
 
   // Retry dead letters first (a trace, a slot read or an RPC that failed may now answer). One that
   // has used every attempt becomes a record (exhaust), never silently dropped.
-  for (const dl of store.listDeadLetters()) {
+  // Ids first, each dead letter re-read just before it is handled: an earlier retry in this loop
+  // may have patched it (later-proven effects), and a stale snapshot must not overwrite that
+  // (Codex follow-up R2).
+  store.listDeadLetters(); // counts corrupt files for status
+  for (const dlId of store.listDeadLetterIds()) {
+    const dl = store.getDeadLetter(dlId);
+    if (!dl) continue;
     if (dl.attempts >= MAX_DEADLETTER_ATTEMPTS) {
       exhaust(store, rs, cfg, ctx, summary, dl);
       continue;
@@ -890,10 +1285,16 @@ export async function tick(chain, cfg, store, rs, ctx) {
       }
       continue;
     }
+    if (dl.route === "tx" && dl.quarantine) {
+      // no tx to look at: it only waits for its cap, then becomes an UNREADABLE record
+      store.putDeadLetter({ ...dl, reasons: dl.reasons });
+      continue;
+    }
     if (dl.route === "tx") {
       // The watched logs come from the dead letter's own getLogs evidence; a dead letter written
       // without it re-reads them from its block by hash (EIP-234), never from the receipt.
-      let watched = Array.isArray(dl.watched) && dl.watched.length ? dl.watched : null;
+      let watched =
+        Array.isArray(dl.watched) && dl.watched.length ? nativeEvidence(dl.watched) : null;
       if (!watched) {
         try {
           watched = await watchedLogsOf(chain, cfg, dl.txHash, dl.blockNumber);
@@ -905,7 +1306,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
         store.putDeadLetter({ ...dl, reasons: ["watched logs unavailable"] });
         continue;
       }
-      await processTx(
+      await processTxIsolated(
         chain,
         cfg,
         rs,
@@ -913,8 +1314,9 @@ export async function tick(chain, cfg, store, rs, ctx) {
         store,
         summary,
         dl.txHash,
-        splitLogs(watched, cfg, dl.blockNumber),
-        fin.number
+        { ...txOfEvidence(watched, cfg, dl.blockNumber), ...(dl.range ? { range: dl.range } : {}) },
+        fin.number,
+        dl
       );
       continue;
     }
@@ -931,6 +1333,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
       continue;
     }
     const log = {
+      address: cfg.aggregator,
       topics: [SIGNERS_COMMITTED(), ethers.toBeHex(BigInt(dl.key), 32)],
       data: ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [BigInt(dl.signerMask)]),
       transactionHash: dl.txHash,
@@ -944,24 +1347,63 @@ export async function tick(chain, cfg, store, rs, ctx) {
 
   if (from > to) return summary;
 
-  const aggLogs = await guarded("aggregator log read", () =>
-    pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page)
+  // A returned entry that is not even an object cannot be grouped or bloom-checked: it is
+  // quarantined at once with its raw value and query, never a reason to stop (Codex follow-up R3).
+  const intake = (raw, source) => {
+    const ok = [];
+    for (const x of raw ?? []) {
+      if (x && typeof x === "object" && !Array.isArray(x)) ok.push(x);
+      else quarantineRaw(store, ctx, summary, x, source, from, to);
+    }
+    return ok;
+  };
+  const aggLogs = intake(
+    await guarded("aggregator log read", () =>
+      pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page)
+    ),
+    "agg"
   );
-  const spLogs = await guarded("superpaymaster log read", () =>
-    pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page)
+  const spLogs = intake(
+    await guarded("superpaymaster log read", () =>
+      pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page)
+    ),
+    "sp"
   );
-  const { extraAgg, extraSp } = await bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary);
+  const bc = await bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary);
+  const extraAgg = intake(bc.extraAgg, "agg");
+  const extraSp = intake(bc.extraSp, "sp");
 
   const byTx = new Map();
-  for (const l of [...aggLogs, ...extraAgg, ...spLogs, ...extraSp]) {
-    const t = byTx.get(l.transactionHash) ?? { block: Number(l.blockNumber), agg: [], sp: [] };
-    const list = lcEq(l.address, cfg.aggregator) ? t.agg : t.sp;
-    if (!list.some(x => logPos(x) === logPos(l))) list.push(l);
-    byTx.set(l.transactionHash, t);
+  // Each log is grouped by the query that returned it (aggregator or SP), never by re-reading its
+  // own address: whether it really matches its query is judged inside the isolation (Codex
+  // follow-up R4). Valid tx hashes are canonicalised (lower case) so one tx is one group, whatever
+  // casing the RPC used; the original hash stays in the evidence. Heights are parsed without
+  // coercion (a value that is not a number never throws here).
+  const groupKey = h =>
+    typeof h === "string" && /^0x[0-9a-fA-F]{64}$/.test(h) ? h.toLowerCase() : h;
+  for (const [l, source] of [
+    ...aggLogs.map(x => [x, "agg"]),
+    ...extraAgg.map(x => [x, "agg"]),
+    ...spLogs.map(x => [x, "sp"]),
+    ...extraSp.map(x => [x, "sp"]),
+  ]) {
+    const k = groupKey(l.transactionHash);
+    const t = byTx.get(k) ?? {
+      block: parsePosition(l.blockNumber) ?? NaN,
+      range: [from, to],
+      agg: [],
+      sp: [],
+    };
+    const list = source === "agg" ? t.agg : t.sp;
+    // Grouping never throws on log contents: a malformed position is judged inside the per-tx
+    // isolation (Codex follow-up R1). Duplicates (bloom-recovered copies) are dropped by their
+    // raw position fields.
+    if (!list.some(x => rawLogKey(x) === rawLogKey(l))) list.push(l);
+    byTx.set(k, t);
   }
   const ordered = [...byTx.entries()].sort((a, b) => a[1].block - b[1].block);
   for (const [txHash, t] of ordered)
-    await processTx(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number);
+    await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
 
   const toHdr = await header(chain, to);
   store.setCursor({ block: to, hash: toHdr.hash });

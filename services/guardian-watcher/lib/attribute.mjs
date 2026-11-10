@@ -8,7 +8,8 @@
 // trace, a log without `position` in a frame that has subcalls, a length or content mismatch -
 // returns aligned = false, and nothing is attributed.
 
-const lc = x => String(x).toLowerCase();
+// no coercion of RPC values (an object with a non-callable toString must not throw)
+const lc = x => (typeof x === "string" ? x.toLowerCase() : "");
 
 /**
  * Scope (M0 §5.2a): these checks defend against an RPC that is honest but inconsistent, lagging or
@@ -16,6 +17,8 @@ const lc = x => String(x).toLowerCase();
  * against an RPC that fabricates a well-formed trace: such an RPC could equally omit events from
  * getLogs. The RPC is a deployment trust assumption (operator-chosen node).
  */
+
+const isAddr = a => /^0x[0-9a-fA-F]{40}$/.test(a);
 
 /** A well-formed log: 20-byte address, at most four 32-byte topics, even-length hex data. */
 export function validLog(l) {
@@ -69,7 +72,11 @@ export function flattenTraceLogs(trace, aggregator, sp) {
   let unsure = false;
   const walk = (f, aggCall, spCall) => {
     if (!f || f.error) return [];
-    const isCall = String(f.type).toUpperCase() === "CALL";
+    const isCall = typeof f.type === "string" && f.type.toUpperCase() === "CALL";
+    // A frame's addresses are used for attribution: malformed ones make the trace unusable rather
+    // than throwing later (#400 review L1).
+    const addrOk = a => a === undefined || a === null || (typeof a === "string" && isAddr(a));
+    if (!addrOk(f.from) || !addrOk(f.to)) unsure = true;
     const here = isCall && lc(f.to) === lc(aggregator) ? nextId++ : aggCall;
     const spHere =
       sp && isCall && lc(f.to) === lc(sp)

@@ -464,7 +464,11 @@ aggregator-only.
   example a different caller frame, or a log placed in a static call), because
   such an RPC could equally omit an event from `getLogs`, which no trace check
   can detect. The RPC is a deployment trust assumption: an operator-chosen node.
-  Comparing several independent RPCs is backlog after 5.5.0.
+  Before Phase D, a separate gate (**D-RPC2**, must merge before Phase D, no
+  bypass) re-fetches every accusatory record's tx from a second, independently
+  operated RPC (a different provider) and holds the record as unconfirmed unless
+  both agree; records that confirm no violation are exempt. Comparing several
+  independent RPCs on every scan is backlog after 5.5.0.
 
 #### 5.2b Dead letters, exhaustion and read integrity
 
@@ -481,6 +485,20 @@ aggregator-only.
   - a record whose price never read (an authenticated BLS action, or an SP event
     already classified) is kept with its route, caller and verdict, and
     `price.unavailable`.
+- One tx never stops the scan: any exception while processing a tx (for example
+  a malformed RPC answer such as a frame address that is not an address, or an
+  aggregator log without its key) makes that tx a dead letter with its watched
+  evidence, and the cursor moves on. At the attempt cap it becomes an
+  `unattributed` record (`UNREADABLE`, nobody accused) carrying that evidence;
+  `status.json` counts txs isolated in the tick and unreadable txs in total.
+- A BLS action with an open dead letter is retried by that dead letter alone,
+  once per tick; retirements of one id are numbered, never overwritten.
+- An SP effect that the trace proves to belong to a BLS action only after the
+  action's record was written is kept beside the record as an amendment
+  (`amendments/bls-<key>.json`, first-write-wins); one proven while the action's
+  dead letter is open goes into that dead letter and so into the record.
+- An unattributed record keeps what is known of the tx itself (sender, target,
+  root selector), never as the caller.
 - A transaction dead letter stores the watched logs exactly as `getLogs`
   returned them. Its retries are judged against that evidence, never against a
   receipt that may be the thing in dispute; one written without it re-reads its

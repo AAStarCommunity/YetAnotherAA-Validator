@@ -138,8 +138,14 @@ function makeChain() {
   const laggingTopics = new Map(); // block -> topic0 that the range getLogs omits
   let lagByHash = false; // ... and a by-hash re-read fails too (the node lacks the block)
   let noBloom = false; // headers without logsBloom
+  const txCalls = new Map(); // hash -> getTransaction calls so far
+  const txPatchFrom = new Map(); // hash -> { from: call index, patch }: a backend that changes
+  const txPatch = new Map(); // hash -> fields a mixed backend answers for getTransaction
   const receiptPatch = new Map(); // hash -> fields a stale backend answers differently
   const receiptLogs = new Map(); // hash -> logs a (inconsistent) RPC returns in the receipt instead
+  const headerPatches = new Map(); // block -> fields one header read answers malformed
+  const rawResults = []; // non-log values a broken RPC returns once in a range getLogs answer
+  let upperTopics = false; // a client answering getLogs topics in upper-case hex
   let traceMode = "ok"; // ok | unsupported (no debug namespace) | noLogs (withLog ignored)
   const txFailures = new Map(); // hash -> remaining getTransaction failures
   let priceFailures = 0; // next N cachedPrice reads fail
@@ -171,7 +177,12 @@ function makeChain() {
         txFailures.set(h, left - 1);
         throw new Error("transient: tx lookup failed");
       }
-      return txs.get(h)?.tx ?? null;
+      const tx = txs.get(h)?.tx ?? null;
+      const k = txCalls.get(h) ?? 0;
+      txCalls.set(h, k + 1);
+      const late = txPatchFrom.get(h);
+      if (tx && late && k >= late.from) return { ...tx, ...late.patch };
+      return tx && txPatch.has(h) ? { ...tx, ...txPatch.get(h) } : tx;
     },
     async getTransactionReceipt(h) {
       if (onReceipt) {
@@ -261,6 +272,11 @@ function makeChain() {
         afterSends = null;
         f();
       }
+      if (out && headerPatches.has(num)) {
+        const p = headerPatches.get(num);
+        headerPatches.delete(num); // once
+        return { ...out, ...p };
+      }
       return out;
     },
     async getLogs({ address, topics, fromBlock, toBlock, blockHash }) {
@@ -273,17 +289,30 @@ function makeChain() {
         fromBlock = n;
         toBlock = n;
       } else if (toBlock - fromBlock + 1 > maxRange) throw new Error("block range too large");
-      return logs.filter(
-        l =>
-          l.address === address &&
-          l.blockNumber >= fromBlock &&
-          l.blockNumber <= toBlock &&
-          (blockHash !== undefined || !laggingBlocks.has(l.blockNumber)) &&
-          (blockHash !== undefined || laggingTopics.get(l.blockNumber) !== l.topics[0]) &&
-          topics.every(
-            (t, i) => t == null || (Array.isArray(t) ? t.includes(l.topics[i]) : l.topics[i] === t)
-          )
-      );
+      const up = x => "0x" + x.slice(2).toUpperCase();
+      return logs
+        .filter(
+          l =>
+            l.address === address &&
+            l.blockNumber >= fromBlock &&
+            l.blockNumber <= toBlock &&
+            (blockHash !== undefined || !laggingBlocks.has(l.blockNumber)) &&
+            (blockHash !== undefined || laggingTopics.get(l.blockNumber) !== l.topics[0]) &&
+            topics.every(
+              (t, i) =>
+                t == null || (Array.isArray(t) ? t.includes(l.topics[i]) : l.topics[i] === t)
+            )
+        )
+        .map(l => (upperTopics ? { ...l, topics: l.topics.map(up) } : l))
+        .concat(
+          blockHash === undefined
+            ? (() => {
+                const mine = rawResults.filter(r => r.address === address);
+                for (const r of mine) rawResults.splice(rawResults.indexOf(r), 1);
+                return mine.map(r => r.value);
+              })()
+            : []
+        );
     },
     async call({ to, data, blockTag }) {
       if (to === SP) {
@@ -736,8 +765,23 @@ function makeChain() {
     setNoBloom: v => (noBloom = v),
     failTx: (hash, times) => txFailures.set(hash, times),
     setTraceMode: m => (traceMode = m),
+    setUpperTopics: v => (upperTopics = v),
+    /** Make the next range getLogs for `address` also return `value` (e.g. null). */
+    injectRawResult: (address, value) => rawResults.push({ address, value }),
+    /** The next header read of block n answers with `patch` applied (once). */
+    patchHeaderOnce: (n, patch) => headerPatches.set(n, patch),
+    /** Patch the getLogs copy of a tx's logs (e.g. a contradictory position), not its receipt. */
+    patchLogs: (hash, patch) => {
+      for (const l of logs) if (l.transactionHash === hash) Object.assign(l, patch);
+    },
+    /** A raw (possibly malformed) log the RPC returns from getLogs, at block n. */
+    injectLog: (n, raw) =>
+      logs.push({ blockNumber: n, blockHash: blocks.get(n).hash, index: 0, ...raw }),
     setReceiptLogs: (hash, l) => receiptLogs.set(hash, l),
     patchReceipt: (hash, p) => receiptPatch.set(hash, p),
+    patchTx: (hash, p) => txPatch.set(hash, p),
+    /** From the k-th getTransaction of this hash on (0-based), answer with `patch` applied. */
+    patchTxFrom: (hash, k, p) => txPatchFrom.set(hash, { from: k, patch: p }),
     failPriceReads: n => (priceFailures = n),
     /** Make block n's header bloom claim these logs ({ address, topics }) without them existing. */
     forceBloom: (n, fake) => forcedBlooms.set(n, bloomOf(fake)),
