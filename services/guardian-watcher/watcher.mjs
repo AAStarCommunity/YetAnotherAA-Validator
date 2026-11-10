@@ -67,17 +67,23 @@ export const TRACE_VERIFY_MS = 3_600_000;
  * is older than traceVerifyMs (quiet ticks too) or this tick saw a sign of trouble. Healthy needs
  * a proof younger than 2 x traceVerifyMs and no unsupported / log-less / all-failed traces now.
  */
-async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
+export async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
   const every = cfg.traceVerifyMs ?? TRACE_VERIFY_MS;
   let cap = store.getTraceCapability();
-  if (stats?.verifiedTx) {
+  const sampleTx = cap?.txHash ?? null;
+  // A trace this tick that shows the capability is missing outweighs any older proof (Codex
+  // #400-fix R5): the proof is dropped, and only a new positive verification restores health.
+  if (stats?.unsupported || stats?.noLogs) {
+    cap = null;
+    store.putTraceCapability(null);
+  } else if (stats?.verifiedTx) {
     cap = { verifiedAt: nowMs, txHash: stats.verifiedTx, by: "scan" };
     store.putTraceCapability(cap);
   }
   const trouble = !!(stats?.unsupported || stats?.noLogs || (stats?.failed && !stats?.verified));
   let check = null;
   if (finalized !== null && (trouble || !cap || nowMs - cap.verifiedAt >= every)) {
-    check = await verifyTrace(chain, cfg, finalized);
+    check = await verifyTrace(chain, cfg, finalized, { sampleTx });
     if (check.state === "verified") {
       cap = { verifiedAt: nowMs, txHash: check.txHash, by: "probe" };
       store.putTraceCapability(cap);
@@ -96,6 +102,8 @@ async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
     degraded.push(`trace without logs on ${stats.noLogs} tx(s): withLog not honoured`);
   if (stats?.failed && !stats?.verified)
     degraded.push(`all ${stats.failed} trace call(s) this tick failed`);
+  if (check && check.state === "unverified" && check.failed > 0)
+    degraded.push(`verification: ${check.failed} sample trace call(s) failed`);
   return {
     trace: {
       capability:

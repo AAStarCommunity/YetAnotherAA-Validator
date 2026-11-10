@@ -138,6 +138,7 @@ function makeChain() {
   const laggingTopics = new Map(); // block -> topic0 that the range getLogs omits
   let lagByHash = false; // ... and a by-hash re-read fails too (the node lacks the block)
   let noBloom = false; // headers without logsBloom
+  const receiptLogs = new Map(); // hash -> logs a (inconsistent) RPC returns in the receipt instead
   let traceMode = "ok"; // ok | unsupported (no debug namespace) | noLogs (withLog ignored)
   const txFailures = new Map(); // hash -> remaining getTransaction failures
   let priceFailures = 0; // next N cachedPrice reads fail
@@ -177,7 +178,8 @@ function makeChain() {
         onReceipt = null;
         return f(h);
       }
-      return txs.get(h)?.receipt ?? null;
+      const rc = txs.get(h)?.receipt ?? null;
+      return rc && receiptLogs.has(h) ? { ...rc, logs: receiptLogs.get(h) } : rc;
     },
     async getBlock(n) {
       const b = blocks.get(Number(n));
@@ -724,6 +726,7 @@ function makeChain() {
     setNoBloom: v => (noBloom = v),
     failTx: (hash, times) => txFailures.set(hash, times),
     setTraceMode: m => (traceMode = m),
+    setReceiptLogs: (hash, l) => receiptLogs.set(hash, l),
     failPriceReads: n => (priceFailures = n),
     /** Make block n's header bloom claim these logs ({ address, topics }) without them existing. */
     forceBloom: (n, fake) => forcedBlooms.set(n, bloomOf(fake)),

@@ -113,10 +113,52 @@ function traceHasLogs(node) {
  *                 (withLog not honoured);
  *   "unverified"  nothing conclusive (no sample, transient failures, misaligned traces).
  */
-export async function verifyTrace(chain, cfg, fromBlock, { blocks = 5, maxTx = 8 } = {}) {
+export async function verifyTrace(
+  chain,
+  cfg,
+  fromBlock,
+  { blocks = 5, maxTx = 8, sampleTx = null } = {}
+) {
   if (typeof chain.send !== "function") return { state: "unsupported", reason: "no send()" };
   let tried = 0;
+  let failed = 0;
   let why = "no transaction with logs in the sampled blocks";
+  // One candidate: null = not a usable sample (no receipt logs), else a verdict or "keep looking".
+  const check = async hash => {
+    let rc = null;
+    try {
+      rc = await chain.getTransactionReceipt(hash);
+    } catch {
+      rc = null;
+    }
+    if (!rc?.logs?.length) return null;
+    tried++;
+    let trace;
+    try {
+      trace = await chain.send("debug_traceTransaction", [hash, TRACE_OPTS]);
+    } catch (e) {
+      if (traceUnsupported(e)) return { state: "unsupported", reason: "method or tracer missing" };
+      failed++;
+      why = "trace call failed";
+      return { state: "next" };
+    }
+    if (!traceHasLogs(trace))
+      return {
+        state: "unsupported",
+        reason: "trace of a tx with logs carries none (withLog not honoured)",
+        txHash: hash,
+      };
+    const a = attributeLogs(trace, rc.logs, cfg.aggregator, cfg.roles.superPaymaster);
+    if (a.aligned) return { state: "verified", txHash: hash, block: Number(rc.blockNumber) };
+    why = `trace does not align with its receipt (${a.why})`;
+    return { state: "next" };
+  };
+  const done = r => r && r.state !== "next";
+  // The stored sample first (Codex #400-fix R5): a quiet chain can still re-prove the capability.
+  if (typeof sampleTx === "string" && /^0x[0-9a-fA-F]{64}$/.test(sampleTx)) {
+    const r = await check(sampleTx);
+    if (done(r)) return { ...r, tried, failed };
+  }
   for (let b = fromBlock; b > fromBlock - blocks && b >= 0 && tried < maxTx; b--) {
     let blk = null;
     try {
@@ -128,36 +170,12 @@ export async function verifyTrace(chain, cfg, fromBlock, { blocks = 5, maxTx = 8
     for (const t of blk?.transactions ?? []) {
       if (tried >= maxTx) break;
       const hash = typeof t === "string" ? t : t?.hash;
-      if (typeof hash !== "string") continue;
-      let rc = null;
-      try {
-        rc = await chain.getTransactionReceipt(hash);
-      } catch {
-        rc = null;
-      }
-      if (!rc?.logs?.length) continue;
-      tried++;
-      let trace;
-      try {
-        trace = await chain.send("debug_traceTransaction", [hash, TRACE_OPTS]);
-      } catch (e) {
-        if (traceUnsupported(e))
-          return { state: "unsupported", reason: "method or tracer missing" };
-        why = "trace call failed";
-        continue;
-      }
-      if (!traceHasLogs(trace))
-        return {
-          state: "unsupported",
-          reason: "trace of a tx with logs carries none (withLog not honoured)",
-          txHash: hash,
-        };
-      const a = attributeLogs(trace, rc.logs, cfg.aggregator, cfg.roles.superPaymaster);
-      if (a.aligned) return { state: "verified", txHash: hash, block: b };
-      why = `trace does not align with its receipt (${a.why})`;
+      if (typeof hash !== "string" || hash === sampleTx) continue;
+      const r = await check(hash);
+      if (done(r)) return { ...r, tried, failed };
     }
   }
-  return { state: "unverified", reason: why };
+  return { state: "unverified", reason: why, tried, failed };
 }
 
 /** Full receipt + callTracer (withLog) trace of a tx, for attribution; null parts when unavailable.
@@ -334,9 +352,26 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   const needFrame = decoded.some(x => amb.has(x.d.event));
   if ((t.agg.length && t.sp.length) || needFrame) {
     const { trace, logs } = await traceAndReceipt(chain, txHash, (summary.trace ??= {}));
-    attr = logs
-      ? attributeLogs(trace, logs, cfg.aggregator, SP)
-      : { aligned: false, owner: new Map(), spCall: new Map(), why: "receipt unavailable" };
+    // The receipt must contain every watched log getLogs returned for this tx (same position and
+    // topic): an inconsistent receipt aligns with nothing it should (Codex #400-fix R5).
+    const watched = [...t.agg, ...t.sp];
+    const consistent =
+      !!logs &&
+      watched.every(w =>
+        logs.some(r => logPos(r) === logPos(w) && r.topics?.[0] === w.topics?.[0])
+      );
+    attr = !logs
+      ? { aligned: false, owner: new Map(), spCall: new Map(), why: "receipt unavailable" }
+      : !consistent
+        ? {
+            aligned: false,
+            owner: new Map(),
+            spCall: new Map(),
+            why: "receipt disagrees with getLogs",
+          }
+        : attributeLogs(trace, logs, cfg.aggregator, SP);
+    // Consistent + aligned implies the receipt holds the watched logs and the trace carries them,
+    // so an empty or log-less pair can never count as proof.
     if (attr.aligned && trace) {
       // A real trace aligned with its receipt is positive proof of the capability (status.trace).
       summary.trace.verified = (summary.trace.verified ?? 0) + 1;

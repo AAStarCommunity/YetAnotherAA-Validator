@@ -23,7 +23,7 @@ import { validateRuleset, evaluate, matchGeneric } from "./lib/rules.mjs";
 import { MAX_DEADLETTER_ATTEMPTS, traceUnsupported, verifyTrace } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store } from "./lib/store.mjs";
-import { runOnce, rulesetIdentity } from "./watcher.mjs";
+import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
 import { attributeLogs } from "./lib/attribute.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1319,6 +1319,88 @@ try {
         sg.trace.capability === "stale",
       sg.trace
     );
+    // R5: a scan trace showing the method missing drops the proof; the next quiet tick, with no
+    // sample in reach, is not healthy again
+    const r1 = mk();
+    r1.c.ownerTx(pause("r5-1a"), keeper);
+    settle(r1.c);
+    const r1a = (await runOnce(r1.c.chain, r1.cfg, r1.store, rs, ident, { now: T0 })).status;
+    r1.c.setTraceMode("unsupported");
+    r1.c.ownerTx(pause("r5-1b"), keeper);
+    settle(r1.c);
+    const r1b = (await runOnce(r1.c.chain, r1.cfg, r1.store, rs, ident, { now: T0 + 1 })).status;
+    r1.c.setTraceMode("ok");
+    for (let i = 0; i < 6; i++) r1.c.mine();
+    // no trace call at all on the next tick: its dead letter is gone (as after exhaustion)
+    {
+      const dd = join(dirs.at(-1), "deadletters");
+      for (const f of readdirSync(dd).filter(f => f.endsWith(".json"))) rmSync(join(dd, f));
+    }
+    const r1c = (await runOnce(r1.c.chain, r1.cfg, r1.store, rs, ident, { now: T0 + 2 })).status;
+    // R5: on a quiet chain the stored sample, out of the discovery window, re-proves the capability
+    const r2 = mk();
+    const s2 = r2.c.ownerTx(guardianSet("r5-2"));
+    for (let i = 0; i < 12; i++) r2.c.mine();
+    r2.store.putTraceCapability({ verifiedAt: T0, txHash: s2.hash, by: "test" });
+    const r2a = (await runOnce(r2.c.chain, r2.cfg, r2.store, rs, ident, { now: T0 + 2 * H + 1 }))
+      .status;
+    // R5: every verification trace fails while the proof is still within 2x: degraded
+    const r3 = mk();
+    const s3 = r3.c.ownerTx(guardianSet("r5-3"), { trace: false });
+    settle(r3.c);
+    r3.store.putTraceCapability({ verifiedAt: T0, txHash: s3.hash, by: "test" });
+    const r3a = (await runOnce(r3.c.chain, r3.cfg, r3.store, rs, ident, { now: T0 + H + 1 }))
+      .status;
+    // R5: a receipt with no logs (disagreeing with getLogs) and a log-less trace prove nothing
+    const r4 = mk();
+    const s4 = r4.c.ownerTx(pause("r5-4"), keeper);
+    r4.c.setReceiptLogs(s4.hash, []);
+    r4.c.setTraceMode("noLogs");
+    settle(r4.c);
+    const r4a = (await runOnce(r4.c.chain, r4.cfg, r4.store, rs, ident, { now: T0 })).status;
+    r4.c.setTraceMode("ok");
+    // a receipt that disagrees with getLogs, but agrees with its trace, is no scan proof either
+    const r5 = mk();
+    const s5 = r5.c.ownerTx(pause("r5-5"), keeper);
+    {
+      const g = spIface.encodeEventLog("GuardianSet", [addr("r5-5a"), addr("r5-5b")]);
+      const blk = s5.block;
+      r5.c.setReceiptLogs(s5.hash, [
+        { address: SP, topics: g.topics, data: g.data, index: 0, blockNumber: blk },
+      ]);
+      r5.c.setTrace(s5.hash, {
+        type: "CALL",
+        from: keeper.from,
+        to: SP,
+        input: keeper.data,
+        logs: [{ address: SP, topics: g.topics, data: g.data }],
+      });
+    }
+    settle(r5.c);
+    const r5a = (await runOnce(r5.c.chain, r5.cfg, r5.store, rs, ident, { now: T0 })).status;
+    cell(
+      "trace R5: unsupported in the scan drops the proof; a stored sample re-proves a quiet chain; failed verification traces degrade; an empty receipt proves nothing",
+      r1a.healthy === true &&
+        r1b.healthy === false &&
+        r1c.healthy === false &&
+        r1c.trace.capability === "unverified" &&
+        r2a.healthy === true &&
+        r2a.trace.lastCheck === "verified" &&
+        r2a.trace.sampleTx === s2.hash &&
+        r3a.healthy === false &&
+        r3a.degraded.some(x => /verification: 1 sample trace/.test(x)) &&
+        r4a.healthy === false &&
+        r4a.trace.capability !== "verified" &&
+        !r4a.trace.thisTick.verified &&
+        !r5a.trace.thisTick.verified,
+      {
+        r1: [r1a.trace, r1b.degraded, r1c.trace],
+        r2: r2a.trace,
+        r3: [r3a.trace, r3a.degraded],
+        r4: [r4a.trace, r4a.degraded],
+        r5: r5a.trace,
+      }
+    );
     const failed = (
       await runOnce(
         {
@@ -1342,6 +1424,39 @@ try {
     );
   } finally {
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  }
+  {
+    // traceHealth alone, on a chain with no sample: a scan trace that shows the capability missing
+    // drops the fresh proof, so the next quiet tick (no trace calls at all) is not healthy
+    const d6 = mkdtempSync(join(tmpdir(), "guardian-watcher-th-"));
+    try {
+      const st = new Store(d6);
+      const empty = {
+        send: async m => (m === "eth_getBlockByNumber" ? { transactions: [] } : null),
+        getTransactionReceipt: async () => null,
+      };
+      const thCfg = { aggregator: AGG, roles: { superPaymaster: SP } };
+      st.putTraceCapability({ verifiedAt: 1000, txHash: null, by: "test" });
+      const h0 = await traceHealth(empty, thCfg, st, {}, 50, 2000);
+      const h1 = await traceHealth(empty, thCfg, st, { unsupported: 1 }, 50, 3000);
+      const h2 = await traceHealth(empty, thCfg, st, {}, 50, 4000);
+      const h3 = await traceHealth(empty, thCfg, st, { noLogs: 1 }, 50, 5000);
+      cell(
+        "traceHealth: unsupported or log-less scan traces drop the proof; a quiet tick after that is not healthy",
+        h0.degraded === null &&
+          h1.degraded !== null &&
+          h2.degraded !== null &&
+          h2.trace.capability === "unverified" &&
+          h3.degraded !== null,
+        { h0, h1: h1.degraded, h2: [h2.trace, h2.degraded] }
+      );
+      st.putTraceCapability({ verifiedAt: 1000, txHash: null, by: "test" });
+      await traceHealth(empty, thCfg, st, { noLogs: 1 }, 50, 6000);
+      const h4 = await traceHealth(empty, thCfg, st, {}, 50, 7000);
+      cell("traceHealth: a log-less scan trace also drops the proof", h4.degraded !== null, h4);
+    } finally {
+      rmSync(d6, { recursive: true, force: true });
+    }
   }
   const e = (code, message) => Object.assign(new Error(message), { error: { code, message } });
   cell(

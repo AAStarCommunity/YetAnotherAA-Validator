@@ -419,15 +419,18 @@ aggregator-only.
   calls too. A tracing RPC (`debug_traceTransaction`, `callTracer` with
   `withLog`) is therefore a requirement, not an optimisation. The capability is
   known only by **positive verification**: a real transaction with logs whose
-  trace aligns log by log with its receipt, either one the scan traced or a
-  sample from the newest finalized blocks. A lookup miss proves nothing, since a
-  node resolves the transaction before it builds the tracer. The proof is stored
-  and re-checked when older than `traceVerifyMs` (1 h), on quiet ticks too. The
+  trace aligns log by log with its receipt, either one the scan traced (its
+  receipt must contain every watched log `getLogs` returned) or a sample: the
+  stored sample transaction first, then the newest finalized blocks. A lookup
+  miss proves nothing, since a node resolves the transaction before it builds
+  the tracer. The proof is stored and re-checked when older than `traceVerifyMs`
+  (1 h), on quiet ticks too; any trace showing the method missing or `withLog`
+  ignored drops it, and only a new positive verification restores health. The
   watcher is in an explicitly labelled **degraded** mode (`status.degraded`
   lists why, `status.healthy` is false, `--once` exits non-zero) when the method
-  or tracer is missing, a trace of a transaction with logs carries none
-  (`withLog` ignored), the proof is older than twice the interval, or every
-  trace call of the tick failed. It is never shown as healthy. Checking this on
+  or tracer is missing, a trace of a transaction with logs carries none, the
+  proof is older than twice the interval, or every trace call of the tick, or of
+  a verification attempt, failed. It is never shown as healthy. Checking this on
   the production RPC is a Phase D pre-deploy item. A fallback that attributes
   without a trace is backlog after 5.5.0. A selector shorter than 4 bytes proves
   no function. A selector listed in `ruleset.json` `publicRoute.functions` gives
