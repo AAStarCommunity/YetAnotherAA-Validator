@@ -631,8 +631,15 @@ contract DisclosureRegistryTest is Test {
         bytes32 action = keccak256(abi.encode(DisclosureRegistry.Kind.SLASH, uint256(33)));
         vm.prank(writer);
         vm.expectEmit(true, false, false, true, address(reg));
-        emit DisclosureRegistry.Amended(id, "ipfs://fixed", keccak256("fixed"), keccak256("why"));
-        reg.amend(id, "ipfs://fixed", keccak256("fixed"), keccak256("why"));
+        DisclosureRegistry.Amendment memory a = DisclosureRegistry.Amendment({
+            txHash: keccak256("the real tx"),
+            blockNumber: EXEC_BLOCK + 1,
+            rulesetCommit: bytes20(uint160(0xbeef)),
+            recordURI: "ipfs://fixed",
+            recordHash: keccak256("fixed")
+        });
+        emit DisclosureRegistry.Amended(id, a, keccak256("why"));
+        reg.amend(id, a, keccak256("why"));
         assertEq(reg.entryBinding(id), bindingBefore, "binding unchanged");
         assertEq(reg.entryOf(action), id, "still the same primary entry");
         assertEq(reg.entryCount(), id, "no new entry");
@@ -641,14 +648,14 @@ contract DisclosureRegistryTest is Test {
     function test_amendOfMissingEntryReverts() public {
         vm.prank(writer);
         vm.expectRevert(DisclosureRegistry.UnknownEntry.selector);
-        reg.amend(42, "ipfs://x", bytes32(0), bytes32(0));
+        reg.amend(42, _amendment(), bytes32(0));
     }
 
     function test_amendByNonWriterReverts() public {
         uint256 id = _disclose(_executed(DisclosureRegistry.Kind.SLASH, 34, _slashInputs(), 0x7));
         vm.prank(makeAddr("stranger"));
         vm.expectRevert(DisclosureRegistry.NotWriter.selector);
-        reg.amend(id, "ipfs://x", bytes32(0), bytes32(0));
+        reg.amend(id, _amendment(), bytes32(0));
     }
 
     function test_duplicateRefusedForEveryKind() public {
@@ -674,5 +681,22 @@ contract DisclosureRegistryTest is Test {
             _executed(DisclosureRegistry.Kind.QUEUE, 0, abi.encode(makeAddr("operator"), uint8(1), uint256(43)), 0x3)
         );
         assertTrue(a != b, "a re-queue with a new epoch is its own entry");
+    }
+
+    function _amendment() internal pure returns (DisclosureRegistry.Amendment memory) {
+        return DisclosureRegistry.Amendment({
+            txHash: bytes32(0), blockNumber: 0, rulesetCommit: bytes20(0), recordURI: "ipfs://x", recordHash: bytes32(0)
+        });
+    }
+
+    function test_queueEntryOfIsKeyedByMessageHash() public {
+        DisclosureRegistry.Signed memory q = _executed(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs(), 0x3);
+        uint256 id = _disclose(q);
+        bytes32 mh = _spMessageHash(DisclosureRegistry.Kind.QUEUE, 0, _queueInputs());
+        assertEq(reg.entryOf(keccak256(abi.encode(DisclosureRegistry.Kind.QUEUE, uint256(mh)))), id);
+    }
+
+    function test_version() public view {
+        assertEq(reg.version(), "DisclosureRegistry-1.0.0");
     }
 }

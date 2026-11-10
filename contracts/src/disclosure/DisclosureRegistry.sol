@@ -108,10 +108,21 @@ contract DisclosureRegistry {
 
     event Replied(uint256 indexed entryId, address indexed replier, string replyURI, bytes32 replyHash);
 
-    /// @notice The writer's correction of an entry's CLAIM fields (record location and hash). It
-    ///         never edits the primary entry; readers apply amendments in order. `reasonHash`
-    ///         commits to a public explanation.
-    event Amended(uint256 indexed entryId, string recordURI, bytes32 recordHash, bytes32 reasonHash);
+    /// @dev The writer's correction of an entry's CLAIM fields: every field of `Record` except
+    ///      `subjectToken` (part of the binding, never amendable) and `blockVerified` (computed). A
+    ///      corrected `blockNumber` is a claim: it is not re-verified against EIP-2935.
+    struct Amendment {
+        bytes32 txHash;
+        uint64 blockNumber;
+        bytes20 rulesetCommit;
+        string recordURI;
+        bytes32 recordHash;
+    }
+
+    /// @notice A correction of an entry's claim fields. It never edits the primary entry; readers
+    ///         apply amendments in order, each replacing the previous claim values in full.
+    ///         `reasonHash` commits to a public explanation.
+    event Amended(uint256 indexed entryId, Amendment amendment, bytes32 reasonHash);
 
     error NotWriter();
     error ZeroAddress();
@@ -176,11 +187,18 @@ contract DisclosureRegistry {
         emit Disclosed(entryId, s.kind, key, s.proposalId, messageHash, s.signers, r);
     }
 
-    /// @notice Correct the record location/hash of an existing entry (WRITER only, append-only).
-    function amend(uint256 entryId, string calldata recordURI, bytes32 recordHash, bytes32 reasonHash) external {
+    /// @notice Correct the claim fields of an existing entry (WRITER only, append-only). With one
+    ///         primary entry per action this is the only way to fix a wrongly claimed txHash,
+    ///         blockNumber, rulesetCommit or record location/hash.
+    function amend(uint256 entryId, Amendment calldata a, bytes32 reasonHash) external {
         if (msg.sender != WRITER) revert NotWriter();
         if (entryBinding[entryId] == bytes32(0)) revert UnknownEntry();
-        emit Amended(entryId, recordURI, recordHash, reasonHash);
+        emit Amended(entryId, a, reasonHash);
+    }
+
+    /// @notice Release identifier (same shape as SuperPaymaster's IVersioned).
+    function version() external pure returns (string memory) {
+        return "DisclosureRegistry-1.0.0";
     }
 
     /// @notice Right of reply. Appends only. The caller must be one of:

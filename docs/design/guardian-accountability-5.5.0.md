@@ -163,11 +163,17 @@ watcher flags, whose factual fields are verified on-chain at write time.
 - One primary entry per action: a second `disclose` of the same `(kind, key)`
   reverts `AlreadyDisclosed(entryId)`, whatever the claim fields say. Duplicates
   are impossible on chain, independent of the watcher's journal.
-- The claim fields of an entry (record location/hash) can be corrected only by
-  `amend(entryId, recordURI, recordHash, reasonHash)`: WRITER only, append-only,
-  emits `Amended`, never edits the primary entry; readers apply amendments in
-  order. The on-chain-verified fields (signers, message, key) cannot be wrong
-  and are never amended.
+- The claim fields of an entry can be corrected only by
+  `amend(entryId, Amendment{txHash, blockNumber, rulesetCommit, recordURI, recordHash}, reasonHash)`:
+  WRITER only, append-only, emits `Amended`, never edits the primary entry;
+  readers apply amendments in order, each replacing the previous claim values in
+  full. A corrected `blockNumber` is a claim (not re-verified against EIP-2935).
+  `subjectToken` is part of the binding and cannot be amended (§4.3). The
+  on-chain-verified fields (signers, message, key) cannot be wrong and are never
+  amended. Before `disclose`, the watcher rechecks its own entry with the
+  recheck tool, so an amendment is the exception.
+- `version()` returns `"DisclosureRegistry-1.0.0"` (SP's IVersioned shape), read
+  back by the release manifest.
 - `WRITER` (the watcher EOA) and `AGGREGATOR` are immutable constructor
   arguments. Only `WRITER` may append a primary entry or an amendment.
 - Rotation: a lost or compromised watcher key means a new registry. So does a
@@ -370,7 +376,9 @@ disabled.
 
 For a flagged action: write the repo evidence record (JSON: tx, block, signers,
 target, calldata, evidence, the recheck command), send Telegram, then
-`DisclosureRegistry.disclose`. Each step is idempotent by `(proposalId, kind)`.
+`DisclosureRegistry.disclose`. Each step is idempotent by `(kind, key)` (QUEUE
+has no proposal id; its key is the message hash), and the registry itself
+refuses a second primary entry for the same `(kind, key)`.
 
 ### 5.4 `pauseUnderstakedOperator`
 
