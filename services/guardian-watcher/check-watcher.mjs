@@ -2816,8 +2816,12 @@ try {
         index: 0,
         transactionHash: 1n,
       });
+      b.c.injectRawResult(SP, { address: SP, ...gs, ...at, index: "1" }); // same text, another type
       const bs = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
       const bq = b.store.listDeadLetters().find(x => x.txHash === quiet.hash);
+      // after persistence and a retry, 1n and "1" are still two observations (R11)
+      await runOnce(b.c.chain, b.cfg, b.store, rs, ident);
+      const bq2 = b.store.listDeadLetters().find(x => x.txHash === quiet.hash);
       // a malformed hash in the final header read: the tick fails, the cursor is not poisoned
       b.c.mine();
       settle(b.c);
@@ -2830,7 +2834,8 @@ try {
       cell(
         "follow-up R10: BigInt fields never throw (isolated, every observation kept); a malformed header hash fails the tick without poisoning the cursor",
         bs.ok === true &&
-          bq?.watched?.length === 3 &&
+          bq?.watched?.length === 4 &&
+          bq2?.watched?.length === 4 &&
           b.store.listDeadLetters().some(x => x.quarantine === true) &&
           bad.ok === false &&
           j(curAfterBad) === j(curBefore) &&

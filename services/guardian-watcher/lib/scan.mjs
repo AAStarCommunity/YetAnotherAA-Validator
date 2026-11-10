@@ -587,7 +587,7 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
       reasons: [isolatedReason(e)],
       ...(t.range ? { range: t.range } : {}),
       events: existing?.events ?? [],
-      watched,
+      watched: typedEvidence(watched),
       ruleset: ctx.ruleset,
       seenAt: ctx.now,
     });
@@ -616,7 +616,7 @@ function quarantineRaw(store, ctx, summary, x, source, from, to) {
     status: "ERROR",
     reasons: ["returned entry is not a log"],
     events: [],
-    watched: evidence,
+    watched: typedEvidence(evidence),
     ruleset: ctx.ruleset,
     seenAt: ctx.now,
   });
@@ -630,6 +630,17 @@ export function safeJson(v) {
     return JSON.stringify(v, (_, x) => (typeof x === "bigint" ? { $bigint: x.toString() } : x));
   } catch {
     return `<unserialisable ${typeof v}>`;
+  }
+}
+
+/** Evidence as it is persisted: BigInt values tagged ({ $bigint }) rather than flattened to
+ * strings, so a stored observation keeps the identity it had when seen (1n and "1" stay two
+ * observations through a retry: Codex follow-up R11). */
+function typedEvidence(watched) {
+  try {
+    return JSON.parse(safeJson(watched));
+  } catch {
+    return watched;
   }
 }
 
@@ -905,7 +916,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       events: independent,
       // The watched logs exactly as getLogs returned them: a retry is judged against THIS
       // evidence, never against a receipt that may be the thing in dispute (Codex #400-fix R7).
-      watched: mergeEvidence(store.getDeadLetter(txDl)?.watched, evidenceOf(t)),
+      watched: typedEvidence(mergeEvidence(store.getDeadLetter(txDl)?.watched, evidenceOf(t))),
       // Records already classified, missing only their price (Codex #400-fix M3): exhaustion
       // keeps their route, caller and verdict, marked price.unavailable.
       ...(pendingRecords ? { pendingRecords } : {}),
