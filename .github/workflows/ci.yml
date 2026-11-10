@@ -180,6 +180,12 @@ jobs:
       - name: Check the disclosure-entry recheck
         run: npm run check:disclosure
 
+      # Guardian watcher core (M0 §5.2): BLS actions and owner/guardian-route actions are recorded
+      # and flagged by the pinned ruleset, unauthenticable ones dead-lettered, the cursor never
+      # passes finality or a failed tick, and a re-scan rewrites nothing.
+      - name: Check the guardian watcher core
+        run: npm run check:watcher
+
   # Job 3: Build project
   build:
     name: Build

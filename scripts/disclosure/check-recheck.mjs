@@ -8,630 +8,31 @@
 // failing case asserts WHICH check fired, so a recheck that fails for the wrong reason is caught too.
 import { ethers } from "ethers";
 import { Kind, aggIface, dvtIface, regIface, safeIface, recheckEntry } from "./recheck-lib.mjs";
-
-const ABI = ethers.AbiCoder.defaultAbiCoder();
-const AGG = ethers.getAddress("0x00000000000000000000000000000000000a6600");
-const REG = ethers.getAddress("0x00000000000000000000000000000000000d1500");
-const WRAPPER = ethers.getAddress("0x00000000000000000000000000000000000bad00");
-const WATCHER = ethers.getAddress("0x0000000000000000000000000000000000000777");
-const SAFE = ethers.getAddress("0x0000000000000000000000000000000000005afe");
-const DVT = ethers.getAddress("0x00000000000000000000000000000000000d7700");
-const MULTISEND = ethers.getAddress("0x0000000000000000000000000000000000035e00");
-const FAKE_DVT = ethers.getAddress("0x00000000000000000000000000000000000fa4e0");
-/** What a release manifest pins for the forwarder roles. */
-const FORWARDERS = { dvtValidator: DVT, ownerSafe: SAFE, multiSendCallOnly: MULTISEND };
-const DS = ethers.id("stub-domain-separator");
-
-const addr = s => ethers.getAddress(ethers.dataSlice(ethers.id(s), 12));
-const G = [addr("g1"), addr("g2"), addr("g3")]; // unsorted by construction of keccak
-const G_NEW = addr("g2-replacement");
-
-// ------------------------------------------------------------------ independent SP-side derivation
-function spMessageHash(kind, id, f) {
-  if (kind === Kind.SLASH)
-    return ethers.keccak256(
-      ABI.encode(
-        ["bytes32", "bytes32", "uint256", "address", "uint8", "uint256", "bytes32"],
-        [
-          DS,
-          ethers.id("SuperPaymaster.BLS.ExecuteSlash.v1"),
-          id,
-          f.operator,
-          f.slashLevel,
-          f.epoch,
-          f.evidenceHash,
-        ]
-      )
-    );
-  if (kind === Kind.GENERIC)
-    return ethers.keccak256(
-      ABI.encode(
-        ["bytes32", "bytes32", "uint256", "address", "bytes32", "uint256"],
-        [
-          DS,
-          ethers.id("SuperPaymaster.BLS.Proposal.v1"),
-          id,
-          f.target,
-          ethers.keccak256(f.callData),
-          f.requiredThreshold,
-        ]
-      )
-    );
-  if (kind === Kind.QUEUE)
-    return ethers.keccak256(
-      ABI.encode(
-        ["bytes32", "bytes32", "address", "uint8", "uint256"],
-        [DS, ethers.id("SuperPaymaster.BLS.QueueSlash.v1"), f.operator, f.slashLevel, f.epoch]
-      )
-    );
-  return ethers.keccak256(
-    ABI.encode(
-      ["bytes32", "bytes32", "uint256", "address[]", "uint256[]", "uint256"],
-      [DS, ethers.id("SuperPaymaster.BLS.Reputation.v1"), id, f.users, f.newScores, f.epoch]
-    )
-  );
-}
-function spKey(kind, id, mh) {
-  if (kind === Kind.GENERIC)
-    return BigInt(
-      ethers.keccak256(
-        ABI.encode(["bytes32", "uint256"], [ethers.id("SuperPaymaster.BLS.Proposal.v1"), id])
-      )
-    );
-  if (kind === Kind.QUEUE) return BigInt(mh);
-  return BigInt(id);
-}
-function spSigners(slots, mask) {
-  const s = [];
-  for (let slot = 1; slot <= 255; slot++) if ((mask >> BigInt(slot - 1)) & 1n) s.push(slots[slot]);
-  for (let i = 1; i < s.length; i++) {
-    const k = s[i];
-    let j = i;
-    while (j > 0 && BigInt(s[j - 1]) > BigInt(k)) {
-      s[j] = s[j - 1];
-      j--;
-    }
-    s[j] = k;
-  }
-  return s;
-}
-
-// ------------------------------------------------------------------ stub chain
-function makeChain() {
-  const blocks = new Map(); // number -> { hash, slots }
-  const txs = new Map(); // hash -> { tx, receipt }
-  const commitments = new Map(); // key -> [{ block, value }] (historical, like real state)
-  const commitAt = (key, tag) => {
-    const at = tag === "latest" ? head : Number(tag);
-    const hist = (commitments.get(key) ?? []).filter(h => h.block <= at);
-    return hist.length ? hist[hist.length - 1].value : ethers.ZeroHash;
-  };
-  const setCommit = (key, block, value) =>
-    commitments.set(key, [...(commitments.get(key) ?? []), { block, value }]);
-  let onCommitRead = null; // one-shot hook: runs while a check is in flight
-  const logs = [];
-  let head = 100;
-  let slots = { 1: G[0], 2: G[1], 3: G[2] };
-  const snapshot = () => ({ ...slots });
-  for (let n = 0; n <= head; n++)
-    blocks.set(n, {
-      hash: ethers.id(`block-${n}`),
-      parentHash: n ? ethers.id(`block-${n - 1}`) : ethers.ZeroHash,
-      slots: snapshot(),
-    });
-
-  const mine = () => {
-    head++;
-    blocks.set(head, {
-      hash: ethers.id(`block-${head}`),
-      parentHash: blocks.get(head - 1).hash,
-      slots: snapshot(),
-    });
-    return head;
-  };
-  const slotsAt = tag => blocks.get(tag === "latest" ? head : Number(tag)).slots;
-  let maxRange = Infinity; // emulate a range-capped RPC
-  let getLogsCalls = 0;
-  let onReceipt = null; // one-shot hook around the next receipt fetch
-  const proposals = new Map(); // DVTValidator id -> { block, operator, slashLevel, evidenceHash }
-  const traces = new Map(); // tx hash -> callTracer frame
-  let onEntryCountRead = null; // one-shot hook right after a by-hash eth_call returns
-  let afterSends = null; // { left, fn }: run fn once `left` more raw sends have returned
-
-  const chain = {
-    async getTransaction(h) {
-      return txs.get(h)?.tx ?? null;
-    },
-    async getTransactionReceipt(h) {
-      if (onReceipt) {
-        const f = onReceipt;
-        onReceipt = null;
-        return f(h);
-      }
-      return txs.get(h)?.receipt ?? null;
-    },
-    async getBlock(n) {
-      const b = blocks.get(Number(n));
-      return b ? { ...b } : null; // a copy, as a real provider returns: reorgs replace, never mutate
-    },
-    async getBlockNumber() {
-      return head;
-    },
-    /** Raw JSON-RPC, never cached (what an ethers provider's `send` is). */
-    async send(method, params) {
-      if (method === "eth_call") {
-        // EIP-1898: state at the block with this hash; unknown (orphaned) hash => error, as a node does.
-        const [{ to, data }, { blockHash }] = params;
-        const n = [...blocks.entries()].find(([, b]) => b.hash === blockHash)?.[0];
-        if (n === undefined) throw new Error("header not found");
-        const out = await chain.call({ to, data, blockTag: n });
-        if (onEntryCountRead) {
-          const f = onEntryCountRead;
-          onEntryCountRead = null;
-          f();
-        }
-        return out;
-      }
-      if (method === "debug_traceTransaction") {
-        const t = traces.get(params[0]);
-        if (!t) throw new Error("the method debug_traceTransaction does not exist");
-        return t;
-      }
-      if (method !== "eth_getBlockByNumber") throw new Error(`stub send: ${method}`);
-      const b = blocks.get(Number(params[0]));
-      const out = b ? { hash: b.hash, parentHash: b.parentHash } : null;
-      if (afterSends && --afterSends.left === 0) {
-        const f = afterSends.fn;
-        afterSends = null;
-        f();
-      }
-      return out;
-    },
-    async getLogs({ address, topics, fromBlock, toBlock }) {
-      getLogsCalls++;
-      if (toBlock - fromBlock + 1 > maxRange) throw new Error("block range too large");
-      return logs.filter(
-        l =>
-          l.address === address &&
-          l.blockNumber >= fromBlock &&
-          l.blockNumber <= toBlock &&
-          topics.every((t, i) => t == null || l.topics[i] === t)
-      );
-    },
-    async call({ to, data, blockTag }) {
-      if (to === REG) {
-        const q = regIface.parseTransaction({ data });
-        if (q.name === "entryCount")
-          return regIface.encodeFunctionResult(q.name, [BigInt(entryCount)]);
-        throw new Error(`stub registry: ${q.name}`);
-      }
-      if (to === DVT) {
-        const q = dvtIface.parseTransaction({ data });
-        if (q.name !== "proposals") throw new Error(`stub dvt: ${q.name}`);
-        const pr = proposals.get(BigInt(q.args[0]));
-        const at = blockTag === "latest" ? head : Number(blockTag);
-        const live = pr && pr.block <= at;
-        return dvtIface.encodeFunctionResult("proposals", [
-          live ? pr.operator : ethers.ZeroAddress,
-          live ? pr.slashLevel : 0,
-          "",
-          false,
-          !!live,
-          live ? pr.evidenceHash : ethers.ZeroHash,
-        ]);
-      }
-      if (to !== AGG) throw new Error("call to unknown contract");
-      const p = aggIface.parseTransaction({ data });
-      if (p.name === "domainSeparator") return aggIface.encodeFunctionResult(p.name, [DS]);
-      if (p.name === "validatorAtSlot")
-        return aggIface.encodeFunctionResult(p.name, [
-          slotsAt(blockTag)[Number(p.args[0])] ?? ethers.ZeroAddress,
-        ]);
-      if (p.name === "proposalSignersCommitment") {
-        const v = commitAt(BigInt(p.args[0]), blockTag);
-        if (onCommitRead) {
-          const f = onCommitRead;
-          onCommitRead = null;
-          f();
-        }
-        return aggIface.encodeFunctionResult(p.name, [v]);
-      }
-      throw new Error(`stub: ${p.name}`);
-    },
-  };
-
-  /** Calldata for an action routed through a forwarder (DVTValidator, the owner Safe, MultiSend). */
-  function wrapVia(via, kind, id, f, aggData, n) {
-    const dvtData = () =>
-      kind === Kind.QUEUE
-        ? dvtIface.encodeFunctionData("queueSlashWithProof", [
-            f.operator,
-            f.slashLevel,
-            f.epoch,
-            "0x",
-          ])
-        : dvtIface.encodeFunctionData("executeWithProof", [
-            id,
-            kind === Kind.REPUTATION ? f.users : [],
-            kind === Kind.REPUTATION ? f.newScores : [],
-            f.epoch,
-            "0x",
-          ]);
-    const safeExec = (target, data, op) =>
-      safeIface.encodeFunctionData("execTransaction", [
-        target,
-        0,
-        data,
-        op,
-        0,
-        0,
-        0,
-        ethers.ZeroAddress,
-        ethers.ZeroAddress,
-        "0x",
-      ]);
-    const packed = subs =>
-      ethers.concat(
-        subs.map(x =>
-          ethers.solidityPacked(
-            ["uint8", "address", "uint256", "uint256", "bytes"],
-            [x.op, x.to, 0, ethers.dataLength(x.data), x.data]
-          )
-        )
-      );
-    const dvtCallFrame = () => ({
-      type: "CALL",
-      to: DVT,
-      input: dvtData(),
-      calls: [{ type: "CALL", to: AGG, input: aggData }],
-    });
-    switch (via.route) {
-      case "dvt":
-        // A reputation proposal is created with operator 0 / level 0 (the aggregator requires both
-        // zero for a batch); a slash proposal stores its own fields.
-        if (kind !== Kind.QUEUE)
-          proposals.set(
-            BigInt(id),
-            kind === Kind.REPUTATION
-              ? {
-                  block: via.createdAt ?? n - 1,
-                  operator: ethers.ZeroAddress,
-                  slashLevel: 0,
-                  evidenceHash: ethers.ZeroHash,
-                }
-              : { block: via.createdAt ?? n - 1, ...(via.overrideProposal ?? f) }
-          );
-        return { to: DVT, data: dvtData() };
-      case "fake-dvt": // DVTValidator calldata at an address the manifest does not pin
-        if (kind !== Kind.QUEUE) proposals.set(BigInt(id), { block: n - 1, ...f });
-        return { to: FAKE_DVT, data: dvtData() };
-      case "safe": // `inner` replaces the Safe's inner call (e.g. a different message under the same key)
-        return { to: SAFE, data: safeExec(AGG, via.inner ?? aggData, 0) };
-      case "safe-delegate":
-        return { to: SAFE, data: safeExec(WRAPPER, aggData, 1) };
-      case "multisend":
-        return {
-          to: SAFE,
-          data: safeExec(
-            MULTISEND,
-            safeIface.encodeFunctionData("multiSend", [
-              packed([
-                { op: 0, to: addr("unrelated"), data: "0x1234" },
-                ...via.subs.map(op => ({ op, to: AGG, data: aggData })),
-                ...(via.extraAgg ? [{ op: 0, to: AGG, data: via.extraAgg }] : []),
-                ...(via.extraSub ? [via.extraSub] : []),
-              ]),
-            ]),
-            1
-          ),
-        };
-      case "trace-delegate": // unpinned wrapper -> DELEGATECALL (not MultiSendCallOnly) -> aggregator
-        return {
-          to: WRAPPER,
-          data: "0xdeadbeef",
-          trace: {
-            type: "CALL",
-            to: WRAPPER,
-            input: "0xdeadbeef",
-            calls: [
-              {
-                type: "DELEGATECALL",
-                to: addr("some-library"),
-                input: "0x01",
-                calls: [{ type: "CALL", to: AGG, input: aggData }],
-              },
-            ],
-          },
-        };
-      case "trace-module": // unpinned wrapper -> pinned Safe module route -> aggregator, seen by trace
-        return {
-          to: WRAPPER,
-          data: "0xdeadbeef",
-          trace: {
-            type: "CALL",
-            to: WRAPPER,
-            input: "0xdeadbeef",
-            calls: [
-              {
-                type: "CALL",
-                to: SAFE,
-                input: safeIface.encodeFunctionData("execTransactionFromModule", [
-                  AGG,
-                  0,
-                  aggData,
-                  0,
-                ]),
-                calls: [{ type: "CALL", to: AGG, input: aggData }],
-              },
-            ],
-          },
-        };
-      case "module":
-        return {
-          to: SAFE,
-          data: safeIface.encodeFunctionData("execTransactionFromModule", [AGG, 0, aggData, 0]),
-        };
-      case "trace": // an unpinned wrapper; the RPC offers a callTracer trace
-        if (via.dvt) proposals.set(BigInt(id), { block: n - 1, ...f });
-        return {
-          to: WRAPPER,
-          data: "0xdeadbeef",
-          trace: {
-            type: "CALL",
-            to: WRAPPER,
-            input: "0xdeadbeef",
-            calls: [
-              via.dvt ? dvtCallFrame() : { type: via.frameType ?? "CALL", to: AGG, input: aggData },
-            ],
-          },
-        };
-      default:
-        throw new Error(`unknown route ${via.route}`);
-    }
-  }
-
-  /** Execute one action as SP would: commitment over pre-block slots, SignersCommitted log. */
-  function execute(kind, id, f, mask, { to = AGG, from = SAFE, midSlots, status = 1, via } = {}) {
-    const n = mine();
-    // midSlots: the slot table as an earlier tx in this block left it and a later one undid it.
-    const pre = midSlots ?? blocks.get(n - 1).slots;
-    const mh = spMessageHash(kind, id, f);
-    const key = spKey(kind, id, mh);
-    const signers = spSigners(pre, mask);
-    const anchor = blocks.get(n - 1).hash;
-    setCommit(
-      key,
-      n,
-      ethers.keccak256(
-        ABI.encode(
-          ["bytes32", "bytes32", "uint256", "bytes32", "uint256", "address[]", "bytes32"],
-          [DS, ethers.id("SuperPaymaster.BLS.SignersCommitment.v1"), key, mh, mask, signers, anchor]
-        )
-      )
-    );
-    let data;
-    if (kind === Kind.SLASH)
-      data = aggIface.encodeFunctionData("verifyAndExecute", [
-        id,
-        f.operator,
-        f.slashLevel,
-        [],
-        [],
-        f.epoch,
-        f.evidenceHash,
-        "0x",
-      ]);
-    if (kind === Kind.REPUTATION)
-      data = aggIface.encodeFunctionData("verifyAndExecute", [
-        id,
-        ethers.ZeroAddress,
-        0,
-        f.users,
-        f.newScores,
-        f.epoch,
-        ethers.ZeroHash,
-        "0x",
-      ]);
-    if (kind === Kind.GENERIC)
-      data = aggIface.encodeFunctionData("executeProposal", [
-        id,
-        f.target,
-        f.callData,
-        f.requiredThreshold,
-        "0x",
-      ]);
-    if (kind === Kind.QUEUE)
-      data = aggIface.encodeFunctionData("queueSlashWithConsensus", [
-        f.operator,
-        f.slashLevel,
-        f.epoch,
-        "0x",
-      ]);
-    let trace = null;
-    if (via) ({ to, data, trace } = wrapVia(via, kind, id, f, data, n));
-    else if (to !== AGG) data = ethers.concat(["0xdeadbeef", data]); // a wrapper contract's own calldata
-    const hash = ethers.id(`action-${n}-${kind}-${id}`);
-    if (trace) traces.set(hash, trace);
-    const ev = aggIface.encodeEventLog("SignersCommitted", [key, mask]);
-    txs.set(hash, {
-      tx: { hash, to, from, data },
-      receipt: {
-        status,
-        blockNumber: n,
-        blockHash: blocks.get(n).hash,
-        logs: [{ address: AGG, topics: ev.topics, data: ev.data }],
-      },
-    });
-    return { hash, key, mh, signers, anchor, block: n, mask };
-  }
-
-  /** Write an entry as the watcher would (honest unless `forge` overrides fields). */
-  let entryCount = 0;
-  function disclose(kind, id, inputs, act, forge = {}) {
-    const n = mine();
-    const entryId = BigInt(++entryCount);
-    const e = {
-      kind,
-      key: act.key,
-      proposalId: kind === Kind.QUEUE ? 0n : id,
-      messageHash: act.mh,
-      signers: act.signers,
-      subjectToken: ethers.ZeroAddress,
-      txHash: act.hash,
-      blockNumber: act.block,
-      blockVerified: true,
-      rulesetCommit: "0x" + "ab".repeat(20),
-      recordURI: "ipfs://record",
-      recordHash: ethers.id("record"),
-      ...forge,
-    };
-    const s = {
-      kind,
-      proposalId: e.proposalId,
-      messageInputs: inputs,
-      signerMask: forge.signerMask ?? act.mask,
-      signers: e.signers,
-      anchor: forge.anchor ?? act.anchor,
-    };
-    const ev = regIface.encodeEventLog("Disclosed", [
-      entryId,
-      e.kind,
-      e.key,
-      e.proposalId,
-      e.messageHash,
-      e.signers,
-      [
-        e.subjectToken,
-        e.txHash,
-        e.blockNumber,
-        e.blockVerified,
-        e.rulesetCommit,
-        e.recordURI,
-        e.recordHash,
-      ],
-    ]);
-    const hash = ethers.id(`disclose-${entryId}`);
-    const data = regIface.encodeFunctionData("disclose", [
-      s,
-      e.subjectToken,
-      e.txHash,
-      e.blockNumber,
-      e.rulesetCommit,
-      e.recordURI,
-      e.recordHash,
-    ]);
-    txs.set(hash, {
-      tx: { hash, to: REG, from: WATCHER, data },
-      receipt: { status: 1, blockNumber: n, blockHash: blocks.get(n).hash, logs: [] },
-    });
-    logs.push({
-      address: REG,
-      topics: ev.topics,
-      data: ev.data,
-      transactionHash: hash,
-      blockNumber: n,
-      blockHash: blocks.get(n).hash,
-    });
-    return entryId;
-  }
-
-  return {
-    chain,
-    execute,
-    disclose,
-    setSlot: (s, v) => (slots[s] = v),
-    /** Replace block `n` with a sibling: same number, new hash (receipts fetched before keep the old one). */
-    /** Drop the parentHash from block n's header (an RPC that omits it). */
-    dropParentHash: n => blocks.set(n, { ...blocks.get(n), parentHash: undefined }),
-    /** During the next receipt fetch: replace the listed blocks (a reorg) and answer null. */
-    reorgDuringReceipt: ns =>
-      (onReceipt = () => {
-        for (const n of ns) blocks.set(n, { ...blocks.get(n), hash: ethers.id(`rcpt-reorg-${n}`) });
-        return null;
-      }),
-    /** Replace block n and return a reverted receipt from the orphaned branch. */
-    revertedOnOrphan: (hash, n) =>
-      (onReceipt = () => {
-        blocks.set(n, { ...blocks.get(n), hash: ethers.id(`orphan-${n}`) });
-        return { ...txs.get(hash).receipt, status: 0 };
-      }),
-    /** After `k` more raw block reads, replace block n (a reorg at an exact point in the check). */
-    reorgAfterSends: (k, n) =>
-      (afterSends = {
-        left: k,
-        fn: () => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`late-reorg-${n}`) }),
-      }),
-    /** Replace the head block right after the next by-hash counter read. */
-    reorgHeadAfterCountRead: () =>
-      (onEntryCountRead = () =>
-        blocks.set(head, { ...blocks.get(head), hash: ethers.id(`head-reorg-${head}`) })),
-    /** Make the next receipt fetch answer without a status field. */
-    receiptWithoutStatus: () =>
-      (onReceipt = h => {
-        const r = { ...txs.get(h).receipt };
-        r.status = null;
-        return r;
-      }),
-    reorg: n => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`reorged-${n}`) }),
-    disclosureBlock: entryId => logs.find(l => BigInt(l.topics[1]) === BigInt(entryId)).blockNumber,
-    capRange: r => (maxRange = r),
-    /** Overwrite the commitment at `key` in a new block (what a key collision would do). */
-    overwrite: key => setCommit(key, mine(), ethers.id(`overwrite-${key}`)),
-    mineEmpty: () => mine(),
-    reorgDuringNextCheck: n =>
-      (onCommitRead = () => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`mid-reorg-${n}`) })),
-    logCalls: () => getLogsCalls,
-    head: () => head,
-  };
-}
-
-// ------------------------------------------------------------------ fixtures
-const slashF = {
-  operator: addr("op"),
-  slashLevel: 1,
-  epoch: 42n,
-  evidenceHash: ethers.id("evidence"),
-};
-const slashIn = ABI.encode(
-  ["address", "uint8", "uint256", "bytes32"],
-  [slashF.operator, slashF.slashLevel, slashF.epoch, slashF.evidenceHash]
-);
-const genF = { target: addr("registry"), callData: "0x12345678", requiredThreshold: 3n };
-const genIn = ABI.encode(
-  ["address", "bytes32", "uint256"],
-  [genF.target, ethers.keccak256(genF.callData), genF.requiredThreshold]
-);
-const qF = { operator: addr("op"), slashLevel: 2, epoch: 43n };
-const qIn = ABI.encode(["address", "uint8", "uint256"], [qF.operator, qF.slashLevel, qF.epoch]);
-const repF = { users: [addr("u1"), addr("u2")], newScores: [10n, 20n], epoch: 44n };
-const repIn = ABI.encode(
-  ["address[]", "uint256[]", "uint256"],
-  [repF.users, repF.newScores, repF.epoch]
-);
-
-/**
- * What an ethers v6 provider does by default: identical requests within the cache window return the
- * first answer. Wraps every typed read; `send` stays raw, as in ethers.
- */
-function withRequestCache(chain) {
-  const cache = new Map();
-  const cached =
-    name =>
-    async (...args) => {
-      const k = `${name}:${JSON.stringify(args, (_, v) => (typeof v === "bigint" ? v.toString() : v))}`;
-      if (!cache.has(k)) cache.set(k, await chain[name](...args));
-      return cache.get(k);
-    };
-  return {
-    getBlock: cached("getBlock"),
-    getTransaction: cached("getTransaction"),
-    getTransactionReceipt: cached("getTransactionReceipt"),
-    getLogs: cached("getLogs"),
-    call: cached("call"),
-    getBlockNumber: () => chain.getBlockNumber(),
-    send: (...a) => chain.send(...a),
-  };
-}
+import {
+  ABI,
+  AGG,
+  REG,
+  WRAPPER,
+  SAFE,
+  DVT,
+  MULTISEND,
+  FAKE_DVT,
+  FORWARDERS,
+  addr,
+  G,
+  G_NEW,
+  spMessageHash,
+  makeChain,
+  slashF,
+  slashIn,
+  genF,
+  genIn,
+  qF,
+  qIn,
+  repF,
+  repIn,
+  withRequestCache,
+} from "./stub-chain.mjs";
 
 // ------------------------------------------------------------------ cases
 const {
@@ -653,6 +54,9 @@ const {
   reorgAfterSends,
   reorgHeadAfterCountRead,
   receiptWithoutStatus,
+  setTrace,
+  setStorage,
+  setPrestate,
 } = makeChain();
 const results = [];
 // want: "PASS" | { diff } (MISMATCH on that field) | { status, reason } | { unverified: {...} } (MATCH,
@@ -1245,6 +649,291 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
     {
       status: "INCONCLUSIVE",
       reason: "no aggregator call recoverable",
+    }
+  );
+}
+
+// ---------------------------------------------------------------- #399 review follow-ups (F1, F2, L1)
+{
+  const SINGLETON = addr("safe-singleton");
+  setStorage(SAFE, 0, ethers.zeroPadValue(SINGLETON, 32));
+  const slashCall = (id, ev = slashF.evidenceHash) =>
+    aggIface.encodeFunctionData("verifyAndExecute", [
+      id,
+      slashF.operator,
+      slashF.slashLevel,
+      [],
+      [],
+      slashF.epoch,
+      ev,
+      "0x",
+    ]);
+  const safeCall = (to, data) =>
+    safeIface.encodeFunctionData("execTransaction", [
+      to,
+      0,
+      data,
+      0,
+      100000,
+      0,
+      0,
+      ethers.ZeroAddress,
+      ethers.ZeroAddress,
+      "0x",
+    ]);
+  const viaSafeProxy = (id, implTo) => ({
+    type: "CALL",
+    to: WRAPPER,
+    input: "0xdeadbeef",
+    calls: [
+      {
+        type: "CALL",
+        to: SAFE,
+        input: safeCall(AGG, slashCall(id)),
+        calls: [
+          {
+            type: "DELEGATECALL",
+            to: implTo,
+            input: safeCall(AGG, slashCall(id)),
+            calls: [{ type: "CALL", to: AGG, input: slashCall(id) }],
+          },
+        ],
+      },
+    ],
+  });
+
+  // F1: a real Safe is a proxy; its singleton hop is followed, a delegatecall elsewhere is not.
+  const f1a = execute(Kind.SLASH, 80n, slashF, 0b011n, { to: WRAPPER });
+  setTrace(f1a.hash, viaSafeProxy(80n, SINGLETON));
+  await expectCase(
+    "trace: owner Safe proxy -> its real singleton -> aggregator is followed",
+    disclose(Kind.SLASH, 80n, slashIn, f1a),
+    "PASS"
+  );
+  const f1b = execute(Kind.SLASH, 81n, slashF, 0b011n, { to: WRAPPER });
+  setTrace(f1b.hash, viaSafeProxy(81n, addr("not-the-singleton")));
+  await expectCase(
+    "trace: owner Safe delegatecalling anything but its singleton is pruned",
+    disclose(Kind.SLASH, 81n, slashIn, f1b),
+    {
+      status: "INCONCLUSIVE",
+      reason: "DELEGATECALL subtree not followed",
+    }
+  );
+
+  // F2: top-level pinned Safe whose inner call goes to an unpinned wrapper: the trace fallback runs.
+  const f2 = execute(Kind.SLASH, 82n, slashF, 0b011n, { to: SAFE });
+  // `to: SAFE` gives the tx Safe calldata the direct decoder cannot follow (deadbeef-prefixed)
+  setTrace(f2.hash, {
+    type: "CALL",
+    to: SAFE,
+    input: "0xdeadbeef",
+    calls: [
+      {
+        type: "DELEGATECALL",
+        to: SINGLETON,
+        calls: [
+          {
+            type: "CALL",
+            to: addr("inner-wrapper"),
+            calls: [{ type: "CALL", to: AGG, input: slashCall(82n) }],
+          },
+        ],
+      },
+    ],
+  });
+  await expectCase(
+    "pinned top-level Safe -> unpinned wrapper -> aggregator: recovered by the trace",
+    disclose(Kind.SLASH, 82n, slashIn, f2),
+    "PASS"
+  );
+
+  // Codex W1 R2 M3: a singleton re-pointed earlier in the same block (slot 0 differs at N-1 and N)
+  // is still the Safe's own hop.
+  {
+    const NEW_SINGLETON = addr("safe-singleton-v2");
+    const m3 = execute(Kind.SLASH, 85n, slashF, 0b011n, { to: WRAPPER });
+    setStorage(SAFE, 0, ethers.zeroPadValue(NEW_SINGLETON, 32), m3.block);
+    setTrace(m3.hash, viaSafeProxy(85n, NEW_SINGLETON));
+    await expectCase(
+      "trace: singleton re-pointed in the same block is followed (slot 0 at N)",
+      disclose(Kind.SLASH, 85n, slashIn, m3),
+      "PASS"
+    );
+    setStorage(SAFE, 0, ethers.zeroPadValue(SINGLETON, 32), m3.block + 1); // restore for later cells
+  }
+
+  // Codex W1 R3 M2: a singleton set by an earlier tx of the block and reverted by a later one is in
+  // neither boundary snapshot; the pre-tx state (prestateTracer) shows it.
+  {
+    const TRANSIENT = addr("safe-singleton-transient");
+    const m3b = execute(Kind.SLASH, 86n, slashF, 0b011n, { to: WRAPPER });
+    setTrace(m3b.hash, viaSafeProxy(86n, TRANSIENT));
+    setPrestate(m3b.hash, {
+      [SAFE.toLowerCase()]: {
+        storage: { [ethers.zeroPadValue("0x00", 32)]: ethers.zeroPadValue(TRANSIENT, 32) },
+      },
+    });
+    await expectCase(
+      "trace: transient singleton seen through the pre-tx state is followed",
+      disclose(Kind.SLASH, 86n, slashIn, m3b),
+      "PASS"
+    );
+  }
+
+  // Codex W1 R3 M1: the direct path sees only a failed decoy under the SAME key; since it does not
+  // authenticate, the trace must still be asked, and recovers the genuine call.
+  {
+    const decoy = aggIface.encodeFunctionData("verifyAndExecute", [
+      92n,
+      slashF.operator,
+      2,
+      [],
+      [],
+      slashF.epoch,
+      ethers.id("decoy"),
+      "0x",
+    ]);
+    const nestedDecoy = {
+      op: 0,
+      to: SAFE,
+      data: safeIface.encodeFunctionData("execTransaction", [
+        AGG,
+        0,
+        decoy,
+        0,
+        100000,
+        0,
+        0,
+        ethers.ZeroAddress,
+        ethers.ZeroAddress,
+        "0x",
+      ]),
+    };
+    const m5 = execute(Kind.SLASH, 92n, slashF, 0b011n, {
+      via: { route: "multisend", subs: [], extraSub: nestedDecoy },
+    });
+    setTrace(m5.hash, {
+      type: "CALL",
+      to: SAFE,
+      calls: [
+        {
+          type: "DELEGATECALL",
+          to: SINGLETON,
+          calls: [
+            {
+              type: "CALL",
+              to: addr("opaque2"),
+              calls: [{ type: "CALL", to: AGG, input: slashCall(92n) }],
+            },
+          ],
+        },
+      ],
+    });
+    await expectCase(
+      "same-key failed decoy on the direct path: trace still consulted, genuine call recovered",
+      disclose(Kind.SLASH, 92n, slashIn, m5),
+      "PASS"
+    );
+  }
+
+  // Codex W1 R2 M4: a pinned Safe batch whose direct path decodes another call, not this one: the
+  // trace is still consulted for the wanted key.
+  {
+    const other = aggIface.encodeFunctionData("executeProposal", [
+      91n,
+      genF.target,
+      "0x55",
+      3n,
+      "0x",
+    ]);
+    const m4 = execute(Kind.SLASH, 90n, slashF, 0b011n, {
+      via: { route: "multisend", subs: [], extraAgg: other },
+    });
+    setTrace(m4.hash, {
+      type: "CALL",
+      to: SAFE,
+      calls: [
+        {
+          type: "DELEGATECALL",
+          to: SINGLETON,
+          calls: [
+            {
+              type: "CALL",
+              to: addr("opaque"),
+              calls: [{ type: "CALL", to: AGG, input: slashCall(90n) }],
+            },
+          ],
+        },
+      ],
+    });
+    await expectCase(
+      "batch: direct path finds another call; the wanted one is recovered by the trace",
+      disclose(Kind.SLASH, 90n, slashIn, m4),
+      "PASS"
+    );
+  }
+
+  // L1a: a reverted aggregator frame must never become a proven candidate. B (reverted) carries the
+  // honest action's id with another message; the honest call sits under a pruned module route. With
+  // the error guard removed, B would be the only proven candidate and accuse the honest entry.
+  const l1a = execute(Kind.SLASH, 83n, slashF, 0b011n, { to: WRAPPER });
+  setTrace(l1a.hash, {
+    type: "CALL",
+    to: WRAPPER,
+    input: "0xdeadbeef",
+    calls: [
+      {
+        type: "CALL",
+        to: AGG,
+        input: slashCall(83n, ethers.id("other evidence")),
+        error: "execution reverted",
+      },
+      {
+        type: "CALL",
+        to: SAFE,
+        input: safeIface.encodeFunctionData("execTransactionFromModule", [
+          AGG,
+          0,
+          slashCall(83n),
+          0,
+        ]),
+        calls: [{ type: "CALL", to: AGG, input: slashCall(83n) }],
+      },
+    ],
+  });
+  await expectCase(
+    "trace: a reverted aggregator frame cannot accuse an honest entry",
+    disclose(Kind.SLASH, 83n, slashIn, l1a),
+    {
+      status: "INCONCLUSIVE",
+      reason: "Safe module route not followed",
+    }
+  );
+
+  // L1b: in a trace, a MultiSend with a non-CALL child is pruned whole.
+  const l1b = execute(Kind.SLASH, 84n, slashF, 0b011n, { to: WRAPPER });
+  setTrace(l1b.hash, {
+    type: "CALL",
+    to: WRAPPER,
+    input: "0xdeadbeef",
+    calls: [
+      {
+        type: "DELEGATECALL",
+        to: MULTISEND,
+        calls: [
+          { type: "CALL", to: AGG, input: slashCall(84n) },
+          { type: "DELEGATECALL", to: addr("lib"), calls: [] },
+        ],
+      },
+    ],
+  });
+  await expectCase(
+    "trace: MultiSend with a non-CALL child is pruned whole",
+    disclose(Kind.SLASH, 84n, slashIn, l1b),
+    {
+      status: "INCONCLUSIVE",
+      reason: "MultiSend with a non-CALL sub-transaction",
     }
   );
 }

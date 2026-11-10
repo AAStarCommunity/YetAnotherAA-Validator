@@ -187,6 +187,7 @@ export function decodeAction(data) {
       fields: {
         target: a.target,
         callDataHash: ethers.keccak256(a.callData),
+        callData: a.callData, // kept for the watcher's rules (selector); not part of any hash
         requiredThreshold: a.requiredThreshold,
       },
     };
@@ -284,7 +285,14 @@ export function parseMultiSend(transactions) {
  * followed. Anything else falls back to a callTracer trace limited to the pinned aggregator and
  * DVTValidator. `notes` says why something was not followed.
  */
-export async function extractCandidates(chain, tx, aggregator, forwarders = {}, blockNumber) {
+export async function extractCandidates(
+  chain,
+  tx,
+  aggregator,
+  forwarders = {},
+  blockNumber,
+  opts = {}
+) {
   const fw = forwarders || {};
   const candidates = [];
   const notes = [];
@@ -409,8 +417,12 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
   if (tx.to) await follow(tx.to, tx.data, "tx", 0, true);
   const pinnedTop =
     tx.to && [aggregator, fw.dvtValidator, fw.ownerSafe].some(a => eqAddr(a, tx.to));
-  if (!pinnedTop) {
-    // Trace fallback: decode only CALL frames whose target is the pinned aggregator or DVTValidator.
+  // Trace fallback: for a wrapper the manifest does not pin, and also when a pinned top-level
+  // forwarder led to no decodable aggregator call (e.g. the Safe called an unpinned wrapper).
+  // Also when the caller asks (`forceTrace`): the direct path found calls, but not the one wanted.
+  let traced = false;
+  if (opts.forceTrace || !pinnedTop || candidates.length === 0) {
+    if (opts.forceTrace) candidates.length = 0; // the trace sees every call; avoid double counting
     let trace = null;
     if (typeof chain.send === "function") {
       try {
@@ -421,7 +433,9 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
     }
     if (!trace) {
       notes.push(
-        "action is wrapped by a contract the manifest does not pin, and no callTracer trace is available"
+        pinnedTop
+          ? "the pinned forwarder did not lead to a decodable aggregator call, and no callTracer trace is available"
+          : "action is wrapped by a contract the manifest does not pin, and no callTracer trace is available"
       );
     } else {
       const selectorOf = d =>
@@ -431,18 +445,65 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
           n => safeIface.getFunction(n).selector
         )
       );
+      // The owner Safe is a proxy: callTracer shows CALL Safe -> DELEGATECALL <singleton>. That one
+      // hop is followed only into the Safe's ACTUAL singleton, read from its storage slot 0 at
+      // block N-1; a delegatecall from the Safe to anything else is pruned like any other.
+      // The Safe's singleton: slot 0 just before THIS tx (prestateTracer, which also sees a change
+      // made by an earlier tx of the same block), and at the parent block and at the block as a
+      // fallback. The hop is followed if the delegatecall target is any of them; otherwise it is
+      // pruned (INCONCLUSIVE, never MISMATCH). Known limit: a Safe that re-points its singleton
+      // inside this same tx before the hop is not seen, which also ends INCONCLUSIVE.
+      let singletons;
+      const safeSingletons = async () => {
+        if (singletons !== undefined) return singletons;
+        singletons = [];
+        try {
+          const pre = await chain.send("debug_traceTransaction", [
+            tx.hash,
+            { tracer: "prestateTracer" },
+          ]);
+          const acct = pre && Object.entries(pre).find(([a]) => eqAddr(a, fw.ownerSafe))?.[1];
+          const word =
+            acct?.storage && Object.entries(acct.storage).find(([k]) => BigInt(k) === 0n)?.[1];
+          if (word)
+            singletons.push(ethers.getAddress(ethers.dataSlice(ethers.zeroPadValue(word, 32), 12)));
+        } catch {
+          /* no prestate tracer: block-boundary reads only */
+        }
+        for (const tag of [blockNumber - 1, blockNumber]) {
+          try {
+            const word = await chain.send("eth_getStorageAt", [
+              fw.ownerSafe,
+              "0x0",
+              ethers.toQuantity(tag),
+            ]);
+            singletons.push(ethers.getAddress(ethers.dataSlice(ethers.zeroPadValue(word, 32), 12)));
+          } catch {
+            /* unreadable: that block contributes no singleton */
+          }
+        }
+        return singletons;
+      };
       // A frame without `error` whose ancestors have none either did succeed, so what it decodes
       // to is proven. The direct path's route rules hold here too: a DELEGATECALL subtree is pruned
-      // unless it enters the pinned MultiSendCallOnly with all-CALL children, and a Safe module
-      // call subtree is pruned.
-      const walk = async (f, path) => {
+      // unless it is the owner Safe's own singleton hop or enters the pinned MultiSendCallOnly with
+      // all-CALL children, and a Safe module call subtree is pruned.
+      const walk = async (f, path, parent) => {
         if (!f || f.error) return;
         const type = String(f.type).toUpperCase();
         if (type === "DELEGATECALL") {
-          if (!eqAddr(f.to, fw.multiSendCallOnly))
-            return notes.push(`${path}: DELEGATECALL subtree not followed`);
-          if ((f.calls || []).some(c => String(c.type).toUpperCase() !== "CALL"))
-            return notes.push(`${path}: MultiSend with a non-CALL sub-transaction not followed`);
+          const parentIsSafe =
+            parent &&
+            String(parent.type).toUpperCase() === "CALL" &&
+            eqAddr(parent.to, fw.ownerSafe);
+          const isSingletonHop =
+            parentIsSafe && (await safeSingletons()).some(a => eqAddr(f.to, a));
+          if (!isSingletonHop) {
+            if (!eqAddr(f.to, fw.multiSendCallOnly))
+              return notes.push(`${path}: DELEGATECALL subtree not followed`);
+            if ((f.calls || []).some(c => String(c.type).toUpperCase() !== "CALL"))
+              return notes.push(`${path}: MultiSend with a non-CALL sub-transaction not followed`);
+          }
         }
         if (eqAddr(f.to, fw.ownerSafe) && moduleSelectors.has(selectorOf(f.input)))
           return notes.push(`${path}: Safe module route not followed`);
@@ -454,12 +515,13 @@ export async function extractCandidates(chain, tx, aggregator, forwarders = {}, 
             await fromDvt(f.input, `${path}.dvtValidator`);
           }
         }
-        for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`);
+        for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`, f);
       };
-      await walk(trace, "trace");
+      await walk(trace, "trace", null);
+      traced = true;
     }
   }
-  return { candidates, notes };
+  return { candidates, notes, traced };
 }
 
 /**
@@ -550,105 +612,119 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
   // forwarders, or from a trace. A candidate counts only if it reproduces the SignersCommitted key;
   // the stored commitment is then the final gate, so a decoding mistake can never make a MATCH.
   const ds = await view(chain, agg, "domainSeparator", [], blockNumber);
-  const found = await extractCandidates(chain, tx, agg, forwarders, blockNumber);
+  let found = await extractCandidates(chain, tx, agg, forwarders, blockNumber);
   facts.route = null;
-  const matching = [];
-  for (const c of found.candidates) {
-    if (
-      (c.kind === Kind.SLASH || c.kind === Kind.REPUTATION) &&
-      BigInt(c.proposalId) >= RAW_ID_BOUND
-    ) {
-      continue; // the aggregator reverts these (InvalidProposalId), so it cannot be the committed call
+  // Decide on one candidate set, on a fresh copy of the facts.
+  const decide = async found => {
+    const f = { ...facts, incomplete: [...facts.incomplete] };
+    const matching = [];
+    for (const c of found.candidates) {
+      if (
+        (c.kind === Kind.SLASH || c.kind === Kind.REPUTATION) &&
+        BigInt(c.proposalId) >= RAW_ID_BOUND
+      ) {
+        continue; // the aggregator reverts these (InvalidProposalId), so it cannot be the committed call
+      }
+      const mh = messageHashOf(ds, c.kind, c.proposalId, c.fields);
+      if (commitmentKey(c.kind, c.proposalId, mh) === commit.key)
+        matching.push({ ...c, messageHash: mh });
     }
-    const mh = messageHashOf(ds, c.kind, c.proposalId, c.fields);
-    if (commitmentKey(c.kind, c.proposalId, mh) === commit.key)
-      matching.push({ ...c, messageHash: mh });
-  }
-  if (matching.length === 0) {
-    facts.incomplete.push(...found.notes);
-    facts.incomplete.push(
-      found.candidates.length
-        ? "no recovered aggregator call reproduces the SignersCommitted key"
-        : "no aggregator call recoverable from this tx (wrapped through a contract the manifest does not pin)"
-    );
-    return { status: null, facts };
-  }
-  // A recovered call's message becomes a FACT only if it is authenticated: it reproduces the stored
-  // commitment, or the call is proven to have succeeded (`proven`: a top-level call to the pinned
-  // aggregator/DVTValidator in a successful tx, or an error-free trace path). A Safe inner call is
-  // not proven — execTransaction does not revert when its inner call fails — so until it matches
-  // the commitment it is never compared, and it can neither accuse nor hide an honest entry.
-  const distinct = [];
-  for (const m of matching) {
-    const d = distinct.find(x => x.messageHash === m.messageHash);
-    if (d) d.proven = d.proven || m.proven;
-    else distinct.push({ ...m });
-  }
-  const useMessage = c => {
-    facts.route = c.route;
-    Object.assign(facts, {
-      kind: c.kind,
-      proposalId: BigInt(c.proposalId),
-      messageHash: c.messageHash,
-      messageInputs: encodeMessageInputs(c.kind, c.fields),
-    });
-  };
-  const proven = distinct.filter(c => c.proven);
-
-  if (facts.anchor !== undefined) {
-    const onchain = await view(chain, agg, "proposalSignersCommitment", [commit.key], snapshot);
-    // The aggregator resolved slots during the tx. Pre-block state equals that unless an earlier
-    // tx in the same block re-registered a slot, so try the parent block first, then the block
-    // itself. A change undone later in the same block is visible in neither.
-    const signerSets = [];
-    for (const tag of [blockNumber - 1, blockNumber]) {
-      signerSets.push({ tag, s: await resolveSigners(chain, agg, commit.signerMask, tag) });
-    }
-    const authenticated = [];
-    for (const c of distinct) {
-      const hit = signerSets.find(
-        x =>
-          expectedCommitment(
-            ds,
-            commit.key,
-            c.messageHash,
-            commit.signerMask,
-            x.s,
-            facts.anchor
-          ) === onchain
+    if (matching.length === 0) {
+      f.incomplete.push(...found.notes);
+      f.incomplete.push(
+        found.candidates.length
+          ? "no recovered aggregator call reproduces the SignersCommitted key"
+          : "no aggregator call recoverable from this tx (wrapped through a contract the manifest does not pin)"
       );
-      if (hit) authenticated.push({ c, hit });
+      return { status: null, facts: f };
     }
-    if (authenticated.length === 1) {
-      useMessage(authenticated[0].c);
-      facts.signers = authenticated[0].hit.s;
-      facts.slotBlock = authenticated[0].hit.tag;
-      return { status: null, facts };
+    // A recovered call's message becomes a FACT only if it is authenticated: it reproduces the stored
+    // commitment, or the call is proven to have succeeded (`proven`: a top-level call to the pinned
+    // aggregator/DVTValidator in a successful tx, or an error-free trace path). A Safe inner call is
+    // not proven — execTransaction does not revert when its inner call fails — so until it matches
+    // the commitment it is never compared, and it can neither accuse nor hide an honest entry.
+    const distinct = [];
+    for (const m of matching) {
+      const d = distinct.find(x => x.messageHash === m.messageHash);
+      if (d) d.proven = d.proven || m.proven;
+      else distinct.push({ ...m });
     }
-    if (authenticated.length > 1) {
-      facts.incomplete.push("several recovered calls reproduce the commitment");
-      return { status: null, facts };
+    const useMessage = c => {
+      f.route = c.route;
+      Object.assign(f, {
+        kind: c.kind,
+        proposalId: BigInt(c.proposalId),
+        messageHash: c.messageHash,
+        messageInputs: encodeMessageInputs(c.kind, c.fields),
+      });
+      f.fields = c.fields;
+    };
+    const proven = distinct.filter(c => c.proven);
+
+    if (f.anchor !== undefined) {
+      const onchain = await view(chain, agg, "proposalSignersCommitment", [commit.key], snapshot);
+      // The aggregator resolved slots during the tx. Pre-block state equals that unless an earlier
+      // tx in the same block re-registered a slot, so try the parent block first, then the block
+      // itself. A change undone later in the same block is visible in neither.
+      const signerSets = [];
+      for (const tag of [blockNumber - 1, blockNumber]) {
+        signerSets.push({ tag, s: await resolveSigners(chain, agg, commit.signerMask, tag) });
+      }
+      const authenticated = [];
+      for (const c of distinct) {
+        const hit = signerSets.find(
+          x =>
+            expectedCommitment(ds, commit.key, c.messageHash, commit.signerMask, x.s, f.anchor) ===
+            onchain
+        );
+        if (hit) authenticated.push({ c, hit });
+      }
+      if (authenticated.length === 1) {
+        useMessage(authenticated[0].c);
+        f.signers = authenticated[0].hit.s;
+        f.slotBlock = authenticated[0].hit.tag;
+        return { status: null, facts: f, authenticated: true };
+      }
+      if (authenticated.length > 1) {
+        f.incomplete.push("several recovered calls reproduce the commitment");
+        return { status: null, facts: f };
+      }
     }
-  }
-  // Not authenticated by the commitment (no anchor, or the slot table changed inside the block).
-  // Only a proven call's message may still be compared; the signer set stays undecided.
-  if (proven.length === 1) {
-    useMessage(proven[0]);
-    facts.incomplete.push(
-      facts.anchor === undefined
-        ? "commitment not rebuilt (no anchor); signers undecided"
-        : "signers at the parent block and at the block do not reproduce proposalSignersCommitment " +
-            "(slot table changed inside the block, or the commitment was overwritten); replay the block to decide"
+    // Not authenticated by the commitment (no anchor, or the slot table changed inside the block).
+    // Only a proven call's message may still be compared; the signer set stays undecided.
+    if (proven.length === 1) {
+      useMessage(proven[0]);
+      f.incomplete.push(
+        f.anchor === undefined
+          ? "commitment not rebuilt (no anchor); signers undecided"
+          : "signers at the parent block and at the block do not reproduce proposalSignersCommitment " +
+              "(slot table changed inside the block, or the commitment was overwritten); replay the block to decide"
+      );
+      return { status: null, facts: f, authenticated: true };
+    }
+    f.incomplete.push(...found.notes);
+    f.incomplete.push(
+      proven.length > 1
+        ? "several proven calls claim the same key with different messages"
+        : "no recovered call is authenticated (none reproduces the commitment, and none is a proven top-level call)"
     );
-    return { status: null, facts };
+    return { status: null, facts: f };
+  };
+  let out = await decide(found);
+  // Nothing authenticated (e.g. the direct path saw only a failed decoy under the same key) and the
+  // trace not yet consulted: ask it, merge, decide again.
+  if (!out.authenticated && !found.traced) {
+    const viaTrace = await extractCandidates(chain, tx, agg, forwarders, blockNumber, {
+      forceTrace: true,
+    });
+    found = {
+      candidates: [...found.candidates, ...viaTrace.candidates],
+      notes: [...found.notes, ...viaTrace.notes],
+      traced: viaTrace.traced,
+    };
+    out = await decide(found);
   }
-  facts.incomplete.push(...found.notes);
-  facts.incomplete.push(
-    proven.length > 1
-      ? "several proven calls claim the same key with different messages"
-      : "no recovered call is authenticated (none reproduces the commitment, and none is a proven top-level call)"
-  );
-  return { status: null, facts };
+  return { status: out.status, facts: out.facts };
 }
 
 /**

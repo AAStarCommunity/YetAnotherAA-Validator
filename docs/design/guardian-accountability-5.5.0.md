@@ -329,12 +329,26 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
   - owner Safe `execTransaction` with operation CALL is followed; a DELEGATECALL
     is followed only into the pinned MultiSendCallOnly, and only through
     sub-transactions that are all CALLs; module routes are not followed.
-  - any other wrapper: a `callTracer` trace, decoding only CALL frames into the
-    pinned aggregator or DVTValidator; without a trace, INCONCLUSIVE.
+  - any other wrapper, and a pinned forwarder that led to no decodable call: a
+    `callTracer` trace, decoding only error-free CALL frames into the pinned
+    aggregator or DVTValidator. The route rules apply inside the trace: module
+    calls are pruned; a DELEGATECALL is followed only as the owner Safe's own
+    proxy hop into its singleton (slot 0 read from the pre-tx state via
+    `prestateTracer`, and at blocks N-1 and N; a Safe that re-points its
+    singleton inside the same tx before the hop is a known INCONCLUSIVE case) or
+    into the pinned MultiSendCallOnly with all-CALL children. Without a trace,
+    INCONCLUSIVE.
 
-  Whatever the route, a recovered call counts only if it yields the
-  `SignersCommitted` key and the stored commitment, so a decoding error ends in
-  INCONCLUSIVE or MISMATCH, never MATCH.
+  Whatever the route, a recovered call's message counts only if it reproduces
+  the stored commitment, or if the call is proven to have succeeded (the
+  top-level call of a successful tx into the pinned aggregator, or an error-free
+  trace frame into it). A call proven to have succeeded also counts without the
+  commitment, which is sound because SuperPaymaster allows each key to succeed
+  only once (`executedProposals`, `usedSlashQueueHashes`, every entry point
+  `nonReentrant`). A Safe inner call or a DVTValidator-derived call is not
+  proven, so it counts only through the commitment. A decoding error therefore
+  ends in INCONCLUSIVE or MISMATCH, never MATCH, and an unauthenticated
+  recovered call is not evidence.
 
 ## 5. Watcher service (DVT repo, Mac Mini only)
 
@@ -377,6 +391,129 @@ disabled.
   Every record, and the registry event (`rulesetCommit`), carries the commit SHA
   of the ruleset that produced the flag. That way the watcher cannot decide
   after the fact what counts as suspicious.
+
+#### 5.2a SuperPaymaster events outside a BLS action: classified by the emitting call (#400 M1)
+
+A watched SuperPaymaster event that the trace does not place inside a BLS
+action's aggregator call is **not** an owner action by default. Three functions
+that emit watched events are permissionless in SP 5.5.1
+(`SuperPaymasterAdmin.sol` at `7eb1fc87`):
+
+| Function                                            | Emits                                                         | Verdict (DSR, 2026-11-10)                                                                                                                                                                                                         |
+| --------------------------------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `updatePrice()` :507 (Chainlink refresh)            | `PriceUpdated`, `PriceModeChanged`, `EmergencyPriceCancelled` | routine when the call emits only `PriceUpdated`; **flagged as informational** ("price mode changed via permissionless refresh, caller not accused") when the same call also emits `PriceModeChanged` or `EmergencyPriceCancelled` |
+| `executeEmergencyPrice()` :417 (after the timelock) | `PriceModeChanged`, `EmergencyPriceExecuted`, `PriceUpdated`  | flagged, with the price before and after; the caller is not accused (the owner's queueing was already flagged)                                                                                                                    |
+| `pauseUnderstakedOperator(address)` :105            | `OperatorPaused`                                              | routine, not flagged (W3 owns it)                                                                                                                                                                                                 |
+
+Every other function that emits a watched event is owner-, guardian- or
+aggregator-only.
+
+- The event is classified by **the call into SuperPaymaster that emitted it**:
+  its selector and `msg.sender`. These come from the nearest enclosing
+  error-free `CALL` into SP in the `callTracer` trace, aligned log by log with
+  the receipt (a `DELEGATECALL` from SP into its own module is looked through).
+  The transaction's own calldata names only the root call, and an event name
+  matching what the root function can emit does not exclude a nested SP call
+  emitting the same event. So an event a permissionless function _can_ emit is
+  attributed **only** by its aligned emitting frame in the trace, for direct
+  calls too. A tracing RPC (`debug_traceTransaction`, `callTracer` with
+  `withLog`) is therefore a requirement, not an optimisation. The capability is
+  known only by **positive verification**: a real transaction with logs whose
+  trace aligns log by log with its receipt, either one the scan traced (its
+  receipt must contain every watched log `getLogs` returned, identical in
+  address, topics and data at the same position, and no other watched log; every
+  receipt log at its own position) or a sample: the stored sample transaction
+  first, then the newest finalized blocks. A lookup miss proves nothing, since a
+  node resolves the transaction before it builds the tracer. The proof is stored
+  and re-checked when older than `traceVerifyMs` (1 h), on quiet ticks too; any
+  trace showing the method missing or `withLog` ignored (a watched log seen by
+  `getLogs` makes a log-less trace conclusive, whatever the receipt says), or a
+  receipt that disagrees with `getLogs`, drops it, and only a new positive
+  verification restores health. The watcher is in an explicitly labelled
+  **degraded** mode (`status.degraded` lists why, `status.healthy` is false,
+  `--once` exits non-zero) when the method or tracer is missing, a trace of a
+  transaction with logs carries none, a receipt disagrees with `getLogs`, the
+  proof is older than twice the interval, or every trace call of the tick, or of
+  a verification attempt, failed. It is never shown as healthy. Checking this on
+  the production RPC is a Phase D pre-deploy item. A fallback that attributes
+  without a trace is backlog after 5.5.0. A selector shorter than 4 bytes proves
+  no function. A selector listed in `ruleset.json` `publicRoute.functions` gives
+  the **public** route. Any other selector gives the **owner** route. Every
+  record carries `caller`, `selector`, `from`, `to` and `callerSource` (`tx` |
+  `trace` | `unknown`), so the ruleset can change later without re-scanning.
+- An event that a permissionless function _can_ emit, whose call cannot be
+  determined (no trace, unaligned trace, tx unavailable), is never guessed. The
+  transaction becomes a dead letter (route `tx`) and is retried each tick. An
+  event that only privileged functions can emit is the owner route whatever the
+  trace says. Its caller is recorded when known.
+
+- **Scope of the trace and receipt checks.** They defend against an RPC that is
+  honest but inconsistent, lagging or only partly supporting the tracer, and
+  against client format differences:
+  - the receipt must name the tx and its block, succeed explicitly and carry no
+    removed or foreign log, and the receipt, its logs and the tx must all name
+    the block the `getLogs` evidence came from (a stale backend can answer from
+    an orphaned earlier inclusion);
+  - the trace root must be the tx itself (sender, destination, full input);
+  - positions are parsed strictly and must be unique and contiguous;
+  - logs must be well formed;
+  - traces from geth before log positions are accepted where the order is
+    unambiguous.
+
+  They do **not** defend against an RPC that fabricates a well-formed trace (for
+  example a different caller frame, or a log placed in a static call), because
+  such an RPC could equally omit an event from `getLogs`, which no trace check
+  can detect. The RPC is a deployment trust assumption: an operator-chosen node.
+  Comparing several independent RPCs is backlog after 5.5.0.
+
+#### 5.2b Dead letters, exhaustion and read integrity
+
+- A transient read failure is a retried dead letter, never a permanent gap:
+  - a tx that cannot be fetched;
+  - a price read that fails, for a record that needs the price;
+  - an action that cannot yet be authenticated.
+- After `MAX_DEADLETTER_ATTEMPTS` (20), a dead letter becomes a record, so every
+  BLS-executed action and every watched event ends with one:
+  - an unauthenticated BLS action becomes `UNRECOVERED` (flagged per ruleset;
+    published to the repo and Telegram only, with no registry entry, since
+    nothing on chain verifies it);
+  - an undeterminable SP event becomes `unattributed` (flagged, nobody accused);
+  - a record whose price never read (an authenticated BLS action, or an SP event
+    already classified) is kept with its route, caller and verdict, and
+    `price.unavailable`.
+- A transaction dead letter stores the watched logs exactly as `getLogs`
+  returned them. Its retries are judged against that evidence, never against a
+  receipt that may be the thing in dispute; one written without it re-reads its
+  block's logs by hash.
+- Evidence a dead letter has established survives every later, weaker failure:
+  an authenticated BLS record awaiting its price, and classified SP records
+  awaiting theirs, are retried for the price only and never rebuilt. A BLS
+  action counts as done only when a parseable, authenticated record exists; an
+  `UNRECOVERED` placeholder or a corrupt file does not stop a later
+  reconstruction.
+- `status.json` counts open, corrupt and exhausted dead letters. A corrupt
+  dead-letter file is counted, never fatal. A record file that does not parse is
+  rewritten. All state writes are fsynced (file, then directory) before they
+  count as done.
+- **logsBloom cross-check (DSR).** For every scanned block, if the header's
+  `logsBloom` says a watched (address, topic) may be present but the range
+  `getLogs` returned no such log, the block is re-read with `getLogs` by
+  `blockHash` (EIP-234):
+  - a node that lacks the block errors instead of answering empty, so the tick
+    fails and is retried (the cursor does not move);
+  - logs that come back are merged in;
+  - an empty answer by hash confirms a bloom false positive, which is counted.
+
+  The check runs per (address, topic), so a returned topic cannot mask a missing
+  one in the same block. A bloom cannot reveal a missing _second_ log of a topic
+  that did come back.
+
+  Headers without a bloom are counted as unchecked and never stop the scan.
+
+- **Residual:** a load-balanced RPC can still serve different node views to
+  different calls. The bloom check catches a node that is behind for a block it
+  was asked about. It does not make a load-balanced endpoint safe in general.
+  Run the Mini's watcher against **one** non-load-balanced endpoint.
 
 ### 5.3 Disclosure
 
