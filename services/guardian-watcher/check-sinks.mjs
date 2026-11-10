@@ -496,6 +496,7 @@ try {
     } catch (e) {
       ge = e.message;
     }
+
     cell(
       "mirror: a failing fetch from a credential-bearing remote is a fixed error, no URL/secret",
       /^mirror commit: git fetch: |^git fetch: /.test(ge ?? "") &&
@@ -616,7 +617,12 @@ try {
       { race1, race2 }
     );
     const hook = join(bare, "hooks", "pre-receive");
-    writeFileSync(hook, "#!/bin/sh\necho 'denied by policy GITSECRET' >&2\nexit 1\n");
+    // DSR: the hook's stderr also carries a credential-bearing URL; the push must not land either
+    writeFileSync(
+      hook,
+      "#!/bin/sh\necho 'denied by policy GITSECRET https://tok:GITSECRET@host/r' >&2\nexit 1\n"
+    );
+    const tipBeforeHook = remoteHead();
     execFileSync("chmod", ["+x", hook]);
     let hk = null;
     try {
@@ -627,7 +633,9 @@ try {
     rmSync(hook);
     cell(
       "mirror: a hook rejection is 'push rejected by the remote', not 'the branch moved', no stderr",
-      /push: push rejected by the remote$/.test(hk ?? "") && !/GITSECRET/.test(hk ?? ""),
+      /push: push rejected by the remote$/.test(hk ?? "") &&
+        !/GITSECRET|tok:|host\/r/.test(hk ?? "") &&
+        remoteHead() === tipBeforeHook, // nothing mirrored
       hk
     );
   } finally {
