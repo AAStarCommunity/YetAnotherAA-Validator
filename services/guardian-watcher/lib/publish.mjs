@@ -161,9 +161,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           ...state.pins[p.name],
           current: false,
           at,
-          error: `provider CID ${up?.cid} != local ${file.cid}`,
+          error: `provider CID differs from local ${file.cid}`,
         };
-        alerts.push(`${p.name}: CID mismatch (${up?.cid} vs ${file.cid})`);
+        alerts.push(`${p.name}: CID mismatch (local ${file.cid})`);
         continue;
       }
       // Public readability by CID, byte for byte: a private or altered copy is not a publication.

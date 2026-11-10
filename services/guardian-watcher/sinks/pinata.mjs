@@ -4,7 +4,8 @@
 // UNVERIFIED until the author's account exists: the exact form-field names and that a sub-256 KiB
 // file comes back as a raw `bafkrei` CID; both are live pre-go-live cells. The CID returned is
 // never trusted: publishRecord compares it with the local CID and fetches the bytes back.
-import { request, jsonOf, fetchBounded } from "./http.mjs";
+import { request, jsonOf, fetchBounded, SinkHttpError } from "./http.mjs";
+import { CID_RE } from "./cid-shape.mjs";
 
 export function pinataPinner({
   token,
@@ -32,10 +33,14 @@ export function pinataPinner({
       });
       const j = jsonOf("pinata upload", r);
       const cid = j?.data?.cid ?? j?.cid ?? null;
-      return { cid: typeof cid === "string" ? cid : null };
+      // The provider's value is untrusted text (it could echo a token): only a CID-shaped
+      // string leaves this sink, and publishRecord compares it with the local CID.
+      if (typeof cid !== "string" || !CID_RE.test(cid))
+        throw new SinkHttpError("pinata upload", "response has no valid CID");
+      return { cid };
     },
     async fetchPublic(cid) {
-      if (!/^b[a-z2-7]{20,}$/.test(String(cid))) return null; // only a base32 CIDv1 enters the URL
+      if (!CID_RE.test(String(cid))) return null; // only a base32 CIDv1 enters the URL
       return fetchBounded(`${gateway.replace(/\/$/, "")}/ipfs/${cid}`);
     },
   };

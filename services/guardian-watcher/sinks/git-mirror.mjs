@@ -15,7 +15,8 @@
 //   and the commit's blob at the path must equal the bytes, before success is returned.
 // All git calls are argv-only (no shell).
 import { spawn } from "node:child_process";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { SinkError, guarded } from "./errors.mjs";
 import { join, posix } from "node:path";
 
 function git(cwd, args, { input, env } = {}) {
@@ -35,13 +36,24 @@ function git(cwd, args, { input, env } = {}) {
     p.stderr.on("data", d => err.length < 64 && err.push(d));
     p.on("error", e => {
       clearTimeout(t);
-      rej(new Error(`git ${args[0]}: ${e.code ?? "spawn failed"}`));
+      rej(new SinkError(`git ${args[0]}: spawn failed`));
     });
     p.on("close", code => {
       clearTimeout(t);
       if (code === 0) return res(Buffer.concat(out));
-      const msg = Buffer.concat(err).toString().trim().slice(0, 300);
-      rej(Object.assign(new Error(`git ${args[0]}: ${msg || `exit ${code}`}`), { code }));
+      // stderr is untrusted (it can carry a remote URL with credentials): it only selects one of
+      // these fixed categories and is then dropped (Codex W2b R2 H2).
+      const se = Buffer.concat(err).toString();
+      const cat = /non-fast-forward|fetch first|stale info|\[rejected\]|failed to push/i.test(se)
+        ? "rejected (the branch moved)"
+        : /could not read from remote|permission denied|authentication|could not resolve|connection|timed out/i.test(
+              se
+            )
+          ? "remote unreachable or not authorized"
+          : /couldn't find remote ref|not a valid object|unknown revision|bad revision/i.test(se)
+            ? "ref or object not found"
+            : `exit ${Number.isInteger(code) ? code : "signal"}`;
+      rej(new SinkError(`git ${args[0]}: ${cat}`));
     });
     p.stdin.end(input ?? undefined);
   });
@@ -60,7 +72,7 @@ export function checkMirrorPath(path) {
     segs.every(
       s => s !== "" && s !== "." && s !== ".." && !s.startsWith("-") && s.toLowerCase() !== ".git"
     );
-  if (!ok) throw new Error(`mirror: path escapes or is not a plain record path: ${p}`);
+  if (!ok) throw new SinkError(`mirror: path escapes or is not a plain record path: ${p}`);
   return p;
 }
 
@@ -72,9 +84,9 @@ export function gitMirror({
   repoUrl,
   beforePush,
 }) {
-  if (!clone) throw new Error("mirror: clone directory required");
+  if (!clone) throw new SinkError("mirror: clone directory required");
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
-    throw new Error("mirror: bad branch name");
+    throw new SinkError("mirror: bad branch name");
   const tracking = `refs/watcher/${branch}`; // our own ref: nothing else updates it
   const fetchTip = async () => {
     await git(clone, [
@@ -99,71 +111,75 @@ export function gitMirror({
   const url = (c, path) => (repoUrl ? `${repoUrl}/blob/${c}/${path}` : null);
 
   return {
-    async commit(path, bytes, message) {
-      path = checkMirrorPath(path);
-      const want = Buffer.from(bytes);
-      const tip = await fetchTip();
-      const cur = await entry(tip, path);
-      if (cur) {
-        if (cur.mode !== "100644" || cur.type !== "blob")
-          throw new Error(`mirror: ${path} exists as ${cur.mode} ${cur.type}; refusing`);
-        if (Buffer.compare(await blobBytes(cur.blob), want) !== 0)
-          throw new Error(`mirror: ${path} exists with different bytes; refusing to overwrite`);
-        const c = await text(clone, ["log", "-1", "--format=%H", tip, "--", path]);
-        return { commit: c, url: url(c, path), existing: true };
-      }
-      // Any prefix of the path that is a file or symlink in the tree would make the new entry
-      // ambiguous; refuse rather than let update-index replace it.
-      const segs = path.split("/");
-      for (let i = 1; i < segs.length; i++) {
-        const e = await entry(tip, segs.slice(0, i).join("/"));
-        if (e && e.type !== "tree")
-          throw new Error(`mirror: ${segs.slice(0, i).join("/")} is not a directory; refusing`);
-      }
-      const blob = await text(clone, ["hash-object", "-w", "--stdin"], { input: want });
-      const gitDir = await text(clone, ["rev-parse", "--absolute-git-dir"]);
-      const index = join(gitDir, `watcher-index-${process.pid}-${Date.now()}`);
-      const env = { GIT_INDEX_FILE: index };
-      let commit;
-      try {
-        await git(clone, ["read-tree", tip], { env });
-        await git(clone, ["update-index", "--add", "--cacheinfo", `100644,${blob},${path}`], {
-          env,
-        });
-        const tree = await text(clone, ["write-tree"], { env });
-        commit = await text(clone, ["commit-tree", tree, "-p", tip, "-F", "-"], {
-          input: Buffer.from(String(message)),
-          env: {
-            GIT_AUTHOR_NAME: "dvt-guardian-watcher",
-            GIT_AUTHOR_EMAIL: "watcher@invalid",
-            GIT_COMMITTER_NAME: "dvt-guardian-watcher",
-            GIT_COMMITTER_EMAIL: "watcher@invalid",
-          },
-        });
-      } finally {
-        rmSync(index, { force: true });
-      }
-      if (beforePush) await beforePush();
-      // Fast-forward only, and only from the tip we built on (lease), never forced.
-      await git(clone, [
-        "push",
-        "--quiet",
-        "--porcelain",
-        `--force-with-lease=refs/heads/${branch}:${tip}`,
-        remote,
-        `${commit}:refs/heads/${branch}`,
-      ]);
-      // Read-back from the remote: the branch contains our commit and it holds exactly the bytes.
-      const after = await fetchTip();
-      try {
-        await git(clone, ["merge-base", "--is-ancestor", commit, after]);
-      } catch {
-        throw new Error("mirror: pushed commit is not on the remote branch after push");
-      }
-      const got = await entry(commit, path);
-      if (!got || Buffer.compare(await blobBytes(got.blob), want) !== 0)
-        throw new Error("mirror: read-back of the pushed record does not match");
-      return { commit, url: url(commit, path) };
-    },
+    commit: (path, bytes, message) =>
+      guarded("mirror commit", () => commitOnce(path, bytes, message)),
   };
+
+  async function commitOnce(path, bytes, message) {
+    path = checkMirrorPath(path);
+    const want = Buffer.from(bytes);
+    const tip = await fetchTip();
+    const cur = await entry(tip, path);
+    if (cur) {
+      if (cur.mode !== "100644" || cur.type !== "blob")
+        throw new SinkError(`mirror: ${path} exists as ${cur.mode} ${cur.type}; refusing`);
+      if (Buffer.compare(await blobBytes(cur.blob), want) !== 0)
+        throw new SinkError(`mirror: ${path} exists with different bytes; refusing to overwrite`);
+      const c = await text(clone, ["log", "-1", "--format=%H", tip, "--", path]);
+      return { commit: c, url: url(c, path), existing: true };
+    }
+    // Any prefix of the path that is a file or symlink in the tree would make the new entry
+    // ambiguous; refuse rather than let update-index replace it.
+    const segs = path.split("/");
+    for (let i = 1; i < segs.length; i++) {
+      const e = await entry(tip, segs.slice(0, i).join("/"));
+      if (e && e.type !== "tree")
+        throw new SinkError(`mirror: ${segs.slice(0, i).join("/")} is not a directory; refusing`);
+    }
+    const blob = await text(clone, ["hash-object", "-w", "--stdin"], { input: want });
+    const gitDir = await text(clone, ["rev-parse", "--absolute-git-dir"]);
+    // A private directory per call (Codex W2b R2 M4): concurrent calls never share an index.
+    const tmp = mkdtempSync(join(gitDir, "watcher-index-"));
+    const env = { GIT_INDEX_FILE: join(tmp, "index") };
+    let commit;
+    try {
+      await git(clone, ["read-tree", tip], { env });
+      await git(clone, ["update-index", "--add", "--cacheinfo", `100644,${blob},${path}`], {
+        env,
+      });
+      const tree = await text(clone, ["write-tree"], { env });
+      commit = await text(clone, ["commit-tree", tree, "-p", tip, "-F", "-"], {
+        input: Buffer.from(String(message)),
+        env: {
+          GIT_AUTHOR_NAME: "dvt-guardian-watcher",
+          GIT_AUTHOR_EMAIL: "watcher@invalid",
+          GIT_COMMITTER_NAME: "dvt-guardian-watcher",
+          GIT_COMMITTER_EMAIL: "watcher@invalid",
+        },
+      });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+    if (beforePush) await beforePush();
+    // Fast-forward only, and only from the tip we built on (lease), never forced.
+    await git(clone, [
+      "push",
+      "--quiet",
+      "--porcelain",
+      `--force-with-lease=refs/heads/${branch}:${tip}`,
+      remote,
+      `${commit}:refs/heads/${branch}`,
+    ]);
+    // Read-back from the remote: the branch contains our commit and it holds exactly the bytes.
+    const after = await fetchTip();
+    try {
+      await git(clone, ["merge-base", "--is-ancestor", commit, after]);
+    } catch {
+      throw new SinkError("mirror: pushed commit is not on the remote branch after push");
+    }
+    const got = await entry(commit, path);
+    if (!got || Buffer.compare(await blobBytes(got.blob), want) !== 0)
+      throw new SinkError("mirror: read-back of the pushed record does not match");
+    return { commit, url: url(commit, path) };
+  }
 }

@@ -2,6 +2,7 @@
 // the FINALIZED block (publish.mjs contract). The writer must be a low-balance, single-purpose
 // service EOA: assertWriterRole refuses the deployer, the aggregator owner and every guardian.
 import { ethers } from "ethers";
+import { SinkError, guarded } from "./errors.mjs";
 
 export const REGISTRY_SINK_ABI = [
   "function disclose((uint8 kind, uint256 proposalId, bytes messageInputs, uint256 signerMask, address[] signers, bytes32 anchor) s, address subjectToken, bytes32 txHash, uint64 blockNumber, bytes20 rulesetCommit, string recordURI, bytes32 recordHash) returns (uint256)",
@@ -24,15 +25,18 @@ export function assertWriterRole(writer, roles) {
     ["aggregator owner", aggregatorOwner],
   ];
   for (const [n, a] of need)
-    if (!ethers.isAddress(a)) throw new Error(`writer role check: ${n} unknown; refusing to run`);
+    if (!ethers.isAddress(a))
+      throw new SinkError(`writer role check: ${n} unknown; refusing to run`);
   if (!Array.isArray(guardians) || guardians.length === 0 || !guardians.every(ethers.isAddress))
-    throw new Error("writer role check: guardian list unknown; refusing to run");
+    throw new SinkError("writer role check: guardian list unknown; refusing to run");
   const w = ethers.getAddress(writer);
   const bad = [...need, ...guardians.map((g, i) => [`guardian ${i}`, g])].filter(
     ([, a]) => ethers.getAddress(a) === w
   );
   if (bad.length)
-    throw new Error(`writer ${w} is also the ${bad.map(b => b[0]).join(", ")}; refusing to run`);
+    throw new SinkError(
+      `writer ${w} is also the ${bad.map(b => b[0]).join(", ")}; refusing to run`
+    );
 }
 
 export const actionId = (kind, key) =>
@@ -45,7 +49,8 @@ export const actionId = (kind, key) =>
  */
 export function registrySink({ provider, wallet, registry, fromBlock, roles, feeBump = 1.25 }) {
   const addr = ethers.getAddress(registry);
-  if (!(feeBump >= 1.125)) throw new Error("registry: feeBump must be >= 1.125 (replacement rule)");
+  if (!(feeBump >= 1.125))
+    throw new SinkError("registry: feeBump must be >= 1.125 (replacement rule)");
   assertWriterRole(ethers.ZeroAddress, roles); // completeness now, the real wallet before signing
   const bumpNum = BigInt(Math.ceil(feeBump * 1000));
   const bumpUp = x => (x * bumpNum + 999n) / 1000n; // rounded up
@@ -58,7 +63,7 @@ export function registrySink({ provider, wallet, registry, fromBlock, roles, fee
     )[0];
   const finalized = async () =>
     Number((await provider.send("eth_getBlockByNumber", ["finalized", false])).number);
-  return {
+  const api = {
     finalized,
     async canonical(n, hash) {
       const b = await provider.send("eth_getBlockByNumber", [ethers.toQuantity(Number(n)), false]);
@@ -117,16 +122,18 @@ export function registrySink({ provider, wallet, registry, fromBlock, roles, fee
       const fee = await provider.getFeeData();
       let maxFee = big(fee.maxFeePerGas);
       let tip = big(fee.maxPriorityFeePerGas);
-      if (maxFee == null || tip == null) throw new Error("registry: no EIP-1559 fee data");
+      if (maxFee == null || tip == null) throw new SinkError("registry: no EIP-1559 fee data");
       if (replace) {
         let last;
         try {
           last = ethers.Transaction.from(prevRaw);
         } catch {
-          throw new Error("registry: a replacement needs the replaced tx's journalled raw bytes");
+          throw new SinkError(
+            "registry: a replacement needs the replaced tx's journalled raw bytes"
+          );
         }
         if (last.from !== from || last.nonce !== n || last.type !== 2)
-          throw new Error("registry: the journalled tx is not ours at this nonce; refusing");
+          throw new SinkError("registry: the journalled tx is not ours at this nonce; refusing");
         const pf = big(last.maxFeePerGas);
         const pt = big(last.maxPriorityFeePerGas);
         maxFee = max(maxFee, bumpUp(pf));
@@ -173,4 +180,11 @@ export function registrySink({ provider, wallet, registry, fromBlock, roles, fee
       return provider.getTransactionCount(await wallet.getAddress(), await finalized());
     },
   };
+  // Error boundary (Codex W2b R2 H3): an RPC failure leaves as "registry <op>: <code>", never with
+  // the provider's message, URL or response.
+  for (const k of Object.keys(api)) {
+    const f = api[k];
+    api[k] = (...a) => guarded(`registry ${k}`, () => f(...a));
+  }
+  return api;
 }

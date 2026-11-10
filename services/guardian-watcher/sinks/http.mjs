@@ -3,10 +3,11 @@
 // body, an exception message or its cause can echo a URL with a token in it (Telegram puts the bot
 // token in the path) or an Authorization value, so none of them is ever copied into an error.
 import { MAX_RECORD_BYTES } from "../lib/cid.mjs";
+import { SinkError } from "./errors.mjs";
 
 export const MAX_API_BYTES = 64 * 1024; // provider JSON answers are a few hundred bytes
 
-export class SinkHttpError extends Error {
+export class SinkHttpError extends SinkError {
   constructor(what, detail) {
     super(`${what}: ${detail}`);
     this.name = "SinkHttpError";

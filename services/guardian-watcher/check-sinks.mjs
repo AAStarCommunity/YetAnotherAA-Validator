@@ -69,7 +69,11 @@ const srv = createServer(async (req, res) => {
     const k = s.indexOf("\r\n--", i + 4);
     return Buffer.from(s.slice(i + 4, k), "latin1");
   };
-  if (req.url === "/pinata/upload") {
+  if (req.url === "/pinata/echo") {
+    return res.end(JSON.stringify({ data: { cid: `Bearer ${req.headers.authorization}` } }));
+  } else if (req.url.startsWith("/filebase/echo")) {
+    return res.end(JSON.stringify({ Hash: String(req.headers.authorization) }));
+  } else if (req.url === "/pinata/upload") {
     const b = fileBytes();
     const cid = cidV1Raw(b);
     blobs.set(cid, b);
@@ -250,6 +254,22 @@ try {
     big.bytes === null && big.status === 500 && /HTTP 500/.test(he ?? ""),
     { status: big.status, n: big.bytes?.length, he }
   );
+  const echo = [];
+  for (const sink of [
+    pinataPinner({ token: "PINSECRET", gateway: `${base}/gw`, uploadUrl: `${base}/pinata/echo` }),
+    filebasePinner({ token: "FBSECRET", gateway: `${base}/gw`, rpcUrl: `${base}/filebase/echo` }),
+  ]) {
+    try {
+      echo.push({ accepted: await sink.upload(rec) });
+    } catch (e) {
+      echo.push(e.message);
+    }
+  }
+  cell(
+    "pinners: a 200 answer echoing the token as the CID is refused, without the token",
+    echo.every(m => typeof m === "string" && /no valid CID/.test(m) && !/SECRET/.test(m)),
+    echo
+  );
   const before = seen.length;
   const odd = [await p.fetchPublic("../../admin"), await p.fetchPublic("bafy?x=1")];
   cell(
@@ -351,6 +371,99 @@ try {
     cell("mirror: a path that is a symlink in the remote tree is refused", sym === true, sym);
     const pre = await refuse("records/afile/x.json", rec, /not a directory/);
     cell("mirror: a path under an existing file is refused", pre === true, pre);
+    const cred = join(d, "cred.git");
+    execFileSync("git", ["init", "--quiet", "--bare", cred]);
+    execFileSync("git", [
+      "-C",
+      cred,
+      "remote",
+      "add",
+      "origin",
+      "https://user:GITSECRET@127.0.0.1:1/r.git",
+    ]);
+    let ge = null;
+    try {
+      await gitMirror({ clone: cred }).commit("records/bls/z.json", rec, "z");
+    } catch (e) {
+      ge = e.message;
+    }
+    cell(
+      "mirror: a failing fetch from a credential-bearing remote is a fixed error, no URL/secret",
+      /^mirror commit: git fetch: |^git fetch: /.test(ge ?? "") &&
+        !/GITSECRET|127\.0\.0\.1|https/.test(ge ?? ""),
+      ge
+    );
+    // Two calls at once on one clone: each has its own index; no temp index survives; after a
+    // retry of whichever lost the race, both records are on the branch.
+    const conc = await Promise.allSettled([
+      m.commit("records/bls/p.json", new TextEncoder().encode("p"), "p"),
+      m.commit("records/bls/q.json", new TextEncoder().encode("q"), "q"),
+    ]);
+    for (const [i, r] of conc.entries())
+      if (r.status === "rejected")
+        await m.commit(
+          `records/bls/${i === 0 ? "p" : "q"}.json`,
+          new TextEncoder().encode(i === 0 ? "p" : "q"),
+          "retry"
+        );
+    const leftovers = execFileSync("ls", [clone])
+      .toString()
+      .split("\n")
+      .filter(f => f.startsWith("watcher-index-"));
+    const tipNow = remoteHead();
+    const hasAt = path => {
+      try {
+        execFileSync("git", ["-C", bare, "cat-file", "-e", `${tipNow}:${path}`], { stdio: "pipe" });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    cell(
+      "mirror: concurrent commits keep their own index, leave no temp index, and lose no record",
+      leftovers.length === 0 &&
+        hasAt("records/bls/p.json") &&
+        hasAt("records/bls/q.json") &&
+        hasAt("records/bls/a.json"),
+      { leftovers, conc: conc.map(r => r.status + (r.reason ? ` ${r.reason.message}` : "")) }
+    );
+    // Codex R2 M4's case: two branches on one clone, committing at once. With a shared index one
+    // commit could be built from the other branch's tree. Each branch must end up holding exactly
+    // its own records. Repeated, since the interleaving is timing-dependent.
+    g(seed, "checkout", "--quiet", "--orphan", "other-branch");
+    g(seed, "rm", "-rf", "--quiet", ".");
+    mkdirSync(join(seed, "records", "y"), { recursive: true });
+    writeFileSync(join(seed, "records", "y", "base.json"), "y");
+    g(seed, "add", "-A");
+    g(seed, "commit", "--quiet", "-m", "other base");
+    g(seed, "push", "--quiet", "origin", "HEAD:refs/heads/other-branch");
+    const mx = gitMirror({ clone });
+    const my = gitMirror({ clone, branch: "other-branch" });
+    const files = br =>
+      g(bare, "ls-tree", "-r", "--name-only", br).split("\n").filter(Boolean).sort();
+    const xBefore = files("disclosure-records");
+    const yBefore = files("other-branch");
+    const added = { x: [], y: [], errors: [] };
+    for (let i = 0; i < 6; i++) {
+      const px = `records/bls/x${i}.json`;
+      const py = `records/y/y${i}.json`;
+      const rs = await Promise.allSettled([
+        mx.commit(px, new TextEncoder().encode(px), px),
+        my.commit(py, new TextEncoder().encode(py), py),
+      ]);
+      for (const r of rs) if (r.status === "rejected") added.errors.push(r.reason.message);
+      added.x.push(px);
+      added.y.push(py);
+    }
+    const wantX = [...xBefore, ...added.x].sort();
+    const wantY = [...yBefore, ...added.y].sort();
+    cell(
+      "mirror: concurrent commits to two branches of one clone never mix their trees",
+      added.errors.length === 0 &&
+        j(files("disclosure-records")) === j(wantX) &&
+        j(files("other-branch")) === j(wantY),
+      { errors: added.errors.slice(0, 3), x: files("disclosure-records"), y: files("other-branch") }
+    );
     // A concurrent writer pushes between our fetch and our push: our push is refused (nothing of
     // theirs is overwritten), and the retry appends on the new tip with both records present.
     execFileSync("git", ["clone", "--quiet", "--branch", "disclosure-records", bare, other], {
@@ -552,6 +665,38 @@ try {
     "sign: a replacement without the replaced raw tx, at another nonce, or of another key is refused",
     Object.values(refusals).every(v => v === true),
     refusals
+  );
+  const leaky = registrySink({
+    provider: {
+      async call() {
+        throw Object.assign(new Error("request to https://rpc.example/v2/RPCSECRET failed"), {
+          url: "https://rpc.example/v2/RPCSECRET",
+        });
+      },
+      async broadcastTransaction() {
+        throw Object.assign(new Error("RPCSECRET nonce too low"), { code: "NONCE_EXPIRED" });
+      },
+    },
+    wallet: w,
+    registry: REG,
+    fromBlock: 0,
+    roles,
+  });
+  const le = [];
+  for (const f of [() => leaky.entryOf(0, 1n), () => leaky.broadcast("0x")]) {
+    try {
+      await f();
+      le.push("no error");
+    } catch (e) {
+      le.push({ m: e.message, short: e.shortMessage, cause: e.cause, url: e.url });
+    }
+  }
+  cell(
+    "registry: RPC failures leave as 'registry <op>: <code>' with no message, URL or cause",
+    le[0]?.m === "registry entryOf: error" &&
+      le[1]?.m === "registry broadcast: NONCE_EXPIRED" &&
+      le.every(x => x.short === undefined && x.cause === undefined && x.url === undefined),
+    le
   );
   // Writer-role separation is enforced BY THE SINK (Codex R1 H7): incomplete roles refuse
   // construction; a wallet that is a guardian is refused before anything is signed.
