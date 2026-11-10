@@ -308,6 +308,43 @@ export function envelopeProblem(txHash, tx, rc, trace, at = {}) {
   return null;
 }
 
+/**
+ * The chain as BLS reconstruction sees it, with every tx and receipt response checked against the
+ * request (Codex follow-up R6): reconstruction fetches its own copies, and a mixed backend must
+ * not hand it another tx's sender. A response that names another tx, or no tx, or (for the
+ * action's own block) another block, throws: the action becomes a retried dead letter.
+ */
+function identityGuard(chain, block) {
+  const same = (got, want) => typeof got === "string" && lcEq(got, want);
+  const inBlock = o =>
+    o?.blockNumber === undefined ||
+    o?.blockNumber === null ||
+    parsePosition(o.blockNumber) === block;
+  return new Proxy(chain, {
+    get(target, prop) {
+      if (prop === "getTransaction")
+        return async h => {
+          const tx = await target.getTransaction(h);
+          if (tx && (!same(tx.hash, h) || !inBlock(tx)))
+            throw new Error("transaction response names another tx or block");
+          return tx;
+        };
+      if (prop === "getTransactionReceipt")
+        return async h => {
+          const rc = await target.getTransactionReceipt(h);
+          if (rc) {
+            const ids = [rc.transactionHash, rc.hash].filter(x => x !== undefined && x !== null);
+            if (!ids.length || !ids.every(x => same(x, h)) || !inBlock(rc))
+              throw new Error("receipt names another tx or block");
+          }
+          return rc;
+        };
+      const v = target[prop];
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+}
+
 /** Build the record for one SignersCommitted log. Returns { record } or { deadLetter }. */
 async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
   const key = BigInt(log.topics[1]);
@@ -327,7 +364,7 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
   let r;
   try {
     r = await rebuildFromAction(
-      chain,
+      identityGuard(chain, Number(log.blockNumber)),
       cfg.aggregator,
       log.transactionHash,
       key,
@@ -495,6 +532,7 @@ async function processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t,
       blockNumber: t.block,
       status: "ERROR",
       reasons: [isolatedReason(e)],
+      ...(t.range ? { range: t.range } : {}),
       events: prev?.events ?? [],
       watched: prev?.watched?.length ? prev.watched : watched,
       ruleset: ctx.ruleset,
@@ -645,7 +683,8 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   // The tx response must be this tx, in this block: its sender, target and calldata are used for
   // attribution on the direct path, where no receipt or trace cross-check runs.
   if (tx) {
-    if (tx.hash !== undefined && tx.hash !== null && !lcEq(tx.hash, txHash))
+    // a response must name this tx: one without a hash is not trusted either (Codex follow-up R6)
+    if (typeof tx.hash !== "string" || !lcEq(tx.hash, txHash))
       throw new Error("transaction response names another tx");
     if (tx.blockHash !== undefined && tx.blockHash !== null && !lcEq(tx.blockHash, canon))
       throw new Error("transaction response from another block");
@@ -803,6 +842,8 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       // Records already classified, missing only their price (Codex #400-fix M3): exhaustion
       // keeps their route, caller and verdict, marked price.unavailable.
       ...(pendingRecords ? { pendingRecords } : {}),
+      // the query range the evidence came from, restored on every retry (Codex follow-up R6)
+      ...(t.range ? { range: t.range } : {}),
       // What is known of the tx itself, kept for an unattributed record at exhaustion (#400 review
       // nit): its sender, target and root selector (not the emitting call's).
       ...(tx
@@ -1146,7 +1187,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
         store,
         summary,
         dl.txHash,
-        txOfEvidence(watched, cfg, dl.blockNumber),
+        { ...txOfEvidence(watched, cfg, dl.blockNumber), ...(dl.range ? { range: dl.range } : {}) },
         fin.number,
         dl
       );

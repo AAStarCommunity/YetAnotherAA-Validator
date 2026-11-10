@@ -2615,6 +2615,55 @@ try {
       );
     }
 
+    // Codex follow-up R6
+    {
+      const q = mk();
+      // (1) a log outside the requested range stays unattributed on retry
+      const quiet = q.c.ownerTx([]);
+      settle(q.c);
+      await runOnce(q.c.chain, q.cfg, q.store, rs, ident); // scans past the quiet tx's block
+      const rq = await q.c.chain.getTransactionReceipt(quiet.hash);
+      const gs = spIface.encodeEventLog("GuardianSet", [addr("r6-a"), addr("r6-b")]);
+      q.c.mine();
+      settle(q.c);
+      q.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: rq.blockNumber,
+        blockHash: rq.blockHash,
+        index: 0,
+        transactionHash: quiet.hash,
+      });
+      await runOnce(q.c.chain, q.cfg, q.store, rs, ident);
+      const dlR = q.store.listDeadLetters().find(x => x.txHash === quiet.hash);
+      await runOnce(q.c.chain, q.cfg, q.store, rs, ident);
+      // (3) a tx response without a hash is not trusted
+      const nh = q.c.ownerTx([{ name: "GuardianSet", args: [addr("r6-n1"), addr("r6-n2")] }], {
+        from: KEEPER,
+      });
+      q.c.patchTx(nh.hash, { hash: undefined });
+      // (2) BLS reconstruction's own tx fetch answered by another tx
+      const sl = q.c.execute(Kind.SLASH, 6060n, slashF, 0b011n);
+      q.c.patchTxFrom(sl.hash, 1, { hash: ethers.id("r6-other"), from: addr("r6-impostor") });
+      settle(q.c);
+      await runOnce(q.c.chain, q.cfg, q.store, rs, ident);
+      const qd = q.store.listDeadLetters();
+      cell(
+        "follow-up R6: an out-of-range log stays a dead letter on retry; a hashless tx response and a reconstruction fetch answered by another tx are refused",
+        Array.isArray(dlR?.range) &&
+          qd.some(x => x.txHash === quiet.hash) &&
+          !q.recs().some(r => r.txHash === quiet.hash) &&
+          qd.some(x => x.txHash === nh.hash) &&
+          !q.recs().some(r => r.txHash === nh.hash) &&
+          qd.some(
+            x =>
+              x.txHash === sl.hash && x.route === "bls" && /another tx/.test(x.reasons?.[0] ?? "")
+          ) &&
+          !q.recs().some(r => r.txHash === sl.hash),
+        { dlR: dlR?.range, dls: qd.map(x => [x.txHash.slice(0, 10), x.route, x.reasons]) }
+      );
+    }
+
     // L2: a BLS dead letter takes exactly one attempt per tick even when its tx also has a dead
     // letter; UNRECOVERED lands at the cap, not at half of it
     const b = mk();

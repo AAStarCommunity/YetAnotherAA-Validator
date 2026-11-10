@@ -138,6 +138,8 @@ function makeChain() {
   const laggingTopics = new Map(); // block -> topic0 that the range getLogs omits
   let lagByHash = false; // ... and a by-hash re-read fails too (the node lacks the block)
   let noBloom = false; // headers without logsBloom
+  const txCalls = new Map(); // hash -> getTransaction calls so far
+  const txPatchFrom = new Map(); // hash -> { from: call index, patch }: a backend that changes
   const txPatch = new Map(); // hash -> fields a mixed backend answers for getTransaction
   const receiptPatch = new Map(); // hash -> fields a stale backend answers differently
   const receiptLogs = new Map(); // hash -> logs a (inconsistent) RPC returns in the receipt instead
@@ -175,6 +177,10 @@ function makeChain() {
         throw new Error("transient: tx lookup failed");
       }
       const tx = txs.get(h)?.tx ?? null;
+      const k = txCalls.get(h) ?? 0;
+      txCalls.set(h, k + 1);
+      const late = txPatchFrom.get(h);
+      if (tx && late && k >= late.from) return { ...tx, ...late.patch };
       return tx && txPatch.has(h) ? { ...tx, ...txPatch.get(h) } : tx;
     },
     async getTransactionReceipt(h) {
@@ -758,6 +764,8 @@ function makeChain() {
     setReceiptLogs: (hash, l) => receiptLogs.set(hash, l),
     patchReceipt: (hash, p) => receiptPatch.set(hash, p),
     patchTx: (hash, p) => txPatch.set(hash, p),
+    /** From the k-th getTransaction of this hash on (0-based), answer with `patch` applied. */
+    patchTxFrom: (hash, k, p) => txPatchFrom.set(hash, { from: k, patch: p }),
     failPriceReads: n => (priceFailures = n),
     /** Make block n's header bloom claim these logs ({ address, topics }) without them existing. */
     forceBloom: (n, fake) => forcedBlooms.set(n, bloomOf(fake)),
