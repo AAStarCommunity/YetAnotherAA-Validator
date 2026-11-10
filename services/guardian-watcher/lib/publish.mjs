@@ -256,7 +256,8 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
 
   if (rec.route === "bls" && sinks.registry && state.registry?.phase !== "confirmed") {
     try {
-      await advanceRegistry(rec, file, sinks.registry, state, persist, alerts, opts);
+      const ar = await advanceRegistry(rec, file, sinks.registry, state, persist, alerts, opts);
+      if (ar === "broadcast-failed") failures.push("registry");
     } catch (e) {
       if (e instanceof PersistError) throw e;
       alerts.push(`registry: ${errMsg(e)}`);
@@ -310,9 +311,11 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
   if (r?.phase === "signed" || r?.phase === "sent" || r?.phase === "landed") {
     // Rebroadcast the latest raw of the journal (never a newly signed one for the same nonce
     // unless replacing a stuck tx below); a known tx is harmless.
+    let broadcastFailed = false;
     try {
       await reg.broadcast(r.raw);
     } catch (e) {
+      broadcastFailed = true;
       state.registry = { ...r, lastBroadcastError: errMsg(e) };
     }
     // A resumed in-flight journal (including one written before sentAt existed) gets its sentAt
@@ -380,7 +383,15 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       await persist(state);
     } else {
       const age = Date.now() - Date.parse(state.registry.sentAt ?? new Date().toISOString());
-      if (age < maxPendingMs) return; // pending; next tick
+      if (age < maxPendingMs) {
+        // Pending. If this pass's rebroadcast failed and nothing has landed, the tx may not be
+        // in any mempool: a stage failure, not a normal wait (Codex W2c R4).
+        if (broadcastFailed) {
+          alerts.push("registry: rebroadcast failed and no receipt yet; retried next pass");
+          return "broadcast-failed";
+        }
+        return; // pending; next tick
+      }
       // Stuck (evicted or underpriced) with its nonce unused: replace it at the SAME nonce with a
       // higher fee, journalled before broadcast like the original.
       alerts.push(

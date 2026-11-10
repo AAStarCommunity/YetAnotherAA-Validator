@@ -434,8 +434,9 @@ const cfg = { aggregator: AGG };
         b.counts.ran === 2 &&
         c.counts.ran === 2 &&
         ran === 5 &&
+        // the budget covers preparation too: past it, no further file is even read (R4)
         timed.counts.ran === 1 &&
-        timed.counts.deferred === 4,
+        timed.counts.flagged === 1,
       { a: a.counts, b: b.counts, c: c.counts, ran, timed: timed.counts }
     );
     // an acknowledged registry incident is parked: not run every pass
@@ -794,6 +795,193 @@ const cfg = { aggregator: AGG };
       "R3: a truncated digest is acknowledged only when the full alert list is stored",
       r1.sent === false && /details not stored/.test(r1.reason) && r2.sent === true,
       { r1, r2 }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- W2c R4 counterexamples
+{
+  // 1. an alias (a copy under another name with a rewritten id) is isolated, published once
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(owner);
+    const id = Store.recordId(owner);
+    writeFileSync(
+      join(d, "records", "alias.json"),
+      JSON.stringify({
+        ...JSON.parse(readFileSync(join(d, "records", `${id}.json`), "utf8")),
+        id: "alias",
+      })
+    );
+    const s = sinks();
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    const r = await publishPending(store, sk);
+    cell(
+      "R4: an alias with a rewritten id is refused (the id is derived, never taken from the file); one publication",
+      r.counts.ran === 1 && r.counts.unreadable === 1 && s.calls.telegram === 1,
+      { r: r.counts, tg: s.calls.telegram }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  // 2. the directory changes during a generation: a record added before the cursor is visited
+  //    (and published) before the generation closes
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const rec = (hx, flagged = true) => ({
+      ...owner,
+      txHash: "0x" + hx.repeat(32),
+      verdict: flagged ? owner.verdict : { flagged: false, reasons: [] },
+    });
+    store.putRecord(rec("bb", false));
+    store.putRecord(rec("cc"));
+    store.putRecord(rec("dd"));
+    const s = sinks();
+    const built = {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      wallet: writer,
+      registryFor: () => s.registry,
+    };
+    const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+    const PL = { ...P, limits: { maxParse: 1, maxRecords: 1 } };
+    await publishPhase(store, roleChain(roles), cfg, PL, built, { now: 5 }); // reads b, no generation
+    rmSync(join(d, "records", `${Store.recordId(rec("bb", false))}.json`));
+    store.putRecord(rec("aa"));
+    const aId = Store.recordId(rec("aa"));
+    let closedWithA = null;
+    for (let i = 0; i < 12; i++) {
+      const r = await publishPhase(store, roleChain(roles), cfg, PL, built, {
+        now: P.reverifyEveryMs + 10 + i,
+      });
+      if (r.reverified) {
+        closedWithA = !!store.getPublication(aId)?.published;
+        break;
+      }
+    }
+    cell(
+      "R4: a generation closes only after a traversal that began after it opened (a record added mid-sweep is published first)",
+      closedWithA === true,
+      { closedWithA }
+    );
+    // 3. orphan cleanup on established absence only: removing files read earlier never retires a
+    //    live record's entry
+    const before = Object.keys(store.getSchedule().entries ?? {});
+    rmSync(join(d, "records", `${aId}.json`));
+    await publishPending(
+      new Store(d),
+      { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null },
+      { maxParse: 1 }
+    );
+    const after = Object.keys(new Store(d).getSchedule().entries ?? {});
+    const dId = Store.recordId(rec("dd"));
+    cell(
+      "R4: only entries whose file is gone are retired; a live record keeps its entry",
+      before.includes(dId) && after.includes(dId) && !after.includes(aId),
+      { before, after }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  // 3b. mid-traversal: entries of files already gone are retired at once, live ones kept
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const ids = ["aa", "bb", "cc", "dd"].map(hx => {
+      const r = { ...owner, txHash: "0x" + hx.repeat(32) };
+      store.putRecord(r);
+      return Store.recordId(r);
+    });
+    store.putSchedule({
+      cursor: `${ids[1]}.json`,
+      entries: Object.fromEntries(ids.map(i => [i, { done: true }])),
+    });
+    for (const i of ids.slice(0, 2)) rmSync(join(d, "records", `${i}.json`));
+    const s = sinks();
+    await publishPending(
+      store,
+      { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null },
+      { maxParse: 1 }
+    );
+    const e = Object.keys(store.getSchedule().entries ?? {});
+    cell(
+      "R4: mid-traversal, entries whose file is gone are retired and live ones kept",
+      !e.includes(ids[0]) && !e.includes(ids[1]) && e.includes(ids[2]) && e.includes(ids[3]),
+      e
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  // 4. a resumed broadcast that fails again is a stage failure (the pass is not ok)
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(bls);
+    const s = sinks({ mine: "pending" });
+    const realB = s.registry.broadcast.bind(s.registry);
+    let n = 0;
+    s.registry.broadcast = async raw => {
+      n++;
+      if (n >= 1) throw Object.assign(new Error("rpc"), { code: "SERVER_ERROR" });
+      return realB(raw);
+    };
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
+    const r1 = await publishPending(store, sk);
+    const r2 = await publishPending(store, sk);
+    const r3 = await publishPending(store, sk);
+    cell(
+      "R4: a rebroadcast that fails with no receipt yet counts as a failed stage on every pass",
+      r2.counts.failed >= 1 && r3.counts.failed >= 1,
+      { r1: r1.counts, r2: r2.counts, r3: r3.counts, n }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+{
+  // 5. a failed schedule write at the generation's close is reported (not ok)
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(owner);
+    const s = sinks();
+    const built = {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      wallet: writer,
+      registryFor: () => s.registry,
+    };
+    const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+    await publishPhase(store, roleChain(roles), cfg, P, built, { now: 1 });
+    const realPut = store.putSchedule.bind(store);
+    // open and close in the same pass; fail only the close write
+    const origSave = realPut;
+    let sawOpen = false;
+    store.putSchedule = x => {
+      if (x.reverifyGen !== undefined) sawOpen = true;
+      else if (sawOpen) throw new Error("disk");
+      return origSave(x);
+    };
+    const r = await publishPhase(store, roleChain(roles), cfg, P, built, {
+      now: P.reverifyEveryMs + 5,
+    });
+    store.putSchedule = realPut;
+    cell(
+      "R4: a schedule write that fails when a generation closes is reported: not ok, alerted",
+      r.ok === false && r.failed >= 1,
+      r
     );
   } finally {
     rmSync(d, { recursive: true, force: true });

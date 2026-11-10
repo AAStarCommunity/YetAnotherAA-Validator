@@ -897,6 +897,37 @@ try {
     gs
   );
 
+  // Codex W2c R4: rebroadcasting a tx the node already holds is not a failure; a real error is
+  {
+    const mk = err => {
+      const p = {
+        ...provider,
+        broadcastTransaction: async () => {
+          throw err;
+        },
+      };
+      return registrySink({ provider: p, wallet: w, registry: REG, fromBlock: 0, roles });
+    };
+    const known = await mk(
+      Object.assign(new Error("x"), { error: { message: "already known" } })
+    ).broadcast("0x01");
+    let real = null;
+    try {
+      await mk(Object.assign(new Error("boom TOKSECRET"), { code: "SERVER_ERROR" })).broadcast(
+        "0x01"
+      );
+    } catch (e) {
+      real = e.message;
+    }
+    cell(
+      "registrySink.broadcast: 'already known' is success; any other error still fails, without the provider's text",
+      known?.known === true &&
+        /registry broadcast: SERVER_ERROR/.test(real ?? "") &&
+        !/TOKSECRET/.test(real ?? ""),
+      { known, real }
+    );
+  }
+
   // Codex W2c R1 H2: roles are re-read immediately before each signature, and a failure refuses
   const late = {};
   for (const [name, cur] of [

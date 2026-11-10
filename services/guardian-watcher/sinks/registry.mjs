@@ -192,7 +192,22 @@ export function registrySink({
       };
     },
     async broadcast(raw) {
-      await provider.broadcastTransaction(raw);
+      try {
+        await provider.broadcastTransaction(raw);
+      } catch (e) {
+        // Rebroadcasting a tx the node already holds is the normal pending case, not a failure
+        // (the text is only classified here; it never leaves this sink).
+        const t = [e?.code, e?.error?.message, e?.info?.error?.message, e?.shortMessage, e?.message]
+          .filter(x => typeof x === "string")
+          .join(" ");
+        if (
+          /already known|known transaction|already imported|ALREADY_EXISTS|tx already in mempool/i.test(
+            t
+          )
+        )
+          return { known: true };
+        throw e;
+      }
     },
     async receipt(hash) {
       const rc = await provider.getTransactionReceipt(hash);

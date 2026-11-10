@@ -46,9 +46,13 @@ export const PASS_MAX_PARSE = 500;
 
 /** A record's id, validated, or null (a parseable file with an unusable identity: R2 M7). */
 function recordIdOf(rec) {
+  // Always derived from the record's own fields; a stored `id` must agree with it, so an alias
+  // (a copy with another file name and a rewritten id) is refused (Codex W2c R4).
   try {
-    const id = rec.id ?? Store.recordId(rec);
-    return typeof id === "string" && /^[A-Za-z0-9._-]+$/.test(id) ? id : null;
+    const id = Store.recordId(rec);
+    if (typeof id !== "string" || !/^[A-Za-z0-9._-]+$/.test(id)) return null;
+    if (rec.id !== undefined && rec.id !== id) return null;
+    return id;
   } catch {
     return null;
   }
@@ -89,22 +93,27 @@ export async function publishPending(
   const pinners = (sinks.pinners ?? []).map(p => p.name);
   const sched = getSchedule(store);
   const entries = { ...(sched.entries ?? {}) };
-  // A bounded, rotating batch of record files: the cursor names the last file read. Listing the
-  // names (no contents) is the only full-directory step; ~45 ms for 50 000 files on the Mini-class
-  // laptop this was measured on.
+  // A bounded batch of record files, in sorted order from the cursor (the last file read). A
+  // SWEEP is one traversal from the first name to the last; it never wraps inside a batch, so a
+  // completed sweep visited every file that existed throughout it (Codex W2c R4). Listing the names
+  // (no contents) is the only full-directory step: ~45 ms for 50 000 files, measured.
   const names = store.recordFiles();
+  let sweeps = sched.sweeps ?? 0;
   let start = 0;
   if (sched.cursor) {
     const k = names.findIndex(n => n > sched.cursor);
+    if (k < 0) sweeps += 1; // the previous traversal had reached the end: it is complete
     start = k < 0 ? 0 : k;
   }
-  const batch = [];
-  for (let i = 0; i < Math.min(maxParse, names.length); i++)
-    batch.push(names[(start + i) % names.length]);
+  const candidates = names.slice(start, start + maxParse);
   const bad = [];
   const seenIds = new Set();
   const work = [];
-  for (const name of batch) {
+  let read = 0;
+  for (const name of candidates) {
+    // the deadline covers preparation too; always at least one file, so a sweep progresses
+    if (read > 0 && now() - t0 >= maxMs) break;
+    read++;
     let rec;
     let id;
     let prev;
@@ -212,20 +221,21 @@ export async function publishPending(
       alerts.push(`${id}: ${safeText("publish", err)}`);
     }
   }
-  // Directory sweep: a full rotation of the cursor. When one completes, entries of records no
-  // longer present and flagged are retired (an orphan must not hold a generation open), and the
-  // sweep count lets a generation close only after a sweep that began after it opened (R3).
-  const sweep = { read: 0, seen: [], ...(sched.sweep ?? {}) };
-  sweep.read += batch.length;
-  sweep.seen = [...new Set([...sweep.seen, ...seenIds])];
-  let sweeps = sched.sweeps ?? 0;
-  let next = { ...sched, cursor: batch.at(-1) ?? null, entries, sweep };
-  if (sweep.read >= names.length) {
-    const live = new Set(sweep.seen);
-    for (const id of Object.keys(entries)) if (!live.has(id)) delete entries[id];
+  // An entry is retired only on established absence: its canonical file is not in this pass's
+  // listing (an orphan must not hold a generation open; a live record keeps its state: R4).
+  const listed = new Set(names);
+  for (const id of Object.keys(entries)) if (!listed.has(`${id}.json`)) delete entries[id];
+  // The traversal advances by the files actually read; reaching the last name completes it.
+  const lastRead = candidates[read - 1] ?? null;
+  const reachedEnd = start + read >= names.length;
+  let cursor = lastRead;
+  if (reachedEnd) {
     sweeps += 1;
-    next = { ...next, entries, sweeps, sweep: { read: 0, seen: [] } };
+    cursor = null;
   }
+  const { sweep: _oldSweep, ...rest } = sched;
+  void _oldSweep;
+  const next = { ...rest, cursor, entries, sweeps };
   const reverifyRemaining =
     reverifyGen === null
       ? 0
@@ -423,29 +433,36 @@ export async function publishPhase(store, chain, cfg, p, built, { now = Date.now
   // been re-checked in it, however many bounded passes that takes (Codex W2c R2).
   // It closes only after a full directory sweep that began after it opened, so records the
   // bounded batches had not reached yet are counted too (Codex W2c R3).
+  const schedFailures = []; // generation-transition schedule writes that failed (Codex W2c R4)
   const meta = store.getAlertState() ?? {};
   let gen = getSchedule(store).reverifyGen ?? null;
   if (gen === null && now - (meta.lastReverifyAt ?? 0) >= p.reverifyEveryMs) {
     gen = now;
     const sc = getSchedule(store);
-    saveSchedule(store, { ...sc, reverifyGen: gen, reverifyGenSweeps: sc.sweeps ?? 0 });
+    // A traversal already under way began before the generation: it does not count, the next
+    // full one does.
+    const need = (sc.sweeps ?? 0) + (sc.cursor ? 2 : 1);
+    if (!saveSchedule(store, { ...sc, reverifyGen: gen, reverifyGenNeed: need }))
+      schedFailures.push("generation open");
   }
-  const genSweeps = getSchedule(store).reverifyGenSweeps ?? 0;
+  const genNeed = getSchedule(store).reverifyGenNeed ?? Infinity;
   const res = await publishPending(
     store,
     { pinners: built.pinners, mirror: built.mirror, telegram: built.telegram, registry },
     { reverifyGen: gen, maxPendingMs: p.maxPendingMs, ...(p.limits ?? {}) }
   );
   const reverified =
-    gen !== null && !res.stopped && res.reverifyRemaining === 0 && res.sweeps > genSweeps;
+    gen !== null && !res.stopped && res.reverifyRemaining === 0 && res.sweeps >= genNeed;
   if (reverified) {
     store.putAlertState({ ...(store.getAlertState() ?? {}), lastReverifyAt: gen });
-    const { reverifyGen, reverifyGenSweeps, ...rest } = getSchedule(store);
+    const { reverifyGen, reverifyGenNeed, ...rest } = getSchedule(store);
     void reverifyGen;
-    void reverifyGenSweeps;
-    saveSchedule(store, rest);
+    void reverifyGenNeed;
+    if (!saveSchedule(store, rest)) schedFailures.push("generation close");
   }
   alerts.push(...res.alerts);
+  for (const w of schedFailures)
+    alerts.push(`publication schedule not saved at ${w}; kept in memory, retried next pass`);
   let detailsSaved = true;
   try {
     store.putAlertList(alerts);
@@ -462,6 +479,7 @@ export async function publishPhase(store, chain, cfg, p, built, { now = Date.now
   return {
     ...out,
     ...res.counts,
+    failed: res.counts.failed + schedFailures.length,
     stopped: res.stopped,
     reverifying: gen !== null && !reverified ? { gen, remaining: res.reverifyRemaining } : null,
     reverified,
@@ -469,6 +487,11 @@ export async function publishPhase(store, chain, cfg, p, built, { now = Date.now
     delivery,
     // Explicit pass result (Codex W2c R2): no failed record, no stop, no skipped registry stage,
     // and the alerts delivered. Deferred work is pending, not a failure.
-    ok: !res.stopped && res.counts.failed === 0 && !out.registrySkipped && deliveredOk,
+    ok:
+      !res.stopped &&
+      res.counts.failed === 0 &&
+      !schedFailures.length &&
+      !out.registrySkipped &&
+      deliveredOk,
   };
 }
