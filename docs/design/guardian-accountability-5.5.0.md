@@ -291,6 +291,24 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
   receipt without an explicit status) is INCONCLUSIVE, never MISMATCH. Two trust
   premises: the registry and aggregator addresses come from the release
   manifest, and consumers treat INCONCLUSIVE as unverified.
+- Message fields are recovered from the transaction and, for the forwarders the
+  release manifest pins (DVTValidator, the owner Safe, optionally Safe's
+  MultiSendCallOnly), from their calldata and pre-execution state. A forwarder
+  is followed only at its pinned address, never by selector alone. Routes:
+  - `DVTValidator.executeWithProof`: `operator`, `slashLevel`, `evidenceHash`
+    are read from `proposals(id)` at block N-1. They never change after creation
+    (DVTValidator-0.7.0 @ f00be603 :215-238, :257); a proposal that did not yet
+    exist at N-1 is INCONCLUSIVE.
+  - `DVTValidator.queueSlashWithProof`: forwarded unchanged; decoded directly.
+  - owner Safe `execTransaction` with operation CALL is followed; a DELEGATECALL
+    is followed only into the pinned MultiSendCallOnly, and only through
+    sub-transactions that are all CALLs; module routes are not followed.
+  - any other wrapper: a `callTracer` trace, decoding only CALL frames into the
+    pinned aggregator or DVTValidator; without a trace, INCONCLUSIVE.
+
+  Whatever the route, a recovered call counts only if it yields the
+  `SignersCommitted` key and the stored commitment, so a decoding error ends in
+  INCONCLUSIVE or MISMATCH, never MATCH.
 
 ## 5. Watcher service (DVT repo, Mac Mini only)
 

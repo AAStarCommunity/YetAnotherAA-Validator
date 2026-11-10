@@ -7,7 +7,7 @@
 // Each case is a control cell: correct entries must PASS and every forged entry must FAIL, and each
 // failing case asserts WHICH check fired, so a recheck that fails for the wrong reason is caught too.
 import { ethers } from "ethers";
-import { Kind, aggIface, regIface, recheckEntry } from "./recheck-lib.mjs";
+import { Kind, aggIface, dvtIface, regIface, safeIface, recheckEntry } from "./recheck-lib.mjs";
 
 const ABI = ethers.AbiCoder.defaultAbiCoder();
 const AGG = ethers.getAddress("0x00000000000000000000000000000000000a6600");
@@ -15,6 +15,11 @@ const REG = ethers.getAddress("0x00000000000000000000000000000000000d1500");
 const WRAPPER = ethers.getAddress("0x00000000000000000000000000000000000bad00");
 const WATCHER = ethers.getAddress("0x0000000000000000000000000000000000000777");
 const SAFE = ethers.getAddress("0x0000000000000000000000000000000000005afe");
+const DVT = ethers.getAddress("0x00000000000000000000000000000000000d7700");
+const MULTISEND = ethers.getAddress("0x0000000000000000000000000000000000035e00");
+const FAKE_DVT = ethers.getAddress("0x00000000000000000000000000000000000fa4e0");
+/** What a release manifest pins for the forwarder roles. */
+const FORWARDERS = { dvtValidator: DVT, ownerSafe: SAFE, multiSendCallOnly: MULTISEND };
 const DS = ethers.id("stub-domain-separator");
 
 const addr = s => ethers.getAddress(ethers.dataSlice(ethers.id(s), 12));
@@ -128,6 +133,8 @@ function makeChain() {
   let maxRange = Infinity; // emulate a range-capped RPC
   let getLogsCalls = 0;
   let onReceipt = null; // one-shot hook around the next receipt fetch
+  const proposals = new Map(); // DVTValidator id -> { block, operator, slashLevel, evidenceHash }
+  const traces = new Map(); // tx hash -> callTracer frame
   let onEntryCountRead = null; // one-shot hook right after a by-hash eth_call returns
   let afterSends = null; // { left, fn }: run fn once `left` more raw sends have returned
 
@@ -165,6 +172,11 @@ function makeChain() {
         }
         return out;
       }
+      if (method === "debug_traceTransaction") {
+        const t = traces.get(params[0]);
+        if (!t) throw new Error("the method debug_traceTransaction does not exist");
+        return t;
+      }
       if (method !== "eth_getBlockByNumber") throw new Error(`stub send: ${method}`);
       const b = blocks.get(Number(params[0]));
       const out = b ? { hash: b.hash, parentHash: b.parentHash } : null;
@@ -193,6 +205,21 @@ function makeChain() {
           return regIface.encodeFunctionResult(q.name, [BigInt(entryCount)]);
         throw new Error(`stub registry: ${q.name}`);
       }
+      if (to === DVT) {
+        const q = dvtIface.parseTransaction({ data });
+        if (q.name !== "proposals") throw new Error(`stub dvt: ${q.name}`);
+        const pr = proposals.get(BigInt(q.args[0]));
+        const at = blockTag === "latest" ? head : Number(blockTag);
+        const live = pr && pr.block <= at;
+        return dvtIface.encodeFunctionResult("proposals", [
+          live ? pr.operator : ethers.ZeroAddress,
+          live ? pr.slashLevel : 0,
+          "",
+          false,
+          !!live,
+          live ? pr.evidenceHash : ethers.ZeroHash,
+        ]);
+      }
       if (to !== AGG) throw new Error("call to unknown contract");
       const p = aggIface.parseTransaction({ data });
       if (p.name === "domainSeparator") return aggIface.encodeFunctionResult(p.name, [DS]);
@@ -213,8 +240,158 @@ function makeChain() {
     },
   };
 
+  /** Calldata for an action routed through a forwarder (DVTValidator, the owner Safe, MultiSend). */
+  function wrapVia(via, kind, id, f, aggData, n) {
+    const dvtData = () =>
+      kind === Kind.QUEUE
+        ? dvtIface.encodeFunctionData("queueSlashWithProof", [
+            f.operator,
+            f.slashLevel,
+            f.epoch,
+            "0x",
+          ])
+        : dvtIface.encodeFunctionData("executeWithProof", [
+            id,
+            kind === Kind.REPUTATION ? f.users : [],
+            kind === Kind.REPUTATION ? f.newScores : [],
+            f.epoch,
+            "0x",
+          ]);
+    const safeExec = (target, data, op) =>
+      safeIface.encodeFunctionData("execTransaction", [
+        target,
+        0,
+        data,
+        op,
+        0,
+        0,
+        0,
+        ethers.ZeroAddress,
+        ethers.ZeroAddress,
+        "0x",
+      ]);
+    const packed = subs =>
+      ethers.concat(
+        subs.map(x =>
+          ethers.solidityPacked(
+            ["uint8", "address", "uint256", "uint256", "bytes"],
+            [x.op, x.to, 0, ethers.dataLength(x.data), x.data]
+          )
+        )
+      );
+    const dvtCallFrame = () => ({
+      type: "CALL",
+      to: DVT,
+      input: dvtData(),
+      calls: [{ type: "CALL", to: AGG, input: aggData }],
+    });
+    switch (via.route) {
+      case "dvt":
+        // A reputation proposal is created with operator 0 / level 0 (the aggregator requires both
+        // zero for a batch); a slash proposal stores its own fields.
+        if (kind !== Kind.QUEUE)
+          proposals.set(
+            BigInt(id),
+            kind === Kind.REPUTATION
+              ? {
+                  block: via.createdAt ?? n - 1,
+                  operator: ethers.ZeroAddress,
+                  slashLevel: 0,
+                  evidenceHash: ethers.ZeroHash,
+                }
+              : { block: via.createdAt ?? n - 1, ...(via.overrideProposal ?? f) }
+          );
+        return { to: DVT, data: dvtData() };
+      case "fake-dvt": // DVTValidator calldata at an address the manifest does not pin
+        if (kind !== Kind.QUEUE) proposals.set(BigInt(id), { block: n - 1, ...f });
+        return { to: FAKE_DVT, data: dvtData() };
+      case "safe": // `inner` replaces the Safe's inner call (e.g. a different message under the same key)
+        return { to: SAFE, data: safeExec(AGG, via.inner ?? aggData, 0) };
+      case "safe-delegate":
+        return { to: SAFE, data: safeExec(WRAPPER, aggData, 1) };
+      case "multisend":
+        return {
+          to: SAFE,
+          data: safeExec(
+            MULTISEND,
+            safeIface.encodeFunctionData("multiSend", [
+              packed([
+                { op: 0, to: addr("unrelated"), data: "0x1234" },
+                ...via.subs.map(op => ({ op, to: AGG, data: aggData })),
+                ...(via.extraAgg ? [{ op: 0, to: AGG, data: via.extraAgg }] : []),
+                ...(via.extraSub ? [via.extraSub] : []),
+              ]),
+            ]),
+            1
+          ),
+        };
+      case "trace-delegate": // unpinned wrapper -> DELEGATECALL (not MultiSendCallOnly) -> aggregator
+        return {
+          to: WRAPPER,
+          data: "0xdeadbeef",
+          trace: {
+            type: "CALL",
+            to: WRAPPER,
+            input: "0xdeadbeef",
+            calls: [
+              {
+                type: "DELEGATECALL",
+                to: addr("some-library"),
+                input: "0x01",
+                calls: [{ type: "CALL", to: AGG, input: aggData }],
+              },
+            ],
+          },
+        };
+      case "trace-module": // unpinned wrapper -> pinned Safe module route -> aggregator, seen by trace
+        return {
+          to: WRAPPER,
+          data: "0xdeadbeef",
+          trace: {
+            type: "CALL",
+            to: WRAPPER,
+            input: "0xdeadbeef",
+            calls: [
+              {
+                type: "CALL",
+                to: SAFE,
+                input: safeIface.encodeFunctionData("execTransactionFromModule", [
+                  AGG,
+                  0,
+                  aggData,
+                  0,
+                ]),
+                calls: [{ type: "CALL", to: AGG, input: aggData }],
+              },
+            ],
+          },
+        };
+      case "module":
+        return {
+          to: SAFE,
+          data: safeIface.encodeFunctionData("execTransactionFromModule", [AGG, 0, aggData, 0]),
+        };
+      case "trace": // an unpinned wrapper; the RPC offers a callTracer trace
+        if (via.dvt) proposals.set(BigInt(id), { block: n - 1, ...f });
+        return {
+          to: WRAPPER,
+          data: "0xdeadbeef",
+          trace: {
+            type: "CALL",
+            to: WRAPPER,
+            input: "0xdeadbeef",
+            calls: [
+              via.dvt ? dvtCallFrame() : { type: via.frameType ?? "CALL", to: AGG, input: aggData },
+            ],
+          },
+        };
+      default:
+        throw new Error(`unknown route ${via.route}`);
+    }
+  }
+
   /** Execute one action as SP would: commitment over pre-block slots, SignersCommitted log. */
-  function execute(kind, id, f, mask, { to = AGG, from = SAFE, midSlots, status = 1 } = {}) {
+  function execute(kind, id, f, mask, { to = AGG, from = SAFE, midSlots, status = 1, via } = {}) {
     const n = mine();
     // midSlots: the slot table as an earlier tx in this block left it and a later one undid it.
     const pre = midSlots ?? blocks.get(n - 1).slots;
@@ -270,8 +447,11 @@ function makeChain() {
         f.epoch,
         "0x",
       ]);
-    if (to !== AGG) data = ethers.concat(["0xdeadbeef", data]); // a wrapper contract's own calldata
+    let trace = null;
+    if (via) ({ to, data, trace } = wrapVia(via, kind, id, f, data, n));
+    else if (to !== AGG) data = ethers.concat(["0xdeadbeef", data]); // a wrapper contract's own calldata
     const hash = ethers.id(`action-${n}-${kind}-${id}`);
+    if (trace) traces.set(hash, trace);
     const ev = aggIface.encodeEventLog("SignersCommitted", [key, mask]);
     txs.set(hash, {
       tx: { hash, to, from, data },
@@ -483,6 +663,7 @@ async function expectCase(name, entryId, want, opts = {}) {
     r = await recheckEntry(opts.chain ?? chain, {
       registry: REG,
       aggregator: AGG,
+      forwarders: opts.forwarders ?? FORWARDERS,
       entryId,
       page: opts.page,
       fromBlock: opts.fromBlock ?? 0,
@@ -825,6 +1006,312 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
     0n,
     { status: "MISMATCH", reason: "entry id 0" },
     { chain: noSend }
+  );
+}
+
+// ---------------------------------------------------------------- forwarder routes (M0 §4.4, DSR)
+// A real action is almost never a top-level aggregator call: slash/queue go through DVTValidator,
+// the owner route through the Safe. Each route is followed only at its manifest-pinned address.
+{
+  const r = (route, extra = {}) => ({ via: { route, ...extra } });
+  const aD = execute(Kind.SLASH, 40n, slashF, 0b011n, r("dvt"));
+  await expectCase(
+    "DVTValidator.executeWithProof route (fields from proposals@N-1)",
+    disclose(Kind.SLASH, 40n, slashIn, aD),
+    "PASS"
+  );
+  const aDq = execute(Kind.QUEUE, 0n, { ...qF, epoch: 50n }, 0b110n, r("dvt"));
+  const qIn50 = ABI.encode(["address", "uint8", "uint256"], [qF.operator, qF.slashLevel, 50n]);
+  await expectCase(
+    "DVTValidator.queueSlashWithProof route",
+    disclose(Kind.QUEUE, 0n, qIn50, aDq),
+    "PASS"
+  );
+  const aDr = execute(Kind.REPUTATION, 41n, repF, 0b111n, r("dvt"));
+  await expectCase(
+    "DVTValidator route, reputation batch",
+    disclose(Kind.REPUTATION, 41n, repIn, aDr),
+    "PASS"
+  );
+  const aDf = execute(Kind.SLASH, 42n, slashF, 0b011n, r("dvt"));
+  await expectCase(
+    "DVTValidator route + forged messageInputs is MISMATCH",
+    disclose(
+      Kind.SLASH,
+      42n,
+      ABI.encode(
+        ["address", "uint8", "uint256", "bytes32"],
+        [slashF.operator, 2, slashF.epoch, slashF.evidenceHash]
+      ),
+      aDf
+    ),
+    { diff: "signed.messageInputs" }
+  );
+  const aDs = execute(Kind.SLASH, 43n, slashF, 0b011n, r("dvt", { createdAt: headNow() + 1 }));
+  await expectCase(
+    "DVTValidator proposal created in the same block is INCONCLUSIVE",
+    disclose(Kind.SLASH, 43n, slashIn, aDs),
+    {
+      status: "INCONCLUSIVE",
+      reason: "did not exist at block",
+    }
+  );
+  const aFk = execute(Kind.SLASH, 44n, slashF, 0b011n, r("fake-dvt"));
+  await expectCase(
+    "DVTValidator selector at an UNPINNED address is INCONCLUSIVE",
+    disclose(Kind.SLASH, 44n, slashIn, aFk),
+    {
+      status: "INCONCLUSIVE",
+      reason: "not pin",
+    }
+  );
+  const aDu = execute(Kind.SLASH, 45n, slashF, 0b011n, r("dvt"));
+  await expectCase(
+    "DVTValidator route with the forwarder NOT pinned is INCONCLUSIVE",
+    disclose(Kind.SLASH, 45n, slashIn, aDu),
+    { status: "INCONCLUSIVE", reason: "not pin" },
+    { forwarders: { ownerSafe: SAFE } }
+  );
+  const aS1 = execute(Kind.GENERIC, 46n, genF, 0b111n, r("safe"));
+  await expectCase(
+    "owner Safe execTransaction (CALL) route",
+    disclose(Kind.GENERIC, 46n, genIn, aS1),
+    "PASS"
+  );
+  const aS2 = execute(Kind.SLASH, 47n, slashF, 0b011n, r("safe-delegate"));
+  await expectCase(
+    "Safe DELEGATECALL (not MultiSendCallOnly) is INCONCLUSIVE",
+    disclose(Kind.SLASH, 47n, slashIn, aS2),
+    {
+      status: "INCONCLUSIVE",
+      reason: "DELEGATECALL",
+    }
+  );
+  const aM1 = execute(Kind.GENERIC, 48n, genF, 0b111n, r("multisend", { subs: [0] }));
+  await expectCase(
+    "Safe -> pinned MultiSendCallOnly, all CALL sub-txs",
+    disclose(Kind.GENERIC, 48n, genIn, aM1),
+    "PASS"
+  );
+  // A batch that also carries an unrelated aggregator call: only the call whose key matches counts.
+  const otherCall = aggIface.encodeFunctionData("executeProposal", [
+    99n,
+    genF.target,
+    "0xabcdef",
+    3n,
+    "0x",
+  ]);
+  const aM3 = execute(
+    Kind.GENERIC,
+    54n,
+    genF,
+    0b111n,
+    r("multisend", { subs: [0], extraAgg: otherCall })
+  );
+  await expectCase(
+    "MultiSend with a second, non-matching aggregator call",
+    disclose(Kind.GENERIC, 54n, genIn, aM3),
+    "PASS"
+  );
+  // Codex review of 022d80db.
+  // H: a Safe inner call is not proven (execTransaction does not revert on inner failure). One
+  // carrying a different message under the honest action's key must not accuse the honest entry.
+  const otherMsg = aggIface.encodeFunctionData("executeProposal", [
+    60n,
+    genF.target,
+    "0x99",
+    3n,
+    "0x",
+  ]);
+  const aH = execute(Kind.GENERIC, 60n, genF, 0b111n, r("safe", { inner: otherMsg }));
+  await expectCase(
+    "unauthenticated Safe inner call cannot accuse an honest entry",
+    disclose(Kind.GENERIC, 60n, genIn, aH),
+    {
+      status: "INCONCLUSIVE",
+      reason: "no recovered call is authenticated",
+    }
+  );
+  // M1: two candidates under one key, only one authenticates -> that one is used. The second is a
+  // nested Safe execTransaction whose inner call fails: with a nonzero safeTxGas (Safe v1.3.0
+  // GnosisSafe.sol L168-170 reverts GS013 only when safeTxGas == 0 && gasPrice == 0) it returns
+  // false without reverting, so the batch (and the honest call before it) still succeeds.
+  const nestedFail = {
+    op: 0,
+    to: SAFE,
+    data: safeIface.encodeFunctionData("execTransaction", [
+      AGG,
+      0,
+      aggIface.encodeFunctionData("executeProposal", [61n, genF.target, "0x77", 3n, "0x"]),
+      0,
+      100000,
+      0,
+      0,
+      ethers.ZeroAddress,
+      ethers.ZeroAddress,
+      "0x",
+    ]),
+  };
+  const aTwo = execute(
+    Kind.GENERIC,
+    61n,
+    genF,
+    0b111n,
+    r("multisend", { subs: [0], extraSub: nestedFail })
+  );
+  await expectCase(
+    "same-key candidates (one inside a failing nested Safe call): the authenticated one is used",
+    disclose(Kind.GENERIC, 61n, genIn, aTwo),
+    "PASS"
+  );
+  // M3: a batch with any non-CALL sub-tx is skipped whole (MultiSendCallOnly would revert it).
+  const aMix = execute(Kind.GENERIC, 62n, genF, 0b111n, r("multisend", { subs: [0, 1] }));
+  await expectCase(
+    "mixed CALL/DELEGATECALL MultiSend batch is skipped whole",
+    disclose(Kind.GENERIC, 62n, genIn, aMix),
+    {
+      status: "INCONCLUSIVE",
+      reason: "batch skipped",
+    }
+  );
+  // M2: the trace walk enforces the module-route rule too.
+  const aTm = execute(Kind.GENERIC, 63n, genF, 0b111n, r("trace-module"));
+  await expectCase(
+    "trace through a Safe module route is INCONCLUSIVE",
+    disclose(Kind.GENERIC, 63n, genIn, aTm),
+    {
+      status: "INCONCLUSIVE",
+      reason: "module route not followed",
+    }
+  );
+  // Codex R2 Medium: a DVTValidator-derived candidate is not proven (its BLS_AGGREGATOR is mutable),
+  // so when it does not reproduce the commitment it must not accuse: INCONCLUSIVE, not MISMATCH.
+  {
+    const aDv = execute(
+      Kind.SLASH,
+      65n,
+      slashF,
+      0b011n,
+      r("dvt", { overrideProposal: { ...slashF, slashLevel: 2 } })
+    );
+    await expectCase(
+      "unauthenticated DVTValidator candidate cannot accuse an honest entry",
+      disclose(Kind.SLASH, 65n, slashIn, aDv),
+      {
+        status: "INCONCLUSIVE",
+        reason: "no recovered call is authenticated",
+      }
+    );
+  }
+  const aTdg = execute(Kind.GENERIC, 64n, genF, 0b111n, r("trace-delegate"));
+  await expectCase(
+    "trace: aggregator call under a non-MultiSend DELEGATECALL is INCONCLUSIVE",
+    disclose(Kind.GENERIC, 64n, genIn, aTdg),
+    {
+      status: "INCONCLUSIVE",
+      reason: "DELEGATECALL subtree not followed",
+    }
+  );
+  const aM2 = execute(Kind.GENERIC, 49n, genF, 0b111n, r("multisend", { subs: [1] }));
+  await expectCase(
+    "MultiSend sub-tx by DELEGATECALL is INCONCLUSIVE",
+    disclose(Kind.GENERIC, 49n, genIn, aM2),
+    {
+      status: "INCONCLUSIVE",
+      reason: "DELEGATECALL is not followed",
+    }
+  );
+  const aMo = execute(Kind.GENERIC, 50n, genF, 0b111n, r("module"));
+  await expectCase("Safe module route is INCONCLUSIVE", disclose(Kind.GENERIC, 50n, genIn, aMo), {
+    status: "INCONCLUSIVE",
+    reason: "module route",
+  });
+  const aT = execute(Kind.SLASH, 51n, slashF, 0b011n, r("trace"));
+  await expectCase(
+    "unpinned wrapper + callTracer frame to the aggregator",
+    disclose(Kind.SLASH, 51n, slashIn, aT),
+    "PASS"
+  );
+  const aTd = execute(Kind.SLASH, 52n, slashF, 0b011n, r("trace", { dvt: true }));
+  await expectCase(
+    "unpinned wrapper + trace through the pinned DVTValidator",
+    disclose(Kind.SLASH, 52n, slashIn, aTd),
+    "PASS"
+  );
+  const aTs = execute(Kind.SLASH, 53n, slashF, 0b011n, r("trace", { frameType: "STATICCALL" }));
+  await expectCase(
+    "trace frame that is not a CALL is not decoded",
+    disclose(Kind.SLASH, 53n, slashIn, aTs),
+    {
+      status: "INCONCLUSIVE",
+      reason: "no aggregator call recoverable",
+    }
+  );
+}
+
+// DSR follow-up to #396: an entry logged in the pre-#396 flat 13-argument event shape is never
+// returned by the topic filter (INCONCLUSIVE, never MATCH), and its data does not decode.
+{
+  const OLD = new ethers.Interface([
+    "event Disclosed(uint256 indexed entryId, uint8 indexed kind, uint256 indexed key, uint256 proposalId, bytes32 messageHash, address[] signers, address subjectToken, bytes32 txHash, uint64 blockNumber, bool blockVerified, bytes20 rulesetCommit, string recordURI, bytes32 recordHash)",
+  ]);
+  const oldTopic = OLD.getEvent("Disclosed").topicHash;
+  results.push({
+    name: "old flat event topic differs from the current one",
+    ok: oldTopic !== regIface.getEvent("Disclosed").topicHash,
+    want: "different topics",
+    got: oldTopic,
+  });
+  const ev = OLD.encodeEventLog("Disclosed", [
+    1n,
+    0,
+    7n,
+    7n,
+    ethers.id("m"),
+    [],
+    ethers.ZeroAddress,
+    ethers.id("tx"),
+    5n,
+    true,
+    "0x" + "ab".repeat(20),
+    "u",
+    ethers.id("r"),
+  ]);
+  let threw = false;
+  try {
+    regIface.decodeEventLog("Disclosed", ev.data, [
+      regIface.getEvent("Disclosed").topicHash,
+      ...ev.topics.slice(1),
+    ]);
+  } catch {
+    threw = true;
+  }
+  results.push({
+    name: "old flat event data does not decode as the current event",
+    ok: threw,
+    want: "throws",
+    got: String(threw),
+  });
+  const oldOnly = {
+    ...chain,
+    async getLogs({ topics }) {
+      return [
+        {
+          address: REG,
+          topics: ev.topics,
+          data: ev.data,
+          blockNumber: 5,
+          blockHash: ethers.id("block-5"),
+          transactionHash: ethers.id("d"),
+        },
+      ].filter(l => l.topics[0] === topics[0] && l.topics[1] === topics[1]);
+    },
+  };
+  await expectCase(
+    "an old-shape log is never treated as an entry",
+    1n,
+    { status: "INCONCLUSIVE", reason: "no Disclosed log was found" },
+    { chain: oldOnly }
   );
 }
 

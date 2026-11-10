@@ -2,7 +2,12 @@
 // Recheck one DisclosureRegistry entry from public RPC data only (M0 §4.4, §9 item 6).
 //
 //   RPC_URL=https://... node scripts/disclosure/recheck-entry.mjs --registry 0x.. --entry 3 \
-//     --from-block <registry deploy block> [--aggregator 0x..] [--confirmations 12]
+//     --from-block <registry deploy block> [--aggregator 0x..] [--confirmations 12] \
+//     [--dvt-validator 0x..] [--owner-safe 0x..] [--multisend-call-only 0x..]
+//
+// The forwarder flags are the release manifest's pinned addresses for those roles. A real action
+// usually reaches the aggregator through DVTValidator or the owner Safe; without the matching
+// flag that route is INCONCLUSIVE (unless the RPC offers a callTracer trace).
 //
 // Reads: the registry's Disclosed log and disclose() calldata, the action tx and receipt it names,
 // the aggregator's domainSeparator / validatorAtSlot / proposalSignersCommitment, and block hashes,
@@ -26,7 +31,7 @@ function arg(name) {
 }
 function usage(msg) {
   console.error(
-    `error: ${msg}\nusage: RPC_URL=.. recheck-entry.mjs --registry <addr> --entry <id> --from-block <n> [--aggregator <addr>] [--confirmations <n>]`
+    `error: ${msg}\nusage: RPC_URL=.. recheck-entry.mjs --registry <addr> --entry <id> --from-block <n> [--aggregator <addr>] [--confirmations <n>] [--dvt-validator <addr>] [--owner-safe <addr>] [--multisend-call-only <addr>]`
   );
   process.exit(2);
 }
@@ -40,6 +45,17 @@ const fromBlock = arg("from-block");
 if (!fromBlock || !/^\d+$/.test(fromBlock)) usage("--from-block <registry deploy block> required");
 const confirmations = arg("confirmations") ?? "12";
 if (!/^\d+$/.test(confirmations)) usage("--confirmations must be a non-negative integer");
+const forwarders = {};
+for (const [flag, role] of [
+  ["dvt-validator", "dvtValidator"],
+  ["owner-safe", "ownerSafe"],
+  ["multisend-call-only", "multiSendCallOnly"],
+]) {
+  const v = arg(flag);
+  if (v === undefined) continue;
+  if (!ethers.isAddress(v)) usage(`--${flag} must be an address`);
+  forwarders[role] = ethers.getAddress(v);
+}
 
 try {
   const chain = makeProvider(rpc);
@@ -58,6 +74,7 @@ try {
     entryId: BigInt(entry),
     fromBlock: Number(fromBlock),
     confirmations: Number(confirmations),
+    forwarders,
   });
   const out = {
     entryId: entry,
