@@ -11,6 +11,7 @@ import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
 import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.mjs";
 import { attributeLogs } from "./attribute.mjs";
 import { mayHaveLog } from "./bloom.mjs";
+import { Store } from "./store.mjs";
 
 export const MAX_DEADLETTER_ATTEMPTS = 20;
 
@@ -271,6 +272,12 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   }
   for (const l of t.agg) {
     if (store.hasBlsRecord(BigInt(l.topics[1]))) continue; // completed before (tx retry, M5)
+    // An authenticated action awaiting only its price is retried by its own dead letter, never
+    // rebuilt here (a rebuild failure must not replace verified evidence; R2 M4).
+    const pend = store.getDeadLetter(
+      Store.recordId({ route: "bls", key: BigInt(l.topics[1]).toString(), kind: undefined })
+    );
+    if (pend?.pendingRecord) continue;
     const call = commitCall.get(logPos(l));
     const out = await blsRecord(chain, cfg, rs, ctx, l, effectsOf.get(call) ?? [], snapshot);
     if (out.record) note(summary, store.putRecord(out.record), out.record);
@@ -303,17 +310,15 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     return { done: false };
   };
   if (tx === undefined || tx === null) return fail("transaction unavailable");
-  // Root-call attribution without a trace is accepted only when it is consistent: the root
-  // selector is a permissionless function and EVERY SP event of the tx is one it can emit, so no
-  // nested call can be hiding behind it (Codex #400-fix H1). A privileged root is the owner route
-  // whoever it calls. Otherwise only the aligned trace frame attributes an ambiguous event.
+  // An ambiguous event is attributed ONLY by its aligned emitting frame in the trace (Codex
+  // #400-fix R2 H1): a tx's calldata names the root call, and matching event names cannot prove
+  // that no nested SP call emitted the same event type. Without that frame, the tx is retried.
+  // For an event only privileged functions can emit, the root call is recorded as best-known
+  // caller information (the route is the owner route whoever called).
   const rootSel = direct ? selectorOf(tx.data) : null;
-  const rootPub = rootSel ? publicFunction(rs, rootSel) : null;
-  const rootConsistent =
-    direct && rootSel && (!rootPub || decoded.every(x => rootPub[1].events.includes(x.d.event)));
-  const directFrame = rootConsistent ? { from: tx.from, selector: rootSel } : null;
+  const directFrame = rootSel ? { from: tx.from, selector: rootSel } : null;
   const traced = e => (attr.aligned ? (attr.spCall.get(e.logIndex) ?? null) : null);
-  const frameOf = e => traced(e) ?? directFrame;
+  const frameOf = e => (amb.has(e.event) ? traced(e) : (traced(e) ?? directFrame));
   // Events emitted by the same SP call, for verdicts that depend on what else the call did.
   const byFrame = new Map();
   for (const e of independent) {
@@ -358,6 +363,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       if (rec.price.error) {
         priceFailed = true;
         rec.price = undefined;
+        rec.priceMissing = true;
       }
     }
     recs.push(rec);
@@ -374,7 +380,12 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
 function exhaust(store, rs, cfg, ctx, summary, dl) {
   if (dl.route === "tx" && dl.pendingRecords) {
     for (const r of dl.pendingRecords) {
-      const rec = { ...r, price: { unavailable: true }, exhaustedAfter: dl.attempts };
+      const { priceMissing, ...rest } = r;
+      const rec = {
+        ...rest,
+        ...(priceMissing ? { price: { unavailable: true } } : {}),
+        exhaustedAfter: dl.attempts,
+      };
       note(summary, store.putRecord(rec), rec);
     }
   } else if (dl.route === "tx") {
@@ -522,6 +533,31 @@ export async function tick(chain, cfg, store, rs, ctx) {
   for (const dl of store.listDeadLetters()) {
     if (dl.attempts >= MAX_DEADLETTER_ATTEMPTS) {
       exhaust(store, rs, cfg, ctx, summary, dl);
+      continue;
+    }
+    if (dl.route === "tx" && dl.pendingRecords) {
+      // Classified already; only prices are missing. Retry just those (R2 M3).
+      const done = [];
+      let failed = false;
+      for (const r of dl.pendingRecords) {
+        if (!r.priceMissing) {
+          done.push(r);
+          continue;
+        }
+        const price = await pricePair(chain, cfg, r.blockNumber);
+        if (price.error) {
+          failed = true;
+          break;
+        }
+        const { priceMissing, ...rest } = r;
+        void priceMissing;
+        done.push({ ...rest, price });
+      }
+      if (failed) store.putDeadLetter({ ...dl, reasons: ["price read failed"] });
+      else {
+        for (const rec of done) note(summary, store.putRecord(rec), rec);
+        store.resolveDeadLetter(dl.id);
+      }
       continue;
     }
     if (dl.route === "tx") {

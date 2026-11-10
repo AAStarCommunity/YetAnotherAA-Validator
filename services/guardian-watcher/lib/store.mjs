@@ -108,10 +108,22 @@ export class Store {
   putDeadLetter(rec) {
     const id = Store.recordId({ ...rec, kind: undefined });
     const path = join(this.dir, "deadletters", `${id}.json`);
-    const prev = readJson(path, null);
+    let prev = null;
+    try {
+      prev = readJson(path, null);
+    } catch {
+      prev = null; // a corrupt dead letter is replaced, never a reason to stop
+    }
+    // Evidence a dead letter has already established (an authenticated BLS record, classified SP
+    // records awaiting only a price) survives any later, weaker failure (Codex #400-fix R2 M3/M4).
+    const keep = {};
+    if (prev?.pendingRecord && !rec.pendingRecord) keep.pendingRecord = prev.pendingRecord;
+    if (prev?.pendingRecords && !rec.pendingRecords) keep.pendingRecords = prev.pendingRecords;
     atomicWriteJson(path, {
       id,
       ...rec,
+      ...keep,
+      ...(keep.pendingRecord ? { status: prev.status } : {}),
       attempts: (prev?.attempts ?? 0) + 1,
       firstSeen: prev?.firstSeen ?? rec.seenAt,
     });
@@ -152,12 +164,31 @@ export class Store {
     return readdirSync(join(this.dir, "deadletters")).filter(f => f.endsWith(".exhausted")).length;
   }
 
-  /** Whether any record exists for this BLS key (whatever its kind, UNRECOVERED included). */
+  /**
+   * Whether an AUTHENTICATED record exists for this BLS key: a parseable record with a kind.
+   * UNRECOVERED, placeholder or corrupt files do not count, so a later authentication still
+   * writes the real record (Codex #400-fix R2).
+   */
   hasBlsRecord(key) {
     const suffix = `-${BigInt(key).toString(16).padStart(64, "0")}.json`;
-    return readdirSync(join(this.dir, "records")).some(
-      f => f.startsWith("bls-") && f.endsWith(suffix)
-    );
+    return readdirSync(join(this.dir, "records")).some(f => {
+      if (!f.startsWith("bls-") || !f.endsWith(suffix)) return false;
+      // UNRECOVERED placeholders carry no kind, so the kind test excludes them too.
+      try {
+        return JSON.parse(readFileSync(join(this.dir, "records", f), "utf8")).kind !== undefined;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  /** The open dead letter with this id, or null. */
+  getDeadLetter(id) {
+    try {
+      return readJson(join(this.dir, "deadletters", `${id}.json`), null);
+    } catch {
+      return null;
+    }
   }
 
   countRecords() {

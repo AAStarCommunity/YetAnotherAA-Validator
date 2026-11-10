@@ -674,7 +674,7 @@ try {
         p1.caller === KEEPER &&
         p1.selector === sel("updatePrice()") &&
         p1.function === "updatePrice()" &&
-        p1.callerSource === "tx",
+        p1.callerSource === "trace",
       p1
     );
     const p2 = byTx(k2.hash);
@@ -861,12 +861,20 @@ try {
         { name: "PriceUpdated", args: [257000000000n, 10n] },
         { name: "OperatorPaused", args: [addr("nested-op")] },
       ],
-      { from: KEEPER, data: sel("updatePrice()"), price: 257000000000n }
+      { from: KEEPER, data: sel("updatePrice()"), price: 257000000000n, trace: false }
     );
     // C2 (H2-adjacent) a direct call whose calldata has no selector: ambiguous events are retried
     const c2 = c.ownerTx([{ name: "OperatorPaused", args: [addr("noselector-op")] }], {
       from: KEEPER,
       data: "0x",
+    });
+    // C1b (R2 H1) a direct updatePrice() WITHOUT a trace whose events are all ones updatePrice can
+    // emit: matching names do not prove the emitting call, so it is retried, not attributed
+    const c1b = c.ownerTx([{ name: "PriceUpdated", args: [257500000000n, 10n] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      price: 257500000000n,
+      trace: false,
     });
     await runOnce(c.chain, cfg, store, rs, ident);
     cell(
@@ -874,7 +882,9 @@ try {
       byTx(c1.hash).length === 0 &&
         dls().some(x => x.txHash === c1.hash) &&
         byTx(c2.hash).length === 0 &&
-        dls().some(x => x.txHash === c2.hash),
+        dls().some(x => x.txHash === c2.hash) &&
+        byTx(c1b.hash).length === 0 &&
+        dls().some(x => x.txHash === c1b.hash),
       { c1: byTx(c1.hash), c2: byTx(c2.hash) }
     );
     {
@@ -1024,6 +1034,58 @@ try {
       byTx(c6.hash).length === 2 && r6.status.bloom.recovered === 1,
       { n: byTx(c6.hash).map(r => r.event), bloom: r6.status.bloom }
     );
+    // C7 (R2 M3) an SP record classified already and awaiting only its price lands once the price
+    // reads, even while the tx lookup fails: the retry re-reads prices only, never re-attributes
+    const c7 = c.ownerTx([{ name: "PriceUpdated", args: [261000000000n, 14n] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      price: 261000000000n,
+    });
+    c.failPriceReads(1_000_000);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c7dl = dls().find(x => x.txHash === c7.hash);
+    c.failPriceReads(0);
+    c.failTx(c7.hash, 1_000_000);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    c.failTx(c7.hash, 0);
+    const [c7r] = byTx(c7.hash);
+    cell(
+      "a classified SP record awaiting its price lands when the price reads, without re-reading the tx",
+      c7dl?.pendingRecords?.length === 1 &&
+        c7r?.route === "public" &&
+        c7r.callerSource === "trace" &&
+        c7r.price &&
+        !c7r.price.unavailable &&
+        !c7r.price.error &&
+        !("priceMissing" in c7r) &&
+        !dls().some(x => x.txHash === c7.hash),
+      { c7dl: c7dl && { reasons: c7dl.reasons, pending: !!c7dl.pendingRecords }, c7r }
+    );
+    // C8 (R2 M4) a mixed tx: an authenticated BLS action awaiting its price, and an SP event whose
+    // caller is undeterminable (no trace). Retrying the tx must not rebuild the BLS action, so its
+    // dead letter takes exactly one attempt per tick (the attempt cap counts ticks).
+    const c8 = c.execute(Kind.GENERIC, 92n, priceG, 0b111n, {
+      via: { route: "safe" },
+      spLogs: [{ name: "OperatorPaused", args: [addr("c8-op")] }],
+      price: 262000000000n,
+    });
+    c.failPriceReads(1_000_000);
+    for (let i = 0; i < 3; i++) await runOnce(c.chain, cfg, store, rs, ident);
+    const c8bls = dls().find(x => x.txHash === c8.hash && x.route === "bls");
+    const c8tx = dls().find(x => x.txHash === c8.hash && x.route === "tx");
+    c.failPriceReads(0);
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const c8r = byTx(c8.hash).find(r => r.route === "bls");
+    cell(
+      "a tx retry never rebuilds a BLS action already awaiting its price (one attempt per tick)",
+      c8bls?.pendingRecord?.kind === "GENERIC" &&
+        c8bls.attempts === 3 &&
+        c8tx?.attempts === 3 &&
+        c8r?.kind === "GENERIC" &&
+        c8r.price &&
+        !c8r.price.unavailable,
+      { bls: c8bls?.attempts, tx: c8tx?.attempts, c8r: c8r && { kind: c8r.kind, price: c8r.price } }
+    );
     // K15 maxBlocksPerTick bounds each tick
     for (let i = 0; i < 5; i++) c.mine();
     const from15 = store.getCursor().block + 1;
@@ -1071,6 +1133,74 @@ try {
     );
   } finally {
     rmSync(d3, { recursive: true, force: true });
+  }
+}
+
+// ---- store: dead letters keep established evidence; only an authenticated record counts as done
+{
+  const d4 = mkdtempSync(join(tmpdir(), "guardian-watcher-store-"));
+  try {
+    const s = new Store(d4);
+    const h = ethers.id("store-unit");
+    const base = { txHash: h, blockNumber: 1, seenAt: "t0" };
+    s.putDeadLetter({
+      ...base,
+      route: "tx",
+      status: "ERROR",
+      reasons: ["price read failed"],
+      events: [],
+      pendingRecords: [{ route: "public", txHash: h, logIndex: 0, priceMissing: true }],
+    });
+    s.putDeadLetter({
+      ...base,
+      route: "tx",
+      status: "ERROR",
+      reasons: ["transaction unavailable"],
+      events: [],
+    });
+    const t = s.getDeadLetter(`tx-${h.toLowerCase()}`);
+    s.putDeadLetter({
+      ...base,
+      route: "bls",
+      key: "5",
+      status: "PRICE_UNAVAILABLE",
+      reasons: ["price read failed"],
+      pendingRecord: { route: "bls", kind: "GENERIC", key: "5" },
+    });
+    s.putDeadLetter({
+      ...base,
+      route: "bls",
+      key: "5",
+      status: "ERROR",
+      reasons: ["transaction unavailable"],
+    });
+    const b = s.getDeadLetter(Store.recordId({ route: "bls", key: "5" }));
+    cell(
+      "a dead letter keeps established evidence across a weaker later failure (pendingRecords; pendingRecord + status)",
+      t?.pendingRecords?.length === 1 &&
+        t.reasons[0] === "transaction unavailable" &&
+        t.attempts === 2 &&
+        b?.pendingRecord?.kind === "GENERIC" &&
+        b.status === "PRICE_UNAVAILABLE" &&
+        b.attempts === 2,
+      { t, b }
+    );
+    s.putRecord({ ...base, route: "bls", key: "6", kind: undefined });
+    const unrec = s.hasBlsRecord(6n);
+    writeFileSync(
+      join(d4, "records", `${Store.recordId({ route: "bls", kind: "SLASH", key: "7" })}.json`),
+      "{not json"
+    );
+    const corrupt = s.hasBlsRecord(7n);
+    s.putRecord({ ...base, route: "bls", key: "8", kind: "SLASH" });
+    const real = s.hasBlsRecord(8n);
+    cell(
+      "hasBlsRecord: only a parseable authenticated record counts (not UNRECOVERED, not corrupt)",
+      !unrec && !corrupt && real,
+      { unrec, corrupt, real }
+    );
+  } finally {
+    rmSync(d4, { recursive: true, force: true });
   }
 }
 

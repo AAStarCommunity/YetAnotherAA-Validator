@@ -674,7 +674,7 @@ function makeChain() {
      * (no selector: "0x"); `to`/`data` model a keeper's direct call, or a call through a contract
      * (then attribution needs a trace: setTrace).
      */
-    ownerTx: (spLogsIn, { from = SAFE, price, to = SP, data = "0x" } = {}) => {
+    ownerTx: (spLogsIn, { from = SAFE, price, to = SP, data = "0x", trace } = {}) => {
       const n = mine();
       const hash = ethers.id(`owner-${n}`);
       const rlogs = spLogsIn.map(x => ({ address: SP, ...spIface.encodeEventLog(x.name, x.args) }));
@@ -685,6 +685,15 @@ function makeChain() {
         receipt: { status: 1, blockNumber: n, blockHash: blocks.get(n).hash, logs: rlogs },
       });
       indexLogs(hash, n, rlogs);
+      // A direct call to SP gets the trace a tracing node would return, unless trace === false.
+      if (to === SP && trace !== false)
+        traces.set(hash, {
+          type: "CALL",
+          from,
+          to: SP,
+          input: data,
+          logs: rlogs.map(l => ({ address: l.address, topics: l.topics, data: l.data })),
+        });
       return { hash, block: n };
     },
     setPrice: (block, price) => prices.push({ block, price }),
