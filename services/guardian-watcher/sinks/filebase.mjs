@@ -3,7 +3,7 @@
 // 0, so 1 is always set), Authorization: Bearer <bucket token>. UNVERIFIED: whether `raw-leaves`
 // is honoured; the returned CID is compared with the local one by publishRecord, so a mismatch is
 // a failed pin, never a wrong publication. Never configure the account S3 key/secret here.
-import { fetchWithTimeout, fetchBounded, httpError } from "./http.mjs";
+import { request, jsonOf, fetchBounded } from "./http.mjs";
 
 export function filebasePinner({
   token,
@@ -17,16 +17,17 @@ export function filebasePinner({
       const form = new FormData();
       form.append("file", new Blob([bytes], { type: "application/json" }), "record.json");
       const url = `${rpcUrl}?cid-version=1&raw-leaves=true&pin=true`;
-      const res = await fetchWithTimeout(url, {
+      const r = await request("filebase add", url, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
         body: form,
       });
-      if (!res.ok) throw await httpError("filebase add", res);
-      const j = await res.json();
-      return { cid: j?.Hash ?? null };
+      const j = jsonOf("filebase add", r);
+      const cid = j?.Hash ?? null;
+      return { cid: typeof cid === "string" ? cid : null };
     },
     async fetchPublic(cid) {
+      if (!/^b[a-z2-7]{20,}$/.test(String(cid))) return null; // only a base32 CIDv1 enters the URL
       return fetchBounded(`${gateway.replace(/\/$/, "")}/ipfs/${cid}`);
     },
   };

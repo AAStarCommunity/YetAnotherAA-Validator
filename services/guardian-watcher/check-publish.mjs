@@ -514,6 +514,7 @@ function sinks(opts = {}) {
     "a stuck tx (nonce unused) is replaced at the SAME nonce, alerted, with both hashes journalled",
     s.calls.sign === 2 &&
       s.calls.lastSignOpts.replace === true &&
+      s.calls.lastSignOpts.prevRaw === "0xraw1" &&
       s.calls.lastSignOpts.nonce === r1.state.registry.nonce &&
       r2.state.registry.hashes.length === 2 &&
       r2.alerts.some(x => /replacing at nonce/.test(x)),

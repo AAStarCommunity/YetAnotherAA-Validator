@@ -3,7 +3,7 @@
 // registry signer. No network, no real credentials. Live provider cells are separate (pre-go-live).
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ethers } from "ethers";
@@ -12,6 +12,7 @@ import { cidV1Raw, MAX_RECORD_BYTES } from "./lib/cid.mjs";
 import { pinataPinner } from "./sinks/pinata.mjs";
 import { filebasePinner } from "./sinks/filebase.mjs";
 import { telegramSink } from "./sinks/telegram.mjs";
+import { request, jsonOf } from "./sinks/http.mjs";
 import { gitMirror } from "./sinks/git-mirror.mjs";
 import { registrySink, assertWriterRole, actionId, regSinkIface } from "./sinks/registry.mjs";
 
@@ -50,6 +51,7 @@ const cell = (name, ok, got) => results.push({ name, ok: !!ok, got: ok ? "" : j(
 
 // ---- local HTTP mock
 const seen = [];
+const BIG_CID = "bafkrei" + "a".repeat(52);
 const blobs = new Map();
 const srv = createServer(async (req, res) => {
   const chunks = [];
@@ -79,13 +81,34 @@ const srv = createServer(async (req, res) => {
     res.end(JSON.stringify({ Hash: cid }));
   } else if (req.url.startsWith("/gw/ipfs/")) {
     const cid = req.url.split("/").pop();
-    if (cid === "big") return res.end(Buffer.alloc(MAX_RECORD_BYTES + 10));
+    if (cid === BIG_CID) return res.end(Buffer.alloc(MAX_RECORD_BYTES + 10));
     const b = blobs.get(cid);
     if (!b) {
       res.statusCode = 404;
       return res.end();
     }
     res.end(b);
+  } else if (req.url === "/stall") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write("{");
+    return; // headers sent, body never finishes
+  } else if (req.url === "/huge-error") {
+    res.statusCode = 500;
+    const chunk = Buffer.alloc(64 * 1024, 0x41);
+    let sent = 0;
+    const pump = () => {
+      while (sent < 64 && res.write(chunk)) sent++;
+      if (sent < 64) res.once("drain", pump);
+      else res.end();
+    };
+    pump();
+    return;
+  } else if (req.url.startsWith("/tgecho/bot")) {
+    // A hostile/buggy upstream that echoes the request path (with the token) everywhere.
+    res.statusCode = req.url.includes("500") ? 500 : 200;
+    return res.end(
+      JSON.stringify({ ok: false, error_code: 401, description: `bad ${req.url}`, path: req.url })
+    );
   } else if (req.url.startsWith("/tg/bot")) {
     const m = JSON.parse(body.toString());
     res.end(
@@ -125,12 +148,12 @@ try {
   );
   cell(
     "gateway body larger than a record is refused (bounded read)",
-    (await p.fetchPublic("big")) === null,
+    (await p.fetchPublic(BIG_CID)) === null,
     null
   );
   cell(
     "gateway 404 is null, not an exception",
-    (await p.fetchPublic("bafkreinothere")) === null,
+    (await p.fetchPublic("bafkrei" + "b".repeat(52))) === null,
     null
   );
 
@@ -166,45 +189,111 @@ try {
     te = e.message;
   }
   cell("telegram: ok=false is an error", /ok=false/.test(te ?? ""), te);
-  cell("errors never carry the token", ![te].some(m => /TOK/.test(m ?? "")), te);
+  const errs = [];
+  for (const apiBase of [`${base}/tgecho`, `${base}/tgecho500`]) {
+    try {
+      await telegramSink({ token: "TOKSECRET", chatId: "42", apiBase }).send("hi");
+      errs.push("no error");
+    } catch (e) {
+      errs.push(e);
+    }
+  }
+  cell(
+    "telegram: an upstream that echoes the token (body/description, 200 and 500) never leaks it",
+    errs.every(
+      e =>
+        e instanceof Error &&
+        !/TOKSECRET/.test(e.message + String(e.stack)) &&
+        e.cause === undefined
+    ) && /error_code 401/.test(errs[0]?.message ?? ""),
+    errs.map(e => e?.message ?? e)
+  );
+  let ne = null;
+  try {
+    await telegramSink({ token: "TOKSECRET", chatId: "42", apiBase: "http://127.0.0.1:1" }).send(
+      "x"
+    );
+  } catch (e) {
+    ne = e;
+  }
+  cell(
+    "a network failure is a fixed error with no cause attached (no URL, no token)",
+    ne &&
+      /request failed/.test(ne.message) &&
+      ne.cause === undefined &&
+      !/TOKSECRET|127\.0\.0\.1/.test(ne.message),
+    ne?.message
+  );
+  const t0 = Date.now();
+  let se = null;
+  try {
+    await request("stall", `${base}/stall`, {}, { ms: 300 });
+  } catch (e) {
+    se = e.message;
+  }
+  cell(
+    "the deadline covers the body: headers then a stalled body is a timeout",
+    /stall: timeout/.test(se ?? "") && Date.now() - t0 < 5000,
+    se
+  );
+  const big = await request("huge", `${base}/huge-error`, {}, { maxBytes: 1024 });
+  let he = null;
+  try {
+    jsonOf("huge", big);
+  } catch (e) {
+    he = e.message;
+  }
+  cell(
+    "an oversized error body is cut off at the cap (bytes=null), never buffered whole",
+    big.bytes === null && big.status === 500 && /HTTP 500/.test(he ?? ""),
+    { status: big.status, n: big.bytes?.length, he }
+  );
+  cell(
+    "fetchPublic refuses anything but a base32 CIDv1 in the URL",
+    (await p.fetchPublic("../../admin")) === null,
+    null
+  );
 } finally {
   srv.close();
 }
 
-// ---- git mirror against a local bare repo
+// ---- git mirror against a local bare "GitHub" and a BARE watcher clone (plumbing, no worktree)
 {
   const d = mkdtempSync(join(tmpdir(), "mirror-"));
   try {
     const bare = join(d, "remote.git");
-    const clone = join(d, "clone");
+    const seed = join(d, "seed");
+    const clone = join(d, "clone.git");
+    const other = join(d, "other");
     const g = (cwd, ...a) =>
-      execFileSync("git", ["-C", cwd, ...a], { stdio: "pipe" })
+      execFileSync("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t", ...a], {
+        stdio: "pipe",
+      })
         .toString()
         .trim();
     execFileSync("git", ["init", "--quiet", "--bare", bare]);
-    execFileSync("git", ["clone", "--quiet", bare, clone], { stdio: "pipe" });
-    g(
-      clone,
-      "-c",
-      "user.name=t",
-      "-c",
-      "user.email=t@t",
-      "commit",
-      "--quiet",
-      "--allow-empty",
-      "-m",
-      "init"
-    );
-    g(clone, "push", "--quiet", "origin", "HEAD:refs/heads/disclosure-records");
+    execFileSync("git", ["clone", "--quiet", bare, seed], { stdio: "pipe" });
+    g(seed, "commit", "--quiet", "--allow-empty", "-m", "init");
+    // A symlink and a plain file already in the tree, for the refusal cells.
+    mkdirSync(join(seed, "records"), { recursive: true });
+    execFileSync("ln", ["-s", "/etc/passwd", join(seed, "records", "link.json")]);
+    writeFileSync(join(seed, "records", "afile"), "x");
+    g(seed, "add", "-A");
+    g(seed, "commit", "--quiet", "-m", "fixtures");
+    g(seed, "push", "--quiet", "origin", "HEAD:refs/heads/disclosure-records");
+    execFileSync("git", ["clone", "--quiet", "--bare", bare, clone], { stdio: "pipe" });
     const m = gitMirror({ clone, repoUrl: "https://github.com/o/r" });
+    const remoteHead = () => g(bare, "rev-parse", "disclosure-records");
     const r1 = await m.commit("records/bls/a.json", rec, "disclosure a");
-    const remoteHead = execFileSync("git", ["-C", bare, "rev-parse", "disclosure-records"])
-      .toString()
-      .trim();
     cell(
-      "mirror: a new record is committed and pushed to disclosure-records",
-      r1.commit === remoteHead && r1.url.endsWith(`/blob/${r1.commit}/records/bls/a.json`),
-      { r1, remoteHead }
+      "mirror: a new record is committed by plumbing in a bare clone and pushed",
+      r1.commit === remoteHead() &&
+        r1.url.endsWith(`/blob/${r1.commit}/records/bls/a.json`) &&
+        Buffer.compare(
+          execFileSync("git", ["-C", bare, "cat-file", "blob", `${r1.commit}:records/bls/a.json`]),
+          Buffer.from(rec)
+        ) === 0,
+      { r1 }
     );
     let r2 = null;
     try {
@@ -214,27 +303,92 @@ try {
     }
     cell(
       "mirror: identical bytes at the same path return the existing commit (idempotent)",
-      r2?.existing && r2.commit === r1.commit,
+      r2?.existing && r2.commit === r1.commit && remoteHead() === r1.commit,
       r2
     );
-    let e1 = null;
-    try {
-      await m.commit("records/bls/a.json", new TextEncoder().encode("other"), "x");
-    } catch (e) {
-      e1 = e.message;
-    }
+    const refuse = async (path, bytes, re) => {
+      try {
+        await m.commit(path, bytes, "x");
+        return "accepted";
+      } catch (e) {
+        return re.test(e.message) ? true : e.message;
+      }
+    };
+    const diff = await refuse(
+      "records/bls/a.json",
+      new TextEncoder().encode("other"),
+      /different bytes/
+    );
     cell(
       "mirror: different bytes at an existing path are refused, never overwritten",
-      /different bytes/.test(e1 ?? ""),
-      e1
+      diff === true,
+      diff
     );
-    let e2 = null;
-    try {
-      await m.commit("../escape.json", rec, "x");
-    } catch (e) {
-      e2 = e.message;
+    const escapes = [];
+    for (const bad of [
+      "../escape.json",
+      "records/../../x.json",
+      ".git/config",
+      "records//a.json",
+      "/abs.json",
+      "records/./a.json",
+      "records/a b.json",
+      "-rf",
+    ]) {
+      const r = await refuse(bad, rec, /escapes or is not a plain record path/);
+      if (r !== true) escapes.push([bad, r]);
     }
-    cell("mirror: a path escaping the clone is refused", /escapes/.test(e2 ?? ""), e2);
+    cell(
+      "mirror: escaping, .git, empty/dot segments, absolute and odd paths are refused",
+      escapes.length === 0,
+      escapes
+    );
+    const sym = await refuse("records/link.json", rec, /exists as 120000/);
+    cell("mirror: a path that is a symlink in the remote tree is refused", sym === true, sym);
+    const pre = await refuse("records/afile/x.json", rec, /not a directory/);
+    cell("mirror: a path under an existing file is refused", pre === true, pre);
+    // A concurrent writer pushes between our fetch and our push: our push is refused (nothing of
+    // theirs is overwritten), and the retry appends on the new tip with both records present.
+    execFileSync("git", ["clone", "--quiet", "--branch", "disclosure-records", bare, other], {
+      stdio: "pipe",
+    });
+    let raced = false;
+    const mr = gitMirror({
+      clone,
+      beforePush: async () => {
+        if (raced) return;
+        raced = true;
+        writeFileSync(join(other, "records", "b.json"), "b");
+        g(other, "add", "-A");
+        g(other, "commit", "--quiet", "-m", "other writer");
+        g(other, "push", "--quiet", "origin", "HEAD:refs/heads/disclosure-records");
+      },
+    });
+    let race1 = null;
+    try {
+      race1 = await mr.commit("records/bls/c.json", rec, "c");
+    } catch (e) {
+      race1 = { error: e.message };
+    }
+    const theirs = remoteHead();
+    const race2 = await mr.commit("records/bls/c.json", rec, "c");
+    const has = (c, path) => {
+      try {
+        execFileSync("git", ["-C", bare, "cat-file", "-e", `${c}:${path}`], { stdio: "pipe" });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    cell(
+      "mirror: a push racing another writer is refused, then the retry lands on the new tip",
+      race1?.error &&
+        race2.commit === remoteHead() &&
+        g(bare, "rev-parse", `${race2.commit}^`) === theirs &&
+        has(race2.commit, "records/b.json") &&
+        has(race2.commit, "records/bls/c.json"),
+      { race1, race2 }
+    );
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -295,7 +449,9 @@ try {
       return 100000n;
     },
   };
-  const sink = registrySink({ provider, wallet: w, registry: REG, fromBlock: 0 });
+  const fees = { maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
+  provider.getFeeData = async () => ({ ...fees });
+  const sink = registrySink({ provider, wallet: w, registry: REG, fromBlock: 0, roles });
   const args = {
     signed: {
       kind: 0,
@@ -327,12 +483,110 @@ try {
       t1.gasLimit === 120000n,
     { to: t1.to, nonce: t1.nonce, name: dec?.name }
   );
-  const s2 = await sink.sign(args, { nonce: 3, replace: true });
+  // Replacement fees come from the REPLACED tx, not from the current estimate (Codex R1 H4).
+  const s0 = await sink.sign(args, { nonce: 3 });
+  fees.maxFeePerGas = 500n; // the estimate FELL since the original was sent
+  fees.maxPriorityFeePerGas = 50n;
+  const s2 = await sink.sign(args, { nonce: 3, replace: true, prevRaw: s0.raw });
   const t2 = ethers.Transaction.from(s2.raw);
+  const s3 = await sink.sign(args, { nonce: 3, replace: true, prevRaw: s2.raw });
+  const t3 = ethers.Transaction.from(s3.raw);
   cell(
-    "sign: a replacement keeps the journalled nonce and bumps both fees by 25%",
-    t2.nonce === 3 && t2.maxFeePerGas === 1250n && t2.maxPriorityFeePerGas === 125n,
-    { n: t2.nonce, f: t2.maxFeePerGas }
+    "sign: replacements bump from the replaced tx (ceil x1.25) even when the estimate fell, and keep rising",
+    t2.nonce === 3 &&
+      t2.maxFeePerGas === 1250n &&
+      t2.maxPriorityFeePerGas === 125n &&
+      t3.maxFeePerGas === 1563n &&
+      t3.maxPriorityFeePerGas === 157n,
+    {
+      t2: [t2.maxFeePerGas, t2.maxPriorityFeePerGas],
+      t3: [t3.maxFeePerGas, t3.maxPriorityFeePerGas],
+    }
+  );
+  fees.maxFeePerGas = 9000n; // the estimate ROSE above the floor: the estimate wins
+  fees.maxPriorityFeePerGas = 900n;
+  const t4 = ethers.Transaction.from(
+    (await sink.sign(args, { nonce: 3, replace: true, prevRaw: s0.raw })).raw
+  );
+  cell(
+    "sign: a replacement uses the current estimate when it is above the bumped floor",
+    t4.maxFeePerGas === 9000n && t4.maxPriorityFeePerGas === 900n,
+    [t4.maxFeePerGas, t4.maxPriorityFeePerGas]
+  );
+  fees.maxFeePerGas = 1000n;
+  fees.maxPriorityFeePerGas = 100n;
+  const refusals = {};
+  for (const [name, o] of [
+    ["no prevRaw", { nonce: 3, replace: true }],
+    ["prevRaw at another nonce", { nonce: 4, replace: true, prevRaw: s0.raw }],
+    [
+      "prevRaw from another key",
+      {
+        nonce: 3,
+        replace: true,
+        prevRaw: await ethers.Wallet.createRandom().signTransaction({
+          to: REG,
+          data: "0x",
+          nonce: 3,
+          chainId: 10n,
+          type: 2,
+          maxFeePerGas: 1000n,
+          maxPriorityFeePerGas: 100n,
+          gasLimit: 21000n,
+        }),
+      },
+    ],
+  ]) {
+    try {
+      await sink.sign(args, o);
+      refusals[name] = "accepted";
+    } catch (e) {
+      refusals[name] = /journalled|not ours/.test(e.message) ? true : e.message;
+    }
+  }
+  cell(
+    "sign: a replacement without the replaced raw tx, at another nonce, or of another key is refused",
+    Object.values(refusals).every(v => v === true),
+    refusals
+  );
+  // Writer-role separation is enforced BY THE SINK (Codex R1 H7): incomplete roles refuse
+  // construction; a wallet that is a guardian is refused before anything is signed.
+  const ctor = {};
+  for (const [name, r] of [
+    ["no roles", undefined],
+    ["no guardians", { ...roles, guardians: [] }],
+    ["no deployer", { ...roles, deployer: undefined }],
+    ["bad owner", { ...roles, aggregatorOwner: "0x1234" }],
+  ]) {
+    try {
+      registrySink({ provider, wallet: w, registry: REG, fromBlock: 0, roles: r });
+      ctor[name] = "accepted";
+    } catch (e) {
+      ctor[name] = /unknown; refusing/.test(e.message) ? true : e.message;
+    }
+  }
+  cell(
+    "registrySink: unknown or incomplete roles refuse construction (fail closed)",
+    Object.values(ctor).every(v => v === true),
+    ctor
+  );
+  let gs = null;
+  try {
+    await registrySink({
+      provider,
+      wallet: w,
+      registry: REG,
+      fromBlock: 0,
+      roles: { ...roles, guardians: [roles.guardians[0], w.address] },
+    }).sign(args);
+    gs = "signed";
+  } catch (e) {
+    gs = e.message;
+  }
+  cell(
+    "registrySink: a wallet that is a guardian is refused at sign time",
+    /also the guardian 1/.test(gs ?? ""),
+    gs
   );
 
   const foreign = regSinkIface.encodeEventLog("Disclosed", [
@@ -370,6 +624,7 @@ try {
     wallet: w,
     registry: REG,
     fromBlock: 0,
+    roles,
   });
   const rc = await sink2.receipt(ethers.id("h"));
   cell(

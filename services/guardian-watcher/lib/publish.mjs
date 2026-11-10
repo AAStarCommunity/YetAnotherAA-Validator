@@ -29,7 +29,7 @@
 //   registry: { finalized() -> block number,
 //               entryOf(kind, key, { blockTag }) -> entryId (0 = none),
 //               entry(entryId, { blockTag }) -> { binding, recordURI, recordHash, amendments[] },
-//               sign(args, { nonce?, replace? }) -> { raw, hash, nonce }, broadcast(raw) -> void,
+//               sign(args, { nonce?, replace?, prevRaw? }) -> { raw, hash, nonce }, broadcast(raw) -> void,
 //               receipt(hash) -> { status, entryId, blockNumber, blockHash } | null,
 //               canonical(blockNumber, blockHash) -> bool,
 //               nonce() -> the writer's nonce at the FINALIZED block }
@@ -343,9 +343,12 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       alerts.push(
         `registry: disclose tx pending ${Math.round(age / 60000)} min; replacing at nonce ${state.registry.nonce}`
       );
+      // The sink takes its fee floor from the tx being replaced (its journalled raw bytes, the
+      // source of truth), so each replacement clears the node's >= 10% rule (W2b R1 H4).
       const rep = await reg.sign(discloseArgs(rec, file), {
         nonce: state.registry.nonce,
         replace: true,
+        prevRaw: state.registry.raw,
       });
       const hashes = [...(state.registry.hashes ?? [state.registry.hash]), rep.hash];
       state.registry = {

@@ -1,11 +1,13 @@
 // Telegram sink: plain text (no parse_mode, so record text can never be interpreted as markup).
-import { fetchWithTimeout, httpError } from "./http.mjs";
+// The bot token is part of the URL path, so no error ever carries the URL, the response body or
+// Telegram's `description` (sinks/http.mjs): only the operation, status and numeric error_code.
+import { request, jsonOf, SinkHttpError } from "./http.mjs";
 
 export function telegramSink({ token, chatId, apiBase = "https://api.telegram.org" }) {
   if (!token || !chatId) throw new Error("telegram: token and chatId required");
   return {
     async send(text) {
-      const res = await fetchWithTimeout(`${apiBase}/bot${token}/sendMessage`, {
+      const r = await request("telegram sendMessage", `${apiBase}/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -14,9 +16,11 @@ export function telegramSink({ token, chatId, apiBase = "https://api.telegram.or
           disable_web_page_preview: true,
         }),
       });
-      if (!res.ok) throw await httpError("telegram sendMessage", res);
-      const j = await res.json();
-      if (!j.ok) throw new Error(`telegram: ok=false ${j.description ?? ""}`);
+      const j = jsonOf("telegram sendMessage", r);
+      if (j?.ok !== true) {
+        const code = Number.isSafeInteger(j?.error_code) ? ` error_code ${j.error_code}` : "";
+        throw new SinkHttpError("telegram sendMessage", `ok=false${code}`);
+      }
     },
   };
 }
