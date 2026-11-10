@@ -808,6 +808,24 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
   await expectCase("…and a wrong proposalId there is still MISMATCH", eT2, { diff: "proposalId" });
 }
 
+// Codex round 5, L1: a provider without raw send cannot prove absence by counter.
+{
+  const noSend = { ...chain };
+  delete noSend.send;
+  await expectCase(
+    "never-issued id through a provider without send is INCONCLUSIVE",
+    997n,
+    { status: "INCONCLUSIVE", reason: "cannot read state by block hash" },
+    { chain: noSend }
+  );
+  await expectCase(
+    "entry id 0 is MISMATCH on any provider",
+    0n,
+    { status: "MISMATCH", reason: "entry id 0" },
+    { chain: noSend }
+  );
+}
+
 // Codex L4: a range-capped RPC still finds the entry (pages halve until they fit), across pages.
 capRange(16);
 const before = logCalls();

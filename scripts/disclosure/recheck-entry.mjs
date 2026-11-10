@@ -12,6 +12,11 @@
 // Exit 0 = MATCH (verified fields only; subjectToken, ruleset and record stay unverified claims),
 // 1 = MISMATCH, 3 = INCONCLUSIVE (cannot be decided from the tx's own data), 2 = usage/RPC error.
 // Sends no transaction.
+//
+// Trust premises: --registry (and --aggregator, if given) must come from the release manifest; the
+// tool authenticates entries against the aggregator, not the registry address itself, and a fake
+// registry can report any entryCount. INCONCLUSIVE is not MATCH: a consumer must treat it as
+// unverified, never as confirmation.
 import { ethers } from "ethers";
 import { KIND_NAME, makeProvider, regIface, recheckEntry } from "./recheck-lib.mjs";
 

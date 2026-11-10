@@ -470,19 +470,28 @@ export async function recheckEntry(
   // The counter is read at the head block BY HASH where the chain allows it (EIP-1898), and the head
   // must still be canonical afterwards, so a reorg cannot turn an orphaned branch into proof.
   const noLogVerdict = async () => {
+    if (BigInt(entryId) === 0n) {
+      return done(Status.MISMATCH, { reasons: ["entry id 0 is never issued (ids start at 1)"] });
+    }
+    // Without by-hash state reads, a counter read by number could come from a branch that was
+    // canonical only during the read (A->B->A); it cannot be the sole proof of absence.
+    if (typeof chain.send !== "function") {
+      return done(Status.INCONCLUSIVE, {
+        reasons: [
+          `no Disclosed log found for entry ${entryId}; this provider cannot read state by block hash`,
+        ],
+      });
+    }
     const headHash = (await canonicalHeader(chain, head))?.hash;
     if (!headHash)
       return done(Status.INCONCLUSIVE, { reasons: [`head block ${head} header unavailable`] });
     const data = regIface.encodeFunctionData("entryCount", []);
-    const ret =
-      typeof chain.send === "function"
-        ? await chain.send("eth_call", [{ to: registry, data }, { blockHash: headHash }])
-        : await chain.call({ to: registry, data, blockTag: head });
+    const ret = await chain.send("eth_call", [{ to: registry, data }, { blockHash: headHash }]);
     const count = regIface.decodeFunctionResult("entryCount", ret)[0];
     if (!(await canonical(chain, head, headHash))) {
       return done(Status.INCONCLUSIVE, { reasons: ["canonical chain changed during the check"] });
     }
-    return BigInt(entryId) > count || BigInt(entryId) === 0n
+    return BigInt(entryId) > count
       ? done(Status.MISMATCH, {
           reasons: [
             `entry ${entryId} not issued as of block ${head} ${headHash} (entryCount ${count})`,

@@ -282,7 +282,11 @@ function reply(uint256 entryId, Signed calldata s, address subjectToken,
   INCONCLUSIVE (not decidable from the tx's own data: a wrapped call, a
   non-canonical block, or a slot table that changed inside the block). Every
   read is pinned to one confirmed snapshot, and canonical inclusion is checked
-  before and after (`scripts/disclosure/recheck-entry.mjs`).
+  before and after (`scripts/disclosure/recheck-entry.mjs`). Absent evidence (a
+  tx or receipt the RPC does not return, a header without `parentHash`, a
+  receipt without an explicit status) is INCONCLUSIVE, never MISMATCH. Two trust
+  premises: the registry and aggregator addresses come from the release
+  manifest, and consumers treat INCONCLUSIVE as unverified.
 
 ## 5. Watcher service (DVT repo, Mac Mini only)
 
