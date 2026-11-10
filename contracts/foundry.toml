@@ -16,4 +16,31 @@ evm_version = "osaka"
 # DisclosureRecheckParity.t.sol reads the JS<->Solidity vectors.
 fs_permissions = [{ access = "read", path = "./test/fixtures" }]
 
+# Deployment profile (DSR, 2026-11-10): the artifacts that are DEPLOYED, and whose bytecode
+# hashes are pinned, are built for the fork every target chain has. SP's release profile is
+# cancun (SuperPaymaster foundry.toml [profile.default] :12, the same for Sepolia L1, OP Sepolia
+# and OP Mainnet), so ours is too. The default profile stays osaka for the gas-profile test above.
+# Build and deploy with FOUNDRY_PROFILE=release; CI runs the disclosure tests under it.
+[profile.release]
+src = "src"
+out = "out-release"
+cache_path = "cache-release"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+evm_version = "cancun"
+# Reproducible pins (PR #402 review M1): the CBOR metadata embeds the auto-detected remappings,
+# which depend on the checkout's (nested) submodules, so CI and a laptop hashed differently.
+# The release artifact carries no metadata and an exact compiler: its hash covers code only.
+# The evmVersion is then checked from the artifact JSON by the deploy script.
+solc = "0.8.33"
+bytecode_hash = "none"
+cbor_metadata = false
+# The parity vectors, and the release artifact whose metadata (evmVersion) the deploy script reads.
+fs_permissions = [
+  { access = "read", path = "./test/fixtures" },
+  { access = "read", path = "./out-release" },
+]
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
