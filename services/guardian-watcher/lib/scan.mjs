@@ -499,11 +499,23 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
           .map(h => h.toLowerCase())
       ),
     ];
+    // Evidence without a block hash (a dead letter stored before it was kept): anchor on the
+    // canonical header at that height, never on whatever the receipt says (Codex #400-fix R14).
+    let anchor = wHashes[0] ?? null;
+    if (logs && !anchor && wHashes.length === 0) {
+      try {
+        anchor = (await header(chain, t.block)).hash;
+      } catch {
+        anchor = null;
+      }
+    }
     const envelope = !logs
       ? null
       : wHashes.length > 1
         ? "watched logs name different blocks"
-        : envelopeProblem(txHash, tx, rc, trace, { blockNumber: t.block, blockHash: wHashes[0] });
+        : !anchor
+          ? "evidence block unavailable"
+          : envelopeProblem(txHash, tx, rc, trace, { blockNumber: t.block, blockHash: anchor });
     // The receipt must contain every watched log getLogs returned for this tx, identical (address,
     // every topic, data) at the same position: an inconsistent receipt aligns with nothing it
     // should (Codex #400-fix R5, R6), and it is a health finding, not only a retry.

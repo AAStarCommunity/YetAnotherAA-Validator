@@ -1562,6 +1562,42 @@ try {
     ).status;
     const orRecs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
     const orDl = orphan.store.listDeadLetters().find(x => x.txHash === so.hash);
+    // R14: a legacy dead letter (evidence without blockHash) is anchored on the canonical header
+    const leg = mk();
+    const sl = leg.c.ownerTx(pause("r14-legacy"), { ...keeper, trace: false });
+    settle(leg.c);
+    await runOnce(leg.c.chain, leg.cfg, leg.store, rs, ident, { now: T0 });
+    {
+      const dd = join(dirs.at(-1), "deadletters");
+      const fl = readdirSync(dd).find(f => f.startsWith("tx-") && f.endsWith(".json"));
+      const v = JSON.parse(readFileSync(join(dd, fl), "utf8"));
+      for (const w of v.watched) delete w.blockHash;
+      writeFileSync(join(dd, fl), JSON.stringify(v));
+    }
+    {
+      const pz = spIface.encodeEventLog("OperatorPaused", [addr("r14-legacy")]);
+      leg.c.setTrace(sl.hash, {
+        type: "CALL",
+        logs: [{ address: SP, topics: pz.topics, data: pz.data }],
+      });
+    }
+    // same height, orphaned inclusion: hash differs from the canonical header
+    leg.c.patchReceipt(sl.hash, { blockHash: ethers.id("r14-orphan") });
+    const sLeg = (await runOnce(leg.c.chain, leg.cfg, leg.store, rs, ident, { now: T0 + 1 }))
+      .status;
+    const legRecs = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+    leg.c.patchReceipt(sl.hash, {});
+    const sLeg2 = (await runOnce(leg.c.chain, leg.cfg, leg.store, rs, ident, { now: T0 + 2 }))
+      .status;
+    const legRecs2 = readdirSync(join(dirs.at(-1), "records")).filter(f => f.endsWith(".json"));
+    cell(
+      "trace R14: a legacy dead letter is anchored on the canonical header: an orphaned same-height receipt is refused, the canonical one attributes",
+      sLeg.trace.thisTick.inconsistent === 1 &&
+        legRecs.length === 0 &&
+        sLeg2.trace.thisTick.verified === 1 &&
+        legRecs2.length === 1,
+      { sLeg: sLeg.trace, legRecs, sLeg2: sLeg2.trace, legRecs2 }
+    );
     cell(
       "trace R13: a receipt from another inclusion (block) is inconsistent: no record, no proof, degraded; the dead letter keeps the block hash",
       sOr.trace.thisTick.inconsistent === 1 &&
