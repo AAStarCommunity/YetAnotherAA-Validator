@@ -8,8 +8,9 @@ import {
   rebuildFromAction,
 } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { spIface, SP_WATCHED_EVENTS } from "./sp-abi.mjs";
-import { evaluate, wantsPrice } from "./rules.mjs";
+import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.mjs";
 import { attributeLogs } from "./attribute.mjs";
+import { mayHaveLog } from "./bloom.mjs";
 
 export const MAX_DEADLETTER_ATTEMPTS = 20;
 
@@ -19,7 +20,7 @@ async function header(chain, tag) {
     false,
   ]);
   if (!b || !b.hash) throw new Error(`block ${tag} unavailable`);
-  return { number: Number(b.number), hash: b.hash };
+  return { number: Number(b.number), hash: b.hash, logsBloom: b.logsBloom };
 }
 
 /** getLogs over [from, to], paged; a failing page halves down to one block before giving up. */
@@ -167,10 +168,20 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
   };
   rec.verdict = evaluate(rs, cfg.roles, rec);
   if (wantsPrice(rs, cfg.roles, rec)) {
-    rec.price = {
-      before: await readPrice(chain, cfg.roles.superPaymaster, rec.blockNumber - 1),
-      after: await readPrice(chain, cfg.roles.superPaymaster, rec.blockNumber),
-    };
+    rec.price = await pricePair(chain, cfg, rec.blockNumber);
+    // A failed price read is transient: retry rather than store the gap forever (#400 Low). The
+    // authenticated record rides along, so exhaustion still yields it, marked priceUnavailable.
+    if (rec.price.error)
+      return {
+        deadLetter: {
+          ...base,
+          status: "PRICE_UNAVAILABLE",
+          reasons: ["price read failed"],
+          verdict: evaluate(rs, cfg.roles, { ...base, kind: undefined }),
+          spEvents,
+          pendingRecord: { ...rec, price: undefined },
+        },
+      };
   }
   return { record: rec };
 }
@@ -179,6 +190,250 @@ function note(summary, res, rec) {
   if (res === "new") summary.newRecords++;
   if (res === "upgraded") summary.upgraded++;
   if (rec.verdict.flagged && (res === "new" || res === "upgraded")) summary.flagged.push(rec);
+}
+
+/** cachedPrice before and after `block`; { error } if either read failed. */
+async function pricePair(chain, cfg, block) {
+  const before = await readPrice(chain, cfg.roles.superPaymaster, block - 1);
+  const after = await readPrice(chain, cfg.roles.superPaymaster, block);
+  return before.error || after.error ? { error: true, before, after } : { before, after };
+}
+
+const SIGNERS_COMMITTED = () => aggIface.getEvent("SignersCommitted").topicHash;
+const spTopics = () => SP_WATCHED_EVENTS.map(n => spIface.getEvent(n).topicHash);
+const lcEq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+
+/** Split a tx's logs into watched aggregator / SuperPaymaster logs. */
+function splitLogs(logs, cfg, block) {
+  const t = { block, agg: [], sp: [] };
+  const spT = new Set(spTopics());
+  for (const l of logs) {
+    if (lcEq(l.address, cfg.aggregator) && l.topics?.[0] === SIGNERS_COMMITTED()) t.agg.push(l);
+    else if (lcEq(l.address, cfg.roles.superPaymaster) && spT.has(l.topics?.[0])) t.sp.push(l);
+  }
+  return t;
+}
+
+/**
+ * The records of one transaction: one per SignersCommitted (BLS route) and one per SuperPaymaster
+ * event that is not proven to be a BLS action's effect. Such an event is classified by the SP call
+ * that emitted it (#400 M1): its selector and msg.sender, from the tx itself when the tx calls SP
+ * directly, else from the callTracer frame aligned with the receipt. A permissionless selector
+ * (ruleset publicRoute) gives the public route; any other selector the owner route. An event a
+ * permissionless function can also emit, whose call cannot be determined, is never guessed: the tx
+ * becomes a dead letter and is retried (route "tx").
+ */
+async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot) {
+  t.sp.sort((a, b) => logPos(a) - logPos(b));
+  const SP = cfg.roles.superPaymaster;
+  let tx;
+  try {
+    tx = await chain.getTransaction(txHash);
+  } catch {
+    tx = undefined;
+  }
+  const direct = tx && tx.to && lcEq(tx.to, SP);
+  // SP events of a BLS tx count as an action's effects only when the trace, aligned log by log
+  // with the receipt, places them inside THAT action's aggregator call. Everything else is a
+  // record of its own, never swallowed and never shared between actions.
+  let attr = { aligned: false, owner: new Map(), spCall: new Map(), why: "not traced" };
+  const amb = ambiguousEvents(rs);
+  const decoded = t.sp.map(l => ({ l, d: decodeSp(l) })).filter(x => x.d);
+  const needFrame = decoded.some(x => amb.has(x.d.event)) && !direct;
+  if ((t.agg.length && t.sp.length) || needFrame) {
+    const { trace, logs } = await traceAndReceipt(chain, txHash);
+    attr = logs
+      ? attributeLogs(trace, logs, cfg.aggregator, SP)
+      : { aligned: false, owner: new Map(), spCall: new Map(), why: "receipt unavailable" };
+  }
+  const commitCall = new Map(
+    t.agg.map(l => [logPos(l), attr.aligned ? attr.owner.get(logPos(l)) : undefined])
+  );
+  const callsWithCommit = new Set(
+    [...commitCall.values()].filter(v => v !== undefined && v !== null)
+  );
+  const effectsOf = new Map(); // aggCall -> [sp event]
+  const independent = [];
+  for (const { l, d } of decoded) {
+    const ev = { ...d, logIndex: logPos(l) };
+    const call = attr.aligned ? attr.owner.get(logPos(l)) : undefined;
+    if (call !== undefined && call !== null && callsWithCommit.has(call)) {
+      effectsOf.set(call, [...(effectsOf.get(call) ?? []), ev]);
+    } else independent.push(ev);
+  }
+  for (const l of t.agg) {
+    const call = commitCall.get(logPos(l));
+    const out = await blsRecord(chain, cfg, rs, ctx, l, effectsOf.get(call) ?? [], snapshot);
+    if (out.record) note(summary, store.putRecord(out.record), out.record);
+    else {
+      store.putDeadLetter(out.deadLetter);
+      summary.deadLetters++;
+    }
+  }
+  if (!independent.length) return { done: true };
+
+  const fail = reason => {
+    store.putDeadLetter({
+      route: "tx",
+      txHash,
+      blockNumber: t.block,
+      status: "ERROR",
+      reasons: [reason],
+      events: independent,
+      ruleset: ctx.ruleset,
+      seenAt: ctx.now,
+    });
+    summary.deadLetters++;
+    return { done: false };
+  };
+  if (tx === undefined || tx === null) return fail("transaction unavailable");
+  const directFrame = direct
+    ? {
+        from: tx.from,
+        selector: typeof tx.data === "string" ? tx.data.slice(0, 10).toLowerCase() : null,
+      }
+    : null;
+  const frameOf = e => directFrame ?? (attr.aligned ? (attr.spCall.get(e.logIndex) ?? null) : null);
+  // Events emitted by the same SP call, for verdicts that depend on what else the call did.
+  const byFrame = new Map();
+  for (const e of independent) {
+    const f = frameOf(e);
+    if (f) byFrame.set(f, [...(byFrame.get(f) ?? []), e.event]);
+  }
+  const recs = [];
+  for (const e of independent) {
+    const f = frameOf(e);
+    if (amb.has(e.event) && !f?.selector)
+      return fail(
+        `caller of ${e.event} undeterminable (${direct ? "no selector" : (attr.why ?? "trace unaligned")})`
+      );
+    const pub = f ? publicFunction(rs, f.selector) : null;
+    const rec = {
+      route: pub ? "public" : "owner",
+      label: pub ? rs.publicRoute.label : rs.ownerRoute.label,
+      event: e.event,
+      args: e.args,
+      txHash,
+      logIndex: e.logIndex,
+      blockNumber: t.block,
+      from: tx.from ? ethers.getAddress(tx.from) : null,
+      to: tx.to ? ethers.getAddress(tx.to) : null,
+      caller: f?.from ? ethers.getAddress(f.from) : null,
+      selector: f?.selector ?? null,
+      callerSource: directFrame ? "tx" : f ? "trace" : "unknown",
+      ...(pub ? { function: pub[0], callEvents: byFrame.get(f) ?? [e.event] } : {}),
+      ruleset: ctx.ruleset,
+      seenAt: ctx.now,
+    };
+    if (t.agg.length) {
+      // Same tx as a BLS action, not proven to be its effect: keep it, and say what is unknown.
+      rec.routeUncertain = attr.aligned
+        ? "same tx as a BLS action; the trace places it outside that action's aggregator call"
+        : `same tx as a BLS action; not attributable (${attr.why}), so whether it is that action's effect is unproven`;
+    }
+    rec.verdict = evaluate(rs, cfg.roles, rec);
+    if (wantsPrice(rs, cfg.roles, rec)) {
+      rec.price = await pricePair(chain, cfg, t.block);
+      if (rec.price.error) return fail("price read failed");
+    }
+    recs.push(rec);
+  }
+  for (const rec of recs) note(summary, store.putRecord(rec), rec);
+  store.resolveDeadLetter(`tx-${String(txHash).toLowerCase()}`);
+  return { done: true };
+}
+
+/** A dead letter that has used every retry becomes a record, so nothing BLS-executed or watched
+ * is left without one (M0 §5.2, #400 Low): an unauthenticated BLS action is UNRECOVERED; an SP
+ * event whose call could not be determined is "unattributed" (nobody accused). */
+function exhaust(store, rs, cfg, ctx, summary, dl) {
+  if (dl.route === "tx") {
+    const amb = ambiguousEvents(rs);
+    for (const e of dl.events ?? []) {
+      const rec = {
+        route: amb.has(e.event) ? "unattributed" : "owner",
+        label: amb.has(e.event) ? "caller not determined" : rs.ownerRoute.label,
+        event: e.event,
+        args: e.args,
+        txHash: dl.txHash,
+        logIndex: e.logIndex,
+        blockNumber: dl.blockNumber,
+        caller: null,
+        callerSource: "unknown",
+        exhaustedAfter: dl.attempts,
+        lastReasons: dl.reasons,
+        ruleset: dl.ruleset ?? ctx.ruleset,
+        seenAt: ctx.now,
+      };
+      rec.verdict = evaluate(rs, cfg.roles, rec);
+      note(summary, store.putRecord(rec), rec);
+    }
+  } else if (dl.pendingRecord) {
+    const rec = { ...dl.pendingRecord, price: { unavailable: true }, exhaustedAfter: dl.attempts };
+    note(summary, store.putRecord(rec), rec);
+  } else {
+    const { status, reasons, attempts, firstSeen, id, verdict, ...base } = dl;
+    void verdict;
+    void id;
+    const rec = {
+      ...base,
+      kind: undefined,
+      unrecoveredStatus: status,
+      lastReasons: reasons,
+      firstSeen,
+      exhaustedAfter: attempts,
+      seenAt: ctx.now,
+    };
+    rec.verdict = evaluate(rs, cfg.roles, rec);
+    note(summary, store.putRecord(rec), rec);
+  }
+  store.retireDeadLetter(dl.id);
+  summary.exhausted++;
+}
+
+/**
+ * Cross-check getLogs against each scanned block's logsBloom (DSR, #400). A block whose bloom says
+ * a watched log may be present, but for which no such log came back, is re-queried by block hash
+ * (EIP-234): a node without that block errors instead of answering empty, so a lagging node behind
+ * a load balancer surfaces as a failed read (the tick throws, the cursor stays, it is retried).
+ * Logs that come back are merged in; an empty answer by hash confirms a bloom false positive.
+ */
+async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
+  const have = (logs, n) => logs.some(l => Number(l.blockNumber) === n);
+  const extraAgg = [];
+  const extraSp = [];
+  for (let a = from; a <= to; a += 100) {
+    const nums = [];
+    for (let n = a; n <= Math.min(to, a + 99); n++) nums.push(n);
+    const hdrs = await Promise.all(nums.map(n => header(chain, n)));
+    for (const h of hdrs) {
+      const n = h.number;
+      for (const [addr, topics, logs, extra] of [
+        [cfg.aggregator, [SIGNERS_COMMITTED()], aggLogs, extraAgg],
+        [cfg.roles.superPaymaster, spTopics(), spLogs, extraSp],
+      ]) {
+        const may = mayHaveLog(h.logsBloom, addr, topics);
+        if (may === null) {
+          summary.bloomUnchecked++;
+          continue;
+        }
+        if (!may || have(logs, n)) continue;
+        let got;
+        try {
+          got = await chain.getLogs({ address: addr, topics: [topics], blockHash: h.hash });
+        } catch {
+          throw new Error(
+            `block ${n}: logsBloom shows a watched log that getLogs did not return, and the by-hash re-read failed; retrying`
+          );
+        }
+        if (got.length) {
+          extra.push(...got);
+          summary.bloomRecovered++;
+        } else summary.bloomFalsePositives++;
+      }
+    }
+  }
+  return { extraAgg, extraSp };
 }
 
 /**
@@ -207,14 +462,46 @@ export async function tick(chain, cfg, store, rs, ctx) {
     newRecords: 0,
     deadLetters: 0,
     upgraded: 0,
+    exhausted: 0,
+    bloomUnchecked: 0,
+    bloomRecovered: 0,
+    bloomFalsePositives: 0,
     flagged: [],
   };
 
-  // Retry dead letters first (a trace, a slot read or an RPC that failed may now answer).
+  // Retry dead letters first (a trace, a slot read or an RPC that failed may now answer). One that
+  // has used every attempt becomes a record (exhaust), never silently dropped.
   for (const dl of store.listDeadLetters()) {
-    if (dl.attempts >= MAX_DEADLETTER_ATTEMPTS) continue;
+    if (dl.attempts >= MAX_DEADLETTER_ATTEMPTS) {
+      exhaust(store, rs, cfg, ctx, summary, dl);
+      continue;
+    }
+    if (dl.route === "tx") {
+      let rc = null;
+      try {
+        rc = await chain.getTransactionReceipt(dl.txHash);
+      } catch {
+        rc = null;
+      }
+      if (!rc?.logs) {
+        store.putDeadLetter({ ...dl, reasons: ["receipt unavailable"] });
+        continue;
+      }
+      await processTx(
+        chain,
+        cfg,
+        rs,
+        ctx,
+        store,
+        summary,
+        dl.txHash,
+        splitLogs(rc.logs, cfg, dl.blockNumber),
+        fin.number
+      );
+      continue;
+    }
     const log = {
-      topics: [aggIface.getEvent("SignersCommitted").topicHash, ethers.toBeHex(BigInt(dl.key), 32)],
+      topics: [SIGNERS_COMMITTED(), ethers.toBeHex(BigInt(dl.key), 32)],
       data: ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [BigInt(dl.signerMask)]),
       transactionHash: dl.txHash,
       blockNumber: dl.blockNumber,
@@ -227,100 +514,20 @@ export async function tick(chain, cfg, store, rs, ctx) {
 
   if (from > to) return summary;
 
-  const aggLogs = await pagedLogs(
-    chain,
-    cfg.aggregator,
-    [aggIface.getEvent("SignersCommitted").topicHash],
-    from,
-    to,
-    cfg.page
-  );
-  const spTopics = SP_WATCHED_EVENTS.map(n => spIface.getEvent(n).topicHash);
-  const spLogs = await pagedLogs(chain, cfg.roles.superPaymaster, [spTopics], from, to, cfg.page);
+  const aggLogs = await pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page);
+  const spLogs = await pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page);
+  const { extraAgg, extraSp } = await bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary);
 
   const byTx = new Map();
-  for (const l of [...aggLogs, ...spLogs]) {
+  for (const l of [...aggLogs, ...extraAgg, ...spLogs, ...extraSp]) {
     const t = byTx.get(l.transactionHash) ?? { block: Number(l.blockNumber), agg: [], sp: [] };
-    (l.address.toLowerCase() === cfg.aggregator.toLowerCase() ? t.agg : t.sp).push(l);
+    const list = lcEq(l.address, cfg.aggregator) ? t.agg : t.sp;
+    if (!list.some(x => logPos(x) === logPos(l))) list.push(l);
     byTx.set(l.transactionHash, t);
   }
   const ordered = [...byTx.entries()].sort((a, b) => a[1].block - b[1].block);
-
-  for (const [txHash, t] of ordered) {
-    t.sp.sort((a, b) => logPos(a) - logPos(b));
-    // SP events of a BLS tx count as an action's effects only when the trace, aligned log by log
-    // with the receipt, places them inside THAT action's aggregator call. Everything else is an
-    // owner/guardian-route record of its own, never swallowed and never shared between actions.
-    let attr = { aligned: false, owner: new Map(), why: "no BLS action in tx" };
-    if (t.agg.length && t.sp.length) {
-      const { trace, logs } = await traceAndReceipt(chain, txHash);
-      attr = logs
-        ? attributeLogs(trace, logs, cfg.aggregator)
-        : { aligned: false, owner: new Map(), why: "receipt unavailable" };
-    }
-    const commitCall = new Map(
-      t.agg.map(l => [logPos(l), attr.aligned ? attr.owner.get(logPos(l)) : undefined])
-    );
-    const callsWithCommit = new Set(
-      [...commitCall.values()].filter(v => v !== undefined && v !== null)
-    );
-    const effectsOf = new Map(); // aggCall -> [sp event]
-    const independent = [];
-    for (const l of t.sp) {
-      const d = decodeSp(l);
-      if (!d) continue;
-      const ev = { ...d, logIndex: logPos(l) };
-      const call = attr.aligned ? attr.owner.get(logPos(l)) : undefined;
-      if (call !== undefined && call !== null && callsWithCommit.has(call)) {
-        effectsOf.set(call, [...(effectsOf.get(call) ?? []), ev]);
-      } else independent.push(ev);
-    }
-    for (const l of t.agg) {
-      const call = commitCall.get(logPos(l));
-      const out = await blsRecord(chain, cfg, rs, ctx, l, effectsOf.get(call) ?? [], fin.number);
-      if (out.record) note(summary, store.putRecord(out.record), out.record);
-      else {
-        store.putDeadLetter(out.deadLetter);
-        summary.deadLetters++;
-      }
-    }
-    if (!independent.length) continue;
-    let tx = null;
-    try {
-      tx = await chain.getTransaction(txHash);
-    } catch {
-      tx = null;
-    }
-    for (const e of independent) {
-      const rec = {
-        route: "owner",
-        label: rs.ownerRoute.label,
-        event: e.event,
-        args: e.args,
-        txHash,
-        logIndex: e.logIndex,
-        blockNumber: t.block,
-        from: tx?.from ? ethers.getAddress(tx.from) : null,
-        to: tx?.to ? ethers.getAddress(tx.to) : null,
-        ruleset: ctx.ruleset,
-        seenAt: ctx.now,
-      };
-      if (t.agg.length) {
-        // Same tx as a BLS action, not proven to be its effect: keep it, and say what is unknown.
-        rec.routeUncertain = attr.aligned
-          ? "same tx as a BLS action; the trace places it outside that action's aggregator call"
-          : `same tx as a BLS action; not attributable (${attr.why}), so whether it is that action's effect is unproven`;
-      }
-      rec.verdict = evaluate(rs, cfg.roles, rec);
-      if (wantsPrice(rs, cfg.roles, rec)) {
-        rec.price = {
-          before: await readPrice(chain, cfg.roles.superPaymaster, t.block - 1),
-          after: await readPrice(chain, cfg.roles.superPaymaster, t.block),
-        };
-      }
-      note(summary, store.putRecord(rec), rec);
-    }
-  }
+  for (const [txHash, t] of ordered)
+    await processTx(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number);
 
   const toHdr = await header(chain, to);
   store.setCursor({ block: to, hash: toHdr.hash });

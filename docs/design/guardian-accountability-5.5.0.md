@@ -392,6 +392,71 @@ disabled.
   of the ruleset that produced the flag. That way the watcher cannot decide
   after the fact what counts as suspicious.
 
+#### 5.2a SuperPaymaster events outside a BLS action: classified by the emitting call (#400 M1)
+
+A watched SuperPaymaster event that the trace does not place inside a BLS
+action's aggregator call is **not** an owner action by default. Three functions
+that emit watched events are permissionless in SP 5.5.1
+(`SuperPaymasterAdmin.sol` at `7eb1fc87`):
+
+| Function                                            | Emits                                                         | Verdict (DSR, 2026-11-10)                                                                                                                                                                                                         |
+| --------------------------------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `updatePrice()` :507 (Chainlink refresh)            | `PriceUpdated`, `PriceModeChanged`, `EmergencyPriceCancelled` | routine when the call emits only `PriceUpdated`; **flagged as informational** ("price mode changed via permissionless refresh, caller not accused") when the same call also emits `PriceModeChanged` or `EmergencyPriceCancelled` |
+| `executeEmergencyPrice()` :417 (after the timelock) | `PriceModeChanged`, `EmergencyPriceExecuted`, `PriceUpdated`  | flagged, with the price before and after; the caller is not accused (the owner's queueing was already flagged)                                                                                                                    |
+| `pauseUnderstakedOperator(address)` :105            | `OperatorPaused`                                              | routine, not flagged (W3 owns it)                                                                                                                                                                                                 |
+
+Every other function that emits a watched event is owner-, guardian- or
+aggregator-only.
+
+- The event is classified by **the call into SuperPaymaster that emitted it**:
+  its selector and `msg.sender`. For a top-level direct call these come from the
+  transaction itself. Otherwise they come from the nearest enclosing error-free
+  `CALL` into SP in the `callTracer` trace, aligned log by log with the receipt
+  (a `DELEGATECALL` from SP into its own module is looked through). A selector
+  listed in `ruleset.json` `publicRoute.functions` gives the **public** route.
+  Any other selector gives the **owner** route. Every record carries `caller`,
+  `selector`, `from`, `to` and `callerSource` (`tx` | `trace` | `unknown`), so
+  the ruleset can change later without re-scanning.
+- An event that a permissionless function _can_ emit, whose call cannot be
+  determined (no trace, unaligned trace, tx unavailable), is never guessed. The
+  transaction becomes a dead letter (route `tx`) and is retried each tick. An
+  event that only privileged functions can emit is the owner route whatever the
+  trace says. Its caller is recorded when known.
+
+#### 5.2b Dead letters, exhaustion and read integrity
+
+- A transient read failure is a retried dead letter, never a permanent gap:
+  - a tx that cannot be fetched;
+  - a price read that fails, for a record that needs the price;
+  - an action that cannot yet be authenticated.
+- After `MAX_DEADLETTER_ATTEMPTS` (20), a dead letter becomes a record, so every
+  BLS-executed action and every watched event ends with one:
+  - an unauthenticated BLS action becomes `UNRECOVERED` (flagged per ruleset;
+    published to the repo and Telegram only, with no registry entry, since
+    nothing on chain verifies it);
+  - an undeterminable SP event becomes `unattributed` (flagged, nobody accused);
+  - an authenticated action whose price never read is kept with
+    `price.unavailable`.
+- `status.json` counts open, corrupt and exhausted dead letters. A corrupt
+  dead-letter file is counted, never fatal. A record file that does not parse is
+  rewritten. All state writes are fsynced (file, then directory) before they
+  count as done.
+- **logsBloom cross-check (DSR).** For every scanned block, if the header's
+  `logsBloom` says a watched (address, topic) may be present but the range
+  `getLogs` returned no such log, the block is re-read with `getLogs` by
+  `blockHash` (EIP-234):
+  - a node that lacks the block errors instead of answering empty, so the tick
+    fails and is retried (the cursor does not move);
+  - logs that come back are merged in;
+  - an empty answer by hash confirms a bloom false positive, which is counted.
+
+  Headers without a bloom are counted as unchecked and never stop the scan.
+
+- **Residual:** a load-balanced RPC can still serve different node views to
+  different calls. The bloom check catches a node that is behind for a block it
+  was asked about. It does not make a load-balanced endpoint safe in general.
+  Run the Mini's watcher against **one** non-load-balanced endpoint.
+
 ### 5.3 Disclosure
 
 For a flagged action: write the repo evidence record (JSON: tx, block, signers,

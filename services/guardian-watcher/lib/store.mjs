@@ -4,18 +4,38 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
-  writeFileSync,
   existsSync,
   readdirSync,
+  openSync,
+  writeSync,
+  fsyncSync,
+  closeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 const bigintSafe = (_, v) => (typeof v === "bigint" ? v.toString() : v);
 
+/**
+ * Atomic AND durable (#400 Low; W2c R1 H1): the bytes are fsynced before the rename and the
+ * directory after it, so a power cut leaves either the old file or the complete new one, never an
+ * empty file, and a returned write survives the crash (the W2 journal relies on that).
+ */
 export function atomicWriteJson(path, obj) {
   const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(obj, bigintSafe, 2) + "\n", { mode: 0o600 });
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeSync(fd, JSON.stringify(obj, bigintSafe, 2) + "\n");
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
   renameSync(tmp, path);
+  const d = openSync(dirname(path), "r");
+  try {
+    fsyncSync(d);
+  } finally {
+    closeSync(d);
+  }
 }
 
 export function readJson(path, fallback) {
@@ -34,11 +54,16 @@ export class Store {
       mkdirSync(join(dir, d), { recursive: true, mode: 0o700 });
   }
 
-  /** Record id: BLS actions by (kind, key); owner-route events by (tx, logIndex). */
+  /**
+   * Record id: BLS actions by (kind, key); SuperPaymaster events by (route, tx, logIndex); a dead
+   * letter for a whole transaction (route "tx") by its hash.
+   */
   static recordId(rec) {
     if (rec.route === "bls")
       return `bls-${rec.kind ?? "UNRECOVERED"}-${BigInt(rec.key).toString(16).padStart(64, "0")}`;
-    return `owner-${rec.txHash.toLowerCase()}-${rec.logIndex}`;
+    if (rec.route === "tx") return `tx-${rec.txHash.toLowerCase()}`;
+    const route = rec.route === "public" || rec.route === "unattributed" ? rec.route : "owner";
+    return `${route}-${rec.txHash.toLowerCase()}-${rec.logIndex}`;
   }
 
   /**
@@ -49,7 +74,16 @@ export class Store {
   putRecord(rec) {
     const id = Store.recordId(rec);
     const path = join(this.dir, "records", `${id}.json`);
-    const existed = existsSync(path);
+    // A file that exists but does not parse was never a valid record (#400 Low): rewrite it rather
+    // than treat it as "the same" and lose the record for good.
+    let existed = existsSync(path);
+    if (existed) {
+      try {
+        JSON.parse(readFileSync(path, "utf8"));
+      } catch {
+        existed = false;
+      }
+    }
     if (!existed) atomicWriteJson(path, { id, ...rec });
     // Reconcile the dead letter for this key even if the record was already written: a crash
     // between the two writes must not leave a resolved action being retried forever.
@@ -84,11 +118,38 @@ export class Store {
     return prev ? "retried" : "new";
   }
 
+  /** Open dead letters. An unreadable file is counted in `corruptDeadLetters`, never a reason to
+   * stop the scan (#400 Low). */
   listDeadLetters() {
-    return readdirSync(join(this.dir, "deadletters"))
-      .filter(f => f.endsWith(".json"))
-      .map(f => readJson(join(this.dir, "deadletters", f), null))
-      .filter(Boolean);
+    this.corruptDeadLetters = 0;
+    const out = [];
+    for (const f of readdirSync(join(this.dir, "deadletters")).filter(f => f.endsWith(".json"))) {
+      try {
+        const v = JSON.parse(readFileSync(join(this.dir, "deadletters", f), "utf8"));
+        if (v) out.push(v);
+      } catch {
+        this.corruptDeadLetters++;
+      }
+    }
+    return out;
+  }
+
+  /** A dead letter whose action now has its record(s): keep it, marked done. */
+  resolveDeadLetter(id) {
+    const path = join(this.dir, "deadletters", `${id}.json`);
+    if (!existsSync(path)) return false;
+    renameSync(path, `${path}.done`);
+    return true;
+  }
+
+  /** A dead letter that used every retry and was turned into a record (exhaust). */
+  retireDeadLetter(id) {
+    const path = join(this.dir, "deadletters", `${id}.json`);
+    if (existsSync(path)) renameSync(path, `${path}.exhausted`);
+  }
+
+  countExhausted() {
+    return readdirSync(join(this.dir, "deadletters")).filter(f => f.endsWith(".exhausted")).length;
   }
 
   countRecords() {

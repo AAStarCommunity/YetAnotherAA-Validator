@@ -7,6 +7,7 @@
 import { ethers } from "ethers";
 import { Kind, aggIface, dvtIface, regIface, safeIface } from "./recheck-lib.mjs";
 import { spIface } from "../../services/guardian-watcher/lib/sp-abi.mjs";
+import { bloomOf } from "../../services/guardian-watcher/lib/bloom.mjs";
 
 const ABI = ethers.AbiCoder.defaultAbiCoder();
 const AGG = ethers.getAddress("0x00000000000000000000000000000000000a6600");
@@ -133,6 +134,12 @@ function makeChain() {
   let maxRange = Infinity; // emulate a range-capped RPC
   let getLogsCalls = 0;
   let onReceipt = null; // one-shot hook around the next receipt fetch
+  const laggingBlocks = new Set(); // range getLogs omits these blocks' logs (a lagging node)
+  let lagByHash = false; // ... and a by-hash re-read fails too (the node lacks the block)
+  let noBloom = false; // headers without logsBloom
+  const txFailures = new Map(); // hash -> remaining getTransaction failures
+  let priceFailures = 0; // next N cachedPrice reads fail
+  const forcedBlooms = new Map(); // block -> bloom hex (to model a bloom false positive)
   let finalityLag = 0; // "finalized" = head - finalityLag
   const storage = new Map(); // `${address}:${slot}` -> [{ block, word }] (block-versioned)
   const prestates = new Map(); // tx hash -> prestateTracer result
@@ -155,6 +162,11 @@ function makeChain() {
 
   const chain = {
     async getTransaction(h) {
+      const left = txFailures.get(h) ?? 0;
+      if (left > 0) {
+        txFailures.set(h, left - 1);
+        throw new Error("transient: tx lookup failed");
+      }
       return txs.get(h)?.tx ?? null;
     },
     async getTransactionReceipt(h) {
@@ -214,7 +226,17 @@ function makeChain() {
             : Number(params[0]);
       const b = blocks.get(num);
       const out = b
-        ? { hash: b.hash, parentHash: b.parentHash, number: ethers.toQuantity(num) }
+        ? {
+            hash: b.hash,
+            parentHash: b.parentHash,
+            number: ethers.toQuantity(num),
+            ...(noBloom
+              ? {}
+              : {
+                  logsBloom:
+                    forcedBlooms.get(num) ?? bloomOf(logs.filter(l => l.blockNumber === num)),
+                }),
+          }
         : null;
       if (afterSends && --afterSends.left === 0) {
         const f = afterSends.fn;
@@ -223,14 +245,22 @@ function makeChain() {
       }
       return out;
     },
-    async getLogs({ address, topics, fromBlock, toBlock }) {
+    async getLogs({ address, topics, fromBlock, toBlock, blockHash }) {
       getLogsCalls++;
-      if (toBlock - fromBlock + 1 > maxRange) throw new Error("block range too large");
+      if (blockHash !== undefined) {
+        // EIP-234: a node without the block errors; one with it answers exactly.
+        const n = [...blocks.entries()].find(([, b]) => b.hash === blockHash)?.[0];
+        if (n === undefined || (lagByHash && laggingBlocks.has(n)))
+          throw new Error("unknown block");
+        fromBlock = n;
+        toBlock = n;
+      } else if (toBlock - fromBlock + 1 > maxRange) throw new Error("block range too large");
       return logs.filter(
         l =>
           l.address === address &&
           l.blockNumber >= fromBlock &&
           l.blockNumber <= toBlock &&
+          (blockHash !== undefined || !laggingBlocks.has(l.blockNumber)) &&
           topics.every(
             (t, i) => t == null || (Array.isArray(t) ? t.includes(l.topics[i]) : l.topics[i] === t)
           )
@@ -240,6 +270,10 @@ function makeChain() {
       if (to === SP) {
         const q = spIface.parseTransaction({ data });
         if (q.name !== "cachedPrice") throw new Error(`stub sp: ${q.name}`);
+        if (priceFailures > 0) {
+          priceFailures--;
+          throw new Error("transient: price read failed");
+        }
         const at = blockTag === "latest" ? head : Number(blockTag);
         const hist = prices.filter(x => x.block <= at);
         const pr = hist.length ? hist[hist.length - 1].price : 0n;
@@ -633,20 +667,40 @@ function makeChain() {
     overwrite: key => setCommit(key, mine(), ethers.id(`overwrite-${key}`)),
     mineEmpty: () => mine(),
     /** A tx straight to the SuperPaymaster proxy (owner/guardian route): SP events, no BLS. */
-    ownerTx: (spLogsIn, { from = SAFE, price } = {}) => {
+    /**
+     * A non-BLS tx emitting SP events. By default the owner Safe calls SP directly with `data`
+     * (no selector: "0x"); `to`/`data` model a keeper's direct call, or a call through a contract
+     * (then attribution needs a trace: setTrace).
+     */
+    ownerTx: (spLogsIn, { from = SAFE, price, to = SP, data = "0x" } = {}) => {
       const n = mine();
       const hash = ethers.id(`owner-${n}`);
       const rlogs = spLogsIn.map(x => ({ address: SP, ...spIface.encodeEventLog(x.name, x.args) }));
       rlogs.forEach((l, i) => (l.index = i)); // receipt logs carry their position, as in ethers
       if (price !== undefined) prices.push({ block: n, price });
       txs.set(hash, {
-        tx: { hash, to: SP, from, data: "0x" },
+        tx: { hash, to, from, data },
         receipt: { status: 1, blockNumber: n, blockHash: blocks.get(n).hash, logs: rlogs },
       });
       indexLogs(hash, n, rlogs);
       return { hash, block: n };
     },
     setPrice: (block, price) => prices.push({ block, price }),
+    /** Range getLogs omits block n's logs (a lagging node); byHashFails: the re-read errors too. */
+    lagBlock: (n, { byHashFails = false } = {}) => {
+      laggingBlocks.add(n);
+      lagByHash = byHashFails;
+    },
+    clearLag: () => {
+      laggingBlocks.clear();
+      lagByHash = false;
+    },
+    setNoBloom: v => (noBloom = v),
+    failTx: (hash, times) => txFailures.set(hash, times),
+    failPriceReads: n => (priceFailures = n),
+    /** Make block n's header bloom claim these logs ({ address, topics }) without them existing. */
+    forceBloom: (n, fake) => forcedBlooms.set(n, bloomOf(fake)),
+    mine: () => mine(),
     /** Install a callTracer trace for a tx (frames may carry `logs`, as with withLog). */
     setTrace: (hash, frame) => traces.set(hash, frame),
     /** Install a prestateTracer result for a tx ({ address: { storage: { slot: word } } }). */

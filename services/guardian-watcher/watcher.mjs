@@ -75,6 +75,14 @@ export async function runOnce(chain, cfg, store, rs, ident) {
       flaggedThisTick: s.flagged.length,
       records: store.countRecords(),
       deadLetters: store.listDeadLetters().length,
+      corruptDeadLetters: store.corruptDeadLetters,
+      exhaustedThisTick: s.exhausted,
+      exhaustedTotal: store.countExhausted(),
+      bloom: {
+        recovered: s.bloomRecovered,
+        falsePositives: s.bloomFalsePositives,
+        unchecked: s.bloomUnchecked,
+      },
     });
     store.writeStatus(status);
     return { status, summary: s };
