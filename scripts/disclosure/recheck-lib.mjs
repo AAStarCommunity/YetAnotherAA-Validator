@@ -203,18 +203,49 @@ async function resolveSigners(chain, aggregator, mask, blockTag) {
 
 export const Status = { MATCH: "MATCH", MISMATCH: "MISMATCH", INCONCLUSIVE: "INCONCLUSIVE" };
 
-/** True when `blockHash` is the canonical hash of `number` right now. */
-async function canonical(chain, number, blockHash) {
+/**
+ * ethers v6 providers cache identical requests (default 250 ms), which would let the closing
+ * canonical check reuse the opening read and miss a reorg in between. Build providers through this,
+ * and canonical() additionally reads block hashes through the uncached raw `send` when it exists.
+ */
+export function makeProvider(url) {
+  return new ethers.JsonRpcProvider(url, undefined, { cacheTimeout: -1 });
+}
+
+/** Canonical hash of block `number` now, read uncached when the chain offers raw `send`. */
+async function canonicalHash(chain, number) {
+  if (typeof chain.send === "function") {
+    const b = await chain.send("eth_getBlockByNumber", [ethers.toQuantity(Number(number)), false]);
+    return b ? b.hash : null;
+  }
   const b = await chain.getBlock(Number(number));
-  return !!b && !!blockHash && b.hash.toLowerCase() === String(blockHash).toLowerCase();
+  return b ? b.hash : null;
+}
+
+async function canonical(chain, number, blockHash) {
+  const h = await canonicalHash(chain, number);
+  return !!h && !!blockHash && h.toLowerCase() === String(blockHash).toLowerCase();
+}
+
+function assertBlockInt(name, v, { positive = false } = {}) {
+  if (!Number.isSafeInteger(v) || v < (positive ? 1 : 0)) {
+    throw new RangeError(
+      `${name} must be a ${positive ? "positive" : "non-negative"} safe integer, got ${v}`
+    );
+  }
 }
 
 /**
- * Rebuild what the registry entry for `key` should say, from the action tx `txHash` only, with every
- * state read pinned to block `snapshot`. Returns { status, reason?, rebuilt? }:
- *   MISMATCH      the tx provably does not support an entry for `key` (forged or wrong pointer);
- *   INCONCLUSIVE  the tx cannot be checked from its own data (wrapped call, non-canonical block,
- *                 or a slot table that changed inside the block) — neither confirmed nor refuted.
+ * Establish what the action tx `txHash` proves about the entry for `key`, every state read pinned
+ * to block `snapshot`. Returns { status, reason?, facts }:
+ *   status MISMATCH      the tx provably cannot back an entry for `key` (missing, reverted, no
+ *                        commitment for `key`, calldata deriving a different key);
+ *   status INCONCLUSIVE  the tx's inclusion is not settled (not canonical, newer than the snapshot);
+ *   status null          the tx is usable. `facts` holds every field it established, and
+ *                        `facts.incomplete` lists what it could not (wrapped call, slot table that
+ *                        changed inside the block). The caller compares the established facts
+ *                        FIRST, so a provable contradiction is MISMATCH even when other fields are
+ *                        undecidable — a forger cannot hide behind INCONCLUSIVE.
  */
 export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot) {
   const agg = ethers.getAddress(aggregator);
@@ -254,19 +285,27 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
     };
   }
 
+  // Facts that hold whatever the calldata looks like.
+  const facts = {
+    key: commit.key,
+    signerMask: commit.signerMask,
+    blockNumber,
+    blockHash: rc.blockHash,
+    anchor: await canonicalHash(chain, blockNumber - 1),
+    caller: ethers.getAddress(tx.from),
+    incomplete: [],
+  };
+
   if (!tx.to || ethers.getAddress(tx.to) !== agg) {
-    return {
-      status: Status.INCONCLUSIVE,
-      reason:
-        "action is not a top-level aggregator call (wrapped); message fields not recoverable from the tx",
-    };
+    facts.incomplete.push(
+      "action is not a top-level aggregator call (wrapped); message fields not recoverable from the tx"
+    );
+    return { status: null, facts };
   }
   const action = decodeAction(tx.data);
   if (!action) {
-    return {
-      status: Status.INCONCLUSIVE,
-      reason: "action calldata is not an aggregator entry point",
-    };
+    facts.incomplete.push("action calldata is not an aggregator entry point");
+    return { status: null, facts };
   }
   if (
     (action.kind === Kind.SLASH || action.kind === Kind.REPUTATION) &&
@@ -284,69 +323,57 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
       reason: "key derived from calldata differs from SignersCommitted key",
     };
   }
+  Object.assign(facts, {
+    kind: action.kind,
+    proposalId: BigInt(action.proposalId),
+    messageHash,
+    messageInputs: encodeMessageInputs(action.kind, action.fields),
+  });
 
-  const anchor = (await chain.getBlock(blockNumber - 1)).hash;
   const onchain = await view(chain, agg, "proposalSignersCommitment", [commit.key], snapshot);
-
   // The aggregator resolved slots during the tx. Pre-block state equals that unless an earlier tx in
   // the same block re-registered a slot, so try the parent block first, then the block itself. A
-  // change that is undone later in the same block is visible in neither: INCONCLUSIVE, not MISMATCH.
-  let signers = null;
-  let slotBlock = null;
+  // change that is undone later in the same block is visible in neither: incomplete, not a mismatch.
   for (const tag of [blockNumber - 1, blockNumber]) {
     const s = await resolveSigners(chain, agg, commit.signerMask, tag);
-    if (expectedCommitment(ds, commit.key, messageHash, commit.signerMask, s, anchor) === onchain) {
-      signers = s;
-      slotBlock = tag;
-      break;
+    if (
+      expectedCommitment(ds, commit.key, messageHash, commit.signerMask, s, facts.anchor) ===
+      onchain
+    ) {
+      facts.signers = s;
+      facts.slotBlock = tag;
+      return { status: null, facts };
     }
   }
-  if (!signers) {
-    return {
-      status: Status.INCONCLUSIVE,
-      reason:
-        "signers at the parent block and at the block do not reproduce proposalSignersCommitment " +
-        "(slot table changed inside the block, or the commitment was overwritten); replay the block to decide",
-    };
-  }
-
-  return {
-    status: Status.MATCH,
-    rebuilt: {
-      kind: action.kind,
-      key: commit.key,
-      proposalId: BigInt(action.proposalId),
-      messageHash,
-      messageInputs: encodeMessageInputs(action.kind, action.fields),
-      signerMask: commit.signerMask,
-      signers,
-      anchor,
-      blockNumber,
-      blockHash: rc.blockHash,
-      caller: ethers.getAddress(tx.from),
-      slotBlock,
-    },
-  };
+  facts.incomplete.push(
+    "signers at the parent block and at the block do not reproduce proposalSignersCommitment " +
+      "(slot table changed inside the block, or the commitment was overwritten); replay the block to decide"
+  );
+  return { status: null, facts };
 }
 
-/** Field-by-field comparison. `entry` = Disclosed event args; `signed` = the disclose() calldata struct. */
-export function compareEntry(entry, signed, rebuilt) {
+/**
+ * Compare the entry with every ESTABLISHED fact; a fact that is absent (undefined) is skipped.
+ * `entry` = Disclosed event args; `signed` = the disclose() calldata struct, or null.
+ */
+export function compareEntry(entry, signed, facts) {
   const diffs = [];
   const eq = (name, a, b) => {
+    if (b === undefined) return;
     const norm = v =>
       Array.isArray(v) ? v.map(x => String(x).toLowerCase()).join(",") : String(v).toLowerCase();
     if (norm(a) !== norm(b)) diffs.push({ field: name, entry: norm(a), rebuilt: norm(b) });
   };
-  eq("kind", Number(entry.kind), rebuilt.kind);
-  eq("key", BigInt(entry.key), rebuilt.key);
-  eq("proposalId", BigInt(entry.proposalId), rebuilt.proposalId);
-  eq("messageHash", entry.messageHash, rebuilt.messageHash);
-  eq("signers", [...entry.signers], rebuilt.signers);
-  eq("blockNumber", Number(entry.blockNumber), rebuilt.blockNumber);
+  eq("key", BigInt(entry.key), facts.key);
+  eq("blockNumber", Number(entry.blockNumber), facts.blockNumber);
+  eq("kind", Number(entry.kind), facts.kind);
+  eq("proposalId", BigInt(entry.proposalId), facts.proposalId);
+  eq("messageHash", entry.messageHash, facts.messageHash);
+  eq("signers", [...entry.signers], facts.signers);
   if (signed) {
-    eq("signed.messageInputs", signed.messageInputs, rebuilt.messageInputs);
-    eq("signed.signerMask", BigInt(signed.signerMask), rebuilt.signerMask);
-    eq("signed.anchor", signed.anchor, rebuilt.anchor);
+    eq("signed.signerMask", BigInt(signed.signerMask), facts.signerMask);
+    eq("signed.anchor", signed.anchor, facts.anchor);
+    eq("signed.messageInputs", signed.messageInputs, facts.messageInputs);
   }
   return diffs;
 }
@@ -356,9 +383,12 @@ export function compareEntry(entry, signed, rebuilt) {
  * a page that errors is halved, down to a single block, before the error is passed on.
  */
 export async function findEntryLogs(chain, registry, entryId, fromBlock, toBlock, page = 10_000) {
+  assertBlockInt("fromBlock", fromBlock);
+  assertBlockInt("toBlock", toBlock);
+  assertBlockInt("page", page, { positive: true });
   const topics = [regIface.getEvent("Disclosed").topicHash, ethers.toBeHex(BigInt(entryId), 32)];
   const out = [];
-  let from = Number(fromBlock);
+  let from = fromBlock;
   let size = page;
   while (from <= toBlock) {
     const to = Math.min(toBlock, from + size - 1);
@@ -383,11 +413,16 @@ export const UNVERIFIED_FIELDS = ["subjectToken", "rulesetCommit", "recordURI", 
  * Full recheck of entry `entryId` in `registry`, against one snapshot `head - confirmations`.
  * Returns { status, ok, reasons[], diffs[], unverified, rebuilt?, entry? }. `ok` is true only for
  * MATCH; MATCH covers the verified fields and says nothing about UNVERIFIED_FIELDS.
+ *
+ * `chain` must not serve block reads from a cache (see makeProvider); a chain with raw `send`
+ * has its block hashes read through it.
  */
 export async function recheckEntry(
   chain,
-  { registry, aggregator, entryId, fromBlock = 0, confirmations = 0, page }
+  { registry, aggregator, entryId, fromBlock = 0, confirmations = 0, page = 10_000 }
 ) {
+  assertBlockInt("fromBlock", fromBlock);
+  assertBlockInt("confirmations", confirmations); // page is checked by findEntryLogs
   const done = (status, extra) => ({
     status,
     ok: status === Status.MATCH,
@@ -395,14 +430,34 @@ export async function recheckEntry(
     diffs: [],
     ...extra,
   });
-  const snapshot = (await chain.getBlockNumber()) - confirmations;
-  const logs = await findEntryLogs(chain, registry, entryId, fromBlock, snapshot, page);
-  if (logs.length !== 1) {
-    return done(Status.MISMATCH, {
-      reasons: [
-        `expected one Disclosed log for entry ${entryId} up to block ${snapshot}, found ${logs.length}`,
-      ],
+  const head = await chain.getBlockNumber();
+  const snapshot = head - confirmations;
+  if (snapshot < fromBlock) {
+    return done(Status.INCONCLUSIVE, {
+      reasons: [`confirmed snapshot ${snapshot} is before fromBlock ${fromBlock}`],
     });
+  }
+  const logs = await findEntryLogs(chain, registry, entryId, fromBlock, snapshot, page);
+  if (logs.length > 1) {
+    return done(Status.MISMATCH, {
+      reasons: [`found ${logs.length} Disclosed logs for entry ${entryId}`],
+    });
+  }
+  if (logs.length === 0) {
+    // Not in the confirmed range. If it is in the unconfirmed tail it is pending, not wrong.
+    const tail =
+      snapshot < head
+        ? await findEntryLogs(chain, registry, entryId, snapshot + 1, head, page)
+        : [];
+    return tail.length
+      ? done(Status.INCONCLUSIVE, {
+          reasons: [
+            `entry ${entryId} is in block ${tail[0].blockNumber}, not yet ${confirmations} confirmations deep`,
+          ],
+        })
+      : done(Status.MISMATCH, {
+          reasons: [`expected one Disclosed log for entry ${entryId} up to block ${head}, found 0`],
+        });
   }
   const log = logs[0];
   if (!(await canonical(chain, log.blockNumber, log.blockHash))) {
@@ -423,13 +478,13 @@ export async function recheckEntry(
   }
 
   const r = await rebuildFromAction(chain, aggregator, entry.txHash, entry.key, snapshot);
-  if (r.status !== Status.MATCH) return done(r.status, { reasons: [r.reason], entry, unverified });
-  const diffs = compareEntry(entry, signed, r.rebuilt);
+  if (r.status) return done(r.status, { reasons: [r.reason], entry, unverified });
+  const diffs = compareEntry(entry, signed, r.facts);
 
   // Both inclusions must still be canonical after all reads, or a reorg ran underneath the check.
   const still =
     (await canonical(chain, log.blockNumber, log.blockHash)) &&
-    (await canonical(chain, r.rebuilt.blockNumber, r.rebuilt.blockHash));
+    (await canonical(chain, r.facts.blockNumber, r.facts.blockHash));
   if (!still) {
     return done(Status.INCONCLUSIVE, {
       reasons: ["canonical chain changed during the check"],
@@ -437,11 +492,13 @@ export async function recheckEntry(
       unverified,
     });
   }
-  return done(diffs.length === 0 ? Status.MATCH : Status.MISMATCH, {
-    reasons: signed ? [] : ["disclose calldata not top-level; event fields only"],
-    diffs,
-    rebuilt: r.rebuilt,
-    entry,
-    unverified,
-  });
+  const reasons = [...r.facts.incomplete];
+  if (!signed) reasons.push("disclose calldata not top-level; event fields only");
+  // A proven contradiction outranks anything left undecided.
+  const status = diffs.length
+    ? Status.MISMATCH
+    : r.facts.incomplete.length
+      ? Status.INCONCLUSIVE
+      : Status.MATCH;
+  return done(status, { reasons, diffs, rebuilt: r.facts, entry, unverified });
 }

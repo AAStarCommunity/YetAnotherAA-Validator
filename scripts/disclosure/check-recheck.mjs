@@ -128,10 +128,17 @@ function makeChain() {
       return txs.get(h)?.receipt ?? null;
     },
     async getBlock(n) {
-      return blocks.get(Number(n)) ?? null;
+      const b = blocks.get(Number(n));
+      return b ? { ...b } : null; // a copy, as a real provider returns: reorgs replace, never mutate
     },
     async getBlockNumber() {
       return head;
+    },
+    /** Raw JSON-RPC, never cached (what an ethers provider's `send` is). */
+    async send(method, params) {
+      if (method !== "eth_getBlockByNumber") throw new Error(`stub send: ${method}`);
+      const b = blocks.get(Number(params[0]));
+      return b ? { hash: b.hash } : null;
     },
     async getLogs({ address, topics, fromBlock, toBlock }) {
       getLogsCalls++;
@@ -311,14 +318,14 @@ function makeChain() {
     disclose,
     setSlot: (s, v) => (slots[s] = v),
     /** Replace block `n` with a sibling: same number, new hash (receipts fetched before keep the old one). */
-    reorg: n => (blocks.get(n).hash = ethers.id(`reorged-${n}`)),
+    reorg: n => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`reorged-${n}`) }),
     disclosureBlock: entryId => logs.find(l => BigInt(l.topics[1]) === BigInt(entryId)).blockNumber,
     capRange: r => (maxRange = r),
     /** Overwrite the commitment at `key` in a new block (what a key collision would do). */
     overwrite: key => setCommit(key, mine(), ethers.id(`overwrite-${key}`)),
     mineEmpty: () => mine(),
     reorgDuringNextCheck: n =>
-      (onCommitRead = () => (blocks.get(n).hash = ethers.id(`mid-reorg-${n}`))),
+      (onCommitRead = () => blocks.set(n, { ...blocks.get(n), hash: ethers.id(`mid-reorg-${n}`) })),
     logCalls: () => getLogsCalls,
     head: () => head,
   };
@@ -348,6 +355,30 @@ const repIn = ABI.encode(
   [repF.users, repF.newScores, repF.epoch]
 );
 
+/**
+ * What an ethers v6 provider does by default: identical requests within the cache window return the
+ * first answer. Wraps every typed read; `send` stays raw, as in ethers.
+ */
+function withRequestCache(chain) {
+  const cache = new Map();
+  const cached =
+    name =>
+    async (...args) => {
+      const k = `${name}:${JSON.stringify(args, (_, v) => (typeof v === "bigint" ? v.toString() : v))}`;
+      if (!cache.has(k)) cache.set(k, await chain[name](...args));
+      return cache.get(k);
+    };
+  return {
+    getBlock: cached("getBlock"),
+    getTransaction: cached("getTransaction"),
+    getTransactionReceipt: cached("getTransactionReceipt"),
+    getLogs: cached("getLogs"),
+    call: cached("call"),
+    getBlockNumber: () => chain.getBlockNumber(),
+    send: (...a) => chain.send(...a),
+  };
+}
+
 // ------------------------------------------------------------------ cases
 const {
   chain,
@@ -367,13 +398,18 @@ const results = [];
 // want: "PASS" | { diff } (MISMATCH on that field) | { status, reason } | { unverified: {...} } (MATCH,
 // with those claims reported back verbatim as unverified).
 async function expectCase(name, entryId, want, opts = {}) {
-  const r = await recheckEntry(chain, {
-    registry: REG,
-    aggregator: AGG,
-    entryId,
-    page: opts.page,
-    confirmations: opts.confirmations ?? 0,
-  });
+  let r;
+  try {
+    r = await recheckEntry(opts.chain ?? chain, {
+      registry: REG,
+      aggregator: AGG,
+      entryId,
+      page: opts.page,
+      confirmations: opts.confirmations ?? 0,
+    });
+  } catch (e) {
+    r = { status: "THREW", ok: false, reasons: [`${e.name}: ${e.message}`], diffs: [] };
+  }
   let ok;
   if (want === "PASS") ok = r.status === "MATCH" && r.ok;
   else if (want.unverified)
@@ -544,6 +580,56 @@ await expectCase("reads pinned to the snapshot, not latest", eSnap, "PASS", { co
     { confirmations: 1 }
   );
 }
+
+// Codex round 2, M1: the closing canonical re-check must not be answered from a request cache.
+const aC = execute(Kind.SLASH, 19n, slashF, 0b011n);
+const eC = disclose(Kind.SLASH, 19n, slashIn, aC);
+reorgDuringNextCheck(aC.block);
+await expectCase(
+  "mid-check reorg caught through a caching provider",
+  eC,
+  { status: "INCONCLUSIVE", reason: "canonical chain changed during the check" },
+  { chain: withRequestCache(chain) }
+);
+
+// Codex round 2, M2: a provable contradiction must not hide behind INCONCLUSIVE.
+const aW2 = execute(Kind.SLASH, 20n, slashF, 0b011n, { to: WRAPPER });
+await expectCase(
+  "wrapped action + wrong blockNumber is MISMATCH, not INCONCLUSIVE",
+  disclose(Kind.SLASH, 20n, slashIn, aW2, { blockNumber: 0 }),
+  { diff: "blockNumber" }
+);
+const aMid2 = execute(Kind.SLASH, 21n, slashF, 0b011n, {
+  midSlots: { 1: G[0], 2: addr("transient2") },
+});
+await expectCase(
+  "intra-block slots + wrong proposalId is MISMATCH, not INCONCLUSIVE",
+  disclose(Kind.SLASH, 21n, slashIn, aMid2, { proposalId: 22n }),
+  { diff: "proposalId" }
+);
+
+// Codex round 2, M3: an honest entry that is not yet confirmations-deep is pending, not wrong.
+const aP = execute(Kind.SLASH, 23n, slashF, 0b011n);
+await expectCase(
+  "honest entry inside the unconfirmed tail is INCONCLUSIVE",
+  disclose(Kind.SLASH, 23n, slashIn, aP),
+  { status: "INCONCLUSIVE", reason: "not yet 3 confirmations deep" },
+  { confirmations: 3 }
+);
+
+// Codex round 2, L4: invalid paging/range inputs are refused before any RPC, not looped on.
+await expectCase(
+  "page 0 is refused",
+  1n,
+  { status: "THREW", reason: "page must be a positive" },
+  { page: 0 }
+);
+await expectCase(
+  "negative confirmations refused",
+  1n,
+  { status: "THREW", reason: "confirmations must be" },
+  { confirmations: -1 }
+);
 
 // Codex L4: a range-capped RPC still finds the entry (pages halve until they fit), across pages.
 capRange(16);

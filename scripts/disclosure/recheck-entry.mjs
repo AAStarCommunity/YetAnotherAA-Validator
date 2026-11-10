@@ -13,7 +13,7 @@
 // 1 = MISMATCH, 3 = INCONCLUSIVE (cannot be decided from the tx's own data), 2 = usage/RPC error.
 // Sends no transaction.
 import { ethers } from "ethers";
-import { KIND_NAME, regIface, recheckEntry } from "./recheck-lib.mjs";
+import { KIND_NAME, makeProvider, regIface, recheckEntry } from "./recheck-lib.mjs";
 
 function arg(name) {
   const i = process.argv.indexOf(`--${name}`);
@@ -37,7 +37,7 @@ const confirmations = arg("confirmations") ?? "12";
 if (!/^\d+$/.test(confirmations)) usage("--confirmations must be a non-negative integer");
 
 try {
-  const chain = new ethers.JsonRpcProvider(rpc);
+  const chain = makeProvider(rpc);
   let aggregator = arg("aggregator");
   if (aggregator && !ethers.isAddress(aggregator)) usage("--aggregator must be an address");
   if (!aggregator) {
@@ -64,9 +64,9 @@ try {
     unverified: r.unverified,
     rebuilt: r.rebuilt && {
       ...r.rebuilt,
-      kind: KIND_NAME[r.rebuilt.kind],
+      kind: r.rebuilt.kind === undefined ? undefined : KIND_NAME[r.rebuilt.kind],
       key: r.rebuilt.key.toString(),
-      proposalId: r.rebuilt.proposalId.toString(),
+      proposalId: r.rebuilt.proposalId?.toString(),
       signerMask: "0x" + r.rebuilt.signerMask.toString(16),
     },
   };
