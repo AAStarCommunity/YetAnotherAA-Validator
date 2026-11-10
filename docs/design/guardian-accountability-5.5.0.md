@@ -409,14 +409,17 @@ Every other function that emits a watched event is owner-, guardian- or
 aggregator-only.
 
 - The event is classified by **the call into SuperPaymaster that emitted it**:
-  its selector and `msg.sender`. For a top-level direct call these come from the
-  transaction itself. Otherwise they come from the nearest enclosing error-free
-  `CALL` into SP in the `callTracer` trace, aligned log by log with the receipt
-  (a `DELEGATECALL` from SP into its own module is looked through). A selector
-  listed in `ruleset.json` `publicRoute.functions` gives the **public** route.
-  Any other selector gives the **owner** route. Every record carries `caller`,
-  `selector`, `from`, `to` and `callerSource` (`tx` | `trace` | `unknown`), so
-  the ruleset can change later without re-scanning.
+  its selector and `msg.sender`. These come from the nearest enclosing
+  error-free `CALL` into SP in the `callTracer` trace, aligned log by log with
+  the receipt (a `DELEGATECALL` from SP into its own module is looked through).
+  The transaction's own calldata names only the root call. So without a trace it
+  is used only when consistent: the root selector is privileged, or it is a
+  permissionless function that can emit every SP event in the transaction.
+  Calldata without a 4-byte selector proves no function. A selector listed in
+  `ruleset.json` `publicRoute.functions` gives the **public** route. Any other
+  selector gives the **owner** route. Every record carries `caller`, `selector`,
+  `from`, `to` and `callerSource` (`tx` | `trace` | `unknown`), so the ruleset
+  can change later without re-scanning.
 - An event that a permissionless function _can_ emit, whose call cannot be
   determined (no trace, unaligned trace, tx unavailable), is never guessed. The
   transaction becomes a dead letter (route `tx`) and is retried each tick. An
@@ -449,6 +452,10 @@ aggregator-only.
     fails and is retried (the cursor does not move);
   - logs that come back are merged in;
   - an empty answer by hash confirms a bloom false positive, which is counted.
+
+  The check runs per (address, topic), so a returned topic cannot mask a missing
+  one in the same block. A bloom cannot reveal a missing _second_ log of a topic
+  that did come back.
 
   Headers without a bloom are counted as unchecked and never stop the scan.
 
