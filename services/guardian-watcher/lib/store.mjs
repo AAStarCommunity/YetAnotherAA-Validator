@@ -9,6 +9,7 @@ import {
   readdirSync,
 } from "node:fs";
 import { join } from "node:path";
+import { SafeError } from "./safe-error.mjs";
 
 const bigintSafe = (_, v) => (typeof v === "bigint" ? v.toString() : v);
 
@@ -30,7 +31,7 @@ export function readJson(path, fallback) {
 export class Store {
   constructor(dir) {
     this.dir = dir;
-    for (const d of ["records", "deadletters"])
+    for (const d of ["records", "deadletters", "publications"])
       mkdirSync(join(dir, d), { recursive: true, mode: 0o700 });
   }
 
@@ -105,5 +106,38 @@ export class Store {
 
   writeStatus(s) {
     atomicWriteJson(join(this.dir, "status.json"), s);
+  }
+
+  /** Every stored record (W2c: the publisher walks the flagged ones). */
+  listRecords() {
+    return readdirSync(join(this.dir, "records"))
+      .filter(f => f.endsWith(".json"))
+      .sort()
+      .map(f => readJson(join(this.dir, "records", f), null))
+      .filter(Boolean);
+  }
+
+  /** The publication journal of a record (publishRecord's state), or null. */
+  getPublication(id) {
+    return readJson(join(this.dir, "publications", `${Store.safeId(id)}.json`), null);
+  }
+
+  /** Durable, atomic: publishRecord awaits this after every stage. */
+  putPublication(id, state) {
+    atomicWriteJson(join(this.dir, "publications", `${Store.safeId(id)}.json`), state);
+  }
+
+  getAlertState() {
+    return readJson(join(this.dir, "alerts.json"), null);
+  }
+
+  putAlertState(s) {
+    atomicWriteJson(join(this.dir, "alerts.json"), s);
+  }
+
+  /** Record ids are ours (recordId), but a file name is checked anyway. */
+  static safeId(id) {
+    if (!/^[A-Za-z0-9-]{1,200}$/.test(String(id))) throw new SafeError("store: bad record id");
+    return id;
   }
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Guardian watcher (M0 §5): detection + records only (W1). Runs on the Mac Mini under launchd.
+// Guardian watcher (M0 §5): detection + records (W1) and, with config.publish, their publication
+// (W2: IPFS pins, git mirror, Telegram, DisclosureRegistry). Runs on the Mac Mini under launchd.
 //
 //   RPC_URL=... node services/guardian-watcher/watcher.mjs --config <config.json> [--once]
 //
@@ -7,7 +8,8 @@
 //   { "chainId": 10, "aggregator": "0x..", "startBlock": N, "dataDir": "/path",
 //     "roles": { "superPaymaster": "0x.." },
 //     "forwarders": { "dvtValidator": "0x..", "ownerSafe": "0x..", "multiSendCallOnly": "0x.." },
-//     "maxBlocksPerTick": 2000, "page": 5000, "intervalMs": 60000 }
+//     "maxBlocksPerTick": 2000, "page": 5000, "intervalMs": 60000,
+//     "publish": { "enabled": true, ... }   (lib/sinks-config.mjs; secrets are Keychain items) }
 //
 // Fail-open on errors: a failed tick is recorded in status.json and retried; the process keeps
 // running, because a watcher that stops is the outcome it exists to prevent.
@@ -21,6 +23,9 @@ import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick } from "./lib/scan.mjs";
 import { safeText } from "./lib/safe-error.mjs";
+import { acquireLock, DEFAULT_LOCK_PORT } from "./lib/lock.mjs";
+import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
+import { publishPhase } from "./lib/publisher.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -109,13 +114,29 @@ async function main() {
     console.error(
       "WARNING: ruleset.json does not match a committed version; records carry ruleset.verified = false"
     );
+  // W2c: publication is opt-in (config.publish.enabled). Everything that can refuse is checked
+  // BEFORE anything is created or read from the network: the publish config, then the lock (one
+  // process per host: it covers scanning too, two watchers on one data dir would race the store),
+  // then secrets and the writer key, loaded once. A bad setup refuses to start, never half-runs.
+  const p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null;
+  await acquireLock(p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT);
   const chain = makeProvider(process.env.RPC_URL);
+  const pub = p ? { p, built: await buildSinks(p, chain) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
   for (;;) {
     const { status } = await runOnce(chain, cfg, store, rs, ident);
+    if (pub) {
+      try {
+        status.publication = await publishPhase(store, chain, cfg, pub.p, pub.built);
+      } catch (e) {
+        status.publication = { error: safeText("publication", e) };
+      }
+      store.writeStatus(status);
+    }
     console.log(JSON.stringify(status));
-    if (once) process.exit(status.ok ? 0 : 1);
+    const pubOk = !status.publication || (!status.publication.error && !status.publication.stopped);
+    if (once) process.exit(status.ok && pubOk ? 0 : 1);
     await new Promise(r => setTimeout(r, cfg.intervalMs));
   }
 }
