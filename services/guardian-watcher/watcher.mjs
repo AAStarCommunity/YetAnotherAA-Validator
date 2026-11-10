@@ -19,7 +19,7 @@ import { ethers } from "ethers";
 import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
-import { tick } from "./lib/scan.mjs";
+import { tick, probeTrace } from "./lib/scan.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -62,6 +62,19 @@ export function loadConfig(path) {
 export async function runOnce(chain, cfg, store, rs, ident) {
   const started = new Date().toISOString();
   const status = { at: started, ruleset: ident, lastError: null };
+  // Trace capability, every tick (DSR, #400): without debug_traceTransaction + callTracer withLog,
+  // every ambiguous SP event stays a dead letter, so such a node is DEGRADED, never healthy.
+  const probe = await probeTrace(chain);
+  const degraded = probe.state === "supported" ? [] : [`trace ${probe.state}: ${probe.reason}`];
+  const finish = traceStats => {
+    if (traceStats?.unsupported)
+      degraded.push(`trace unsupported on ${traceStats.unsupported} tx(s)`);
+    if (traceStats?.noLogs)
+      degraded.push(`trace without logs on ${traceStats.noLogs} tx(s): withLog not honoured`);
+    status.trace = { probe: probe.state, reason: probe.reason, thisTick: traceStats ?? {} };
+    status.degraded = degraded.length ? degraded : null;
+    status.healthy = status.ok === true && !status.degraded;
+  };
   try {
     const s = await tick(chain, cfg, store, rs, { ruleset: ident, now: started });
     const cur = store.getCursor();
@@ -84,6 +97,7 @@ export async function runOnce(chain, cfg, store, rs, ident) {
         unchecked: s.bloomUnchecked,
       },
     });
+    finish(s.trace);
     store.writeStatus(status);
     return { status, summary: s };
   } catch (e) {
@@ -92,6 +106,7 @@ export async function runOnce(chain, cfg, store, rs, ident) {
     status.records = store.countRecords();
     status.deadLetters = store.listDeadLetters().length;
     status.cursor = store.getCursor()?.block ?? null;
+    finish(null);
     store.writeStatus(status);
     return { status, summary: null };
   }
@@ -118,10 +133,13 @@ async function main() {
   const chain = makeProvider(process.env.RPC_URL);
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
+  let first = true;
   for (;;) {
     const { status } = await runOnce(chain, cfg, store, rs, ident);
+    if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
+    first = false;
     console.log(JSON.stringify(status));
-    if (once) process.exit(status.ok ? 0 : 1);
+    if (once) process.exit(status.healthy ? 0 : 1);
     await new Promise(r => setTimeout(r, cfg.intervalMs));
   }
 }

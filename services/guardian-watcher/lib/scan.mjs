@@ -80,8 +80,57 @@ export function logPos(l) {
   return n;
 }
 
-/** Full receipt + callTracer (withLog) trace of a tx, for attribution; null parts when unavailable. */
-async function traceAndReceipt(chain, txHash) {
+const TRACE_OPTS = { tracer: "callTracer", tracerConfig: { withLog: true } };
+
+/** Whether a debug_traceTransaction error says this node lacks the method or the tracer option
+ * (not a transient failure). JSON-RPC -32601 is "method not found". */
+export function traceUnsupported(e) {
+  const codes = [e?.error?.code, e?.info?.error?.code, e?.code];
+  if (codes.includes(-32601)) return true;
+  const msg = [e?.error?.message, e?.info?.error?.message, e?.shortMessage, e?.message]
+    .filter(x => typeof x === "string")
+    .join(" ");
+  return /(method|namespace)\b.{0,60}\b(not found|does not exist|not available|not supported|unsupported|disabled|not allowed)|unknown tracer|tracer\b.{0,30}\bnot (found|supported)/i.test(
+    msg
+  );
+}
+
+/** Whether any frame of a callTracer trace carries a log (withLog honoured). */
+function traceHasLogs(node) {
+  if (!node || typeof node !== "object") return false;
+  if (Array.isArray(node.logs) && node.logs.length) return true;
+  return (node.calls ?? []).some(traceHasLogs);
+}
+
+/**
+ * Trace capability of the RPC (DSR, #400): ambiguous SP events are attributed only by the trace,
+ * so a node without debug_traceTransaction + callTracer withLog leaves them all as dead letters.
+ * Probed with a hash that names no transaction: a node that has the method answers "transaction
+ * not found" (or a result); one that lacks it says so. Returns { state, reason }:
+ * "supported" | "unsupported" | "unknown" (any other answer: never reported as supported).
+ */
+export const TRACE_PROBE_HASH = "0x" + "00".repeat(31) + "01";
+
+export async function probeTrace(chain) {
+  if (typeof chain.send !== "function") return { state: "unsupported", reason: "no send()" };
+  try {
+    await chain.send("debug_traceTransaction", [TRACE_PROBE_HASH, TRACE_OPTS]);
+    return { state: "supported", reason: "answered" };
+  } catch (e) {
+    if (traceUnsupported(e)) return { state: "unsupported", reason: "method or tracer missing" };
+    const msg = [e?.error?.message, e?.info?.error?.message, e?.shortMessage, e?.message]
+      .filter(x => typeof x === "string")
+      .join(" ");
+    if (/transaction\b.{0,20}\bnot found|unknown transaction|not found: transaction/i.test(msg))
+      return { state: "supported", reason: "transaction not found" };
+    return { state: "unknown", reason: "probe failed" };
+  }
+}
+
+/** Full receipt + callTracer (withLog) trace of a tx, for attribution; null parts when unavailable.
+ * `stats` counts outcomes for status: ok, unsupported, failed, noLogs (a trace without any log
+ * while the receipt has some: withLog ignored, so nothing can be aligned). */
+async function traceAndReceipt(chain, txHash, stats = {}) {
   let trace = null;
   let rc = null;
   try {
@@ -91,14 +140,15 @@ async function traceAndReceipt(chain, txHash) {
   }
   if (typeof chain.send === "function") {
     try {
-      trace = await chain.send("debug_traceTransaction", [
-        txHash,
-        { tracer: "callTracer", tracerConfig: { withLog: true } },
-      ]);
-    } catch {
+      trace = await chain.send("debug_traceTransaction", [txHash, TRACE_OPTS]);
+      if (rc?.logs?.length && !traceHasLogs(trace)) stats.noLogs = (stats.noLogs ?? 0) + 1;
+      else stats.ok = (stats.ok ?? 0) + 1;
+    } catch (e) {
       trace = null;
+      if (traceUnsupported(e)) stats.unsupported = (stats.unsupported ?? 0) + 1;
+      else stats.failed = (stats.failed ?? 0) + 1;
     }
-  }
+  } else stats.unsupported = (stats.unsupported ?? 0) + 1;
   return { trace, logs: rc?.logs ?? null };
 }
 
@@ -250,7 +300,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   // is asked for whenever an ambiguous event is present, direct or not (Codex #400-fix H1).
   const needFrame = decoded.some(x => amb.has(x.d.event));
   if ((t.agg.length && t.sp.length) || needFrame) {
-    const { trace, logs } = await traceAndReceipt(chain, txHash);
+    const { trace, logs } = await traceAndReceipt(chain, txHash, (summary.trace ??= {}));
     attr = logs
       ? attributeLogs(trace, logs, cfg.aggregator, SP)
       : { aligned: false, owner: new Map(), spCall: new Map(), why: "receipt unavailable" };
@@ -333,7 +383,10 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       return fail(
         `caller of ${e.event} undeterminable (${direct ? "no selector" : (attr.why ?? "trace unaligned")})`
       );
-    const pub = f ? publicFunction(rs, f.selector) : null;
+    // Only an ambiguous event can be public: an event no permissionless function emits is the owner
+    // route whatever the root call was (Codex #400-fix R3 H1: a root updatePrice() selector must not
+    // turn a nested GuardianSet into unflagged public activity).
+    const pub = f && amb.has(e.event) ? publicFunction(rs, f.selector) : null;
     const rec = {
       route: pub ? "public" : "owner",
       label: pub ? rs.publicRoute.label : rs.ownerRoute.label,
@@ -374,6 +427,14 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   return { done: true };
 }
 
+/** Whether a pending SP record still lacks a price it needs: marked so, or (a record persisted
+ * without the marker) the ruleset wants one and no valid pair is present (Codex #400-fix R3 M). */
+function priceStillMissing(rs, cfg, r) {
+  if (r.priceMissing) return true;
+  if (!wantsPrice(rs, cfg.roles, r)) return false;
+  return !(r.price && typeof r.price === "object" && !r.price.error && !r.price.unavailable);
+}
+
 /** A dead letter that has used every retry becomes a record, so nothing BLS-executed or watched
  * is left without one (M0 §5.2, #400 Low): an unauthenticated BLS action is UNRECOVERED; an SP
  * event whose call could not be determined is "unattributed" (nobody accused). */
@@ -381,9 +442,10 @@ function exhaust(store, rs, cfg, ctx, summary, dl) {
   if (dl.route === "tx" && dl.pendingRecords) {
     for (const r of dl.pendingRecords) {
       const { priceMissing, ...rest } = r;
+      void priceMissing;
       const rec = {
         ...rest,
-        ...(priceMissing ? { price: { unavailable: true } } : {}),
+        ...(priceStillMissing(rs, cfg, r) ? { price: { unavailable: true } } : {}),
         exhaustedAfter: dl.attempts,
       };
       note(summary, store.putRecord(rec), rec);
@@ -525,6 +587,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
     bloomUnchecked: 0,
     bloomRecovered: 0,
     bloomFalsePositives: 0,
+    trace: {},
     flagged: [],
   };
 
@@ -540,7 +603,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
       const done = [];
       let failed = false;
       for (const r of dl.pendingRecords) {
-        if (!r.priceMissing) {
+        if (!priceStillMissing(rs, cfg, r)) {
           done.push(r);
           continue;
         }

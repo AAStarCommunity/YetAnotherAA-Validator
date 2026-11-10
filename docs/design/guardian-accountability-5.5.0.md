@@ -412,14 +412,23 @@ aggregator-only.
   its selector and `msg.sender`. These come from the nearest enclosing
   error-free `CALL` into SP in the `callTracer` trace, aligned log by log with
   the receipt (a `DELEGATECALL` from SP into its own module is looked through).
-  The transaction's own calldata names only the root call. So without a trace it
-  is used only when consistent: the root selector is privileged, or it is a
-  permissionless function that can emit every SP event in the transaction.
-  Calldata without a 4-byte selector proves no function. A selector listed in
-  `ruleset.json` `publicRoute.functions` gives the **public** route. Any other
-  selector gives the **owner** route. Every record carries `caller`, `selector`,
-  `from`, `to` and `callerSource` (`tx` | `trace` | `unknown`), so the ruleset
-  can change later without re-scanning.
+  The transaction's own calldata names only the root call, and an event name
+  matching what the root function can emit does not exclude a nested SP call
+  emitting the same event. So an event a permissionless function _can_ emit is
+  attributed **only** by its aligned emitting frame in the trace, for direct
+  calls too. A tracing RPC (`debug_traceTransaction`, `callTracer` with
+  `withLog`) is therefore a requirement, not an optimisation. Each tick probes
+  it and counts what real trace calls returned (`status.trace`). A node without
+  the method, one whose traces carry no logs (`withLog` ignored), or a probe
+  that cannot be verified puts the watcher in an explicitly labelled
+  **degraded** mode: `status.degraded` lists why, `status.healthy` is false, and
+  `--once` exits non-zero. It is never shown as healthy. Checking this on the
+  production RPC is a Phase D pre-deploy item. A fallback that attributes
+  without a trace is backlog after 5.5.0. A selector shorter than 4 bytes proves
+  no function. A selector listed in `ruleset.json` `publicRoute.functions` gives
+  the **public** route. Any other selector gives the **owner** route. Every
+  record carries `caller`, `selector`, `from`, `to` and `callerSource` (`tx` |
+  `trace` | `unknown`), so the ruleset can change later without re-scanning.
 - An event that a permissionless function _can_ emit, whose call cannot be
   determined (no trace, unaligned trace, tx unavailable), is never guessed. The
   transaction becomes a dead letter (route `tx`) and is retried each tick. An
@@ -438,8 +447,15 @@ aggregator-only.
     published to the repo and Telegram only, with no registry entry, since
     nothing on chain verifies it);
   - an undeterminable SP event becomes `unattributed` (flagged, nobody accused);
-  - an authenticated action whose price never read is kept with
+  - a record whose price never read (an authenticated BLS action, or an SP event
+    already classified) is kept with its route, caller and verdict, and
     `price.unavailable`.
+- Evidence a dead letter has established survives every later, weaker failure:
+  an authenticated BLS record awaiting its price, and classified SP records
+  awaiting theirs, are retried for the price only and never rebuilt. A BLS
+  action counts as done only when a parseable, authenticated record exists; an
+  `UNRECOVERED` placeholder or a corrupt file does not stop a later
+  reconstruction.
 - `status.json` counts open, corrupt and exhausted dead letters. A corrupt
   dead-letter file is counted, never fatal. A record file that does not parse is
   rewritten. All state writes are fsynced (file, then directory) before they

@@ -138,6 +138,7 @@ function makeChain() {
   const laggingTopics = new Map(); // block -> topic0 that the range getLogs omits
   let lagByHash = false; // ... and a by-hash re-read fails too (the node lacks the block)
   let noBloom = false; // headers without logsBloom
+  let traceMode = "ok"; // ok | unsupported (no debug namespace) | noLogs (withLog ignored)
   const txFailures = new Map(); // hash -> remaining getTransaction failures
   let priceFailures = 0; // next N cachedPrice reads fail
   const forcedBlooms = new Map(); // block -> bloom hex (to model a bloom false positive)
@@ -214,8 +215,17 @@ function makeChain() {
         return pre;
       }
       if (method === "debug_traceTransaction") {
+        if (traceMode === "unsupported")
+          throw Object.assign(new Error("the method debug_traceTransaction does not exist"), {
+            error: { code: -32601, message: "the method debug_traceTransaction does not exist" },
+          });
+        if (!txs.has(params[0])) throw new Error("transaction not found");
         const t = traces.get(params[0]);
-        if (!t) throw new Error("the method debug_traceTransaction does not exist");
+        if (!t) throw new Error("trace unavailable"); // a transient failure for this tx
+        if (traceMode === "noLogs") {
+          const strip = n => ({ ...n, logs: undefined, calls: (n.calls ?? []).map(strip) });
+          return strip(t);
+        }
         return t;
       }
       if (method !== "eth_getBlockByNumber") throw new Error(`stub send: ${method}`);
@@ -710,6 +720,7 @@ function makeChain() {
     },
     setNoBloom: v => (noBloom = v),
     failTx: (hash, times) => txFailures.set(hash, times),
+    setTraceMode: m => (traceMode = m),
     failPriceReads: n => (priceFailures = n),
     /** Make block n's header bloom claim these logs ({ address, topics }) without them existing. */
     forceBloom: (n, fake) => forcedBlooms.set(n, bloomOf(fake)),

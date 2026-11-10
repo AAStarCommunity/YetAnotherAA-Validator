@@ -20,7 +20,7 @@ import {
 } from "../../scripts/disclosure/stub-chain.mjs";
 import { spIface } from "./lib/sp-abi.mjs";
 import { validateRuleset, evaluate, matchGeneric } from "./lib/rules.mjs";
-import { MAX_DEADLETTER_ATTEMPTS } from "./lib/scan.mjs";
+import { MAX_DEADLETTER_ATTEMPTS, traceUnsupported, probeTrace } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store } from "./lib/store.mjs";
 import { runOnce, rulesetIdentity } from "./watcher.mjs";
@@ -1086,6 +1086,55 @@ try {
         !c8r.price.unavailable,
       { bls: c8bls?.attempts, tx: c8tx?.attempts, c8r: c8r && { kind: c8r.kind, price: c8r.price } }
     );
+    // C9 (R3 H1) an event no permissionless function emits stays the owner route even when the root
+    // call's selector is a public one and no trace is available
+    const c9 = c.ownerTx([{ name: "GuardianSet", args: [addr("c9-old"), addr("c9-new")] }], {
+      from: KEEPER,
+      data: sel("updatePrice()"),
+      trace: false,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const [c9r] = byTx(c9.hash);
+    cell(
+      "a privileged-only event under a public root selector is the owner route, flagged (never public)",
+      c9r?.route === "owner" && c9r.verdict.flagged && c9r.function === undefined,
+      c9r
+    );
+    // C10 (R3 M) a pending SP record persisted without the priceMissing marker still gets its price
+    const legacyTx = ethers.id("legacy-pending");
+    store.putDeadLetter({
+      route: "tx",
+      txHash: legacyTx,
+      blockNumber: c3.block,
+      status: "ERROR",
+      reasons: ["price read failed"],
+      events: [],
+      pendingRecords: [
+        {
+          route: "public",
+          label: rs.publicRoute.label,
+          event: "PriceUpdated",
+          args: ["258000000000", "11"],
+          txHash: legacyTx,
+          logIndex: 0,
+          blockNumber: c3.block,
+          caller: KEEPER,
+          selector: sel("updatePrice()"),
+          callerSource: "trace",
+          function: "updatePrice()",
+          callEvents: ["PriceUpdated"],
+          verdict: { flagged: false, reasons: [] },
+        },
+      ],
+      seenAt: "legacy",
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    const [c10r] = byTx(legacyTx);
+    cell(
+      "a pending record without the priceMissing marker is still priced when the ruleset wants a price",
+      c10r?.price?.before !== undefined && c10r.price.after !== undefined && !c10r.price.error,
+      c10r
+    );
     // K15 maxBlocksPerTick bounds each tick
     for (let i = 0; i < 5; i++) c.mine();
     const from15 = store.getCursor().block + 1;
@@ -1134,6 +1183,107 @@ try {
   } finally {
     rmSync(d3, { recursive: true, force: true });
   }
+}
+
+// ---- trace capability (DSR, #400): reported every tick; without it the watcher is DEGRADED
+{
+  const d5 = mkdtempSync(join(tmpdir(), "guardian-watcher-trace-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(d5);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const pause = n => [{ name: "OperatorPaused", args: [addr(n)] }];
+    const keeper = {
+      from: addr("keeper-eoa"),
+      data: ethers.id("pauseUnderstakedOperator(address)").slice(0, 10),
+    };
+    c.ownerTx(pause("t-ok"), keeper);
+    const ok = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    c.setTraceMode("unsupported");
+    c.ownerTx(pause("t-unsup"), keeper);
+    const un = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    c.setTraceMode("noLogs");
+    c.ownerTx(pause("t-nologs"), keeper);
+    const nl = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    c.setTraceMode("ok");
+    const flaky = {
+      ...c.chain,
+      send: async (m, p) => {
+        if (m === "debug_traceTransaction" && p[0] === ethers.toBeHex(1n, 32))
+          throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+        return c.chain.send(m, p);
+      },
+    };
+    const unk = (await runOnce(flaky, cfg, store, rs, ident)).status;
+    cell(
+      "trace capability: a tracing node is healthy; no debug method, withLog ignored, or an unverifiable probe is DEGRADED (never healthy)",
+      ok.healthy === true &&
+        ok.trace.probe === "supported" &&
+        ok.degraded === null &&
+        ok.trace.thisTick.ok >= 1 &&
+        un.ok === true &&
+        un.healthy === false &&
+        un.trace.probe === "unsupported" &&
+        un.trace.thisTick.unsupported >= 1 &&
+        nl.healthy === false &&
+        nl.trace.probe === "supported" &&
+        nl.trace.thisTick.noLogs >= 1 &&
+        nl.degraded.some(x => /withLog/.test(x)) &&
+        unk.healthy === false &&
+        unk.trace.probe === "unknown",
+      { ok: ok.trace, un: [un.trace, un.degraded], nl: [nl.trace, nl.degraded], unk: unk.trace }
+    );
+    const failed = (
+      await runOnce(
+        {
+          ...c.chain,
+          send: async (m, p) => {
+            if (m === "eth_getBlockByNumber") throw new Error("down");
+            return c.chain.send(m, p);
+          },
+        },
+        cfg,
+        store,
+        rs,
+        ident
+      )
+    ).status;
+    cell(
+      "a failed tick is never healthy, and still reports the trace probe",
+      failed.ok === false && failed.healthy === false && failed.trace?.probe === "supported",
+      failed
+    );
+  } finally {
+    rmSync(d5, { recursive: true, force: true });
+  }
+  const e = (code, message) => Object.assign(new Error(message), { error: { code, message } });
+  cell(
+    "traceUnsupported: method-missing answers are unsupported; tx-not-found and transport errors are not",
+    traceUnsupported(e(-32601, "x")) &&
+      traceUnsupported(
+        new Error("the method debug_traceTransaction does not exist/is not available")
+      ) &&
+      traceUnsupported(new Error("Method not found")) &&
+      traceUnsupported(new Error("debug namespace is disabled")) &&
+      traceUnsupported(new Error('unknown tracer "callTracer"')) &&
+      !traceUnsupported(new Error("transaction not found")) &&
+      !traceUnsupported(new Error("timeout")) &&
+      !traceUnsupported(Object.assign(new Error("x"), { code: "ECONNRESET" })),
+    null
+  );
+  cell(
+    "probeTrace: a chain without send() is unsupported",
+    (await probeTrace({})).state === "unsupported",
+    null
+  );
 }
 
 // ---- store: dead letters keep established evidence; only an authenticated record counts as done
