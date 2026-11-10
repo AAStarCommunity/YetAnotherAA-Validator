@@ -516,6 +516,9 @@ function evidenceLog(l, source, range) {
   // The RAW position fields and `removed` are kept as the RPC gave them: normalising here would
   // turn contradictory evidence (index 0, logIndex 99) into valid evidence on retry (Codex
   // follow-up R1).
+  // stored evidence that could not be kept as JSON is already final: kept as is, so a retry keeps
+  // one identity for it (follow-up #2 R6)
+  if (l?.raw === DEEP_PLACEHOLDER && typeof l.rawSha256 === "string") return { ...l };
   const has = k => l?.[k] !== undefined && l?.[k] !== null;
   return {
     address: l?.address,
@@ -539,7 +542,19 @@ function evidenceLog(l, source, range) {
  * so a later sighting never replaces an earlier one (Codex follow-up R7). */
 function mergeEvidence(a, b) {
   // identity = raw contents, the query that returned it, and its range (Codex follow-up R8)
-  const key = e => rawLogKey(e) + safeJson([e?.source ?? null, e?.range ?? null]) + str(e?.raw);
+  // A deep observation and the placeholder it is stored as share one identity, the sha256 of its
+  // full text, so a retry neither duplicates it nor collapses two distinct deep ones (R6).
+  const key = e => {
+    if (e?.raw === DEEP_PLACEHOLDER && typeof e.rawSha256 === "string")
+      return `deep:${e.rawSha256}`;
+    const k = rawLogKey(e) + safeJson([e?.source ?? null, e?.range ?? null]) + str(e?.raw);
+    if (!k.includes("<unserialisable")) return k;
+    try {
+      return `deep:${deepDigest(e)}`;
+    } catch {
+      return k;
+    }
+  };
   // each key computed once, a Set for membership: linear, whatever the flood (follow-up #2 R2)
   const out = [];
   const seen = new Set();
@@ -748,6 +763,9 @@ const MAX_PER_TX_ISOLATIONS = 100;
 /** A tx whose block holds more isolating txs than any real block can carry (30M gas / 21 000):
  * the excess joins the bounded quarantine (it cannot be a real block's content). */
 const MAX_TXS_PER_BLOCK = 2000;
+/** More SignersCommitted logs in one tx than a 30M-gas block can BLS-verify (each needs a pairing
+ * check, well over 100 000 gas): such a tx cannot be real. */
+const MAX_COMMITS_PER_TX = 300;
 const RESERVED = ["source", "range", "raw", "count", "quarantine"];
 
 /** A fresh RPC log never brings our own evidence fields (a returned `range` must not stand in for
@@ -778,9 +796,21 @@ export function safeJson(v) {
       return x;
     });
   } catch {
-    return `<unserialisable ${typeof v}>`;
+    // too deep for JSON.stringify: an identity from the full text, so distinct deep values stay
+    // distinct wherever this is used as a key (follow-up #2 R6)
+    try {
+      return `<unserialisable ${typeof v} ${deepDigest(v)}>`;
+    } catch {
+      return `<unserialisable ${typeof v}>`;
+    }
   }
 }
+
+/** sha256 of a value's full JSON text, encoded without recursion. */
+function deepDigest(v) {
+  return `0x${createHash("sha256").update(iterJson(v)).digest("hex")}`;
+}
+const DEEP_PLACEHOLDER = "<evidence too deep or too large to serialise>";
 
 /** Evidence as it is persisted: BigInt values tagged ({ $bigint }) rather than flattened to
  * strings, so a stored observation keeps the identity it had when seen (1n and "1" stay two
@@ -805,13 +835,13 @@ function typedEvidence(watched) {
           text = null;
         }
         return {
-          raw: "<evidence too deep or too large to serialise>",
+          raw: DEEP_PLACEHOLDER,
           ...(text === null
             ? {}
             : {
                 rawPrefix: text.slice(0, QUARANTINE_SAMPLE_CHARS),
                 rawLength: text.length,
-                rawSha256: `0x${createHash("sha256").update(text).digest("hex")}`,
+                rawSha256: `0x${createHash("sha256").update(text).digest("hex")}`, // = deepDigest(item)
               }),
           source: typeof item?.source === "string" ? item.source : null,
           range:
@@ -1595,6 +1625,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
   let inRangeIsolations = 0;
   const perBucket = new Map();
   const overflow = { agg: [], sp: [] };
+  const impossible = { agg: [], sp: [] };
   for (const [txHash, t] of ordered) {
     const b = Number.isSafeInteger(t.block) ? t.block : null;
     if (stopAt !== null && inRange(b) && b > stopAt) continue; // read again next tick
@@ -1606,11 +1637,20 @@ export async function tick(chain, cfg, store, rs, ctx) {
     }
     // Any dead letter this tx wrote counts, thrown or not: a lookup that answers null writes one
     // through fail() without throwing, and must spend the budget too (follow-up #2 R5).
-    const before = (summary.txIsolations ?? 0) + summary.deadLetters;
+    // A tx with more commitments than a block's gas could verify is not a real tx: its logs join
+    // the bounded quarantine instead of one dead letter per commitment (follow-up #2 R6).
+    if (t.agg.length > MAX_COMMITS_PER_TX) {
+      for (const l of t.agg) impossible.agg.push(l);
+      for (const l of t.sp) impossible.sp.push(l);
+      continue;
+    }
+    // every dead letter written counts (one tx can write several: one per commitment)
+    const before = summary.deadLetters;
     await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
-    if ((summary.txIsolations ?? 0) + summary.deadLetters > before) {
-      perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + 1);
-      if (inRange(b)) inRangeIsolations++;
+    const writes = summary.deadLetters - before;
+    if (writes > 0) {
+      perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + writes);
+      if (inRange(b)) inRangeIsolations += writes;
     }
     if (stopAt === null && inRange(b) && inRangeIsolations >= MAX_PER_TX_ISOLATIONS) stopAt = b;
   }
@@ -1628,6 +1668,19 @@ export async function tick(chain, cfg, store, rs, ctx) {
         from,
         cutoff,
         `past ${MAX_TXS_PER_BLOCK} isolating txs in one block (or with no usable height)`
+      );
+  for (const source of ["agg", "sp"])
+    if (impossible[source].length)
+      quarantineRaw(
+        store,
+        rs,
+        ctx,
+        summary,
+        impossible[source],
+        source,
+        from,
+        cutoff,
+        `in a tx with more than ${MAX_COMMITS_PER_TX} commitments (more than a block can verify)`
       );
   if (cutoff < to || overflow.agg.length || overflow.sp.length) summary.budgetStop = true;
   summary.to = cutoff;

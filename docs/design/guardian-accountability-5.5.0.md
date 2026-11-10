@@ -507,8 +507,9 @@ aggregator-only.
     evidence that cannot be stored as JSON. The payload itself is not stored:
     under the accepted RPC trust model it records a node fault, not evidence
     against anyone, and unbounded storage would be a new failure point.
-  - Per-tick budget: after 100 txs inside the scanned range wrote a dead letter
-    (thrown or not: a lookup that answers null counts), the tick finishes the
+  - Per-tick budget: after 100 dead-letter writes by txs inside the scanned
+    range (thrown or not: a lookup that answers null counts, and a tx counts
+    once per dead letter it writes, e.g. per commitment), the tick finishes the
     current block, stops, and sets the cursor there; the later blocks are read
     again next tick. Only an in-range height can set the stop, so the cursor
     always advances. Txs with no usable height, or a height outside the range,
@@ -517,6 +518,13 @@ aggregator-only.
   - Per-block cap: past 2000 isolating txs in one block (more than any real
     block can carry), or in the shared bucket of txs outside the range, the
     excess goes into one quarantine record per query.
+  - A tx with more than 300 `SignersCommitted` logs (more than a block's gas can
+    BLS-verify) cannot be real: its logs go into one quarantine record per
+    query, not one dead letter per commitment.
+  - Identities stay distinct at any depth: a deep value is keyed by the sha256
+    of its full text, and the placeholder it is stored as keeps that digest, so
+    distinct deep observations are never merged and a retry never duplicates
+    one.
   - The logsBloom cross-check runs on the raw answers, so an entry quarantined
     at intake is not mistaken for a missing log.
   - A tick that isolated anything, hit the budget, or left the cursor more than

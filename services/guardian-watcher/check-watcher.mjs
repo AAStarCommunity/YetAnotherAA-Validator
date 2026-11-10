@@ -4183,6 +4183,168 @@ try {
   );
 }
 
+// ---- follow-up #2 R6: a tx's commitments each spend the budget; an impossible number of them is
+// one quarantine
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r6-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const sc = (k, m) => aggIface.encodeEventLog("SignersCommitted", [k, m]);
+  const out = {};
+  try {
+    // 2100 commitments in one tx whose lookups answer null: one quarantine, no dead letter each
+    const a = mk();
+    for (let i = 0; i < 3; i++) a.c.mine();
+    for (let i = 0; i < 2100; i++)
+      a.c.injectLog(a.cfg.startBlock + 1, {
+        address: AGG,
+        ...sc(BigInt(i + 1), 3n),
+        index: i,
+        transactionHash: ethers.id("r6-big"),
+      });
+    for (let i = 0; i < 4; i++) a.c.mine();
+    out.a = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.aDls = a.store.listDeadLetters().length;
+    out.aQ = withQ(a.store).filter(x => x.quarantine);
+    // three txs of 60 commitments on three blocks: the writes of the first two reach the budget,
+    // so the tick stops before the third block
+    const b = mk();
+    for (let i = 0; i < 4; i++) b.c.mine();
+    for (let t = 0; t < 3; t++)
+      for (let i = 0; i < 60; i++)
+        b.c.injectLog(b.cfg.startBlock + t, {
+          address: AGG,
+          ...sc(BigInt(1000 * t + i + 1), 3n),
+          index: i,
+          transactionHash: ethers.id(`r6-tx-${t}`),
+        });
+    for (let i = 0; i < 4; i++) b.c.mine();
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    out.bDls = b.store.listDeadLetters();
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  const bTx = new Set(out.bDls.map(x => x.txHash));
+  cell(
+    "follow-up R6: 2100 commitments in one tx are one quarantine (no per-commitment writes); commitments spend the budget one write each, so three 60-commitment txs stop the tick before the third block",
+    out.a.ok &&
+      out.aDls === 0 &&
+      out.aQ.length === 1 &&
+      out.aQ[0].entries === 2100 &&
+      /more than 300 commitments/.test(out.aQ[0].reasons.join(" ")) &&
+      out.b.ok &&
+      out.b.budgetStopThisTick &&
+      out.b.cursor === out.b.scanned[0] + 1 &&
+      !out.bDls.some(x => x.txHash === ethers.id("r6-tx-2")),
+    {
+      a: [out.a.ok, out.aDls, out.aQ.length, out.aQ[0]?.entries, out.aQ[0]?.reasons],
+      b: [
+        out.b.ok,
+        out.b.cursor,
+        out.b.scanned,
+        out.b.budgetStopThisTick,
+        out.bDls.length,
+        bTx.size,
+      ],
+    }
+  );
+}
+
+// ---- follow-up #2 R6: two distinct deep logs of one tx stay two observations, through retries
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-deeptx-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("dt-a"), addr("dt-b")]);
+  const nest = leaf => {
+    let v = leaf;
+    for (let i = 0; i < 10_000; i++) v = [v];
+    return v;
+  };
+  const h = ethers.id("dt-tx");
+  let w1, w3;
+  try {
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("a"),
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("b"),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: h,
+    });
+    // the first tick fails at its cursor write, so the same range is read again while the dead
+    // letter is open: the fresh copies must match their stored placeholders, not add to them
+    const setCursor = store.setCursor.bind(store);
+    store.setCursor = () => {
+      store.setCursor = setCursor;
+      throw new Error("injected cursor write failure");
+    };
+    await runOnce(c.chain, cfg, store, rs, ident);
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("a"),
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("b"),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: h,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    w1 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    for (let i = 0; i < 2; i++) await runOnce(c.chain, cfg, store, rs, ident);
+    w3 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const shas = w => new Set(w.map(x => x.rawSha256).filter(Boolean));
+  cell(
+    "follow-up R6: two distinct 10 000-deep logs of one tx are two stored observations with distinct digests, unchanged by a re-read of the same range and by retries",
+    w1.length === 2 &&
+      shas(w1).size === 2 &&
+      w3.length === 2 &&
+      JSON.stringify(w3) === JSON.stringify(w1),
+    { n1: w1.length, s1: shas(w1).size, n3: w3.length }
+  );
+}
+
 // ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)
 {
   const got = [];
