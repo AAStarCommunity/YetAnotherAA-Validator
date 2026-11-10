@@ -46,7 +46,23 @@ export const REGISTRY_ABI = [
   "function entryCount() view returns (uint256)",
 ];
 
+/** SuperPaymaster DVTValidator-0.7.0 (f00be603 :272-310) — the forwarder the guardians use. */
+export const DVT_ABI = [
+  "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof)",
+  "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof)",
+  "function proposals(uint256) view returns (address operator, uint8 slashLevel, string reason, bool executed, bool exists, bytes32 evidenceHash)",
+];
+/** Safe v1.3/v1.4 owner-transaction entry point, and the MultiSend(CallOnly) batch call. */
+export const SAFE_ABI = [
+  "function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures)",
+  "function execTransactionFromModule(address to, uint256 value, bytes data, uint8 operation)",
+  "function execTransactionFromModuleReturnData(address to, uint256 value, bytes data, uint8 operation)",
+  "function multiSend(bytes transactions)",
+];
+
 export const aggIface = new ethers.Interface(AGGREGATOR_ABI);
+export const dvtIface = new ethers.Interface(DVT_ABI);
+export const safeIface = new ethers.Interface(SAFE_ABI);
 export const regIface = new ethers.Interface(REGISTRY_ABI);
 
 // ------------------------------------------------------------------ pure encoding (SP mirror)
@@ -240,6 +256,178 @@ function assertBlockInt(name, v, { positive = false } = {}) {
   }
 }
 
+const eqAddr = (a, b) => !!a && !!b && ethers.getAddress(a) === ethers.getAddress(b);
+
+/** Packed MultiSend payload: (uint8 op, address to, uint256 value, uint256 len, bytes data)*. */
+export function parseMultiSend(transactions) {
+  const b = ethers.getBytes(transactions);
+  const out = [];
+  let i = 0;
+  while (i < b.length) {
+    if (i + 85 > b.length) return null;
+    const operation = b[i];
+    const to = ethers.getAddress(ethers.hexlify(b.slice(i + 1, i + 21)));
+    const len = Number(BigInt(ethers.hexlify(b.slice(i + 53, i + 85))));
+    if (!Number.isSafeInteger(len) || i + 85 + len > b.length) return null;
+    out.push({ operation, to, data: ethers.hexlify(b.slice(i + 85, i + 85 + len)) });
+    i += 85 + len;
+  }
+  return out;
+}
+
+/**
+ * Aggregator calls recoverable from tx `tx`, as candidates { kind, proposalId, fields, route }.
+ * A forwarder is followed ONLY at the address the release manifest pins for its role
+ * (`forwarders.dvtValidator`, `.ownerSafe`, `.multiSendCallOnly`); a look-alike elsewhere is
+ * ignored. Safe: execTransaction with operation CALL is followed; DELEGATECALL only into the pinned
+ * MultiSendCallOnly and only through sub-transactions that are all CALLs; module routes are not
+ * followed. Anything else falls back to a callTracer trace limited to the pinned aggregator and
+ * DVTValidator. `notes` says why something was not followed.
+ */
+export async function extractCandidates(chain, tx, aggregator, forwarders = {}, blockNumber) {
+  const fw = forwarders || {};
+  const candidates = [];
+  const notes = [];
+
+  async function fromDvt(data, route) {
+    let p;
+    try {
+      p = dvtIface.parseTransaction({ data });
+    } catch {
+      p = null;
+    }
+    if (!p) return notes.push(`${route}: calldata is not a DVTValidator forwarding call`);
+    if (p.name === "queueSlashWithProof") {
+      candidates.push({
+        kind: Kind.QUEUE,
+        proposalId: 0n,
+        fields: { operator: p.args.operator, slashLevel: p.args.slashLevel, epoch: p.args.epoch },
+        route: `${route}.queueSlashWithProof`,
+      });
+      return;
+    }
+    if (p.name !== "executeWithProof") {
+      return notes.push(`${route}: ${p.name} is not a DVTValidator forwarding call`);
+    }
+    // The aggregator read proposals[id] during block N; its fields never change after creation
+    // (DVTValidator f00be603 :215-238, :257), so the parent block shows what it used — unless the
+    // proposal was created inside block N itself.
+    const ret = await chain.call({
+      to: fw.dvtValidator,
+      data: dvtIface.encodeFunctionData("proposals", [p.args.id]),
+      blockTag: blockNumber - 1,
+    });
+    const pr = dvtIface.decodeFunctionResult("proposals", ret);
+    if (!pr.exists) {
+      return notes.push(
+        `${route}: proposal ${p.args.id} did not exist at block ${blockNumber - 1} (created in the same block?)`
+      );
+    }
+    const repUsers = [...p.args.repUsers];
+    candidates.push(
+      repUsers.length === 0
+        ? {
+            kind: Kind.SLASH,
+            proposalId: p.args.id,
+            fields: {
+              operator: pr.operator,
+              slashLevel: pr.slashLevel,
+              epoch: p.args.epoch,
+              evidenceHash: pr.evidenceHash,
+            },
+            route: `${route}.executeWithProof`,
+          }
+        : {
+            kind: Kind.REPUTATION,
+            proposalId: p.args.id,
+            fields: { users: repUsers, newScores: [...p.args.newScores], epoch: p.args.epoch },
+            route: `${route}.executeWithProof`,
+          }
+    );
+  }
+
+  async function follow(to, data, route, depth) {
+    if (depth > 4) return notes.push(`${route}: nesting too deep`);
+    if (eqAddr(to, aggregator)) {
+      const a = decodeAction(data);
+      if (a) candidates.push({ ...a, route: `${route}.aggregator` });
+      else notes.push(`${route}: aggregator calldata is not an entry point`);
+      return;
+    }
+    if (eqAddr(to, fw.dvtValidator)) return fromDvt(data, `${route}.dvtValidator`);
+    if (eqAddr(to, fw.ownerSafe)) {
+      let p;
+      try {
+        p = safeIface.parseTransaction({ data });
+      } catch {
+        p = null;
+      }
+      if (!p) return notes.push(`${route}: ownerSafe call is not a known Safe entry point`);
+      if (p.name !== "execTransaction")
+        return notes.push(`${route}: Safe ${p.name} (module route) is not followed`);
+      const op = Number(p.args.operation);
+      if (op === 0) return follow(p.args.to, p.args.data, `${route}.safe`, depth + 1);
+      if (op === 1 && eqAddr(p.args.to, fw.multiSendCallOnly)) {
+        let m;
+        try {
+          m = safeIface.parseTransaction({ data: p.args.data });
+        } catch {
+          m = null;
+        }
+        const subs = m && m.name === "multiSend" ? parseMultiSend(m.args.transactions) : null;
+        if (!subs) return notes.push(`${route}: malformed MultiSendCallOnly batch`);
+        for (let k = 0; k < subs.length; k++) {
+          if (subs[k].operation !== 0) {
+            notes.push(`${route}.multiSend[${k}]: DELEGATECALL is not followed`);
+            continue;
+          }
+          await follow(subs[k].to, subs[k].data, `${route}.safe.multiSend[${k}]`, depth + 1);
+        }
+        return;
+      }
+      return notes.push(
+        `${route}: Safe DELEGATECALL to ${p.args.to} is not followed (only the pinned MultiSendCallOnly)`
+      );
+    }
+    // Not a pinned contract: nothing is decoded from it here.
+  }
+
+  if (tx.to) await follow(tx.to, tx.data, "tx", 0);
+  const pinnedTop =
+    tx.to && [aggregator, fw.dvtValidator, fw.ownerSafe].some(a => eqAddr(a, tx.to));
+  if (!pinnedTop) {
+    // Trace fallback: decode only CALL frames whose target is the pinned aggregator or DVTValidator.
+    let trace = null;
+    if (typeof chain.send === "function") {
+      try {
+        trace = await chain.send("debug_traceTransaction", [tx.hash, { tracer: "callTracer" }]);
+      } catch {
+        trace = null;
+      }
+    }
+    if (!trace) {
+      notes.push(
+        "action is wrapped by a contract the manifest does not pin, and no callTracer trace is available"
+      );
+    } else {
+      const walk = async (f, path) => {
+        if (!f || f.error) return;
+        if (String(f.type).toUpperCase() === "CALL") {
+          if (eqAddr(f.to, aggregator)) {
+            const a = decodeAction(f.input);
+            if (a) candidates.push({ ...a, route: `${path}.aggregator` });
+          } else if (eqAddr(f.to, fw.dvtValidator)) {
+            await fromDvt(f.input, `${path}.dvtValidator`);
+          }
+        }
+        for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`);
+      };
+      await walk(trace, "trace");
+    }
+  }
+  return { candidates, notes };
+}
+
 /**
  * Establish what the action tx `txHash` proves about the entry for `key`, every state read pinned
  * to block `snapshot`. Returns { status, reason?, facts }:
@@ -252,7 +440,7 @@ function assertBlockInt(name, v, { positive = false } = {}) {
  *                        FIRST, so a provable contradiction is MISMATCH even when other fields are
  *                        undecidable — a forger cannot hide behind INCONCLUSIVE.
  */
-export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot) {
+export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot, forwarders = {}) {
   const agg = ethers.getAddress(aggregator);
   const tx = await chain.getTransaction(txHash);
   const rc = await chain.getTransactionReceipt(txHash);
@@ -324,30 +512,40 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
   if (facts.anchor === undefined)
     facts.incomplete.push("action block header carries no parentHash");
 
-  if (!tx.to || ethers.getAddress(tx.to) !== agg) {
+  // Recover the aggregator call(s) this tx made, from the tx itself through the manifest-pinned
+  // forwarders, or from a trace. A candidate counts only if it reproduces the SignersCommitted key;
+  // the stored commitment is then the final gate, so a decoding mistake can never make a MATCH.
+  const ds = await view(chain, agg, "domainSeparator", [], blockNumber);
+  const found = await extractCandidates(chain, tx, agg, forwarders, blockNumber);
+  facts.route = null;
+  const matching = [];
+  for (const c of found.candidates) {
+    if (
+      (c.kind === Kind.SLASH || c.kind === Kind.REPUTATION) &&
+      BigInt(c.proposalId) >= RAW_ID_BOUND
+    ) {
+      continue; // the aggregator reverts these (InvalidProposalId), so it cannot be the committed call
+    }
+    const mh = messageHashOf(ds, c.kind, c.proposalId, c.fields);
+    if (commitmentKey(c.kind, c.proposalId, mh) === commit.key)
+      matching.push({ ...c, messageHash: mh });
+  }
+  if (matching.length === 0) {
+    facts.incomplete.push(...found.notes);
     facts.incomplete.push(
-      "action is not a top-level aggregator call (wrapped); message fields not recoverable from the tx"
+      found.candidates.length
+        ? "no recovered aggregator call reproduces the SignersCommitted key"
+        : "no aggregator call recoverable from this tx (wrapped through a contract the manifest does not pin)"
     );
     return { status: null, facts };
   }
-  const action = decodeAction(tx.data);
-  if (!action) {
-    facts.incomplete.push("action calldata is not an aggregator entry point");
+  if (new Set(matching.map(m => m.messageHash)).size > 1) {
+    facts.incomplete.push("several recovered calls claim the same key with different messages");
     return { status: null, facts };
   }
-  if (
-    (action.kind === Kind.SLASH || action.kind === Kind.REPUTATION) &&
-    BigInt(action.proposalId) >= RAW_ID_BOUND
-  ) {
-    return mismatch("action proposalId >= 2^128");
-  }
-
-  const ds = await view(chain, agg, "domainSeparator", [], blockNumber);
-  const messageHash = messageHashOf(ds, action.kind, action.proposalId, action.fields);
-  const derivedKey = commitmentKey(action.kind, action.proposalId, messageHash);
-  if (derivedKey !== commit.key) {
-    return mismatch("key derived from calldata differs from SignersCommitted key");
-  }
+  const action = matching[0];
+  const messageHash = action.messageHash;
+  facts.route = action.route;
   Object.assign(facts, {
     kind: action.kind,
     proposalId: BigInt(action.proposalId),
@@ -447,7 +645,15 @@ export const UNVERIFIED_FIELDS = ["subjectToken", "rulesetCommit", "recordURI", 
  */
 export async function recheckEntry(
   chain,
-  { registry, aggregator, entryId, fromBlock = 0, confirmations = 0, page = 10_000 }
+  {
+    registry,
+    aggregator,
+    forwarders = {},
+    entryId,
+    fromBlock = 0,
+    confirmations = 0,
+    page = 10_000,
+  }
 ) {
   assertBlockInt("fromBlock", fromBlock);
   assertBlockInt("confirmations", confirmations);
@@ -542,7 +748,14 @@ export async function recheckEntry(
     /* disclose through a wrapper: compare the event only */
   }
 
-  const r = await rebuildFromAction(chain, aggregator, entry.record.txHash, entry.key, snapshot);
+  const r = await rebuildFromAction(
+    chain,
+    aggregator,
+    entry.record.txHash,
+    entry.key,
+    snapshot,
+    forwarders
+  );
   if (r.status) {
     // A definitive verdict needs the disclosure to still be canonical, like the full path below.
     if (r.status === Status.MISMATCH && !(await canonical(chain, log.blockNumber, log.blockHash))) {
