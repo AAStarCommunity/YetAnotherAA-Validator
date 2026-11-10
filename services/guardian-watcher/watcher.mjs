@@ -84,6 +84,7 @@ export async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
     stats?.unsupported ||
     stats?.noLogs ||
     stats?.inconsistent ||
+    stats?.unaligned ||
     (stats?.failed && !stats?.verified)
   );
   let check = null;
@@ -109,6 +110,10 @@ export async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
     degraded.push(`all ${stats.failed} trace call(s) this tick failed`);
   if (stats?.inconsistent)
     degraded.push(`receipt disagrees with getLogs on ${stats.inconsistent} tx(s)`);
+  if (stats?.unaligned)
+    degraded.push(
+      `trace did not align with a consistent receipt on ${stats.unaligned} tx(s) (${stats.unalignedWhy})`
+    );
   if (check && check.state === "unverified" && check.failed > 0)
     degraded.push(`verification: ${check.failed} sample trace call(s) failed`);
   return {

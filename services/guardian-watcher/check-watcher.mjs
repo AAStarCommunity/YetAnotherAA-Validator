@@ -1527,6 +1527,30 @@ try {
       ],
       "case"
     );
+    // R12: an invalid receipt position is handled per tx (inconsistent), never aborts the tick;
+    // a consistent receipt whose trace cannot align (noncontiguous positions) is a health finding
+    const badPos = await extraCase(
+      (a, blk) => [{ address: SP, topics: a.topics, data: a.data, index: false, blockNumber: blk }],
+      "badpos"
+    );
+    const gap = await extraCase(
+      (a, blk) => [
+        { address: SP, topics: a.topics, data: a.data, index: 0, blockNumber: blk },
+        { address: AGG, topics: [ethers.ZeroHash], data: "0x", index: 2, blockNumber: blk },
+      ],
+      "gap"
+    );
+    cell(
+      "trace R12: an invalid receipt position is a per-tx inconsistency (tick ok); a consistent receipt that cannot align degrades",
+      badPos.ok === true &&
+        badPos.trace.thisTick.inconsistent === 1 &&
+        gap.ok === true &&
+        gap.trace.thisTick.unaligned === 1 &&
+        !gap.trace.thisTick.verified &&
+        gap.healthy === false &&
+        gap.degraded.some(x => /did not align/.test(x)),
+      { badPos: [badPos.ok, badPos.lastError, badPos.trace], gap: [gap.trace, gap.degraded] }
+    );
     cell(
       "trace R9: a receipt differing from getLogs only in hex case is consistent (supporting node stays healthy)",
       !caseR.trace.thisTick.inconsistent && caseR.trace.thisTick.verified === 1 && caseR.healthy,
@@ -1746,7 +1770,9 @@ try {
           ...l,
           data: ethers.AbiCoder.defaultAbiCoder().encode(["int256", "uint256"], [1n, 3n]),
         }) &&
-        !sameLog(l, { ...l, topics: [...l.topics, ethers.ZeroHash] }),
+        !sameLog(l, { ...l, topics: [...l.topics, ethers.ZeroHash] }) &&
+        !sameLog({ ...l, index: false }, l) &&
+        !sameLog({ ...l, index: 3, logIndex: 4 }, l),
       null
     );
   }
@@ -1856,14 +1882,19 @@ try {
     const H0 = ethers.id("tx-0");
     const ok = { from: addr("u"), to: SP, data: "0x12345678" };
     const tr = { type: "CALL", from: addr("u"), to: SP, input: "0x12345678" };
-    const rc = (x = {}) => ({ status: 1, logs: [{ ...L, index: 0 }], ...x });
+    const rc = (x = {}) => ({ transactionHash: H0, status: 1, logs: [{ ...L, index: 0 }], ...x });
     cell(
       "envelopeProblem: receipt for another tx, failed receipt with logs, removed / foreign logs, and a trace root that is not the tx are refused",
       envelopeProblem(H0, ok, rc(), tr) === null &&
         envelopeProblem(H0, { ...ok, to: null }, rc(), { ...tr, type: "CREATE", to: addr("c") }) ===
           null &&
         /another tx/.test(envelopeProblem(H0, ok, rc({ transactionHash: ethers.id("x") }), tr)) &&
-        /failed receipt/.test(envelopeProblem(H0, ok, rc({ status: 0 }), tr)) &&
+        /explicit success/.test(envelopeProblem(H0, ok, rc({ status: 0 }), tr)) &&
+        /explicit success/.test(envelopeProblem(H0, ok, rc({ status: undefined }), tr)) &&
+        /does not name/.test(envelopeProblem(H0, ok, rc({ transactionHash: undefined }), tr)) &&
+        envelopeProblem(H0, ok, rc({ transactionHash: undefined, hash: H0, status: "0x1" }), tr) ===
+          null &&
+        /another tx/.test(envelopeProblem(H0, ok, rc({ hash: ethers.id("z") }), tr)) &&
         /removed/.test(
           envelopeProblem(H0, ok, rc({ logs: [{ ...L, index: 0, removed: true }] }), tr)
         ) &&
@@ -1921,7 +1952,11 @@ try {
             m === "eth_getBlockByNumber"
               ? { transactions: [ethers.id("s2")] }
               : { type: "CALL", from: ok.from, to: SP, input, logs: [L] },
-          getTransactionReceipt: async () => ({ status: 1, logs: [{ ...L, index: 0 }] }),
+          getTransactionReceipt: async () => ({
+            transactionHash: ethers.id("s2"),
+            status: 1,
+            logs: [{ ...L, index: 0 }],
+          }),
           getTransaction: async () => ok,
         },
         { aggregator: AGG, roles: { superPaymaster: SP } },

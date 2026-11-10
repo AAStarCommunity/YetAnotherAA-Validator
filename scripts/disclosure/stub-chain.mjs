@@ -178,7 +178,8 @@ function makeChain() {
         onReceipt = null;
         return f(h);
       }
-      const rc = txs.get(h)?.receipt ?? null;
+      const base = txs.get(h)?.receipt ?? null;
+      const rc = base ? { transactionHash: h, ...base } : null; // a real receipt names its tx
       return rc && receiptLogs.has(h) ? { ...rc, logs: receiptLogs.get(h) } : rc;
     },
     async getBlock(n) {

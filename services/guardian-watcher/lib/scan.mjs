@@ -98,8 +98,11 @@ export function sameLog(a, b) {
   const h = x => String(x ?? "").toLowerCase();
   const ta = a.topics ?? [];
   const tb = b.topics ?? [];
+  const pa = receiptPos(a);
+  // An invalid position is a mismatch, never an exception (Codex #400-fix R12).
   return (
-    logPos(a) === logPos(b) &&
+    pa !== null &&
+    pa === receiptPos(b) &&
     h(a.address) === h(b.address) &&
     ta.length === tb.length &&
     ta.every((t, i) => h(t) === h(tb[i])) &&
@@ -238,7 +241,8 @@ async function traceAndReceipt(chain, txHash, stats = {}, expectLogs = false) {
   return { trace, logs: rc?.logs ?? null, rc };
 }
 
-const failedStatus = s => s === 0 || s === "0x0" || s === 0n || s === "0";
+// Success must be explicit: a missing or unrecognized status is not success (Codex #400-fix R12).
+const okStatus = s => s === 1 || s === "0x1" || s === 1n || s === "1";
 
 /**
  * Cross-checks of a receipt and a trace against the tx they claim to describe (an honest but
@@ -248,8 +252,11 @@ const failedStatus = s => s === 0 || s === "0x0" || s === 0n || s === "0";
  */
 export function envelopeProblem(txHash, tx, rc, trace) {
   if (rc) {
-    if (rc.transactionHash && !lcEq(rc.transactionHash, txHash)) return "receipt names another tx";
-    if (failedStatus(rc.status) && rc.logs?.length) return "failed receipt carries logs";
+    // ethers v6 names the receipt's tx `hash`; raw JSON-RPC names it `transactionHash`.
+    const ids = [rc.transactionHash, rc.hash].filter(x => x !== undefined && x !== null);
+    if (!ids.length) return "receipt does not name its tx";
+    if (!ids.every(x => lcEq(x, txHash))) return "receipt names another tx";
+    if (!okStatus(rc.status)) return "receipt is not an explicit success";
     for (const l of rc.logs ?? []) {
       if (l?.transactionHash && !lcEq(l.transactionHash, txHash))
         return "receipt log of another tx";
@@ -480,6 +487,13 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
           : attributeLogs(trace, logs, cfg.aggregator, SP);
     // Consistent + aligned implies the receipt holds the watched logs and the trace carries them,
     // so an empty or log-less pair can never count as proof.
+    if (consistent && trace && tx && !attr.aligned) {
+      // A consistent receipt whose trace still does not align (noncontiguous positions, malformed
+      // trace logs, ambiguous positionless order): a health finding, so a stored proof cannot keep
+      // the watcher "healthy" while attribution fails (Codex #400-fix R12).
+      stats.unaligned = (stats.unaligned ?? 0) + 1;
+      stats.unalignedWhy = attr.why;
+    }
     if (attr.aligned && trace) {
       // A real trace aligned with its receipt is positive proof of the capability (status.trace).
       summary.trace.verified = (summary.trace.verified ?? 0) + 1;
