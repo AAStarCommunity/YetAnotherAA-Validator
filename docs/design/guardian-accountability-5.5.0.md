@@ -83,6 +83,25 @@ evidenceHash = keccak256(abi.encode(TAG_EVIDENCE, category, keccak256(body)))
 TAG_EVIDENCE = keccak256("SuperPaymaster.DVT.Evidence.v2")
 ```
 
+Vectors: `contracts/test/fixtures/evidence-vectors.json`, generated from
+`scripts/disclosure/recheck-lib.mjs` (`npm run check:disclosure` diffs it) and
+recomputed in Solidity by `contracts/test/EvidenceHashParity.t.sol` (an
+independent recomputation, not SP's contract). Running SP's DVTValidator 0.8.0
+against the same file is planned once its branch is published; until then the
+parity covers our two implementations only. `abi.encode`, never `encodePacked`:
+for `evidenceHash` the two coincide (three static `bytes32` words), but for
+`evidence` they differ, since `bytes` is dynamic and `abi.encode` adds its
+offset and length.
+
+The DVT node does not yet build proposals this way (it files
+`evidenceHash = proofHash`, and over-issue uses its own tag). That is closed in
+5.5.0 (`categoryCount() == 0`, and node slash submission is disabled), and is
+moved to §3.1 before the first category is deployed (DSR 918b553d): each
+category's body is a versioned ABI struct; the audit-slash body carries the
+proof identity's ABI fields and `bytes32 proofHash` (still the off-chain archive
+address, no longer the evidenceHash); over-issue becomes
+`DVT.Evidence.OverIssue.v1`.
+
 `evidenceHash` is the value DVTValidator passes into `verifyAndExecute`, so the
 aggregator's existing slash message (and hence the signer commitment) binds it.
 Chain, aggregator and Registry are already bound by the aggregator's
@@ -485,12 +504,104 @@ aggregator-only.
   - a record whose price never read (an authenticated BLS action, or an SP event
     already classified) is kept with its route, caller and verdict, and
     `price.unavailable`.
-- One tx never stops the scan: any exception while processing a tx (for example
-  a malformed RPC answer such as a frame address that is not an address, or an
-  aggregator log without its key) makes that tx a dead letter with its watched
-  evidence, and the cursor moves on. At the attempt cap it becomes an
-  `unattributed` record (`UNREADABLE`, nobody accused) carrying that evidence;
-  `status.json` counts txs isolated in the tick and unreadable txs in total.
+- Malformed answers are isolated together with their evidence; within the
+  per-tick and per-block caps, the scan advances at least one block every tick.
+  - Logs are read through raw `eth_getLogs` (range and by hash), not the
+    provider's `getLogs`, whose formatter throws on an entry it cannot format
+    before any isolation could see it. Fields the RPC returns under the
+    watcher's own evidence names (`source`, `range`, `raw`, `count`,
+    `quarantine`) are stripped before use.
+  - Any exception while processing a tx (a malformed or inconsistent RPC answer)
+    makes that tx a dead letter with its watched evidence, and the cursor moves
+    on. At the attempt cap a tx dead letter becomes an `unattributed` record
+    (`UNREADABLE`, its own verdict, nobody accused) carrying that evidence.
+  - Entries that cannot be handled per tx (not an object, no valid tx hash, or
+    past a cap below) become a quarantine record at once: final, `unattributed`,
+    `UNREADABLE`, never an accusation and never dropped. One record per answer
+    keeps the total, up to 10 distinct samples with their counts, the query
+    source and range, and the sha256 of the whole raw payload, so the gap can be
+    audited. The payload is hashed in full, encoded without recursion, so no
+    nesting depth turns it into a placeholder; a sample longer than 2048
+    characters keeps its prefix, full length and own sha256, as does per-tx
+    evidence that cannot be stored as JSON. The payload itself is not stored:
+    under the accepted RPC trust model it records a node fault, not evidence
+    against anyone, and unbounded storage would be a new failure point.
+  - Per-tick budget: after 100 dead-letter writes by txs inside the scanned
+    range (thrown or not: a lookup that answers null counts, and a tx counts
+    once per dead letter it writes, e.g. per commitment), the tick finishes the
+    current block, stops, and sets the cursor there; the later blocks are read
+    again next tick. Only an in-range height can set the stop, so the cursor
+    always advances. Txs with no usable height, or a height outside the range,
+    belong to no later block: they are handled in the tick that read them, never
+    deferred. Dead-letter retries and those txs do not count towards the budget.
+  - Per-block cap: past 2000 isolations (dead letters, amendment and patch
+    writes) in one block, or in the shared bucket of txs outside the range, the
+    excess goes into one quarantine record per query. Under an honest RPC an
+    isolation is a rare transient failure, so the cap only bounds what a
+    misbehaving answer can make the watcher write. Records never count towards
+    it (#404 review B1): otherwise anyone could fill a block with public
+    `updatePrice()` records and push a later owner action of that block into a
+    quarantine that accuses nobody.
+  - A tx with more than 300 `SignersCommitted` logs (more than a block's gas can
+    BLS-verify), or more than 2000 watched logs, cannot be real: its logs go
+    into one quarantine record per query, not one dead letter or record each.
+    Records are bounded per tx by this cap and per block by the chain's own gas;
+    only dead letters spend the per-tick budget, so a busy healthy range is
+    never reported degraded.
+  - An evidence item nested more than 64 levels deep (real logs are about 3) is
+    stored as a placeholder with its prefix, full length and sha256: state files
+    are indented, so a stored value grows with the square of its depth (a
+    6000-deep value of 42 KB was a 72 MB dead letter). Stored evidence is
+    decoded without recursion, and evidence that cannot be decoded spends a
+    retry attempt, so no nesting depth fails a tick.
+  - A trace deeper than the EVM call-depth limit (1024 frames below the root),
+    or whose `calls` or `logs` are not arrays, is not a trace and is refused
+    before anything walks it; trace flattening is iterative and linear in the
+    trace. Persisted reasons are diagnostics: at most 10 of at most 512
+    characters are kept, with the total and the sha256 of the full list.
+  - Dead-letter retries obey the same per-tx admission limits as fresh evidence;
+    amendment and dead-letter patch writes count towards the per-block cap, and
+    a conflicting amendment is stored under the sha256 of its signature (one
+    lookup, no scan). A public record keeps the call's distinct event names
+    (bounded by the ABI), which is all its verdict reads. Work over an answer is
+    linear: txs are visited by height bucket without sorting the answer, receipt
+    logs are placed by position, and matching uses keyed sets.
+  - Evidence keeps exactly what the RPC said, including objects that use the
+    encoder's own tag keys (`$obj`, `$bigint`): the escape is recognised by
+    identity, not by its parent's keys. Store lookups do not grow with the
+    archive: a BLS record is found by its kind's file name, and a dead letter's
+    retirements are numbered by a durable counter.
+  - An evidence item over 64 KB of encoded JSON (escapes and UTF-8 bytes
+    counted) is stored as the same placeholder. The stored observation is the
+    received one: every own field is kept as received (including `null` and
+    `false`), a key named `__proto__` stays a plain key, and only valid hex is
+    case-folded for comparison; a missing field and an explicit `null` are two
+    different observations.
+  - Bound: the logsBloom cross-check traverses the returned logs once per block
+    and watched topic, so its work is the answer size times the capped block
+    range (`maxBlocksPerTick`) times the fixed topic count.
+  - Accepted bound (DSR 97a9d55c): each tick's work is linear in the local
+    archive size (status totals are recounted from the directories). It is
+    visible: `status.json` reports `archiveFiles` and the whole tick's `tickMs`
+    (capability verification included), and a tick slower than `maxTickFraction`
+    (default 0.5) of the poll interval is degraded. An active dead-letter index
+    with recoverable counters is planned after 5.5.0.
+  - Identities stay distinct at any depth: a deep value is keyed by the sha256
+    of its full text, and the placeholder it is stored as keeps that digest, so
+    distinct deep observations are never merged and a retry never duplicates
+    one.
+  - The logsBloom cross-check runs on the raw answers, so an entry quarantined
+    at intake is not mistaken for a missing log.
+  - A tick that isolated anything, hit the budget, or left the cursor more than
+    `maxLagBlocks` (default 300, about 1 h on Sepolia) behind finalized is
+    reported degraded (`status.healthy` false, with the reasons; `--once` exits
+    non-zero). `status.json` counts budget stops and quarantine records per tick
+    and in total (budget stops in `counters.json`; quarantine records recounted
+    from disk), and unreadable records in total. The alert on degraded status,
+    and the external heartbeat/lag check of §5.5 that also catches a dead
+    watcher process, are W2c.
+  - A tick still fails, and is retried with the cursor unchanged, when a read it
+    cannot do without fails (a header, a non-array log answer).
 - A BLS action with an open dead letter is retried by that dead letter alone,
   once per tick; retirements of one id are numbered, never overwritten.
 - An SP effect that the trace proves to belong to a BLS action only after the

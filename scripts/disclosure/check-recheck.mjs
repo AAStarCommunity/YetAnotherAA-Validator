@@ -7,7 +7,18 @@
 // Each case is a control cell: correct entries must PASS and every forged entry must FAIL, and each
 // failing case asserts WHICH check fired, so a recheck that fails for the wrong reason is caught too.
 import { ethers } from "ethers";
-import { Kind, aggIface, dvtIface, regIface, safeIface, recheckEntry } from "./recheck-lib.mjs";
+import {
+  Kind,
+  aggIface,
+  dvtIface,
+  regIface,
+  safeIface,
+  recheckEntry,
+  evidenceCategory,
+  encodeEvidence,
+  decodeEvidence,
+  evidenceHashOf,
+} from "./recheck-lib.mjs";
 import {
   ABI,
   AGG,
@@ -1018,6 +1029,42 @@ results.push({
 capRange(Infinity);
 
 let failed = 0;
+// M0 §3.1 evidence helpers refuse malformed inputs (a wrong category or body would otherwise yield
+// a well-formed hash for evidence no checker accepts), and round-trip what they encode.
+{
+  const throws = f => {
+    try {
+      f();
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  const cat = evidenceCategory("OverIssue", 1);
+  const bad = [
+    () => evidenceCategory("Over-Issue", 1),
+    () => evidenceCategory("", 1),
+    () => evidenceCategory("OverIssue", 0),
+    () => evidenceCategory("OverIssue", 1.5),
+    () => encodeEvidence("0x1234", "0x"),
+    () => evidenceHashOf(cat.slice(0, 64), "0x"),
+  ];
+  const refused = bad.map(throws);
+  const body = "0x0102";
+  const back = decodeEvidence(encodeEvidence(cat, body));
+  results.push({
+    name: "evidence helpers refuse a malformed category name, version or bytes32, and round-trip category and body",
+    ok:
+      refused.every(Boolean) &&
+      cat === ethers.id("DVT.Evidence.OverIssue.v1") &&
+      back.category === cat &&
+      back.body === body &&
+      evidenceHashOf(cat, body) !== evidenceHashOf(cat, "0x0103"),
+    want: "all refused; round trip exact",
+    got: JSON.stringify({ refused, back }),
+  });
+}
+
 for (const r of results) {
   console.log(
     `${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     want ${r.want}\n     got  ${r.got}`}`

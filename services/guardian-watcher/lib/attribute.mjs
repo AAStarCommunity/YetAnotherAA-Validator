@@ -67,16 +67,42 @@ const same = (t, r) =>
  * { from, selector } of the call that emitted the log, i.e. who called SP and which function
  * (#400 M1). A DELEGATECALL from SP into its own module is not a new entry and is looked through.
  */
+// why the last flattenTraceLogs call found the trace unusable (for the dead-letter reason)
+let lastUnsureWhy = null;
+
+/** A trace nests no deeper than the EVM's call-depth limit (1024 frames): a deeper one cannot be
+ * real, and is refused before anything walks it (follow-up #2 R8). Iterative. */
+export function traceDepthOk(trace, max = 1025) {
+  const st = [[trace, 1]];
+  while (st.length) {
+    const [f, d] = st.pop();
+    if (!f || typeof f !== "object") continue;
+    if (d > max) return false;
+    // `calls` and `logs`, when present, must be arrays: anything else (an object with a `length`,
+    // say) is not a trace, and code that trusts its length would loop on it (follow-up #2 R9)
+    if (f.calls !== undefined && f.calls !== null && !Array.isArray(f.calls)) return false;
+    if (f.logs !== undefined && f.logs !== null && !Array.isArray(f.logs)) return false;
+    if (Array.isArray(f.calls)) for (const c of f.calls) st.push([c, d + 1]);
+  }
+  return true;
+}
+
 export function flattenTraceLogs(trace, aggregator, sp) {
+  // Iterative, in exactly the order the recursive walk visited frames (pre-order ids, children
+  // before a frame's own position checks), and linear: each frame's logs are bucketed by position
+  // once and emitted into one output array (follow-up #2 R8: N logs beside N empty calls was
+  // N^2 work, and copying descendants through every ancestor cost depth x logs).
   let nextId = 0;
-  let unsure = false;
-  const walk = (f, aggCall, spCall) => {
-    if (!f || f.error) return [];
+  let unsureWhy = null;
+  const addrOk = a => a === undefined || a === null || (typeof a === "string" && isAddr(a));
+  const missing = l => l.position === undefined || l.position === null;
+  // node: { emit: [bucket_0, child_0, bucket_1, ..., bucket_n], has: whether it emits a log }
+  const enter = (f, aggCall, spCall) => {
+    if (!f || f.error) return { node: { emit: [], has: false }, children: [] };
     const isCall = typeof f.type === "string" && f.type.toUpperCase() === "CALL";
     // A frame's addresses are used for attribution: malformed ones make the trace unusable rather
     // than throwing later (#400 review L1).
-    const addrOk = a => a === undefined || a === null || (typeof a === "string" && isAddr(a));
-    if (!addrOk(f.from) || !addrOk(f.to)) unsure = true;
+    if (!addrOk(f.from) || !addrOk(f.to)) unsureWhy ??= "trace frame address malformed";
     const here = isCall && lc(f.to) === lc(aggregator) ? nextId++ : aggCall;
     const spHere =
       sp && isCall && lc(f.to) === lc(sp)
@@ -87,42 +113,75 @@ export function flattenTraceLogs(trace, aggregator, sp) {
         : spCall;
     const logs = Array.isArray(f.logs) ? f.logs : [];
     const calls = Array.isArray(f.calls) ? f.calls : [];
-    // Children first, in order (aggregator call ids stay in execution order): their surviving
-    // logs decide whether a positionless log here is ambiguous.
-    const childOut = calls.map(c => walk(c, here, spHere));
-    const missing = l => l.position === undefined || l.position === null;
+    return { node: { emit: null, has: false, logs, calls, here, spHere }, children: calls };
+  };
+  const exit = (node, childNodes) => {
+    const { logs, calls, here, spHere } = node;
     // A log without `position` is placed after the children. That is unambiguous only when no
     // child subtree has a surviving log (geth before positions existed: Codex #400-fix R11).
-    if (logs.some(missing) && childOut.some(o => o.length)) unsure = true;
+    if (logs.some(missing) && childNodes.some(c => c.has))
+      unsureWhy ??= "trace logs lack positions";
     // An explicit position must place the log between child calls: an integer in
     // [0, calls.length], given as a number or a decimal/0x string (no booleans, arrays, empty
     // strings), and a frame's positions never decrease in emission order. Anything else is a
     // malformed trace, never silently repaired (Codex #400-fix R9, R10).
+    const buckets = Array.from({ length: calls.length + 1 }, () => []);
     let prev = 0;
     for (const l of logs) {
-      if (missing(l)) continue;
+      if (missing(l)) {
+        buckets[calls.length].push(l);
+        continue;
+      }
       const p = parsePosition(l.position);
-      if (p === null || p > calls.length || p < prev) unsure = true;
-      else prev = p;
+      if (p === null || p > calls.length || p < prev)
+        unsureWhy ??= "trace log position invalid or out of order";
+      else {
+        prev = p;
+        buckets[p].push(l);
+      }
     }
-    const at = k =>
-      logs.filter(l => (missing(l) ? k === calls.length : parsePosition(l.position) === k));
-    const out = [];
+    const emit = [];
     for (let k = 0; k <= calls.length; k++) {
-      for (const l of at(k))
+      emit.push({ bucket: buckets[k], here, spHere });
+      if (k < calls.length) emit.push(childNodes[k]);
+    }
+    node.emit = emit;
+    node.has = logs.length > 0 || childNodes.some(c => c.has);
+  };
+  // the walk: an explicit stack of enter/exit steps, children entered in order
+  const root = enter(trace, null, null);
+  const st = [{ ...root, kids: [], i: 0 }];
+  while (st.length) {
+    const top = st[st.length - 1];
+    if (top.node.emit === null && top.i < top.children.length) {
+      const c = top.children[top.i++];
+      const e = enter(c, top.node.here, top.node.spHere);
+      top.kids.push(e.node);
+      if (e.node.emit === null) st.push({ ...e, kids: [], i: 0 });
+      continue;
+    }
+    st.pop();
+    if (top.node.emit === null) exit(top.node, top.kids);
+  }
+  lastUnsureWhy = unsureWhy;
+  if (unsureWhy) return null;
+  // emission: buckets and child subtrees in order, without recursion
+  const out = [];
+  const em = [root.node];
+  while (em.length) {
+    const x = em.pop();
+    if (x.bucket) {
+      for (const l of x.bucket)
         out.push({
           address: l.address,
           topics: l.topics,
           data: l.data,
-          aggCall: here,
-          spCall: spHere,
+          aggCall: x.here,
+          spCall: x.spHere,
         });
-      if (k < calls.length) out.push(...childOut[k]);
-    }
-    return out;
-  };
-  const seq = walk(trace, null, null);
-  return unsure ? null : seq;
+    } else for (let k = x.emit.length - 1; k >= 0; k--) em.push(x.emit[k]);
+  }
+  return out;
 }
 
 /**
@@ -140,11 +199,20 @@ export function attributeLogs(trace, receiptLogs, aggregator, sp) {
   // missing one would let a later log's frame overwrite an earlier one's (Codex #400-fix R8, R11).
   const pos = receiptLogs.map(receiptPos);
   const valid = pos.every(p => p !== null) && new Set(pos).size === pos.length;
-  if (!valid || (pos.length && Math.max(...pos) - Math.min(...pos) + 1 !== pos.length))
+  // min/max by a loop, never a spread of an RPC-sized array (call-stack bound)
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const p of pos) {
+    if (p < lo) lo = p;
+    if (p > hi) hi = p;
+  }
+  if (!valid || (pos.length && hi - lo + 1 !== pos.length))
     return { aligned: false, owner, spCall, why: "receipt log positions invalid or duplicated" };
   const seq = flattenTraceLogs(trace, aggregator, sp);
-  if (!seq) return { aligned: false, owner, spCall, why: "trace logs lack positions" };
-  const rl = [...receiptLogs].sort((a, b) => receiptPos(a) - receiptPos(b));
+  if (!seq) return { aligned: false, owner, spCall, why: lastUnsureWhy ?? "trace unusable" };
+  // positions are unique and contiguous (checked above): each log goes straight to its slot, O(n)
+  const rl = new Array(receiptLogs.length);
+  for (let i = 0; i < receiptLogs.length; i++) rl[pos[i] - lo] = receiptLogs[i];
   if (seq.length !== rl.length)
     return {
       aligned: false,

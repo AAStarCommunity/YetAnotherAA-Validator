@@ -1,12 +1,18 @@
 // CI self-test for the guardian watcher core (W1) against the shared stub chain. Each cell asserts a
 // specific outcome; must-pass and must-fail cells are both present (a self-test of only one kind
 // proves nothing).
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { Kind, aggIface } from "../../scripts/disclosure/recheck-lib.mjs";
+import {
+  Kind,
+  aggIface,
+  traceDepthOk as recheckDepthOk,
+  findEntryLogs,
+} from "../../scripts/disclosure/recheck-lib.mjs";
 import {
   AGG,
   SAFE,
@@ -27,16 +33,41 @@ import {
   sameLog,
   envelopeProblem,
   txOfEvidence,
+  typedEvidence,
+  nativeEvidence,
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
-import { Store, writeAll, validAmendment } from "./lib/store.mjs";
-import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
-import { attributeLogs, flattenTraceLogs, validLog, receiptPos } from "./lib/attribute.mjs";
+import {
+  Store,
+  writeAll,
+  validAmendment,
+  atomicWriteJson,
+  boundReasons,
+  renameDurable,
+} from "./lib/store.mjs";
+import { runOnce, rulesetIdentity, traceHealth, loadConfig } from "./watcher.mjs";
+import {
+  attributeLogs,
+  flattenTraceLogs,
+  validLog,
+  receiptPos,
+  traceDepthOk,
+} from "./lib/attribute.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const rs = validateRuleset(JSON.parse(readFileSync(join(HERE, "ruleset.json"), "utf8")));
 const results = [];
 const j = v => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
+/** Open dead letters plus quarantine records in dead-letter shape: since follow-up #2 R4 a
+ * quarantine is a final record at once (DSR log 2892c30f), not a dead letter waiting for its cap. */
+const withQ = store => [
+  ...store.listDeadLetters(),
+  ...readdirSync(join(store.dir, "records"))
+    .filter(f => f.endsWith(".json"))
+    .map(f => JSON.parse(readFileSync(join(store.dir, "records", f), "utf8")))
+    .filter(r => r.quarantine === true)
+    .map(r => ({ ...r, watched: r.evidence, reasons: r.lastReasons, finalRecord: true })),
+];
 const cell = (name, ok, got) => results.push({ name, ok: !!ok, got: ok ? "" : j(got) });
 
 const dir = mkdtempSync(join(tmpdir(), "guardian-watcher-"));
@@ -425,6 +456,11 @@ try {
     ...c.chain,
     getLogs: async () => {
       throw new Error("rpc down");
+    },
+    // range reads go through raw eth_getLogs (#403 review M-1): the RPC is down there too
+    send: async (m, p) => {
+      if (m === "eth_getLogs") throw new Error("rpc down");
+      return c.chain.send(m, p);
     },
   };
   c.execute(Kind.SLASH, 104n, slashF, 0b011n);
@@ -2171,7 +2207,16 @@ try {
       "L1: a malformed frame or aggregator log is isolated per tx (tick ok, dead letter with evidence), ends unattributed and counted; the scan moves on",
       s1.ok === true &&
         s1.isolatedThisTick === 1 &&
-        dl1.some(x => x.txHash === t1.hash && x.route === "tx") &&
+        // #403 review L-2: isolating a malformed answer makes the tick degraded, not healthy
+        s1.healthy === false &&
+        s1.degraded?.some(x => /1 malformed RPC answer\(s\) isolated/.test(x)) &&
+        // L-4: the reason names the malformed frame address, not missing positions
+        dl1.some(
+          x =>
+            x.txHash === t1.hash &&
+            x.route === "tx" &&
+            /trace frame address malformed/.test(x.reasons?.[0] ?? "")
+        ) &&
         dl1.some(
           x =>
             x.txHash === ethers.id("rev-malformed") &&
@@ -2182,6 +2227,8 @@ try {
         unread?.route === "unattributed" &&
         unread.event === "UNREADABLE" &&
         unread.evidence?.length === 1 &&
+        unread.verdict?.rule === "watcher.UNREADABLE" &&
+        !/SuperPaymaster|permissionless/.test(unread.verdict.reasons.join(" ")) &&
         sEnd.unreadableTotal === 1 &&
         sEnd.ok === true,
       { s1: [s1.ok, s1.isolatedThisTick, s1.lastError], dl1, unread, sEnd: sEnd.unreadableTotal }
@@ -2291,7 +2338,7 @@ try {
       settle(g.c);
       const gs1 = (await runOnce(g.c.chain, g.cfg, g.store, rs, ident)).status;
       g.c.clearLag();
-      const gDls = g.store.listDeadLetters();
+      const gDls = withQ(g.store);
       cell(
         "follow-up R2: bloom recovery beside a malformed position, conflicting copies at one position, a log without a tx hash and a removed standalone event are each isolated; tick ok",
         gs1.ok === true &&
@@ -2404,7 +2451,7 @@ try {
         spEvents: [{ event: "PriceUpdated" }],
       });
       cell(
-        "follow-up R2: a patched dead letter survives a tx-first retry order (effects reach the record); a corrupt amendment is repaired, not trusted",
+        "follow-up R2: a patched dead letter survives a tx-first retry order (effects reach the record); a corrupt amendment file is set aside and replaced, never trusted",
         rx?.spEvents?.[0]?.event === "PriceUpdated" &&
           rep === "repaired" &&
           h.store.getBlsAmendment(sx.key)?.spEvents?.length === 1,
@@ -2439,7 +2486,7 @@ try {
       const ok3 = k.c.ownerTx([{ name: "GuardianSet", args: [addr("r3-g1"), addr("r3-g2")] }]);
       settle(k.c);
       const ks = (await runOnce(k.c.chain, k.cfg, k.store, rs, ident)).status;
-      const kd = k.store.listDeadLetters();
+      const kd = withQ(k.store);
       const hDl = kd.find(x => x.txHash === ethers.id("r3-height"));
       cell(
         "follow-up R3: copies disagreeing on their block, an invalid height and a null entry are isolated (tick ok, valid log recorded, raw height kept)",
@@ -2578,7 +2625,10 @@ try {
           badOnes.every(b => !validAmendment(b, k5)) &&
           rc === "conflict" &&
           m.store.getBlsAmendment(k5)?.txHash === okA.txHash &&
-          readdirSync(join(m.d, "amendments")).includes(`bls-${keyHex}.json.conflict.1`) &&
+          // addressed by the sha256 of the proof's signature (follow-up #2 R9)
+          readdirSync(join(m.d, "amendments")).some(f =>
+            new RegExp(`^bls-${keyHex}\\.json\\.conflict\\.[0-9a-f]{64}$`).test(f)
+          ) &&
           m.store.putBlsAmendment(k5, okA) === "same",
         { rc, valid: badOnes.map(b => validAmendment(b, k5)) }
       );
@@ -2786,7 +2836,7 @@ try {
         "follow-up R9: a tx hash or topic that cannot be stringified is isolated; the scan never throws and moves on",
         us.ok === true &&
           us2.ok === true &&
-          u.store.listDeadLetters().some(x => x.quarantine === true) &&
+          withQ(u.store).some(x => x.quarantine === true) &&
           u.store.listDeadLetters().some(x => x.txHash === quiet.hash) &&
           u.recs().some(r => r.txHash === later.hash),
         { us: [us.ok, us.lastError], us2: [us2.ok, us2.lastError] }
@@ -2839,7 +2889,7 @@ try {
           bq?.watched?.length === 5 &&
           bq2?.watched?.length === 5 &&
           j(bq2.watched) === j(bq.watched) && // stored bytes unchanged by retries (idempotent)
-          b.store.listDeadLetters().some(x => x.quarantine === true) &&
+          withQ(b.store).some(x => x.quarantine === true) &&
           bad.ok === false &&
           j(curAfterBad) === j(curBefore) &&
           good.ok === true &&
@@ -3005,15 +3055,18 @@ try {
     e5.c.ownerTx([{ name: "GuardianSet", args: [addr("rev-l5a"), addr("rev-l5b")] }]);
     settle(e5.c);
     e5.c.setUpperTopics(true);
+    const calls0 = e5.c.logCalls();
     const s5 = (await runOnce(e5.c.chain, e5.cfg, e5.store, rs, ident)).status;
+    const callsUsed = e5.c.logCalls() - calls0; // aggregator + SP range reads, no by-hash re-read
     e5.c.setUpperTopics(false);
     cell(
       "L5: bloom topics compared case-insensitively (no false re-read for upper-case hex)",
       s5.ok === true &&
         s5.bloom.recovered === 0 &&
         s5.bloom.falsePositives === 0 &&
-        e5.recs().length === 1,
-      { bloom: s5.bloom, n: e5.recs().length, err: s5.lastError }
+        e5.recs().length === 1 &&
+        callsUsed === 2, // #403 review L-3: no by-hash re-read at all
+      { bloom: s5.bloom, n: e5.recs().length, err: s5.lastError, callsUsed }
     );
   } finally {
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
@@ -3046,6 +3099,2242 @@ try {
   } finally {
     rmSync(d7, { recursive: true, force: true });
   }
+}
+
+// ---- #403 review M-1: the production path. A real ethers JsonRpcProvider (only its transport
+// replaced) answers eth_getLogs with raw JSON holding malformed entries; the range read must not go
+// through ethers' log formatter (which throws on them), so the tick completes, the cursor moves and
+// every malformed entry is isolated.
+{
+  const dP = mkdtempSync(join(tmpdir(), "guardian-watcher-realprov-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const good = c.ownerTx([{ name: "GuardianSet", args: [addr("rp-g1"), addr("rp-g2")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const q = x => ethers.toQuantity(x);
+    const asJson = l => ({
+      address: l.address,
+      topics: l.topics,
+      data: l.data,
+      blockNumber: q(l.blockNumber),
+      blockHash: l.blockHash,
+      transactionHash: l.transactionHash,
+      transactionIndex: "0x0",
+      logIndex: q(l.index),
+      removed: false,
+    });
+    const gs = spIface.encodeEventLog("GuardianSet", [addr("rp-a"), addr("rp-b")]);
+    const rq = await c.chain.getTransactionReceipt(good.hash);
+    const base = {
+      address: SP.toLowerCase(),
+      topics: gs.topics,
+      data: gs.data,
+      blockNumber: q(rq.blockNumber),
+      blockHash: rq.blockHash,
+      transactionIndex: "0x0",
+      removed: false,
+    };
+    const malformed = [
+      null,
+      { ...base, transactionHash: ethers.id("rp-badidx"), logIndex: "bad" },
+      { ...base, transactionHash: ethers.id("rp-short"), logIndex: "0x5", address: "0x1234" },
+      { ...base, logIndex: "0x6" }, // no transactionHash
+      {
+        ...base,
+        transactionHash: ethers.id("rp-huge"),
+        logIndex: "0x7",
+        blockNumber: "0x" + "f".repeat(80),
+      },
+    ];
+    let malformedServed = false;
+    let byHashMalformed = false;
+    let malformedByHash = [];
+    class RawRpc extends ethers.JsonRpcProvider {
+      constructor() {
+        super("http://127.0.0.1:1", undefined, {
+          staticNetwork: ethers.Network.from(1),
+          batchMaxCount: 1,
+          cacheTimeout: -1,
+        });
+      }
+      async _send(payload) {
+        const out = [];
+        for (const p of Array.isArray(payload) ? payload : [payload]) {
+          try {
+            let result;
+            if (p.method === "eth_chainId") result = "0x1";
+            else if (p.method === "eth_getLogs") {
+              const raw = (await c.chain.send("eth_getLogs", p.params)).map(asJson);
+              const isSp = String(p.params[0].address).toLowerCase() === SP.toLowerCase();
+              const byHash = p.params[0].blockHash !== undefined;
+              if (isSp && byHash && byHashMalformed) {
+                byHashMalformed = false;
+                result = [...raw, ...malformedByHash];
+              } else if (isSp && !byHash && !malformedServed) {
+                malformedServed = true;
+                result = [...raw, ...malformed];
+              } else result = raw;
+            } else if (p.method === "eth_getBlockByNumber")
+              result = await c.chain.send(p.method, p.params);
+            else if (["eth_getTransactionByHash", "eth_getTransactionReceipt"].includes(p.method))
+              result = null;
+            else throw new Error(`not served: ${p.method}`);
+            out.push({ id: p.id, jsonrpc: "2.0", result });
+          } catch (e) {
+            out.push({
+              id: p.id,
+              jsonrpc: "2.0",
+              error: { code: -32601, message: String(e.message) },
+            });
+          }
+        }
+        return out;
+      }
+    }
+    const prov = new RawRpc();
+    // control: the provider's own getLogs throws on this answer (the formatter boundary is real)
+    malformedServed = false;
+    let formatterThrew = false;
+    try {
+      await prov.getLogs({ address: SP, fromBlock: cfg.startBlock, toBlock: c.head() });
+    } catch {
+      formatterThrew = true;
+    }
+    malformedServed = false;
+    const store = new Store(dP);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const head1 = c.head();
+    const st = (await runOnce(prov, cfg, store, rs, ident)).status;
+    // the bloom's by-hash re-read is the same raw path: a lagging range answer leaves a watched log
+    // out, the by-hash answer brings it back together with a malformed entry
+    const g2 = c.ownerTx([{ name: "GuardianSet", args: [addr("rp-h1"), addr("rp-h2")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const r2 = await c.chain.getTransactionReceipt(g2.hash);
+    c.lagTopic(r2.blockNumber, gs.topics[0]);
+    malformedByHash = [
+      {
+        ...base,
+        blockNumber: q(r2.blockNumber),
+        blockHash: r2.blockHash,
+        transactionHash: ethers.id("rp-byhash"),
+        logIndex: "bad",
+      },
+    ];
+    byHashMalformed = true;
+    const st2 = (await runOnce(prov, cfg, store, rs, ident)).status;
+    c.clearLag();
+    const dls = withQ(store);
+    cell(
+      "M-1: the bloom's by-hash re-read also takes the raw path: a malformed entry there is isolated, the tick completes",
+      st2.ok === true &&
+        st2.bloom.recovered >= 1 &&
+        dls.some(x => x.txHash === ethers.id("rp-byhash")),
+      { st2: [st2.ok, st2.lastError, st2.bloom], dls: dls.map(x => x.txHash.slice(0, 10)) }
+    );
+    cell(
+      "M-1: through a real ethers JsonRpcProvider, malformed raw eth_getLogs entries are isolated and the tick completes (the provider's own getLogs throws on the same answer)",
+      formatterThrew &&
+        st.ok === true &&
+        st.cursor === head1 &&
+        st.isolatedThisTick >= 4 &&
+        dls.some(x => x.quarantine === true) &&
+        dls.some(x => x.txHash === ethers.id("rp-badidx")) &&
+        dls.some(x => x.txHash === ethers.id("rp-short")) &&
+        dls.some(x => x.txHash === ethers.id("rp-huge")),
+      {
+        formatterThrew,
+        st: [st.ok, st.lastError, st.cursor, st.isolatedThisTick],
+        dls: dls.map(x => [x.txHash.slice(0, 10), x.quarantine, x.reasons]),
+      }
+    );
+  } finally {
+    rmSync(dP, { recursive: true, force: true });
+  }
+}
+
+// ---- #403 review L-1, L-3 (wiring, patch), L-5
+{
+  const dL = mkdtempSync(join(tmpdir(), "guardian-watcher-403l-"));
+  try {
+    // L-3: atomicWriteJson goes through writeAll (a short writer is driven to completion)
+    let calls = 0;
+    const short = (fd, b, off, len) => {
+      calls++;
+      return writeSync(fd, b, off, Math.min(5, len));
+    };
+    const p = join(dL, "w.json");
+    atomicWriteJson(p, { a: "x".repeat(40) }, short);
+    cell(
+      "L-3: atomicWriteJson writes through writeAll (a short writer is looped to a complete file)",
+      calls > 2 && JSON.parse(readFileSync(p, "utf8")).a.length === 40,
+      { calls }
+    );
+    // L-3: patchDeadLetter spends no attempt
+    const st = new Store(join(dL, "s"));
+    const dl = {
+      route: "tx",
+      txHash: ethers.id("l3"),
+      blockNumber: 1,
+      status: "ERROR",
+      reasons: ["x"],
+      events: [],
+      seenAt: "t",
+    };
+    st.putDeadLetter(dl);
+    const id = `tx-${dl.txHash.toLowerCase()}`;
+    st.patchDeadLetter(id, { spEvents: [{ event: "PriceUpdated", logIndex: 1 }] });
+    const after = st.getDeadLetter(id);
+    cell(
+      "L-3: patchDeadLetter updates fields without spending an attempt",
+      after.attempts === 1 && after.spEvents?.length === 1,
+      after
+    );
+    // L-5: the same conflicting proof is stored once, and conflicts are counted in total
+    const okA = {
+      key: "9",
+      txHash: ethers.id("l5-a"),
+      provenBy: "trace",
+      spEvents: [{ event: "PriceUpdated", logIndex: 1 }],
+    };
+    const okB = { ...okA, txHash: ethers.id("l5-b") };
+    const seq = [okA, okA, okB, okB, okB, okA].map(x => st.putBlsAmendment(9n, x));
+    cell(
+      "L-5: an identical conflicting amendment is stored once; conflicts are counted in total",
+      // a repeat of a stored conflict writes nothing ("conflict-same"; follow-up #2 R9)
+      j(seq) === j(["new", "same", "conflict", "conflict-same", "conflict-same", "same"]) &&
+        st.countAmendmentConflicts() === 1,
+      { seq, conflicts: st.countAmendmentConflicts() }
+    );
+  } finally {
+    rmSync(dL, { recursive: true, force: true });
+  }
+  // L-1: a later failed tx lookup keeps the sender / target / selector an earlier one established
+  const dK = mkdtempSync(join(tmpdir(), "guardian-watcher-403l1-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dK);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const KEEP = addr("l1-keeper");
+    const sel = ethers.id("pauseUnderstakedOperator(address)").slice(0, 10);
+    const t = c.ownerTx([{ name: "OperatorPaused", args: [addr("l1-op")] }], {
+      from: KEEP,
+      data: sel,
+      trace: false,
+    });
+    for (let i = 0; i < 4; i++) c.mine();
+    await runOnce(c.chain, cfg, store, rs, ident); // the lookup works: sender etc. stored
+    c.failTx(t.hash, 1_000_000); // every later lookup fails
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      await runOnce(c.chain, cfg, store, rs, ident);
+    c.failTx(t.hash, 0);
+    const recs = readdirSync(join(dK, "records")).map(f =>
+      JSON.parse(readFileSync(join(dK, "records", f), "utf8"))
+    );
+    const r = recs.find(x => x.txHash === t.hash);
+    cell(
+      "L-1: later failed tx lookups keep the sender, target and root selector of an earlier one, through exhaustion",
+      r?.route === "unattributed" &&
+        r.from === KEEP &&
+        r.to === SP &&
+        r.rootSelector === sel &&
+        r.caller === null,
+      r
+    );
+  } finally {
+    rmSync(dK, { recursive: true, force: true });
+  }
+}
+
+// ---- #404 review L3: a later lookup answering a DIFFERENT tx does not replace the facts the first
+// lookup established (first write wins)
+{
+  const dL3 = mkdtempSync(join(tmpdir(), "guardian-watcher-l3-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dL3);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const KEEP = addr("l3-keeper");
+    const sel = ethers.id("pauseUnderstakedOperator(address)").slice(0, 10);
+    const t = c.ownerTx([{ name: "OperatorPaused", args: [addr("l3-op")] }], {
+      from: KEEP,
+      data: sel,
+      trace: false,
+    });
+    for (let i = 0; i < 4; i++) c.mine();
+    await runOnce(c.chain, cfg, store, rs, ident); // the first lookup names the tx
+    // every later lookup answers another sender and calldata for the same hash
+    c.patchTxFrom(t.hash, 1, { from: addr("l3-other"), data: "0xdeadbeef" });
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      await runOnce(c.chain, cfg, store, rs, ident);
+    const recs = readdirSync(join(dL3, "records")).map(f =>
+      JSON.parse(readFileSync(join(dL3, "records", f), "utf8"))
+    );
+    const r = recs.find(x => x.txHash === t.hash);
+    cell(
+      "#404 L3: a later lookup naming a different sender and calldata does not replace the first lookup's facts (unattributed record keeps them, caller null)",
+      r?.route === "unattributed" && r.from === KEEP && r.rootSelector === sel && r.caller === null,
+      r && { route: r.route, from: r.from, sel: r.rootSelector, caller: r.caller }
+    );
+  } finally {
+    rmSync(dL3, { recursive: true, force: true });
+  }
+}
+
+// ---- Codex follow-up #2 R1: a huge raw answer (150 000 null entries) on the range read and on the
+// by-hash re-read is quarantined, and the cursor moves (no call-stack overflow before intake)
+{
+  const dH = mkdtempSync(join(tmpdir(), "guardian-watcher-huge-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dH);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const g = c.ownerTx([{ name: "GuardianSet", args: [addr("huge-a"), addr("huge-b")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const huge = new Array(150_000).fill(null);
+    let mode = "range";
+    const chain = {
+      ...c.chain,
+      send: async (m, p) => {
+        const r = await c.chain.send(m, p);
+        if (m !== "eth_getLogs" || String(p[0].address).toLowerCase() !== SP.toLowerCase())
+          return r;
+        const byHash = p[0].blockHash !== undefined;
+        if ((mode === "range" && !byHash) || (mode === "hash" && byHash)) {
+          mode = "done";
+          return [...r, ...huge];
+        }
+        return r;
+      },
+    };
+    const s1 = (await runOnce(chain, cfg, store, rs, ident)).status;
+    const g2 = c.ownerTx([{ name: "GuardianSet", args: [addr("huge-c"), addr("huge-d")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const r2 = await c.chain.getTransactionReceipt(g2.hash);
+    c.lagTopic(r2.blockNumber, spIface.getEvent("GuardianSet").topicHash);
+    mode = "hash";
+    const s2 = (await runOnce(chain, cfg, store, rs, ident)).status;
+    c.clearLag();
+    cell(
+      "huge raw answers (150 000 entries) on the range read and on the by-hash re-read are quarantined; the cursor moves",
+      s1.ok === true &&
+        s1.cursor !== null &&
+        s1.isolatedThisTick >= 150_000 &&
+        s2.ok === true &&
+        s2.bloom.recovered >= 1 &&
+        s2.isolatedThisTick >= 150_000 &&
+        // bounded: one quarantine record per answer, not one per entry; each a final record
+        // carrying the sha256 of its whole payload
+        withQ(store).filter(x => x.quarantine === true).length === 2 &&
+        withQ(store)
+          .filter(x => x.quarantine)
+          .every(
+            x =>
+              x.finalRecord &&
+              /^0x[0-9a-f]{64}$/.test(x.payloadSha256) &&
+              x.entries === 150_000 &&
+              /150000 returned entries are not a log/.test(x.reasons[0])
+          ),
+      {
+        s1: [s1.ok, s1.lastError, s1.cursor, s1.isolatedThisTick],
+        s2: [s2.ok, s2.lastError, s2.isolatedThisTick, s2.bloom],
+      }
+    );
+    void g;
+  } finally {
+    rmSync(dH, { recursive: true, force: true });
+  }
+}
+
+// ---- quarantine samples are bounded: 30 distinct non-log entries -> one quarantine record, 10 samples
+{
+  const dQ = mkdtempSync(join(tmpdir(), "guardian-watcher-qsamples-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dQ);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    for (let i = 0; i < 4; i++) c.mine();
+    for (let i = 0; i < 30; i++) c.injectRawResult(SP, i % 2 ? `junk-${i}` : i);
+    const st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    const q = withQ(store).filter(x => x.quarantine === true);
+    cell(
+      "quarantine is bounded: 30 distinct non-log entries make one quarantine record keeping 10 samples, the total in its reason",
+      st.ok === true &&
+        q.length === 1 &&
+        q[0].watched.length === 10 &&
+        /^30 returned entries are not a log \(30 distinct, first 10 kept\)/.test(q[0].reasons[0]),
+      q.map(x => [x.watched.length, x.reasons])
+    );
+  } finally {
+    rmSync(dQ, { recursive: true, force: true });
+  }
+}
+
+// ---- follow-up #2 R2/R3: floods stay bounded per tick without losing evidence; deep JSON is stored
+{
+  const mkRun = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-flood-"));
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(d);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    for (let i = 0; i < 4; i++) c.mine();
+    const tick = async () => {
+      const t0 = Date.now();
+      const st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+      return { st, ms: Date.now() - t0 };
+    };
+    return { d, c, store, tick };
+  };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("fl-a"), addr("fl-b")]);
+  const out = {};
+  const runs = [];
+  try {
+    // 4000 object-shaped entries naming no tx: one bounded quarantine
+    const a = mkRun();
+    runs.push(a);
+    for (let i = 0; i < 4000; i++) a.c.injectRawResult(SP, { logIndex: i });
+    out.objFlood = await a.tick();
+    out.objFloodQ = withQ(a.store).filter(x => x.quarantine).length;
+    // 150 malformed logs of distinct txs in ONE block: isolated per tx (a block is never split)
+    const b = mkRun();
+    runs.push(b);
+    for (let i = 0; i < 150; i++)
+      b.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: 101,
+        index: "bad",
+        transactionHash: ethers.id(`fl-one-${i}`),
+      });
+    out.oneBlock = await b.tick();
+    out.oneBlockDls = b.store.listDeadLetters().filter(x => !x.quarantine).length;
+    // 150 malformed logs spread over 150 blocks: the tick stops at a block boundary after the
+    // budget; the next tick finishes them; none is dropped
+    const m = mkRun();
+    runs.push(m);
+    const first = m.c.head() + 1;
+    for (let i = 0; i < 150; i++) m.c.mine();
+    for (let i = 0; i < 4; i++) m.c.mine();
+    for (let i = 0; i < 150; i++)
+      m.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: first + i,
+        index: "bad",
+        transactionHash: ethers.id(`fl-many-${i}`),
+      });
+    out.many1 = await m.tick();
+    out.many1Dls = m.store.listDeadLetters().filter(x => !x.quarantine).length;
+    // the stub hands injected answers out once: re-inject the tail the second tick reads again
+    for (let i = 0; i < 150; i++)
+      if (first + i > out.many1.st.cursor)
+        m.c.injectRawResult(SP, {
+          address: SP,
+          ...gs,
+          blockNumber: first + i,
+          index: "bad",
+          transactionHash: ethers.id(`fl-many-${i}`),
+        });
+    out.many2 = await m.tick();
+    out.manyDls = m.store.listDeadLetters().filter(x => !x.quarantine).length;
+    // a log whose `data` is nested 10 000 deep, and one carrying a deeply nested `range` field
+    const dd = mkRun();
+    runs.push(dd);
+    let deep = "x";
+    for (let i = 0; i < 10_000; i++) deep = [deep];
+    dd.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: deep,
+      blockNumber: 101,
+      index: 0,
+      transactionHash: ethers.id("fl-deep"),
+    });
+    dd.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: "0x1",
+      blockNumber: 101,
+      index: 1,
+      transactionHash: ethers.id("fl-range"),
+      range: [deep, 1],
+    });
+    out.deep = await dd.tick();
+    out.deepDls = dd.store.listDeadLetters();
+  } finally {
+    for (const r of runs) rmSync(r.d, { recursive: true, force: true });
+  }
+  cell(
+    "floods are bounded per tick without dropping evidence: junk naming no tx is one quarantine; one block's 150 malformed txs are isolated per tx; 150 spread over blocks stop at a block boundary and finish next tick; deep data / a returned deep `range` never escape",
+    out.objFlood.st.ok &&
+      out.objFlood.ms < 10_000 &&
+      out.objFloodQ === 1 &&
+      out.oneBlock.st.ok &&
+      out.oneBlockDls === 150 &&
+      out.many1.st.ok &&
+      out.many1.st.cursor < out.many2.st.cursor &&
+      out.many1Dls >= 100 &&
+      out.many1Dls < 150 &&
+      out.many2.st.ok &&
+      out.manyDls === 150 &&
+      out.deep.st.ok &&
+      out.deepDls.length === 2 &&
+      /too deep or too large/.test(JSON.stringify(out.deepDls.map(x => x.watched))) &&
+      // the placeholder keeps the full text's length and sha256 (follow-up #2 R5)
+      out.deepDls.some(x =>
+        (x.watched ?? []).some(
+          w => /^0x[0-9a-f]{64}$/.test(w.rawSha256 ?? "") && w.rawLength > 20_000
+        )
+      ),
+    {
+      objFlood: [out.objFlood.st.ok, out.objFlood.ms, out.objFloodQ],
+      oneBlock: [out.oneBlock.st.ok, out.oneBlockDls],
+      many: [out.many1.st.cursor, out.many1Dls, out.many2.st.cursor, out.manyDls],
+      deep: [out.deep.st.ok, out.deep.st.lastError, out.deepDls?.length],
+    }
+  );
+}
+
+// ---- follow-up #2 R3: one block past any real size joins a bounded quarantine; RPC fields that
+// collide with the watcher's own evidence fields never reach the evidence
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-overflow-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("ov-a"), addr("ov-b")]);
+  for (let i = 0; i < 2100; i++)
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      blockNumber: 101,
+      index: i,
+      removed: true,
+      transactionHash: ethers.id(`ov-${i}`),
+    });
+  const reserved = () =>
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      blockNumber: 102,
+      index: 0,
+      removed: true,
+      transactionHash: ethers.id("ov-reserved"),
+      source: "agg",
+      quarantine: true,
+      count: 7,
+    });
+  reserved();
+  let st, st2, dls, ms;
+  try {
+    const t0 = Date.now();
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    ms = Date.now() - t0;
+    // the tick stopped after block 101 (its budget); block 102 is read again on the next tick
+    reserved();
+    st2 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    dls = withQ(store);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const perTx = dls.filter(x => !x.quarantine);
+  const q = dls.filter(x => x.quarantine);
+  const res = perTx.find(x => x.txHash === ethers.id("ov-reserved"));
+  const resEv = JSON.stringify(res?.watched ?? null);
+  cell(
+    "a block past MAX_TXS_PER_BLOCK isolates 2000 txs and quarantines the rest in one bounded letter (query source kept); the tick stops at that block and the next one continues; reserved fields (source, quarantine, count) returned by the RPC are stripped from evidence",
+    st?.ok &&
+      st.cursor === 101 &&
+      st2?.ok &&
+      st2.cursor > 102 &&
+      perTx.length === 2001 &&
+      q.length === 1 &&
+      /"source":"sp"/.test(JSON.stringify(q[0].watched)) &&
+      /^100 returned entries are past 2000 isolating txs in one block/.test(
+        q[0].reasons?.join(" ") ?? ""
+      ) &&
+      res &&
+      !res.quarantine &&
+      !/"count":7/.test(resEv) &&
+      !/"source":"agg"/.test(resEv) &&
+      /"source":"sp"/.test(resEv),
+    {
+      ok: st?.ok,
+      err: st?.lastError,
+      c1: st?.cursor,
+      c2: st2?.cursor,
+      ms,
+      perTx: perTx.length,
+      q: q.length,
+      qReason: q[0]?.reasons,
+      resEv: resEv.slice(0, 300),
+    }
+  );
+}
+
+// ---- follow-up #2 R3 (mutants): txs with no usable height are capped like a block; a `range`
+// the RPC returns never becomes the stored query range
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-noheight-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const from = cfg.startBlock;
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("nh-a"), addr("nh-b")]);
+  for (let i = 0; i < 2100; i++)
+    // half with no height, half claiming distinct heights past the range: one shared bucket
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      index: i,
+      ...(i % 2 ? { blockNumber: 1_000_000 + i } : {}),
+      transactionHash: ethers.id(`nh-${i}`),
+    });
+  c.injectRawResult(SP, {
+    address: SP,
+    ...gs,
+    blockNumber: from,
+    index: 0,
+    removed: true,
+    transactionHash: ethers.id("nh-range"),
+    range: [1, 2],
+  });
+  let st, dls;
+  try {
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    dls = withQ(store);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const perTx = dls.filter(x => !x.quarantine);
+  const q = dls.filter(x => x.quarantine);
+  const fake = perTx.find(x => x.txHash === ethers.id("nh-range"));
+  const ranges = (fake?.watched ?? []).map(w => w.range);
+  cell(
+    "2100 logs of distinct txs with no height: 2000 isolated, the rest one bounded quarantine (never one write each); a `range` field returned by the RPC is not stored as the query range",
+    st?.ok &&
+      perTx.length === 2001 &&
+      q.length === 1 &&
+      /no usable height/.test(q[0].reasons?.join(" ") ?? "") &&
+      ranges.length > 0 &&
+      ranges.every(r => Array.isArray(r) && r[0] === from && r[1] !== 2),
+    {
+      ok: st?.ok,
+      err: st?.lastError,
+      perTx: perTx.length,
+      q: q.length,
+      qr: q[0]?.reasons,
+      ranges,
+      from,
+    }
+  );
+}
+
+// ---- follow-up #2 R3: entries naming no usable tx hash share one bulk quarantine at intake
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-nohash-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("nx-a"), addr("nx-b")]);
+  for (const h of ["x1", "0x12", 7])
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+  let st, dls;
+  try {
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    dls = withQ(store);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "three logs with distinct unusable tx hashes: one bulk quarantine at intake, no per-tx dead letter",
+    st?.ok &&
+      dls.length === 1 &&
+      dls[0].quarantine &&
+      /^3 returned entries are not a log/.test(dls[0].reasons?.join(" ") ?? ""),
+    { ok: st?.ok, n: dls?.length, r: dls?.map(x => x.reasons) }
+  );
+}
+
+// ---- follow-up #2 R4: only an in-range height can stop a tick (it always advances); txs with no
+// height or outside the range are handled in the tick that read them, never deferred and lost
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r4-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r4-a"), addr("r4-b")]);
+  const out = {};
+  try {
+    // 150 isolating logs claiming the block before the range, beside one healthy owner tx
+    const a = mk();
+    const k = a.c.ownerTx([{ name: "SlashCancelled", args: [addr("r4-op")] }]);
+    for (let i = 0; i < 4; i++) a.c.mine();
+    for (let i = 0; i < 150; i++)
+      a.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: a.cfg.startBlock - 1,
+        index: 0,
+        transactionHash: ethers.id(`r4-prev-${i}`),
+      });
+    out.a = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.aRec = readdirSync(join(a.store.dir, "records")).some(f =>
+      f.includes(k.hash.toLowerCase().slice(2))
+    );
+    out.aDls = a.store.listDeadLetters().length;
+    // 120 isolating logs on distinct in-range blocks, plus 5 with no height: the tick stops at a
+    // block boundary, and the 5 are already dead letters (handled, not deferred)
+    const b = mk();
+    const first = b.cfg.startBlock;
+    for (let i = 0; i < 124; i++) b.c.mine();
+    for (let i = 0; i < 120; i++)
+      b.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: first + i,
+        index: "bad",
+        transactionHash: ethers.id(`r4-in-${i}`),
+      });
+    for (let i = 0; i < 5; i++)
+      b.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        index: 0,
+        transactionHash: ethers.id(`r4-nh-${i}`),
+      });
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    const bd = new Set(b.store.listDeadLetters().map(x => x.txHash));
+    out.bNh = [0, 1, 2, 3, 4].filter(i => bd.has(ethers.id(`r4-nh-${i}`))).length;
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R4: 150 isolating logs naming the block before the range cannot hold the cursor (the range completes, the healthy tx is recorded); after an early stop, txs with no height are already dead letters",
+    out.a.ok &&
+      out.a.cursor === out.a.finalized &&
+      out.aRec &&
+      out.aDls === 150 &&
+      !out.a.budgetStopThisTick &&
+      out.b.ok &&
+      out.b.cursor < out.b.finalized &&
+      out.b.budgetStopThisTick &&
+      out.bNh === 5,
+    {
+      a: [out.a.ok, out.a.cursor, out.a.finalized, out.aRec, out.aDls],
+      b: [out.b.ok, out.b.cursor, out.b.finalized, out.bNh],
+    }
+  );
+}
+
+// ---- DSR 2892c30f: quarantine is a final, unaccusing record with the payload's sha256; status counts
+// budget stops and quarantines (totals survive ticks); a budget stop and a cursor too far behind are
+// degraded
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-counters-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("ct-a"), addr("ct-b")]);
+  const first = cfg.startBlock;
+  for (let i = 0; i < 130; i++) c.mine();
+  const junk = [7, "x", { logIndex: 1 }];
+  const out = {};
+  try {
+    for (const x of junk) c.injectRawResult(SP, x);
+    for (let i = 0; i < 110; i++)
+      c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: first + i,
+        index: "bad",
+        transactionHash: ethers.id(`ct-${i}`),
+      });
+    out.t1 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    out.q = readdirSync(join(d, "records"))
+      .map(f => JSON.parse(readFileSync(join(d, "records", f), "utf8")))
+      .filter(r => r.quarantine);
+    out.dlQ = store.listDeadLetters().filter(x => x.quarantine).length;
+    // the next tick: more junk, a second budget stop
+    for (const x of ["y", 8]) c.injectRawResult(SP, x);
+    for (let i = 110; i < 125; i++)
+      c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        blockNumber: first + i,
+        index: "bad",
+        transactionHash: ethers.id(`ct-${i}`),
+      });
+    out.t2 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    // lag: a tick limited to 2 blocks, with more than maxLagBlocks still to go
+    const d2 = mkdtempSync(join(tmpdir(), "guardian-watcher-lag-"));
+    try {
+      const c2 = makeChain();
+      const cfg2 = { ...cfg, startBlock: c2.head() + 1, maxBlocksPerTick: 2, maxLagBlocks: 5 };
+      for (let i = 0; i < 20; i++) c2.mine();
+      out.lag = (await runOnce(c2.chain, cfg2, new Store(d2), rs, ident)).status;
+      const cfg3 = { ...cfg2, maxLagBlocks: 1000 };
+      out.noLag = (await runOnce(c2.chain, cfg3, new Store(d2), rs, ident)).status;
+    } finally {
+      rmSync(d2, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const want = createHash("sha256");
+  for (const x of junk) want.update(JSON.stringify(x) + "\n");
+  const q = out.q[0];
+  cell(
+    "quarantine is final at once (unattributed, UNREADABLE, caller null, never an accusation) with entries, samples and the sha256 of the whole payload; status counts budget stops and quarantines per tick and in total; budget stop and lag > maxLagBlocks are degraded",
+    out.q.length === 1 &&
+      out.dlQ === 0 &&
+      q.route === "unattributed" &&
+      q.event === "UNREADABLE" &&
+      q.caller === null &&
+      q.verdict.rule === "watcher.UNREADABLE" &&
+      q.entries === 3 &&
+      q.payloadSha256 === `0x${want.digest("hex")}` &&
+      q.evidence.length === 3 &&
+      out.t1.quarantinedThisTick === 1 &&
+      out.t1.quarantinedTotal === 1 &&
+      out.t1.budgetStopThisTick === true &&
+      out.t1.budgetStopsTotal === 1 &&
+      out.t1.healthy === false &&
+      out.t1.degraded.some(r => /isolation budget reached/.test(r)) &&
+      out.t2.quarantinedTotal === 2 &&
+      out.t2.budgetStopsTotal >= 1 &&
+      out.lag.ok &&
+      out.lag.degraded?.some(r => /blocks behind finalized \(> 5\)/.test(r)) &&
+      !(out.noLag.degraded ?? []).some(r => /behind finalized/.test(r)),
+    {
+      q: q && {
+        route: q.route,
+        event: q.event,
+        entries: q.entries,
+        sha: q.payloadSha256,
+        ev: q.evidence?.length,
+      },
+      dlQ: out.dlQ,
+      t1: out.t1 && [
+        out.t1.quarantinedThisTick,
+        out.t1.quarantinedTotal,
+        out.t1.budgetStopThisTick,
+        out.t1.budgetStopsTotal,
+        out.t1.degraded,
+      ],
+      t2: out.t2 && [out.t2.quarantinedTotal, out.t2.budgetStopsTotal],
+      lag: out.lag && [out.lag.lagBlocks, out.lag.degraded],
+      noLag: out.noLag?.degraded,
+    }
+  );
+}
+
+// ---- a tick that fails after its quarantine and re-reads the same range does not count it twice
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-qsame-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 6; i++) c.mine();
+  let t1, t2, recs, afterT1;
+  try {
+    // the tick fails at its last step (the cursor write), after the quarantine was written
+    const setCursor = store.setCursor.bind(store);
+    store.setCursor = () => {
+      store.setCursor = setCursor;
+      throw new Error("injected cursor write failure");
+    };
+    c.injectRawResult(SP, "junk");
+    t1 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    afterT1 = readdirSync(join(d, "records")).length;
+    c.injectRawResult(SP, "junk");
+    t2 = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    recs = readdirSync(join(d, "records")).filter(f => f.endsWith(".json")).length;
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "a quarantine written by a tick that then failed is still counted in total; its re-read by the retried range is the same record (not new this tick)",
+    t1.ok === false &&
+      afterT1 === 1 &&
+      t2.ok === true &&
+      recs === 1 &&
+      t2.quarantinedThisTick === 0 &&
+      t2.quarantinedTotal === 1,
+    {
+      t1: [t1.ok, t1.lastError, afterT1],
+      t2: [t2.ok, t2.quarantinedThisTick, t2.quarantinedTotal, t2.scanned],
+      recs,
+    }
+  );
+}
+
+// ---- follow-up #2 R5: dead letters written without a throw (a tx lookup answering null) spend
+// the budget and the per-block cap too
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r5-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("SlashCancelled", [addr("r5-op")]);
+  const out = {};
+  try {
+    const a = mk();
+    for (let i = 0; i < 160; i++) a.c.mine();
+    for (let i = 0; i < 150; i++)
+      a.c.injectLog(a.cfg.startBlock + i, {
+        address: SP,
+        ...gs,
+        transactionHash: ethers.id(`r5-many-${i}`),
+      });
+    for (let i = 0; i < 4; i++) a.c.mine();
+    out.a = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.aDls = a.store.listDeadLetters();
+    const b = mk();
+    for (let i = 0; i < 3; i++) b.c.mine();
+    for (let i = 0; i < 2100; i++)
+      b.c.injectLog(b.cfg.startBlock + 1, {
+        address: SP,
+        ...gs,
+        index: i,
+        transactionHash: ethers.id(`r5-one-${i}`),
+      });
+    for (let i = 0; i < 4; i++) b.c.mine();
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    out.bDls = b.store.listDeadLetters().length;
+    out.bQ = withQ(b.store).filter(x => x.quarantine).length;
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R5: null tx lookups (dead letters without a throw) spend the budget (150 over blocks: the tick stops at a block boundary) and the per-block cap (2100 in one block: 2000 dead letters + one quarantine)",
+    out.a.ok &&
+      out.a.budgetStopThisTick &&
+      out.a.cursor < out.a.finalized &&
+      out.aDls.length >= 100 &&
+      out.aDls.length < 150 &&
+      out.aDls.every(x => /transaction unavailable/.test(x.reasons.join(" "))) &&
+      out.b.ok &&
+      out.bDls === 2000 &&
+      out.bQ === 1,
+    {
+      a: [out.a.ok, out.a.cursor, out.a.finalized, out.aDls.length, out.aDls[0]?.reasons],
+      b: [out.b.ok, out.bDls, out.bQ],
+    }
+  );
+}
+
+// ---- follow-up #2 R5: deep JSON is hashed and sampled in full (no placeholder): distinct deep
+// entries stay distinct, the payload digest is of the real text
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-deepq-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const N = 10_000;
+  const nest = leaf => {
+    let v = leaf;
+    for (let i = 0; i < N; i++) v = [v];
+    return v;
+  };
+  const texts = ["a", "b"].map(l => "[".repeat(N) + JSON.stringify(l) + "]".repeat(N));
+  let st, q;
+  try {
+    c.injectRawResult(SP, nest("a"));
+    c.injectRawResult(SP, nest("b"));
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    q = withQ(store).find(x => x.quarantine);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const want = createHash("sha256");
+  for (const t of texts) want.update(t + "\n");
+  const sh = t => `0x${createHash("sha256").update(t).digest("hex")}`;
+  const ev = q?.evidence ?? [];
+  cell(
+    "two distinct 10 000-deep entries: one quarantine, two samples (prefix, full length, own sha256), payload sha256 of the full text",
+    st?.ok &&
+      q &&
+      q.distinct === 2 &&
+      ev.length === 2 &&
+      q.payloadSha256 === `0x${want.digest("hex")}` &&
+      ev.every(e => e.truncated && e.rawLength === texts[0].length && e.raw.length <= 2048) &&
+      new Set(ev.map(e => e.rawSha256)).size === 2 &&
+      ev.every(e => texts.map(sh).includes(e.rawSha256)) &&
+      !JSON.stringify(ev).includes("unserialisable"),
+    {
+      ok: st?.ok,
+      err: st?.lastError,
+      distinct: q?.distinct,
+      ev: ev.map(e => [e.truncated, e.rawLength, e.rawSha256?.slice(0, 10)]),
+    }
+  );
+}
+
+// ---- a busy, healthy range spends no budget: 150 healthy txs are recorded in one tick, not degraded
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-busy-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  let st, recs;
+  try {
+    // one failing tx first (a null lookup), so a dead letter already exists in this tick
+    c.mine();
+    c.injectLog(cfg.startBlock, {
+      address: SP,
+      ...spIface.encodeEventLog("SlashCancelled", [addr("busy-bad")]),
+      transactionHash: ethers.id("busy-bad"),
+    });
+    for (let i = 0; i < 150; i++)
+      c.ownerTx([{ name: "SlashCancelled", args: [addr(`busy-${i}`)] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    recs = store.countRecords();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "one failing tx then 150 healthy txs in one tick: all recorded, no budget stop (healthy txs spend nothing), the cursor reaches finalized",
+    st.ok &&
+      recs === 150 &&
+      !st.budgetStopThisTick &&
+      st.cursor === st.finalized &&
+      st.deadLetters === 1,
+    {
+      ok: st.ok,
+      recs,
+      budget: st.budgetStopThisTick,
+      cursor: st.cursor,
+      fin: st.finalized,
+      dls: st.deadLetters,
+      deg: st.degraded,
+    }
+  );
+}
+
+// ---- follow-up #2 R6: a tx's commitments each spend the budget; an impossible number of them is
+// one quarantine
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r6-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const sc = (k, m) => aggIface.encodeEventLog("SignersCommitted", [k, m]);
+  const out = {};
+  try {
+    // 2100 commitments in one tx whose lookups answer null: one quarantine, no dead letter each
+    const a = mk();
+    for (let i = 0; i < 3; i++) a.c.mine();
+    for (let i = 0; i < 2100; i++)
+      a.c.injectLog(a.cfg.startBlock + 1, {
+        address: AGG,
+        ...sc(BigInt(i + 1), 3n),
+        index: i,
+        transactionHash: ethers.id("r6-big"),
+      });
+    for (let i = 0; i < 4; i++) a.c.mine();
+    out.a = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.aDls = a.store.listDeadLetters().length;
+    out.aQ = withQ(a.store).filter(x => x.quarantine);
+    // three txs of 60 commitments on three blocks: the writes of the first two reach the budget,
+    // so the tick stops before the third block
+    const b = mk();
+    for (let i = 0; i < 4; i++) b.c.mine();
+    for (let t = 0; t < 3; t++)
+      for (let i = 0; i < 60; i++)
+        b.c.injectLog(b.cfg.startBlock + t, {
+          address: AGG,
+          ...sc(BigInt(1000 * t + i + 1), 3n),
+          index: i,
+          transactionHash: ethers.id(`r6-tx-${t}`),
+        });
+    for (let i = 0; i < 4; i++) b.c.mine();
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    out.bDls = b.store.listDeadLetters();
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  const bTx = new Set(out.bDls.map(x => x.txHash));
+  cell(
+    "follow-up R6: 2100 commitments in one tx are one quarantine (no per-commitment writes); commitments spend the budget one write each, so three 60-commitment txs stop the tick before the third block",
+    out.a.ok &&
+      out.aDls === 0 &&
+      out.aQ.length === 1 &&
+      out.aQ[0].entries === 2100 &&
+      /more than 300 commitments/.test(out.aQ[0].reasons.join(" ")) &&
+      out.b.ok &&
+      out.b.budgetStopThisTick &&
+      out.b.cursor === out.b.scanned[0] + 1 &&
+      !out.bDls.some(x => x.txHash === ethers.id("r6-tx-2")),
+    {
+      a: [out.a.ok, out.aDls, out.aQ.length, out.aQ[0]?.entries, out.aQ[0]?.reasons],
+      b: [
+        out.b.ok,
+        out.b.cursor,
+        out.b.scanned,
+        out.b.budgetStopThisTick,
+        out.bDls.length,
+        bTx.size,
+      ],
+    }
+  );
+}
+
+// ---- follow-up #2 R6: two distinct deep logs of one tx stay two observations, through retries
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-deeptx-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("dt-a"), addr("dt-b")]);
+  const nest = leaf => {
+    let v = leaf;
+    for (let i = 0; i < 10_000; i++) v = [v];
+    return v;
+  };
+  const h = ethers.id("dt-tx");
+  let w1, w3;
+  try {
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("a"),
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("b"),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: h,
+    });
+    // the first tick fails at its cursor write, so the same range is read again while the dead
+    // letter is open: the fresh copies must match their stored placeholders, not add to them
+    const setCursor = store.setCursor.bind(store);
+    store.setCursor = () => {
+      store.setCursor = setCursor;
+      throw new Error("injected cursor write failure");
+    };
+    await runOnce(c.chain, cfg, store, rs, ident);
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("a"),
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("b"),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: h,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    w1 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    for (let i = 0; i < 2; i++) await runOnce(c.chain, cfg, store, rs, ident);
+    w3 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const shas = w => new Set(w.map(x => x.rawSha256).filter(Boolean));
+  cell(
+    "follow-up R6: two distinct 10 000-deep logs of one tx are two stored observations with distinct digests, unchanged by a re-read of the same range and by retries",
+    w1.length === 2 &&
+      shas(w1).size === 2 &&
+      w3.length === 2 &&
+      JSON.stringify(w3) === JSON.stringify(w1),
+    { n1: w1.length, s1: shas(w1).size, n3: w3.length }
+  );
+}
+// ---- follow-up #2 R7: the same for logs 100 deep (storable as JSON, but past MAX_EVIDENCE_DEPTH)
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-deeptx100-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  for (let i = 0; i < 4; i++) c.mine();
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("dt-a"), addr("dt-b")]);
+  const nest = leaf => {
+    let v = leaf;
+    for (let i = 0; i < 100; i++) v = [v];
+    return v;
+  };
+  const h = ethers.id("dt-tx-100");
+  let w1, w3;
+  try {
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("a"),
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("b"),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: h,
+    });
+    // the first tick fails at its cursor write, so the same range is read again while the dead
+    // letter is open: the fresh copies must match their stored placeholders, not add to them
+    const setCursor = store.setCursor.bind(store);
+    store.setCursor = () => {
+      store.setCursor = setCursor;
+      throw new Error("injected cursor write failure");
+    };
+    await runOnce(c.chain, cfg, store, rs, ident);
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("a"),
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: nest("b"),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: h,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    w1 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    for (let i = 0; i < 2; i++) await runOnce(c.chain, cfg, store, rs, ident);
+    w3 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const shas = w => new Set(w.map(x => x.rawSha256).filter(Boolean));
+  cell(
+    "follow-up R7: two distinct 100-deep logs of one tx are two stored observations with distinct digests, unchanged by a re-read of the same range and by retries",
+    w1.length === 2 &&
+      shas(w1).size === 2 &&
+      w3.length === 2 &&
+      JSON.stringify(w3) === JSON.stringify(w1),
+    { n1: w1.length, s1: shas(w1).size, n3: w3.length }
+  );
+}
+
+// ---- follow-up #2 R7: stored evidence thousands deep is decoded without recursion (retries run,
+// attempts count); one tx's watched logs and one block's records are bounded
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r7-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d) };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r7-a"), addr("r7-b")]);
+  const out = {};
+  try {
+    // a log whose data is 6000 nested objects: a dead letter, retried on later ticks
+    const a = mk();
+    for (let i = 0; i < 4; i++) a.c.mine();
+    let deep = "x";
+    // 6000: still storable as JSON, but deeper than any recursive decoder survives
+    for (let i = 0; i < 6000; i++) deep = { a: deep };
+    const h = ethers.id("r7-deep");
+    a.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: deep,
+      blockNumber: a.cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    });
+    out.a1 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.a2 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.a3 = (await runOnce(a.c.chain, a.cfg, a.store, rs, ident)).status;
+    out.aAtt = a.store.getDeadLetter(`tx-${h.toLowerCase()}`)?.attempts;
+    // stored as a placeholder (prefix, length, sha256), so the file stays small: indented JSON of a
+    // 6000-deep value would be tens of MB, rewritten on every retry
+    const dlFile = join(a.store.dir, "deadletters", `tx-${h.toLowerCase()}.json`);
+    out.aBytes = readFileSync(dlFile).length;
+    out.aW = a.store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    // 2100 watched SP logs in one tx: one quarantine, no records or dead letters each
+    const b = mk();
+    for (let i = 0; i < 3; i++) b.c.mine();
+    for (let i = 0; i < 2100; i++)
+      b.c.injectLog(b.cfg.startBlock + 1, {
+        address: SP,
+        ...gs,
+        index: i,
+        transactionHash: ethers.id("r7-big"),
+      });
+    for (let i = 0; i < 4; i++) b.c.mine();
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    out.bRecs = b.store.countRecords();
+    out.bQ = withQ(b.store).filter(x => x.quarantine);
+    // healthy txs in one block, 2105 records: records never count towards the per-block cap, so all
+    // three txs are recorded and nothing is quarantined (#404 review B1)
+    const e = mk();
+    const ev = (n, tag) =>
+      Array.from({ length: n }, (_, i) => ({
+        name: "SlashCancelled",
+        args: [addr(`${tag}-${i}`)],
+      }));
+    const t1 = e.c.ownerTx(ev(1500, "r7-t1"));
+    e.c.ownerTx(ev(600, "r7-t2"), { atBlock: t1.block });
+    const t3 = e.c.ownerTx(ev(5, "r7-t3"), { atBlock: t1.block });
+    for (let i = 0; i < 4; i++) e.c.mine();
+    out.e = (await runOnce(e.c.chain, e.cfg, e.store, rs, ident)).status;
+    out.eRecs = e.store.countRecords();
+    out.eQ = withQ(e.store).filter(x => x.quarantine);
+    out.eT3 = readdirSync(join(e.store.dir, "records")).some(f =>
+      f.includes(t3.hash.toLowerCase().slice(2))
+    );
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R7: 6000-deep evidence is stored as a small placeholder and retried (ticks ok, attempts count); 2100 watched logs in one tx are one quarantine; 2105 healthy records in one block are all kept (records never fill the per-block cap)",
+    out.a1.ok &&
+      out.a2.ok &&
+      out.a3.ok &&
+      out.aAtt >= 3 &&
+      out.aBytes < 100_000 &&
+      out.aW.length === 1 &&
+      /^0x[0-9a-f]{64}$/.test(out.aW[0].rawSha256 ?? "") &&
+      out.b.ok &&
+      out.bRecs === 1 &&
+      out.bQ.length === 1 &&
+      out.bQ[0].entries === 2100 &&
+      out.e.ok &&
+      out.eRecs === 2105 &&
+      out.eT3 &&
+      out.eQ.length === 0,
+    {
+      a: [out.a1.ok, out.a2.ok, out.a2.lastError, out.a3.ok, out.aAtt, out.aBytes, out.aW.length],
+      b: [out.b.ok, out.bRecs, out.bQ.length, out.bQ[0]?.entries],
+      e: [out.e.ok, out.e.lastError, out.eRecs, out.eT3, out.eQ.length, out.eQ[0]?.entries],
+    }
+  );
+}
+
+// ---- follow-up #2 R8: trace flattening is linear; traces past the EVM call-depth limit are
+// refused; persisted reasons are bounded
+{
+  const A = AGG;
+  const N = 30_000;
+  const big = {
+    type: "CALL",
+    from: addr("r8-from"),
+    to: SP,
+    input: "0x12345678",
+    calls: Array.from({ length: N }, () => ({
+      type: "CALL",
+      from: SP,
+      to: addr("r8-to"),
+      input: "0x",
+    })),
+    logs: Array.from({ length: N }, (_, i) => ({
+      address: SP,
+      topics: [ethers.id("t")],
+      data: "0x",
+      position: i,
+    })),
+  };
+  const t0 = Date.now();
+  const flat = flattenTraceLogs(big, A, SP);
+  const ms = Date.now() - t0;
+  const chain = n => {
+    let f = { type: "CALL", from: addr("r8-x"), to: addr("r8-y"), input: "0x" };
+    for (let i = 1; i < n; i++)
+      f = { type: "CALL", from: addr("r8-x"), to: addr("r8-y"), input: "0x", calls: [f] };
+    return f;
+  };
+  const many = Array.from({ length: 50 }, (_, i) => `step ${i}: ` + "p".repeat(10_000));
+  const br = boundReasons({ reasons: many, lastReasons: ["short"] });
+  const want = createHash("sha256");
+  for (const x of many) want.update(x + "\n");
+  // through the store: a dead letter keeps the bound
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-reasons-"));
+  let stored;
+  try {
+    const st = new Store(d);
+    st.putDeadLetter({
+      route: "tx",
+      txHash: ethers.id("r8-dl"),
+      blockNumber: 1,
+      reasons: many,
+      seenAt: "x",
+    });
+    stored = readFileSync(
+      join(d, "deadletters", `tx-${ethers.id("r8-dl").toLowerCase()}.json`)
+    ).length;
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R8: 30 000 logs beside 30 000 calls flatten in linear time; a trace of 1025 frames passes and 1026 is refused; persisted reasons keep 10 of at most 512 characters with the total and the sha256 of the full list",
+    flat?.length === N &&
+      ms < 3000 &&
+      traceDepthOk(chain(1025)) &&
+      !traceDepthOk(chain(1026)) &&
+      br.reasons.length === 10 &&
+      br.reasons.every(x => x.length <= 513) &&
+      br.reasonsTotal === 50 &&
+      br.reasonsSha256 === `0x${want.digest("hex")}` &&
+      br.lastReasons.length === 1 &&
+      br.lastReasonsTotal === undefined &&
+      stored < 20_000,
+    {
+      n: flat?.length,
+      ms,
+      d1025: traceDepthOk(chain(1025)),
+      d1026: traceDepthOk(chain(1026)),
+      r: br.reasons.length,
+      tot: br.reasonsTotal,
+      stored,
+    }
+  );
+}
+
+// ---- follow-up #2 R9: a trace whose calls or logs are not arrays is refused (both validators);
+// a dead-letter retry obeys the same admission limits as fresh evidence
+{
+  const bad = [
+    { type: "CALL", calls: { length: "Infinity" } },
+    { type: "CALL", calls: [{ type: "CALL", calls: { length: 5 } }] },
+    { type: "CALL", logs: { length: 3 } },
+  ];
+  const good = { type: "CALL", calls: [{ type: "CALL", logs: [] }], logs: [] };
+  const units =
+    bad.every(t => !traceDepthOk(t) && !recheckDepthOk(t)) &&
+    traceDepthOk(good) &&
+    recheckDepthOk(good);
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r9-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r9-a"), addr("r9-b")]);
+  let st, recs, q, open;
+  try {
+    for (let i = 0; i < 4; i++) c.mine();
+    const blk = cfg.startBlock + 1;
+    const h = ethers.id("r9-legacy");
+    // the tick scans from after the dead letter's block, so only the retry sees these logs
+    cfg.startBlock = c.head() + 1;
+    for (let i = 0; i < 2501; i++)
+      c.injectLog(blk, { address: SP, ...gs, index: i, transactionHash: h });
+    for (let i = 0; i < 4; i++) c.mine();
+    // a dead letter written without stored evidence (legacy): its retry re-reads by hash
+    store.putDeadLetter({
+      route: "tx",
+      txHash: h,
+      blockNumber: blk,
+      status: "ERROR",
+      reasons: ["legacy"],
+      events: [],
+      seenAt: "x",
+    });
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    recs = readdirSync(join(d, "records")).filter(f => !f.startsWith("quarantine-")).length;
+    q = withQ(store).filter(x => x.quarantine);
+    open = store.getDeadLetter(`tx-${h.toLowerCase()}`);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R9: traces with non-array calls/logs are refused by both validators; a legacy dead letter whose re-read returns 2501 logs is one quarantine (no record each), and resolved",
+    units && st.ok && recs === 0 && q.length === 1 && q[0].entries === 2501 && open === null,
+    { units, ok: st.ok, err: st.lastError, recs, q: q.length, entries: q[0]?.entries, open: !!open }
+  );
+}
+
+// ---- follow-up #2 R9: receipt logs given out of order are placed by their position (no sort)
+{
+  const l1 = { address: SP, topics: [ethers.id("o1")], data: "0x01" };
+  const l2 = { address: SP, topics: [ethers.id("o2")], data: "0x02" };
+  const l3 = { address: SP, topics: [ethers.id("o3")], data: "0x03" };
+  const trace = {
+    type: "CALL",
+    from: addr("ord-from"),
+    to: SP,
+    input: "0x12345678",
+    logs: [l1, l2, l3],
+  };
+  const receipt = [
+    { ...l3, index: 12 },
+    { ...l1, index: 10 },
+    { ...l2, index: 11 },
+  ];
+  const r = attributeLogs(trace, receipt, AGG, SP);
+  const swapped = attributeLogs(
+    trace,
+    [
+      { ...l2, index: 10 },
+      { ...l1, index: 11 },
+      { ...l3, index: 12 },
+    ],
+    AGG,
+    SP
+  );
+  cell(
+    "follow-up R9: receipt logs out of order align by their positions; logs at swapped positions do not",
+    r.aligned &&
+      [10, 11, 12].every(p => r.spCall.get(p)?.from === addr("ord-from")) &&
+      !swapped.aligned,
+    { aligned: r.aligned, why: r.why, swapped: swapped.aligned }
+  );
+}
+
+// ---- follow-up #2 R10: evidence carrying the encoder's own tag keys round-trips exactly;
+// retirements are numbered by a durable counter; the rechecker appends without spreads
+{
+  const tag = v =>
+    JSON.stringify(v, (k, x) => (typeof x === "bigint" ? { "#bigint": x.toString() } : x));
+  const samples = [
+    { data: { $obj: 0, nested: { $obj: { lost: "original wrapper" } } } },
+    { data: { $obj: 1, inner: { $bigint: "5" } } },
+    { $bigint: "7" },
+    { $obj: { $obj: { $bigint: "9" } } },
+    { n: 5n, m: { $bigint: "5" }, k: [{ $obj: 2 }, 3n] },
+  ];
+  // twice through storage: what a retry does
+  const round = v => nativeEvidence(typedEvidence(nativeEvidence(typedEvidence([v]))))[0];
+  const rt = samples.map(v => tag(round(v)) === tag(v));
+  // retirements: five of one id are five files; a lost counter is rebuilt
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-retire-"));
+  const id = `tx-${ethers.id("rt").toLowerCase()}`;
+  let names;
+  try {
+    const st = new Store(d);
+    const put = () =>
+      st.putDeadLetter({
+        route: "tx",
+        txHash: ethers.id("rt"),
+        blockNumber: 1,
+        reasons: ["x"],
+        seenAt: "x",
+      });
+    for (let i = 0; i < 3; i++) {
+      put();
+      st.retireDeadLetter(id);
+    }
+    rmSync(join(d, "deadletters", `${id}.json.exhausted-next`));
+    for (let i = 0; i < 2; i++) {
+      put();
+      st.retireDeadLetter(id);
+    }
+    names = readdirSync(join(d, "deadletters"))
+      .filter(f => /\.exhausted(\.\d+)?$/.test(f))
+      .sort();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const base = `${id}.json`;
+  const want = [
+    `${base}.exhausted`,
+    `${base}.exhausted.2`,
+    `${base}.exhausted.3`,
+    `${base}.exhausted.4`,
+    `${base}.exhausted.5`,
+  ].sort();
+  // the rechecker: 150 000 logs in one page
+  const many = Array.from({ length: 150_000 }, (_, i) => ({ i }));
+  let found, err;
+  try {
+    found = await findEntryLogs({ getLogs: async () => many }, addr("reg"), 1n, 1, 1);
+  } catch (e) {
+    err = e.message;
+  }
+  cell(
+    "follow-up R10: evidence with nested $obj/$bigint keys round-trips exactly through storage twice; five retirements of one id are five numbered files (a lost counter is rebuilt); the rechecker takes 150 000 logs of one page without a spread",
+    rt.every(Boolean) && j(names) === j(want) && found?.length === 150_000,
+    { rt, names, err, n: found?.length }
+  );
+}
+
+// ---- follow-up #2 R11: huge shallow evidence is a small placeholder; a __proto__ key never fakes
+// log fields; malformed strings keep their case; falsy fields are kept; sampling is bounded
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r11-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d), d };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r11-a"), addr("r11-b")]);
+  const out = {};
+  try {
+    // (a) a 1 000 000-character data value
+    const a = mk();
+    for (let i = 0; i < 4; i++) a.c.mine();
+    const ha = ethers.id("r11-big");
+    a.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: "z".repeat(1_000_000),
+      blockNumber: a.cfg.startBlock,
+      index: 0,
+      transactionHash: ha,
+    });
+    await runOnce(a.c.chain, a.cfg, a.store, rs, ident);
+    out.aBytes = readFileSync(join(a.d, "deadletters", `tx-${ha.toLowerCase()}.json`)).length;
+    out.aW = a.store.getDeadLetter(`tx-${ha.toLowerCase()}`)?.watched ?? [];
+    // (b) a log whose fields sit under an own __proto__ key, next to a reserved key
+    const b = mk();
+    for (let i = 0; i < 4; i++) b.c.mine();
+    const hb = ethers.id("r11-proto");
+    b.c.injectRawResult(
+      SP,
+      JSON.parse(
+        JSON.stringify({
+          source: "agg",
+          transactionHash: hb,
+          blockNumber: b.cfg.startBlock,
+          index: 0,
+        }).replace(/^\{/, `{"__proto__":${JSON.stringify({ address: SP, ...gs })},`)
+      )
+    );
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    out.bRecs = b.store.countRecords();
+    out.bDl = !!b.store.getDeadLetter(`tx-${hb.toLowerCase()}`);
+    // nothing inherited reaches the evidence: the stored observation has no address or topics
+    out.bW = b.store.getDeadLetter(`tx-${hb.toLowerCase()}`)?.watched ?? [];
+    // (c) two observations differing only in the case of a malformed string
+    const c3 = mk();
+    for (let i = 0; i < 4; i++) c3.c.mine();
+    const hc = ethers.id("r11-case");
+    // ...and an explicit null is kept as received
+    c3.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: "0x",
+      logIndex: null,
+      blockNumber: c3.cfg.startBlock,
+      index: 1,
+      transactionHash: hc,
+    });
+    for (const data of ["BAD", "bad"])
+      c3.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        data,
+        blockNumber: c3.cfg.startBlock,
+        index: 0,
+        transactionHash: hc,
+      });
+    await runOnce(c3.c.chain, c3.cfg, c3.store, rs, ident);
+    const cAll = c3.store.getDeadLetter(`tx-${hc.toLowerCase()}`)?.watched ?? [];
+    out.cW = cAll.map(w => w.data).filter(x => x !== "0x");
+    out.cNull = cAll.some(
+      w => w.data === "0x" && Object.hasOwn(w, "logIndex") && w.logIndex === null
+    );
+    // (d) a real tx whose getLogs copy says blockHash: false: kept as received, never a record
+    const e = mk();
+    const k = e.c.ownerTx([{ name: "SlashCancelled", args: [addr("r11-op")] }]);
+    for (let i = 0; i < 4; i++) e.c.mine();
+    e.c.patchLogs(k.hash, { blockHash: false });
+    for (let i = 0; i < 3; i++) await runOnce(e.c.chain, e.cfg, e.store, rs, ident);
+    out.eW = e.store.getDeadLetter(`tx-${k.hash.toLowerCase()}`)?.watched ?? [];
+    out.eRecs = e.store.countRecords();
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  // (e) trace sampling: a block listing 20 000 transactions whose receipts are null
+  let lookups = 0;
+  const fake = {
+    send: async m =>
+      m === "eth_getBlockByNumber"
+        ? {
+            hash: ethers.id("blk"),
+            transactions: Array.from({ length: 20_000 }, (_, i) => ethers.id(`s-${i}`)),
+          }
+        : null,
+    getTransactionReceipt: async () => {
+      lookups++;
+      return null;
+    },
+  };
+  const v = await verifyTrace(fake, { aggregator: AGG, roles: { superPaymaster: SP } }, 100);
+  cell(
+    "follow-up R11: a 1 MB data value is a small placeholder; fields under a __proto__ key are not log fields (no record); 'BAD' and 'bad' stay two observations; blockHash: false is kept and never becomes a record; trace sampling looks at a bounded number of receipts",
+    out.aBytes < 100_000 &&
+      out.aW[0]?.rawLength > 1_000_000 &&
+      /^0x[0-9a-f]{64}$/.test(out.aW[0]?.rawSha256 ?? "") &&
+      out.b.ok &&
+      out.bRecs === 0 &&
+      out.bDl &&
+      out.bW.length === 1 &&
+      out.bW[0].address === undefined &&
+      out.bW[0].topics === undefined &&
+      out.cNull &&
+      out.cW.length === 2 &&
+      out.cW.includes("BAD") &&
+      out.cW.includes("bad") &&
+      out.eW.some(w => w.blockHash === false) &&
+      out.eRecs === 0 &&
+      v.state === "unverified" &&
+      lookups <= 200,
+    {
+      aBytes: out.aBytes,
+      aLen: out.aW[0]?.rawLength,
+      b: [out.b.ok, out.bRecs, out.bDl, out.bW],
+      cNull: out.cNull,
+      c: out.cW,
+      e: [out.eW.map(w => w.blockHash), out.eRecs],
+      v: v.state,
+      lookups,
+    }
+  );
+}
+
+// ---- DSR 97a9d55c: status reports the tick's duration and the archive size; a tick slower than
+// maxTickFraction of the interval is degraded
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-timing-"));
+  const c = makeChain();
+  const base = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  let fast, slow;
+  try {
+    c.ownerTx([{ name: "SlashCancelled", args: [addr("tm-op")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const store = new Store(d);
+    fast = (await runOnce(c.chain, { ...base, intervalMs: 600_000 }, store, rs, ident)).status;
+    // capability verification made slow (20 ms per receipt): the tick time must include it
+    const slowChain = Object.create(c.chain);
+    slowChain.getTransactionReceipt = async h => {
+      await new Promise(r => setTimeout(r, 20));
+      return c.chain.getTransactionReceipt(h);
+    };
+    // a fresh store, so capability verification runs (no stored proof yet)
+    const d2 = mkdtempSync(join(tmpdir(), "guardian-watcher-timing2-"));
+    try {
+      // scanning starts after the owner tx: only the capability check (which samples recent
+      // blocks) reads a receipt, so the slowness can come from finish() alone
+      const cfgSlow = { ...base, startBlock: c.head() + 1, intervalMs: 20 };
+      slow = (await runOnce(slowChain, cfgSlow, new Store(d2), rs, ident)).status;
+    } finally {
+      rmSync(d2, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "status reports tickMs and archiveFiles; a tick slower than maxTickFraction of the interval is degraded",
+    Number.isFinite(fast.tickMs) &&
+      fast.archiveFiles >= 1 &&
+      !(fast.degraded ?? []).some(r => /tick took/.test(r)) &&
+      (slow.degraded ?? []).some(r => /tick took \d+ ms, more than 10 ms/.test(r)) &&
+      slow.tickMs >= 20 &&
+      slow.healthy === false,
+    { fast: [fast.tickMs, fast.archiveFiles, fast.degraded], slow: [slow.tickMs, slow.degraded] }
+  );
+}
+
+// ---- follow-up #2 R12: a missing field and an explicit null are two observations, through
+// retries; evidence size is measured as encoded bytes
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r12-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r12-a"), addr("r12-b")]);
+  const h = ethers.id("r12-null");
+  const hn = ethers.id("r12-nul");
+  let w1, w3, nul;
+  try {
+    for (let i = 0; i < 4; i++) c.mine();
+    const { data, ...noData } = {
+      address: SP,
+      ...gs,
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    };
+    void data;
+    c.injectRawResult(SP, noData);
+    c.injectRawResult(SP, { ...noData, data: null });
+    // 20 000 NUL characters: 20 000 characters, but 120 000 bytes of JSON
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: "\u0000".repeat(20_000),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: hn,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    w1 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    for (let i = 0; i < 2; i++) await runOnce(c.chain, cfg, store, rs, ident);
+    w3 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    nul = store.getDeadLetter(`tx-${hn.toLowerCase()}`)?.watched ?? [];
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R12: a log missing `data` and one with data: null are two stored observations, unchanged by retries; 20 000 NUL characters (120 KB of JSON) are a placeholder",
+    w1.length === 2 &&
+      w1.some(w => Object.hasOwn(w, "data") && w.data === null) &&
+      w1.some(w => !Object.hasOwn(w, "data")) &&
+      JSON.stringify(w3) === JSON.stringify(w1) &&
+      nul.length === 1 &&
+      /^0x[0-9a-f]{64}$/.test(nul[0].rawSha256 ?? ""),
+    { n1: w1.length, w1, n3: w3.length, nul: nul.map(x => [x.raw?.slice?.(0, 20), x.rawLength]) }
+  );
+}
+
+// ---- config: maxLagBlocks / maxTickFraction are validated; a non-array eth_getLogs answer fails
+// the tick (cursor unchanged), never treated as an empty range
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-cfg-"));
+  const p = join(d, "c.json");
+  const baseCfg = { aggregator: AGG, dataDir: d, startBlock: 1, roles: { superPaymaster: SP } };
+  const tryCfg = extra => {
+    writeFileSync(p, JSON.stringify({ ...baseCfg, ...extra }));
+    try {
+      return loadConfig(p);
+    } catch (e) {
+      return { error: e.message };
+    }
+  };
+  const ok = tryCfg({});
+  const bads = [
+    { maxLagBlocks: 0 },
+    { maxLagBlocks: 1.5 },
+    { maxTickFraction: 0 },
+    { maxTickFraction: "0.5" },
+    { maxTickFraction: 11 },
+  ].map(tryCfg);
+  const good = tryCfg({ maxLagBlocks: 10, maxTickFraction: 0.25 });
+  // a node answering eth_getLogs with an object, not an array
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  for (let i = 0; i < 4; i++) c.mine();
+  const odd = Object.create(c.chain);
+  odd.send = async (m, params) => (m === "eth_getLogs" ? { length: 0 } : c.chain.send(m, params));
+  const store = new Store(join(d, "s"));
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const st = (await runOnce(odd, cfg, store, rs, ident)).status;
+  const cur = store.getCursor();
+  rmSync(d, { recursive: true, force: true });
+  cell(
+    "config: maxLagBlocks and maxTickFraction are validated (defaults 300 and 0.5); a non-array eth_getLogs answer fails the tick and leaves the cursor unset",
+    !ok.error &&
+      ok.maxLagBlocks === 300 &&
+      ok.maxTickFraction === 0.5 &&
+      bads.every(b => /config: (maxLagBlocks|maxTickFraction)/.test(b.error ?? "")) &&
+      good.maxLagBlocks === 10 &&
+      good.maxTickFraction === 0.25 &&
+      st.ok === false &&
+      /not an array/.test(st.lastError ?? "") &&
+      cur === null,
+    { ok, bads, good: [good.maxLagBlocks, good.maxTickFraction], st: [st.ok, st.lastError], cur }
+  );
+}
+
+// ---- #404 review B1: healthy records never crowd a later owner action of the same block into
+// quarantine (the per-block cap counts isolations, not records)
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-b1-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const s4 = x => ethers.id(x).slice(0, 10);
+  let st,
+    owner,
+    q,
+    pub,
+    ownerAtCursor = false,
+    cursorAt = null,
+    ownerBlock = null;
+  try {
+    // tx A: anyone calls updatePrice() emitting 2000 PriceUpdated (2000 public records)
+    const a = c.ownerTx(
+      Array.from({ length: 2000 }, (_, i) => ({
+        name: "PriceUpdated",
+        args: [250000000000n + BigInt(i), BigInt(i)],
+      })),
+      { from: addr("b1-attacker"), data: s4("updatePrice()"), price: 250000000000n }
+    );
+    // tx B: the Safe's GuardianSet in the same block, after A
+    const b = c.ownerTx([{ name: "GuardianSet", args: [addr("b1-g0"), addr("b1-g1")] }], {
+      atBlock: a.block,
+    });
+    for (let i = 0; i < 4; i++) c.mine();
+    // when the cursor is written, the owner record must already be on disk (DSR 41120e87)
+    const setCursor = store.setCursor.bind(store);
+    store.setCursor = cur => {
+      ownerAtCursor = readdirSync(join(d, "records")).some(f => {
+        const r = JSON.parse(readFileSync(join(d, "records", f), "utf8"));
+        return r.txHash === b.hash && r.event === "GuardianSet";
+      });
+      cursorAt = cur.block;
+      return setCursor(cur);
+    };
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    const recs = readdirSync(join(d, "records")).map(f =>
+      JSON.parse(readFileSync(join(d, "records", f), "utf8"))
+    );
+    owner = recs.find(r => r.txHash === b.hash && r.event === "GuardianSet");
+    pub = recs.filter(r => r.txHash === a.hash).length;
+    q = recs.filter(r => r.quarantine).length;
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "#404 B1: 2000 public PriceUpdated records then an owner GuardianSet last in the same block: the owner action is a full owner-route record, already on disk when the cursor moves past its block; nothing quarantined",
+    st.ok &&
+      pub === 2000 &&
+      owner?.route === "owner" &&
+      q === 0 &&
+      ownerAtCursor &&
+      cursorAt >= ownerBlock,
+    {
+      ok: st.ok,
+      err: st.lastError,
+      pub,
+      owner: owner && [owner.route, owner.event],
+      q,
+      ownerAtCursor,
+      cursorAt,
+      ownerBlock,
+    }
+  );
+}
+
+// ---- #404 review L2-L4: renames and writes fsync their directory; a corrupt conflict file is kept
+// as .invalid; tx facts are first-write-wins
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-l2-"));
+  const synced = [];
+  const spy = dir => synced.push(dir);
+  let l4, l4files;
+  try {
+    writeFileSync(join(d, "a"), "x");
+    renameDurable(join(d, "a"), join(d, "b"), spy);
+    atomicWriteJson(join(d, "c.json"), { v: 1 }, writeSync, spy);
+    // L4: a conflict file with garbage at the address of a new conflicting proof
+    const st = new Store(join(d, "s"));
+    const k = 77n;
+    const am = (tx, ev) => ({
+      key: k.toString(),
+      txHash: tx,
+      provenBy: "trace",
+      provenAt: "t",
+      spEvents: [{ event: ev, logIndex: 1, args: [] }],
+      ruleset: { commit: "0".repeat(40) },
+    });
+    st.putBlsAmendment(k, am(ethers.id("l4-a"), "SlashQueued"));
+    const other = am(ethers.id("l4-b"), "SlashCancelled");
+    const first = st.putBlsAmendment(k, other);
+    const dir = join(d, "s", "amendments");
+    const cfile = readdirSync(dir).find(f => /\.conflict\.[0-9a-f]{64}$/.test(f));
+    writeFileSync(join(dir, cfile), "{ garbage");
+    l4 = [first, st.putBlsAmendment(k, other)];
+    l4files = readdirSync(dir).sort();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "#404 L2/L4: renameDurable and atomicWriteJson fsync the target directory; a corrupt conflict file is kept as .invalid.1 and the proof rewritten",
+    synced.length === 2 &&
+      synced.every(x => x === d) &&
+      j(l4) === j(["conflict", "conflict"]) &&
+      l4files.some(f => /\.conflict\.[0-9a-f]{64}\.invalid\.1$/.test(f)) &&
+      l4files.some(f => /\.conflict\.[0-9a-f]{64}$/.test(f)),
+    { synced, l4, l4files }
+  );
+}
+
+// ---- #404 review Info: a log in the raw JSON-RPC shape a production node returns (hex logIndex and
+// blockNumber, no `index`, lower-case address) goes all the way to a record
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-rawshape-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const toRaw = l => ({
+    address: String(l.address).toLowerCase(),
+    topics: l.topics,
+    data: l.data,
+    blockNumber: ethers.toQuantity(l.blockNumber),
+    blockHash: l.blockHash,
+    transactionHash: l.transactionHash,
+    transactionIndex: "0x0",
+    logIndex: ethers.toQuantity(l.index ?? l.logIndex),
+    removed: false,
+  });
+  const raw = Object.create(c.chain);
+  let shaped = 0;
+  raw.send = async (m, params) => {
+    const r = await c.chain.send(m, params);
+    if (m !== "eth_getLogs" || !Array.isArray(r)) return r;
+    shaped += r.length;
+    return r.map(toRaw);
+  };
+  let st, rec;
+  try {
+    const t = c.ownerTx([{ name: "GuardianSet", args: [addr("raw-g0"), addr("raw-g1")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    st = (await runOnce(raw, cfg, new Store(d), rs, ident)).status;
+    rec = readdirSync(join(d, "records"))
+      .map(f => JSON.parse(readFileSync(join(d, "records", f), "utf8")))
+      .find(r => r.txHash === t.hash);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "#404 Info: a raw JSON-RPC-shaped log (hex logIndex/blockNumber, no index, lower-case address) is recorded on the owner route with no isolation",
+    shaped > 0 &&
+      st.ok &&
+      rec?.route === "owner" &&
+      rec.event === "GuardianSet" &&
+      !st.isolatedThisTick,
+    {
+      shaped,
+      ok: st.ok,
+      err: st.lastError,
+      iso: st.isolatedThisTick,
+      rec: rec && [rec.route, rec.event],
+    }
+  );
 }
 
 // ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)

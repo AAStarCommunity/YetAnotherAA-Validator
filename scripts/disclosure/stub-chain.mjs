@@ -162,7 +162,7 @@ function makeChain() {
         blockNumber: n,
         blockHash: blocks.get(n).hash,
         transactionHash: hash,
-        index: i, // as an ethers v6 Log names it (not logIndex)
+        index: l.index ?? i, // as an ethers v6 Log names it (not logIndex)
       })
     );
   const proposals = new Map(); // DVTValidator id -> { block, operator, slashLevel, evidenceHash }
@@ -215,6 +215,18 @@ function makeChain() {
           f();
         }
         return out;
+      }
+      if (method === "eth_getLogs") {
+        // the raw method: the same answer as getLogs (injected malformed values pass unchanged)
+        const f = params[0] ?? {};
+        const q = x => (typeof x === "string" ? Number(BigInt(x)) : x);
+        return chain.getLogs({
+          address: f.address,
+          topics: f.topics ?? [],
+          ...(f.blockHash !== undefined
+            ? { blockHash: f.blockHash }
+            : { fromBlock: q(f.fromBlock), toBlock: q(f.toBlock) }),
+        });
       }
       if (method === "eth_getStorageAt") {
         const [who, slot, tag] = params;
@@ -720,11 +732,14 @@ function makeChain() {
      * (no selector: "0x"); `to`/`data` model a keeper's direct call, or a call through a contract
      * (then attribution needs a trace: setTrace).
      */
-    ownerTx: (spLogsIn, { from = SAFE, price, to = SP, data = "0x", trace } = {}) => {
-      const n = mine();
-      const hash = ethers.id(`owner-${n}`);
+    ownerTx: (spLogsIn, { from = SAFE, price, to = SP, data = "0x", trace, atBlock } = {}) => {
+      // atBlock: a further tx in an existing block (several txs per block)
+      const n = atBlock ?? mine();
+      const hash = ethers.id(atBlock === undefined ? `owner-${n}` : `owner-${n}-${txs.size}`);
       const rlogs = spLogsIn.map(x => ({ address: SP, ...spIface.encodeEventLog(x.name, x.args) }));
-      rlogs.forEach((l, i) => (l.index = i)); // receipt logs carry their position, as in ethers
+      // receipt logs carry their position, as in ethers; block-wide, after the block's earlier txs
+      const base = atBlock === undefined ? 0 : logs.filter(l => l.blockNumber === n).length;
+      rlogs.forEach((l, i) => (l.index = base + i));
       if (price !== undefined) prices.push({ block: n, price });
       txs.set(hash, {
         tx: { hash, to, from, data },
