@@ -276,7 +276,7 @@ for (let i = 0; i < 120 && !up; i++) {
   await new Promise(r => setTimeout(r, 500));
   if (anvil.exitCode !== null) break;
   try {
-    await p.getBlockNumber();
+    await p.send("eth_blockNumber", []);
     up = true;
   } catch {
     // starting
@@ -319,8 +319,8 @@ const isRevert = e => {
   return inner.code === 3 || /revert/i.test(String(inner.message ?? e?.shortMessage ?? ""));
 };
 const reader = {
-  chainId: async () => Number((await p.getNetwork()).chainId),
-  head: async () => p.getBlockNumber(),
+  chainId: async () => Number(await p.send("eth_chainId", [])),
+  head: async () => Number(await p.send("eth_blockNumber", [])),
   block: async n => {
     const b = await p.send("eth_getBlockByNumber", [ethers.toQuantity(n), false]);
     return b ? { hash: b.hash } : null;
@@ -404,9 +404,15 @@ const reader = {
       const hash = await p.send("eth_sendTransaction", [
         { ...tx, gas: ethers.toQuantity(gasUsed * 2) },
       ]);
-      const rc = await p.waitForTransaction(hash, 1, 30_000);
+      // bounded receipt polling of our own (Codex A7 R9): ethers' waitForTransaction logs RPC
+      // errors to stdout from inside its poller; a failure here throws into the fixed diagnostic
+      let rc = null;
+      for (let i = 0; i < 60 && !rc; i++) {
+        rc = await p.send("eth_getTransactionReceipt", [hash]);
+        if (!rc) await new Promise(r => setTimeout(r, 500));
+      }
       await p.send("anvil_stopImpersonatingAccount", [sender]);
-      out.gasUsedFork = rc && rc.status === 1 ? Number(rc.gasUsed) : undefined;
+      out.gasUsedFork = rc && rc.status === "0x1" ? Number(rc.gasUsed) : undefined;
     } finally {
       // the revert must succeed (Codex A7 R2 #3); the head and hash are re-checked after compare
       if ((await p.send("evm_revert", [snap])) !== true) throw new Infra("evm_revert failed");
@@ -439,7 +445,7 @@ if (opt("address-book") && !opt("pins-commit"))
   unverified.push("address book from --address-book (not SP's pins at the manifest commit)");
 // the probe ran between snapshot and revert: the drills must get exactly the read-back block
 {
-  const head = await p.getBlockNumber();
+  const head = Number(await p.send("eth_blockNumber", []));
   const b = await p.send("eth_getBlockByNumber", [ethers.toQuantity(h.readbackBlock), false]);
   cmp.push({
     path: "fork restored after the probe (head, hash)",
