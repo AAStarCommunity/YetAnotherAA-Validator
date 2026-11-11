@@ -11,6 +11,22 @@
 //   getTransaction(hash), getTransactionReceipt(hash), getBlock(number), call({ to, data, blockTag })
 import { ethers } from "ethers";
 
+/** No deeper than the EVM call-depth limit (1024 frames below the root); iterative. */
+export function traceDepthOk(trace, max = 1025) {
+  const st = [[trace, 1]];
+  while (st.length) {
+    const [f, d] = st.pop();
+    if (!f || typeof f !== "object") continue;
+    if (d > max) return false;
+    // `calls` and `logs`, when present, must be arrays: anything else (an object with a `length`,
+    // say) is not a trace, and code that trusts its length would loop on it (follow-up #2 R9)
+    if (f.calls !== undefined && f.calls !== null && !Array.isArray(f.calls)) return false;
+    if (f.logs !== undefined && f.logs !== null && !Array.isArray(f.logs)) return false;
+    if (Array.isArray(f.calls)) for (const c of f.calls) st.push([c, d + 1]);
+  }
+  return true;
+}
+
 const ABI = ethers.AbiCoder.defaultAbiCoder();
 
 export const TAG = {
@@ -480,6 +496,12 @@ export async function extractCandidates(
       } catch {
         trace = null;
       }
+      // A trace deeper than the EVM's call-depth limit (1024) cannot be real: refused before the
+      // walk, whose per-level paths would otherwise grow with the square of the depth.
+      if (trace && !traceDepthOk(trace)) {
+        trace = null;
+        notes.push("trace deeper than the EVM call-depth limit; not followed");
+      }
     }
     if (!trace) {
       notes.push(
@@ -551,7 +573,11 @@ export async function extractCandidates(
           if (!isSingletonHop) {
             if (!eqAddr(f.to, fw.multiSendCallOnly))
               return notes.push(`${path}: DELEGATECALL subtree not followed`);
-            if ((f.calls || []).some(c => String(c.type).toUpperCase() !== "CALL"))
+            if (
+              (Array.isArray(f.calls) ? f.calls : []).some(
+                c => String(c?.type).toUpperCase() !== "CALL"
+              )
+            )
               return notes.push(`${path}: MultiSend with a non-CALL sub-transaction not followed`);
           }
         }
@@ -565,7 +591,8 @@ export async function extractCandidates(
             await fromDvt(f.input, `${path}.dvtValidator`);
           }
         }
-        for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`, f);
+        const kids = Array.isArray(f.calls) ? f.calls : [];
+        for (let k = 0; k < kids.length; k++) await walk(kids[k], `${path}.${k}`, f);
       };
       await walk(trace, "trace", null);
       traced = true;
@@ -680,7 +707,7 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
         matching.push({ ...c, messageHash: mh });
     }
     if (matching.length === 0) {
-      f.incomplete.push(...found.notes);
+      for (const n of found.notes) f.incomplete.push(n); // no RPC-sized spread
       f.incomplete.push(
         found.candidates.length
           ? "no recovered aggregator call reproduces the SignersCommitted key"
@@ -693,12 +720,14 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
     // aggregator/DVTValidator in a successful tx, or an error-free trace path). A Safe inner call is
     // not proven — execTransaction does not revert when its inner call fails — so until it matches
     // the commitment it is never compared, and it can neither accuse nor hide an honest entry.
-    const distinct = [];
+    // by message hash in a Map: linear however many candidates a trace yields (follow-up #2 R9)
+    const byHash = new Map();
     for (const m of matching) {
-      const d = distinct.find(x => x.messageHash === m.messageHash);
+      const d = byHash.get(m.messageHash);
       if (d) d.proven = d.proven || m.proven;
-      else distinct.push({ ...m });
+      else byHash.set(m.messageHash, { ...m });
     }
+    const distinct = [...byHash.values()];
     const useMessage = c => {
       f.route = c.route;
       Object.assign(f, {
@@ -752,7 +781,7 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
       );
       return { status: null, facts: f, authenticated: true };
     }
-    f.incomplete.push(...found.notes);
+    for (const n of found.notes) f.incomplete.push(n); // no RPC-sized spread
     f.incomplete.push(
       proven.length > 1
         ? "several proven calls claim the same key with different messages"
@@ -818,9 +847,14 @@ export async function findEntryLogs(chain, registry, entryId, fromBlock, toBlock
   while (from <= toBlock) {
     const to = Math.min(toBlock, from + size - 1);
     try {
-      out.push(
-        ...(await chain.getLogs({ address: registry, topics, fromBlock: from, toBlock: to }))
-      );
+      // appended one by one: a spread of an RPC-sized answer overflows the call stack
+      for (const l of await chain.getLogs({
+        address: registry,
+        topics,
+        fromBlock: from,
+        toBlock: to,
+      }))
+        out.push(l);
       from = to + 1;
       size = page;
     } catch (e) {
