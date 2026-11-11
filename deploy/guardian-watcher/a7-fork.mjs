@@ -5,7 +5,7 @@
 //
 //   A7_FORK_URL=<archive RPC> node deploy/guardian-watcher/a7-fork.mjs \
 //     --dump <state.json> --dump-sha256 <hex> --readback <a7-readback.json> \
-//     --address-book <{key: address}.json> --fund <test key address>
+//     (--pins-commit <SP manifest commit> | --address-book <{key: address}.json>) --fund <test key address>
 //     [--anvil <path>] [--schema <file>] [--abi-dir <dir>] [--port 8546] [--record <out.json>] [--keep]
 //
 // Steps, each one fatal on failure:
@@ -48,8 +48,11 @@ const opt = k => {
   const i = args.indexOf(`--${k}`);
   return i >= 0 ? args[i + 1] : undefined;
 };
+// every diagnostic is redacted (Codex A7 R2 #5): an input echoed into a message can hold a URL
 const die = (code, msg) => {
-  console.error(`a7-fork: ${msg}`);
+  console.error(
+    `a7-fork: ${String(msg).replace(/[a-z][a-z0-9+.-]*:\/\/\S*/gi, "(a URL: not shown)")}`
+  );
   process.exit(code);
 };
 const dumpPath = opt("dump");
@@ -114,18 +117,28 @@ if (h.dumpSha256 !== dumpSha) die(1, "the read-back was taken from another dump 
 if (h.anvilCommit !== ANVIL_COMMIT)
   die(1, "the read-back was taken on another anvil commit than the pinned build");
 if (h.hardfork !== "amsterdam") die(1, `read-back hardfork is ${h.hardfork}, expected amsterdam`);
+// the address book: SP's deployments/release/rc8/<chain>.pins.json at the step-13 manifest commit,
+// through the GitHub API (DSR); --address-book only for an offline copy (then unverified)
+const CHAINS = { 11155111: "sepolia", 10: "optimism", 1: "mainnet" };
 let addressBook = null;
 let addressBookSha = null;
-if (opt("address-book")) {
-  const raw = readFileSync(opt("address-book"));
+let addressBookSource = null;
+if (opt("pins-commit") || opt("address-book")) {
+  const pinsPath = `deployments/release/rc8/${CHAINS[h.chainId] ?? h.chainId}.pins.json`;
+  const raw = opt("pins-commit")
+    ? ghRaw(pinsPath, opt("pins-commit"))
+    : readFileSync(opt("address-book"));
+  if (!raw) die(3, `cannot fetch SP ${pinsPath} at the manifest commit`);
+  addressBookSource = opt("pins-commit") ? `${pinsPath} @ ${opt("pins-commit")}` : "offline copy";
   addressBookSha = sha256(raw);
   try {
-    addressBook = JSON.parse(raw.toString("utf8"));
+    const j = JSON.parse(raw.toString("utf8"));
+    addressBook = j && typeof j.addresses === "object" ? j.addresses : j;
   } catch {
     die(1, "address book is not JSON");
   }
   for (const [k, v] of Object.entries(addressBook))
-    if (!ethers.isAddress(v)) die(1, `address book entry ${k} is not an address`);
+    if (!ethers.isAddress(v)) die(1, "an address book entry is not an address");
 }
 
 // ---- 2. SP's committed ABIs and SlashLevel order at header.spCommit
@@ -316,6 +329,12 @@ const reader = {
   // the probe, last; snapshot/revert so the drills get the read-back state; the sender is
   // impersonated (no key); judged: fork receipt gasUsed, upstream simulateV1 gasUsed, upstream
   // eth_call at gas = gasUsed; recorded only: estimates and gas - 1
+  upstreamCodehash: async (a, n) => {
+    const r = await upstream("eth_getCode", [a, ethers.toQuantity(n)]);
+    return typeof r.result === "string" && r.result !== "0x"
+      ? ethers.keccak256(r.result).toLowerCase()
+      : undefined;
+  },
   probe: async ({ sender, initcode, forkBlock, gasUsed }) => {
     const tx = { from: sender, data: initcode };
     const blockTag = ethers.toQuantity(forkBlock);
@@ -346,7 +365,8 @@ const reader = {
       await p.send("anvil_stopImpersonatingAccount", [sender]);
       out.gasUsedFork = rc && rc.status === 1 ? Number(rc.gasUsed) : undefined;
     } finally {
-      await p.send("evm_revert", [snap]);
+      // the revert must succeed (Codex A7 R2 #3); the head and hash are re-checked after compare
+      if ((await p.send("evm_revert", [snap])) !== true) throw new Infra("evm_revert failed");
     }
     return out;
   },
@@ -369,6 +389,25 @@ try {
 }
 const { cmp, unverified } = result;
 for (const k of missingAbi) unverified.push(`abis/ has no file for ${k} (ask SP)`);
+// ABIs or the address book not fetched from SP at the pinned commits are not authenticated
+// (Codex A7 R2 #4): usable for a dry run, never for SAME STATE
+if (opt("abi-dir")) unverified.push("ABIs from --abi-dir (not SP's abis/ at spCommit)");
+if (opt("address-book") && !opt("pins-commit"))
+  unverified.push("address book from --address-book (not SP's pins at the manifest commit)");
+// the probe ran between snapshot and revert: the drills must get exactly the read-back block
+{
+  const head = await p.getBlockNumber();
+  const b = await p.send("eth_getBlockByNumber", [ethers.toQuantity(h.readbackBlock), false]);
+  cmp.push({
+    path: "fork restored after the probe (head, hash)",
+    sp: `${h.readbackBlock} ${h.readbackBlockHash}`,
+    fork: `${head} ${b?.hash}`,
+    ok:
+      head === h.readbackBlock &&
+      !!b?.hash &&
+      b.hash.toLowerCase() === h.readbackBlockHash.toLowerCase(),
+  });
+}
 const failed = cmp.filter(x => !x.ok);
 const proven = !failed.length && !unverified.length;
 
@@ -385,6 +424,7 @@ const record = {
   abiSource: opt("abi-dir") ? "offline copy (--abi-dir)" : `GitHub API at ${h.spCommit}`,
   slashLevels,
   addressBookSha256: addressBookSha,
+  addressBookSource,
   forkHost: (() => {
     try {
       return new URL(forkUrl).hostname;

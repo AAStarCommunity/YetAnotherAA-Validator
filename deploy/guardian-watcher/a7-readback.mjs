@@ -1,4 +1,4 @@
-// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 248ef831, frozen v4;
+// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 3bf4bba2, frozen v5;
 // docs/release/a7/aoa-a7-readback-1.schema.json, read methods in its "x-readMethods") with what THIS
 // script reads from the loaded fork. Pure: every chain read goes through an injected reader, so the
 // rules are self-tested (check-a7-readback.mjs) without a chain.
@@ -19,12 +19,12 @@ import Ajv2020 from "ajv/dist/2020.js";
 import { AbiCoder, keccak256 } from "ethers";
 
 export const SCHEMA_ID = "aoa-a7-readback/1";
-/** sha256 of SP's FROZEN schema file at 248ef831 (DSR-verified; any later change needs DSR
+/** sha256 of SP's FROZEN schema file at 3bf4bba2 (v5, DSR-verified; any later change needs DSR
  * acceptance and a new hash). */
-export const SCHEMA_SHA256 = "a6b9174192bfda61614f4b4b2f98ee9a5a4ae8898a3c73bf060b31d268470f6b";
+export const SCHEMA_SHA256 = "0ac860742f997120cec3a7f185323e090f30371f6e67c27fda200b3a18a6e131";
 export const SCHEMA_SOURCE = {
   repo: "AAStarCommunity/SuperPaymaster",
-  ref: "248ef83180619fdcd0d8603f70996df9c37493aa",
+  ref: "3bf4bba28506a23f7c741f281846340afe2f86a9",
   path: "docs/release/a7/aoa-a7-readback-1.schema.json",
 };
 export const ANVIL_COMMIT = "4e8874b2bdc840929585ca73e170993c50a4a531";
@@ -39,9 +39,11 @@ export const OWNERSHIP_2STEP_SLOT =
 export const KNOWN_PREDICATES = [
   "all(estimateSimulate[p] == gasUsedFork == expected.gasUsed for p if int) and all(callAtGasUsed.values())",
 ];
-/** The inventory (the schema's "SDK pins names"): each must be in the read-back. */
+/** The inventory: the frozen schema v5's contracts.required (20 keys); the self-test asserts the
+ * pinned schema says exactly this. */
 export const REQUIRED_CONTRACTS = [
   "superPaymaster",
+  "spAdminExtension",
   "superPaymasterLens",
   "registry",
   "policyRegistry",
@@ -59,7 +61,29 @@ export const REQUIRED_CONTRACTS = [
   "entryPoint",
   "ownerSafe",
   "multiSendCallOnly",
+  "evaluationCommunityToken",
 ];
+/** Contract-specific fields that MUST be present (x-readMethods; Codex A7 R2 #1): a read-back that
+ * leaves one out is unverified, never silently passed. */
+export const REQUIRED_FIELDS = {
+  blsAggregator: ["guardianSet", "signerMaskOrder", "thresholds"],
+  ownerSafe: ["threshold", "owners", "singleton"],
+  entryPoint: ["deposit", "staked", "stake", "unstakeDelaySec", "withdrawTime"],
+  evaluationCommunityToken: [
+    "creditPolicy",
+    "policyEpoch",
+    "pendingPolicy",
+    "pendingPolicyEta",
+    "issuanceCap",
+    "SUPERPAYMASTER_ADDRESS",
+  ],
+};
+/** Contracts with a role system (x-readMethods v5); every other contract's roles must be "n/a:...". */
+export const ROLE_SYSTEMS = ["registry", "timelockController"];
+/** The canonical EntryPoint v0.7 (x-readMethods "externalVersion"). */
+export const ENTRY_POINT_V07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
+/** Pre-existing (not SP-deployed) contracts: identity = the fork's codehash equals upstream's. */
+export const EXTERNAL_CONTRACTS = ["entryPoint", "multiSendCallOnly"];
 /**
  * contractKey -> SP abis/<file> at header.spCommit. superPaymaster and xPNTsTokenV2Impl use SP's
  * combined ".full" ABIs (core + extension reached through the core's fallback, per the files' own
@@ -74,7 +98,7 @@ export const ABI_FILES = {
   blsAggregator: "BLSAggregator.json",
   dvtValidator: "DVTValidator.json",
   reputationSystem: "ReputationSystem.json",
-  disclosureRegistry: null,
+  disclosureRegistry: null, // DVT's own contract: ABI from the DVT repo at the manifest's DVT commit
   xPNTsFactoryV2: "xPNTsFactoryV2.json",
   xPNTsTokenV2Impl: "xPNTsTokenV2.full.json",
   xPNTsTokenV2Ext: "xPNTsTokenV2Ext.json",
@@ -83,12 +107,15 @@ export const ABI_FILES = {
   aPNTsCapped: "APNTsCapped.json",
   gTokenStaking: "GTokenStaking.json",
   entryPoint: "EntryPoint.json",
-  ownerSafe: null,
-  multiSendCallOnly: null,
+  ownerSafe: null, // SP to add the official safe-smart-account release ABI (tag + sha256)
+  multiSendCallOnly: null, // likewise
+  evaluationCommunityToken: "xPNTsTokenV2.full.json", // an xPNTs v2 token instance (core + ext)
+  timelockController: "TimelockController.json",
 };
 /** Safe getters (x-readMethods "ownerSafe"): typed reads only; Safe's ABI is not in SP's abis/, so
  * absence (null) on the Safe is never decided from this. */
 export const SAFE_GETTERS = [
+  "function VERSION() view returns (string)",
   "function getThreshold() view returns (uint256)",
   "function getOwners() view returns (address[])",
 ];
@@ -248,7 +275,22 @@ export async function compare(rb, reader, facts) {
     }
     const a = c.address;
     addrOf[key] = a;
+    // the contract-specific fields the read methods require (Codex A7 R2 #1): ours, not the file's
+    for (const f of REQUIRED_FIELDS[key] ?? [])
+      if (!(f in c)) unverified.push(`${P}.${f} (missing from the read-back)`);
+    if (key === "entryPoint")
+      check(
+        `${P}.address=canonical EntryPoint v0.7`,
+        ENTRY_POINT_V07,
+        a,
+        lc(a) === lc(ENTRY_POINT_V07)
+      );
     const codehash = await codehashAt(a);
+    // a pre-existing contract's identity is its code: the fork's must be upstream's at forkBlock
+    if (EXTERNAL_CONTRACTS.includes(key)) {
+      const upHash = await reader.upstreamCodehash(a, h.forkBlock);
+      check(`${P}.codehash=upstream`, upHash, codehash, !!upHash && upHash === codehash);
+    }
     if (isState(c.codehash)) check(`${P}.codehash`, c.codehash, codehash, codehash === undefined);
     else check(`${P}.codehash`, c.codehash, codehash, codehash === lc(c.codehash));
     const implWord = await reader.slot(a, EIP1967_IMPL);
@@ -303,8 +345,12 @@ export async function compare(rb, reader, facts) {
       );
     }
 
-    for (const k of ["version", "owner", "pendingOwner", "guardian"])
-      await field(`${P}.${k}`, iface, key, a, k, c[k]);
+    for (const k of ["version", "owner", "pendingOwner", "guardian"]) {
+      // the Safe exposes VERSION(), not version() (x-readMethods v5)
+      if (key === "ownerSafe" && k === "version")
+        await field(`${P}.version`, facts.safe, key, a, "VERSION", c.version);
+      else await field(`${P}.${k}`, iface, key, a, k, c[k]);
+    }
     // Registry: pendingOwner() cross-checked against its ERC-7201 slot (x-readMethods)
     if (key === "registry" && !isState(c.pendingOwner)) {
       const w = await reader.slot(a, OWNERSHIP_2STEP_SLOT);
@@ -326,6 +372,7 @@ export async function compare(rb, reader, facts) {
       if (key === "blsAggregator" && ["guardianSet", "signerMaskOrder", "thresholds"].includes(k))
         continue; // below
       if (key === "ownerSafe" && ["threshold", "owners", "singleton"].includes(k)) continue; // below
+      if (key === "entryPoint" && REQUIRED_FIELDS.entryPoint.includes(k)) continue; // below
       if (!IDENT.test(k) || (v !== null && typeof v === "object")) {
         unverified.push(`${P}.${k} (no read method)`);
         continue;
@@ -334,21 +381,53 @@ export async function compare(rb, reader, facts) {
     }
     if (key === "blsAggregator") await bls(P, iface, a, c);
     if (key === "ownerSafe") await safe(P, a, c);
+    if (key === "entryPoint") await entryPoint(P, iface, a, c);
+  }
+
+  // EntryPoint v0.7: getDepositInfo(superPaymaster) -> deposit, staked, stake, unstakeDelaySec,
+  // withdrawTime, recorded as fields of contracts.entryPoint (x-readMethods v5)
+  async function entryPoint(P, iface, a, c) {
+    const sp = rb.contracts.superPaymaster?.address;
+    const g =
+      isState(sp) || !sp ? { kind: "nosp" } : await read(iface, a, "getDepositInfo(address)", [sp]);
+    for (const f of REQUIRED_FIELDS.entryPoint) {
+      if (!(f in c)) continue; // already unverified above
+      if (g.kind === "noabi") unverified.push(`${P}.${f} (no ABI)`);
+      else if (g.kind !== "value") check(`${P}.${f}`, c[f], g.kind, false);
+      else {
+        const comp = g.f.outputs[0].components.find(x => x.name === f);
+        if (!comp) check(`${P}.${f}`, c[f], "(no such DepositInfo field)", false);
+        else check(`${P}.${f}`, c[f], g.v[f], sameTyped(comp.type, c[f], g.v[f]));
+      }
+    }
   }
 
   async function roles(P, iface, key, a, c) {
-    const hasRoleF = iface?.getFunction("hasRole(bytes32,address)");
-    const granted = iface?.getEvent("RoleGranted(bytes32,address,address)");
-    const revoked = iface?.getEvent("RoleRevoked(bytes32,address,address)");
-    if (isState(c.roles)) {
-      if (!iface) return unverified.push(`${P}.roles (no ABI)`);
-      return check(`${P}.roles`, c.roles, hasRoleF ? "hasRole in ABI" : null, !hasRoleF);
-    }
+    // only the Registry's own role system and a TimelockController have roles (x-readMethods v5);
+    // every other contract writes "n/a:no role system"
+    if (!ROLE_SYSTEMS.includes(key))
+      return check(
+        `${P}.roles`,
+        c.roles,
+        "(no role system by x-readMethods)",
+        typeof c.roles === "string" && c.roles.startsWith("n/a:")
+      );
     if (!iface) return unverified.push(`${P}.roles (no ABI)`);
-    if (!hasRoleF || !granted || !revoked) {
-      // no AccessControl in SP's ABI: there are no roles to list
-      return check(`${P}.roles`, c.roles, {}, Object.keys(c.roles).length === 0);
-    }
+    const hasRoleF = iface.getFunction("hasRole(bytes32,address)");
+    if (!hasRoleF || isState(c.roles) || typeof c.roles !== "object")
+      return check(`${P}.roles`, c.roles, hasRoleF ? "hasRole in ABI" : "no hasRole", false);
+    // candidates: every role event in SP's ABI whose first two indexed arguments are (role, account)
+    const roleEvents = ["RoleGranted", "RoleRevoked", "RoleRegistered", "RoleExited"]
+      .map(n => iface.getEvent(n))
+      .filter(
+        e =>
+          e &&
+          e.inputs[0]?.type === "bytes32" &&
+          e.inputs[0].indexed &&
+          e.inputs[1]?.type === "address" &&
+          e.inputs[1].indexed
+      );
+    if (!roleEvents.length) return check(`${P}.roles`, "(role events)", "none in ABI", false);
     const src = c.rolesSource;
     if (!src || !Number.isSafeInteger(src.fromBlock) || src.toBlock !== h.readbackBlock)
       return unverified.push(`${P}.roles (no rolesSource {fromBlock, toBlock = readbackBlock})`);
@@ -362,7 +441,7 @@ export async function compare(rb, reader, facts) {
     );
     const logs = await reader.logs({
       address: a,
-      topics: [[granted.topicHash, revoked.topicHash]],
+      topics: [roleEvents.map(e => e.topicHash)],
       fromBlock: src.fromBlock,
       toBlock: h.readbackBlock,
     });
@@ -438,6 +517,23 @@ export async function compare(rb, reader, facts) {
           ours.push({ address: slots[i], pubkeyHash, slot: Number(out[1]), isActive: out[2] });
         }
         const spSet = Array.isArray(c.guardianSet) ? c.guardianSet : [];
+        // the SET, one to one (Codex A7 R2 #2): unique addresses on SP's side, and exactly ours
+        const spAddrs = spSet.map(e => lc(e?.address));
+        const uniq = new Set(spAddrs);
+        check(
+          `${P}.guardianSet.unique`,
+          "no duplicate address",
+          uniq.size === spAddrs.length ? "unique" : "duplicates",
+          uniq.size === spAddrs.length
+        );
+        const oursAddrs = ours.map(o => o.address).sort();
+        check(
+          `${P}.guardianSet.addresses`,
+          [...uniq].sort(),
+          oursAddrs,
+          JSON.stringify([...uniq].sort()) === JSON.stringify(oursAddrs) &&
+            uniq.size === spAddrs.length
+        );
         check(`${P}.guardianSet.length`, spSet.length, ours.length, spSet.length === ours.length);
         for (const e of spSet) {
           const o = ours.find(x => x.address === lc(e?.address));
@@ -455,6 +551,9 @@ export async function compare(rb, reader, facts) {
         }
       }
       if ("signerMaskOrder" in c) {
+        for (const k of Object.keys(c.signerMaskOrder ?? {}))
+          if (!["source", "bits"].includes(k))
+            unverified.push(`${P}.signerMaskOrder.${k} (no read method)`);
         // bit i selects slot i+1
         const bits = Array.isArray(c.signerMaskOrder?.bits) ? c.signerMaskOrder.bits.map(lc) : null;
         if (!bits) check(`${P}.signerMaskOrder.bits`, c.signerMaskOrder, null, false);
@@ -476,6 +575,11 @@ export async function compare(rb, reader, facts) {
         check(`${P}.thresholds`, t, null, false);
         return;
       }
+      // every SlashLevel must be listed (x-readMethods: slashThresholds(level) for each SlashLevel)
+      if (!facts.slashLevels) unverified.push(`${P}.thresholds (SlashLevel order unknown)`);
+      else
+        for (const lvl of Object.keys(facts.slashLevels))
+          if (!(lvl in t)) unverified.push(`${P}.thresholds.${lvl} (missing from the read-back)`);
       for (const [name, v] of Object.entries(t)) {
         const Q = `${P}.thresholds.${name}`;
         // a related constant with its own getter (minThreshold, SLASH_THRESHOLD_FLOOR, ...)
@@ -550,7 +654,8 @@ export async function compare(rb, reader, facts) {
       const l = ref(two[1]);
       const r = ref(two[2]);
       if (!l || !r || typeof v !== "boolean") {
-        unverified.push(`${P} (unresolvable)`);
+        // e.g. "x.creditPolicy == OFF": the right side must name a getter too (x.POLICY_OFF)
+        unverified.push(`${P} (unresolvable: both sides must be <contractKey>.<getter>)`);
         continue;
       }
       const gl = await readRef(l);
