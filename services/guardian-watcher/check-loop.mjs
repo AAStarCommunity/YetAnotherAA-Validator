@@ -3607,6 +3607,38 @@ const good = {
       );
       rmSync(d, { recursive: true, force: true });
     }
+    // (j) #425 approval Low: switched back to the old registry while waiting, the wait marker clears
+    // and the stage resumes there as the current one (no fresh signature, not degraded)
+    {
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "j" });
+      b.chain.nonce = 5;
+      b.chain.known.add(x.old.hash);
+      await pass(x.store, b);
+      const waited = x.store.getPublication(id).registryWait?.nonce;
+      const back = sinks({ registryAddress: OLD, rawTag: "j2", mine: "pending" });
+      back.chain.nonce = 5;
+      back.chain.known.add(x.old.hash);
+      const pb = await pass(x.store, back);
+      const jb = x.store.getPublication(id);
+      cell(
+        "B2-A(j): switched back to the old registry while waiting, the wait marker clears and the old stage resumes as current: no fresh signature, no nonce-wait, not migrating",
+        waited === 5 &&
+          !jb.registryWait &&
+          jb.registry.at?.address === OLD &&
+          jb.registry.hash === x.old.hash &&
+          back.calls.sign === 0 &&
+          pb.stalls.nonceWait === 0 &&
+          pb.stalls.migrating === 0,
+        {
+          waited,
+          jb: [jb.registryWait, jb.registry.at, jb.registry.hash],
+          sign: back.calls.sign,
+          stalls: pb.stalls,
+        }
+      );
+      rmSync(x.d, { recursive: true, force: true });
+    }
     // (f) another writer (the M0 §5.5a recovery) or another chain has its own nonce space: no wait;
     // a stage already waiting is archived at once when the chain changes (Codex W2d R7 #1)
     {
