@@ -270,12 +270,35 @@ contract SpEvidenceParityTest is Test {
 );
 const harnessText = readFileSync(join(out, TEST), "utf8");
 
+// Forge inherits nothing that could change what it compiles: FOUNDRY_* / DAPP_* overrides (an
+// inherited remapping could redirect an import) are dropped (Codex R2 #2).
+const forgeEnv = Object.fromEntries(
+  Object.entries(process.env).filter(([k]) => !/^(FOUNDRY_|DAPP_)/.test(k))
+);
+// forge-std, authenticated by the blobs git has for this repo's checkout of it
+const forgeStdBlobs = (() => {
+  const m = new Map();
+  let listing;
+  try {
+    listing = execFileSync("git", ["-C", forgeStd, "ls-files", "-s", "src"], { encoding: "utf8" });
+  } catch {
+    infra("cannot list forge-std's tracked files");
+  }
+  for (const line of listing.split("\n")) {
+    const mm = line.match(/^\d+ ([0-9a-f]{40}) \d+\t(.+)$/);
+    if (mm) m.set(mm[2], mm[1]);
+  }
+  if (!m.size) infra("forge-std lists no tracked sources");
+  return m;
+})();
+
 /** forge test --json, parsed: { ran, status, reason, logs } of our one test, or an infra failure. */
 function runForge() {
   let stdout = "";
   try {
     stdout = execFileSync(forge, ["test", "--json", "--build-info", "-vv"], {
       cwd: out,
+      env: forgeEnv,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 256 << 20,
@@ -314,7 +337,14 @@ function verifyInputs() {
         if (src.content !== undefined && src.content !== harnessText) mismatched.push(rel);
         continue;
       }
-      if (rel.includes("forge-std/src/")) continue;
+      if (rel.startsWith(`${forgeStd}/src/`)) {
+        // exactly forge-std's own file, by git blob
+        const inner = rel.slice(forgeStd.length + 1);
+        const want = forgeStdBlobs.get(inner);
+        const text = src.content ?? readFileSync(rel, "utf8");
+        if (!want || gitBlob(text) !== want) mismatched.push(rel);
+        continue;
+      }
       const fetched = files.get(rel);
       if (!fetched) {
         unknown.push(rel);
@@ -326,7 +356,18 @@ function verifyInputs() {
     }
   }
   const notCompiled = [...files.keys()].filter(p => !seen.has(p));
-  return { unknown, mismatched, notCompiled };
+  // the harness's DVTValidator can only be the fetched one: no other source defines that name
+  const definers = new Set();
+  for (const f of readdirSync(dir).filter(n => n.endsWith(".json"))) {
+    const bi = JSON.parse(readFileSync(join(dir, f), "utf8"));
+    for (const [path, defs] of Object.entries(bi.output?.contracts ?? {}))
+      if (defs && Object.hasOwn(defs, "DVTValidator"))
+        definers.add(path.startsWith(out) ? path.slice(out.length + 1) : path);
+  }
+  const validatorAt = [...definers];
+  if (validatorAt.length !== 1 || validatorAt[0] !== ENTRY)
+    mismatched.push(`DVTValidator defined at ${validatorAt.join(", ") || "nowhere"}`);
+  return { unknown, mismatched, notCompiled, validatorAt };
 }
 
 writeFileSync(join(out, "fixtures/evidence-vectors.json"), fixture);

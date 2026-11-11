@@ -82,28 +82,72 @@ export function diffEmissions(table, ruleset, watched) {
   return { missingFunctions, missingEvents, restrictedOnPublicRoute, stale };
 }
 
+/** The number of gaps: the one predicate for both the text verdict and the exit status. */
+export const gaps = d =>
+  d.missingFunctions.length + d.missingEvents.length + d.restrictedOnPublicRoute.length;
+
+/** A refusal written by this script (fixed text, safe to print). */
+class TableError extends Error {}
+
+/** Contracts the watcher reads whose every external function must be in the table. */
+const REQUIRED_CONTRACTS = ["SuperPaymaster"];
+
 function validateTable(t, watched) {
-  if (!t || !Array.isArray(t.rows)) throw new Error("table: `rows` must be an array");
+  try {
+    validateTableInner(t, watched);
+  } catch (e) {
+    throw e instanceof TableError ? e : new TableError("table malformed");
+  }
+}
+
+function validateTableInner(t, watched) {
+  const fail = m => {
+    throw new TableError(m);
+  };
+  // completeness (Codex R2 #1): the generator states, per contract, EVERY external/public selector
+  // from the compiled ABI, and every one of them must have a row. A non-empty table alone proves
+  // nothing; the required contracts must be there.
+  if (!t?.inventory || typeof t.inventory !== "object")
+    fail("table: `inventory` (contract -> all external selectors) is required");
+  for (const c of REQUIRED_CONTRACTS)
+    if (!Array.isArray(t.inventory[c]) || !t.inventory[c].length)
+      fail(`table: inventory has no selectors for ${c}`);
+  const rowsBy = new Map();
+  for (const r of Array.isArray(t.rows) ? t.rows : []) {
+    if (typeof r?.contract !== "string" || typeof r?.selector !== "string") continue;
+    rowsBy.set(`${r.contract}|${r.selector.toLowerCase()}`, true);
+  }
+  for (const [c, sels] of Object.entries(t.inventory)) {
+    if (!Array.isArray(sels)) fail(`table: inventory.${c} must be an array of selectors`);
+    for (const sel of sels) {
+      if (typeof sel !== "string" || !/^0x[0-9a-fA-F]{8}$/.test(sel))
+        fail(`table: inventory.${c} has a malformed selector`);
+      if (!rowsBy.has(`${c}|${sel.toLowerCase()}`))
+        fail(`table: ${c} ${sel} is in the inventory but has no row`);
+    }
+  }
+  if (!t || !Array.isArray(t.rows)) throw new TableError("table: `rows` must be an array");
   // provenance: which tree, which tool, how (Codex R1 #4); an empty inventory proves nothing
   if (!/^[0-9a-f]{40}$/.test(t.spCommit ?? ""))
-    throw new Error("table: spCommit must be a full 40-hex SHA");
+    throw new TableError("table: spCommit must be a full 40-hex SHA");
   for (const k of ["tool", "toolVersion", "command"])
-    if (typeof t[k] !== "string" || !t[k].trim()) throw new Error(`table: ${k} must be stated`);
-  if (!t.rows.length) throw new Error("table: no rows (an empty inventory proves nothing)");
+    if (typeof t[k] !== "string" || !t[k].trim())
+      throw new TableError(`table: ${k} must be stated`);
+  if (!t.rows.length) throw new TableError("table: no rows (an empty inventory proves nothing)");
   const seen = new Map();
   const byTopic = new Map(watched.map(w => [w.topic0.toLowerCase(), w.name]));
   const hex = (x, n) => typeof x === "string" && new RegExp(`^0x[0-9a-fA-F]{${n}}$`).test(x);
   for (const [i, r] of t.rows.entries()) {
     const at = `rows[${i}]`;
     if (typeof r?.contract !== "string" || !r.contract.trim())
-      throw new Error(`${at}.contract must be stated`);
+      throw new TableError(`${at}.contract must be stated`);
     if (typeof r?.function !== "string" || !/^[A-Za-z_$][\w$]*\(.*\)$/.test(r.function))
-      throw new Error(`${at}.function must be a function signature`);
+      throw new TableError(`${at}.function must be a function signature`);
     if (!hex(r.selector, 8) || ethers.id(r.function).slice(0, 10) !== r.selector.toLowerCase())
-      throw new Error(`${at}.selector is not keccak256(${r.function})[0:4]`);
+      throw new TableError(`${at}.selector is not keccak256(${r.function})[0:4]`);
     if (typeof r.callerRestricted !== "boolean")
-      throw new Error(`${at}.callerRestricted must be true or false (no default)`);
-    if (!Array.isArray(r.events)) throw new Error(`${at}.events must be an array`);
+      throw new TableError(`${at}.callerRestricted must be true or false (no default)`);
+    if (!Array.isArray(r.events)) throw new TableError(`${at}.events must be an array`);
     // one row per (contract, selector); an identical repeat is harmless, a conflicting one is not
     const dupKey = `${r.contract}|${r.selector.toLowerCase()}`;
     const canon = JSON.stringify([
@@ -112,18 +156,20 @@ function validateTable(t, watched) {
       [...r.events.map(e => e.topic0.toLowerCase())].sort(),
     ]);
     if (seen.has(dupKey) && seen.get(dupKey) !== canon)
-      throw new Error(`${at}: conflicting duplicate row for ${dupKey}`);
+      throw new TableError(`${at}: conflicting duplicate row for ${dupKey}`);
     seen.set(dupKey, canon);
     for (const [k, e] of r.events.entries()) {
       const ea = `${at}.events[${k}]`;
       if (typeof e?.signature !== "string" || !hex(e.topic0, 64))
-        throw new Error(`${ea} needs a signature and a 32-byte topic0`);
+        throw new TableError(`${ea} needs a signature and a 32-byte topic0`);
       if (ethers.id(e.signature) !== e.topic0.toLowerCase())
-        throw new Error(`${ea}.topic0 is not keccak256(${e.signature})`);
+        throw new TableError(`${ea}.topic0 is not keccak256(${e.signature})`);
       // a name that disagrees with its topic0 would make the diff misread the row
       const known = byTopic.get(e.topic0.toLowerCase());
       if (known && e.name !== known)
-        throw new Error(`${ea}: topic0 is the watched ${known}, but the row names it ${e.name}`);
+        throw new TableError(
+          `${ea}: topic0 is the watched ${known}, but the row names it ${e.name}`
+        );
     }
   }
 }
@@ -134,7 +180,7 @@ function validateRuleset(ruleset) {
   for (const sig of Object.keys(ruleset?.publicRoute?.functions ?? {})) {
     const sel = ethers.id(sig).slice(0, 10);
     if (bySel.has(sel))
-      throw new Error(`ruleset: ${bySel.get(sel)} and ${sig} share selector ${sel}`);
+      throw new TableError(`ruleset: ${bySel.get(sel)} and ${sig} share selector ${sel}`);
     bySel.set(sel, sig);
   }
 }
@@ -151,6 +197,11 @@ function selfTest(watched) {
   const W = n => {
     const w = sigOf(n);
     return { name: n, signature: null, topic0: w.topic0, via: "test" };
+  };
+  const inv = rows => {
+    const o = { SuperPaymaster: [] };
+    for (const r of rows) (o[r.contract] ??= []).push(r.selector);
+    return o;
   };
   const row = (fn, restricted, events) => ({
     contract: "SuperPaymaster",
@@ -193,6 +244,7 @@ function selfTest(watched) {
   table.tool = "test";
   table.toolVersion = "0";
   table.command = "selfTest";
+  table.inventory = inv(table.rows);
   const d = diffEmissions(table, ruleset, watched);
   // a function that became restricted but is still listed: a gap
   const restr = diffEmissions(
@@ -202,7 +254,8 @@ function selfTest(watched) {
   );
   const restrictedOk =
     restr.restrictedOnPublicRoute.length === 1 &&
-    restr.restrictedOnPublicRoute[0].signature === "updatePrice()";
+    restr.restrictedOnPublicRoute[0].signature === "updatePrice()" &&
+    gaps(restr) === 1; // the text verdict and the exit status share this predicate (Codex R2 #8)
   const ok =
     JSON.stringify(d.missingFunctions.map(x => [x.signature, x.events])) ===
       JSON.stringify([["expireWithdraw(address)", ["OperatorPaused"]]]) &&
@@ -244,8 +297,20 @@ function selfTest(watched) {
   });
   // provenance and inventory refusals
   const prov = { spCommit: "0".repeat(40), tool: "t", toolVersion: "0", command: "c" };
+  // an incomplete table: SuperPaymaster's inventory names a selector with no row (Codex R2 #1)
+  const incomplete = {
+    ...prov,
+    rows: [row("poke()", false, [])],
+    inventory: {
+      SuperPaymaster: [
+        ethers.id("poke()").slice(0, 10),
+        ethers.id("unlisted(address)").slice(0, 10),
+      ],
+    },
+  };
   const more = [
-    { ...prov, rows: [] },
+    incomplete,
+    { ...prov, rows: [], inventory: { SuperPaymaster: [] } },
     { rows: [row("f()", false, [])] },
     { ...prov, rows: [{ ...row("f()", false, []), contract: "" }] },
     { ...prov, rows: [row("f()", false, []), row("f()", true, [])] },
@@ -299,7 +364,9 @@ if (isMain) {
     ruleset = JSON.parse(readFileSync(rulesetPath, "utf8"));
     validateRuleset(ruleset);
   } catch (e) {
-    console.error(`bad input: ${e.message}`);
+    // our own validation messages are fixed text; anything else (a JSON parse error quotes its
+    // input) is reported only as a category (Codex R2 #7)
+    console.error(`bad input: ${e instanceof TableError ? e.message : "unreadable or not JSON"}`);
     process.exit(2);
   }
   const d = diffEmissions(table, ruleset, watched);
@@ -313,7 +380,11 @@ if (isMain) {
     spCommit: table.spCommit ?? null,
     tool: table.tool ?? null,
     toolVersion: table.toolVersion ?? null,
-    command: table.command ?? null,
+    // the generator's command can carry an RPC URL or a token: only its digest is reported
+    commandSha256:
+      typeof table.command === "string"
+        ? createHash("sha256").update(table.command).digest("hex")
+        : null,
     watched,
     ...d,
   };
@@ -327,14 +398,16 @@ if (isMain) {
       console.log(
         `MISSING EVENTS   ${g.signature}: add ${g.events.join(", ")} to its publicRoute entry`
       );
+    for (const g of d.restrictedOnPublicRoute)
+      console.log(
+        `RESTRICTED ON PUBLIC ROUTE ${g.signature}: caller-restricted, but publicRoute still lists ${g.listedAs}; remove it`
+      );
     for (const s of d.stale)
-      console.log(`info: publicRoute lists ${s}, which the table does not show as permissionless`);
-    if (!d.missingFunctions.length && !d.missingEvents.length)
+      console.log(`info: publicRoute lists ${s}, which the table does not contain`);
+    if (gaps(d) === 0)
       console.log(
         `OK: every watched event a permissionless function can emit is on the public route (${table.rows.length} functions checked)`
       );
   }
-  process.exit(
-    d.missingFunctions.length || d.missingEvents.length || d.restrictedOnPublicRoute.length ? 1 : 0
-  );
+  process.exit(gaps(d) ? 1 : 0);
 }

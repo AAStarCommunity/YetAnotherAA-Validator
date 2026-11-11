@@ -107,15 +107,37 @@ else {
 // ---- 3. Sender keystore: an encrypted keystore, mode exactly 0600, whose DECRYPTED address is none
 // of the forbidden keys (guardians, owner Safe, deployer)
 const sender = cfg.sender ?? {};
-const forbidden = Array.isArray(sender.forbidden) ? sender.forbidden : [];
-const forbiddenOk = forbidden.length > 0 && forbidden.every(isAddr);
+// role-specific (Codex R2 #4): every guardian, the owner Safe and the deployer, each required; the
+// on-chain SP.guardian() is checked against the sender as well (section 7)
+const fb = sender.forbidden ?? {};
+const guardians = Array.isArray(fb.guardians) ? fb.guardians : [];
+const roleList = [
+  ["guardians", guardians.length > 0 && guardians.every(isAddr)],
+  ["ownerSafe", isAddr(fb.ownerSafe)],
+  ["deployer", isAddr(fb.deployer)],
+];
+const forbiddenOk = roleList.every(([, ok]) => ok);
+const forbidden = forbiddenOk ? [...guardians, fb.ownerSafe, fb.deployer] : [];
 add(
   "sender-forbidden-list",
   forbiddenOk ? "PASS" : "MISSING",
   forbiddenOk
-    ? `${forbidden.length} addresses`
-    : "sender.forbidden must list the guardian, owner and deployer addresses"
+    ? `${guardians.length} guardians, owner Safe, deployer`
+    : `sender.forbidden.${roleList
+        .filter(([, ok]) => !ok)
+        .map(([k]) => k)
+        .join(", ")} not set`
 );
+if (
+  forbiddenOk &&
+  isAddr(cfg.contracts?.manifestSafe) &&
+  fb.ownerSafe.toLowerCase() !== cfg.contracts.manifestSafe.toLowerCase()
+)
+  add(
+    "sender-forbidden-list:ownerSafe",
+    "FAIL",
+    "sender.forbidden.ownerSafe is not contracts.manifestSafe"
+  );
 let senderAddr = null;
 const ksPath = expand(sender.keystore);
 if (placeholder(sender.keystore)) add("sender-keystore", "MISSING", "sender.keystore not set");
@@ -165,6 +187,13 @@ else {
 // ---- 4. launchd: one inspection per label, in the configured domain; "not found" is told apart from
 // an inspection that failed
 const ld = cfg.launchd ?? {};
+// required members (Codex R2 #3): whatever the config lists, these are always checked
+const REQUIRED_OFF = ["io.aastar.dvt-committee-keeper", "io.aastar.dvt-apply-rotation"];
+const REQUIRED_ON = ["ai.aastar.aoa-watcher"];
+ld.mustBeOff = [
+  ...new Set([...REQUIRED_OFF, ...(Array.isArray(ld.mustBeOff) ? ld.mustBeOff : [])]),
+];
+ld.mustBeOn = [...new Set([...REQUIRED_ON, ...(Array.isArray(ld.mustBeOn) ? ld.mustBeOn : [])])];
 const domain = placeholder(ld.domain) ? `gui/${process.getuid?.() ?? 0}` : ld.domain;
 function launchdState(label) {
   const r = spawnSync("launchctl", ["print", `${domain}/${label}`], { encoding: "utf8" });
@@ -205,9 +234,45 @@ for (const label of ld.mustBeOn ?? []) {
 // in the process environment takes precedence over .env, so an explicit AUDIT_ENABLED=false and
 // AUDIT_EXECUTE_SLASH=false in the container's environment are binding; an ABSENT variable could
 // still be switched on by a .env file, so absence does not pass.
-const nodes = cfg.dvtNodes?.containers;
-if (!Array.isArray(nodes) || !nodes.length)
-  add("node-slash-off", "MISSING", "dvtNodes.containers not set");
+// required members (Codex R2 #3): every running container built from the DVT image is checked,
+// whatever the config lists; a compose-defined node that is neither running nor configured is said
+const composeNodes = new Set();
+// the deployment's own compose file (dvtNodes.compose, required): testnet and mainnet differ
+const composeFile = cfg.dvtNodes?.compose;
+if (placeholder(composeFile) || !/^docker-compose\.[a-z0-9-]+\.yml$/.test(composeFile))
+  add("node-compose", "MISSING", "dvtNodes.compose (the deployment's docker-compose file) not set");
+for (const f of placeholder(composeFile) ? [] : [composeFile]) {
+  let text = "";
+  try {
+    text = readFileSync(join(ROOT, f), "utf8");
+  } catch {
+    continue;
+  }
+  for (const m of text.matchAll(/container_name:\s*([A-Za-z0-9_.-]*node[A-Za-z0-9_.-]*)/g))
+    composeNodes.add(m[1]);
+}
+const runningDvt = new Set();
+{
+  const r = spawnSync("docker", ["ps", "--format", "{{.Names}} {{.Image}}"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (r.status === 0)
+    for (const l of r.stdout.split("\n")) {
+      const [n, img] = l.trim().split(/\s+/);
+      if (n && /^aastar-dvt(:|$)/.test(img ?? "")) runningDvt.add(n);
+    }
+}
+const nodes = [
+  ...new Set([
+    ...(Array.isArray(cfg.dvtNodes?.containers) ? cfg.dvtNodes.containers : []),
+    ...runningDvt,
+  ]),
+];
+for (const n of composeNodes)
+  if (!nodes.includes(n))
+    add(`node-slash-off:${n}`, "MISSING", "defined in compose, neither running nor configured");
+if (!nodes.length) add("node-slash-off", "MISSING", "no DVT node configured or running");
 for (const c of nodes ?? []) {
   if (placeholder(c)) {
     add(`node-slash-off:${c}`, "MISSING", "container name not set");
@@ -246,6 +311,9 @@ const rpcCfg = cfg.rpc ?? {};
 // never a file); like the Keychain values, they are never printed.
 const primaryUrl = process.env.PHASE_D_RPC_PRIMARY || secret("rpcPrimary");
 const secondUrl = process.env.PHASE_D_RPC_SECOND || secret("rpcSecondary");
+// an override run is a dry run: it can never be a release acceptance (Codex R2 #6)
+if (process.env.PHASE_D_RPC_PRIMARY || process.env.PHASE_D_RPC_SECOND)
+  add("release-mode", "FAIL", "PHASE_D_RPC_* override in use: dry run, not the Keychain endpoints");
 const label = which => (placeholder(rpcCfg[which]?.operator) ? which : rpcCfg[which].operator);
 const errCode = e =>
   typeof e?.code === "string" && /^[A-Z_]{2,40}$/.test(e.code) ? e.code : "error";
@@ -314,9 +382,15 @@ else if (C.aggregator.toLowerCase() !== String(wcfg.aggregator).toLowerCase())
     "FAIL",
     "contracts.aggregator is not the aggregator the watcher config watches"
   );
+else if (C.dvtValidator.toLowerCase() !== String(wcfg.forwarders?.dvtValidator ?? "").toLowerCase())
+  add(
+    "onchain:binding",
+    "FAIL",
+    "contracts.dvtValidator is not the watcher config's forwarders.dvtValidator"
+  );
 else if (!primaryUrl) add("onchain", "MISSING", "needs the primary RPC");
 else {
-  add("onchain:binding", "PASS", "contracts.aggregator equals the watcher config");
+  add("onchain:binding", "PASS", "contracts.aggregator and dvtValidator equal the watcher config");
   const p = new ethers.JsonRpcProvider(primaryUrl, undefined, { staticNetwork: true });
   const read = async (to, sig, ret) => {
     const i = new ethers.Interface([`function ${sig} view returns (${ret})`]);
@@ -334,6 +408,18 @@ else {
       add(id, "FAIL", "read failed");
     }
   };
+  // the validator checked is the one the aggregator executes through (Codex R2 #5)
+  await fact(
+    "aggregator.DVT_VALIDATOR==dvtValidator",
+    () => read(C.aggregator, "DVT_VALIDATOR()", "address"),
+    v => v.toLowerCase() === C.dvtValidator.toLowerCase()
+  );
+  await fact(
+    "sender!=SP.guardian",
+    () => read(wcfg.roles.superPaymaster, "guardian()", "address"),
+    v => !!senderAddr && v.toLowerCase() !== senderAddr.toLowerCase(),
+    v => (senderAddr ? `SP.guardian() ${v}` : "sender address not verified yet")
+  );
   await fact(
     "dvtValidator.categoryCount==0",
     () => read(C.dvtValidator, "categoryCount()", "uint256"),

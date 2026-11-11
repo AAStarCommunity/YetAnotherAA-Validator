@@ -1,7 +1,9 @@
 {
   "comment": "Phase D check config. Copy to phase-d.json on the Mini; fill the <...> values (public data only). No secret goes in this file: tokens, the keystore password and both RPC URLs live in the macOS Keychain under the account and services below (DSR 0829236d), entered interactively by the author.",
   "chainId": 11155111,
-  "release": { "spCommit": "<full 40-hex SP commit of the rc.8 release tag>" },
+  "release": {
+    "spCommit": "<full 40-hex SP commit of the rc.8 release tag>"
+  },
   "watcherConfig": "~/.aoa-watcher/config.json",
   "keychain": {
     "account": "aoa-watcher",
@@ -15,16 +17,22 @@
     }
   },
   "rpc": {
-    "primary": { "operator": "<operator name of the primary trace RPC>" },
-    "second": { "operator": "<a different operator for the second trace RPC>" }
+    "primary": {
+      "operator": "<operator name of the primary trace RPC>"
+    },
+    "second": {
+      "operator": "<a different operator for the second trace RPC>"
+    }
   },
   "sender": {
     "keystore": "~/.aoa-watcher/sender.keystore.json",
-    "forbidden": [
-      "<guardian addresses, from the step-13 manifest and the on-chain guardian set>",
-      "<owner Safe>",
-      "<deployer>"
-    ],
+    "forbidden": {
+      "guardians": [
+        "<every guardian address: step-13 manifest and the on-chain guardian set>"
+      ],
+      "ownerSafe": "<owner Safe (= contracts.manifestSafe)>",
+      "deployer": "<deployer address>"
+    },
     "minBalanceWei": "50000000000000000"
   },
   "contracts": {
@@ -40,7 +48,10 @@
     ],
     "mustBeOn": ["ai.aastar.aoa-watcher"]
   },
-  "dvtNodes": { "containers": ["dvt-node-1", "dvt-node-2", "dvt-node-3"] },
+  "dvtNodes": {
+    "compose": "docker-compose.testnet.yml",
+    "containers": ["dvt-node-1", "dvt-node-2", "dvt-node-3"]
+  },
   "releaseEvidence": {
     "spParity": "~/.aoa-watcher/evidence/sp-evidence-parity.json",
     "a3": "~/.aoa-watcher/evidence/a3-emissions.json"
