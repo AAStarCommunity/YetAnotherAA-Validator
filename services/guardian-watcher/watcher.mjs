@@ -100,6 +100,15 @@ export function stallReasons(publication) {
     out.push(
       `${st.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
     );
+  // what still needs attention (Codex W2c R20), store-wide until the journal no longer says so
+  if (st.incidents)
+    out.push(`${st.incidents} unresolved registry or bytes incident(s) (acknowledge or resolve)`);
+  if (st.inconsistent)
+    out.push(
+      `${st.inconsistent} disclose receipt(s) final but the entry not visible (RPC inconsistent)`
+    );
+  if (st.unverified)
+    out.push(`${st.unverified} pin(s) not re-verified since a failed check (retried every pass)`);
   // the generic count last: a specific cause above names the same record more precisely
   if (st.failing)
     out.push(`${st.failing} record(s) failing publication (retried every pass; see the alerts)`);

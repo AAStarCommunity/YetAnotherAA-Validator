@@ -2441,6 +2441,108 @@ const good = {
   }
 }
 
+// ---- Codex W2c R20: what still needs attention counts store-wide until the journal says it is over
+{
+  const { stallReasons } = await import("./watcher.mjs");
+  const skOf = s => ({
+    pinners: s.pinners,
+    mirror: s.mirror,
+    telegram: s.telegram,
+    registry: s.registry,
+  });
+  // #1: an unacknowledged revert is an incident (degraded) until acknowledged
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const s = sinks({ mine: "revert" });
+      const sk = skOf(s);
+      let p;
+      for (let i = 0; i < 4; i++)
+        p = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      const id = Store.recordId(bls);
+      const j = store.getPublication(id);
+      const later = await publishPending(store, sk, { maxPendingMs: 60 * 60_000, maxParse: 0 });
+      store.putPublication(id, { ...j, registry: { ...j.registry, ack: { by: "test", at: "t" } } });
+      const acked = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      cell(
+        "R20#1: an unacknowledged reverted disclose is an incident store-wide (also outside the batch) until acknowledged",
+        j.registry.phase === "reverted" &&
+          p.stalls.incidents === 1 &&
+          later.stalls.incidents === 1 &&
+          stallReasons({ stalls: later.stalls }).some(r =>
+            /1 unresolved registry or bytes incident/.test(r)
+          ) &&
+          acked.stalls.incidents === 0,
+        { phase: j.registry.phase, p: p.stalls, later: later.stalls, acked: acked.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #2: a final receipt whose entry is not visible is degraded until a later check finds the entry
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const s = sinks({});
+      const sk = skOf(s);
+      await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      const saved = new Map(s.chain.byAction);
+      s.chain.byAction.clear(); // the RPC does not show the entry at the finalized block
+      const odd = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      const oddReg = store.getPublication(Store.recordId(bls)).registry;
+      for (const [k, v] of saved) s.chain.byAction.set(k, v);
+      let ok;
+      for (let i = 0; i < 3; i++)
+        ok = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      cell(
+        "R20#2: a final receipt without a visible entry is 'inconsistent' (degraded) until the entry is confirmed",
+        oddReg.phase === "landed" &&
+          !!oddReg.inconsistentAt &&
+          odd.stalls.inconsistent === 1 &&
+          store.getPublication(Store.recordId(bls)).registry.phase === "confirmed" &&
+          ok.stalls.inconsistent === 0,
+        { odd: odd.stalls, oddReg, ok: ok.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #3: a re-verification that cannot reach the gateway is retried every pass until it succeeds
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      const r = { ...owner, txHash: ethers.id("r20-gw") };
+      store.putRecord(r);
+      const s = sinks();
+      const sk = { ...skOf(s), registry: null };
+      for (let i = 0; i < 3; i++) await publishPending(store, sk, {});
+      s.pinOpts.pinata.fetchThrows = true;
+      const rv = await publishPending(store, sk, { reverifyGen: 1 });
+      const next = await publishPending(store, sk, {}); // an ordinary pass, gateway still down
+      s.pinOpts.pinata.fetchThrows = false;
+      const fetches0 = s.calls.fetches;
+      const healed = await publishPending(store, sk, {});
+      cell(
+        "R20#3: a failed gateway re-verification is 'unverified' (degraded, not done) and retried each pass until verified",
+        rv.stalls.unverified === 1 &&
+          next.stalls.unverified === 1 &&
+          next.counts.done === 0 &&
+          healed.stalls.unverified === 0 &&
+          s.calls.fetches > fetches0 &&
+          !store.getPublication(Store.recordId(r)).pins.pinata.checkError,
+        { rv: rv.stalls, next: [next.stalls, next.counts.done], healed: healed.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

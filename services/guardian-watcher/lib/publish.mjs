@@ -175,7 +175,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   for (const p of sinks.pinners ?? []) {
     const cur = state.pins[p.name];
     const at = new Date().toISOString();
-    if (cur?.current && !opts.reverify) continue;
+    // a pin whose last re-verification could not reach the gateway is re-verified on every pass
+    // until a check succeeds (Codex W2c R20 #3)
+    if (cur?.current && !opts.reverify && !cur.checkError) continue;
     try {
       if (cur?.current) {
         // Reverify: still served, byte for byte? If not, demote and upload again below. A transport
@@ -193,7 +195,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           back &&
           bytesEqual(back instanceof Uint8Array ? back : ethers.getBytes(back), file.bytes)
         ) {
-          state.pins[p.name] = { ...cur, checkedAt: at };
+          const { checkError: _e, checkErrorAt: _a, ...kept } = cur;
+          (void _e, _a);
+          state.pins[p.name] = { ...kept, checkedAt: at };
           continue;
         }
         alerts.push(
@@ -554,8 +558,14 @@ async function settleLanded(rec, file, reg, state, persist, alerts, rc) {
     return;
   }
   if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
-  // Final receipt but no entry at the finalized block: inconsistent RPC; stay landed, alert.
-  state.registry = { ...state.registry, phase: "landed", entryId: String(rc.entryId) };
+  // Final receipt but no entry at the finalized block: inconsistent RPC; stay landed, alert, and
+  // mark it so the watcher is degraded until a later check confirms the entry (Codex W2c R20 #2)
+  state.registry = {
+    ...state.registry,
+    phase: "landed",
+    entryId: String(rc.entryId),
+    inconsistentAt: new Date().toISOString(),
+  };
   await persist(state);
   alerts.push(`registry: receipt final but entry ${rc.entryId} not visible at the finalized block`);
 }

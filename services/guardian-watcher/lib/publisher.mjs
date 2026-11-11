@@ -22,6 +22,8 @@ export function isDone(rec, st, { pinners, cid, ignoreRegistry = false } = {}) {
   if (st.bytesChanged) return false;
   if (cid !== undefined && st.cid !== cid) return false;
   if (pinners && !pinners.every(n => st.pins?.[n]?.current)) return false;
+  // a pin not verified since a failed check is not done: it is retried (Codex W2c R20 #3)
+  if (Object.values(st.pins ?? {}).some(p => p?.current && p.checkError)) return false;
   if (rec.route !== "bls" || ignoreRegistry) return true; // owner route: repo + Telegram only
   return st.registry?.phase === "confirmed";
 }
@@ -32,6 +34,23 @@ const openIncident = st =>
   ((st?.registry?.phase === "conflict" || st?.registry?.phase === "reverted") &&
     !st.registry.ack) ||
   !!st?.bytesChanged;
+
+/**
+ * What still needs someone's attention in a journal, beyond stalls (Codex W2c R20): an unresolved
+ * incident, a final receipt whose entry was not visible, a pin not verified since a failed check.
+ * Kept in the record's schedule entry and counted store-wide until the journal no longer says so.
+ */
+export function attentionKind(pub) {
+  if (openIncident(pub)) return "incident";
+  if (pub?.registry?.phase === "landed" && pub.registry.inconsistentAt) return "inconsistent";
+  if (Object.values(pub?.pins ?? {}).some(p => p?.current && p.checkError)) return "unverified";
+  return null;
+}
+const withAttention = (e, kind) => {
+  const { attention: _old, ...rest } = e ?? {};
+  void _old;
+  return kind ? { ...rest, attention: kind } : rest;
+};
 
 /** An acknowledged registry incident: the registry stage is parked; everything else still runs. */
 const parked = st =>
@@ -95,7 +114,11 @@ function countStalls(sched) {
   const failing = Object.values(sched?.entries ?? {}).filter(
     e => e?.failing === true || e?.stageFailed === true
   ).length;
+  const att = Object.values(sched?.entries ?? {}).map(e => e?.attention);
   return {
+    incidents: att.filter(k => k === "incident").length,
+    inconsistent: att.filter(k => k === "inconsistent").length,
+    unverified: att.filter(k => k === "unverified").length,
     feeCapped: all.filter(k => k === "feeCapped").length,
     insufficientFunds: all.filter(k => k === "insufficientFunds").length,
     failing,
@@ -218,7 +241,7 @@ export async function publishPending(
         continue;
       }
       // every record read is refreshed from its journal, deferred ones included (Codex W2c R15 #1)
-      entries[id] = withStall(entries[id], stallKind(prev));
+      entries[id] = withAttention(withStall(entries[id], stallKind(prev)), attentionKind(prev));
       try {
         cid = recordFile(rec).cid;
       } catch {
@@ -284,7 +307,7 @@ export async function publishPending(
       const stageFailed = (r.failures ?? []).length > 0;
       if (stageFailed) counts.failed++; // a sink failed or refused: the pass is not ok (R3)
       entries[id] = {
-        ...withStall(e, stallKind(r.state)),
+        ...withAttention(withStall(e, stallKind(r.state)), attentionKind(r.state)),
         lastRunAt: now(),
         done,
         failing: false,
@@ -305,12 +328,15 @@ export async function publishPending(
       // a failure still rotates (R2); the stall is what the journal now says (it may have advanced
       // before the failure), unknown if it cannot be read
       let kind;
+      let att = e.attention ?? null;
       try {
-        kind = stallKind(store.getPublication(id));
+        const cur = store.getPublication(id);
+        kind = stallKind(cur);
+        att = attentionKind(cur);
       } catch {
         kind = "unknown";
       }
-      entries[id] = { ...withStall(e, kind), lastRunAt: now(), failing: true };
+      entries[id] = { ...withAttention(withStall(e, kind), att), lastRunAt: now(), failing: true };
       counts.failed++;
       if (err instanceof PersistError) {
         alerts.push(`${id}: ${err.message}; publication pass stopped`);
