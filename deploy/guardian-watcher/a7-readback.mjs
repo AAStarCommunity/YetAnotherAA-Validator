@@ -66,7 +66,19 @@ export const REQUIRED_CONTRACTS = [
 /** Contract-specific fields that MUST be present (x-readMethods; Codex A7 R2 #1): a read-back that
  * leaves one out is unverified, never silently passed. */
 export const REQUIRED_FIELDS = {
-  blsAggregator: ["guardianSet", "signerMaskOrder", "thresholds"],
+  blsAggregator: [
+    "guardianSet",
+    "signerMaskOrder",
+    "thresholds",
+    // x-readMethods "blsAggregator.verifier" and "thresholds" (Codex A7 R3 #1)
+    "fraudProofVerifier",
+    "pendingFraudProofVerifier",
+    "DVT_VALIDATOR",
+    "domainSeparator",
+    "MAX_VALIDATORS",
+  ],
+  dvtValidator: ["categoryCount"],
+  disclosureRegistry: ["WRITER", "AGGREGATOR"],
   ownerSafe: ["threshold", "owners", "singleton"],
   entryPoint: ["deposit", "staked", "stake", "unstakeDelaySec", "withdrawTime"],
   evaluationCommunityToken: [
@@ -472,6 +484,12 @@ export async function compare(rb, reader, facts) {
           return unverified.push(`${P}.roles.${name} (role id not resolvable from the ABI)`);
         id = lc(g.v);
       }
+      // a role named twice (by name and by id, or twice by name) could hide a contradiction
+      // (Codex A7 R3 #2): the second occurrence fails
+      if (spRoles.has(id)) {
+        check(`${P}.roles[${id.slice(0, 10)}…]`, "one entry per role", "listed twice", false);
+        continue;
+      }
       spRoles.set(id, new Set(members.map(lc)));
     }
     const ids = new Set([...ours.keys(), ...spRoles.keys()]);
@@ -576,6 +594,10 @@ export async function compare(rb, reader, facts) {
         return;
       }
       // every SlashLevel must be listed (x-readMethods: slashThresholds(level) for each SlashLevel)
+      // the related constants (x-readMethods): listed in thresholds or as contract keys
+      for (const k of ["minThreshold", "defaultThreshold", "SLASH_THRESHOLD_FLOOR"])
+        if (!(k in t) && !(k in c))
+          unverified.push(`${P}.thresholds.${k} (missing from the read-back)`);
       if (!facts.slashLevels) unverified.push(`${P}.thresholds (SlashLevel order unknown)`);
       else
         for (const lvl of Object.keys(facts.slashLevels))

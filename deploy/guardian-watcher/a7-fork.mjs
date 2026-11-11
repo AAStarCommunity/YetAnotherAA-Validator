@@ -55,6 +55,16 @@ const die = (code, msg) => {
   );
   process.exit(code);
 };
+// nothing uncaught may print raw input (Codex A7 R3 #3): any failure outside die() is a fixed line
+process.on("uncaughtException", () => die(3, "unexpected failure (no detail printed)"));
+process.on("unhandledRejection", () => die(3, "unexpected failure (no detail printed)"));
+const readInput = (path, what) => {
+  try {
+    return readFileSync(path);
+  } catch {
+    return die(1, `cannot read ${what}`);
+  }
+};
 const dumpPath = opt("dump");
 const dumpSha = (opt("dump-sha256") ?? "").toLowerCase().replace(/^0x/, "");
 const readbackPath = opt("readback");
@@ -93,13 +103,13 @@ const anvilBin =
 
 // ---- 1. inputs: schema, read-back, dump, address book
 const schemaText = opt("schema")
-  ? readFileSync(opt("schema"))
+  ? readInput(opt("schema"), "--schema")
   : ghRaw(SCHEMA_SOURCE.path, SCHEMA_SOURCE.ref);
 if (!schemaText) die(3, "cannot fetch SP's read-back schema through the GitHub API (--schema)");
 if (sha256(schemaText) !== SCHEMA_SHA256)
   die(1, `the read-back schema is not SP's pinned file (sha256 ${SCHEMA_SHA256})`);
 const schema = JSON.parse(schemaText.toString("utf8"));
-const rbText = readFileSync(readbackPath);
+const rbText = readInput(readbackPath, "--readback");
 let rb;
 try {
   rb = JSON.parse(rbText.toString("utf8"));
@@ -111,7 +121,7 @@ if (errors.length)
   die(1, `read-back does not validate against ${SCHEMA_ID}: ${errors.slice(0, 10).join("; ")}`);
 const h = rb.header;
 if (h.source !== "fork") die(1, `read-back source is ${h.source}: not a fork read-back`);
-const dump = readFileSync(dumpPath);
+const dump = readInput(dumpPath, "--dump");
 if (sha256(dump) !== dumpSha) die(1, "dump sha256 does not match --dump-sha256");
 if (h.dumpSha256 !== dumpSha) die(1, "the read-back was taken from another dump (dumpSha256)");
 if (h.anvilCommit !== ANVIL_COMMIT)
@@ -127,7 +137,7 @@ if (opt("pins-commit") || opt("address-book")) {
   const pinsPath = `deployments/release/rc8/${CHAINS[h.chainId] ?? h.chainId}.pins.json`;
   const raw = opt("pins-commit")
     ? ghRaw(pinsPath, opt("pins-commit"))
-    : readFileSync(opt("address-book"));
+    : readInput(opt("address-book"), "--address-book");
   if (!raw) die(3, `cannot fetch SP ${pinsPath} at the manifest commit`);
   addressBookSource = opt("pins-commit") ? `${pinsPath} @ ${opt("pins-commit")}` : "offline copy";
   addressBookSha = sha256(raw);

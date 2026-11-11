@@ -98,7 +98,16 @@ const base = structuredClone(example);
   C.registry.roles = { ROLE_COMMUNITY: [MEMBER] };
   C.registry.rolesSource = { fromBlock: 12000000, toBlock: base.header.readbackBlock };
   C.blsAggregator.guardianSet = [{ address: G1, pubkeyHash: PK_HASH, slot: 1, isActive: true }];
-  C.blsAggregator.thresholds = { WARNING: 1, MINOR: 2, MAJOR: 3 };
+  C.blsAggregator.thresholds = {
+    WARNING: 1,
+    MINOR: 2,
+    MAJOR: 3,
+    minThreshold: 2,
+    defaultThreshold: 2,
+    SLASH_THRESHOLD_FLOOR: 2,
+  };
+  C.blsAggregator.pendingFraudProofVerifier = "0x0000000000000000000000000000000000000000";
+  C.dvtValidator.categoryCount ??= 0;
   base.checks = {
     "dvtValidator.categoryCount": 0,
     "superPaymaster.fraudProofVerifier": "0x0000000000000000000000000000000000000000",
@@ -198,6 +207,12 @@ function world(rb) {
       frags.push("function EXTENSION() view returns (address)");
       vals.push(["EXTENSION", c.extension]);
     }
+    if (key === "blsAggregator")
+      for (const [k, v] of Object.entries(c.thresholds ?? {}))
+        if (!["WARNING", "MINOR", "MAJOR"].includes(k)) {
+          frags.push(`function ${k}() view returns (uint256)`);
+          vals.push([k, v]);
+        }
     if (key === "blsAggregator")
       frags.push(
         "function validatorAtSlot(uint8) view returns (address)",
@@ -444,6 +459,39 @@ await mut(
   () => {},
   "contracts.multiSendCallOnly.codehash=upstream",
   w => ({ upstreamCodehash: async () => "0x" + "12".repeat(32) })
+);
+// ---- Codex A7 R3 #1: the BLS safety getters are required too
+for (const f of [
+  "fraudProofVerifier",
+  "pendingFraudProofVerifier",
+  "DVT_VALIDATOR",
+  "domainSeparator",
+  "MAX_VALIDATORS",
+])
+  await unv(
+    `R3#1: blsAggregator.${f} left out is unverified`,
+    rb => delete rb.contracts.blsAggregator[f],
+    `contracts.blsAggregator.${f} (missing`
+  );
+await unv(
+  "R3#1: thresholds without minThreshold is unverified",
+  rb => delete rb.contracts.blsAggregator.thresholds.minThreshold,
+  "contracts.blsAggregator.thresholds.minThreshold (missing"
+);
+await unv(
+  "dvtValidator.categoryCount left out is unverified",
+  rb => delete rb.contracts.dvtValidator.categoryCount,
+  "contracts.dvtValidator.categoryCount (missing"
+);
+// ---- Codex A7 R3 #2: one role listed twice (by name and by id) fails
+await mut(
+  "R3#2: ROLE_COMMUNITY: [wrong] plus its bytes32 id: [actual] fails",
+  rb =>
+    (rb.contracts.registry.roles = {
+      ROLE_COMMUNITY: ["0x0000000000000000000000000000000000000bad"],
+      [ROLE]: [MEMBER],
+    }),
+  "contracts.registry.roles["
 );
 // ---- R2 #2: the guardian SET, one to one
 await mut(
