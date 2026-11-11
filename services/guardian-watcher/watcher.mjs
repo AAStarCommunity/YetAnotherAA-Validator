@@ -20,6 +20,7 @@ import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick, verifyTrace } from "./lib/scan.mjs";
+import { confirmPending } from "./lib/confirm.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -72,6 +73,9 @@ export function loadConfig(path) {
     // a tick slower than this share of the poll interval is degraded (DSR 97a9d55c): the work per
     // tick grows with the local archive, and that must show before it outruns the interval
     maxTickFraction: 0.5,
+    // D-RPC2: nothing accusatory is published without a second provider's confirmation; running
+    // without one is degraded (RPC_URL_2)
+    requireSecondProvider: true,
     forwarders: {},
     ...c,
   };
@@ -155,7 +159,12 @@ export async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
   };
 }
 
-export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
+/**
+ * One tick. `second` ({ chain, host }) is the D-RPC2 second provider: after the scan, every
+ * accusatory record not yet confirmed is re-run on it (lib/confirm.mjs). Without it, the tick is
+ * degraded, because accusatory records can never be confirmed and so never published.
+ */
+export async function runOnce(chain, cfg, store, rs, ident, { now, second } = {}) {
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
   const status = { at: started, ruleset: ident, lastError: null };
@@ -239,6 +248,30 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
     const maxLag = cfg.maxLagBlocks ?? 300;
     if (lag !== null && lag > maxLag)
       more.push(`cursor ${lag} blocks behind finalized (> ${maxLag})`);
+    // D-RPC2: confirm accusatory records on the second provider (never on the first)
+    if (second?.chain) {
+      try {
+        status.confirm = {
+          secondProvider: second.host ?? null,
+          ...(await confirmPending(store, second.chain, second.host ?? null, cfg, rs, ident, {
+            runOnce,
+            now: nowMs,
+          })),
+        };
+        if (status.confirm.final)
+          more.push(
+            `${status.confirm.final} accusatory record(s) never confirmed by the second provider (held for good)`
+          );
+      } catch {
+        status.confirm = { secondProvider: second.host ?? null, error: "confirmation pass failed" };
+        more.push("D-RPC2 confirmation pass failed");
+      }
+    } else {
+      status.confirm = { secondProvider: null };
+      // required in production (loadConfig defaults requireSecondProvider: true)
+      if (cfg.requireSecondProvider)
+        more.push("no second provider (D-RPC2): accusatory records stay held");
+    }
     await finish(s.trace, s.finalized, s.isolated ?? 0, more);
     store.writeStatus(status);
     return { status, summary: s };
@@ -273,11 +306,16 @@ async function main() {
       "WARNING: ruleset.json does not match a committed version; records carry ruleset.verified = false"
     );
   const chain = makeProvider(process.env.RPC_URL);
+  // D-RPC2: the second provider's URL comes from the environment (on the Mini, from the Keychain);
+  // only its host is ever recorded
+  const second = process.env.RPC_URL_2
+    ? { chain: makeProvider(process.env.RPC_URL_2), host: new URL(process.env.RPC_URL_2).hostname }
+    : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
   let first = true;
   for (;;) {
-    const { status } = await runOnce(chain, cfg, store, rs, ident);
+    const { status } = await runOnce(chain, cfg, store, rs, ident, { second });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
     console.log(JSON.stringify(status));

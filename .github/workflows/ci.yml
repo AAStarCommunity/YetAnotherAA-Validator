@@ -186,6 +186,9 @@ jobs:
       - name: Check the guardian watcher core
         run: npm run check:watcher
 
+      - name: D-RPC2 second-provider confirmation self-test
+        run: npm run check:drpc2
+
   # Job 3: Build project
   build:
     name: Build

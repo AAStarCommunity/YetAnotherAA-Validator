@@ -371,6 +371,50 @@ async function scenario(build) {
   );
 }
 
+// ---- wiring: runOnce with a second provider confirms in the same tick and reports it; without one,
+// a production config (requireSecondProvider) is degraded
+{
+  const d1 = mkdtempSync(join(tmpdir(), "drpc2-wire-"));
+  const d2 = mkdtempSync(join(tmpdir(), "drpc2-wire2-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const t = c.ownerTx([{ name: "GuardianSet", args: [addr("w-a"), addr("w-b")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const s1 = new Store(d1);
+    const st = (
+      await runOnce(c.chain, cfg, s1, rs, ident, {
+        second: { chain: c.chain, host: "second.example" },
+      })
+    ).status;
+    const rec = recsOf(d1).find(r => r.txHash === t.hash);
+    const st2 = (
+      await runOnce(c.chain, { ...cfg, requireSecondProvider: true }, new Store(d2), rs, ident)
+    ).status;
+    cell(
+      "wiring: runOnce confirms the accusatory record in the same tick (status.confirm, holds, mayPublish); a production config without a second provider is degraded",
+      st.ok &&
+        st.confirm?.confirmed === 1 &&
+        st.confirm.secondProvider === "second.example" &&
+        mayPublish(s1, rec) &&
+        st2.ok &&
+        st2.healthy === false &&
+        (st2.degraded ?? []).some(x => /no second provider/.test(x)),
+      { confirm: st.confirm, degraded2: st2.degraded }
+    );
+  } finally {
+    rmSync(d1, { recursive: true, force: true });
+    rmSync(d2, { recursive: true, force: true });
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(
