@@ -101,9 +101,16 @@ export async function planFill(store, reg, where, n) {
       return {
         refuse: `a journalled tx at nonce ${n} (${k.id}) is still known to the node: it is mined or evicted first`,
       };
-  // an earlier fill at this nonce that a node knows is not sent twice
+  // an earlier fill at this nonce, by this writer on this chain, that a node knows is not sent twice
+  // (another writer's or chain's fill is another nonce space: Codex W2d R9)
   for (const f of readFills(store))
-    if (f?.nonce === n && f.hash && (await reg.knows(f.hash)))
+    if (
+      f?.nonce === n &&
+      String(f.writer).toLowerCase() === writer &&
+      f.chainId === where.chainId &&
+      f.hash &&
+      (await reg.knows(f.hash))
+    )
       return { refuse: `a fill at nonce ${n} is already known to the node` };
   if (waits.length) return { basis: "wait", ids: waits };
   if (nonceGaps(entries, writer, where.chainId, range).includes(n))

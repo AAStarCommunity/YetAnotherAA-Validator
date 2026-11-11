@@ -3412,6 +3412,13 @@ const good = {
       const f1 = JSON.parse(readFileSync(join(y.d, "nonce-fills.json"), "utf8")).fills;
       const r2 = await runFill(y.store, c.registry, whereOf(CC), 5, "retry", () => "T2");
       const f2 = JSON.parse(readFileSync(join(y.d, "nonce-fills.json"), "utf8")).fills;
+      // R9: that fill (writer 0x77) does not block another writer's fill at the same nonce
+      const other = sinks({ registryAddress: CC, rawTag: "g4", writer: W2 });
+      other.chain.nonce = 5;
+      other.chain.latestNonce = 5;
+      other.chain.pendingNonce = 6;
+      for (const h of c.chain.known) other.chain.known.add(h);
+      const otherWriter = await planFill(y.store, other.registry, whereOf(CC), 5);
       cell(
         "B2-A(g) R8: a stale wait marker does not open a current-registry nonce; a known archived tx at the nonce refuses a gap fill (accepted once evicted); a lost broadcast answer stays pending and is settled applied, never sent twice",
         marker === 5 &&
@@ -3424,8 +3431,20 @@ const good = {
           r2.code === 1 &&
           f2.length === 1 &&
           f2[0].applied === true &&
-          JSON.stringify(c.calls.fills) === "[5]",
-        { marker, stale, archivedKnown, archivedGone, r1, f1, r2, f2, fills: c.calls.fills }
+          JSON.stringify(c.calls.fills) === "[5]" &&
+          otherWriter.basis === "gap",
+        {
+          marker,
+          stale,
+          archivedKnown,
+          archivedGone,
+          r1,
+          f1,
+          r2,
+          f2,
+          fills: c.calls.fills,
+          otherWriter,
+        }
       );
       for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
     }
