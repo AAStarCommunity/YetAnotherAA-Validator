@@ -754,11 +754,14 @@ attestation: nothing in the repository proves them.
    - **A leaked sender key: what it can do**
      (`contracts/src/disclosure/ DisclosureRegistry.sol`, version
      `DisclosureRegistry-1.0.0`):
-     - It cannot create an accusation. `disclose` passes `_verifySigned` first:
-       the signer set, the mask and the message must reproduce a non-zero
-       `AGGREGATOR.proposalSignersCommitment(key)`, so only an action the
-       aggregator actually executed can be disclosed, with the signers it
-       committed to.
+     - It cannot fabricate an action or its committed signers. `disclose` passes
+       `_verifySigned` first: the signer set, the mask and the message must
+       reproduce a non-zero `AGGREGATOR.proposalSignersCommitment(key)`, so only
+       an action the aggregator actually executed can be disclosed, with the
+       signers it committed to. It can still falsely accuse them over a real
+       action: the record behind `recordURI` and the reading of why the action
+       is misbehaviour are the writer's claims (the contract leaves them
+       unverified).
      - It can disclose a real action first with false claim fields. Each action
        has one primary entry (`entryOf`, `AlreadyDisclosed`); `txHash`,
        `blockNumber`, `rulesetCommit`, `recordURI` and `recordHash` are the
@@ -790,8 +793,13 @@ attestation: nothing in the repository proves them.
      it disclosed to. After a switch, records already confirmed in the old
      registry count as done and are not disclosed again in the new one, and a
      signed but unconfirmed disclose would be rebroadcast to the old address.
-     Switching registries therefore needs each journal's registry stage reset by
-     hand; there is no tool for this yet.
+     Until W2d, switching registries therefore needs each journal's registry
+     stage reset by hand. W2d (planned) records the registry address and chain
+     id in each journal's registry stage, treats a mismatch with the current
+     `publish.registry` as not done (old signed transactions are voided and
+     never broadcast to a non-current address; the record is re-signed by the
+     new writer and disclosed again), and keeps the watcher degraded until every
+     record is confirmed on the new registry.
 3. **After an alert.**
    - Alerts go to the Telegram chat configured in `publish.telegram.chatId`; the
      heartbeat uses the same bot and chat unless configured otherwise. By the
@@ -839,7 +847,8 @@ attestation: nothing in the repository proves them.
      RPCs': both providers must still serve the logs and traces of the missed
      range. If the logs of a range cannot be read, the tick fails there: the
      cursor does not move and the watcher is unhealthy (`ok: false`,
-     `lastError`) until a provider that serves it is configured. A transaction
+     `lastError`) until the range becomes readable, through the provider
+     recovering or a reconfiguration; each iteration retries it. A transaction
      whose details cannot be fetched becomes a dead letter, retried and then
      recorded (§5.2b). Nothing is skipped silently.
    - Publication is at least once with idempotent sinks: a record interrupted
@@ -859,8 +868,9 @@ attestation: nothing in the repository proves them.
      pass it. They are chosen as independent operators; that is an assumption,
      not a check of their honesty.
    - A leaked sender key between the leak and the switch to a new registry (item
-     2): it cannot invent accusations, but its claims and amendments in that
-     window are indistinguishable from the watcher's on chain.
+     2): it cannot fabricate an action or its signers, but it can falsely accuse
+     them over a real action, and its claims and amendments in that window are
+     indistinguishable from the watcher's on chain.
 
 ## 6. Random committee (D7: prepared, not enabled)
 
