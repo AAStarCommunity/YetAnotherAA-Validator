@@ -553,6 +553,9 @@ aggregator-only.
     `false`), a key named `__proto__` stays a plain key, and only valid hex is
     case-folded for comparison; a missing field and an explicit `null` are two
     different observations.
+  - Bound: the logsBloom cross-check traverses the returned logs once per block
+    and watched topic, so its work is the answer size times the capped block
+    range (`maxBlocksPerTick`) times the fixed topic count.
   - Accepted bound (DSR 97a9d55c): each tick's work is linear in the local
     archive size (status totals are recounted from the directories). It is
     visible: `status.json` reports `archiveFiles` and the whole tick's `tickMs`
