@@ -3427,7 +3427,7 @@ try {
   }
 }
 
-// ---- quarantine samples are bounded: 30 distinct non-log entries -> one dead letter, 10 samples
+// ---- quarantine samples are bounded: 30 distinct non-log entries -> one quarantine record, 10 samples
 {
   const dQ = mkdtempSync(join(tmpdir(), "guardian-watcher-qsamples-"));
   try {
@@ -3447,7 +3447,7 @@ try {
     const st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
     const q = withQ(store).filter(x => x.quarantine === true);
     cell(
-      "quarantine is bounded: 30 distinct non-log entries make one dead letter keeping 10 samples, the total in its reason",
+      "quarantine is bounded: 30 distinct non-log entries make one quarantine record keeping 10 samples, the total in its reason",
       st.ok === true &&
         q.length === 1 &&
         q[0].watched.length === 10 &&
