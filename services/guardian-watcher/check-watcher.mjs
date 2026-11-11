@@ -11,6 +11,7 @@ import {
   Kind,
   aggIface,
   traceDepthOk as recheckDepthOk,
+  findEntryLogs,
 } from "../../scripts/disclosure/recheck-lib.mjs";
 import {
   AGG,
@@ -32,6 +33,8 @@ import {
   sameLog,
   envelopeProblem,
   txOfEvidence,
+  typedEvidence,
+  nativeEvidence,
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store, writeAll, validAmendment, atomicWriteJson, boundReasons } from "./lib/store.mjs";
@@ -4718,6 +4721,73 @@ try {
       [10, 11, 12].every(p => r.spCall.get(p)?.from === addr("ord-from")) &&
       !swapped.aligned,
     { aligned: r.aligned, why: r.why, swapped: swapped.aligned }
+  );
+}
+
+// ---- follow-up #2 R10: evidence carrying the encoder's own tag keys round-trips exactly;
+// retirements are numbered by a durable counter; the rechecker appends without spreads
+{
+  const tag = v =>
+    JSON.stringify(v, (k, x) => (typeof x === "bigint" ? { "#bigint": x.toString() } : x));
+  const samples = [
+    { data: { $obj: 0, nested: { $obj: { lost: "original wrapper" } } } },
+    { data: { $obj: 1, inner: { $bigint: "5" } } },
+    { $bigint: "7" },
+    { $obj: { $obj: { $bigint: "9" } } },
+    { n: 5n, m: { $bigint: "5" }, k: [{ $obj: 2 }, 3n] },
+  ];
+  // twice through storage: what a retry does
+  const round = v => nativeEvidence(typedEvidence(nativeEvidence(typedEvidence([v]))))[0];
+  const rt = samples.map(v => tag(round(v)) === tag(v));
+  // retirements: five of one id are five files; a lost counter is rebuilt
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-retire-"));
+  const id = `tx-${ethers.id("rt").toLowerCase()}`;
+  let names;
+  try {
+    const st = new Store(d);
+    const put = () =>
+      st.putDeadLetter({
+        route: "tx",
+        txHash: ethers.id("rt"),
+        blockNumber: 1,
+        reasons: ["x"],
+        seenAt: "x",
+      });
+    for (let i = 0; i < 3; i++) {
+      put();
+      st.retireDeadLetter(id);
+    }
+    rmSync(join(d, "deadletters", `${id}.json.exhausted-next`));
+    for (let i = 0; i < 2; i++) {
+      put();
+      st.retireDeadLetter(id);
+    }
+    names = readdirSync(join(d, "deadletters"))
+      .filter(f => /\.exhausted(\.\d+)?$/.test(f))
+      .sort();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  const base = `${id}.json`;
+  const want = [
+    `${base}.exhausted`,
+    `${base}.exhausted.2`,
+    `${base}.exhausted.3`,
+    `${base}.exhausted.4`,
+    `${base}.exhausted.5`,
+  ].sort();
+  // the rechecker: 150 000 logs in one page
+  const many = Array.from({ length: 150_000 }, (_, i) => ({ i }));
+  let found, err;
+  try {
+    found = await findEntryLogs({ getLogs: async () => many }, addr("reg"), 1n, 1, 1);
+  } catch (e) {
+    err = e.message;
+  }
+  cell(
+    "follow-up R10: evidence with nested $obj/$bigint keys round-trips exactly through storage twice; five retirements of one id are five numbered files (a lost counter is rebuilt); the rechecker takes 150 000 logs of one page without a spread",
+    rt.every(Boolean) && j(names) === j(want) && found?.length === 150_000,
+    { rt, names, err, n: found?.length }
   );
 }
 

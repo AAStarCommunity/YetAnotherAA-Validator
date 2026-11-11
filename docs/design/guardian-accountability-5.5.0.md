@@ -542,6 +542,11 @@ aggregator-only.
     (bounded by the ABI), which is all its verdict reads. Work over an answer is
     linear: txs are visited by height bucket without sorting the answer, receipt
     logs are placed by position, and matching uses keyed sets.
+  - Evidence keeps exactly what the RPC said, including objects that use the
+    encoder's own tag keys (`$obj`, `$bigint`): the escape is recognised by
+    identity, not by its parent's keys. Store lookups do not grow with the
+    archive: a BLS record is found by its kind's file name, and a dead letter's
+    retirements are numbered by a durable counter.
   - Identities stay distinct at any depth: a deep value is keyed by the sha256
     of its full text, and the placeholder it is stored as keeps that digest, so
     distinct deep observations are never merged and a retry never duplicates

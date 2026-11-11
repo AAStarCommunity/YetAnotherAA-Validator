@@ -807,16 +807,23 @@ export function safeJson(v) {
   try {
     // collision-free: a BigInt becomes { $bigint }, and a plain object that itself uses one of the
     // tag keys is escaped as { $obj: {...} }, so a literal never equals a tag (Codex follow-up R12)
+    // The escape's own inner copy is recognised by identity, never by its parent's keys: a parent
+    // that merely HAS a `$obj` key (it came from the RPC) must not switch escaping off below it
+    // (follow-up #2 R10).
+    const escaped = new WeakSet();
     return JSON.stringify(v, function (k, x) {
       if (typeof x === "bigint") return { $bigint: x.toString() };
       if (
         x &&
         typeof x === "object" &&
         !Array.isArray(x) &&
-        (Object.hasOwn(x, "$bigint") || Object.hasOwn(x, "$obj")) &&
-        !Object.hasOwn(this, "$obj")
-      )
-        return { $obj: { ...x } };
+        !escaped.has(x) &&
+        (Object.hasOwn(x, "$bigint") || Object.hasOwn(x, "$obj"))
+      ) {
+        const inner = { ...x };
+        escaped.add(inner);
+        return { $obj: inner };
+      }
       return x;
     });
   } catch {
@@ -839,7 +846,7 @@ const DEEP_PLACEHOLDER = "<evidence too deep or too large to serialise>";
 /** Evidence as it is persisted: BigInt values tagged ({ $bigint }) rather than flattened to
  * strings, so a stored observation keeps the identity it had when seen (1n and "1" stay two
  * observations through a retry: Codex follow-up R11). */
-function typedEvidence(watched) {
+export function typedEvidence(watched) {
   // Never the original object as a fallback: a value that cannot be serialised (nested too deep,
   // say) would then throw in the dead-letter write, outside the isolation (follow-up #2 R2). Each
   // item that cannot be encoded, or is nested deeper than any real log (MAX_EVIDENCE_DEPTH), becomes
@@ -910,7 +917,7 @@ function deepPlaceholder(item) {
 /** Stored evidence back to the values it was seen with (the inverse of typedEvidence): every read of
  * persisted evidence decodes, every write encodes, so persistence is idempotent and an observation
  * keeps one identity across any number of retries (Codex follow-up R12). */
-function nativeEvidence(watched) {
+export function nativeEvidence(watched) {
   // Iterative (follow-up #2 R7): stored evidence may be nested thousands deep, and a recursive
   // decoder would overflow on every retry, outside the isolation.
   const conv = x => {

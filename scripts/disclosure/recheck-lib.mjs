@@ -657,7 +657,7 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
         matching.push({ ...c, messageHash: mh });
     }
     if (matching.length === 0) {
-      f.incomplete.push(...found.notes);
+      for (const n of found.notes) f.incomplete.push(n); // no RPC-sized spread
       f.incomplete.push(
         found.candidates.length
           ? "no recovered aggregator call reproduces the SignersCommitted key"
@@ -731,7 +731,7 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
       );
       return { status: null, facts: f, authenticated: true };
     }
-    f.incomplete.push(...found.notes);
+    for (const n of found.notes) f.incomplete.push(n); // no RPC-sized spread
     f.incomplete.push(
       proven.length > 1
         ? "several proven calls claim the same key with different messages"
@@ -797,9 +797,14 @@ export async function findEntryLogs(chain, registry, entryId, fromBlock, toBlock
   while (from <= toBlock) {
     const to = Math.min(toBlock, from + size - 1);
     try {
-      out.push(
-        ...(await chain.getLogs({ address: registry, topics, fromBlock: from, toBlock: to }))
-      );
+      // appended one by one: a spread of an RPC-sized answer overflows the call stack
+      for (const l of await chain.getLogs({
+        address: registry,
+        topics,
+        fromBlock: from,
+        toBlock: to,
+      }))
+        out.push(l);
       from = to + 1;
       size = page;
     } catch (e) {

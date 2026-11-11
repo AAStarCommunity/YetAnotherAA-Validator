@@ -123,6 +123,9 @@ export function boundReasons(rec) {
   return out;
 }
 
+/** The record kinds a BLS action can have (recheck-lib KIND_NAME). */
+const BLS_KINDS = ["SLASH", "GENERIC", "QUEUE", "REPUTATION"];
+
 export function readJson(path, fallback) {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
@@ -249,10 +252,25 @@ export class Store {
   retireDeadLetter(id) {
     const path = join(this.dir, "deadletters", `${id}.json`);
     if (!existsSync(path)) return;
-    // never overwrite an earlier retirement of the same id (#400 review L2): number them
-    let target = `${path}.exhausted`;
-    for (let k = 2; existsSync(target); k++) target = `${path}.exhausted.${k}`;
-    renameDurable(path, target);
+    // never overwrite an earlier retirement of the same id (#400 review L2): number them. The next
+    // number is kept in a durable counter beside them, so a retirement probes O(1) names, not every
+    // earlier one (follow-up #2 R10); a missing or unreadable counter is rebuilt by one scan.
+    const ctr = `${path}.exhausted-next`;
+    let k = null;
+    try {
+      const v = readJson(ctr, null)?.next;
+      if (Number.isSafeInteger(v) && v >= 1) k = v;
+    } catch {
+      k = null;
+    }
+    if (k === null) {
+      k = 1;
+      while (existsSync(k === 1 ? `${path}.exhausted` : `${path}.exhausted.${k}`)) k++;
+    }
+    // a counter behind the files (a crash between rename and counter write) moves forward
+    while (existsSync(k === 1 ? `${path}.exhausted` : `${path}.exhausted.${k}`)) k++;
+    renameDurable(path, k === 1 ? `${path}.exhausted` : `${path}.exhausted.${k}`);
+    atomicWriteJson(ctr, { next: k + 1 });
   }
 
   /** Unattributed records of txs whose answers never became readable (#400 review L1). */
@@ -376,12 +394,14 @@ export class Store {
    * writes the real record (Codex #400-fix R2).
    */
   hasBlsRecord(key) {
-    const suffix = `-${BigInt(key).toString(16).padStart(64, "0")}.json`;
-    return readdirSync(join(this.dir, "records")).some(f => {
-      if (!f.startsWith("bls-") || !f.endsWith(suffix)) return false;
-      // UNRECOVERED placeholders carry no kind, so the kind test excludes them too.
+    // One file per known kind, looked up directly: never a listing of the whole archive per
+    // commitment (follow-up #2 R10). UNRECOVERED placeholders carry no kind, so are not looked at.
+    const hex = BigInt(key).toString(16).padStart(64, "0");
+    return BLS_KINDS.some(kind => {
+      const p = join(this.dir, "records", `bls-${kind}-${hex}.json`);
+      if (!existsSync(p)) return false;
       try {
-        return JSON.parse(readFileSync(join(this.dir, "records", f), "utf8")).kind !== undefined;
+        return JSON.parse(readFileSync(p, "utf8")).kind !== undefined;
       } catch {
         return false;
       }
