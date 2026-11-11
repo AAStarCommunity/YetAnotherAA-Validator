@@ -17,8 +17,12 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const results = [];
-const cell = (name, ok, got) =>
+// exactly three arguments: a stray comma in a condition would otherwise move part of it into the
+// diagnostic and drop the rest silently (Codex M1 R3)
+const cell = (name, ok, got, ...extra) => {
+  if (extra.length) throw new Error(`cell "${name}": more than three arguments`);
   results.push({ name, ok: !!ok, got: ok ? "" : JSON.stringify(got) });
+};
 
 // ---- F2 / N1: preflight, with an injected JSON-RPC
 const FORK = "https://fork.invalid/KEY";
@@ -671,8 +675,8 @@ if (process.env.FAKE_ANVIL_SERVE) {
         !full.out.includes("127.0.0.1") &&
         startedPids().length === pidsBefore + 1 &&
         rpcCalls().length > 0 &&
-        !rpcCalls().some(([m]) => m === "anvil_setBalance"),
-      leftover.length === 0,
+        !rpcCalls().some(([m]) => m === "anvil_setBalance") &&
+        leftover.length === 0,
       {
         status: full.status,
         err: full.err,
