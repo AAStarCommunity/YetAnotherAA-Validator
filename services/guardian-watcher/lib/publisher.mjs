@@ -290,7 +290,9 @@ export async function publishPending(
     counts.unreadable += bad.length;
     counts.failed += bad.length;
     alerts.push(
-      `${bad.length} record file(s) unreadable, oversized, duplicated or without a matching id; not published (first: ${bad.slice(0, 5).join(", ")})`
+      // a count only: a file name is the directory's content and may carry anything (a token
+      // pasted into a name), so it never reaches an alert, alerts-latest.json or Telegram (R22)
+      `${bad.length} record file(s) unreadable, oversized, duplicated or without a matching id; not published (see records/ on the host)`
     );
   }
   // Least recently run first (failures included), so a bounded pass rotates through a backlog.

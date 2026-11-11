@@ -728,7 +728,9 @@ const cfg = { aggregator: AGG };
     const q3 = await publishPending(store, sk, { maxRecords: 10, now: clock });
     cell(
       "R3: a second file with the same record identity is isolated (no duplicate publication)",
-      q3.alerts.some(a => /duplicated or without a matching id/.test(a) && /zz-copy/.test(a)) &&
+      q3.counts.unreadable === 1 &&
+        q3.alerts.some(a => /^1 record file\(s\) unreadable, oversized, duplicated/.test(a)) &&
+        !q3.alerts.some(a => /zz-copy/.test(a)) &&
         s.calls.telegram === tg0,
       { q3: q3.counts, alerts: q3.alerts }
     );
@@ -740,8 +742,9 @@ const cfg = { aggregator: AGG };
     const q4 = await publishPending(store, sk, { maxRecords: 10, now: clock });
     cell(
       "R3: a record file over the read bound is refused (unreadable), not parsed",
-      q4.alerts.some(a => /owner-0xbig-0/.test(a)),
-      q4.alerts
+      q4.counts.unreadable === q3.counts.unreadable + 1 &&
+        !q4.alerts.some(a => /owner-0xbig-0/.test(a)),
+      { q3: q3.counts.unreadable, q4: q4.counts.unreadable, alerts: q4.alerts }
     );
   } finally {
     rmSync(d, { recursive: true, force: true });
@@ -2636,6 +2639,40 @@ const good = {
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
+  }
+}
+
+// ---- Codex W2c R22: a record file's name never reaches an alert, the saved details or Telegram
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord({ ...owner, txHash: ethers.id("r22-good") });
+    const SENT = "private-TOKEN9z7q";
+    writeFileSync(join(d, "records", `${SENT}.json`), "{not a record");
+    writeFileSync(join(d, "records", `x.${SENT}.json`), "{not a record");
+    const s = sinks();
+    const built = {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      wallet: writer,
+      registryFor: () => s.registry,
+    };
+    const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+    const out = await publishPhase(store, roleChain(roles), cfg, P, built, { now: 5 });
+    const saved = readFileSync(join(d, "alerts-latest.json"), "utf8");
+    cell(
+      "R22: a file name (a sentinel token) is in no returned alert, not in alerts-latest.json, not in any Telegram text",
+      out.unreadable === 2 &&
+        !JSON.stringify(out).includes(SENT) &&
+        !saved.includes(SENT) &&
+        s.calls.texts.length > 0 &&
+        !s.calls.texts.some(t => t.includes(SENT)),
+      { unreadable: out.unreadable, saved: saved.slice(0, 300), texts: s.calls.texts.length }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
   }
 }
 
