@@ -502,8 +502,11 @@ aggregator-only.
   Before Phase D, a separate gate (**D-RPC2**, must merge before Phase D, no
   bypass) re-fetches every accusatory record's tx from a second, independently
   operated RPC (a different provider) and holds the record as unconfirmed unless
-  both agree; records that confirm no violation are exempt. Comparing several
-  independent RPCs on every scan is backlog after 5.5.0.
+  both agree; records that confirm no violation are exempt. Holds, status and
+  alerts name the second provider only by its declared operator label
+  (`secondProvider`), never by URL or hostname: some providers put the API key
+  in a subdomain, so a hostname can be a secret. Comparing several independent
+  RPCs on every scan is backlog after 5.5.0.
 
 #### 5.2b Dead letters, exhaustion and read integrity
 
