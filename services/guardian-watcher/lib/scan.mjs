@@ -176,8 +176,11 @@ export async function verifyTrace(
   chain,
   cfg,
   fromBlock,
-  { blocks = 5, maxTx = 8, sampleTx = null } = {}
+  { blocks = 5, maxTx = 8, sampleTx = null, perBlock = 40 } = {}
 ) {
+  // Every receipt lookup counts, with or without logs (follow-up #2 R11): at most `perBlock`
+  // transactions of each sampled block are looked at, so an answer listing 20 000 transactions
+  // costs a bounded number of requests, not one each.
   if (typeof chain.send !== "function") return { state: "unsupported", reason: "no send()" };
   let tried = 0;
   let failed = 0;
@@ -256,8 +259,11 @@ export async function verifyTrace(
       why = "sample block unavailable";
       continue;
     }
-    for (const t of blk?.transactions ?? []) {
-      if (tried >= maxTx) break;
+    const list = Array.isArray(blk?.transactions) ? blk.transactions : [];
+    let looked = 0;
+    for (const t of list) {
+      if (tried >= maxTx || looked >= perBlock) break;
+      looked++;
       const hash = typeof t === "string" ? t : t?.hash;
       if (typeof hash !== "string" || hash === sampleTx) continue;
       const r = await check(hash, { blockNumber: b, blockHash: blk.hash });
@@ -532,7 +538,9 @@ function evidenceLog(l, source, range) {
   // stored evidence that could not be kept as JSON is already final: kept as is, so a retry keeps
   // one identity for it (follow-up #2 R6)
   if (l?.raw === DEEP_PLACEHOLDER && typeof l.rawSha256 === "string") return { ...l };
-  const has = k => l?.[k] !== undefined && l?.[k] !== null;
+  // present = an own property, whatever its value (null, false, 0, ""): the stored observation is
+  // the received one, and validation stays separate from serialisation (follow-up #2 R11)
+  const has = k => !!l && typeof l === "object" && Object.hasOwn(l, k);
   return {
     address: l?.address,
     topics: Array.isArray(l?.topics) ? [...l.topics] : l?.topics,
@@ -541,7 +549,7 @@ function evidenceLog(l, source, range) {
     ...(has("logIndex") ? { logIndex: l.logIndex } : {}),
     ...(has("removed") ? { removed: l.removed } : {}),
     blockNumber: l?.blockNumber, // raw: an invalid height stays as the RPC gave it
-    ...(l?.blockHash ? { blockHash: l.blockHash } : {}),
+    ...(has("blockHash") ? { blockHash: l.blockHash } : {}),
     transactionHash: l?.transactionHash,
     // which query returned it (aggregator or SuperPaymaster): a retry classifies by this, never by
     // re-filtering a possibly malformed log out of existence (Codex follow-up R2)
@@ -561,7 +569,7 @@ function mergeEvidence(a, b) {
     if (e?.raw === DEEP_PLACEHOLDER && typeof e.rawSha256 === "string")
       return `deep:${e.rawSha256}`;
     // stored as a placeholder (too deep for any real log): keyed as that placeholder will be
-    if (deeperThan(e, MAX_EVIDENCE_DEPTH))
+    if (deeperThan(e, MAX_EVIDENCE_DEPTH) || largerThan(e, MAX_EVIDENCE_BYTES))
       try {
         return `deep:${deepDigest(e)}`;
       } catch {
@@ -797,7 +805,16 @@ const RESERVED = ["source", "range", "raw", "count", "quarantine"];
 function stripReserved(l) {
   if (!RESERVED.some(k => Object.hasOwn(l, k))) return l;
   const out = {};
-  for (const [k, v] of Object.entries(l)) if (!RESERVED.includes(k)) out[k] = v;
+  // own data properties only: assigning a key named __proto__ would replace the copy's prototype
+  // and make nested fields look like log fields (follow-up #2 R11)
+  for (const [k, v] of Object.entries(l))
+    if (!RESERVED.includes(k))
+      Object.defineProperty(out, k, {
+        value: v,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
   return out;
 }
 
@@ -854,14 +871,15 @@ export function typedEvidence(watched) {
   // indented, so a stored value's size grows with the square of its depth (a 6000-deep value of
   // 42 KB was a 72 MB dead letter, rewritten on every retry: follow-up #2 R7).
   const items = Array.isArray(watched) ? watched : [watched];
-  if (!items.some(it => deeperThan(it, MAX_EVIDENCE_DEPTH)))
+  const tooBig = it => deeperThan(it, MAX_EVIDENCE_DEPTH) || largerThan(it, MAX_EVIDENCE_BYTES);
+  if (!items.some(tooBig))
     try {
       return JSON.parse(safeJson(watched));
     } catch {
       // fall through to the per-item encoding
     }
   return items.map(item => {
-    if (!deeperThan(item, MAX_EVIDENCE_DEPTH))
+    if (!tooBig(item))
       try {
         return JSON.parse(safeJson(item));
       } catch {
@@ -884,6 +902,37 @@ function deeperThan(v, max) {
   return false;
 }
 const MAX_EVIDENCE_DEPTH = 64;
+/** A stored evidence item's JSON is at most this many characters (a real watched log is under
+ * 1 KB): a larger one is kept as a placeholder with its prefix, full length and sha256, so a
+ * retry never rewrites a huge value (follow-up #2 R11). */
+const MAX_EVIDENCE_BYTES = 65_536;
+
+/** Whether a value's JSON text is longer than `max` characters, measured without recursion and
+ * stopping as soon as it is (strings by length, other leaves by a small bound). */
+function largerThan(v, max) {
+  let n = 0;
+  const st = [v];
+  while (st.length) {
+    const x = st.pop();
+    if (typeof x === "string") n += x.length + 2;
+    else if (x && typeof x === "object") {
+      const keys = Array.isArray(x) ? null : Object.keys(x);
+      n += 2;
+      if (keys)
+        for (const k of keys) {
+          n += k.length + 4;
+          st.push(x[k]);
+        }
+      else
+        for (const c of x) {
+          n += 1;
+          st.push(c);
+        }
+    } else n += 24;
+    if (n > max) return true;
+  }
+  return false;
+}
 
 /** The stored form of an evidence item too deep or too large to keep as JSON. */
 function deepPlaceholder(item) {
@@ -963,7 +1012,9 @@ export function nativeEvidence(watched) {
 /** A log's raw identity for de-duplication: every field as the RPC gave it, never parsed, so only
  * identical copies collapse and conflicting ones at one position survive (Codex follow-up R2). */
 export function rawLogKey(l) {
-  const h = x => (typeof x === "string" ? x.toLowerCase() : x);
+  // case-folded only where case carries no meaning (valid hex); a malformed string is kept exactly,
+  // so "BAD" and "bad" stay two observations (follow-up #2 R11)
+  const h = x => (typeof x === "string" && /^0x[0-9a-fA-F]*$/.test(x) ? x.toLowerCase() : x);
   return safeJson([
     h(l?.address),
     Array.isArray(l?.topics) ? l.topics.map(h) : l?.topics,

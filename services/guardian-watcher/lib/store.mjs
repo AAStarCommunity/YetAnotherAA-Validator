@@ -294,6 +294,20 @@ export class Store {
     return next;
   }
 
+  /** Files in the local archive (records, dead letters incl. retired, amendments): each tick's
+   * work is linear in this (an accepted bound, DSR 97a9d55c), so status reports it. */
+  countArchiveFiles() {
+    let n = 0;
+    for (const d of ["records", "deadletters", "amendments"]) {
+      try {
+        n += readdirSync(join(this.dir, d)).length;
+      } catch {
+        // a directory not created yet holds nothing
+      }
+    }
+    return n;
+  }
+
   countQuarantined() {
     return readdirSync(join(this.dir, "records")).filter(
       f => f.startsWith("quarantine-") && f.endsWith(".json")

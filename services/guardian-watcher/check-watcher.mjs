@@ -4791,6 +4791,187 @@ try {
   );
 }
 
+// ---- follow-up #2 R11: huge shallow evidence is a small placeholder; a __proto__ key never fakes
+// log fields; malformed strings keep their case; falsy fields are kept; sampling is bounded
+{
+  const runs = [];
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r11-"));
+    runs.push(d);
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    return { c, cfg, store: new Store(d), d };
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r11-a"), addr("r11-b")]);
+  const out = {};
+  try {
+    // (a) a 1 000 000-character data value
+    const a = mk();
+    for (let i = 0; i < 4; i++) a.c.mine();
+    const ha = ethers.id("r11-big");
+    a.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: "z".repeat(1_000_000),
+      blockNumber: a.cfg.startBlock,
+      index: 0,
+      transactionHash: ha,
+    });
+    await runOnce(a.c.chain, a.cfg, a.store, rs, ident);
+    out.aBytes = readFileSync(join(a.d, "deadletters", `tx-${ha.toLowerCase()}.json`)).length;
+    out.aW = a.store.getDeadLetter(`tx-${ha.toLowerCase()}`)?.watched ?? [];
+    // (b) a log whose fields sit under an own __proto__ key, next to a reserved key
+    const b = mk();
+    for (let i = 0; i < 4; i++) b.c.mine();
+    const hb = ethers.id("r11-proto");
+    b.c.injectRawResult(
+      SP,
+      JSON.parse(
+        JSON.stringify({
+          source: "agg",
+          transactionHash: hb,
+          blockNumber: b.cfg.startBlock,
+          index: 0,
+        }).replace(/^\{/, `{"__proto__":${JSON.stringify({ address: SP, ...gs })},`)
+      )
+    );
+    out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
+    out.bRecs = b.store.countRecords();
+    out.bDl = !!b.store.getDeadLetter(`tx-${hb.toLowerCase()}`);
+    // nothing inherited reaches the evidence: the stored observation has no address or topics
+    out.bW = b.store.getDeadLetter(`tx-${hb.toLowerCase()}`)?.watched ?? [];
+    // (c) two observations differing only in the case of a malformed string
+    const c3 = mk();
+    for (let i = 0; i < 4; i++) c3.c.mine();
+    const hc = ethers.id("r11-case");
+    // ...and an explicit null is kept as received
+    c3.c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: "0x",
+      logIndex: null,
+      blockNumber: c3.cfg.startBlock,
+      index: 1,
+      transactionHash: hc,
+    });
+    for (const data of ["BAD", "bad"])
+      c3.c.injectRawResult(SP, {
+        address: SP,
+        ...gs,
+        data,
+        blockNumber: c3.cfg.startBlock,
+        index: 0,
+        transactionHash: hc,
+      });
+    await runOnce(c3.c.chain, c3.cfg, c3.store, rs, ident);
+    const cAll = c3.store.getDeadLetter(`tx-${hc.toLowerCase()}`)?.watched ?? [];
+    out.cW = cAll.map(w => w.data).filter(x => x !== "0x");
+    out.cNull = cAll.some(
+      w => w.data === "0x" && Object.hasOwn(w, "logIndex") && w.logIndex === null
+    );
+    // (d) a real tx whose getLogs copy says blockHash: false: kept as received, never a record
+    const e = mk();
+    const k = e.c.ownerTx([{ name: "SlashCancelled", args: [addr("r11-op")] }]);
+    for (let i = 0; i < 4; i++) e.c.mine();
+    e.c.patchLogs(k.hash, { blockHash: false });
+    for (let i = 0; i < 3; i++) await runOnce(e.c.chain, e.cfg, e.store, rs, ident);
+    out.eW = e.store.getDeadLetter(`tx-${k.hash.toLowerCase()}`)?.watched ?? [];
+    out.eRecs = e.store.countRecords();
+  } finally {
+    for (const d of runs) rmSync(d, { recursive: true, force: true });
+  }
+  // (e) trace sampling: a block listing 20 000 transactions whose receipts are null
+  let lookups = 0;
+  const fake = {
+    send: async m =>
+      m === "eth_getBlockByNumber"
+        ? {
+            hash: ethers.id("blk"),
+            transactions: Array.from({ length: 20_000 }, (_, i) => ethers.id(`s-${i}`)),
+          }
+        : null,
+    getTransactionReceipt: async () => {
+      lookups++;
+      return null;
+    },
+  };
+  const v = await verifyTrace(fake, { aggregator: AGG, roles: { superPaymaster: SP } }, 100);
+  cell(
+    "follow-up R11: a 1 MB data value is a small placeholder; fields under a __proto__ key are not log fields (no record); 'BAD' and 'bad' stay two observations; blockHash: false is kept and never becomes a record; trace sampling looks at a bounded number of receipts",
+    out.aBytes < 100_000 &&
+      out.aW[0]?.rawLength > 1_000_000 &&
+      /^0x[0-9a-f]{64}$/.test(out.aW[0]?.rawSha256 ?? "") &&
+      out.b.ok &&
+      out.bRecs === 0 &&
+      out.bDl &&
+      out.bW.length === 1 &&
+      out.bW[0].address === undefined &&
+      out.bW[0].topics === undefined &&
+      out.cNull &&
+      out.cW.length === 2 &&
+      out.cW.includes("BAD") &&
+      out.cW.includes("bad") &&
+      out.eW.some(w => w.blockHash === false) &&
+      out.eRecs === 0 &&
+      v.state === "unverified" &&
+      lookups <= 200,
+    {
+      aBytes: out.aBytes,
+      aLen: out.aW[0]?.rawLength,
+      b: [out.b.ok, out.bRecs, out.bDl, out.bW],
+      cNull: out.cNull,
+      c: out.cW,
+      e: [out.eW.map(w => w.blockHash), out.eRecs],
+      v: v.state,
+      lookups,
+    }
+  );
+}
+
+// ---- DSR 97a9d55c: status reports the tick's duration and the archive size; a tick slower than
+// maxTickFraction of the interval is degraded
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-timing-"));
+  const c = makeChain();
+  const base = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  let fast, slow;
+  try {
+    c.ownerTx([{ name: "SlashCancelled", args: [addr("tm-op")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const store = new Store(d);
+    fast = (await runOnce(c.chain, { ...base, intervalMs: 600_000 }, store, rs, ident)).status;
+    // an interval so short that any tick exceeds half of it
+    slow = (await runOnce(c.chain, { ...base, intervalMs: 0.001 }, store, rs, ident)).status;
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "status reports tickMs and archiveFiles; a tick slower than maxTickFraction of the interval is degraded",
+    Number.isFinite(fast.tickMs) &&
+      fast.archiveFiles >= 1 &&
+      !(fast.degraded ?? []).some(r => /tick took/.test(r)) &&
+      (slow.degraded ?? []).some(r => /tick took \d+ ms, more than 0 ms/.test(r)) &&
+      slow.healthy === false,
+    { fast: [fast.tickMs, fast.archiveFiles, fast.degraded], slow: [slow.tickMs, slow.degraded] }
+  );
+}
+
 // ---- durable writes: a short write is completed, zero progress refused (Codex W2c R2)
 {
   const got = [];

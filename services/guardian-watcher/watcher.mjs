@@ -56,6 +56,11 @@ export function loadConfig(path) {
   for (const a of [c.aggregator, c.roles.superPaymaster, ...Object.values(c.forwarders ?? {})]) {
     if (!ethers.isAddress(a)) throw new Error(`config: bad address ${a}`);
   }
+  if (
+    c.maxTickFraction !== undefined &&
+    !(typeof c.maxTickFraction === "number" && c.maxTickFraction > 0 && c.maxTickFraction <= 10)
+  )
+    throw new Error("config: maxTickFraction must be a number in (0, 10]");
   if (c.maxLagBlocks !== undefined && !(Number.isSafeInteger(c.maxLagBlocks) && c.maxLagBlocks > 0))
     throw new Error("config: maxLagBlocks must be a positive integer");
   return {
@@ -64,6 +69,9 @@ export function loadConfig(path) {
     intervalMs: 60_000,
     // the cursor this far behind finalized is degraded (about 1 h of Sepolia blocks): DSR 2892c30f
     maxLagBlocks: 300,
+    // a tick slower than this share of the poll interval is degraded (DSR 97a9d55c): the work per
+    // tick grows with the local archive, and that must show before it outruns the interval
+    maxTickFraction: 0.5,
     forwarders: {},
     ...c,
   };
@@ -151,6 +159,19 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
   const status = { at: started, ruleset: ident, lastError: null };
+  // wall time of this tick and the archive it ran over, reported with every status
+  const tickStart = Date.now();
+  const timing = () => {
+    const ms = Date.now() - tickStart;
+    const limit = (cfg.maxTickFraction ?? 0.5) * (cfg.intervalMs ?? 60_000);
+    let files = null;
+    try {
+      files = store.countArchiveFiles();
+    } catch {
+      files = null;
+    }
+    return { ms, limit, files };
+  };
   const finish = async (stats, finalized, isolated = 0, more = []) => {
     let h;
     try {
@@ -203,7 +224,14 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
         unchecked: s.bloomUnchecked,
       },
     });
+    const tm = timing();
+    status.tickMs = tm.ms;
+    status.archiveFiles = tm.files;
     const more = [];
+    if (tm.ms > tm.limit)
+      more.push(
+        `tick took ${tm.ms} ms, more than ${Math.round(tm.limit)} ms (maxTickFraction of the interval)`
+      );
     if (s.budgetStop) more.push("isolation budget reached this tick (the rest is read next tick)");
     const lag = cur ? s.finalized - cur.block : null;
     const maxLag = cfg.maxLagBlocks ?? 300;
@@ -218,6 +246,9 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
     status.records = store.countRecords();
     status.deadLetters = store.listDeadLetters().length;
     status.cursor = store.getCursor()?.block ?? null;
+    const tm = timing();
+    status.tickMs = tm.ms;
+    status.archiveFiles = tm.files;
     await finish(null, null);
     store.writeStatus(status);
     return { status, summary: null };
