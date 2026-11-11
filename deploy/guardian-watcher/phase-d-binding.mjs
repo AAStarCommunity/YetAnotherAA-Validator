@@ -7,7 +7,7 @@
 // Phase D config must name those same items. Pure: launchctl output, file texts and paths come in.
 // Self-test: node deploy/guardian-watcher/check-phase-d-binding.mjs
 
-/** program and argv as `launchctl print` shows them. */
+/** program, argv and pid as `launchctl print` shows them. */
 export function parseLaunchd(out) {
   const program = out.match(/^\s*program = (.+)$/m)?.[1]?.trim() ?? null;
   const block = out.match(/^\s*arguments = \{\n([\s\S]*?)\n\s*\}/m)?.[1] ?? "";
@@ -15,11 +15,63 @@ export function parseLaunchd(out) {
     .split("\n")
     .map(x => x.trim())
     .filter(Boolean);
-  return { program, argv };
+  const pid = Number(out.match(/^\s*pid = (\d+)$/m)?.[1]);
+  return { program, argv, pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null };
+}
+
+/**
+ * The LIVE process (Codex R9): the job's pid must be the watcher itself, i.e. the wrapper's final
+ * exec happened. Its command line must be exactly `node <entry> --config <config>`, and its
+ * environment must hold RPC_URL and RPC_URL_2 equal to the Keychain values Phase D verified. This
+ * catches what file checks cannot: a bash startup injection (BASH_ENV) that never reaches the
+ * wrapper, and a wrapper or symlink replaced after the job started. Values are compared in memory and
+ * never returned; only fixed wording is.
+ * @param psCommand `ps -ww -o command= -p <pid>`; psEnv `ps -E -ww -o command= -p <pid>`
+ */
+export function liveProblems({
+  pid,
+  psCommand,
+  psEnv,
+  wantEntry,
+  wantConfig,
+  rpcPrimary,
+  rpcSecondary,
+}) {
+  if (!pid) return ["the watcher job has no pid"];
+  if (typeof psCommand !== "string" || typeof psEnv !== "string")
+    return ["the watcher process cannot be inspected"];
+  const problems = [];
+  const argv = psCommand.trim().split(/ +/);
+  if (
+    !SAFE_PATH.test(wantEntry ?? "") ||
+    !SAFE_PATH.test(wantConfig ?? "") ||
+    argv.length !== 4 ||
+    !/(^|\/)node$/.test(argv[0]) ||
+    argv[1] !== wantEntry ||
+    argv[2] !== "--config" ||
+    argv[3] !== wantConfig
+  )
+    problems.push(
+      "the running process is not the watcher with this config (wrapper never reached its exec?)"
+    );
+  // the environment follows the command line in ps -E output
+  if (!psEnv.startsWith(psCommand.trim())) problems.push("the watcher process cannot be inspected");
+  else if (!rpcPrimary || !rpcSecondary)
+    problems.push("RPC URLs not in the Keychain: the process environment is not checkable");
+  else {
+    const env = psEnv.trim().slice(psCommand.trim().length).trim().split(/ +/);
+    const one = (k, v) => {
+      const hits = env.filter(t => t.startsWith(`${k}=`));
+      return hits.length === 1 && hits[0] === `${k}=${v}`;
+    };
+    if (!one("RPC_URL", rpcPrimary) || !one("RPC_URL_2", rpcSecondary))
+      problems.push("the running watcher's RPC URLs are not the Keychain items Phase D verified");
+  }
+  return problems;
 }
 
 // a value placed between double quotes in the wrapper: no shell expansion, no quote, no newline
-const SAFE_PATH = /^\/[A-Za-z0-9._\-/ ]+$/;
+const SAFE_PATH = /^\/[A-Za-z0-9._\-/]+$/;
 
 /** The wrapper Phase D accepts, or null when a value cannot be placed safely. */
 export function canonicalWrapper(template, { config, entry }) {

@@ -16,7 +16,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { parseLaunchd, bindingProblems } from "./phase-d-binding.mjs";
+import { parseLaunchd, bindingProblems, liveProblems } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
@@ -253,7 +253,7 @@ for (const label of ld.mustBeOn ?? []) {
   else if (!out)
     add("watcher-job-binding", "MISSING", "watcher job not running, binding not checkable");
   else {
-    const { program, argv } = parseLaunchd(out);
+    const { program, argv, pid } = parseLaunchd(out);
     let text = null;
     try {
       text = readFileSync(wrapper, "utf8");
@@ -278,12 +278,33 @@ for (const label of ld.mustBeOn ?? []) {
       services: kc.services,
       account: kcAccount,
     });
+    // the live process, not only the files (Codex R9): what the pid actually runs, with which RPCs
+    const ps = extra =>
+      pid
+        ? spawnSync("ps", [...extra, "-ww", "-o", "command=", "-p", String(pid)], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+          })
+        : null;
+    const c = ps([]);
+    const e = ps(["-E"]);
+    problems.push(
+      ...liveProblems({
+        pid,
+        psCommand: c?.status === 0 ? c.stdout : null,
+        psEnv: e?.status === 0 ? e.stdout : null,
+        wantEntry: join(W, "watcher.mjs"),
+        wantConfig,
+        rpcPrimary: secret("rpcPrimary"),
+        rpcSecondary: secret("rpcSecondary"),
+      })
+    );
     add(
       "watcher-job-binding",
       problems.length ? "FAIL" : "PASS",
       problems.length
         ? problems.join("; ")
-        : "the running job is the wrapper for this config, RPCs from the Keychain"
+        : "the running process is this checkout's watcher with this config and the Keychain RPCs"
     );
   }
 }
