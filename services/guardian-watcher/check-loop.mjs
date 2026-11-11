@@ -3308,7 +3308,8 @@ const good = {
       let ph;
       for (let i = 0; i < 3; i++)
         ph = await publishPhase(x.store, roleChain(healthy), phCfg, phP, built, { now: 7 + i });
-      const failing = sinks({ registryAddress: CC, rawTag: "d3", nonceRangeFail: true });
+      const fOpts = { registryAddress: CC, rawTag: "d3", nonceRangeFail: true };
+      const failing = sinks(fOpts);
       const phF = await publishPhase(
         x.store,
         roleChain(healthy),
@@ -3317,21 +3318,45 @@ const good = {
         { ...built, registryFor: () => failing.registry },
         { now: 20 }
       );
+      // DSR: the failed check clears by itself once its cause is gone (the node answers again, and
+      // the range is fully held): no gap and no unknown reason left
+      fOpts.nonceRangeFail = false;
+      failing.chain.nonce = 7;
+      failing.chain.latestNonce = 7;
+      failing.chain.pendingNonce = 7;
+      const phR = await publishPhase(
+        x.store,
+        roleChain(healthy),
+        phCfg,
+        phP,
+        { ...built, registryFor: () => failing.registry },
+        { now: 21 }
+      );
       const w = "0x" + "ab".repeat(20);
       const held = n => ({ nonceUse: { from: w, chainId: "1", nonce: n } });
       const inPool = nonceGaps({}, w, "1", { latest: 5, pending: 6 });
       const below = nonceGaps({ r: held(6) }, w, "1", { latest: 5, pending: 5 });
       const none = nonceGaps({ r: held(5), s: held(6) }, w, "1", { latest: 5, pending: 7 });
       cell(
-        "B2-A(d): a writer nonce pending or skipped that no active stage holds is degraded (W1 -> W2 -> W1 through publishPhase; an eviction below a held nonce); a failed check is degraded too; a fully held range is not",
+        "B2-A(d): a writer nonce pending or skipped that no active stage holds is degraded (W1 -> W2 -> W1 through publishPhase; an eviction below a held nonce); a failed check is degraded too and clears by itself once the node answers again; a fully held range is not",
         ph.stalls.nonceGaps?.includes(5) &&
           stallReasons(ph).some(r => /nonce\(s\) 5\b.*held by no journal/.test(r)) &&
           phF.stalls.nonceGapUnknown === true &&
+          !phR.stalls.nonceGapUnknown &&
+          !phR.stalls.nonceGaps &&
+          !stallReasons(phR).some(r => /nonce gap check failed|held by no journal/.test(r)) &&
           stallReasons(phF).includes("writer nonce gap check failed") &&
           JSON.stringify(inPool) === "[5]" &&
           JSON.stringify(below) === "[5]" &&
           JSON.stringify(none) === "[]",
-        { ph: [ph.registrySkipped, ph.stalls], phF: phF.stalls, inPool, below, none }
+        {
+          ph: [ph.registrySkipped, ph.stalls],
+          phF: phF.stalls,
+          phR: phR.stalls,
+          inPool,
+          below,
+          none,
+        }
       );
       rmSync(x.d, { recursive: true, force: true });
     }
@@ -3581,6 +3606,39 @@ const good = {
         { asW1, asW2, asW2known }
       );
       rmSync(d, { recursive: true, force: true });
+    }
+    // (j) #425 approval Low: switched back to the old registry while waiting, the wait marker clears
+    // and the stage resumes there as the current one (no fresh signature, not degraded)
+    {
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "j" });
+      b.chain.nonce = 5;
+      b.chain.known.add(x.old.hash);
+      await pass(x.store, b);
+      const waited = x.store.getPublication(id).registryWait?.nonce;
+      const back = sinks({ registryAddress: OLD, rawTag: "j2", mine: "pending" });
+      back.chain.nonce = 5;
+      back.chain.known.add(x.old.hash);
+      const pb = await pass(x.store, back);
+      const jb = x.store.getPublication(id);
+      cell(
+        "B2-A(j): switched back to the old registry while waiting, the wait marker clears and the old stage resumes as current (its own tx rebroadcast to the old registry, no fresh signature), no nonce-wait, not migrating",
+        waited === 5 &&
+          !jb.registryWait &&
+          jb.registry.at?.address === OLD &&
+          jb.registry.hash === x.old.hash &&
+          back.calls.sign === 0 &&
+          (back.calls.raws ?? []).includes(x.old.raw) &&
+          pb.stalls.nonceWait === 0 &&
+          pb.stalls.migrating === 0,
+        {
+          waited,
+          jb: [jb.registryWait, jb.registry.at, jb.registry.hash],
+          sign: back.calls.sign,
+          stalls: pb.stalls,
+        }
+      );
+      rmSync(x.d, { recursive: true, force: true });
     }
     // (f) another writer (the M0 §5.5a recovery) or another chain has its own nonce space: no wait;
     // a stage already waiting is archived at once when the chain changes (Codex W2d R7 #1)
