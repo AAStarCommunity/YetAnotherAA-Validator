@@ -1,4 +1,4 @@
-// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 8f330504, frozen v9;
+// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 7c7827c0, frozen v10;
 // docs/release/a7/aoa-a7-readback-1.schema.json, read methods in its "x-readMethods") with what THIS
 // script reads from the loaded fork. Pure: every chain read goes through an injected reader, so the
 // rules are self-tested (check-a7-readback.mjs) without a chain.
@@ -19,18 +19,18 @@ import Ajv2020 from "ajv/dist/2020.js";
 import { AbiCoder, keccak256 } from "ethers";
 
 export const SCHEMA_ID = "aoa-a7-readback/1";
-/** sha256 of SP's FROZEN schema file at 8f330504 (v9, DSR-verified; any later change needs DSR
+/** sha256 of SP's FROZEN schema file at 7c7827c0 (v10, DSR-verified; any later change needs DSR
  * acceptance and a new hash). */
-export const SCHEMA_SHA256 = "bc009b278348c25be8858ef04b0dd3decf24489421a6dbc98d67956e619dc106";
+export const SCHEMA_SHA256 = "cb49395f6a88bb3dd75c08385d4bb1f22798b8b664366557c7b04b41df4a08ef";
 export const SCHEMA_SOURCE = {
   repo: "AAStarCommunity/SuperPaymaster",
-  ref: "8f3305047a72f3f0132827447d70af1375debe8a",
+  ref: "7c7827c02f59ef809c4cf852cfff269e99344eb3",
   path: "docs/release/a7/aoa-a7-readback-1.schema.json",
 };
 export const ANVIL_COMMIT = "4e8874b2bdc840929585ca73e170993c50a4a531";
 /** sha256 of SP's fork example at the pinned schema commit: its per-contract field list is the
  * field inventory (Codex A7 R11), independent of the read-back under test. */
-export const EXAMPLE_SHA256 = "a5effd05cf469c01d05090b0e56704f4ccc9b55021c294f57c4d2d1e498706c2";
+export const EXAMPLE_SHA256 = "4888f3644565b9fb9ecfc2facf11786a3c11ef4b8bb6dad0411975787a271359";
 /** The check inventory from SP's pinned example: every check key it lists (Codex A7 R12). */
 export const checkInventory = example => Object.keys(example?.checks ?? {});
 /** The field inventory from SP's pinned example: contract key -> its non-common fields. */
@@ -74,7 +74,10 @@ export const REQUIRED_CONTRACTS = [
   "ownerSafe",
   "multiSendCallOnly",
   "evaluationCommunityToken",
+  "timelockController", // schema v10: required ("n/a:not deployed" when there is none)
 ];
+/** A field whose getter has another name (x-readMethods): contract key -> field -> getter. */
+export const GETTER_ALIASES = { timelockController: { minDelay: "getMinDelay" } };
 /** Contract-specific fields that MUST be present (x-readMethods; Codex A7 R2 #1): a read-back that
  * leaves one out is unverified, never silently passed. */
 export const REQUIRED_FIELDS = {
@@ -152,6 +155,8 @@ export const SAFE_GETTERS = [
 ];
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** An OWN property of an input object: never an inherited one such as "constructor" (Codex A7 R14). */
+const own = (o, k) => o != null && typeof o === "object" && Object.hasOwn(o, k);
 const COMMON = [
   "address",
   "version",
@@ -297,6 +302,29 @@ export async function compare(rb, reader, facts) {
   eq("header.ethConfig.forkId", AMSTERDAM.forkId, h.ethConfig.forkId);
   const co = h.ethConfig.corroboration;
   eq("header.ethConfig.corroboration.blockNumber", h.forkBlock, co.blockNumber);
+  // two distinct declared providers; ethConfig and its corroboration come from two of them (R14)
+  {
+    const provs = Array.isArray(h.providers) ? h.providers : [];
+    const uniq = new Set(provs);
+    check(
+      "header.providers (at least two, distinct)",
+      "≥2 distinct",
+      provs.length,
+      provs.length >= 2 && uniq.size === provs.length
+    );
+    check(
+      "header.ethConfig.provider is declared",
+      h.ethConfig.provider ?? null,
+      null,
+      uniq.has(h.ethConfig.provider)
+    );
+    check(
+      "header.ethConfig.corroboration.provider is another declared provider",
+      co.provider ?? null,
+      null,
+      uniq.has(co.provider) && co.provider !== h.ethConfig.provider
+    );
+  }
   eq("header.ethConfig.corroboration.blockAccessListHash", true, co.blockAccessListHash);
   eq("header.ethConfig.corroboration.slotNumber", true, co.slotNumber);
   const up = await reader.upstreamHeader(h.forkBlock);
@@ -305,13 +333,13 @@ export async function compare(rb, reader, facts) {
 
   // ---- inventory (Codex A7 R1 #1): ours, not the file's
   for (const k of REQUIRED_CONTRACTS)
-    if (!(k in rb.contracts)) unverified.push(`contracts.${k} (missing from the read-back)`);
+    if (!own(rb.contracts, k)) unverified.push(`contracts.${k} (missing from the read-back)`);
   if (Object.keys(rb.checks).length === 0) unverified.push("checks (empty)");
   // every check SP's pinned example lists must be in the read-back (Codex A7 R12)
   for (const k of facts.checkInventory ?? [])
-    if (!(k in rb.checks)) unverified.push(`checks.${k} (missing from the read-back)`);
+    if (!own(rb.checks, k)) unverified.push(`checks.${k} (missing from the read-back)`);
   // optional in the schema; required when the manifest's address book declares one (DSR)
-  if (facts.addressBook?.timelockController && !("timelockController" in rb.contracts))
+  if (facts.addressBook?.timelockController && !own(rb.contracts, "timelockController"))
     unverified.push(
       "contracts.timelockController (declared in the address book, missing from the read-back)"
     );
@@ -326,7 +354,8 @@ export async function compare(rb, reader, facts) {
   };
   const scalarOut = f => f.outputs.length === 1 && !/[[\]()]|tuple/.test(f.outputs[0].type);
   // the field rules, for one SP value and one zero-argument getter
-  const field = async (path, iface, key, addr, name, sp) => {
+  const field = async (path, iface, key, addr, nameIn, sp) => {
+    const name = GETTER_ALIASES[key]?.[nameIn] ?? nameIn;
     if (sp === null) {
       // absent: decided from SP's ABI only (DSR)
       if (!iface) return unverified.push(`${path} (null: no ABI for ${key})`);
@@ -353,8 +382,17 @@ export async function compare(rb, reader, facts) {
     const iface = facts.abi?.[key] ?? null;
     // the address comes from the manifest address book, never from the file (x-readMethods)
     const book = facts.addressBook?.[key];
+    const notDeployed = typeof c.address === "string" && c.address.startsWith("n/a:not deployed");
     if (!facts.addressBook) unverified.push(`${P}.address (no address book)`);
-    else if (book === undefined) unverified.push(`${P}.address (not in the address book)`);
+    else if (book === undefined && notDeployed) {
+      // the manifest's address book declares no such contract, and SP says it is not deployed:
+      // every other field must say so too (schema v10, the timelock when there is none)
+      const allNa = Object.entries(c).every(
+        ([k, v]) => k === "address" || (typeof v === "string" && v.startsWith("n/a:not deployed"))
+      );
+      check(`${P}.address`, c.address, "(not in the address book)", allNa);
+      continue;
+    } else if (book === undefined) unverified.push(`${P}.address (not in the address book)`);
     else if (isState(c.address)) check(`${P}.address`, c.address, book, false);
     else check(`${P}.address`, c.address, book, lc(book) === lc(c.address));
     if (isState(c.address)) {
@@ -370,7 +408,7 @@ export async function compare(rb, reader, facts) {
       ...(REQUIRED_FIELDS[key] ?? []),
       ...(facts.fieldInventory?.[key] ?? []),
     ]))
-      if (!(f in c)) unverified.push(`${P}.${f} (missing from the read-back)`);
+      if (!own(c, f)) unverified.push(`${P}.${f} (missing from the read-back)`);
     if (key === "entryPoint")
       check(
         `${P}.address=canonical EntryPoint v0.7`,
@@ -499,7 +537,7 @@ export async function compare(rb, reader, facts) {
     const g =
       isState(sp) || !sp ? { kind: "nosp" } : await read(iface, a, "getDepositInfo(address)", [sp]);
     for (const f of REQUIRED_FIELDS.entryPoint) {
-      if (!(f in c)) continue; // already unverified above
+      if (!own(c, f)) continue; // already unverified above
       if (g.kind === "noabi") unverified.push(`${P}.${f} (no ABI)`);
       else if (g.kind !== "value") check(`${P}.${f}`, c[f], g.kind, false);
       else {
@@ -603,14 +641,14 @@ export async function compare(rb, reader, facts) {
   async function bls(P, iface, a, c) {
     if (!iface) {
       for (const k of ["guardianSet", "signerMaskOrder", "thresholds"])
-        if (k in c) unverified.push(`${P}.${k} (no ABI)`);
+        if (own(c, k)) unverified.push(`${P}.${k} (no ABI)`);
       return;
     }
     // slots 1..MAX_VALIDATORS -> address; nonzero -> getBLSPublicKey (x-readMethods)
     const mv = await read(iface, a, "MAX_VALIDATORS()");
     if (mv.kind !== "value" || BigInt(mv.v) > 255n) {
       for (const k of ["guardianSet", "signerMaskOrder", "N"])
-        if (k in c) check(`${P}.${k}`, "(MAX_VALIDATORS)", mv.kind, false);
+        if (own(c, k)) check(`${P}.${k}`, "(MAX_VALIDATORS)", mv.kind, false);
     } else {
       const slots = [];
       for (let s = 1; s <= Number(mv.v); s++) {
@@ -622,11 +660,11 @@ export async function compare(rb, reader, facts) {
         slots.push(lc(g.v));
       }
       // N has no getter in SP's ABI: it is the number of occupied slots (validatorAtSlot != 0)
-      if ("N" in c) {
+      if (own(c, "N")) {
         const n = slots.filter(x => x !== ZERO).length;
         check(`${P}.N=occupied slots`, c.N, n, sameTyped("uint256", c.N, n));
       }
-      if ("guardianSet" in c) {
+      if (own(c, "guardianSet")) {
         const ours = [];
         for (let i = 0; i < slots.length; i++) {
           if (slots[i] === ZERO) continue;
@@ -676,7 +714,7 @@ export async function compare(rb, reader, facts) {
               unverified.push(`${Q}.${k} (no read method)`);
         }
       }
-      if ("signerMaskOrder" in c) {
+      if (own(c, "signerMaskOrder")) {
         for (const k of Object.keys(c.signerMaskOrder ?? {}))
           if (!["source", "bits"].includes(k))
             unverified.push(`${P}.signerMaskOrder.${k} (no read method)`);
@@ -695,7 +733,7 @@ export async function compare(rb, reader, facts) {
         }
       }
     }
-    if ("thresholds" in c) {
+    if (own(c, "thresholds")) {
       const t = c.thresholds;
       if (!t || typeof t !== "object" || Array.isArray(t)) {
         check(`${P}.thresholds`, t, null, false);
@@ -704,12 +742,12 @@ export async function compare(rb, reader, facts) {
       // every SlashLevel must be listed (x-readMethods: slashThresholds(level) for each SlashLevel)
       // the related constants (x-readMethods): listed in thresholds or as contract keys
       for (const k of ["minThreshold", "defaultThreshold", "SLASH_THRESHOLD_FLOOR"])
-        if (!(k in t) && !(k in c))
+        if (!own(t, k) && !own(c, k))
           unverified.push(`${P}.thresholds.${k} (missing from the read-back)`);
       if (!facts.slashLevels) unverified.push(`${P}.thresholds (SlashLevel order unknown)`);
       else
         for (const lvl of Object.keys(facts.slashLevels))
-          if (!(lvl in t)) unverified.push(`${P}.thresholds.${lvl} (missing from the read-back)`);
+          if (!own(t, lvl)) unverified.push(`${P}.thresholds.${lvl} (missing from the read-back)`);
       for (const [name, v] of Object.entries(t)) {
         const Q = `${P}.thresholds.${name}`;
         // a related constant with its own getter (minThreshold, SLASH_THRESHOLD_FLOOR, ...)
@@ -736,7 +774,7 @@ export async function compare(rb, reader, facts) {
       ["threshold", "getThreshold()"],
       ["owners", "getOwners()"],
     ]) {
-      if (!(k in c)) continue;
+      if (!own(c, k)) continue;
       const r = await reader.call(a, s, s.getFunction(sig), []);
       if (r.status !== "value") {
         check(`${P}.${k}`, c[k], r.status, false);
@@ -754,7 +792,7 @@ export async function compare(rb, reader, facts) {
         );
       } else check(`${P}.threshold`, c.threshold, r.v, sameTyped("uint256", c.threshold, r.v));
     }
-    if ("singleton" in c) {
+    if (own(c, "singleton")) {
       const w = await reader.slot(a, "0x" + "0".repeat(64));
       check(
         `${P}.singleton`,
@@ -865,7 +903,7 @@ export async function compare(rb, reader, facts) {
     // outside the safe range is a failure, never filtered out; "n/a:" / "unreadable:" means that
     // provider has no eth_simulateV1; anything else fails
     for (const prov of h.providers)
-      if (!(prov in pr.estimateSimulate))
+      if (!own(pr.estimateSimulate, prov))
         unverified.push(`amsterdamProbe.estimateSimulate.${prov} (missing)`);
     for (const [prov, n] of Object.entries(pr.estimateSimulate))
       if (!Number.isSafeInteger(n) && !isState(n))
@@ -883,7 +921,7 @@ export async function compare(rb, reader, facts) {
     }
     // every declared provider, not only the keys SP wrote (#412 review F4)
     for (const prov of h.providers)
-      if (!(prov in pr.callAtGasUsed))
+      if (!own(pr.callAtGasUsed, prov))
         unverified.push(`amsterdamProbe.callAtGasUsed.${prov} (missing)`);
     const calls = Object.entries(pr.callAtGasUsed);
     check(

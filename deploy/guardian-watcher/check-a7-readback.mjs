@@ -39,15 +39,15 @@ const cell = (name, ok, got) =>
 const schemaText = fx("aoa-a7-readback-1.schema.json");
 const exampleText = fx("aoa-a7-readback-1.example.json");
 const liveText = fx("aoa-a7-readback-1.live.example.json");
-cell("schema is SP's frozen v9 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
+cell("schema is SP's frozen v10 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
 cell(
   "fork example is SP's (sha256)",
-  sha(exampleText) === "a5effd05cf469c01d05090b0e56704f4ccc9b55021c294f57c4d2d1e498706c2",
+  sha(exampleText) === "4888f3644565b9fb9ecfc2facf11786a3c11ef4b8bb6dad0411975787a271359",
   sha(exampleText)
 );
 cell(
   "live example is SP's (sha256)",
-  sha(liveText) === "8558aa7d74460c9c8bb74e5dab4bbfe98436ea76777a460aa79ba998cc18116f",
+  sha(liveText) === "6c460198c7ae0b27cc268b4c97b889a9c8096a76ade97913c55ee26cdf32d004",
   sha(liveText)
 );
 const schema = JSON.parse(schemaText);
@@ -128,7 +128,9 @@ const base = structuredClone(example);
   C.superPaymaster.extensionCodehash = C.spAdminExtension.codehash;
   C.evaluationCommunityToken.SUPERPAYMASTER_ADDRESS = C.superPaymaster.address;
   // x-readMethods v5: only the Registry (and a Timelock) has a role system
-  for (const [k, c] of Object.entries(C)) if (k !== "registry") c.roles = "n/a:no role system";
+  for (const [k, c] of Object.entries(C))
+    if (k !== "registry" && k !== "timelockController") c.roles = "n/a:no role system";
+  C.timelockController.rolesSource = { fromBlock: 12000000, toBlock: base.header.readbackBlock };
   C.registry.roles = { ROLE_COMMUNITY: [MEMBER] };
   C.registry.rolesSource = { fromBlock: 12000000, toBlock: base.header.readbackBlock };
   C.blsAggregator.guardianSet = [
@@ -190,6 +192,7 @@ const typeOf = v =>
           : /^\d+$/.test(v)
             ? "uint256"
             : "string";
+const TL_ROLES = ["DEFAULT_ADMIN_ROLE", "PROPOSER_ROLE", "EXECUTOR_ROLE", "CANCELLER_ROLE"];
 const SKIP = [
   "address",
   "codehash",
@@ -272,6 +275,18 @@ function world(rb) {
         "function slashThresholds(uint8) view returns (uint8)"
       );
     if (key === "entryPoint") frags.push(DEPOSIT);
+    if (key === "timelockController") {
+      // OpenZeppelin TimelockController: role getters, AccessControl, getMinDelay() (not minDelay())
+      frags.push(
+        ...TL_ROLES.map(r => `function ${r}() view returns (bytes32)`),
+        "function hasRole(bytes32, address) view returns (bool)",
+        "function getMinDelay() view returns (uint256)",
+        "event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)",
+        "event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender)"
+      );
+      const mi = frags.indexOf("function minDelay() view returns (uint256)");
+      if (mi >= 0) frags.splice(mi, 1);
+    }
     if (key === "registry")
       frags.push(
         "function ROLE_COMMUNITY() view returns (bytes32)",
@@ -283,7 +298,16 @@ function world(rb) {
       );
     const iface = new Interface([...new Set(frags)]);
     abi[key] = iface;
-    for (const [k, v] of vals) ans(c.address, iface, `${k}()`, [], v);
+    for (const [k, v] of vals)
+      if (iface.getFunction(`${k}()`)) ans(c.address, iface, `${k}()`, [], v);
+    if (key === "timelockController") {
+      ans(c.address, iface, "getMinDelay()", [], BigInt(c.minDelay));
+      for (const r of TL_ROLES) {
+        ans(c.address, iface, `${r}()`, [], keccakId(r));
+        for (const m of c.roles[r] ?? [])
+          ans(c.address, iface, "hasRole(bytes32,address)", [keccakId(r), m], true);
+      }
+    }
     if (key === "registry") {
       if (!isState(c.pendingOwner))
         slots.set(`${c.address.toLowerCase()}|${OWNERSHIP_2STEP_SLOT}`, word(c.pendingOwner));
@@ -318,6 +342,7 @@ function world(rb) {
   // the real run marks them unverified (a7-fork.mjs)
   for (const k of Object.keys(C)) abi[k] ??= new Interface([]);
   const reg = C.registry.address;
+  const tl = C.timelockController.address;
   const reader = {
     chainId: async () => rb.header.chainId,
     head: async () => rb.header.readbackBlock,
@@ -331,18 +356,29 @@ function world(rb) {
       return answers.has(k) ? { status: "value", v: answers.get(k) } : { status: "revert" };
     },
     logs: async ({ address }) =>
-      address.toLowerCase() === reg.toLowerCase()
-        ? [
-            {
+      address.toLowerCase() === tl.toLowerCase()
+        ? TL_ROLES.flatMap(r =>
+            (C.timelockController.roles[r] ?? []).map(m => ({
               topics: [
-                abi.registry.getEvent("RoleRegistered").topicHash,
-                ROLE,
-                word(MEMBER),
+                abi.timelockController.getEvent("RoleGranted").topicHash,
+                keccakId(r),
+                word(m),
                 "0x" + "0".repeat(64),
               ],
-            },
-          ]
-        : [],
+            }))
+          )
+        : address.toLowerCase() === reg.toLowerCase()
+          ? [
+              {
+                topics: [
+                  abi.registry.getEvent("RoleRegistered").topicHash,
+                  ROLE,
+                  word(MEMBER),
+                  "0x" + "0".repeat(64),
+                ],
+              },
+            ]
+          : [],
     upstreamHeader: async () => ({ blockAccessListHash: true, slotNumber: true }),
     upstreamCodehash: async a => {
       const c = codes.get(a.toLowerCase());
@@ -555,12 +591,85 @@ await mut(
   rb => (rb.contracts.blsAggregator.N = 3),
   "contracts.blsAggregator.N=occupied slots"
 );
+// ---- schema v10: the timelock is required; "not deployed" only when the address book agrees
 await unv(
-  "a timelock declared in the address book but missing from the read-back is unverified",
-  () => {},
-  "contracts.timelockController (declared",
-  undefined,
-  { addressBook: { ...addressBook, timelockController: A(0x7171) } }
+  "v10: a read-back without timelockController is unverified",
+  rb => delete rb.contracts.timelockController,
+  "contracts.timelockController (missing"
+);
+{
+  const notDeployed = () =>
+    Object.fromEntries(
+      Object.keys(base.contracts.timelockController)
+        .filter(k => k !== "minDelay" && k !== "rolesSource")
+        .map(k => [k, "n/a:not deployed"])
+    );
+  const book = (() => {
+    const b = { ...addressBook };
+    delete b.timelockController;
+    return b;
+  })();
+  const rb = clone();
+  rb.contracts.timelockController = notDeployed();
+  const ok = await run(rb, undefined, { addressBook: book });
+  cell(
+    "v10: a timelock written all 'n/a:not deployed', absent from the address book, passes",
+    !failed(ok).some(p => p.startsWith("contracts.timelockController")) &&
+      !ok.unverified.some(u => u.startsWith("contracts.timelockController")),
+    {
+      f: failed(ok).filter(p => p.includes("timelock")),
+      u: ok.unverified.filter(u => u.includes("timelock")),
+    }
+  );
+  const rb2 = clone();
+  rb2.contracts.timelockController = { ...notDeployed(), owner: "n/a:no owner" };
+  const half = await run(rb2, undefined, { addressBook: book });
+  cell(
+    "v10: 'not deployed' with any field saying otherwise fails",
+    failed(half).includes("contracts.timelockController.address"),
+    failed(half)
+  );
+}
+await mut(
+  "v10: a timelock role member SP left out fails",
+  rb => (rb.contracts.timelockController.roles.PROPOSER_ROLE = []),
+  "contracts.timelockController.roles["
+);
+await mut(
+  "v10: minDelay other than getMinDelay() fails",
+  rb => (rb.contracts.timelockController.minDelay = 86400),
+  "contracts.timelockController.minDelay"
+);
+// ---- Codex A7 R14: inherited property names never stand in for evidence; providers complete
+await unv(
+  'R14: a provider named "constructor" without a simulateV1 entry is unverified',
+  rb => rb.header.providers.push("constructor"),
+  "amsterdamProbe.estimateSimulate.constructor (missing"
+);
+await unv(
+  'R14: a provider named "constructor" without a callAtGasUsed entry is unverified',
+  rb => rb.header.providers.push("constructor"),
+  "amsterdamProbe.callAtGasUsed.constructor (missing"
+);
+await mut(
+  "R14: a single declared provider fails",
+  rb => (rb.header.providers = [rb.header.providers[0]]),
+  "header.providers (at least two, distinct)"
+);
+await mut(
+  "R14: the corroboration from the same provider as ethConfig fails",
+  rb => (rb.header.ethConfig.corroboration.provider = rb.header.ethConfig.provider),
+  "header.ethConfig.corroboration.provider is another declared provider"
+);
+await mut(
+  "R14: an undeclared ethConfig provider fails",
+  rb => (rb.header.ethConfig.provider = "elsewhere"),
+  "header.ethConfig.provider is declared"
+);
+await unv(
+  "a contract field the pinned example lists, left out, stays unverified with own-property checks",
+  rb => delete rb.contracts.superPaymaster.REGISTRY,
+  "contracts.superPaymaster.REGISTRY (missing"
 );
 await mut(
   "creditPolicy == POLICY_OFF is read on chain: a policy other than OFF fails",
