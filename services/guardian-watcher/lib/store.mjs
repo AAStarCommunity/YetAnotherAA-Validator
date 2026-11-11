@@ -318,17 +318,18 @@ export class Store {
         // the same conflicting proof is stored once, not again on every retry (#403 review L-5)
         const sig = a =>
           `${String(a?.txHash).toLowerCase()}|${JSON.stringify(a?.spEvents, bigintSafe)}`;
-        let c = 1;
-        while (existsSync(`${path}.conflict.${c}`)) {
+        // addressed by the sha256 of its signature: one lookup, never a scan of every earlier
+        // conflict (follow-up #2 R9); an existing file for it is kept, a missing one written
+        const cpath = `${path}.conflict.${createHash("sha256").update(sig(amendment)).digest("hex")}`;
+        if (existsSync(cpath)) {
           try {
-            if (sig(JSON.parse(readFileSync(`${path}.conflict.${c}`, "utf8"))) === sig(amendment))
-              return "conflict";
+            if (sig(JSON.parse(readFileSync(cpath, "utf8"))) === sig(amendment))
+              return "conflict-same";
           } catch {
-            // an unreadable conflict file is kept; the proof is written under the next number
+            // unreadable: rewritten below
           }
-          c++;
         }
-        atomicWriteJson(`${path}.conflict.${c}`, amendment);
+        atomicWriteJson(cpath, amendment);
         return "conflict";
       }
       // keep the invalid bytes for inspection, then persist the valid proof (Codex follow-up R3)
@@ -355,7 +356,9 @@ export class Store {
 
   /** Conflicting amendment proofs kept so far, in total (#403 review L-5). */
   countAmendmentConflicts() {
-    return readdirSync(join(this.dir, "amendments")).filter(f => /\.conflict\.\d+$/.test(f)).length;
+    return readdirSync(join(this.dir, "amendments")).filter(f =>
+      /\.conflict\.([0-9a-f]{64}|\d+)$/.test(f)
+    ).length;
   }
 
   countAmendments() {

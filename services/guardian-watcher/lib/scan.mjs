@@ -125,6 +125,18 @@ export function traceUnsupported(e) {
   );
 }
 
+/** The identity sameLog compares, as one string (null for an invalid position): two logs are
+ * sameLog-equal exactly when their keys are equal. */
+export function sameLogKey(l) {
+  const p = receiptPos(l);
+  if (p === null) return null;
+  const h = x => str(x).toLowerCase();
+  const t = Array.isArray(l.topics) ? l.topics : (l.topics ?? []);
+  const topics = [];
+  for (let i = 0; i < t.length; i++) topics.push(h(t[i]));
+  return JSON.stringify([p, h(l.address), topics, h(l.data)]);
+}
+
 /** The same log: position, address, every topic and the data (case-insensitive hex). */
 export function sameLog(a, b) {
   const h = x => str(x).toLowerCase();
@@ -146,7 +158,7 @@ export function sameLog(a, b) {
 function traceHasLogs(node) {
   if (!node || typeof node !== "object") return false;
   if (Array.isArray(node.logs) && node.logs.length) return true;
-  return (node.calls ?? []).some(traceHasLogs);
+  return (Array.isArray(node.calls) ? node.calls : []).some(traceHasLogs);
 }
 
 /**
@@ -777,6 +789,7 @@ const MAX_COMMITS_PER_TX = 300;
 /** More watched logs in one tx than a real admin or aggregator tx emits (the watched SP events are
  * privileged state changes); bounds the records one tx can write (follow-up #2 R7). */
 const MAX_LOGS_PER_TX = 2000;
+const OVERSIZED_TX = `in a tx with more than ${MAX_COMMITS_PER_TX} commitments or ${MAX_LOGS_PER_TX} watched logs`;
 const RESERVED = ["source", "range", "raw", "count", "quarantine"];
 
 /** A fresh RPC log never brings our own evidence fields (a returned `range` must not stand in for
@@ -1097,12 +1110,21 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     const rs2 = logs ? splitLogs(logs, cfg, t.block) : { agg: [], sp: [] };
     const rw = [...rs2.agg, ...rs2.sp];
     const rpos = logs ? logs.map(receiptPos) : [];
+    const rwKeys = new Set();
+    for (const r of rw) {
+      const k = sameLogKey(r);
+      if (k !== null) rwKeys.add(k);
+    }
     const consistent =
       !!logs &&
       !envelope &&
       !watched.some(w => w.removed === true) &&
       rw.length === watched.length &&
-      watched.every(w => rw.some(r => sameLog(r, w))) &&
+      // keyed as sameLog compares (position, address, topics, data; hex case-insensitive): linear
+      watched.every(w => {
+        const k = sameLogKey(w);
+        return k !== null && rwKeys.has(k);
+      }) &&
       rpos.every(p => p !== null) &&
       new Set(rpos).size === logs.length;
     if (logs && !consistent) stats.inconsistent = (stats.inconsistent ?? 0) + 1;
@@ -1146,7 +1168,9 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     const ev = { ...d, logIndex: logPos(l) };
     const call = attr.aligned ? attr.owner.get(logPos(l)) : undefined;
     if (call !== undefined && call !== null && callsWithCommit.has(call)) {
-      effectsOf.set(call, [...(effectsOf.get(call) ?? []), ev]);
+      const list = effectsOf.get(call) ?? [];
+      list.push(ev); // push, never a copy of the growing list (follow-up #2 R9)
+      effectsOf.set(call, list);
     } else independent.push(ev);
   }
   for (const l of t.agg) {
@@ -1154,7 +1178,7 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       // Completed before (tx retry, M5). Effects the trace proves only now are kept beside the
       // record, not lost when the tx dead letter resolves (#400 review L4).
       const effects = effectsOf.get(commitCall.get(logPos(l))) ?? [];
-      if (
+      const am =
         effects.length &&
         store.putBlsAmendment(BigInt(l.topics[1]), {
           key: BigInt(l.topics[1]).toString(),
@@ -1163,10 +1187,12 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
           provenAt: ctx.now,
           spEvents: effects,
           ruleset: ctx.ruleset,
-        }) === "conflict"
-      )
-        // a different valid proof already stands for this action: both kept, and counted
-        summary.amendmentConflicts = (summary.amendmentConflicts ?? 0) + 1;
+        });
+      // every write counts towards the per-block cap (follow-up #2 R9)
+      if (am && am !== "same" && am !== "conflict-same")
+        summary.otherWrites = (summary.otherWrites ?? 0) + 1;
+      // a different valid proof already stands for this action: both kept, and counted
+      if (am === "conflict") summary.amendmentConflicts = (summary.amendmentConflicts ?? 0) + 1;
       continue;
     }
     // A BLS action with an open dead letter is retried by that dead letter only, once per tick,
@@ -1179,13 +1205,15 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       // ...but effects the trace proves now go into that dead letter, so its own retry (and its
       // record) carries them (#400 review L4). No attempt is spent.
       const effects = effectsOf.get(commitCall.get(logPos(l))) ?? [];
-      if (effects.length && !(pend.spEvents ?? []).length)
+      if (effects.length && !(pend.spEvents ?? []).length) {
+        summary.otherWrites = (summary.otherWrites ?? 0) + 1;
         store.patchDeadLetter(pend.id, {
           spEvents: effects,
           ...(pend.pendingRecord && !(pend.pendingRecord.spEvents ?? []).length
             ? { pendingRecord: { ...pend.pendingRecord, spEvents: effects } }
             : {}),
         });
+      }
       continue;
     }
     const call = commitCall.get(logPos(l));
@@ -1257,8 +1285,10 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
     const f = frameOf(e);
     if (f) {
       // push, never a copy of the growing list: linear in the events (follow-up #2 R7)
+      // the call's DISTINCT event names, in first-seen order: bounded by the ABI however many
+      // events the call emitted, so a record never carries a list as long as the tx (R9)
       const list = byFrame.get(f) ?? [];
-      list.push(e.event);
+      if (!list.includes(e.event)) list.push(e.event);
       byFrame.set(f, list);
     }
   }
@@ -1580,18 +1610,21 @@ export async function tick(chain, cfg, store, rs, ctx) {
         store.putDeadLetter({ ...dl, reasons: ["watched logs unavailable"] });
         continue;
       }
-      await processTxIsolated(
-        chain,
-        cfg,
-        rs,
-        ctx,
-        store,
-        summary,
-        dl.txHash,
-        { ...txOfEvidence(watched, cfg, dl.blockNumber), ...(dl.range ? { range: dl.range } : {}) },
-        fin.number,
-        dl
-      );
+      const rt = {
+        ...txOfEvidence(watched, cfg, dl.blockNumber),
+        ...(dl.range ? { range: dl.range } : {}),
+      };
+      // the same admission limits as fresh evidence (follow-up #2 R9): a re-fetch past them is a
+      // bounded quarantine, never one write per log
+      if (rt.agg.length > MAX_COMMITS_PER_TX || rt.agg.length + rt.sp.length > MAX_LOGS_PER_TX) {
+        const [qf, qt] = Array.isArray(dl.range) ? dl.range : [dl.blockNumber, dl.blockNumber];
+        for (const source of ["agg", "sp"])
+          if (rt[source].length)
+            quarantineRaw(store, rs, ctx, summary, rt[source], source, qf, qt, OVERSIZED_TX);
+        store.resolveDeadLetter(dl.id);
+        continue;
+      }
+      await processTxIsolated(chain, cfg, rs, ctx, store, summary, dl.txHash, rt, fin.number, dl);
       continue;
     }
     if (dl.pendingRecord) {
@@ -1681,10 +1714,22 @@ export async function tick(chain, cfg, store, rs, ctx) {
     byTx.set(k, t);
   }
   // Txs without a usable height go last (a NaN comparison would leave the order undefined).
-  const hOf = t => (Number.isSafeInteger(t.block) ? t.block : Infinity);
-  const ordered = [...byTx.entries()].sort((a, b) =>
-    hOf(a[1]) === hOf(b[1]) ? 0 : hOf(a[1]) < hOf(b[1]) ? -1 : 1
-  );
+  // In height order without sorting the answer (follow-up #2 R9): groups are bucketed by their
+  // height inside [from, to], visited block by block; groups outside the range or without a height
+  // follow in arrival order (they are handled in this tick whatever the stop).
+  const inRangeGroups = new Map();
+  const outsideGroups = [];
+  for (const entry of byTx.entries()) {
+    const h = entry[1].block;
+    if (Number.isSafeInteger(h) && h >= from && h <= to) {
+      const list = inRangeGroups.get(h) ?? [];
+      list.push(entry);
+      inRangeGroups.set(h, list);
+    } else outsideGroups.push(entry);
+  }
+  const ordered = [];
+  for (let h = from; h <= to; h++) for (const e of inRangeGroups.get(h) ?? []) ordered.push(e);
+  for (const e of outsideGroups) ordered.push(e);
   // The isolation budget is enforced where isolations happen (follow-up #2 R3): once
   // MAX_PER_TX_ISOLATIONS txs of this range were isolated, the current block is finished and the
   // cursor stops there; the later blocks of the range are read again next tick. Only a height inside
@@ -1723,10 +1768,11 @@ export async function tick(chain, cfg, store, rs, ctx) {
     // every dead letter written counts towards the budget (one tx can write several: one per
     // commitment); the per-block cap counts records too, so no block writes without bound (R7)
     const before = summary.deadLetters;
-    const recBefore = summary.newRecords + summary.upgraded;
+    const recBefore = summary.newRecords + summary.upgraded + (summary.otherWrites ?? 0);
     await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
     const writes = summary.deadLetters - before;
-    const recWrites = summary.newRecords + summary.upgraded - recBefore;
+    const recWrites =
+      summary.newRecords + summary.upgraded + (summary.otherWrites ?? 0) - recBefore;
     if (writes + recWrites > 0)
       perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + writes + recWrites);
     if (writes > 0 && inRange(b)) inRangeIsolations += writes;
@@ -1758,7 +1804,7 @@ export async function tick(chain, cfg, store, rs, ctx) {
         source,
         from,
         cutoff,
-        `in a tx with more than ${MAX_COMMITS_PER_TX} commitments or ${MAX_LOGS_PER_TX} watched logs`
+        OVERSIZED_TX
       );
   if (cutoff < to || overflow.agg.length || overflow.sp.length) summary.budgetStop = true;
   summary.to = cutoff;

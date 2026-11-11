@@ -78,6 +78,10 @@ export function traceDepthOk(trace, max = 1025) {
     const [f, d] = st.pop();
     if (!f || typeof f !== "object") continue;
     if (d > max) return false;
+    // `calls` and `logs`, when present, must be arrays: anything else (an object with a `length`,
+    // say) is not a trace, and code that trusts its length would loop on it (follow-up #2 R9)
+    if (f.calls !== undefined && f.calls !== null && !Array.isArray(f.calls)) return false;
+    if (f.logs !== undefined && f.logs !== null && !Array.isArray(f.logs)) return false;
     if (Array.isArray(f.calls)) for (const c of f.calls) st.push([c, d + 1]);
   }
   return true;
@@ -206,7 +210,9 @@ export function attributeLogs(trace, receiptLogs, aggregator, sp) {
     return { aligned: false, owner, spCall, why: "receipt log positions invalid or duplicated" };
   const seq = flattenTraceLogs(trace, aggregator, sp);
   if (!seq) return { aligned: false, owner, spCall, why: lastUnsureWhy ?? "trace unusable" };
-  const rl = [...receiptLogs].sort((a, b) => receiptPos(a) - receiptPos(b));
+  // positions are unique and contiguous (checked above): each log goes straight to its slot, O(n)
+  const rl = new Array(receiptLogs.length);
+  for (let i = 0; i < receiptLogs.length; i++) rl[pos[i] - lo] = receiptLogs[i];
   if (seq.length !== rl.length)
     return {
       aligned: false,

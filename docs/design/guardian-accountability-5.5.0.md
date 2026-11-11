@@ -530,11 +530,18 @@ aggregator-only.
     6000-deep value of 42 KB was a 72 MB dead letter). Stored evidence is
     decoded without recursion, and evidence that cannot be decoded spends a
     retry attempt, so no nesting depth fails a tick.
-  - A trace deeper than the EVM call-depth limit (1024 frames) cannot be real
-    and is refused before anything walks it; trace flattening is iterative and
-    linear in the trace. Persisted reasons are diagnostics: at most 10 of at
-    most 512 characters are kept, with the total and the sha256 of the full
-    list.
+  - A trace deeper than the EVM call-depth limit (1024 frames below the root),
+    or whose `calls` or `logs` are not arrays, is not a trace and is refused
+    before anything walks it; trace flattening is iterative and linear in the
+    trace. Persisted reasons are diagnostics: at most 10 of at most 512
+    characters are kept, with the total and the sha256 of the full list.
+  - Dead-letter retries obey the same per-tx admission limits as fresh evidence;
+    amendment and dead-letter patch writes count towards the per-block cap, and
+    a conflicting amendment is stored under the sha256 of its signature (one
+    lookup, no scan). A public record keeps the call's distinct event names
+    (bounded by the ABI), which is all its verdict reads. Work over an answer is
+    linear: txs are visited by height bucket without sorting the answer, receipt
+    logs are placed by position, and matching uses keyed sets.
   - Identities stay distinct at any depth: a deep value is keyed by the sha256
     of its full text, and the placeholder it is stored as keeps that digest, so
     distinct deep observations are never merged and a retry never duplicates

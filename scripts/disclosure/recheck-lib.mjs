@@ -18,6 +18,10 @@ export function traceDepthOk(trace, max = 1025) {
     const [f, d] = st.pop();
     if (!f || typeof f !== "object") continue;
     if (d > max) return false;
+    // `calls` and `logs`, when present, must be arrays: anything else (an object with a `length`,
+    // say) is not a trace, and code that trusts its length would loop on it (follow-up #2 R9)
+    if (f.calls !== undefined && f.calls !== null && !Array.isArray(f.calls)) return false;
+    if (f.logs !== undefined && f.logs !== null && !Array.isArray(f.logs)) return false;
     if (Array.isArray(f.calls)) for (const c of f.calls) st.push([c, d + 1]);
   }
   return true;
@@ -519,7 +523,11 @@ export async function extractCandidates(
           if (!isSingletonHop) {
             if (!eqAddr(f.to, fw.multiSendCallOnly))
               return notes.push(`${path}: DELEGATECALL subtree not followed`);
-            if ((f.calls || []).some(c => String(c.type).toUpperCase() !== "CALL"))
+            if (
+              (Array.isArray(f.calls) ? f.calls : []).some(
+                c => String(c?.type).toUpperCase() !== "CALL"
+              )
+            )
               return notes.push(`${path}: MultiSend with a non-CALL sub-transaction not followed`);
           }
         }
@@ -533,7 +541,8 @@ export async function extractCandidates(
             await fromDvt(f.input, `${path}.dvtValidator`);
           }
         }
-        for (let k = 0; k < (f.calls || []).length; k++) await walk(f.calls[k], `${path}.${k}`, f);
+        const kids = Array.isArray(f.calls) ? f.calls : [];
+        for (let k = 0; k < kids.length; k++) await walk(kids[k], `${path}.${k}`, f);
       };
       await walk(trace, "trace", null);
       traced = true;
@@ -661,12 +670,14 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
     // aggregator/DVTValidator in a successful tx, or an error-free trace path). A Safe inner call is
     // not proven — execTransaction does not revert when its inner call fails — so until it matches
     // the commitment it is never compared, and it can neither accuse nor hide an honest entry.
-    const distinct = [];
+    // by message hash in a Map: linear however many candidates a trace yields (follow-up #2 R9)
+    const byHash = new Map();
     for (const m of matching) {
-      const d = distinct.find(x => x.messageHash === m.messageHash);
+      const d = byHash.get(m.messageHash);
       if (d) d.proven = d.proven || m.proven;
-      else distinct.push({ ...m });
+      else byHash.set(m.messageHash, { ...m });
     }
+    const distinct = [...byHash.values()];
     const useMessage = c => {
       f.route = c.route;
       Object.assign(f, {

@@ -7,7 +7,11 @@ import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { Kind, aggIface } from "../../scripts/disclosure/recheck-lib.mjs";
+import {
+  Kind,
+  aggIface,
+  traceDepthOk as recheckDepthOk,
+} from "../../scripts/disclosure/recheck-lib.mjs";
 import {
   AGG,
   SAFE,
@@ -2611,7 +2615,10 @@ try {
           badOnes.every(b => !validAmendment(b, k5)) &&
           rc === "conflict" &&
           m.store.getBlsAmendment(k5)?.txHash === okA.txHash &&
-          readdirSync(join(m.d, "amendments")).includes(`bls-${keyHex}.json.conflict.1`) &&
+          // addressed by the sha256 of the proof's signature (follow-up #2 R9)
+          readdirSync(join(m.d, "amendments")).some(f =>
+            new RegExp(`^bls-${keyHex}\\.json\\.conflict\\.[0-9a-f]{64}$`).test(f)
+          ) &&
           m.store.putBlsAmendment(k5, okA) === "same",
         { rc, valid: badOnes.map(b => validAmendment(b, k5)) }
       );
@@ -3291,7 +3298,8 @@ try {
     const seq = [okA, okA, okB, okB, okB, okA].map(x => st.putBlsAmendment(9n, x));
     cell(
       "L-5: an identical conflicting amendment is stored once; conflicts are counted in total",
-      j(seq) === j(["new", "same", "conflict", "conflict", "conflict", "same"]) &&
+      // a repeat of a stored conflict writes nothing ("conflict-same"; follow-up #2 R9)
+      j(seq) === j(["new", "same", "conflict", "conflict-same", "conflict-same", "same"]) &&
         st.countAmendmentConflicts() === 1,
       { seq, conflicts: st.countAmendmentConflicts() }
     );
@@ -4613,6 +4621,103 @@ try {
       tot: br.reasonsTotal,
       stored,
     }
+  );
+}
+
+// ---- follow-up #2 R9: a trace whose calls or logs are not arrays is refused (both validators);
+// a dead-letter retry obeys the same admission limits as fresh evidence
+{
+  const bad = [
+    { type: "CALL", calls: { length: "Infinity" } },
+    { type: "CALL", calls: [{ type: "CALL", calls: { length: 5 } }] },
+    { type: "CALL", logs: { length: 3 } },
+  ];
+  const good = { type: "CALL", calls: [{ type: "CALL", logs: [] }], logs: [] };
+  const units =
+    bad.every(t => !traceDepthOk(t) && !recheckDepthOk(t)) &&
+    traceDepthOk(good) &&
+    recheckDepthOk(good);
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r9-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r9-a"), addr("r9-b")]);
+  let st, recs, q, open;
+  try {
+    for (let i = 0; i < 4; i++) c.mine();
+    const blk = cfg.startBlock + 1;
+    const h = ethers.id("r9-legacy");
+    // the tick scans from after the dead letter's block, so only the retry sees these logs
+    cfg.startBlock = c.head() + 1;
+    for (let i = 0; i < 2501; i++)
+      c.injectLog(blk, { address: SP, ...gs, index: i, transactionHash: h });
+    for (let i = 0; i < 4; i++) c.mine();
+    // a dead letter written without stored evidence (legacy): its retry re-reads by hash
+    store.putDeadLetter({
+      route: "tx",
+      txHash: h,
+      blockNumber: blk,
+      status: "ERROR",
+      reasons: ["legacy"],
+      events: [],
+      seenAt: "x",
+    });
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    recs = readdirSync(join(d, "records")).filter(f => !f.startsWith("quarantine-")).length;
+    q = withQ(store).filter(x => x.quarantine);
+    open = store.getDeadLetter(`tx-${h.toLowerCase()}`);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R9: traces with non-array calls/logs are refused by both validators; a legacy dead letter whose re-read returns 2501 logs is one quarantine (no record each), and resolved",
+    units && st.ok && recs === 0 && q.length === 1 && q[0].entries === 2501 && open === null,
+    { units, ok: st.ok, err: st.lastError, recs, q: q.length, entries: q[0]?.entries, open: !!open }
+  );
+}
+
+// ---- follow-up #2 R9: receipt logs given out of order are placed by their position (no sort)
+{
+  const l1 = { address: SP, topics: [ethers.id("o1")], data: "0x01" };
+  const l2 = { address: SP, topics: [ethers.id("o2")], data: "0x02" };
+  const l3 = { address: SP, topics: [ethers.id("o3")], data: "0x03" };
+  const trace = {
+    type: "CALL",
+    from: addr("ord-from"),
+    to: SP,
+    input: "0x12345678",
+    logs: [l1, l2, l3],
+  };
+  const receipt = [
+    { ...l3, index: 12 },
+    { ...l1, index: 10 },
+    { ...l2, index: 11 },
+  ];
+  const r = attributeLogs(trace, receipt, AGG, SP);
+  const swapped = attributeLogs(
+    trace,
+    [
+      { ...l2, index: 10 },
+      { ...l1, index: 11 },
+      { ...l3, index: 12 },
+    ],
+    AGG,
+    SP
+  );
+  cell(
+    "follow-up R9: receipt logs out of order align by their positions; logs at swapped positions do not",
+    r.aligned &&
+      [10, 11, 12].every(p => r.spCall.get(p)?.from === addr("ord-from")) &&
+      !swapped.aligned,
+    { aligned: r.aligned, why: r.why, swapped: swapped.aligned }
   );
 }
 
