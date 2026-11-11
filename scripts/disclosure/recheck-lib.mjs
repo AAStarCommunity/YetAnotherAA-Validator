@@ -307,7 +307,10 @@ async function canonicalHeader(chain, number) {
     typeof chain.send === "function"
       ? await chain.send("eth_getBlockByNumber", [ethers.toQuantity(Number(number)), false])
       : await chain.getBlock(Number(number));
-  return b && b.hash ? { hash: b.hash, parentHash: b.parentHash ?? undefined } : null;
+  // A header is untrusted RPC data and its hash ends up in stored reasons: only a well-formed
+  // bytes32 is accepted; anything else is "unavailable" (Codex W2b R5).
+  const h32 = v => (typeof v === "string" && /^0x[0-9a-fA-F]{64}$/.test(v) ? v : undefined);
+  return b && h32(b.hash) ? { hash: h32(b.hash), parentHash: h32(b.parentHash) } : null;
 }
 
 async function canonical(chain, number, blockHash) {
@@ -652,7 +655,8 @@ export async function rebuildFromAction(chain, aggregator, txHash, key, snapshot
   if (st !== 1) {
     return {
       status: Status.INCONCLUSIVE,
-      reason: `action receipt has no valid status (${rc.status})`,
+      // Fixed text: the RPC's value is untrusted and this reason is stored (Codex W2b R4).
+      reason: "action receipt has no valid status",
     };
   }
 

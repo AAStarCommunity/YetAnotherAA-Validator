@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Guardian watcher (M0 §5): detection + records only (W1). Runs on the Mac Mini under launchd.
+// Guardian watcher (M0 §5): detection + records (W1) and, with config.publish, their publication
+// (W2: IPFS pins, git mirror, Telegram, DisclosureRegistry). Runs on the Mac Mini under launchd.
 //
 //   RPC_URL=... node services/guardian-watcher/watcher.mjs --config <config.json> [--once]
 //
@@ -7,7 +8,8 @@
 //   { "chainId": 10, "aggregator": "0x..", "startBlock": N, "dataDir": "/path",
 //     "roles": { "superPaymaster": "0x.." },
 //     "forwarders": { "dvtValidator": "0x..", "ownerSafe": "0x..", "multiSendCallOnly": "0x.." },
-//     "maxBlocksPerTick": 2000, "page": 5000, "intervalMs": 60000 }
+//     "maxBlocksPerTick": 2000, "page": 5000, "intervalMs": 60000,
+//     "publish": { "enabled": true, ... }   (lib/sinks-config.mjs; secrets are Keychain items) }
 //
 // Fail-open on errors: a failed tick is recorded in status.json and retried; the process keeps
 // running, because a watcher that stops is the outcome it exists to prevent.
@@ -21,6 +23,10 @@ import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick, verifyTrace } from "./lib/scan.mjs";
 import { confirmPending } from "./lib/confirm.mjs";
+import { safeText } from "./lib/safe-error.mjs";
+import { acquireLock, DEFAULT_LOCK_PORT } from "./lib/lock.mjs";
+import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
+import { publishPhase } from "./lib/publisher.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -35,12 +41,13 @@ export function rulesetIdentity(bytes, dir = HERE) {
     const commit = execFileSync(
       "git",
       ["-C", dir, "log", "-1", "--format=%H", "--", "ruleset.json"],
-      {
-        encoding: "utf8",
-      }
+      // stderr is not inherited: git's diagnostics never reach our output (Codex W2b R4).
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
     ).trim();
     if (!/^[0-9a-f]{40}$/.test(commit)) return { commit: null, hash, verified: false };
-    const committed = execFileSync("git", ["-C", dir, "show", `${commit}:./ruleset.json`]);
+    const committed = execFileSync("git", ["-C", dir, "show", `${commit}:./ruleset.json`], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
     const same = ethers.keccak256(committed) === hash;
     return same ? { commit, hash, verified: true } : { commit: null, hash, verified: false };
   } catch {
@@ -164,10 +171,12 @@ export async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
  * accusatory record not yet confirmed is re-run on it (lib/confirm.mjs). Without it, the tick is
  * degraded, because accusatory records can never be confirmed and so never published.
  */
-export async function runOnce(chain, cfg, store, rs, ident, { now, second } = {}) {
+export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry } = {}) {
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
-  const status = { at: started, ruleset: ident, lastError: null };
+  // `carry`: fields kept from the previous status while this run has not replaced them yet (the
+  // last publication result, marked in progress: Codex W2c R1 M8).
+  const status = { at: started, ruleset: ident, lastError: null, ...(carry ?? {}) };
   // wall time of this tick and the archive it ran over, reported with every status
   const tickStart = Date.now();
   const timing = () => {
@@ -277,7 +286,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second } = {}
     return { status, summary: s };
   } catch (e) {
     status.ok = false;
-    status.lastError = e.shortMessage ?? e.message;
+    status.lastError = safeText("tick", e); // never a foreign error's text (lib/safe-error.mjs)
     status.records = store.countRecords();
     status.deadLetters = store.listDeadLetters().length;
     status.cursor = store.getCursor()?.block ?? null;
@@ -285,6 +294,14 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second } = {}
     store.writeStatus(status);
     return { status, summary: null };
   }
+}
+
+/** `--once` exit code: 0 only for a healthy scan (trace capability verified, DSR #400) AND, when
+ * publication ran, a pass that reported ok (no failed record, stop, skipped registry stage or
+ * undelivered alerts: Codex W2c R2). */
+export function onceExitCode(status) {
+  const pubOk = !status.publication || status.publication.ok === true;
+  return status.healthy === true && pubOk ? 0 : 1;
 }
 
 async function main() {
@@ -305,23 +322,71 @@ async function main() {
     console.error(
       "WARNING: ruleset.json does not match a committed version; records carry ruleset.verified = false"
     );
+  // W2c: publication is opt-in (config.publish.enabled). Everything that can refuse is checked
+  // BEFORE anything is created or read from the network: the publish config, then the lock (one
+  // process per host: it covers scanning too, two watchers on one data dir would race the store),
+  // then secrets and the writer key, loaded once. A bad setup refuses to start, never half-runs.
+  const p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null;
+  await acquireLock(p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT);
   const chain = makeProvider(process.env.RPC_URL);
   // D-RPC2: the second provider's URL comes from the environment (on the Mini, from the Keychain);
   // only its host is ever recorded
   const second = process.env.RPC_URL_2
     ? { chain: makeProvider(process.env.RPC_URL_2), host: new URL(process.env.RPC_URL_2).hostname }
     : null;
+  const pub = p ? { p, built: await buildSinks(p, chain) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
+  let lastPub = store.readStatus()?.publication ?? null;
   let first = true;
+  let slowNote = null; // the last iteration was slower than maxTickFraction of the interval
   for (;;) {
-    const { status } = await runOnce(chain, cfg, store, rs, ident, { second });
+    // The last publication result stays visible, marked in progress, until this pass replaces it.
+    const carry = pub
+      ? { publication: { ...(lastPub ?? {}), inProgress: true, since: new Date().toISOString() } }
+      : undefined;
+    const iterStart = Date.now();
+    const { status } = await runOnce(chain, cfg, store, rs, ident, { second, carry });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
+    if (pub) {
+      try {
+        // the previous iteration's slowness is only known after its publication: carried here
+        const degraded = [...(status.degraded ?? []), ...(slowNote ? [slowNote] : [])];
+        status.publication = await publishPhase(store, chain, cfg, pub.p, pub.built, {
+          degraded: degraded.length ? degraded : undefined,
+        });
+      } catch (e) {
+        status.publication = { error: safeText("publication", e) };
+      }
+      lastPub = status.publication;
+      // the whole iteration (scan and publication) against the interval: a slow one is degraded,
+      // and alerted by the next pass (tickMs covers the scan alone)
+      status.iterationMs = Date.now() - iterStart;
+      const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
+      slowNote =
+        status.iterationMs > limit
+          ? // fixed wording: the alert set's identity must not change with every duration (Codex W2c
+            // R9); the measured time is status.iterationMs
+            `iteration slower than ${Math.round(limit)} ms (maxTickFraction of the interval)`
+          : null;
+      if (slowNote) {
+        status.degraded = [...(status.degraded ?? []), slowNote];
+        status.healthy = false;
+      }
+      store.writeStatus(status);
+    }
     console.log(JSON.stringify(status));
-    if (once) process.exit(status.healthy ? 0 : 1);
+    if (once) process.exit(onceExitCode(status));
     await new Promise(r => setTimeout(r, cfg.intervalMs));
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main();
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  // Last boundary (Codex W2b R4): nothing reaches Node's default handler, which would print a
+  // foreign error's message and properties.
+  main().catch(e => {
+    console.error(safeText("watcher fatal", e));
+    process.exit(1);
+  });
+}

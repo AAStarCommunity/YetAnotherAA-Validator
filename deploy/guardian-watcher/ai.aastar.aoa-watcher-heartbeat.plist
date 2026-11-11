@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.aastar.aoa-watcher-heartbeat</string>
+  <!-- External check on the guardian watcher (M0 §5.5): independent of the watcher process. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/REPLACE_USER/.aoa-watcher/repo/deploy/guardian-watcher/heartbeat.mjs</string>
+    <string>--config</string>
+    <string>/Users/REPLACE_USER/.aoa-watcher/config.json</string>
+  </array>
+  <!-- Top-level keys. Nested inside another dict, StartInterval passes plutil -lint and launchd ignores it;
+       verify with: launchctl print gui/$(id -u)/ai.aastar.aoa-watcher-heartbeat | grep "run interval" -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_USER/.aoa-watcher/heartbeat.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_USER/.aoa-watcher/heartbeat.log</string>
+</dict>
+</plist>

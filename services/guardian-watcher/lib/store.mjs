@@ -1,6 +1,7 @@
 // Durable local state for the watcher: records, dead letters, cursor, status. Plain JSON files,
 // written atomically (temp file + rename) so a crash never leaves a half-written record.
 import { createHash } from "node:crypto";
+import { SafeError } from "./safe-error.mjs";
 import {
   mkdirSync,
   readFileSync,
@@ -11,6 +12,7 @@ import {
   writeSync,
   fsyncSync,
   closeSync,
+  statSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 
@@ -46,7 +48,7 @@ export function writeAll(fd, buf, write = writeSync) {
   let off = 0;
   while (off < buf.length) {
     const n = write(fd, buf, off, buf.length - off);
-    if (!(n > 0)) throw new Error(`short write: ${off} of ${buf.length} bytes`);
+    if (!(n > 0)) throw new SafeError(`short write: ${off} of ${buf.length} bytes`);
     off += n;
   }
 }
@@ -140,7 +142,7 @@ export function readJson(path, fallback) {
 export class Store {
   constructor(dir) {
     this.dir = dir;
-    for (const d of ["records", "deadletters", "amendments"])
+    for (const d of ["records", "deadletters", "publications", "amendments"])
       mkdirSync(join(dir, d), { recursive: true, mode: 0o700 });
   }
 
@@ -488,5 +490,98 @@ export class Store {
 
   writeStatus(s) {
     atomicWriteJson(join(this.dir, "status.json"), s);
+  }
+
+  /** Every stored record (W2c: the publisher walks the flagged ones). */
+  listRecords() {
+    return readdirSync(join(this.dir, "records"))
+      .filter(f => f.endsWith(".json"))
+      .sort()
+      .map(f => readJson(join(this.dir, "records", f), null))
+      .filter(Boolean);
+  }
+
+  /** Record file names, sorted (the publisher reads them in bounded, rotating batches). */
+  recordFiles() {
+    return readdirSync(join(this.dir, "records"))
+      .filter(f => f.endsWith(".json"))
+      .sort();
+  }
+
+  /** One record file, parsed; throws when it is unreadable. */
+  readRecordFile(name, maxBytes = Infinity) {
+    const path = join(this.dir, "records", name);
+    // size first: an oversized or corrupt file is refused before it is read (Codex W2c R3)
+    if (statSync(path).size > maxBytes) throw new Error("record file too large");
+    return JSON.parse(readFileSync(path, "utf8"));
+  }
+
+  /** Publication scheduling (Codex W2c R2): rotation cursor, per-record progress, the reverify
+   * generation. Kept apart from the journals; unreadable counts as empty (only order is lost). */
+  getSchedule() {
+    try {
+      return readJson(join(this.dir, "publish-schedule.json"), null) ?? {};
+    } catch {
+      return {};
+    }
+  }
+
+  putSchedule(s) {
+    atomicWriteJson(join(this.dir, "publish-schedule.json"), s);
+  }
+
+  /** The full alert list of the last pass (the Telegram digest may say "N more"). */
+  putAlertList(alerts) {
+    atomicWriteJson(join(this.dir, "alerts-latest.json"), { alerts });
+  }
+
+  /** Every readable record, and the names of record files that do not parse (Codex W2c R1 M7). */
+  listRecordsTolerant() {
+    const records = [];
+    const corrupt = [];
+    for (const f of readdirSync(join(this.dir, "records"))
+      .filter(f => f.endsWith(".json"))
+      .sort()) {
+      try {
+        const v = JSON.parse(readFileSync(join(this.dir, "records", f), "utf8"));
+        if (v) records.push(v);
+      } catch {
+        corrupt.push(f);
+      }
+    }
+    return { records, corrupt };
+  }
+
+  /** The last status written, or null (unreadable counts as none). */
+  readStatus() {
+    try {
+      return readJson(join(this.dir, "status.json"), null);
+    } catch {
+      return null;
+    }
+  }
+
+  /** The publication journal of a record (publishRecord's state), or null. */
+  getPublication(id) {
+    return readJson(join(this.dir, "publications", `${Store.safeId(id)}.json`), null);
+  }
+
+  /** Durable, atomic: publishRecord awaits this after every stage. */
+  putPublication(id, state) {
+    atomicWriteJson(join(this.dir, "publications", `${Store.safeId(id)}.json`), state);
+  }
+
+  getAlertState() {
+    return readJson(join(this.dir, "alerts.json"), null);
+  }
+
+  putAlertState(s) {
+    atomicWriteJson(join(this.dir, "alerts.json"), s);
+  }
+
+  /** Record ids are ours (recordId), but a file name is checked anyway. */
+  static safeId(id) {
+    if (!/^[A-Za-z0-9-]{1,200}$/.test(String(id))) throw new SafeError("store: bad record id");
+    return id;
   }
 }
