@@ -186,6 +186,11 @@ jobs:
       - name: Check the guardian watcher core
         run: npm run check:watcher
 
+      # Phase D (M0 §5.2a): the running watcher job is exactly the configured wrapper, reading the
+      # RPC URLs from the very Keychain items Phase D verified (Codex R6, R7 counterexamples).
+      - name: Check the Phase D watcher-job binding
+        run: npm run check:phase-d-binding
+
   # Job 3: Build project
   build:
     name: Build
