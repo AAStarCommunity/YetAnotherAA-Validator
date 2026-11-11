@@ -212,7 +212,9 @@ Once the cause is understood and fixed (for example the second provider was
 misconfigured), re-arm the record so the second provider is asked again. The
 command refuses anything but `unconfirmed-final`, needs the watcher stopped, and
 writes the states before and after and your reason into the record's journal
-(`holdRearms`). It publishes nothing: the record stays held until confirmed.
+(`holdRearms`; an entry left `pending` by an interrupted run is settled by
+running the command again). It publishes nothing: the record stays held until
+confirmed.
 
 ```sh
 launchctl bootout gui/$(id -u)/ai.aastar.aoa-watcher

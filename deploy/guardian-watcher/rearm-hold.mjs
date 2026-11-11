@@ -18,10 +18,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const W = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "services", "guardian-watcher");
-const { loadConfig } = await import(join(W, "watcher.mjs"));
+const { loadConfig, watcherLockPort } = await import(join(W, "watcher.mjs"));
 const { Store, atomicWriteJson } = await import(join(W, "lib", "store.mjs"));
 const { getHold } = await import(join(W, "lib", "confirm.mjs"));
-const { acquireLock, DEFAULT_LOCK_PORT } = await import(join(W, "lib", "lock.mjs"));
+const { acquireLock } = await import(join(W, "lib", "lock.mjs"));
 
 const die = (code, msg) => {
   console.error(`rearm-hold: ${msg}`);
@@ -71,6 +71,22 @@ export function rearmed(hold, reason, at) {
   };
 }
 
+/**
+ * Settle journal entries an interrupted run left "pending", from the hold, which is the source of
+ * truth (Codex D-RPC2 R8 #5): an entry whose time is in the hold's `rearmed` list was applied,
+ * otherwise it was not. Returns the settled list, or null when there is nothing to settle. Pure.
+ */
+export function reconcile(journalList, hold) {
+  const applied = new Set((hold?.rearmed ?? []).map(e => e.at));
+  let changed = false;
+  const out = (journalList ?? []).map(e => {
+    if (e?.applied !== "pending") return e;
+    changed = true;
+    return { ...e, applied: applied.has(e.at) };
+  });
+  return changed ? out : null;
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const cfgPath = arg("config");
   const id = arg("id");
@@ -89,22 +105,36 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     die(1, "not a record id");
   }
   try {
-    await acquireLock(cfg.publish?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT);
+    // exactly the port the watcher takes for this config (Codex D-RPC2 R8 #3)
+    await acquireLock(watcherLockPort(cfg));
   } catch {
     die(2, "the watcher is running (its lock is held): stop it first");
   }
   const store = new Store(cfg.dataDir);
   const hold = getHold(store, id);
+  // first settle what an interrupted earlier run left pending
+  try {
+    const pub = store.getPublication(id);
+    const settled = reconcile(pub?.holdRearms, hold);
+    if (settled) {
+      store.putPublication(id, { ...pub, holdRearms: settled });
+      console.log(
+        `rearm-hold: settled ${settled.filter(e => e.applied === true).length} applied / ${settled.filter(e => e.applied === false).length} not applied earlier re-arm(s)`
+      );
+    }
+  } catch {
+    die(3, "the record's journal cannot be read or written");
+  }
   const why = refusal(hold, reason);
   if (why) die(1, why);
   const at = new Date().toISOString();
   const { hold: next, entry } = rearmed(hold, reason, at);
-  // the journal first, as not yet applied: a failure after it leaves the attempt recorded
+  // the journal first, as pending: an interruption after it is settled by the next run, from the hold
   try {
     const pub = store.getPublication(id) ?? {};
     store.putPublication(id, {
       ...pub,
-      holdRearms: [...(pub.holdRearms ?? []), { ...entry, applied: false }],
+      holdRearms: [...(pub.holdRearms ?? []), { ...entry, applied: "pending" }],
     });
     atomicWriteJson(join(store.dir, "holds", `${id}.json`), next);
     const pub2 = store.getPublication(id);
@@ -112,7 +142,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     list[list.length - 1] = { ...list[list.length - 1], applied: true };
     store.putPublication(id, { ...pub2, holdRearms: list });
   } catch {
-    die(3, "a write failed; see holdRearms in the record's journal for what was applied");
+    die(3, "a write failed; run the command again to settle the journal (holdRearms)");
   }
   console.log(`rearm-hold: ${id} re-armed (was unconfirmed-final); it stays held until confirmed`);
   process.exit(0);

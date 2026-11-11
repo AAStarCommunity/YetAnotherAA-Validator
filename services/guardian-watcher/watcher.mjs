@@ -181,6 +181,12 @@ export async function publicationStep({
   return nextSlow;
 }
 
+/** The lock port the watcher takes for this config (one process per host), shared with every tool
+ * that must not run beside it (deploy/guardian-watcher/rearm-hold.mjs; Codex D-RPC2 R8 #3). */
+export function watcherLockPort(cfg, p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null) {
+  return p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT;
+}
+
 export const TRACE_VERIFY_MS = 3_600_000;
 
 /**
@@ -373,6 +379,8 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
           );
         // held and not publishable: a disagreement, or a second provider that keeps not answering
         // (DSR, ded99d78): degraded, never published
+        if (status.confirm.cursorUnsaved)
+          more.push("D-RPC2 confirmation cursor not saved (rotating in memory)");
         if (status.confirm.mismatch)
           more.push(
             `${status.confirm.mismatch} accusatory record(s) differ on the second provider (held, not published)`
@@ -437,7 +445,7 @@ async function main() {
   // process per host: it covers scanning too, two watchers on one data dir would race the store),
   // then secrets and the writer key, loaded once. A bad setup refuses to start, never half-runs.
   const p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null;
-  await acquireLock(p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT);
+  await acquireLock(watcherLockPort(cfg, p));
   const chain = makeProvider(process.env.RPC_URL);
   // D-RPC2: the second provider's URL comes from the environment (on the Mini, from the Keychain);
   // only the operator's label for it is ever recorded

@@ -6,7 +6,7 @@ import { mayPublish } from "./confirm.mjs";
 import { ethers } from "ethers";
 import { Store, atomicWriteJson } from "./store.mjs";
 import { publishRecord, PersistError } from "./publish.mjs";
-import { recordFile } from "./record-file.mjs";
+import { recordFile, recordVersionOf } from "./record-file.mjs";
 import { MAX_RECORD_BYTES } from "./cid.mjs";
 import { SafeError, safeText, guarded } from "./safe-error.mjs";
 import { assertWriterRole } from "../sinks/registry.mjs";
@@ -264,7 +264,7 @@ export async function publishPending(
         attentionKind(prev, pinners)
       );
       try {
-        cid = recordFile(rec).cid;
+        cid = recordFile(rec, { version: recordVersionOf(prev) }).cid;
       } catch {
         cid = null; // publishRecord fails on it, and says so
       }

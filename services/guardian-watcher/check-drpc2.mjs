@@ -5,7 +5,8 @@
 // never vacuous.
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import {
   AGG,
@@ -629,7 +630,12 @@ async function scenario(build) {
       const id = Store.recordId(bls);
       const { recordFile } = await import("./lib/record-file.mjs");
       const rec = JSON.parse(readFileSync(join(d, "records", `${id}.json`), "utf8"));
-      store.putPublication(id, { cid: recordFile(rec).cid, published: false, pins: {} });
+      store.putPublication(id, {
+        cid: recordFile(rec).cid,
+        recordVersion: 2,
+        published: false,
+        pins: {},
+      });
       const s = sinks();
       const r = await publishPending(store, {
         pinners: s.pinners,
@@ -663,7 +669,12 @@ async function scenario(build) {
       store.putRecord(bls);
       const id = Store.recordId(bls);
       const rec = JSON.parse(readFileSync(join(d, "records", `${id}.json`), "utf8"));
-      store.putPublication(id, { cid: recordFile(rec).cid, published: true, pins: {} });
+      store.putPublication(id, {
+        cid: recordFile(rec).cid,
+        recordVersion: 2,
+        published: true,
+        pins: {},
+      });
       const s = sinks();
       const r = await publishPending(store, {
         pinners: s.pinners,
@@ -929,6 +940,182 @@ async function scenario(build) {
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
+  }
+  // ---- Codex D-RPC2 R8
+  // #1: a backoff deadline further away than the cap (clock ahead, then corrected) is retried now
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-skew-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const id = Store.recordId(bls);
+      const { atomicWriteJson } = await import("./lib/store.mjs");
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(join(d, "holds"), { recursive: true });
+      const digest = viewDigest(stored(store, bls));
+      const base = {
+        id,
+        state: "unconfirmed",
+        digest,
+        mismatches: 0,
+        unavailableStreak: 3,
+        lastResult: "unavailable",
+      };
+      const runs = [];
+      const run = async (second, c, temp) => {
+        runs.push(1);
+        return { status: { ok: false } };
+      };
+      atomicWriteJson(join(d, "holds", `${id}.json`), {
+        ...base,
+        nextAttemptAt: 1_000 + CONFIRM_BACKOFF_MAX_MS,
+      });
+      const inCap = await confirmPending(store, {}, "s", { startBlock: 0 }, null, null, {
+        runOnce: run,
+        now: 1_000,
+      });
+      atomicWriteJson(join(d, "holds", `${id}.json`), {
+        ...base,
+        nextAttemptAt: 1_000 + 365 * 24 * 3_600_000,
+      });
+      const far = await confirmPending(store, {}, "s", { startBlock: 0 }, null, null, {
+        runOnce: run,
+        now: 1_000,
+      });
+      cell(
+        "R8#1: a deadline within the cap is honoured (backing off); one a year away is not trusted and the record is retried now",
+        inCap.backingOff === 1 && inCap.checked === 0 && far.checked === 1 && runs.length === 1,
+        { inCap, far, runs: runs.length }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #2: a journal that committed to a v1 CID keeps it; a new record is published as v2
+  {
+    const { recordFile, recordVersionOf } = await import("./lib/record-file.mjs");
+    const { publishPending } = await import("./lib/publisher.mjs");
+    const { sinks } = await import("./mock-sinks.mjs");
+    const d = mkdtempSync(join(tmpdir(), "drpc2-v1-"));
+    try {
+      const store = new Store(d);
+      const old = { ...owner, txHash: ethers.id("v1-old"), lastReasons: ["local"], firstSeen: "t" };
+      const neu = { ...owner, txHash: ethers.id("v1-new"), lastReasons: ["local"], firstSeen: "t" };
+      store.putRecord(old);
+      store.putRecord(neu);
+      const oid = Store.recordId(old);
+      const nid = Store.recordId(neu);
+      const v1 = recordFile(stored(store, old), { version: 1 });
+      const v2 = recordFile(stored(store, old), { version: 2 });
+      // published before #422: the journal committed to the v1 CID (no recordVersion field)
+      store.putPublication(oid, { cid: v1.cid, recordHash: v1.recordHash });
+      // both confirmed, so the gate lets them through
+      const { atomicWriteJson } = await import("./lib/store.mjs");
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(join(d, "holds"), { recursive: true });
+      for (const [rid, r] of [
+        [oid, old],
+        [nid, neu],
+      ])
+        atomicWriteJson(join(d, "holds", `${rid}.json`), {
+          id: rid,
+          state: "confirmed",
+          digest: viewDigest(stored(store, r)),
+        });
+      const s = sinks();
+      await publishPending(store, {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        registry: null,
+      });
+      const jo = store.getPublication(oid);
+      const jn = store.getPublication(nid);
+      cell(
+        "R8#2: a v1 journal keeps its v1 CID (no bytes-change incident); a record first published now is v2",
+        v1.cid !== v2.cid &&
+          recordVersionOf({ cid: "x" }) === 1 &&
+          recordVersionOf({}) === 2 &&
+          !jo.bytesChanged &&
+          jo.cid === v1.cid &&
+          jo.recordVersion === 1 &&
+          jn.recordVersion === 2 &&
+          jn.cid === recordFile(stored(store, neu), { version: 2 }).cid,
+        { jo: [jo.cid === v1.cid, jo.bytesChanged, jo.recordVersion], jn: jn.recordVersion }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #3: the re-arm tool takes exactly the watcher's lock port
+  {
+    const { watcherLockPort } = await import("./watcher.mjs");
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../deploy/guardian-watcher/rearm-hold.mjs"),
+      "utf8"
+    );
+    const wsrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "watcher.mjs"), "utf8");
+    cell(
+      "R8#3: rearm-hold and the watcher choose the lock port with the same function (watcherLockPort)",
+      /acquireLock\(watcherLockPort\(cfg\)\)/.test(src) &&
+        /acquireLock\(watcherLockPort\(cfg, p\)\)/.test(wsrc) &&
+        watcherLockPort({ lockPort: 47999 }) === 47999 &&
+        watcherLockPort({}) === 47331,
+      null
+    );
+  }
+  // #4: a cursor that cannot be saved is reported and the rotation goes on in memory
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-cur-"));
+    try {
+      const store = new Store(d);
+      const r1 = { ...bls, key: "7201", proposalId: "7201", txHash: ethers.id("c1") };
+      const r2 = { ...bls, key: "7202", proposalId: "7202", txHash: ethers.id("c2") };
+      store.putRecord(r1);
+      store.putRecord(r2);
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(join(d, "holds", "_pass.json", "x"), { recursive: true }); // unwritable cursor
+      const run = async () => ({ status: { ok: false } });
+      const a = await confirmPending(store, {}, "s", { startBlock: 0 }, null, null, {
+        runOnce: run,
+        maxParse: 1,
+        now: 1,
+      });
+      const b = await confirmPending(store, {}, "s", { startBlock: 0 }, null, null, {
+        runOnce: run,
+        maxParse: 1,
+        now: 2,
+      });
+      const att = [r1, r2].map(r => getHold(store, Store.recordId(r))?.attempts ?? 0);
+      cell(
+        "R8#4: an unsaved confirmation cursor is reported and the batch still rotates in memory (both records re-run)",
+        a.cursorUnsaved === true && b.cursorUnsaved === true && att[0] === 1 && att[1] === 1,
+        { a, b, att }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #5: an interrupted re-arm leaves its journal entry pending, settled from the hold
+  {
+    const { reconcile } = await import("../../deploy/guardian-watcher/rearm-hold.mjs");
+    const hold = { rearmed: [{ at: "t1" }] };
+    const out = reconcile(
+      [
+        { at: "t0", applied: true },
+        { at: "t1", applied: "pending" },
+        { at: "t2", applied: "pending" },
+      ],
+      hold
+    );
+    cell(
+      "R8#5: a pending re-arm entry is applied when the hold records it, not applied otherwise; settled entries stay",
+      out?.[0].applied === true &&
+        out[1].applied === true &&
+        out[2].applied === false &&
+        reconcile([{ at: "t0", applied: true }], hold) === null,
+      out
+    );
   }
   // #2: one malformed record does not stop the pass
   {

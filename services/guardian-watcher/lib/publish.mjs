@@ -36,7 +36,7 @@
 import { ethers } from "ethers";
 import { SafeError, safeCode, safeText } from "./safe-error.mjs";
 import { Kind } from "../../../scripts/disclosure/recheck-lib.mjs";
-import { recordFile, mirrorPath } from "./record-file.mjs";
+import { recordFile, mirrorPath, recordVersionOf } from "./record-file.mjs";
 import { MIRROR_BLOB_URL } from "../sinks/git-mirror.mjs";
 
 /** A failure to persist state: publication must stop, the returned state is NOT durable. */
@@ -137,7 +137,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
       throw new PersistError(e); // never mistaken for a sink failure: the caller must stop
     }
   };
-  const file = recordFile(rec);
+  // the serialization this journal committed to (v1 before #422), never changed under it
+  const version = recordVersionOf(prev);
+  const file = recordFile(rec, { version });
   const state = { ...prev, pins: { ...(prev.pins ?? {}) } };
   const alerts = [];
   // Stage failures (a sink that errored or refused), as distinct from pending work: the pass is
@@ -174,6 +176,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     return { state, alerts, failures };
   }
   state.cid = file.cid;
+  state.recordVersion = version;
   state.recordHash = file.recordHash;
   state.bytes = file.bytes.length;
 

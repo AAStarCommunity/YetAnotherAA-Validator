@@ -183,6 +183,7 @@ export function mayPublish(store, rec) {
  *   waiting   unconfirmed and the last 2+ attempts in a row were unavailable (degraded);
  * and for this pass: checked (re-runs), backingOff (skipped until nextAttemptAt).
  */
+const cursorMemo = new WeakMap();
 export async function confirmPending(
   store,
   second,
@@ -212,12 +213,16 @@ export async function confirmPending(
     .filter(n => n.endsWith(".json"))
     .sort();
   const passFile = join(holds, "_pass.json");
+  // the rotation as last computed in this process, so a cursor that cannot be saved still rotates
+  // (Codex D-RPC2 R8 #4); otherwise the saved one, or the beginning
   let cursor = null;
-  try {
-    cursor = readJson(passFile, null)?.cursor ?? null;
-  } catch {
-    cursor = null; // unreadable: start over (only the order is lost)
-  }
+  if (cursorMemo.has(store)) cursor = cursorMemo.get(store);
+  else
+    try {
+      cursor = readJson(passFile, null)?.cursor ?? null;
+    } catch {
+      cursor = null; // unreadable: start over (only the order is lost)
+    }
   let start = 0;
   if (cursor) {
     const k = names.findIndex(n => n > cursor);
@@ -250,7 +255,14 @@ export async function confirmPending(
     if (prev?.state === "confirmed" && prev.digest === viewDigest(rec)) continue;
     if (prev?.state === "unconfirmed-final") continue;
     const sameContent = prev?.digest === viewDigest(rec);
-    if (sameContent && Number.isFinite(prev?.nextAttemptAt) && nowMs < prev.nextAttemptAt) {
+    // a deadline further away than the cap allows (the clock was ahead when it was set, or it
+    // was rolled back) is not trusted: the record is retried now (Codex D-RPC2 R8 #1)
+    if (
+      sameContent &&
+      Number.isFinite(prev?.nextAttemptAt) &&
+      nowMs < prev.nextAttemptAt &&
+      prev.nextAttemptAt - nowMs <= CONFIRM_BACKOFF_MAX_MS
+    ) {
       counts.backingOff++;
       continue;
     }
@@ -291,10 +303,11 @@ export async function confirmPending(
   // the rotation: the traversal advances by the batch; reaching the last name starts over
   const last = batch.at(-1) ?? null;
   const next = start + batch.length >= names.length ? null : last;
+  cursorMemo.set(store, next);
   try {
     atomicWriteJson(passFile, { cursor: next });
   } catch {
-    // the next pass starts at the beginning again: only the order is lost
+    counts.cursorUnsaved = true; // reported (degraded); the rotation goes on in memory
   }
   // store-wide counts from the holds of records that still exist
   const present = new Set(names);
