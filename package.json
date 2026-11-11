@@ -41,6 +41,7 @@
     "check:sp-parity": "node scripts/disclosure/sp-evidence-parity.mjs",
     "check:a3-emissions": "node scripts/disclosure/a3-emission-diff.mjs",
     "check:phase-d": "node deploy/guardian-watcher/phase-d-check.mjs",
+    "check:phase-d-binding": "node deploy/guardian-watcher/check-phase-d-binding.mjs",
     "e2e:committee": "node scripts/e2e/committee-e2e.mjs",
     "e2e:selftest": "node scripts/e2e/selftest.mjs",
     "check:pin-rate": "node scripts/check-pin-rate.mjs"

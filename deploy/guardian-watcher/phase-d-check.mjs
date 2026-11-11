@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
+import { parseLaunchd, bindingProblems } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
@@ -252,37 +253,23 @@ for (const label of ld.mustBeOn ?? []) {
   else if (!out)
     add("watcher-job-binding", "MISSING", "watcher job not running, binding not checkable");
   else {
-    const program = out.match(/^\s*program = (.+)$/m)?.[1]?.trim();
-    const argsBlock = out.match(/^\s*arguments = \{\n([\s\S]*?)\n\s*\}/m)?.[1] ?? "";
-    const argv = argsBlock
-      .split("\n")
-      .map(x => x.trim())
-      .filter(Boolean);
+    const { program, argv } = parseLaunchd(out);
     let text = null;
     try {
       text = readFileSync(wrapper, "utf8");
     } catch {
       text = null;
     }
-    const problems = [];
-    const progOk =
-      program === wrapper ||
-      (argv.length === 2 && /\/bash$/.test(argv[0]) && argv[1] === wrapper) ||
-      argv[0] === wrapper;
-    if (!progOk) problems.push("the job does not run the configured wrapper");
-    if (text === null) problems.push("wrapper unreadable");
-    else {
-      if (!wantConfig || !text.includes(`WATCHER_CONFIG="${wantConfig}"`))
-        problems.push("wrapper names another config than watcherConfig");
-      if (
-        !/security find-generic-password -s aoa-dvt-rpc-primary -a aoa-watcher -w/.test(text) ||
-        !/security find-generic-password -s aoa-dvt-rpc-secondary -a aoa-watcher -w/.test(text)
-      )
-        problems.push("wrapper does not read both RPC URLs from the Keychain");
-      if (/https?:\/\//i.test(text)) problems.push("wrapper holds a URL");
-      if (!/exec node "\$WATCHER_ENTRY" --config "\$WATCHER_CONFIG"/.test(text))
-        problems.push("wrapper does not exec the watcher with that config");
-    }
+    const problems = bindingProblems({
+      program,
+      argv,
+      wrapper,
+      text,
+      wantConfig,
+      services: kc.services,
+      account: kcAccount,
+      ok: v => !placeholder(v),
+    });
     add(
       "watcher-job-binding",
       problems.length ? "FAIL" : "PASS",
