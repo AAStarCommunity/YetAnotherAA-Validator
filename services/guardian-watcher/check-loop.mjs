@@ -2720,6 +2720,46 @@ const good = {
   );
 }
 
+// ---- Codex D-RPC2 R6: a permanent hold does not keep the store's reverify generation open
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const a = { ...owner, txHash: ethers.id("r6-published") };
+    const b = { ...owner, txHash: ethers.id("r6-held") };
+    store.putRecord(a);
+    store.putRecord(b);
+    // b's confirmation never came: held for good (unconfirmed-final), never publishable
+    const bid = Store.recordId(b);
+    atomicWriteJson(join(d, "holds", `${bid}.json`), {
+      id: bid,
+      state: "unconfirmed-final",
+      attempts: 10,
+    });
+    const s = sinks();
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    for (let i = 0; i < 3; i++) await publishPending(store, sk, {});
+    const f0 = s.calls.fetches ?? 0;
+    const r1 = await publishPending(store, sk, { reverifyGen: 1 });
+    const r2 = await publishPending(store, sk, { reverifyGen: 2 });
+    cell(
+      "R6: with one record held for good, a reverify generation still completes (remaining 0) and the next one re-checks the published record's pins again",
+      r1.counts.held === 1 &&
+        r1.reverifyRemaining === 0 &&
+        r2.reverifyRemaining === 0 &&
+        (s.calls.fetches ?? 0) > f0 &&
+        store.getPublication(bid) === null,
+      {
+        r1: [r1.counts.held, r1.reverifyRemaining],
+        r2: r2.reverifyRemaining,
+        fetches: [f0, s.calls.fetches],
+      }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);
