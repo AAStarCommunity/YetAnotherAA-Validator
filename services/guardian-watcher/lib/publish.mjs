@@ -555,12 +555,33 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       alerts.push(`registry: a disclose tx succeeded without a Disclosed event`);
       return;
     }
-    // No receipt. Nonce consumed at the FINALIZED block without any of our hashes landing: the
-    // journalled txs are dead. On-chain uniqueness makes a re-sign safe.
-    if ((await reg.nonce()) > state.registry.nonce) {
+    // A stage signed by ANOTHER writer than the configured one (a writer change on this registry)
+    // is not this writer's to judge or replace: its nonce lives in the other writer's nonce space.
+    // It is archived, never dropped, so its txs stay visible to fill-nonce's guard, and the
+    // configured writer discloses afresh (Codex W2d R12).
+    const me = typeof reg.writer === "function" ? await reg.writer() : null;
+    const signer = stageSigner(state.registry);
+    if (me && signer && signer.toLowerCase() !== String(me).toLowerCase()) {
+      alerts.push(
+        `registry: the disclose tx (nonce ${state.registry.nonce}) was signed by another writer; archived, disclosed again by the configured writer`
+      );
+      state.registryHistory = [
+        ...(state.registryHistory ?? []),
+        { ...state.registry, supersededAt: new Date().toISOString(), supersededBy: "writer" },
+      ];
+      state.registry = null;
+      await persist(state);
+    } else if ((await reg.nonce()) > state.registry.nonce) {
+      // No receipt. Nonce consumed at the FINALIZED block without any of our hashes landing: the
+      // journalled txs are dead. On-chain uniqueness makes a re-sign safe. They are archived, not
+      // erased (Codex W2d R12), so every journalled tx stays visible.
       alerts.push(
         `registry: disclose tx (nonce ${state.registry.nonce}) was dropped or replaced; re-signing`
       );
+      state.registryHistory = [
+        ...(state.registryHistory ?? []),
+        { ...state.registry, supersededAt: new Date().toISOString(), supersededBy: "dropped" },
+      ];
       state.registry = null;
       await persist(state);
     } else {

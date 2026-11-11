@@ -3481,10 +3481,31 @@ const good = {
         gasLimit: 21000n,
       });
       const fromBytes = stageSigner({ raw: realRaw, from: ethers.getAddress(W2) });
+      // R12: W1's tx archived (not erased) when W2 takes over even with W2's nonce past it, so
+      // fill-nonce as W1 still sees it; a same-writer drop is archived too
+      const y = await onA();
+      const z2 = sinks({ registryAddress: OLD, rawTag: "h3", writer: W2 });
+      z2.chain.nonce = 6;
+      await pass(y.store, z2);
+      const yh = y.store.getPublication(id).registryHistory ?? [];
+      const w1 = sinks({ registryAddress: CC, rawTag: "h4" });
+      w1.chain.nonce = 5;
+      w1.chain.latestNonce = 5;
+      w1.chain.pendingNonce = 6;
+      w1.chain.known.add(y.old.hash);
+      const w1Fill = await planFill(y.store, w1.registry, whereOf(CC), 5);
+      const q = await onA();
+      const qd = sinks({ registryAddress: OLD, rawTag: "h5" });
+      qd.chain.nonce = 6; // same writer, nonce consumed, no receipt: dropped
+      await pass(q.store, qd);
+      const qh = q.store.getPublication(id).registryHistory ?? [];
       cell(
-        "B2-A(h) R10: a replacement by another writer journals that writer; fill-nonce refuses the nonce on the current registry and a later switch waits for it; the signed bytes name the signer over a stale from",
-        jr.replacements === 1 &&
+        "B2-A(h) R10/R12: another writer's stage is archived (never erased), the configured writer signs afresh and journals itself; fill-nonce refuses its nonce on the current registry, a later switch waits for it, and the archived tx still refuses a fill; a dropped stage is archived; the signed bytes name the signer over a stale from",
+        !jr.replacements &&
           jr.from === ethers.getAddress(W2) &&
+          yh.some(h => h.supersededBy === "writer" && h.hash === y.old.hash) &&
+          /still known/.test(w1Fill.refuse ?? "") &&
+          qh.some(h => h.supersededBy === "dropped" && h.hash === q.old.hash) &&
           /on the current registry/.test(held.refuse ?? "") &&
           jb.registryWait?.nonce === 5 &&
           jb.registry.at?.address === OLD &&
@@ -3496,8 +3517,12 @@ const good = {
           wait: jb.registryWait,
           sign: b.calls.sign,
           fromBytes,
+          yh,
+          w1Fill,
+          qh,
         }
       );
+      for (const z of [y, q]) rmSync(z.d, { recursive: true, force: true });
       rmSync(d, { recursive: true, force: true });
     }
     // (i) Codex W2d R11: a stage holding two writers' txs (a replacement after a writer change):
