@@ -5170,7 +5170,13 @@ try {
   const store = new Store(d);
   const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
   const s4 = x => ethers.id(x).slice(0, 10);
-  let st, owner, q, pub;
+  let st,
+    owner,
+    q,
+    pub,
+    ownerAtCursor = false,
+    cursorAt = null,
+    ownerBlock = null;
   try {
     // tx A: anyone calls updatePrice() emitting 2000 PriceUpdated (2000 public records)
     const a = c.ownerTx(
@@ -5185,6 +5191,16 @@ try {
       atBlock: a.block,
     });
     for (let i = 0; i < 4; i++) c.mine();
+    // when the cursor is written, the owner record must already be on disk (DSR 41120e87)
+    const setCursor = store.setCursor.bind(store);
+    store.setCursor = cur => {
+      ownerAtCursor = readdirSync(join(d, "records")).some(f => {
+        const r = JSON.parse(readFileSync(join(d, "records", f), "utf8"));
+        return r.txHash === b.hash && r.event === "GuardianSet";
+      });
+      cursorAt = cur.block;
+      return setCursor(cur);
+    };
     st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
     const recs = readdirSync(join(d, "records")).map(f =>
       JSON.parse(readFileSync(join(d, "records", f), "utf8"))
@@ -5196,9 +5212,23 @@ try {
     rmSync(d, { recursive: true, force: true });
   }
   cell(
-    "#404 B1: 2000 public records then an owner GuardianSet in the same block: the owner action is recorded on the owner route, nothing quarantined",
-    st.ok && pub === 2000 && owner?.route === "owner" && q === 0,
-    { ok: st.ok, err: st.lastError, pub, owner: owner && [owner.route, owner.event], q }
+    "#404 B1: 2000 public PriceUpdated records then an owner GuardianSet last in the same block: the owner action is a full owner-route record, already on disk when the cursor moves past its block; nothing quarantined",
+    st.ok &&
+      pub === 2000 &&
+      owner?.route === "owner" &&
+      q === 0 &&
+      ownerAtCursor &&
+      cursorAt >= ownerBlock,
+    {
+      ok: st.ok,
+      err: st.lastError,
+      pub,
+      owner: owner && [owner.route, owner.event],
+      q,
+      ownerAtCursor,
+      cursorAt,
+      ownerBlock,
+    }
   );
 }
 
