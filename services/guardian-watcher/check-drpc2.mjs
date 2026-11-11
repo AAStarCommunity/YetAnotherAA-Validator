@@ -415,6 +415,83 @@ async function scenario(build) {
   }
 }
 
+// ---- the publisher's gate (lib/publisher.mjs publishPending): held records are never published
+{
+  const { publishPending } = await import("./lib/publisher.mjs");
+  const { bls, owner, sinks } = await import("./mock-sinks.mjs");
+  const { atomicWriteJson } = await import("./lib/store.mjs");
+  const { mkdirSync } = await import("node:fs");
+  const hold = (store, rec, state) => {
+    mkdirSync(join(store.dir, "holds"), { recursive: true });
+    const id = Store.recordId(rec);
+    atomicWriteJson(join(store.dir, "holds", `${id}.json`), { id, state, attempts: 1 });
+  };
+  const run = async (state, rec) => {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-pub-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(rec);
+      if (state) hold(store, rec, state);
+      const s = sinks();
+      const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+      const r = await publishPending(store, sk);
+      return {
+        counts: r.counts,
+        published: store.getPublication(Store.recordId(rec)),
+        uploads: Object.values(s.calls.uploads).reduce((a, b) => a + b, 0),
+        telegram: s.calls.telegram,
+      };
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  };
+  for (const [label, state] of [
+    ["no hold yet", null],
+    ["unconfirmed", "unconfirmed"],
+    ["unconfirmed-final", "unconfirmed-final"],
+  ]) {
+    const r = await run(state, bls);
+    cell(
+      `publisher: an accusatory record with ${label} is held: not pinned, not mirrored, no Telegram, counted`,
+      r.counts.held === 1 &&
+        r.counts.ran === 0 &&
+        !r.published &&
+        r.uploads === 0 &&
+        r.telegram === 0,
+      r
+    );
+  }
+  const ok = await run("confirmed", owner);
+  cell(
+    "publisher: a confirmed accusatory record is published",
+    ok.counts.held === 0 && ok.published?.published === true && ok.uploads > 0,
+    ok
+  );
+  // an unreadable hold file is not a confirmation
+  const d = mkdtempSync(join(tmpdir(), "drpc2-pub-"));
+  try {
+    const store = new Store(d);
+    store.putRecord(bls);
+    const { writeFileSync } = await import("node:fs");
+    mkdirSync(join(d, "holds"), { recursive: true });
+    writeFileSync(join(d, "holds", `${Store.recordId(bls)}.json`), "{not json");
+    const s = sinks();
+    const r = await publishPending(store, {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      registry: null,
+    });
+    cell(
+      "publisher: an unreadable hold is not a confirmation (held)",
+      r.counts.held === 1 && r.counts.ran === 0,
+      r.counts
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(

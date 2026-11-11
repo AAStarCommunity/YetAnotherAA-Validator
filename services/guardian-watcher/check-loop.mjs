@@ -1,12 +1,24 @@
 // CI self-test for W2c: the publication loop (lib/publisher.mjs), sink construction from config
 // (lib/sinks-config.mjs) and the store's publication journal, against the shared mock sinks.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { Store } from "./lib/store.mjs";
+import { Store as BaseStore, atomicWriteJson } from "./lib/store.mjs";
+// These cells test publication itself, not D-RPC2 (check-drpc2.mjs does): every record stored here
+// is also marked confirmed by the second provider, as a confirmed hold, so publishPending's D-RPC2
+// gate (lib/confirm.mjs mayPublish) lets it through.
+class Store extends BaseStore {
+  putRecord(rec) {
+    const r = super.putRecord(rec);
+    const id = BaseStore.recordId(rec);
+    mkdirSync(join(this.dir, "holds"), { recursive: true });
+    atomicWriteJson(join(this.dir, "holds", `${id}.json`), { id, state: "confirmed", attempts: 1 });
+    return r;
+  }
+}
 import {
   publishPending,
   publishPhase,

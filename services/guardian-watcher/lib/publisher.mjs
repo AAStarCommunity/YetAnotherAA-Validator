@@ -2,6 +2,7 @@
 // sinks, resuming its durable journal (store/publications/<id>.json). publishRecord does the
 // per-record work and is crash-safe stage by stage; this module only decides what to run, reads
 // the writer's roles from chain, builds the sinks and delivers the run's alerts.
+import { mayPublish } from "./confirm.mjs";
 import { ethers } from "ethers";
 import { Store } from "./store.mjs";
 import { publishRecord, PersistError } from "./publish.mjs";
@@ -89,6 +90,7 @@ export async function publishPending(
     parked: 0,
     deferred: 0,
     unreadable: 0,
+    held: 0,
   };
   const pinners = (sinks.pinners ?? []).map(p => p.name);
   const sched = getSchedule(store);
@@ -130,6 +132,13 @@ export async function publishPending(
       }
       seenIds.add(id);
       counts.flagged++;
+      // D-RPC2: an accusatory record is published only once the second provider confirmed it
+      // field by field (lib/confirm.mjs); held records stay unpublished and are counted, never
+      // dropped. A non-accusatory record is not held.
+      if (!mayPublish(store, rec)) {
+        counts.held++;
+        continue;
+      }
       try {
         prev = store.getPublication(id) ?? {};
       } catch {
