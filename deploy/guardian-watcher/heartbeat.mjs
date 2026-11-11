@@ -35,12 +35,22 @@ export async function check({
   writeState,
   readState,
 }) {
-  const interval = cfg.intervalMs ?? 60_000;
+  // The heartbeat reads config.json on its own (no watcher validation): every number it uses or
+  // prints must be a positive safe integer, or the default is used and the bad setting is alerted
+  // in fixed wording, never echoed (Codex W2c R24)
+  let badSetting = false;
+  const posInt = (v, def) => {
+    if (v === undefined || v === null) return def;
+    if (Number.isSafeInteger(v) && v > 0) return v;
+    badSetting = true;
+    return def;
+  };
   const hb = cfg.heartbeat ?? {};
-  const staleAfter = hb.staleAfterMs ?? 3 * interval;
-  const realert = hb.realertMs ?? 3_600_000;
-  const unhealthyAfter = hb.unhealthyAfter ?? 2;
-  const maxLag = cfg.maxLagBlocks ?? 300;
+  const interval = posInt(cfg.intervalMs, 60_000);
+  const staleAfter = posInt(hb.staleAfterMs, 3 * interval);
+  const realert = posInt(hb.realertMs, 3_600_000);
+  const unhealthyAfter = posInt(hb.unhealthyAfter, 2);
+  const maxLag = posInt(cfg.maxLagBlocks, 300);
   const state = readState() ?? { alerting: null, lastSentAt: 0, unhealthyRuns: 0 };
 
   // what is wrong now, in fixed wording
@@ -87,6 +97,11 @@ export async function check({
     problem = {
       key: "lag",
       text: `cursor ${status.lagBlocks} blocks behind finalized (> ${maxLag})`,
+    };
+  if (!problem && badSetting)
+    problem = {
+      key: "config",
+      text: "heartbeat config invalid: a numeric setting is not a positive integer (defaults used)",
     };
   const unhealthyRuns = status && status.healthy === false ? state.unhealthyRuns + 1 : 0;
   if (!problem && unhealthyRuns >= unhealthyAfter) {

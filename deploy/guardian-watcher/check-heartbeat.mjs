@@ -13,13 +13,16 @@ const cfg = {
 };
 
 /** A run of checks over a scripted status file and clock; returns the messages and states. */
-async function run(steps, { failSend = false, failState = false } = {}) {
-  let state = null;
+async function run(
+  steps,
+  { failSend = false, failState = false, cfg: cfgIn = cfg, state: st0 = null } = {}
+) {
+  let state = st0;
   const sent = [];
   const out = [];
   for (const s of steps) {
     const r = await check({
-      cfg,
+      cfg: cfgIn,
       now: s.now,
       readStatus: () => {
         if (s.status === undefined) throw new Error("ENOENT");
@@ -167,6 +170,23 @@ const T = 10_000_000;
     "status.at unchanged for longer than staleAfter alerts even if mtime moves",
     s2.sent.length === 1 && /status unchanged for 4 min/.test(s2.sent[0]),
     s2
+  );
+}
+
+// Codex W2c R24: the heartbeat reads config.json itself; a bad numeric setting is never echoed
+{
+  const SENT = "PRIVATE_SENTINEL";
+  const T = Date.parse("2026-11-12T00:00:00.000Z");
+  const r = await run([{ now: T, status: ok(T) }], {
+    cfg: { ...cfg, maxLagBlocks: `https://rpc.example/?apiKey=${SENT}` },
+    state: { alerting: "stale", lastSentAt: 0, unhealthyRuns: 0, lastAt: "x", lastAtSeenSince: 0 },
+  });
+  cell(
+    "R24: a non-integer maxLagBlocks is alerted as a config problem in fixed wording, never echoed, and is no recovery",
+    r.sent.length === 1 &&
+      /heartbeat config invalid: a numeric setting is not a positive integer/.test(r.sent[0]) &&
+      !r.sent.some(t => t.includes(SENT) || /RECOVERED/.test(t)),
+    r.sent
   );
 }
 
