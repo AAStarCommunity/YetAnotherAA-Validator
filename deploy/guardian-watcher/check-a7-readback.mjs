@@ -36,15 +36,15 @@ const cell = (name, ok, got) =>
 const schemaText = fx("aoa-a7-readback-1.schema.json");
 const exampleText = fx("aoa-a7-readback-1.example.json");
 const liveText = fx("aoa-a7-readback-1.live.example.json");
-cell("schema is SP's frozen v5 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
+cell("schema is SP's frozen v7 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
 cell(
   "fork example is SP's (sha256)",
-  sha(exampleText) === "5b18f574d7bbdbba6ec787d62625ddd45217b38ae170d2d8df3779b659177dc2",
+  sha(exampleText) === "20fd1d952f52b195ab3379038be27ac63619ec76eff8a04796318b3d7a4da11b",
   sha(exampleText)
 );
 cell(
   "live example is SP's (sha256)",
-  sha(liveText) === "bdbf3085add03c1080e438f60bcc37e91a4e702a58dbb30fa0129058e234f5c8",
+  sha(liveText) === "a184468e12e157781433bef06dbe4c187710f1306c53d9824495d59200da9e7e",
   sha(liveText)
 );
 const schema = JSON.parse(schemaText);
@@ -99,20 +99,23 @@ const base = structuredClone(example);
   C.registry.roles = { ROLE_COMMUNITY: [MEMBER] };
   C.registry.rolesSource = { fromBlock: 12000000, toBlock: base.header.readbackBlock };
   C.blsAggregator.guardianSet = [{ address: G1, pubkeyHash: PK_HASH, slot: 1, isActive: true }];
-  C.blsAggregator.thresholds = {
-    WARNING: 1,
-    MINOR: 2,
-    MAJOR: 3,
+  C.blsAggregator.thresholds = { WARNING: 1, MINOR: 2, MAJOR: 3 };
+  Object.assign(C.blsAggregator, {
+    N: 1, // one occupied slot in this world
+    pendingFraudProofVerifier: "0x0000000000000000000000000000000000000000",
+    pendingFraudProofVerifierReadyAt: 0,
     minThreshold: 2,
     defaultThreshold: 2,
     SLASH_THRESHOLD_FLOOR: 2,
-  };
-  C.blsAggregator.pendingFraudProofVerifier = "0x0000000000000000000000000000000000000000";
+  });
   C.dvtValidator.categoryCount ??= 0;
+  C.evaluationCommunityToken.POLICY_OFF = 0;
+  C.evaluationCommunityToken.creditPolicy = 0;
   base.checks = {
     "dvtValidator.categoryCount": 0,
     "superPaymaster.fraudProofVerifier": "0x0000000000000000000000000000000000000000",
     "blsAggregator.owner == superPaymaster.owner": true,
+    "evaluationCommunityToken.creditPolicy == evaluationCommunityToken.POLICY_OFF": true,
   };
   base.amsterdamProbe.estimateSimulate = { alchemy: 256645, tenderly: "n/a:no eth_simulateV1" };
 }
@@ -189,6 +192,7 @@ function world(rb) {
     const skipHere =
       key === "entryPoint" ? ["deposit", "staked", "stake", "unstakeDelaySec", "withdrawTime"] : [];
     if (key === "ownerSafe") skipHere.push("version", "threshold", "owners", "singleton");
+    if (key === "blsAggregator") skipHere.push("N"); // no N() in SP's ABI
     for (const [k, v] of Object.entries(c)) {
       if (
         SKIP.includes(k) ||
@@ -388,19 +392,20 @@ cell(
   pos.cmp.map(x => x.path)
 );
 
-// ---- SP's own example (placeholders)
+// ---- SP's own example and the v7 schema rules
 {
-  const w = world(base);
-  const r = await compare(example, w.reader, facts(example, w));
+  const v = structuredClone(example);
+  v.contracts.blsAggregator.roles = {};
   cell(
-    "SP's example: '<x>.creditPolicy == OFF' is unverified (both sides must be getters)",
-    r.unverified.some(u => u.startsWith("checks.evaluationCommunityToken.creditPolicy == OFF")),
-    r.unverified
+    "v7 schema: a roles object on a contract without a role system is rejected",
+    validate(schema, v).length > 0,
+    null
   );
   cell(
-    "SP's example: roles {} on a contract without a role system fails (x-readMethods v5: n/a)",
-    failed(r).includes("contracts.blsAggregator.roles"),
-    failed(r)
+    "v7 example: the credit-policy check compares two getters (creditPolicy == POLICY_OFF)",
+    "evaluationCommunityToken.creditPolicy == evaluationCommunityToken.POLICY_OFF" in
+      example.checks,
+    Object.keys(example.checks)
   );
 }
 
@@ -475,9 +480,9 @@ for (const f of [
     `contracts.blsAggregator.${f} (missing`
   );
 await unv(
-  "R3#1: thresholds without minThreshold is unverified",
-  rb => delete rb.contracts.blsAggregator.thresholds.minThreshold,
-  "contracts.blsAggregator.thresholds.minThreshold (missing"
+  "R3#1: blsAggregator.minThreshold left out is unverified",
+  rb => delete rb.contracts.blsAggregator.minThreshold,
+  "contracts.blsAggregator.minThreshold (missing"
 );
 await unv(
   "dvtValidator.categoryCount left out is unverified",
@@ -493,6 +498,31 @@ await mut(
       [ROLE]: [MEMBER],
     }),
   "contracts.registry.roles["
+);
+// ---- schema v7
+await mut(
+  "N other than the occupied slots fails",
+  rb => (rb.contracts.blsAggregator.N = 3),
+  "contracts.blsAggregator.N=occupied slots"
+);
+await unv(
+  "a timelock declared in the address book but missing from the read-back is unverified",
+  () => {},
+  "contracts.timelockController (declared",
+  undefined,
+  { addressBook: { ...addressBook, timelockController: A(0x7171) } }
+);
+await mut(
+  "creditPolicy == POLICY_OFF is read on chain: a policy other than OFF fails",
+  () => {},
+  "checks.evaluationCommunityToken.creditPolicy == evaluationCommunityToken.POLICY_OFF",
+  (w, rb) => ({
+    call: async (a, i, f, args) =>
+      f.name === "creditPolicy" &&
+      a.toLowerCase() === rb.contracts.evaluationCommunityToken.address.toLowerCase()
+        ? { status: "value", v: 2 }
+        : w.reader.call(a, i, f, args),
+  })
 );
 // ---- R2 #2: the guardian SET, one to one
 await mut(
@@ -605,6 +635,19 @@ await mut(
     "R4: a URL-shaped key in the read-back never reaches the record",
     !/FAKE_SECRET|https:/.test(out) && /redacted key/.test(out),
     out.slice(0, 600)
+  ); // Codex A7 R5: production's top-level "rpc" exemption must not reach a nested "rpc"
+  const rb5 = clone();
+  rb5.contracts.ownerSafe.owners = {
+    rpc: { "https://rpc.example/FAKE_SECRET": [] },
+    x: { rpc: "https://y/Z" },
+  };
+  const r5 = await run(rb5);
+  const rec = { rpc: "http://127.0.0.1:8546", failed: r5.cmp.filter(x => !x.ok) };
+  const out5 = JSON.stringify(sanitize(rec, new Set(["rpc"])));
+  cell(
+    "R5: with production's exemption, a nested rpc key or value is still redacted; the top-level local rpc is kept",
+    !/FAKE_SECRET|https:|y\/Z/.test(out5) && out5.includes("http://127.0.0.1:8546"),
+    out5.slice(0, 600)
   );
 }
 // ---- null = absent from SP's ABI, never by calling

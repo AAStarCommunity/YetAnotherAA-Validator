@@ -1,4 +1,4 @@
-// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 3bf4bba2, frozen v5;
+// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 543f3498, frozen v7;
 // docs/release/a7/aoa-a7-readback-1.schema.json, read methods in its "x-readMethods") with what THIS
 // script reads from the loaded fork. Pure: every chain read goes through an injected reader, so the
 // rules are self-tested (check-a7-readback.mjs) without a chain.
@@ -19,12 +19,12 @@ import Ajv2020 from "ajv/dist/2020.js";
 import { AbiCoder, keccak256 } from "ethers";
 
 export const SCHEMA_ID = "aoa-a7-readback/1";
-/** sha256 of SP's FROZEN schema file at 3bf4bba2 (v5, DSR-verified; any later change needs DSR
+/** sha256 of SP's FROZEN schema file at 543f3498 (v7, DSR-verified; any later change needs DSR
  * acceptance and a new hash). */
-export const SCHEMA_SHA256 = "0ac860742f997120cec3a7f185323e090f30371f6e67c27fda200b3a18a6e131";
+export const SCHEMA_SHA256 = "b1505b47ae871800a7f7569bfe89ad852951b669dbfb17afc87265205396194f";
 export const SCHEMA_SOURCE = {
   repo: "AAStarCommunity/SuperPaymaster",
-  ref: "3bf4bba28506a23f7c741f281846340afe2f86a9",
+  ref: "543f349889b21d32ff9b738bc26b1aea5d5ec47c",
   path: "docs/release/a7/aoa-a7-readback-1.schema.json",
 };
 export const ANVIL_COMMIT = "4e8874b2bdc840929585ca73e170993c50a4a531";
@@ -76,6 +76,12 @@ export const REQUIRED_FIELDS = {
     "DVT_VALIDATOR",
     "domainSeparator",
     "MAX_VALIDATORS",
+    // schema v7 required
+    "N",
+    "pendingFraudProofVerifierReadyAt",
+    "minThreshold",
+    "defaultThreshold",
+    "SLASH_THRESHOLD_FLOOR",
   ],
   dvtValidator: ["categoryCount"],
   disclosureRegistry: ["WRITER", "AGGREGATOR"],
@@ -83,6 +89,7 @@ export const REQUIRED_FIELDS = {
   entryPoint: ["deposit", "staked", "stake", "unstakeDelaySec", "withdrawTime"],
   evaluationCommunityToken: [
     "creditPolicy",
+    "POLICY_OFF",
     "policyEpoch",
     "pendingPolicy",
     "pendingPolicyEta",
@@ -237,6 +244,11 @@ export async function compare(rb, reader, facts) {
   for (const k of REQUIRED_CONTRACTS)
     if (!(k in rb.contracts)) unverified.push(`contracts.${k} (missing from the read-back)`);
   if (Object.keys(rb.checks).length === 0) unverified.push("checks (empty)");
+  // optional in the schema; required when the manifest's address book declares one (DSR)
+  if (facts.addressBook?.timelockController && !("timelockController" in rb.contracts))
+    unverified.push(
+      "contracts.timelockController (declared in the address book, missing from the read-back)"
+    );
 
   // one typed read through SP's ABI. kind: noabi | notinabi | unsupported | value | empty | revert | decode
   const read = async (iface, addr, sig, args = []) => {
@@ -381,7 +393,10 @@ export async function compare(rb, reader, facts) {
     // contract-specific keys
     for (const [k, v] of Object.entries(c)) {
       if (COMMON.includes(k) || k === "rolesSource") continue;
-      if (key === "blsAggregator" && ["guardianSet", "signerMaskOrder", "thresholds"].includes(k))
+      if (
+        key === "blsAggregator" &&
+        ["guardianSet", "signerMaskOrder", "thresholds", "N"].includes(k)
+      )
         continue; // below
       if (key === "ownerSafe" && ["threshold", "owners", "singleton"].includes(k)) continue; // below
       if (key === "entryPoint" && REQUIRED_FIELDS.entryPoint.includes(k)) continue; // below
@@ -510,7 +525,7 @@ export async function compare(rb, reader, facts) {
     // slots 1..MAX_VALIDATORS -> address; nonzero -> getBLSPublicKey (x-readMethods)
     const mv = await read(iface, a, "MAX_VALIDATORS()");
     if (mv.kind !== "value" || BigInt(mv.v) > 255n) {
-      for (const k of ["guardianSet", "signerMaskOrder"])
+      for (const k of ["guardianSet", "signerMaskOrder", "N"])
         if (k in c) check(`${P}.${k}`, "(MAX_VALIDATORS)", mv.kind, false);
     } else {
       const slots = [];
@@ -521,6 +536,11 @@ export async function compare(rb, reader, facts) {
           return;
         }
         slots.push(lc(g.v));
+      }
+      // N has no getter in SP's ABI: it is the number of occupied slots (validatorAtSlot != 0)
+      if ("N" in c) {
+        const n = slots.filter(x => x !== ZERO).length;
+        check(`${P}.N=occupied slots`, c.N, n, sameTyped("uint256", c.N, n));
       }
       if ("guardianSet" in c) {
         const ours = [];
@@ -757,15 +777,17 @@ const URLISH = /[a-z][a-z0-9+.-]*:\/\//i;
 export const redact = (k, v) => (typeof v === "string" && URLISH.test(v) ? "(redacted)" : v);
 /** Deep copy with URL-like KEYS and string values redacted (Codex A7 R4): a JSON replacer can
  * rewrite values but not keys, and read-back keys (e.g. role names) are external input. */
-export function sanitize(v, keep = new Set()) {
-  if (Array.isArray(v)) return v.map(x => sanitize(x, keep));
+export function sanitize(v, keepTop = new Set(), depth = 0) {
+  if (Array.isArray(v)) return v.map(x => sanitize(x, keepTop, depth + 1));
   if (typeof v === "bigint") return v.toString();
   if (v && typeof v === "object") {
     const out = {};
     let n = 0;
     for (const [k, x] of Object.entries(v)) {
       const key = URLISH.test(k) ? `(redacted key ${++n})` : k;
-      out[key] = keep.has(k) ? x : sanitize(x, keep);
+      // the exemption is for a TOP-LEVEL key of the record only (Codex A7 R5): a nested "rpc"
+      // inside external input is redacted like anything else
+      out[key] = depth === 0 && keepTop.has(k) ? x : sanitize(x, keepTop, depth + 1);
     }
     return out;
   }

@@ -79,14 +79,14 @@ if (!dumpPath || !/^[0-9a-f]{64}$/.test(dumpSha) || !readbackPath || !ethers.isA
   );
 if (!forkUrl) die(2, "A7_FORK_URL (an archive RPC of the forked chain) is not set");
 const sha256 = buf => createHash("sha256").update(buf).digest("hex");
-const ghRaw = (path, ref) => {
+const ghRaw = (path, ref, repo = SCHEMA_SOURCE.repo) => {
   const r = spawnSync(
     "gh",
     [
       "api",
       "-H",
       "Accept: application/vnd.github.raw",
-      `repos/${SCHEMA_SOURCE.repo}/contents/${path}?ref=${ref}`,
+      `repos/${repo}/contents/${path}?ref=${ref}`,
     ],
     { stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 << 20 }
   );
@@ -133,6 +133,9 @@ const CHAINS = { 11155111: "sepolia", 10: "optimism", 1: "mainnet" };
 let addressBook = null;
 let addressBookSha = null;
 let addressBookSource = null;
+// DisclosureRegistry is DVT's own contract: its ABI comes from the DVT repo at the commit the
+// manifest/pins record (disclosureRegistrySource {repo, commit, path}, DSR)
+let disclosureRegistrySource = null;
 if (opt("pins-commit") || opt("address-book")) {
   const pinsPath = `deployments/release/rc8/${CHAINS[h.chainId] ?? h.chainId}.pins.json`;
   const raw = opt("pins-commit")
@@ -144,6 +147,7 @@ if (opt("pins-commit") || opt("address-book")) {
   try {
     const j = JSON.parse(raw.toString("utf8"));
     addressBook = j && typeof j.addresses === "object" ? j.addresses : j;
+    disclosureRegistrySource = j?.disclosureRegistrySource ?? null;
   } catch {
     die(1, "address book is not JSON");
   }
@@ -178,6 +182,32 @@ for (const [key, file] of Object.entries(ABI_FILES)) {
     die(1, `abis/${file} is not an ABI`);
   }
   abiFiles[key] = { file, sha256: sha256(raw) };
+}
+if ("disclosureRegistry" in rb.contracts) {
+  const src = disclosureRegistrySource;
+  const okSrc =
+    src &&
+    src.repo === "AAStarCommunity/YetAnotherAA-Validator" &&
+    /^[0-9a-f]{40}$/.test(String(src.commit)) &&
+    /^[A-Za-z0-9._/-]+\.json$/.test(String(src.path)) &&
+    !String(src.path).includes("..");
+  // the ABI loop above already listed it as missing; it is removed only when fetched here
+  if (okSrc && opt("pins-commit")) {
+    const raw = ghRaw(src.path, src.commit, src.repo);
+    if (!raw) die(3, "cannot fetch the DisclosureRegistry ABI at the manifest's DVT commit");
+    try {
+      const j = JSON.parse(raw.toString("utf8"));
+      abi.disclosureRegistry = new ethers.Interface(Array.isArray(j) ? j : j.abi);
+    } catch {
+      die(1, "the DisclosureRegistry ABI file is not an ABI");
+    }
+    abiFiles.disclosureRegistry = {
+      file: `${src.repo}@${src.commit}:${src.path}`,
+      sha256: sha256(raw),
+    };
+    const i = missingAbi.indexOf("disclosureRegistry");
+    if (i >= 0) missingAbi.splice(i, 1);
+  }
 }
 // SlashLevel names -> index, from SP's source at spCommit (the ABI shows only uint8)
 let slashLevels = null;
