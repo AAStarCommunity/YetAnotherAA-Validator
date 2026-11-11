@@ -57,7 +57,7 @@ export function writeAll(fd, buf, write = writeSync) {
  * empty file, and a returned write survives the crash (the W2 journal relies on that). `write` is
  * the byte writer handed to writeAll (injectable, so a cell can prove the wiring: #403 review L-3).
  */
-export function atomicWriteJson(path, obj, write = writeSync) {
+export function atomicWriteJson(path, obj, write = writeSync, sync = fsyncDir) {
   const tmp = `${path}.tmp-${process.pid}`;
   const buf = Buffer.from(JSON.stringify(obj, bigintSafe, 2) + "\n", "utf8");
   const fd = openSync(tmp, "w", 0o600);
@@ -71,13 +71,15 @@ export function atomicWriteJson(path, obj, write = writeSync) {
     closeSync(fd);
   }
   renameSync(tmp, path);
-  fsyncDir(dirname(path));
+  sync(dirname(path)); // injectable for a test (#404 review L2)
 }
 
 /** A rename is durable only once its directory is fsynced (#403 review L-4). */
-export function renameDurable(from, to) {
+/** rename, then fsync the target's directory so the rename survives a power cut; `sync` is
+ * injectable for a test (#404 review L2). */
+export function renameDurable(from, to, sync = fsyncDir) {
   renameSync(from, to);
-  fsyncDir(dirname(to));
+  sync(dirname(to));
 }
 
 function fsyncDir(dir) {
@@ -354,12 +356,18 @@ export class Store {
         // conflict (follow-up #2 R9); an existing file for it is kept, a missing one written
         const cpath = `${path}.conflict.${createHash("sha256").update(sig(amendment)).digest("hex")}`;
         if (existsSync(cpath)) {
+          let ok = false;
           try {
-            if (sig(JSON.parse(readFileSync(cpath, "utf8"))) === sig(amendment))
-              return "conflict-same";
+            ok = sig(JSON.parse(readFileSync(cpath, "utf8"))) === sig(amendment);
           } catch {
-            // unreadable: rewritten below
+            ok = false;
           }
+          if (ok) return "conflict-same";
+          // as on the main path (#404 review L4): the bad bytes are kept for inspection, never
+          // overwritten in place
+          let k = 1;
+          while (existsSync(`${cpath}.invalid.${k}`)) k++;
+          renameDurable(cpath, `${cpath}.invalid.${k}`);
         }
         atomicWriteJson(cpath, amendment);
         return "conflict";

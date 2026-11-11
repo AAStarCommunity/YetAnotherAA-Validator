@@ -37,7 +37,14 @@ import {
   nativeEvidence,
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
-import { Store, writeAll, validAmendment, atomicWriteJson, boundReasons } from "./lib/store.mjs";
+import {
+  Store,
+  writeAll,
+  validAmendment,
+  atomicWriteJson,
+  boundReasons,
+  renameDurable,
+} from "./lib/store.mjs";
 import { runOnce, rulesetIdentity, traceHealth, loadConfig } from "./watcher.mjs";
 import {
   attributeLogs,
@@ -3354,6 +3361,49 @@ try {
   }
 }
 
+// ---- #404 review L3: a later lookup answering a DIFFERENT tx does not replace the facts the first
+// lookup established (first write wins)
+{
+  const dL3 = mkdtempSync(join(tmpdir(), "guardian-watcher-l3-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const store = new Store(dL3);
+    const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+    const KEEP = addr("l3-keeper");
+    const sel = ethers.id("pauseUnderstakedOperator(address)").slice(0, 10);
+    const t = c.ownerTx([{ name: "OperatorPaused", args: [addr("l3-op")] }], {
+      from: KEEP,
+      data: sel,
+      trace: false,
+    });
+    for (let i = 0; i < 4; i++) c.mine();
+    await runOnce(c.chain, cfg, store, rs, ident); // the first lookup names the tx
+    // every later lookup answers another sender and calldata for the same hash
+    c.patchTxFrom(t.hash, 1, { from: addr("l3-other"), data: "0xdeadbeef" });
+    for (let i = 0; i <= MAX_DEADLETTER_ATTEMPTS + 1; i++)
+      await runOnce(c.chain, cfg, store, rs, ident);
+    const recs = readdirSync(join(dL3, "records")).map(f =>
+      JSON.parse(readFileSync(join(dL3, "records", f), "utf8"))
+    );
+    const r = recs.find(x => x.txHash === t.hash);
+    cell(
+      "#404 L3: a later lookup naming a different sender and calldata does not replace the first lookup's facts (unattributed record keeps them, caller null)",
+      r?.route === "unattributed" && r.from === KEEP && r.rootSelector === sel && r.caller === null,
+      r && { route: r.route, from: r.from, sel: r.rootSelector, caller: r.caller }
+    );
+  } finally {
+    rmSync(dL3, { recursive: true, force: true });
+  }
+}
+
 // ---- Codex follow-up #2 R1: a huge raw answer (150 000 null entries) on the range read and on the
 // by-hash re-read is quarantined, and the cursor moves (no call-stack overflow before intake)
 {
@@ -4503,7 +4553,8 @@ try {
     out.b = (await runOnce(b.c.chain, b.cfg, b.store, rs, ident)).status;
     out.bRecs = b.store.countRecords();
     out.bQ = withQ(b.store).filter(x => x.quarantine);
-    // healthy txs in one block whose records reach the per-block cap: the tx after it is quarantined
+    // healthy txs in one block, 2105 records: records never count towards the per-block cap, so all
+    // three txs are recorded and nothing is quarantined (#404 review B1)
     const e = mk();
     const ev = (n, tag) =>
       Array.from({ length: n }, (_, i) => ({
@@ -4524,7 +4575,7 @@ try {
     for (const d of runs) rmSync(d, { recursive: true, force: true });
   }
   cell(
-    "follow-up R7: 6000-deep evidence is stored as a small placeholder and retried (ticks ok, attempts count); 2100 watched logs in one tx are one quarantine; records past the per-block cap send the next tx to quarantine",
+    "follow-up R7: 6000-deep evidence is stored as a small placeholder and retried (ticks ok, attempts count); 2100 watched logs in one tx are one quarantine; 2105 healthy records in one block are all kept (records never fill the per-block cap)",
     out.a1.ok &&
       out.a2.ok &&
       out.a3.ok &&
@@ -4537,9 +4588,9 @@ try {
       out.bQ.length === 1 &&
       out.bQ[0].entries === 2100 &&
       out.e.ok &&
-      out.eRecs === 2100 + 1 &&
-      !out.eT3 &&
-      out.eQ.length === 1,
+      out.eRecs === 2105 &&
+      out.eT3 &&
+      out.eQ.length === 0,
     {
       a: [out.a1.ok, out.a2.ok, out.a2.lastError, out.a3.ok, out.aAtt, out.aBytes, out.aW.length],
       b: [out.b.ok, out.bRecs, out.bQ.length, out.bQ[0]?.entries],
@@ -5100,6 +5151,159 @@ try {
       /not an array/.test(st.lastError ?? "") &&
       cur === null,
     { ok, bads, good: [good.maxLagBlocks, good.maxTickFraction], st: [st.ok, st.lastError], cur }
+  );
+}
+
+// ---- #404 review B1: healthy records never crowd a later owner action of the same block into
+// quarantine (the per-block cap counts isolations, not records)
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-b1-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const s4 = x => ethers.id(x).slice(0, 10);
+  let st, owner, q, pub;
+  try {
+    // tx A: anyone calls updatePrice() emitting 2000 PriceUpdated (2000 public records)
+    const a = c.ownerTx(
+      Array.from({ length: 2000 }, (_, i) => ({
+        name: "PriceUpdated",
+        args: [250000000000n + BigInt(i), BigInt(i)],
+      })),
+      { from: addr("b1-attacker"), data: s4("updatePrice()"), price: 250000000000n }
+    );
+    // tx B: the Safe's GuardianSet in the same block, after A
+    const b = c.ownerTx([{ name: "GuardianSet", args: [addr("b1-g0"), addr("b1-g1")] }], {
+      atBlock: a.block,
+    });
+    for (let i = 0; i < 4; i++) c.mine();
+    st = (await runOnce(c.chain, cfg, store, rs, ident)).status;
+    const recs = readdirSync(join(d, "records")).map(f =>
+      JSON.parse(readFileSync(join(d, "records", f), "utf8"))
+    );
+    owner = recs.find(r => r.txHash === b.hash && r.event === "GuardianSet");
+    pub = recs.filter(r => r.txHash === a.hash).length;
+    q = recs.filter(r => r.quarantine).length;
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "#404 B1: 2000 public records then an owner GuardianSet in the same block: the owner action is recorded on the owner route, nothing quarantined",
+    st.ok && pub === 2000 && owner?.route === "owner" && q === 0,
+    { ok: st.ok, err: st.lastError, pub, owner: owner && [owner.route, owner.event], q }
+  );
+}
+
+// ---- #404 review L2-L4: renames and writes fsync their directory; a corrupt conflict file is kept
+// as .invalid; tx facts are first-write-wins
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-l2-"));
+  const synced = [];
+  const spy = dir => synced.push(dir);
+  let l4, l4files;
+  try {
+    writeFileSync(join(d, "a"), "x");
+    renameDurable(join(d, "a"), join(d, "b"), spy);
+    atomicWriteJson(join(d, "c.json"), { v: 1 }, writeSync, spy);
+    // L4: a conflict file with garbage at the address of a new conflicting proof
+    const st = new Store(join(d, "s"));
+    const k = 77n;
+    const am = (tx, ev) => ({
+      key: k.toString(),
+      txHash: tx,
+      provenBy: "trace",
+      provenAt: "t",
+      spEvents: [{ event: ev, logIndex: 1, args: [] }],
+      ruleset: { commit: "0".repeat(40) },
+    });
+    st.putBlsAmendment(k, am(ethers.id("l4-a"), "SlashQueued"));
+    const other = am(ethers.id("l4-b"), "SlashCancelled");
+    const first = st.putBlsAmendment(k, other);
+    const dir = join(d, "s", "amendments");
+    const cfile = readdirSync(dir).find(f => /\.conflict\.[0-9a-f]{64}$/.test(f));
+    writeFileSync(join(dir, cfile), "{ garbage");
+    l4 = [first, st.putBlsAmendment(k, other)];
+    l4files = readdirSync(dir).sort();
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "#404 L2/L4: renameDurable and atomicWriteJson fsync the target directory; a corrupt conflict file is kept as .invalid.1 and the proof rewritten",
+    synced.length === 2 &&
+      synced.every(x => x === d) &&
+      j(l4) === j(["conflict", "conflict"]) &&
+      l4files.some(f => /\.conflict\.[0-9a-f]{64}\.invalid\.1$/.test(f)) &&
+      l4files.some(f => /\.conflict\.[0-9a-f]{64}$/.test(f)),
+    { synced, l4, l4files }
+  );
+}
+
+// ---- #404 review Info: a log in the raw JSON-RPC shape a production node returns (hex logIndex and
+// blockNumber, no `index`, lower-case address) goes all the way to a record
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-rawshape-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const toRaw = l => ({
+    address: String(l.address).toLowerCase(),
+    topics: l.topics,
+    data: l.data,
+    blockNumber: ethers.toQuantity(l.blockNumber),
+    blockHash: l.blockHash,
+    transactionHash: l.transactionHash,
+    transactionIndex: "0x0",
+    logIndex: ethers.toQuantity(l.index ?? l.logIndex),
+    removed: false,
+  });
+  const raw = Object.create(c.chain);
+  let shaped = 0;
+  raw.send = async (m, params) => {
+    const r = await c.chain.send(m, params);
+    if (m !== "eth_getLogs" || !Array.isArray(r)) return r;
+    shaped += r.length;
+    return r.map(toRaw);
+  };
+  let st, rec;
+  try {
+    const t = c.ownerTx([{ name: "GuardianSet", args: [addr("raw-g0"), addr("raw-g1")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    st = (await runOnce(raw, cfg, new Store(d), rs, ident)).status;
+    rec = readdirSync(join(d, "records"))
+      .map(f => JSON.parse(readFileSync(join(d, "records", f), "utf8")))
+      .find(r => r.txHash === t.hash);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "#404 Info: a raw JSON-RPC-shaped log (hex logIndex/blockNumber, no index, lower-case address) is recorded on the owner route with no isolation",
+    shaped > 0 &&
+      st.ok &&
+      rec?.route === "owner" &&
+      rec.event === "GuardianSet" &&
+      !st.isolatedThisTick,
+    {
+      shaped,
+      ok: st.ok,
+      err: st.lastError,
+      iso: st.isolatedThisTick,
+      rec: rec && [rec.route, rec.event],
+    }
   );
 }
 

@@ -788,8 +788,10 @@ function quarantineRaw(store, rs, ctx, summary, bad, source, from, to, why = "no
 const QUARANTINE_SAMPLES = 10;
 const MAX_PER_TX_ISOLATIONS = 100;
 
-/** A tx whose block holds more isolating txs than any real block can carry (30M gas / 21 000):
- * the excess joins the bounded quarantine (it cannot be a real block's content). */
+/** Isolations (dead letters, amendments, patches) one block may write. Under an honest RPC an
+ * isolation is a rare transient failure, so a real block comes nowhere near this; the cap bounds what
+ * a misbehaving answer can make the watcher write, and the excess joins the bounded quarantine.
+ * Records do not count (#404 review B1). */
 const MAX_TXS_PER_BLOCK = 2000;
 /** More SignersCommitted logs in one tx than a 30M-gas block can BLS-verify (each needs a pairing
  * check, well over 100 000 gas): such a tx cannot be real. */
@@ -1314,19 +1316,21 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
       ...(t.range ? { range: t.range } : {}),
       // What is known of the tx itself, kept for an unattributed record at exhaustion (#400 review
       // nit): its sender, target and root selector (not the emitting call's).
-      // A later failed lookup keeps what an earlier one established (#403 review L-1).
-      ...(tx
-        ? {
-            txFrom: tx.from ? ethers.getAddress(tx.from) : null,
-            txTo: tx.to ? ethers.getAddress(tx.to) : null,
-            rootSelector: selectorOf(tx.data),
-          }
-        : (() => {
-            const prior = store.getDeadLetter(txDl);
-            return prior && "txFrom" in prior
-              ? { txFrom: prior.txFrom, txTo: prior.txTo, rootSelector: prior.rootSelector }
-              : {};
-          })()),
+      // First write wins (#403 review L-1; #404 review L3): what an earlier lookup established is
+      // kept, whether a later one answers nothing or a different tx; only the first lookup that
+      // names the tx sets them.
+      ...(() => {
+        const prior = store.getDeadLetter(txDl);
+        if (prior && "txFrom" in prior)
+          return { txFrom: prior.txFrom, txTo: prior.txTo, rootSelector: prior.rootSelector };
+        return tx
+          ? {
+              txFrom: tx.from ? ethers.getAddress(tx.from) : null,
+              txTo: tx.to ? ethers.getAddress(tx.to) : null,
+              rootSelector: selectorOf(tx.data),
+            }
+          : {};
+      })(),
       ruleset: ctx.ruleset,
       seenAt: ctx.now,
     });
@@ -1829,16 +1833,18 @@ export async function tick(chain, cfg, store, rs, ctx) {
       for (const l of t.sp) impossible.sp.push(l);
       continue;
     }
-    // every dead letter written counts towards the budget (one tx can write several: one per
-    // commitment); the per-block cap counts records too, so no block writes without bound (R7)
+    // Every dead letter written counts towards the budget (one tx can write several: one per
+    // commitment), and dead letters plus amendment/patch writes count towards the per-block cap.
+    // RECORDS NEVER COUNT (#404 review B1): a healthy record is the watcher doing its job, and
+    // counting them let 2000 public PriceUpdated records crowd a later owner action of the same
+    // block into a quarantine that accuses nobody. Records are bounded per tx (MAX_LOGS_PER_TX)
+    // and by the chain's own gas.
     const before = summary.deadLetters;
-    const recBefore = summary.newRecords + summary.upgraded + (summary.otherWrites ?? 0);
+    const otherBefore = summary.otherWrites ?? 0;
     await processTxIsolated(chain, cfg, rs, ctx, store, summary, txHash, t, fin.number, null);
     const writes = summary.deadLetters - before;
-    const recWrites =
-      summary.newRecords + summary.upgraded + (summary.otherWrites ?? 0) - recBefore;
-    if (writes + recWrites > 0)
-      perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + writes + recWrites);
+    const abnormal = writes + (summary.otherWrites ?? 0) - otherBefore;
+    if (abnormal > 0) perBucket.set(bucket, (perBucket.get(bucket) ?? 0) + abnormal);
     if (writes > 0 && inRange(b)) inRangeIsolations += writes;
     if (stopAt === null && inRange(b) && inRangeIsolations >= MAX_PER_TX_ISOLATIONS) stopAt = b;
   }

@@ -515,15 +515,20 @@ aggregator-only.
     always advances. Txs with no usable height, or a height outside the range,
     belong to no later block: they are handled in the tick that read them, never
     deferred. Dead-letter retries and those txs do not count towards the budget.
-  - Per-block cap: past 2000 isolating txs in one block (more than any real
-    block can carry), or in the shared bucket of txs outside the range, the
-    excess goes into one quarantine record per query.
+  - Per-block cap: past 2000 isolations (dead letters, amendment and patch
+    writes) in one block, or in the shared bucket of txs outside the range, the
+    excess goes into one quarantine record per query. Under an honest RPC an
+    isolation is a rare transient failure, so the cap only bounds what a
+    misbehaving answer can make the watcher write. Records never count towards
+    it (#404 review B1): otherwise anyone could fill a block with public
+    `updatePrice()` records and push a later owner action of that block into a
+    quarantine that accuses nobody.
   - A tx with more than 300 `SignersCommitted` logs (more than a block's gas can
     BLS-verify), or more than 2000 watched logs, cannot be real: its logs go
     into one quarantine record per query, not one dead letter or record each.
-    The per-block cap counts records as well as dead letters, so no block writes
-    without bound; only dead letters spend the per-tick budget, so a busy
-    healthy range is never reported degraded.
+    Records are bounded per tx by this cap and per block by the chain's own gas;
+    only dead letters spend the per-tick budget, so a busy healthy range is
+    never reported degraded.
   - An evidence item nested more than 64 levels deep (real logs are about 3) is
     stored as a placeholder with its prefix, full length and sha256: state files
     are indented, so a stored value grows with the square of its depth (a
