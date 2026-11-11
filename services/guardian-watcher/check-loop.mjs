@@ -1663,6 +1663,126 @@ const good = {
   }
 }
 
+// ---- Codex W2c R12: stall index lifecycle
+{
+  const { stallReasons } = await import("./watcher.mjs");
+  const { stallCounts, stallKind, readStalls } = await import("./lib/publisher.mjs");
+  const sp = d => join(d, "stalls.json");
+  // #2: the FIRST broadcast failing for funds is journalled and counted from that pass
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const s = sinks({ mine: "pending", rejectBroadcast: true });
+      const sk = {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        registry: s.registry,
+      };
+      const p1 = await publishPending(store, sk, { maxPendingMs: 0 });
+      const pub = store.getPublication(Store.recordId(bls));
+      cell(
+        "R12#2: an initial broadcast refused for funds is journalled, alerted and counted in the same pass",
+        p1.stalls.insufficientFunds === 1 &&
+          /INSUFFICIENT_FUNDS|insufficient/i.test(
+            String(pub?.registry?.lastBroadcastError ?? "")
+          ) &&
+          p1.alerts.some(a => /insufficient funds/.test(a)),
+        { stalls: p1.stalls, reg: pub?.registry, alerts: p1.alerts }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #1: a confirmed journal is no stall, even if it still carries feeCapped; a done record clears
+  {
+    cell(
+      "R12#1: stallKind of a confirmed registry stage is null even with feeCapped / an old error",
+      stallKind({
+        registry: { phase: "confirmed", feeCapped: "t", lastBroadcastError: "INSUFFICIENT_FUNDS" },
+      }) === null && stallKind({ registry: { phase: "sent", feeCapped: "t" } }) === "feeCapped",
+      null
+    );
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const s = sinks({});
+      const sk = {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        registry: s.registry,
+      };
+      for (let i = 0; i < 4; i++) await publishPending(store, sk, { maxPendingMs: 0 });
+      const id = Store.recordId(bls);
+      const pub = store.getPublication(id);
+      // a stale marker: the journal confirmed but still carrying feeCapped, and the index entry
+      store.putPublication(id, {
+        ...pub,
+        registry: { ...pub.registry, feeCapped: "2026-01-01T00:00:00Z" },
+      });
+      writeFileSync(sp(d), JSON.stringify({ [id]: { kind: "feeCapped", since: "x" } }));
+      const p = await publishPending(store, sk, { maxPendingMs: 0 });
+      cell(
+        "R12#1: a done (confirmed) record clears its stale stall entry store-wide",
+        pub?.registry?.phase === "confirmed" &&
+          p.stalls.feeCapped === 0 &&
+          !(id in (readStalls(store) ?? { [id]: 1 })),
+        { phase: pub?.registry?.phase, stalls: p.stalls, idx: readStalls(store) }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #3: a corrupt index is rebuilt from the journals; if that fails too, the state is "unknown"
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const s = sinks({ mine: "pending", rejectBroadcast: true });
+      const sk = {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        registry: s.registry,
+      };
+      await publishPending(store, sk, { maxPendingMs: 0 });
+      writeFileSync(sp(d), "{not json");
+      cell(
+        "R12#3: an unreadable index counts as unknown, never as zero stalls",
+        stallCounts(store).unknown === true &&
+          stallReasons({ stalls: stallCounts(store) })[0] ===
+            "stall state unknown: the stall index is unreadable",
+        stallCounts(store)
+      );
+      const p = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
+      cell(
+        "R12#3: the next pass rebuilds the index from the journals (the unfunded record is counted again)",
+        p.stalls.insufficientFunds === 1 &&
+          !p.stalls.unknown &&
+          p.alerts.some(a => /rebuilt from the publication journals/.test(a)),
+        { stalls: p.stalls, alerts: p.alerts }
+      );
+      writeFileSync(sp(d), "[]");
+      writeFileSync(join(d, "publications", `${Store.recordId(bls)}.json`), "{corrupt");
+      const q = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
+      cell(
+        "R12#3: index and a journal both unreadable: stall state unknown, degraded",
+        q.stalls.unknown === true &&
+          stallReasons({ stalls: q.stalls }).some(r => /stall state unknown/.test(r)) &&
+          q.alerts.some(a => /could not be rebuilt/.test(a)),
+        { stalls: q.stalls, alerts: q.alerts }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

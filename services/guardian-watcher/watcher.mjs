@@ -89,6 +89,8 @@ export function stallReasons(publication) {
   // store-wide counts (lib/publisher.mjs stallCounts), never the batch's (DSR)
   const st = publication?.stalls ?? {};
   const out = [];
+  // an unreadable, unrebuildable index is not "no stalls" (Codex W2c R12 #3)
+  if (st.unknown) out.push("stall state unknown: the stall index is unreadable");
   if (st.feeCapped)
     out.push(`${st.feeCapped} disclose tx(s) need a fee above registry.maxFeePerGas`);
   if (st.insufficientFunds)

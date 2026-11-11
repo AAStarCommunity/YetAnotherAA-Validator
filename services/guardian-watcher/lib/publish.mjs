@@ -484,7 +484,7 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
         replacements: (state.registry.replacements ?? 0) + 1,
       };
       await persist(state); // journal BEFORE broadcast
-      await reg.broadcast(rep.raw);
+      await broadcastJournalled(reg, rep.raw, state, persist, alerts);
       return;
     }
   }
@@ -513,9 +513,28 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     nonce: signed.nonce,
   };
   await persist(state); // journal BEFORE broadcast
-  await reg.broadcast(signed.raw);
+  await broadcastJournalled(reg, signed.raw, state, persist, alerts);
   state.registry = { ...state.registry, phase: "sent", sentAt: new Date().toISOString() };
   await persist(state);
+}
+
+/**
+ * A first or replacement broadcast (Codex W2c R12 #2): a failure is journalled like a rebroadcast's
+ * (lastBroadcastError, so an unfunded writer counts as a stall from the first attempt) and alerted
+ * when it is insufficient funds, then rethrown so the pass still records the failure.
+ */
+async function broadcastJournalled(reg, raw, state, persist, alerts) {
+  try {
+    await reg.broadcast(raw);
+  } catch (e) {
+    state.registry = { ...state.registry, lastBroadcastError: errMsg(e) };
+    if (safeCode(e) === "INSUFFICIENT_FUNDS")
+      alerts.push(
+        `registry: the writer has insufficient funds for the disclose tx (nonce ${state.registry.nonce}); fund the writer`
+      );
+    await persist(state); // a persist failure (PersistError) stops the pass, as everywhere else
+    throw e;
+  }
 }
 
 /** A successful receipt: confirmed only once final and the entry at the finalized block is ours. */

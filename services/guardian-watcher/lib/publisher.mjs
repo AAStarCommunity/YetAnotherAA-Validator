@@ -4,7 +4,8 @@
 // the writer's roles from chain, builds the sinks and delivers the run's alerts.
 import { ethers } from "ethers";
 import { join } from "node:path";
-import { Store, atomicWriteJson, readJson } from "./store.mjs";
+import { existsSync, readFileSync } from "node:fs";
+import { Store, atomicWriteJson } from "./store.mjs";
 import { publishRecord, PersistError } from "./publish.mjs";
 import { recordFile } from "./record-file.mjs";
 import { MAX_RECORD_BYTES } from "./cid.mjs";
@@ -73,34 +74,44 @@ function recordIdOf(rec) {
  * either state. Degraded is computed from this, never from one batch.
  */
 const stallsPath = store => join(store.dir, "stalls.json");
+/** The stall index, {} when absent, or null when it exists but cannot be read (Codex W2c R12 #3). */
 export function readStalls(store) {
+  if (!existsSync(stallsPath(store))) return {};
   try {
-    const j = readJson(stallsPath(store), {});
-    return j && typeof j === "object" && !Array.isArray(j) ? j : {};
+    const j = JSON.parse(readFileSync(stallsPath(store), "utf8"));
+    return j && typeof j === "object" && !Array.isArray(j) ? j : null;
   } catch {
-    return {};
+    return null;
   }
 }
+/** Store-wide counts; { unknown: true } when the index is unreadable and could not be rebuilt. */
 export function stallCounts(store) {
-  const all = Object.values(readStalls(store));
+  const idx = readStalls(store);
+  if (idx === null) return { feeCapped: 0, insufficientFunds: 0, unknown: true };
+  const all = Object.values(idx);
   return {
     feeCapped: all.filter(x => x?.kind === "feeCapped").length,
     insufficientFunds: all.filter(x => x?.kind === "insufficientFunds").length,
   };
 }
-function updateStall(store, id, regState, now) {
-  const kind = regState?.feeCapped
-    ? "feeCapped"
-    : /INSUFFICIENT_FUNDS/.test(String(regState?.lastBroadcastError ?? ""))
-      ? "insufficientFunds"
-      : null;
-  const all = readStalls(store);
-  const had = all[id];
-  if (kind && had?.kind === kind) return;
-  if (!kind && !had) return;
-  if (kind) all[id] = { kind, since: had?.kind === kind ? had.since : now };
-  else delete all[id];
-  atomicWriteJson(stallsPath(store), all);
+/** The stall a journal is in: none once the registry stage is confirmed (Codex W2c R12 #1). */
+export function stallKind(pub) {
+  const r = pub?.registry;
+  if (!r || r.phase === "confirmed") return null;
+  if (r.feeCapped) return "feeCapped";
+  if (/INSUFFICIENT_FUNDS/.test(String(r.lastBroadcastError ?? ""))) return "insufficientFunds";
+  return null;
+}
+/** Rebuild the index from every record's publication journal (when the index is unreadable);
+ * throws if any journal is unreadable, so the state stays "unknown" rather than under-counted. */
+function rebuildStalls(store, now) {
+  const out = {};
+  for (const name of store.recordFiles()) {
+    const id = name.replace(/\.json$/, "");
+    const kind = stallKind(store.getPublication(id));
+    if (kind) out[id] = { kind, since: now, rebuilt: true };
+  }
+  return out;
 }
 
 export async function publishPending(
@@ -131,6 +142,30 @@ export async function publishPending(
     insufficientFunds: 0, // a disclose tx the writer cannot pay for (#411 F1)
   };
   const pinners = (sinks.pinners ?? []).map(p => p.name);
+  // the store-wide stall index (DSR): loaded once, updated per record processed, written once;
+  // rebuilt from the journals if unreadable (Codex W2c R12 #3)
+  let stalls = readStalls(store);
+  let stallsDirty = false;
+  if (stalls === null) {
+    try {
+      stalls = rebuildStalls(store, new Date(now()).toISOString());
+      stallsDirty = true;
+      alerts.push("stall index was unreadable; rebuilt from the publication journals");
+    } catch {
+      stalls = null;
+      alerts.push("stall index is unreadable and could not be rebuilt: stall state unknown");
+    }
+  }
+  const noteStall = (id, pub) => {
+    if (stalls === null) return;
+    const kind = stallKind(pub);
+    const had = stalls[id];
+    if (kind && had?.kind === kind) return;
+    if (!kind && !had) return;
+    if (kind) stalls[id] = { kind, since: new Date(now()).toISOString() };
+    else delete stalls[id];
+    stallsDirty = true;
+  };
   const sched = getSchedule(store);
   const entries = { ...(sched.entries ?? {}) };
   // A bounded batch of record files, in sorted order from the cursor (the last file read). A
@@ -196,6 +231,7 @@ export async function publishPending(
       if (isParked) counts.parked++;
       else counts.done++;
       entries[id] = { ...e, done: true };
+      noteStall(id, prev); // a done record clears any stale entry (Codex W2c R12 #1)
       if (openIncident(prev)) counts.incidents++;
       continue;
     }
@@ -254,7 +290,7 @@ export async function publishPending(
       if (r.state.registry?.feeCapped) counts.feeCapped++;
       if (/INSUFFICIENT_FUNDS/.test(String(r.state.registry?.lastBroadcastError ?? "")))
         counts.insufficientFunds++;
-      updateStall(store, id, r.state.registry, new Date(now()).toISOString());
+      noteStall(id, r.state);
     } catch (err) {
       entries[id] = { ...e, lastRunAt: now(), failing: true }; // a failure still rotates (R2)
       counts.failed++;
@@ -290,6 +326,7 @@ export async function publishPending(
     counts.failed++;
     alerts.push("publication schedule not saved; rotation kept in memory, retried next pass");
   }
+  if (stallsDirty && stalls !== null) atomicWriteJson(stallsPath(store), stalls);
   return { alerts, counts, stopped, reverifyRemaining, sweeps, stalls: stallCounts(store) };
 }
 
