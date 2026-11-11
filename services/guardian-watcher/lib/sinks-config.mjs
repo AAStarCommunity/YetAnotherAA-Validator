@@ -16,7 +16,8 @@
 //     "mirror": { "clone": "/path/to/bare/clone.git", "branch": "disclosure-records",
 //                 "repoUrl": "https://github.com/AAStarCommunity/YetAnotherAA-Validator" },
 //     "registry": { "address": "0x…", "fromBlock": N, "deployer": "0x…", "maxFeePerGas": "<wei>",
-//                   "keystore": "~/.aoa-watcher/sender.keystore.json" },
+//                   "keystore": "/Users/<you>/.aoa-watcher/sender.keystore.json" },
+//     (an absolute path: "~" is not expanded, #413 review N3)
 //     "lockPort": 47331, "maxPendingMs": 1800000, "reverifyEveryMs": 604800000, "alertRepeatMs": 3600000 }
 import { readFileSync } from "node:fs";
 import { ethers } from "ethers";
@@ -87,7 +88,7 @@ export function publishConfig(c) {
  * Read every secret and decrypt the writer keystore. `readSecret(service, account)` is injectable
  * for tests. Returns { pinners, telegram, mirror, wallet, registryFor(roles) }.
  */
-export async function buildSinks(p, provider, { readSecret = keychainRead } = {}) {
+export async function buildSinks(p, provider, { readSecret = keychainRead, chainId } = {}) {
   const acct = p.keychainAccount;
   const pinners = [];
   for (const x of p.pinners) {
@@ -140,6 +141,7 @@ export async function buildSinks(p, provider, { readSecret = keychainRead } = {}
       roles,
       currentRoles,
       maxFeePerGas: BigInt(p.registry.maxFeePerGas),
+      chainId,
     });
   return { pinners, telegram, mirror, wallet, registryFor };
 }

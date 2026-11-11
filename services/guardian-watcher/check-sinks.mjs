@@ -759,6 +759,7 @@ try {
   const fees = { maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
   provider.getFeeData = async () => ({ ...fees });
   const sink = registrySink({
+    chainId: 10,
     maxFeePerGas: FEE_CAP,
     provider,
     wallet: w,
@@ -800,6 +801,7 @@ try {
   {
     // #411 review F1: an absolute maxFeePerGas ceiling; a fee above it is refused, never sent
     const capped = registrySink({
+      chainId: 10,
       maxFeePerGas: 1200n,
       provider,
       wallet: w,
@@ -816,7 +818,7 @@ try {
     }
     let noCap = null;
     try {
-      registrySink({ provider, wallet: w, registry: REG, fromBlock: 0, roles });
+      registrySink({ chainId: 10, provider, wallet: w, registry: REG, fromBlock: 0, roles });
     } catch (e) {
       noCap = e.message;
     }
@@ -916,6 +918,7 @@ try {
     refusals
   );
   const leaky = registrySink({
+    chainId: 10,
     maxFeePerGas: FEE_CAP,
     provider: {
       async call() {
@@ -966,6 +969,7 @@ try {
     ],
   ]);
   const uriSink = registrySink({
+    chainId: 10,
     maxFeePerGas: FEE_CAP,
     provider: {
       async call() {
@@ -1004,6 +1008,7 @@ try {
   ]) {
     try {
       registrySink({
+        chainId: 10,
         maxFeePerGas: FEE_CAP,
         provider,
         wallet: w,
@@ -1024,6 +1029,7 @@ try {
   let gs = null;
   try {
     await registrySink({
+      chainId: 10,
       maxFeePerGas: FEE_CAP,
       provider,
       wallet: w,
@@ -1051,6 +1057,7 @@ try {
         },
       };
       return registrySink({
+        chainId: 10,
         maxFeePerGas: FEE_CAP,
         provider: p,
         wallet: w,
@@ -1117,6 +1124,7 @@ try {
     let calls = 0;
     try {
       await registrySink({
+        chainId: 10,
         maxFeePerGas: FEE_CAP,
         provider,
         wallet: w,
@@ -1160,6 +1168,7 @@ try {
     [ethers.ZeroAddress, ethers.id("tx"), 100n, true, "0x" + "00".repeat(20), "u", ethers.id("r")],
   ]);
   const sink2 = registrySink({
+    chainId: 10,
     maxFeePerGas: FEE_CAP,
     provider: {
       async getTransactionReceipt() {
@@ -1184,6 +1193,81 @@ try {
     "receipt: entryId from the registry's own Disclosed log; block hash carried for canonical()",
     rc.entryId === 9n && rc.blockHash === ethers.id("b50") && rc.status === 1,
     rc
+  );
+}
+
+// ---- #413 review N2: the registry signs only for the configured chain
+{
+  const REG2 = ethers.getAddress("0x" + "ac".repeat(20));
+  const w = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const prov = chain => ({
+    async getTransactionCount() {
+      return 1;
+    },
+    async getFeeData() {
+      return { maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
+    },
+    async getNetwork() {
+      return { chainId: chain };
+    },
+    async estimateGas() {
+      return 100000n;
+    },
+  });
+  let missing = null;
+  try {
+    registrySink({
+      provider: prov(10n),
+      wallet: w,
+      registry: REG2,
+      fromBlock: 0,
+      roles,
+      maxFeePerGas: 10_000n,
+    });
+  } catch (e) {
+    missing = e.message;
+  }
+  const mk = chain =>
+    registrySink({
+      chainId: 10,
+      provider: prov(chain),
+      wallet: w,
+      registry: REG2,
+      fromBlock: 0,
+      roles,
+      currentRoles: async () => roles,
+      maxFeePerGas: 10_000n,
+    });
+  let other = null;
+  try {
+    await mk(11n).sign({
+      signed: {
+        kind: 0,
+        proposalId: 7n,
+        messageInputs: "0x1234",
+        signerMask: 3n,
+        signers: [ethers.getAddress("0x" + "d4".repeat(20))],
+        anchor: ethers.ZeroHash,
+      },
+      subjectToken: ethers.ZeroAddress,
+      txHash: ethers.id("tx"),
+      blockNumber: 100n,
+      rulesetCommit: "0x" + "ab".repeat(20),
+      recordURI: "ipfs://bafkreix",
+      recordHash: ethers.id("r"),
+    });
+  } catch (e) {
+    other = e.code ?? e.message;
+  }
+  cell(
+    "N2: no configured chainId refuses construction; an RPC on another chain refuses to sign (CHAIN)",
+    /chainId \(the configured chain\) is required/.test(missing ?? "") && other === "CHAIN",
+    { missing, other }
   );
 }
 

@@ -155,7 +155,7 @@ export function sinks(opts = {}) {
         calls.broadcast++;
         calls.lastRaw = raw;
         const hash = ethers.id(`disclose-${raw.slice(5)}`);
-        if (opts.rejectBroadcast) {
+        if (opts.rejectBroadcast || opts.rejectRaw?.(raw)) {
           // a node refusing every broadcast (e.g. a writer without funds): never known
           const e = new Error("insufficient funds for gas * price + value");
           e.code = "INSUFFICIENT_FUNDS";

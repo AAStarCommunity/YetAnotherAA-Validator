@@ -167,7 +167,9 @@ export async function publishPending(
   // R15 #3), keyed by its file name; retired with the file like any entry
   const unknownFile = name => {
     const nid = String(name).replace(/\.json$/, "");
-    if (/^[A-Za-z0-9-]{1,200}$/.test(nid)) entries[nid] = withStall(entries[nid], "unknown");
+    // failing: alerted on its own, it does not hold a reverify generation open (#413 review F2)
+    if (/^[A-Za-z0-9-]{1,200}$/.test(nid))
+      entries[nid] = { ...withStall(entries[nid], "unknown"), failing: true };
   };
   const bad = [];
   const seenIds = new Set();
@@ -204,7 +206,7 @@ export async function publishPending(
         prev = store.getPublication(id) ?? {};
       } catch {
         // never reset: not published (nor signed for) until repaired by hand; its stall is unknown
-        entries[id] = withStall(entries[id], "unknown");
+        entries[id] = { ...withStall(entries[id], "unknown"), failing: true };
         counts.failed++;
         alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
         continue;
@@ -259,7 +261,7 @@ export async function publishPending(
     try {
       prev = store.getPublication(id) ?? {};
     } catch {
-      entries[id] = withStall(entries[id], "unknown");
+      entries[id] = { ...withStall(entries[id], "unknown"), failing: true };
       counts.failed++;
       alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
       continue;
@@ -549,6 +551,17 @@ export async function publishPhase(
   // is registered and re-checked, whatever the bounded batches had reached). A record added later
   // is not done, so it needs no re-check: it is published by the normal path when reached.
   const schedFailures = []; // generation-transition schedule writes that failed (Codex W2c R4)
+  // an unreadable alerts.json must not abort every pass (#413 review B1): it only holds the digest
+  // dedupe and lastReverifyAt, so it is reset (a digest may repeat, a re-check may run early),
+  // alerted, and the pass is not ok. If the reset fails too, the pass throws and is degraded.
+  let alertStateReset = false;
+  try {
+    store.getAlertState();
+  } catch {
+    store.putAlertState({});
+    alertStateReset = true;
+    alerts.push("alert state (alerts.json) was unreadable; reset");
+  }
   const meta = store.getAlertState() ?? {};
   let gen = getSchedule(store).reverifyGen ?? null;
   if (gen === null && now - (meta.lastReverifyAt ?? 0) >= p.reverifyEveryMs) {
@@ -617,6 +630,7 @@ export async function publishPhase(
       res.counts.failed === 0 &&
       !schedFailures.length &&
       !out.registrySkipped &&
+      !alertStateReset &&
       deliveredOk,
   };
 }

@@ -93,8 +93,18 @@ export function registrySink({
   currentRoles,
   feeBump = 1.25,
   maxFeePerGas: feeCapIn,
+  chainId: chainIdIn,
 }) {
   const addr = ethers.getAddress(registry);
+  // the configured chain (#413 review N2): every signature is for it, and only while the RPC is on
+  // it; a wrong or hostile RPC cannot get a disclose tx signed for another chain
+  let chainId;
+  try {
+    chainId = BigInt(chainIdIn);
+  } catch {
+    chainId = 0n;
+  }
+  if (!(chainId > 0n)) throw new SinkError("registry: chainId (the configured chain) is required");
   if (!(feeBump >= 1.125))
     throw new SinkError("registry: feeBump must be >= 1.125 (replacement rule)");
   // An absolute ceiling on maxFeePerGas, from config (#411 review F1, DSR): no fee ever above it.
@@ -225,11 +235,16 @@ export function registrySink({
           "registry: the fee needed exceeds the configured maxFeePerGas",
           "FEE_CAP"
         );
+      if (BigInt((await provider.getNetwork()).chainId) !== chainId)
+        throw new SinkError(
+          "registry: the RPC is on another chain than the configured chainId",
+          "CHAIN"
+        );
       const tx = {
         to: addr,
         data,
         nonce: n,
-        chainId: (await provider.getNetwork()).chainId,
+        chainId,
         type: 2,
         maxFeePerGas: maxFee,
         maxPriorityFeePerGas: tip,

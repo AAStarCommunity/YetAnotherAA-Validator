@@ -22,7 +22,7 @@ import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick, verifyTrace } from "./lib/scan.mjs";
-import { safeText } from "./lib/safe-error.mjs";
+import { SafeError, safeText } from "./lib/safe-error.mjs";
 import { acquireLock, DEFAULT_LOCK_PORT } from "./lib/lock.mjs";
 import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
 import { publishPhase } from "./lib/publisher.mjs";
@@ -87,8 +87,11 @@ export function loadConfig(path) {
 /** The disclose stalls that make the watcher degraded (DSR, #411 F1): fixed wording, counts only. */
 export function stallReasons(publication) {
   // store-wide counts (lib/publisher.mjs stallCounts), never the batch's (DSR)
-  const st = publication?.stalls ?? {};
   const out = [];
+  // no store-wide counts at all (the pass threw, or never reported them) is not "no stalls"
+  // (#413 review B1)
+  if (!publication?.stalls) return ["stall state unknown: no publication result"];
+  const st = publication.stalls;
   // an unreadable, unrebuildable index is not "no stalls" (Codex W2c R12 #3)
   if (st.unknown) out.push("stall state unknown: the stall index is unreadable");
   if (st.feeCapped)
@@ -98,6 +101,44 @@ export function stallReasons(publication) {
       `${st.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
     );
   return out;
+}
+
+/**
+ * One iteration's publication, as the resident loop runs it (#413 review B1): a pass that throws,
+ * or that does not report ok, makes the watcher degraded (fixed wording, healthy = false) so the
+ * heartbeat sees it; so do disclose stalls and a slow iteration. Returns the next slowNote.
+ */
+export async function publicationStep({ status, run, slowNote, iterStart, cfg, now = Date.now }) {
+  try {
+    // the previous iteration's slowness is only known after its publication: carried here
+    const degraded = [...(status.degraded ?? []), ...(slowNote ? [slowNote] : [])];
+    status.publication = await run(degraded.length ? degraded : undefined);
+  } catch (e) {
+    status.publication = { error: safeText("publication", e) };
+  }
+  const reasons = [];
+  if (status.publication?.error) reasons.push("publication pass failed (see the alerts)");
+  else if (status.publication?.ok !== true)
+    reasons.push("publication pass not ok (a stage failed, stopped or was skipped)");
+  // a stalled disclose is a degraded watcher (DSR, #411 F1), whatever else the pass did; fixed
+  // wording, counts only. The heartbeat alerts on healthy: false.
+  reasons.push(...stallReasons(status.publication));
+  // the whole iteration (scan and publication) against the interval: a slow one is degraded,
+  // and alerted by the next pass (tickMs covers the scan alone)
+  status.iterationMs = now() - iterStart;
+  const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
+  const nextSlow =
+    status.iterationMs > limit
+      ? // fixed wording: the alert set's identity must not change with every duration (Codex W2c
+        // R9); the measured time is status.iterationMs
+        `iteration slower than ${Math.round(limit)} ms (maxTickFraction of the interval)`
+      : null;
+  if (nextSlow) reasons.push(nextSlow);
+  if (reasons.length) {
+    status.degraded = [...(status.degraded ?? []), ...reasons];
+    status.healthy = false;
+  }
+  return nextSlow;
 }
 
 export const TRACE_VERIFY_MS = 3_600_000;
@@ -312,7 +353,11 @@ async function main() {
   const p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null;
   await acquireLock(p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT);
   const chain = makeProvider(process.env.RPC_URL);
-  const pub = p ? { p, built: await buildSinks(p, chain) } : null;
+  // the registry signs only for the configured chain (#413 review N2): a missing chainId refuses
+  // to start, and a mismatching RPC refuses each signature
+  if (p && !Number.isSafeInteger(cfg.chainId))
+    throw new SafeError("config: chainId required when publish is enabled");
+  const pub = p ? { p, built: await buildSinks(p, chain, { chainId: cfg.chainId }) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
   let lastPub = store.readStatus()?.publication ?? null;
@@ -328,37 +373,14 @@ async function main() {
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
     if (pub) {
-      try {
-        // the previous iteration's slowness is only known after its publication: carried here
-        const degraded = [...(status.degraded ?? []), ...(slowNote ? [slowNote] : [])];
-        status.publication = await publishPhase(store, chain, cfg, pub.p, pub.built, {
-          degraded: degraded.length ? degraded : undefined,
-        });
-      } catch (e) {
-        status.publication = { error: safeText("publication", e) };
-      }
+      slowNote = await publicationStep({
+        status,
+        slowNote,
+        iterStart,
+        cfg,
+        run: degraded => publishPhase(store, chain, cfg, pub.p, pub.built, { degraded }),
+      });
       lastPub = status.publication;
-      // a stalled disclose is a degraded watcher (DSR, #411 F1), whatever else the pass did; fixed
-      // wording, counts only. The heartbeat alerts on healthy: false.
-      const stalls = stallReasons(status.publication);
-      if (stalls.length) {
-        status.degraded = [...(status.degraded ?? []), ...stalls];
-        status.healthy = false;
-      }
-      // the whole iteration (scan and publication) against the interval: a slow one is degraded,
-      // and alerted by the next pass (tickMs covers the scan alone)
-      status.iterationMs = Date.now() - iterStart;
-      const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
-      slowNote =
-        status.iterationMs > limit
-          ? // fixed wording: the alert set's identity must not change with every duration (Codex W2c
-            // R9); the measured time is status.iterationMs
-            `iteration slower than ${Math.round(limit)} ms (maxTickFraction of the interval)`
-          : null;
-      if (slowNote) {
-        status.degraded = [...(status.degraded ?? []), slowNote];
-        status.healthy = false;
-      }
       store.writeStatus(status);
     }
     console.log(JSON.stringify(status));

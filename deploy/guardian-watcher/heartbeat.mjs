@@ -117,7 +117,9 @@ export async function check({
         sent = problem.key;
       }
     }
-  } else if (state.alerting) {
+  } else if (state.alerting && status?.healthy === true) {
+    // recovery needs a positive healthy: a fresh but unhealthy status below the unhealthy
+    // threshold is not "recovered" (#413 review N1); the alert stays open until it is
     const ok = await send(
       `[aoa-watcher] ${host}: RECOVERED (status fresh, lag within ${maxLag}, healthy)`
     );

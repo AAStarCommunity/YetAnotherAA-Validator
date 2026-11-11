@@ -472,7 +472,10 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
         );
         return;
       }
-      const { feeCapped, ...rest } = state.registry;
+      // the replacement supersedes the old tx's fee cap and broadcast error (#413 review F3); a
+      // failure of the new broadcast is journalled again by broadcastJournalled
+      const { feeCapped, lastBroadcastError, ...rest } = state.registry;
+      void lastBroadcastError;
       state.registry = {
         ...rest,
         raw: rep.raw,

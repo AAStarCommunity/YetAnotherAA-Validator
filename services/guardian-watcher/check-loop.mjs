@@ -1107,6 +1107,10 @@ const cfg = { aggregator: AGG };
     return Buffer.from(t.slice(i + 4, k), "latin1");
   };
   const srv = createServer(async (req, res) => {
+    // a token-leak probe on 127.0.0.1: it echoes the URL and Authorization on purpose (the cells
+    // check that nothing of it reaches our output). Never rendered as HTML (#413 review B2).
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("X-Content-Type-Options", "nosniff");
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks);
@@ -2139,6 +2143,181 @@ const good = {
           phase: pub?.registry?.phase,
           telegram: s.calls.telegram,
         }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+}
+
+// ---- #413 review (clestons): B1, F2, F3, N1
+{
+  const { publicationStep } = await import("./watcher.mjs");
+  const step = async run => {
+    const status = { healthy: true, degraded: undefined };
+    await publicationStep({
+      status,
+      run,
+      slowNote: null,
+      iterStart: 0,
+      cfg: { intervalMs: 60_000 },
+      now: () => 1,
+    });
+    return status;
+  };
+  // B1: a thrown pass, a pass that is not ok, and a pass without counts are all degraded
+  const thrown = await step(async () => {
+    throw new Error("alerts.json: Unexpected token");
+  });
+  const notOk = await step(async () => ({
+    ok: false,
+    stalls: { feeCapped: 0, insufficientFunds: 0 },
+  }));
+  const noCounts = await step(async () => ({ ok: true }));
+  const fine = await step(async () => ({
+    ok: true,
+    stalls: { feeCapped: 0, insufficientFunds: 0 },
+  }));
+  cell(
+    "B1: a publication pass that throws is degraded (healthy false, fixed wording, no foreign text) and its stalls are unknown",
+    thrown.healthy === false &&
+      thrown.degraded.includes("publication pass failed (see the alerts)") &&
+      thrown.degraded.includes("stall state unknown: no publication result") &&
+      !JSON.stringify(thrown.degraded).includes("Unexpected token"),
+    thrown
+  );
+  cell(
+    "B1: a pass that is not ok, or reports no stall counts, is degraded; an ok pass with counts is not",
+    notOk.healthy === false &&
+      notOk.degraded.includes("publication pass not ok (a stage failed, stopped or was skipped)") &&
+      noCounts.healthy === false &&
+      noCounts.degraded.includes("stall state unknown: no publication result") &&
+      fine.healthy === true &&
+      fine.degraded === undefined,
+    { notOk, noCounts, fine }
+  );
+  // B1 (the trigger): an unreadable alerts.json is reset and alerted; it no longer aborts every pass
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord({ ...owner, txHash: ethers.id("b1-alerts") });
+      const s = sinks();
+      const built = {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        wallet: writer,
+        registryFor: () => s.registry,
+      };
+      const roles = { owner: ethers.getAddress("0x" + "5a".repeat(20)), max: 3, slots: { 1: G1 } };
+      writeFileSync(join(d, "alerts.json"), "{corrupt");
+      const a = await publishPhase(store, roleChain(roles), cfg, P, built, { now: 5 });
+      const b = await publishPhase(store, roleChain(roles), cfg, P, built, { now: 6 });
+      cell(
+        "B1: a corrupt alerts.json does not abort the pass: reset, alerted, that pass not ok; the next pass is ok",
+        a.ok === false &&
+          a.ran >= 1 &&
+          b.ok === true &&
+          JSON.parse(readFileSync(join(d, "alerts.json"), "utf8")) !== null,
+        { a: [a.ok, a.ran, a.alerts], b: [b.ok, b.alerts] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // F2: an "unknown" entry (unreadable journal) does not hold the reverify generation open
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const sk = { pinners: [], mirror: null, telegram: null, registry: null };
+      writeFileSync(join(d, "publications", `${Store.recordId(bls)}.json`), "{corrupt");
+      const p = await publishPending(store, sk, { reverifyGen: 1 });
+      cell(
+        "F2: an unreadable journal is unknown AND failing, so reverifyRemaining does not count it",
+        p.stalls.unknown === true &&
+          p.reverifyRemaining === 0 &&
+          store.getSchedule().entries[Store.recordId(bls)]?.failing === true,
+        {
+          stalls: p.stalls,
+          remaining: p.reverifyRemaining,
+          entry: store.getSchedule().entries?.[Store.recordId(bls)],
+        }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // F3: a successful replacement clears the old tx's broadcast error (no false funding stall)
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const o = { mine: "pending", rejectBroadcast: true };
+      const s = sinks(o);
+      const sk = {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        registry: s.registry,
+      };
+      const p1 = await publishPending(store, sk, { maxPendingMs: 0 });
+      const firstRaw = store.getPublication(Store.recordId(bls)).registry.raw;
+      o.rejectBroadcast = false;
+      o.rejectRaw = raw => raw === firstRaw; // the old tx still refused, its replacement accepted
+      const p2 = await publishPending(store, sk, { maxPendingMs: 0 });
+      const reg = store.getPublication(Store.recordId(bls)).registry;
+      cell(
+        "F3: after a successful replacement the old broadcast error is gone: no false insufficient-funds stall",
+        p1.stalls.insufficientFunds === 1 &&
+          reg.raw !== firstRaw &&
+          (reg.replacements ?? 0) >= 1 &&
+          reg.lastBroadcastError === undefined &&
+          p2.stalls.insufficientFunds === 0,
+        {
+          p1: p1.stalls,
+          p2: p2.stalls,
+          reg: { raw: reg.raw, rep: reg.replacements, err: reg.lastBroadcastError },
+        }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // N1: after an alert, a fresh but unhealthy status (below the unhealthy threshold) is not RECOVERED
+  {
+    const { check: heartbeat } = await import("../../deploy/guardian-watcher/heartbeat.mjs");
+    const d = tmp();
+    try {
+      let st = {
+        alerting: "stale",
+        unhealthyRuns: 0,
+        lastAt: "x",
+        lastAtSeenSince: 0,
+        lastSentAt: 0,
+      };
+      const sent = [];
+      const tick = async (at, healthy) =>
+        heartbeat({
+          cfg: { dataDir: d, intervalMs: 60_000, heartbeat: { label: "t" } },
+          now: Date.parse(at),
+          readStatus: () =>
+            JSON.stringify({ at, healthy, degraded: healthy ? [] : ["x"], lagBlocks: 0 }),
+          statMtime: () => Date.parse(at),
+          send: async t => (sent.push(t), true),
+          readState: () => st,
+          writeState: x => ((st = x), true),
+        });
+      await tick("2026-11-11T00:00:00.000Z", false);
+      const afterUnhealthy = sent.some(t => /RECOVERED/.test(t));
+      await tick("2026-11-11T00:01:00.000Z", true);
+      cell(
+        "N1: no RECOVERED while the fresh status is unhealthy; RECOVERED once it is healthy",
+        !afterUnhealthy && sent.some(t => /RECOVERED/.test(t)),
+        sent
       );
     } finally {
       rmSync(d, { recursive: true, force: true });
