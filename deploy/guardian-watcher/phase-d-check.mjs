@@ -263,17 +263,40 @@ for (const f of placeholder(composeFile) ? [] : [composeFile]) {
 }
 const runningDvt = new Set();
 {
-  const r = spawnSync("docker", ["ps", "--format", "{{.Names}} {{.Image}}"], {
+  // A DVT node is recognised by what makes it one, not by an image name (Codex R4 #2): every running
+  // container whose environment HAS the node's required VALIDATOR_CONTRACT_ADDRESS key (only key
+  // names are read here, never values), plus any image named aastar-dvt in any registry or digest
+  // form. Discovery that fails is a failure.
+  const r = spawnSync("docker", ["ps", "--format", "{{.Names}}\t{{.Image}}"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });
-  // discovery that fails is a failure, never "no node running" (Codex R3 #2)
   if (r.status !== 0)
     add("node-discovery", "FAIL", "docker ps failed: the running DVT nodes are unknown");
-  if (r.status === 0)
+  else
     for (const l of r.stdout.split("\n")) {
-      const [n, img] = l.trim().split(/\s+/);
-      if (n && /^aastar-dvt(:|$)/.test(img ?? "")) runningDvt.add(n);
+      const [n, img] = l.trim().split("\t");
+      if (!n) continue;
+      if (/(^|\/)aastar-dvt(:|@|$)/.test(img ?? "")) {
+        runningDvt.add(n);
+        continue;
+      }
+      const e = spawnSync("docker", ["inspect", "--format", "{{json .Config.Env}}", n], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (e.status !== 0) {
+        add(`node-discovery:${n}`, "FAIL", "running container could not be inspected");
+        continue;
+      }
+      let keys = [];
+      try {
+        keys = JSON.parse(e.stdout).map(x => String(x).split("=")[0]);
+      } catch {
+        add(`node-discovery:${n}`, "FAIL", "running container's environment unreadable");
+        continue;
+      }
+      if (keys.includes("VALIDATOR_CONTRACT_ADDRESS")) runningDvt.add(n);
     }
 }
 const nodes = [

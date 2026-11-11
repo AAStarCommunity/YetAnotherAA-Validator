@@ -138,7 +138,12 @@ function validateTableInner(t, watched) {
   // provenance: which tree, which tool, how (Codex R1 #4); an empty inventory proves nothing
   if (!/^[0-9a-f]{40}$/.test(t.spCommit ?? ""))
     throw new TableError("table: spCommit must be a full 40-hex SHA");
-  for (const k of ["tool", "toolVersion", "command"])
+  // tool and toolVersion are printed, so they are labels only (no ':', '/', '?', '=': no URL or
+  // token can pass); command can be anything and is reported as its digest (Codex R4 #1)
+  for (const k of ["tool", "toolVersion"])
+    if (typeof t[k] !== "string" || !/^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,63}$/.test(t[k]))
+      throw new TableError(`table: ${k} must be a short label (letters, digits, space . _ + -)`);
+  for (const k of ["command"])
     if (typeof t[k] !== "string" || !t[k].trim())
       throw new TableError(`table: ${k} must be stated`);
   if (!t.rows.length) throw new TableError("table: no rows (an empty inventory proves nothing)");
