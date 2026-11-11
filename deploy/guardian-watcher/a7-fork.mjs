@@ -5,7 +5,7 @@
 //
 //   A7_FORK_URL=<archive RPC> node deploy/guardian-watcher/a7-fork.mjs \
 //     --dump <state.json> --dump-sha256 <hex> --readback <a7-readback.json> \
-//     --fund <test key address> [--anvil <path>] [--schema <file>] [--port 8546]
+//     --fund <test key address> [--abi-dir <dir>] [--anvil <path>] [--schema <file>] [--port 8546]
 //     [--record <out.json>] [--keep]
 //
 // Steps, each one fatal on failure:
@@ -21,10 +21,14 @@
 //      proven from upstream (SP's ethConfig + this script's own upstream header), never from the
 //      local engine's eth_config. Any mismatch, or any field without an independent reader, stops;
 //   5. the record notes the anvil build, both sha256s, the fork block and every comparison.
+// --abi-dir holds <contractKey>.json (a forge artifact or a bare ABI array) built from SP at
+// header.spCommit: a null ("absent") field is decided from it (the selector is not in the ABI), never
+// by calling, because a contract with a fallback answers any selector (DSR). Without it, every null
+// field is unverified. Each ABI file's sha256 is recorded.
 // The fork URL is read from the environment and never printed or recorded (only its host).
 import { spawn, execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ethers } from "ethers";
@@ -108,6 +112,27 @@ if (h.dumpSha256 !== dumpSha) die(1, "the read-back was taken from another dump 
 if (h.anvilCommit !== ANVIL_COMMIT)
   die(1, "the read-back was taken on another anvil commit than the pinned build");
 if (h.hardfork !== "amsterdam") die(1, `read-back hardfork is ${h.hardfork}, expected amsterdam`);
+
+// ABIs of SP's build at header.spCommit, for null ("absent") fields
+const abi = {};
+const abiFiles = {};
+if (opt("abi-dir")) {
+  for (const f of readdirSync(opt("abi-dir")).filter(x =>
+    /^[A-Za-z_][A-Za-z0-9_]*\.json$/.test(x)
+  )) {
+    const raw = readFileSync(join(opt("abi-dir"), f));
+    let frags;
+    try {
+      const j = JSON.parse(raw.toString("utf8"));
+      frags = new ethers.Interface(Array.isArray(j) ? j : j.abi);
+    } catch {
+      die(1, `ABI file ${f} is not an ABI or a forge artifact`);
+    }
+    const key = f.slice(0, -5);
+    abi[key] = new Set(frags.fragments.filter(x => x.type === "function").map(x => x.selector));
+    abiFiles[key] = sha256(raw);
+  }
+}
 
 // ---- 2. the pinned anvil on the fork, with the dump loaded
 let anvilVersion;
@@ -261,6 +286,7 @@ const { cmp, unverified } = await compare(rb, reader, {
   anvilCommit,
   dumpSha256: dumpSha,
   forkBlock: h.forkBlock,
+  abi,
 });
 
 const failed = cmp.filter(x => !x.ok);
@@ -270,6 +296,7 @@ const record = {
   anvilVersion,
   anvilCommit,
   readbackSchema: { ...SCHEMA_SOURCE, sha256: SCHEMA_SHA256 },
+  abiFiles,
   forkHost: (() => {
     try {
       return new URL(forkUrl).hostname;

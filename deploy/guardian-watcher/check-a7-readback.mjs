@@ -111,7 +111,22 @@ function fakeWorld(rb, tweak = {}) {
   };
   return reader;
 }
-const facts = rb => ({
+// SP's ABIs, consistent with the read-back: every non-null scalar key is a getter; a null one is not
+import { id as keccakId } from "ethers";
+const sel = n => keccakId(`${n}()`).slice(0, 10);
+const abiOf = rb =>
+  Object.fromEntries(
+    Object.entries(rb.contracts).map(([k, c]) => [
+      k,
+      new Set(
+        Object.entries(c)
+          .filter(([, v]) => v !== null)
+          .map(([n]) => sel(n))
+      ),
+    ])
+  );
+const facts = (rb, abi = abiOf(consistent)) => ({
+  abi,
   anvilVersion: rb.header.anvilVersion,
   anvilCommit: ANVIL_COMMIT,
   dumpSha256: rb.header.dumpSha256,
@@ -253,12 +268,31 @@ await mut(
   rb => (rb.contracts.superPaymaster.owner = "0x" + "9".repeat(40)),
   "contracts.superPaymaster.owner"
 );
-await mut(
-  "SP says version absent (null) but the fork answers: fails",
-  () => {},
-  "contracts.spAdminExtension.version",
-  () => ({ call: async (a, n) => (n === "version" ? "X-1.0" : undefined) })
-);
+// null = absent from SP's ABI, decided from the ABI, never by calling (DSR)
+{
+  const P = "contracts.spAdminExtension.version";
+  const fallback = { call: async (a, n) => (n === "version" ? "X-1.0" : undefined) };
+  const r1 = await compare(clone(), fakeWorld(consistent, fallback), facts(clone()));
+  cell(
+    "null version, a fallback contract answers version(), ABI has no version(): passes (not called)",
+    r1.cmp.some(x => x.path === P && x.ok) && !r1.unverified.some(u => u.startsWith(P)),
+    r1.cmp.filter(x => x.path === P)
+  );
+  const abi = abiOf(consistent);
+  abi.spAdminExtension = new Set([...abi.spAdminExtension, sel("version")]);
+  const r2 = await compare(clone(), fakeWorld(consistent), facts(clone(), abi));
+  cell(
+    "null version but version() IS in SP's ABI: fails",
+    failedPaths(r2).includes(P),
+    failedPaths(r2)
+  );
+  const r3 = await compare(clone(), fakeWorld(consistent), facts(clone(), {}));
+  cell(
+    "null version without SP's ABI: unverified (the run stops)",
+    r3.unverified.some(u => u.startsWith(P)) && !r3.cmp.some(x => x.path === P),
+    r3.unverified
+  );
+}
 await mut(
   "a scalar extra differs (OPERATOR_WITHDRAWAL_WINDOW): fails",
   rb => (rb.contracts.superPaymaster.OPERATOR_WITHDRAWAL_WINDOW = 3600),

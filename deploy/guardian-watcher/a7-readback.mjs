@@ -10,6 +10,7 @@
 //   - anything this script has no independent reader for is listed as UNVERIFIED, and an unverified
 //     field stops the rehearsal exactly like a mismatch (no drill on a state that was not proven).
 import Ajv2020 from "ajv/dist/2020.js";
+import { id as keccakId } from "ethers";
 
 export const SCHEMA_ID = "aoa-a7-readback/1";
 /** sha256 of SP's FROZEN schema file at 2228c0b6 (DSR-verified; any later change needs DSR
@@ -68,7 +69,7 @@ export function typeOf(v) {
  *   call(addr, name, type) -> value | undefined (undefined = no value: absent or reverted),
  *   upstreamHeader(n) -> {blockAccessListHash: bool, slotNumber: bool} | undefined,
  *   probe({sender, initcode, forkBlock}) -> {estimateFork, gasUsedFork, estimateLive} | undefined
- * }; facts: {anvilVersion, anvilCommit, dumpSha256, forkBlock}.
+ * }; facts: {anvilVersion, anvilCommit, dumpSha256, forkBlock, abi?: {contractKey: Set<selector>}}.
  * Returns {cmp: [{path, sp, fork, ok}], unverified: [path]}.
  */
 export async function compare(rb, reader, facts) {
@@ -84,6 +85,15 @@ export async function compare(rb, reader, facts) {
   // a valueState from SP: our read must also yield nothing (undefined, or the empty/zero form)
   const nothing = (path, sp, ours) =>
     cmp.push({ path, sp, fork: ours ?? null, ok: ours === undefined || ours === null });
+  // null = "absent" (DSR): the selector is not in the ABI of SP's build at header.spCommit. Decided
+  // from the ABI, never by calling: a contract with a fallback answers any selector. Without that
+  // contract's ABI (facts.abi[contractKey], a Set of 4-byte selectors) the field is unverified.
+  const absent = (path, contractKey, fn) => {
+    const abi = facts.abi?.[contractKey];
+    if (!abi) return unverified.push(`${path} (null: no ABI for ${contractKey})`);
+    const sel = keccakId(`${fn}()`).slice(0, 10);
+    cmp.push({ path, sp: null, fork: abi.has(sel) ? `${sel} in ABI` : null, ok: !abi.has(sel) });
+  };
   const h = rb.header;
 
   // ---- header
@@ -156,6 +166,10 @@ export async function compare(rb, reader, facts) {
       ["pendingOwner", "address"],
       ["guardian", "address"],
     ]) {
+      if (c[k] === null) {
+        absent(`${P}.${k}`, key, k);
+        continue;
+      }
       const ours = await reader.call(a, k, type);
       if (isState(c[k])) nothing(`${P}.${k}`, c[k], ours);
       else check(`${P}.${k}`, c[k], ours);
@@ -181,6 +195,10 @@ export async function compare(rb, reader, facts) {
       const t = isState(v) ? null : typeOf(v);
       if (!IDENT.test(k) || (!isState(v) && !t)) {
         unverified.push(`${P}.${k}`);
+        continue;
+      }
+      if (v === null) {
+        absent(`${P}.${k}`, key, k);
         continue;
       }
       if (isState(v)) {
@@ -218,6 +236,12 @@ export async function compare(rb, reader, facts) {
         break;
       }
       if (!done) unverified.push(P);
+      continue;
+    }
+    if (v === null) {
+      const m = k.match(/^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$/);
+      if (!m || !addrOf[m[1]]) unverified.push(P);
+      else absent(P, m[1], m[2]);
       continue;
     }
     const t = isState(v) ? "uint256" : typeOf(v);
