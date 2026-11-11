@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 const W = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "services", "guardian-watcher");
 const { Store, atomicWriteJson, readJson } = await import(join(W, "lib", "store.mjs"));
 const { nonceUseOf, nonceGaps } = await import(join(W, "lib", "publisher.mjs"));
-const { registryAt, sameRegistry } = await import(join(W, "lib", "publish.mjs"));
+const { registryAt, sameRegistry, stageSigner } = await import(join(W, "lib", "publish.mjs"));
 
 /** One plain local line, never an endpoint (a URL can carry a key). Pure. */
 export function badReason(reason) {
@@ -53,6 +53,10 @@ function journals(store) {
   return out;
 }
 
+const fillsPath = store => join(store.dir, "nonce-fills.json");
+const readFills = store => readJson(fillsPath(store), { fills: [] }).fills ?? [];
+const writeFills = (store, fills) => atomicWriteJson(fillsPath(store), { fills });
+
 /**
  * Whether nonce `n` may be filled, against every journal and the node: { basis, ids } or
  * { refuse }. `where` is the configured registry { address, chainId }.
@@ -71,34 +75,41 @@ export async function planFill(store, reg, where, n) {
   }
   const entries = {};
   const waits = [];
+  // every journalled tx of this writer at this nonce on this chain, active or archived (Codex W2d
+  // R8 #2): while a node still knows one, it is mined or evicted first, never replaced by a fill
+  const known = [];
   for (const { id, pub } of pubs) {
     const u = nonceUseOf(pub);
     entries[id] = u ? { nonceUse: u } : {};
+    for (const st of [pub.registry, ...(pub.registryHistory ?? [])]) {
+      if (!st || st.nonce !== n) continue;
+      const at = registryAt(st);
+      const signer = stageSigner(st);
+      if (!at || at.chainId !== where.chainId || !signer || signer.toLowerCase() !== writer)
+        continue;
+      for (const h of st.hashes ?? (st.hash ? [st.hash] : [])) known.push({ id, h });
+    }
     if (!u || u.from !== writer || u.chainId !== where.chainId || u.nonce !== n) continue;
-    if (!pub.registryWait && sameRegistry(registryAt(pub.registry), where))
+    // a stage on the current registry is the watcher's own to finish, whatever a wait marker says
+    // (a marker left from an earlier configuration is stale: Codex W2d R8 #1)
+    if (sameRegistry(registryAt(pub.registry), where))
       return { refuse: `nonce ${n} is held by ${id}'s stage on the current registry` };
-    waits.push({
-      id,
-      hashes: pub.registry.hashes ?? (pub.registry.hash ? [pub.registry.hash] : []),
-    });
+    waits.push(id);
   }
-  if (waits.length) {
-    for (const w of waits)
-      for (const h of w.hashes)
-        if (await reg.knows(h))
-          return {
-            refuse: `the old tx at nonce ${n} (${w.id}) is still known to the node: it is mined or evicted first`,
-          };
-    return { basis: "wait", ids: waits.map(w => w.id) };
-  }
+  for (const k of known)
+    if (await reg.knows(k.h))
+      return {
+        refuse: `a journalled tx at nonce ${n} (${k.id}) is still known to the node: it is mined or evicted first`,
+      };
+  // an earlier fill at this nonce that a node knows is not sent twice
+  for (const f of readFills(store))
+    if (f?.nonce === n && f.hash && (await reg.knows(f.hash)))
+      return { refuse: `a fill at nonce ${n} is already known to the node` };
+  if (waits.length) return { basis: "wait", ids: waits };
   if (nonceGaps(entries, writer, where.chainId, range).includes(n))
     return { basis: "gap", ids: [] };
   return { refuse: `nonce ${n} is neither waited for by a record nor a gap` };
 }
-
-const fillsPath = store => join(store.dir, "nonce-fills.json");
-const readFills = store => readJson(fillsPath(store), { fills: [] }).fills ?? [];
-const writeFills = (store, fills) => atomicWriteJson(fillsPath(store), { fills });
 
 /** Settle entries an interrupted run left pending: applied when a node knows the signed tx. */
 export async function reconcileFills(store, reg) {
@@ -147,10 +158,14 @@ export async function runFill(store, reg, where, n, reason, now = () => new Date
   try {
     await reg.broadcast(signed.raw);
   } catch {
-    entry.applied = false;
-    entry.error = "broadcast failed";
+    // the node may have accepted it and the answer been lost (Codex W2d R8 #3): the outcome is
+    // unknown, so the entry stays pending and the next run settles it from the node
+    entry.error = "broadcast answer lost or refused (outcome unknown)";
     writeFills(store, fills);
-    return { code: 3, msg: "broadcast failed; nothing was sent (run again to retry)" };
+    return {
+      code: 3,
+      msg: "the broadcast failed or its answer was lost; run the command again: it settles this entry from the node first",
+    };
   }
   entry.applied = true;
   writeFills(store, fills);

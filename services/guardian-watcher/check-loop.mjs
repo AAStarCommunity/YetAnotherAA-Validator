@@ -3370,6 +3370,65 @@ const good = {
       );
       for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
     }
+    // (g) Codex W2d R8: fill-nonce refuses a current-registry nonce even under a stale wait marker
+    // (#1), refuses while an ARCHIVED journalled tx at the nonce is known (#2), and a lost
+    // broadcast answer leaves the entry pending, settled from the node on the next run (#3)
+    {
+      // #1: waiting on B for A's nonce 5 (evicted), then A configured again before a pass
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "g" });
+      b.chain.nonce = 5;
+      await pass(x.store, b);
+      const marker = x.store.getPublication(id).registryWait?.nonce;
+      const stale = await planFill(x.store, b.registry, whereOf(OLD), 5);
+      // #2: W1's nonce-5 tx archived by a switch to W2, then back to W1 while it is still known
+      const y = await onA();
+      const w2 = sinks({ registryAddress: NEW, rawTag: "g2", writer: W2, mine: "pending" });
+      await pass(y.store, w2);
+      const c = sinks({ registryAddress: CC, rawTag: "g3" });
+      c.chain.nonce = 5;
+      c.chain.latestNonce = 5;
+      c.chain.pendingNonce = 6;
+      c.chain.known.add(y.old.hash);
+      const archivedKnown = await planFill(y.store, c.registry, whereOf(CC), 5);
+      c.chain.known.delete(y.old.hash); // evicted
+      const archivedGone = await planFill(y.store, c.registry, whereOf(CC), 5);
+      // #3: the node accepts the fill, the answer is lost
+      const lossy = {
+        ...c.registry,
+        async broadcast(raw) {
+          await c.registry.broadcast(raw);
+          throw new Error("socket hang up");
+        },
+      };
+      const r1 = await runFill(
+        y.store,
+        lossy,
+        whereOf(CC),
+        5,
+        "evicted after round trip",
+        () => "T1"
+      );
+      const f1 = JSON.parse(readFileSync(join(y.d, "nonce-fills.json"), "utf8")).fills;
+      const r2 = await runFill(y.store, c.registry, whereOf(CC), 5, "retry", () => "T2");
+      const f2 = JSON.parse(readFileSync(join(y.d, "nonce-fills.json"), "utf8")).fills;
+      cell(
+        "B2-A(g) R8: a stale wait marker does not open a current-registry nonce; a known archived tx at the nonce refuses a gap fill (accepted once evicted); a lost broadcast answer stays pending and is settled applied, never sent twice",
+        marker === 5 &&
+          /on the current registry/.test(stale.refuse ?? "") &&
+          /still known/.test(archivedKnown.refuse ?? "") &&
+          archivedGone.basis === "gap" &&
+          r1.code === 3 &&
+          f1.length === 1 &&
+          f1[0].applied === "pending" &&
+          r2.code === 1 &&
+          f2.length === 1 &&
+          f2[0].applied === true &&
+          JSON.stringify(c.calls.fills) === "[5]",
+        { marker, stale, archivedKnown, archivedGone, r1, f1, r2, f2, fills: c.calls.fills }
+      );
+      for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
+    }
     // (f) another writer (the M0 §5.5a recovery) or another chain has its own nonce space: no wait;
     // a stage already waiting is archived at once when the chain changes (Codex W2d R7 #1)
     {
