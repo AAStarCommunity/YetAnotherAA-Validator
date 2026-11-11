@@ -83,6 +83,23 @@ evidenceHash = keccak256(abi.encode(TAG_EVIDENCE, category, keccak256(body)))
 TAG_EVIDENCE = keccak256("SuperPaymaster.DVT.Evidence.v2")
 ```
 
+Vectors: `contracts/test/fixtures/evidence-vectors.json`, generated from
+`scripts/disclosure/recheck-lib.mjs` (`npm run check:disclosure` diffs it) and
+recomputed in Solidity by `contracts/test/EvidenceHashParity.t.sol`; SP's
+DVTValidator is checked against the same file. `abi.encode`, never
+`encodePacked`: for `evidenceHash` the two coincide (three static `bytes32`
+words), but for `evidence` they differ, since `bytes` is dynamic and
+`abi.encode` adds its offset and length.
+
+The DVT node does not yet build proposals this way (it files
+`evidenceHash = proofHash`, and over-issue uses its own tag). That is closed in
+5.5.0 (`categoryCount() == 0`, and node slash submission is disabled), and is
+moved to §3.1 before the first category is deployed (DSR 918b553d): each
+category's body is a versioned ABI struct; the audit-slash body carries the
+proof identity's ABI fields and `bytes32 proofHash` (still the off-chain archive
+address, no longer the evidenceHash); over-issue becomes
+`DVT.Evidence.OverIssue.v1`.
+
 `evidenceHash` is the value DVTValidator passes into `verifyAndExecute`, so the
 aggregator's existing slash message (and hence the signer commitment) binds it.
 Chain, aggregator and Registry are already bound by the aggregator's
