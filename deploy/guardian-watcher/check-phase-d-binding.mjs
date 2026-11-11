@@ -11,6 +11,8 @@ import {
   bindingProblems,
   canonicalWrapper,
   liveProblems,
+  parseLstart,
+  staleProblems,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -267,6 +269,37 @@ cell(
     );
   }
   child.kill();
+}
+
+// R10: edited, forgot to restart
+{
+  const start = parseLstart("Wed Nov 11 14:54:38 2026");
+  const before = start - 60_000;
+  const parses =
+    start !== null &&
+    parseLstart("Wed Nov  4 09:01:02 2026") !== null &&
+    parseLstart("garbage") === null;
+  cell("lstart parses (padded day too) and rejects garbage", parses ? [] : ["no"], true);
+  const f = (cfgM, srcM = before) =>
+    staleProblems({
+      startedAtMs: start,
+      files: [
+        { label: "watcherConfig", mtimeMs: cfgM },
+        { label: "wrapper", mtimeMs: before },
+        { label: "watcher source", mtimeMs: srcM },
+      ],
+    });
+  cell("files older than the process start pass", f(before), true);
+  cell(
+    "R10: config edited after start (no restart) fails",
+    f(start + 5_000),
+    false,
+    "watcherConfig"
+  );
+  cell("watcher code updated after start fails", f(before, start + 1), false, "watcher source");
+  cell("same-second edit is ambiguous: fails", f(start + 400), false, "restart it");
+  cell("an unstat-able file fails", f(null), false, "watcherConfig");
+  cell("no start time fails", staleProblems({ startedAtMs: null, files: [] }), false, "start time");
 }
 
 let failed = 0;

@@ -11,12 +11,18 @@
 // fixed category, never an exception's text. See phase-d.example.json; a "<...>" value is MISSING.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, existsSync, statSync, accessSync, constants } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync, accessSync, constants } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { parseLaunchd, bindingProblems, liveProblems } from "./phase-d-binding.mjs";
+import {
+  parseLaunchd,
+  bindingProblems,
+  liveProblems,
+  parseLstart,
+  staleProblems,
+} from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
@@ -297,6 +303,43 @@ for (const label of ld.mustBeOn ?? []) {
         wantConfig,
         rpcPrimary: secret("rpcPrimary"),
         rpcSecondary: secret("rpcSecondary"),
+      })
+    );
+    // what the process loaded is what Phase D checks (Codex R10): nothing changed since it started
+    const st = pid
+      ? spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+          encoding: "utf8",
+          env: { ...process.env, LC_ALL: "C" },
+          stdio: ["ignore", "pipe", "ignore"],
+        })
+      : null;
+    const mtime = f => {
+      try {
+        return statSync(f).mtimeMs;
+      } catch {
+        return null;
+      }
+    };
+    const watcherFiles = [];
+    const walk = (d, label) => {
+      try {
+        for (const e of readdirSync(d, { withFileTypes: true }))
+          if (e.isDirectory()) walk(join(d, e.name), label);
+          else if (/\.(mjs|json)$/.test(e.name) && !/^check-/.test(e.name))
+            watcherFiles.push({ label, mtimeMs: mtime(join(d, e.name)) });
+      } catch {
+        watcherFiles.push({ label, mtimeMs: null });
+      }
+    };
+    walk(W, "watcher source");
+    problems.push(
+      ...staleProblems({
+        startedAtMs: st?.status === 0 ? parseLstart(st.stdout) : null,
+        files: [
+          { label: "watcherConfig", mtimeMs: wantConfig ? mtime(wantConfig) : null },
+          { label: "wrapper", mtimeMs: mtime(wrapper) },
+          ...watcherFiles,
+        ],
       })
     );
     add(

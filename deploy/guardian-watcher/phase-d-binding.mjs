@@ -152,3 +152,32 @@ export function bindingProblems({
     );
   return problems;
 }
+
+/** `ps -o lstart=` (LC_ALL=C), local time, whole seconds -> epoch ms, or null. */
+export function parseLstart(s) {
+  const t = String(s ?? "").trim();
+  if (!/^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(t)) return null;
+  const ms = new Date(t.replace(/ +/g, " ")).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * The running watcher loaded what Phase D checks (Codex R10): it reads its config and code once at
+ * start, so a config, wrapper or watcher source changed after the process started (an honest
+ * "edited, forgot to restart") means Phase D validated files the process is not running. Any such
+ * file whose mtime is not strictly before the start second fails (same-second is ambiguous: fail).
+ * files: [{label, mtimeMs | null}]; a file that cannot be stat'ed fails.
+ */
+export function staleProblems({ startedAtMs, files }) {
+  if (startedAtMs === null || startedAtMs === undefined)
+    return ["the watcher process start time cannot be read"];
+  const startSec = Math.floor(startedAtMs / 1000);
+  const late = files
+    .filter(
+      f => f.mtimeMs === null || f.mtimeMs === undefined || Math.floor(f.mtimeMs / 1000) >= startSec
+    )
+    .map(f => f.label);
+  return late.length
+    ? [`changed after the watcher started (restart it): ${[...new Set(late)].join(", ")}`]
+    : [];
+}
