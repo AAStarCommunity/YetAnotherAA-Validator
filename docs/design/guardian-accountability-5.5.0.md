@@ -683,6 +683,22 @@ detection time, pause tx time.
   lag, RPC failure, low balance, stale heartbeat.
 - Sender: a new low-balance EOA, JSON keystore, password in the macOS Keychain.
   Never in `.env` or plaintext; not a guardian, owner or deployer key.
+- **Phase D pre-deploy check — trust boundary (DSR, #407).**
+  `npm run check:phase-d` defends against two things only: an **honest
+  operator's mistake** (a wrong config, a wrapper not reinstalled, a config
+  edited or a checkout pulled without restarting the watcher, the committee
+  keeper left on, a node without explicit `AUDIT_*=false`) and **secret
+  disclosure** (no URL, token or key is printed). It checks the running watcher
+  process itself: its command line, its RPC environment against the Keychain,
+  and that it started after every file it loaded. It does **not** defend against
+  the Mini's operator: whoever controls the Mini's user account and launchd can
+  spoof a process title, ship a fake `node`, forge environment entries or
+  backdate mtimes. The Mini operator is a trust root of the deployment, on the
+  same level as the RPC trust assumption (§5.2b), not something Phase D
+  verifies. Also accepted: SP's table generator, the operator's own declarations
+  (RPC operators, the notDvt container list), the checkout Phase D runs from,
+  and `node_modules` beyond the lockfile's mtime. The paper states the same in
+  its limitations (DSR owns that wording).
 
 ## 6. Random committee (D7: prepared, not enabled)
 
