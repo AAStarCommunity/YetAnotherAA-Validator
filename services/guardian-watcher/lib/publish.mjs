@@ -328,9 +328,26 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           ? old.raws
           : hashes.map((_, i) => (i === hashes.length - 1 ? old.raw : null));
       // the old txs are kept as FEE-FLOOR candidates only (R5): never broadcast again, and their
-      // receipts are never taken as the new registry's completion
+      // receipts are never taken as the new registry's completion. A stage that itself came from a
+      // migration carries its inherited floor candidates on (Codex W2d R6: A -> B -> C keeps A's)
+      const inherited =
+        old.floorHashes?.length &&
+        String(old.floorFrom ?? "").toLowerCase() === String(oldFrom ?? "").toLowerCase()
+          ? { hashes: old.floorHashes, raws: old.floorRaws ?? old.floorHashes.map(() => null) }
+          : { hashes: [], raws: [] };
       if (oldFrom && me && oldFrom.toLowerCase() === me.toLowerCase() && hashes.length)
-        replace = { nonce: old.nonce, from: oldFrom, hashes, raws };
+        replace = {
+          nonce: old.nonce,
+          from: oldFrom,
+          hashes: [...inherited.hashes, ...hashes],
+          raws: [...inherited.raws, ...raws],
+        };
+    }
+    // a stage with no tx yet (unsigned, e.g. fee-capped) after an earlier migration: that
+    // migration's outstanding replacement instruction carries over (Codex W2d R6); it is
+    // re-validated on every attempt (signer, nonce) as always
+    if (!replace && state.registryMigrated?.replace && from?.chainId === where.chainId) {
+      replace = state.registryMigrated.replace;
     }
     state.registryHistory = [
       ...(state.registryHistory ?? []),

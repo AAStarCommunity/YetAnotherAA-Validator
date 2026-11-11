@@ -3192,6 +3192,70 @@ const good = {
     );
     for (const x of [k, e, w, c, t]) rmSync(x.d, { recursive: true, force: true });
   }
+  // (k) Codex W2d R6: two switches in a row (A -> B -> C) keep the recovery for A's pending nonce:
+  // B in flight (its broadcasts lost) carries A's floor; B unsigned (fee-capped) carries A's
+  // pending replacement instruction
+  {
+    const CC = "0x" + "cc".repeat(20);
+    const base = async () => {
+      const d = tmp();
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, mine: "pending" });
+      a.chain.nonce = 5;
+      await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      return { d, store, oldA: store.getPublication(Store.recordId(bls)).registry };
+    };
+    // B in flight, its broadcasts lost; then C
+    const x = await base();
+    const b = sinks({
+      registryAddress: NEW,
+      rawTag: "b",
+      mine: "pending",
+      rejectRaw: r => String(r).startsWith("0xrawb"),
+    });
+    b.chain.nonce = 5;
+    b.chain.known.add(x.oldA.hash);
+    await publishPending(x.store, skOf(b), { maxPendingMs: 60 * 60_000 });
+    const c = sinks({ registryAddress: CC, rawTag: "c", mine: "pending" });
+    c.chain.nonce = 5;
+    c.chain.known.add(x.oldA.hash); // A still pending; B never reached the pool
+    await publishPending(x.store, skOf(c), { maxPendingMs: 60 * 60_000 });
+    const inflight = c.calls.lastSignOpts;
+    // B unsigned (fee-capped) with A's instruction pending; then C
+    const y = await base();
+    {
+      const id = Store.recordId(bls);
+      const jy = y.store.getPublication(id);
+      y.store.putPublication(id, {
+        ...jy,
+        registryHistory: [jy.registry],
+        registry: { phase: "unsigned", feeCapped: "t", at: { address: NEW, chainId: "11155111" } },
+        registryMigrated: {
+          from: y.oldA.at,
+          to: { address: NEW, chainId: "11155111" },
+          at: "t",
+          replace: { nonce: 5, from: y.oldA.from, hashes: [y.oldA.hash], raws: [y.oldA.raw] },
+        },
+      });
+    }
+    const c2 = sinks({ registryAddress: CC, rawTag: "c", mine: "pending" });
+    c2.chain.nonce = 5;
+    c2.chain.known.add(y.oldA.hash);
+    await publishPending(y.store, skOf(c2), { maxPendingMs: 60 * 60_000 });
+    const capped = c2.calls.lastSignOpts;
+    cell(
+      "W2d(k) R6: A -> B -> C keeps A's pending nonce recoverable: in-flight B carries A's floor, unsigned B carries A's instruction",
+      inflight?.replace === true &&
+        inflight.nonce === 5 &&
+        inflight.prevRaw === x.oldA.raw &&
+        capped?.replace === true &&
+        capped.nonce === 5 &&
+        capped.prevRaw === y.oldA.raw,
+      { inflight, capped }
+    );
+    for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
+  }
   // (c) the same address on another chain is another registry
   {
     const d = tmp();
