@@ -47,8 +47,9 @@ const results = [];
 // every line of the report passes through here: a URL-like fragment (an honest mistake such as an
 // RPC URL pasted into an operator label) is replaced, never printed (Codex, #408 review of M0 §5.5)
 const URLISH = /[a-z][a-z0-9+.-]*:\/\/\S*/gi;
-const add = (id, status, detail) =>
-  results.push({ id, status, detail: String(detail ?? "").replace(URLISH, "(a URL: not shown)") });
+// both channels: the id interpolates config values too (launchd labels, container names), #408 N1
+const scrub = v => String(v ?? "").replace(URLISH, "(a URL: not shown)");
+const add = (id, status, detail) => results.push({ id: scrub(id), status, detail: scrub(detail) });
 const placeholder = v =>
   v === undefined || v === null || v === "" || (typeof v === "string" && /^<.*>$/.test(v));
 const expand = p => (typeof p === "string" && p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
