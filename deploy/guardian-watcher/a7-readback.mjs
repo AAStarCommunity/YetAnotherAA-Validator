@@ -382,14 +382,21 @@ export async function compare(rb, reader, facts) {
     const iface = facts.abi?.[key] ?? null;
     // the address comes from the manifest address book, never from the file (x-readMethods)
     const book = facts.addressBook?.[key];
-    const notDeployed = typeof c.address === "string" && c.address.startsWith("n/a:not deployed");
+    const NOT_DEPLOYED = "n/a:not deployed";
+    const notDeployed = c.address === NOT_DEPLOYED;
     if (!facts.addressBook) unverified.push(`${P}.address (no address book)`);
     else if (book === undefined && notDeployed) {
       // the manifest's address book declares no such contract, and SP says it is not deployed:
-      // every other field must say so too (schema v10, the timelock when there is none)
-      const allNa = Object.entries(c).every(
-        ([k, v]) => k === "address" || (typeof v === "string" && v.startsWith("n/a:not deployed"))
-      );
+      // every common field AND every field the pinned example lists must be present and EXACTLY
+      // "n/a:not deployed" (schema v10; Codex A7 R15), nothing else may be written
+      const need = new Set([
+        ...COMMON,
+        ...(REQUIRED_FIELDS[key] ?? []),
+        ...(facts.fieldInventory?.[key] ?? []),
+      ]);
+      const allNa =
+        [...need].every(k => own(c, k) && c[k] === NOT_DEPLOYED) &&
+        Object.keys(c).every(k => need.has(k) || k === "rolesSource");
       check(`${P}.address`, c.address, "(not in the address book)", allNa);
       continue;
     } else if (book === undefined) unverified.push(`${P}.address (not in the address book)`);

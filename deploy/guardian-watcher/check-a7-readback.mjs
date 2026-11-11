@@ -601,7 +601,7 @@ await unv(
   const notDeployed = () =>
     Object.fromEntries(
       Object.keys(base.contracts.timelockController)
-        .filter(k => k !== "minDelay" && k !== "rolesSource")
+        .filter(k => k !== "rolesSource")
         .map(k => [k, "n/a:not deployed"])
     );
   const book = (() => {
@@ -624,6 +624,24 @@ await unv(
   const rb2 = clone();
   rb2.contracts.timelockController = { ...notDeployed(), owner: "n/a:no owner" };
   const half = await run(rb2, undefined, { addressBook: book });
+  for (const [name, f] of [
+    ["minDelay left out", c => delete c.minDelay],
+    [
+      "a value that only starts with the marker",
+      c => (c.minDelay = "n/a:not deployed BUT ACTUALLY DEPLOYED"),
+    ],
+    ["an extra field", c => (c.extra = "n/a:not deployed")],
+  ]) {
+    const rb3 = clone();
+    rb3.contracts.timelockController = notDeployed();
+    f(rb3.contracts.timelockController);
+    const r3 = await run(rb3, undefined, { addressBook: book });
+    cell(
+      `R15: 'not deployed' with ${name} fails`,
+      failed(r3).includes("contracts.timelockController.address"),
+      failed(r3)
+    );
+  }
   cell(
     "v10: 'not deployed' with any field saying otherwise fails",
     failed(half).includes("contracts.timelockController.address"),
