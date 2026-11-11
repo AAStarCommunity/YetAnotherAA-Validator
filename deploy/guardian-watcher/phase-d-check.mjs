@@ -23,6 +23,7 @@ import {
   parseLstart,
   staleProblems,
   importClosure,
+  publishBindingProblems,
 } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -112,19 +113,12 @@ else {
       try {
         const { publishConfig } = await import(join(W, "lib/sinks-config.mjs"));
         const pc = wcfg.publish?.enabled === true ? publishConfig(wcfg.publish) : null;
-        const ks = cfg.sender?.keystore;
-        const problems = [];
-        if (!pc) problems.push("publication is not enabled in the watcher config");
-        else {
-          if (placeholder(ks) || resolve(expand(pc.registry.keystore)) !== resolve(expand(ks)))
-            problems.push("the watcher's registry.keystore is not sender.keystore");
-          if (pc.registry.service !== cfg.keychain?.services?.keystorePassword)
-            problems.push(
-              "the watcher's keystore password item is not keychain.services.keystorePassword"
-            );
-          if (pc.keychainAccount !== cfg.keychain?.account)
-            problems.push("the watcher's keychainAccount is not keychain.account");
-        }
+        const problems = publishBindingProblems({
+          wcfg,
+          pc,
+          cfg,
+          samePath: (a, b) => !placeholder(b) && resolve(expand(a)) === resolve(expand(b)),
+        });
         add(
           "watcher-publish",
           problems.length ? "FAIL" : "PASS",

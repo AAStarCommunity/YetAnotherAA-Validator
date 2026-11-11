@@ -1,5 +1,6 @@
 {
   "comment": "Guardian watcher config. Copy to ~/.aoa-watcher/config.json on the Mini and fill the <...> values (public data only). No secret goes here: the RPC URLs come from the Keychain through run-watcher.sh, the sink tokens and the keystore password from the Keychain through lib/sinks-config.mjs.",
+  "chainId": 11155111,
   "aggregator": "<BLSAggregator address from the step-13 manifest (= phase-d.json contracts.aggregator)>",
   "roles": {
     "superPaymaster": "<SuperPaymaster proxy address from the step-13 manifest>"
@@ -14,6 +15,7 @@
   "intervalMs": 60000,
   "maxLagBlocks": 300,
   "requireSecondProvider": true,
+  "secondProvider": "<the second RPC's provider name, e.g. tenderly (a label, never a URL)>",
   "publish": {
     "enabled": true,
     "keychainAccount": "aoa-watcher",

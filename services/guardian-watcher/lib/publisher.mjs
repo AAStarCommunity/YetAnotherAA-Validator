@@ -2,6 +2,7 @@
 // sinks, resuming its durable journal (store/publications/<id>.json). publishRecord does the
 // per-record work and is crash-safe stage by stage; this module only decides what to run, reads
 // the writer's roles from chain, builds the sinks and delivers the run's alerts.
+import { mayPublish } from "./confirm.mjs";
 import { ethers } from "ethers";
 import { Store, atomicWriteJson } from "./store.mjs";
 import {
@@ -184,6 +185,7 @@ export async function publishPending(
     parked: 0,
     deferred: 0,
     unreadable: 0,
+    held: 0,
     feeCapped: 0, // a disclose tx whose replacement needs a fee above maxFeePerGas (#411 F1)
     insufficientFunds: 0, // a disclose tx the writer cannot pay for (#411 F1)
   };
@@ -287,6 +289,20 @@ export async function publishPending(
       } catch {
         cid = null; // publishRecord fails on it, and says so
       }
+      // D-RPC2: every sink operation, including resuming an unfinished publication, needs the
+      // second provider's confirmation of THIS content (lib/confirm.mjs; Codex D-RPC2 R3): held
+      // records are counted, never dropped. The one exception is a record already in a
+      // changed-bytes INCIDENT (a recorded bytesChanged, or a CID other than the journal's):
+      // publishRecord only reports it and returns before any sink, so the signal is kept and
+      // nothing is sent.
+      const incident = !!prev?.bytesChanged || (!!prev?.cid && !!cid && prev.cid !== cid);
+      if (!incident && !mayPublish(store, rec)) {
+        counts.held++;
+        // marked held: alerted and degraded through D-RPC2's own reasons, it does not hold a
+        // reverify generation open for the rest of the store (Codex D-RPC2 R6); no sink runs
+        entries[id] = { ...(entries[id] ?? {}), held: true };
+        continue;
+      }
     } catch {
       bad.push(name);
       unknownFile(name);
@@ -294,7 +310,10 @@ export async function publishPending(
     }
     // Registered before any limit applies, so a deferred or newly found record still counts
     // toward the reverify generation (Codex W2c R3).
-    const e = (entries[id] = { ...(entries[id] ?? {}) });
+    // past the hold: a confirmed record is no longer held
+    const { held: _h, ...unheld } = entries[id] ?? {};
+    void _h;
+    const e = (entries[id] = unheld);
     const reverify = reverifyGen !== null && e.reverifiedGen !== reverifyGen;
     // an acknowledged incident parks the registry stage only for the registry it happened on (W2d)
     const isParked = parked(prev) && (!where || sameRegistry(registryAt(prev.registry), where));
@@ -430,7 +449,8 @@ export async function publishPending(
     reverifyGen === null
       ? 0
       : // a record that keeps failing is alerted on its own; it does not hold the generation open
-        Object.values(entries).filter(x => !x.failing && x.reverifiedGen !== reverifyGen).length;
+        Object.values(entries).filter(x => !x.failing && !x.held && x.reverifiedGen !== reverifyGen)
+          .length;
   if (!saveSchedule(store, next)) {
     counts.failed++;
     alerts.push("publication schedule not saved; rotation kept in memory, retried next pass");

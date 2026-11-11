@@ -14,6 +14,7 @@ import {
   parseLstart,
   staleProblems,
   importClosure,
+  publishBindingProblems,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -355,6 +356,79 @@ cell(
     miss.some(x => x.path === "/gone.mjs" && x.missing) ? [] : [miss],
     true
   );
+}
+
+// ---- watcher-publish (Codex W2c R11) and its chainId (#413 review follow-up)
+{
+  const cfg = {
+    chainId: 11155111,
+    sender: { keystore: "/Users/op/.aoa-watcher/sender.keystore.json" },
+    keychain: {
+      account: "aoa-watcher",
+      services: { keystorePassword: "aoa-dvt-watcher-keystore-pw" },
+    },
+  };
+  const pc = {
+    keychainAccount: "aoa-watcher",
+    registry: {
+      keystore: "/Users/op/.aoa-watcher/sender.keystore.json",
+      service: "aoa-dvt-watcher-keystore-pw",
+    },
+  };
+  const samePath = (a, b) => a === b;
+  const run = (wcfg, p = pc, c = cfg) => publishBindingProblems({ wcfg, pc: p, cfg: c, samePath });
+  const bound = run({ chainId: 11155111 });
+  const noChain = run({});
+  const otherChain = run({ chainId: 10 });
+  const off = run({ chainId: 11155111 }, null);
+  const otherKs = run(
+    { chainId: 11155111 },
+    { ...pc, registry: { ...pc.registry, keystore: "/tmp/x.json" } }
+  );
+  const otherPw = run(
+    { chainId: 11155111 },
+    { ...pc, registry: { ...pc.registry, service: "other-item" } }
+  );
+  const otherAcct = run({ chainId: 11155111 }, { ...pc, keychainAccount: "someone-else" });
+  // the caller's predicate decides path equality: a placeholder sender.keystore never matches,
+  // and an equal path written differently does (as phase-d-check passes it)
+  const phSame = (a, b) =>
+    !/^<.*>$/.test(String(b)) && a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+  const placeholderKs = publishBindingProblems({
+    wcfg: { chainId: 11155111 },
+    pc: { ...pc, registry: { ...pc.registry, keystore: "<sender keystore>" } },
+    cfg: { ...cfg, sender: { keystore: "<sender keystore>" } },
+    samePath: phSame,
+  });
+  const ltPath = publishBindingProblems({
+    wcfg: { chainId: 11155111 },
+    pc: { ...pc, registry: { ...pc.registry, keystore: "<sender>.json" } },
+    cfg: { ...cfg, sender: { keystore: "<sender>.json" } },
+    samePath: phSame,
+  });
+  results.push({
+    name: "watcher-publish: bound passes; no or another chainId, publication off, another keystore, password item or account, or a placeholder keystore each fail with fixed wording; a path starting with < is not a placeholder",
+    ok:
+      bound.length === 0 &&
+      noChain.join() === "the watcher config has no chainId" &&
+      otherChain.join() === "the watcher's chainId is not phase-d.json chainId" &&
+      off.join() === "publication is not enabled in the watcher config" &&
+      otherKs.join() === "the watcher's registry.keystore is not sender.keystore" &&
+      otherPw.join() ===
+        "the watcher's keystore password item is not keychain.services.keystorePassword" &&
+      otherAcct.join() === "the watcher's keychainAccount is not keychain.account" &&
+      placeholderKs.join() === "the watcher's registry.keystore is not sender.keystore" &&
+      ltPath.length === 0,
+    got: { bound, noChain, otherChain, off, otherKs, otherPw, otherAcct, placeholderKs, ltPath },
+  });
+  // the example configs agree: copying them as the runbook says passes this binding's chain check
+  const ex = JSON.parse(readFileSync(join(here, "config.example.json"), "utf8"));
+  const pd = JSON.parse(readFileSync(join(here, "phase-d.example.json"), "utf8"));
+  results.push({
+    name: "config.example.json has a chainId and it is phase-d.example.json's (a copied config starts publishing)",
+    ok: Number.isSafeInteger(ex.chainId) && ex.chainId === pd.chainId,
+    got: { ex: ex.chainId, pd: pd.chainId },
+  });
 }
 
 let failed = 0;

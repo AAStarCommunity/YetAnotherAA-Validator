@@ -15,7 +15,26 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { Store } from "./lib/store.mjs";
+import { Store as BaseStore, atomicWriteJson } from "./lib/store.mjs";
+import { viewDigest } from "./lib/confirm.mjs";
+// These cells test publication itself, not D-RPC2 (check-drpc2.mjs does): every record stored here
+// is also marked confirmed by the second provider, as a confirmed hold, so publishPending's D-RPC2
+// gate (lib/confirm.mjs mayPublish) lets it through.
+class Store extends BaseStore {
+  putRecord(rec) {
+    const r = super.putRecord(rec);
+    const id = BaseStore.recordId(rec);
+    mkdirSync(join(this.dir, "holds"), { recursive: true });
+    atomicWriteJson(join(this.dir, "holds", `${id}.json`), {
+      id,
+      state: "confirmed",
+      attempts: 1,
+      // the digest of the content as stored (the file), as confirmPending computes it
+      digest: viewDigest(JSON.parse(readFileSync(join(this.dir, "records", `${id}.json`), "utf8"))),
+    });
+    return r;
+  }
+}
 import {
   publishPending,
   publishPhase,
@@ -1806,7 +1825,7 @@ const good = {
         "R12#3: an unreadable schedule counts as unknown, never as zero stalls",
         u0.unknown === true &&
           stallReasons({ stalls: u0 })[0] ===
-            "stall state unknown: the stall index is unreadable" &&
+            "stall state unknown: records not all re-read yet, or a record or journal unreadable" &&
           seen[0].alerts.some(a =>
             /schedule unreadable; stall state unknown until a full sweep/.test(a)
           ),
@@ -2903,6 +2922,46 @@ const good = {
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
+  }
+}
+
+// ---- Codex D-RPC2 R6: a permanent hold does not keep the store's reverify generation open
+{
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    const a = { ...owner, txHash: ethers.id("r6-published") };
+    const b = { ...owner, txHash: ethers.id("r6-held") };
+    store.putRecord(a);
+    store.putRecord(b);
+    // b's confirmation never came: held for good (unconfirmed-final), never publishable
+    const bid = Store.recordId(b);
+    atomicWriteJson(join(d, "holds", `${bid}.json`), {
+      id: bid,
+      state: "unconfirmed-final",
+      attempts: 10,
+    });
+    const s = sinks();
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+    for (let i = 0; i < 3; i++) await publishPending(store, sk, {});
+    const f0 = s.calls.fetches ?? 0;
+    const r1 = await publishPending(store, sk, { reverifyGen: 1 });
+    const r2 = await publishPending(store, sk, { reverifyGen: 2 });
+    cell(
+      "R6: with one record held for good, a reverify generation still completes (remaining 0) and the next one re-checks the published record's pins again",
+      r1.counts.held === 1 &&
+        r1.reverifyRemaining === 0 &&
+        r2.reverifyRemaining === 0 &&
+        (s.calls.fetches ?? 0) > f0 &&
+        store.getPublication(bid) === null,
+      {
+        r1: [r1.counts.held, r1.reverifyRemaining],
+        r2: r2.reverifyRemaining,
+        fetches: [f0, s.calls.fetches],
+      }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
   }
 }
 

@@ -75,17 +75,19 @@ cp $REPO/deploy/guardian-watcher/config.example.json ~/.aoa-watcher/config.json
 sed -i '' "s|REPLACE_USER|$(id -un)|g" ~/.aoa-watcher/config.json
 ```
 
-Fill every `<...>` from the step-13 manifest (public data only): `aggregator`,
-`roles.superPaymaster`, `forwarders.dvtValidator` / `ownerSafe` /
-`multiSendCallOnly` (Phase D's `onchain:binding` compares
-`forwarders.dvtValidator` with `phase-d.json` `contracts.dvtValidator`),
-`startBlock` (the aggregator's deployment block), `publish.registry`
-(DisclosureRegistry address, its deployment block as `fromBlock`, the deployer,
-and `maxFeePerGas`: the absolute fee ceiling in wei as a decimal string; its
-`keystore` must be the same file as `phase-d.json` `sender.keystore`), the
-Pinata gateway, the Telegram chat id. Keep `publish.enabled: true`
-(`watcher-publish`). The git mirror needs a bare clone whose push key is in the
-ssh-agent:
+Check `chainId` (the example's is Sepolia, 11155111; it must equal
+`phase-d.json` `chainId`: the watcher refuses to publish without it, and
+`watcher-publish` compares the two). Fill every `<...>` from the step-13
+manifest (public data only): `aggregator`, `roles.superPaymaster`,
+`forwarders.dvtValidator` / `ownerSafe` / `multiSendCallOnly` (Phase D's
+`onchain:binding` compares `forwarders.dvtValidator` with `phase-d.json`
+`contracts.dvtValidator`), `startBlock` (the aggregator's deployment block),
+`publish.registry` (DisclosureRegistry address, its deployment block as
+`fromBlock`, the deployer, and `maxFeePerGas`: the absolute fee ceiling in wei
+as a decimal string; its `keystore` must be the same file as `phase-d.json`
+`sender.keystore`), the Pinata gateway, the Telegram chat id. Keep
+`publish.enabled: true` (`watcher-publish`). The git mirror needs a bare clone
+whose push key is in the ssh-agent:
 `git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git`.
 
 ## 5. The Phase D config
@@ -198,3 +200,30 @@ A MISSING line names what is not set or not reachable; a FAIL line names what is
 wrong. Fix it, restart the watcher if a watched file changed (step 7), and run
 step 10 again. The report never contains a Keychain value; a label that looks
 like a URL is replaced by `(a URL: not shown)`.
+
+## After acceptance: re-arming a held accusation (D-RPC2)
+
+An accusatory record is published only after a second, independent provider has
+reproduced it. If the second provider keeps reproducing something else
+(`CONFIRM_MAX_ATTEMPTS` mismatches), the record is held for good
+(`unconfirmed-final`) and the watcher stays degraded. An outage of the second
+provider never does this: unavailable answers are retried with a backoff (at
+most 1 h) for as long as it takes.
+
+Once the cause is understood and fixed (for example the second provider was
+misconfigured), re-arm the record so the second provider is asked again. The
+command refuses anything but `unconfirmed-final`, needs the watcher stopped, and
+writes the states before and after and your reason into the record's journal
+(`holdRearms`; an entry left `pending` by an interrupted run is settled by
+running the command again). It publishes nothing: the record stays held until
+confirmed.
+
+```sh
+launchctl bootout gui/$(id -u)/ai.aastar.aoa-watcher
+node $REPO/deploy/guardian-watcher/rearm-hold.mjs --config ~/.aoa-watcher/config.json \
+  --id <record id> --reason "<why, one plain line, no URL>"
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.aastar.aoa-watcher.plist
+```
+
+The record id is the file name (without `.json`) under `holds/` in the data
+directory; `status.json` counts the held records (`confirm.final`).

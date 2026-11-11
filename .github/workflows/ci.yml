@@ -195,6 +195,9 @@ jobs:
       - name: Check the Phase D report redaction
         run: npm run check:phase-d-redact
 
+      - name: D-RPC2 second-provider confirmation self-test
+        run: npm run check:drpc2
+
       # A7 rehearsal (M0 §9): SP's frozen aoa-a7-readback/1 schema and both examples (sha256-pinned)
       # validate; every comparison rule fails on its mutation; a live read-back is never a fork's.
       - name: Check the A7 read-back comparison
