@@ -503,6 +503,53 @@ async function scenario(build) {
       rmSync(d, { recursive: true, force: true });
     }
   }
+  // D-RPC2 Codex R3: "published: true" with unfinished delivery and no hold resumes nothing; a
+  // tampered published record raises INCIDENT without any sink
+  {
+    const { recordFile } = await import("./lib/record-file.mjs");
+    const sinkCalls = s =>
+      Object.values(s.calls.uploads).reduce((a, b) => a + b, 0) +
+      s.calls.telegram +
+      s.calls.mirror +
+      s.calls.sign;
+    const d = mkdtempSync(join(tmpdir(), "drpc2-pub-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const id = Store.recordId(bls);
+      const rec = JSON.parse(readFileSync(join(d, "records", `${id}.json`), "utf8"));
+      store.putPublication(id, { cid: recordFile(rec).cid, published: true, pins: {} });
+      const s = sinks();
+      const r = await publishPending(store, {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        registry: s.registry,
+      });
+      cell(
+        "R3: a 'published' journal with unfinished delivery and no confirmation resumes no sink",
+        r.counts.held === 1 && sinkCalls(s) === 0,
+        { counts: r.counts, calls: s.calls }
+      );
+      // tampered after publication: incident, still no sink
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(join(d, "records", `${id}.json`), JSON.stringify({ ...rec, tampered: true }));
+      const s2 = sinks();
+      const r2 = await publishPending(store, {
+        pinners: s2.pinners,
+        mirror: s2.mirror,
+        telegram: s2.telegram,
+        registry: s2.registry,
+      });
+      cell(
+        "R3: a published record whose bytes changed raises INCIDENT and calls no sink",
+        r2.alerts.some(x => /bytes changed.*INCIDENT/.test(x)) && sinkCalls(s2) === 0,
+        { alerts: r2.alerts, calls: s2.calls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
   // an unreadable hold file is not a confirmation
   const d = mkdtempSync(join(tmpdir(), "drpc2-pub-"));
   try {

@@ -145,14 +145,14 @@ export async function publishPending(
       } catch {
         cid = null; // publishRecord fails on it, and says so
       }
-      // D-RPC2: an accusatory record is first published only once the second provider confirmed
-      // THIS content (lib/confirm.mjs); held records stay unpublished and are counted, never
-      // dropped. One already published goes on to publishRecord even if its content no longer
-      // matches the confirmation: that is a tampered record, which publishRecord refuses to
-      // republish and reports as an INCIDENT on every pass, a signal the hold must not swallow.
-      // only a record that was actually PUBLISHED bypasses the hold (D-RPC2 Codex R2): a journal
-      // that merely recorded a CID (every pin and the mirror failed) authorizes nothing
-      if (prev?.published !== true && !mayPublish(store, rec)) {
+      // D-RPC2: every sink operation, including resuming an unfinished publication, needs the
+      // second provider's confirmation of THIS content (lib/confirm.mjs; Codex D-RPC2 R3): held
+      // records are counted, never dropped. The one exception is a record already in a
+      // changed-bytes INCIDENT (a recorded bytesChanged, or a CID other than the journal's):
+      // publishRecord only reports it and returns before any sink, so the signal is kept and
+      // nothing is sent.
+      const incident = !!prev?.bytesChanged || (!!prev?.cid && !!cid && prev.cid !== cid);
+      if (!incident && !mayPublish(store, rec)) {
         counts.held++;
         continue;
       }
