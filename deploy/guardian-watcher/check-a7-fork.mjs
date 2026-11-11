@@ -358,6 +358,15 @@ const okArgs = [
   const servers = [];
   const anvilLog = join(d, "anvil.log");
   const anvilPids = join(d, "anvil.pids");
+  const anvilRpc = join(d, "anvil.rpc");
+  const rpcCalls = () =>
+    fs.existsSync(anvilRpc)
+      ? fs
+          .readFileSync(anvilRpc, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map(l => JSON.parse(l))
+      : [];
   const readLog = () => (fs.existsSync(anvilLog) ? fs.readFileSync(anvilLog, "utf8") : "");
   const startedPids = () =>
     fs.existsSync(anvilPids)
@@ -422,7 +431,8 @@ const okArgs = [
         c.kill("SIGKILL");
         killAnvils();
       }, 90_000);
-      c.on("exit", status => {
+      // "close": after the child exited AND its stdout/stderr were drained (Codex M1 R2)
+      c.on("close", status => {
         clearTimeout(t);
         res({ status, err: err.trim(), out });
       });
@@ -475,6 +485,8 @@ if (process.env.FAKE_ANVIL_SERVE) {
     req.on("data", c => (b += c));
     req.on("end", () => {
       const all = [].concat(JSON.parse(b));
+      for (const m of all)
+        fs.appendFileSync(process.env.FAKE_ANVIL_RPCLOG, JSON.stringify([m.method, m.params ?? []]) + "\\n");
       const one = m => {
         const r =
           m.method === "eth_blockNumber"
@@ -545,7 +557,11 @@ if (process.env.FAKE_ANVIL_SERVE) {
     );
     const busy = await serve(() => "0x7a69");
     const url = p => `http://127.0.0.1:${p}/KEY`;
-    const fakeEnv = { FAKE_ANVIL_LOG: anvilLog, FAKE_ANVIL_PIDS: anvilPids };
+    const fakeEnv = {
+      FAKE_ANVIL_LOG: anvilLog,
+      FAKE_ANVIL_PIDS: anvilPids,
+      FAKE_ANVIL_RPCLOG: anvilRpc,
+    };
     const clearLog = () => fs.rmSync(anvilLog, { force: true });
     const p1 = await freePort();
 
@@ -626,6 +642,7 @@ if (process.env.FAKE_ANVIL_SERVE) {
         crashed.out === "",
       crashed
     );
+    const pidsBefore = startedPids().length;
     const full = await runAsync([...args(await freePort()), "--anvil", fakeAnvil], {
       A7_FORK_URL: url(sepoliaAt),
       FAKE_ANVIL_VERSION: goodVersion,
@@ -652,9 +669,18 @@ if (process.env.FAKE_ANVIL_SERVE) {
         (rec.failed.length > 0 || rec.unverified.length > 0) &&
         !full.out.includes("KEY") &&
         !full.out.includes("127.0.0.1") &&
-        startedPids().length >= 1 &&
-        leftover.length === 0,
-      { status: full.status, err: full.err, verdict: rec?.verdict, leftover }
+        startedPids().length === pidsBefore + 1 &&
+        rpcCalls().length > 0 &&
+        !rpcCalls().some(([m]) => m === "anvil_setBalance"),
+      leftover.length === 0,
+      {
+        status: full.status,
+        err: full.err,
+        verdict: rec?.verdict,
+        leftover,
+        newPids: startedPids().length - pidsBefore,
+        setBalance: rpcCalls().filter(([m]) => m === "anvil_setBalance"),
+      }
     );
   } finally {
     killAnvils();
