@@ -301,6 +301,7 @@ async function main() {
   const once = process.argv.includes("--once");
   let lastPub = store.readStatus()?.publication ?? null;
   let first = true;
+  let slowNote = null; // the last iteration was slower than maxTickFraction of the interval
   for (;;) {
     // The last publication result stays visible, marked in progress, until this pass replaces it.
     const carry = pub
@@ -312,8 +313,10 @@ async function main() {
     first = false;
     if (pub) {
       try {
+        // the previous iteration's slowness is only known after its publication: carried here
+        const degraded = [...(status.degraded ?? []), ...(slowNote ? [slowNote] : [])];
         status.publication = await publishPhase(store, chain, cfg, pub.p, pub.built, {
-          degraded: status.degraded,
+          degraded: degraded.length ? degraded : undefined,
         });
       } catch (e) {
         status.publication = { error: safeText("publication", e) };
@@ -323,11 +326,12 @@ async function main() {
       // and alerted by the next pass (tickMs covers the scan alone)
       status.iterationMs = Date.now() - iterStart;
       const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
-      if (status.iterationMs > limit) {
-        status.degraded = [
-          ...(status.degraded ?? []),
-          `iteration took ${status.iterationMs} ms, more than ${Math.round(limit)} ms (maxTickFraction of the interval)`,
-        ];
+      slowNote =
+        status.iterationMs > limit
+          ? `iteration took ${status.iterationMs} ms, more than ${Math.round(limit)} ms (maxTickFraction of the interval)`
+          : null;
+      if (slowNote) {
+        status.degraded = [...(status.degraded ?? []), slowNote];
         status.healthy = false;
       }
       store.writeStatus(status);

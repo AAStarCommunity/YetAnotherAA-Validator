@@ -10,12 +10,13 @@
 //   status.json missing, unreadable, or older than staleAfterMs (default 3 x intervalMs)
 //       -> "watcher not running or stuck", at once, repeated at most every realertMs (1 h)
 //   status.lagBlocks > maxLagBlocks                         -> "cursor N blocks behind", likewise
-//   status.healthy === false on unhealthyAfter (2) checks in a row -> the watcher's degraded reasons
+//   status.at unchanged across checks for longer than staleAfterMs, or in the future -> stale
+//   status.healthy === false on unhealthyAfter (2) checks in a row -> "degraded" with a reason COUNT
 //   back to healthy after an alert                          -> one RECOVERED message
 //   state that cannot be written                            -> an alert at once (it would mute the rules)
 // The bot token comes from the macOS Keychain (service aoa-dvt-alert-bot-token, account aoa-watcher,
-// DSR 0829236d); it is handed to curl through stdin, never on a command line. Degraded reasons are
-// the watcher's own wording (SafeError rule); nothing else from status.json is sent.
+// DSR 0829236d; or publish.telegram.service when set); it is handed to curl through stdin, never on
+// a command line. Nothing from status.json is sent but numbers: fixed wording only.
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, renameSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -52,17 +53,35 @@ export async function check({
   }
   const at = status && Date.parse(status.at);
   let age = null;
+  let mtime = null;
   try {
-    age = now - Math.max(Number.isFinite(at) ? at : 0, statMtime(join(cfg.dataDir, "status.json")));
+    mtime = statMtime(join(cfg.dataDir, "status.json"));
+    age = now - Math.max(Number.isFinite(at) ? at : 0, mtime);
   } catch {
     age = null;
   }
+  // a timestamp in the future (clock rollback, or a bad write) would otherwise read as fresh until
+  // it passes (Codex W2c R8 #2); and a status.at that does not change across checks is stale however
+  // fresh it claims to be
+  const future = Math.max(Number.isFinite(at) ? at : 0, mtime ?? 0) > now + 60_000;
+  const sameAt = status && state.lastAt === status.at;
+  const unchangedFor = sameAt && state.lastAtSeenSince ? now - state.lastAtSeenSince : 0;
   if (!status || age === null)
     problem = { key: "stale", text: "watcher not running or stuck: no readable status.json" };
+  else if (future)
+    problem = {
+      key: "stale",
+      text: "watcher status timestamp is in the future (clock or status.json wrong)",
+    };
   else if (age > staleAfter)
     problem = {
       key: "stale",
       text: `watcher not running or stuck: status.json is ${Math.round(age / 60_000)} min old`,
+    };
+  else if (unchangedFor > staleAfter)
+    problem = {
+      key: "stale",
+      text: `watcher not running or stuck: status unchanged for ${Math.round(unchangedFor / 60_000)} min`,
     };
   else if (Number.isSafeInteger(status.lagBlocks) && status.lagBlocks > maxLag)
     problem = {
@@ -71,20 +90,22 @@ export async function check({
     };
   const unhealthyRuns = status && status.healthy === false ? state.unhealthyRuns + 1 : 0;
   if (!problem && unhealthyRuns >= unhealthyAfter) {
-    const reasons = Array.isArray(status.degraded)
-      ? status.degraded
-          .filter(x => typeof x === "string")
-          .slice(0, 5)
-          .map(x => x.slice(0, 200))
-      : [];
+    // only a count leaves the Mini: status.degraded is the watcher's text, and truncation is not
+    // sanitization (Codex W2c R8 #1); the reasons are read on the Mini itself
+    const n = Array.isArray(status.degraded) ? status.degraded.length : 0;
     problem = {
       key: "unhealthy",
-      text: `watcher degraded for ${unhealthyRuns} checks: ${reasons.join("; ") || "no reason given"}`,
+      text: `watcher degraded for ${unhealthyRuns} checks (${n} reason${n === 1 ? "" : "s"} in status.json on the host)`,
     };
   }
 
   const host = hb.label ?? hostname();
-  const next = { ...state, unhealthyRuns };
+  const next = {
+    ...state,
+    unhealthyRuns,
+    lastAt: status?.at ?? null,
+    lastAtSeenSince: sameAt ? (state.lastAtSeenSince ?? now) : now,
+  };
   let sent = null;
   if (problem) {
     const changed = state.alerting !== problem.key;
@@ -117,7 +138,8 @@ export async function check({
 
 /** Telegram through curl, the token in curl's config on stdin (never in argv). */
 function telegramSend(cfg) {
-  const svc = cfg.heartbeat?.keychainService ?? "aoa-dvt-alert-bot-token";
+  const svc =
+    cfg.heartbeat?.keychainService ?? cfg.publish?.telegram?.service ?? "aoa-dvt-alert-bot-token";
   const acct = cfg.heartbeat?.keychainAccount ?? cfg.publish?.keychainAccount ?? "aoa-watcher";
   const chatId = cfg.heartbeat?.chatId ?? cfg.publish?.telegram?.chatId;
   return async text => {

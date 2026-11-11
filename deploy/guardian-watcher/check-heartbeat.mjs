@@ -99,10 +99,10 @@ const T = 10_000_000;
     { now: T + 60_000, status: bad(T + 60_000) },
   ]);
   cell(
-    "healthy:false alerts only after two checks in a row, with the watcher's own reasons",
+    "healthy:false alerts only after two checks in a row, with a reason count only",
     r.out[0].sent === null &&
       r.sent.length === 1 &&
-      /degraded for 2 checks: isolation budget reached/.test(r.sent[0]),
+      /degraded for 2 checks \(1 reason in status\.json on the host\)/.test(r.sent[0]),
     r
   );
 }
@@ -133,6 +133,40 @@ const T = 10_000_000;
     "only fixed wording is sent: nothing else from status.json",
     r.sent.length === 1 && !r.sent[0].includes("SECRETKEY"),
     r
+  );
+}
+
+{
+  // Codex W2c R8 #1: degraded reasons never leave the host, whatever they contain
+  const bad = at => ok(at, { healthy: false, degraded: ["rpc https://x/SECRET_TOKEN failed"] });
+  const r = await run([
+    { now: T, status: bad(T) },
+    { now: T + 60_000, status: bad(T + 60_000) },
+  ]);
+  cell(
+    "a secret inside status.degraded is never sent",
+    r.sent.length === 1 && !r.sent[0].includes("SECRET") && !r.sent[0].includes("https"),
+    r
+  );
+}
+{
+  // Codex W2c R8 #2: a future timestamp does not read as fresh
+  const r = await run([{ now: T, status: ok(T + 3_600_000), mtime: T - 600_000 }]);
+  cell(
+    "a status.at in the future alerts at once (clock rollback / bad write)",
+    r.sent.length === 1 && /in the future/.test(r.sent[0]),
+    r
+  );
+  // the same status.at seen across checks is stale even if the file keeps being touched
+  const s2 = await run([
+    { now: T, status: ok(T) },
+    { now: T + 120_000, status: ok(T), mtime: T + 120_000 },
+    { now: T + 240_000, status: ok(T), mtime: T + 240_000 },
+  ]);
+  cell(
+    "status.at unchanged for longer than staleAfter alerts even if mtime moves",
+    s2.sent.length === 1 && /status unchanged for 4 min/.test(s2.sent[0]),
+    s2
   );
 }
 
