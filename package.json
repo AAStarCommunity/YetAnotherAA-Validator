@@ -40,6 +40,7 @@
     "check:watcher": "node services/guardian-watcher/check-watcher.mjs",
     "check:sp-parity": "node scripts/disclosure/sp-evidence-parity.mjs",
     "check:a3-emissions": "node scripts/disclosure/a3-emission-diff.mjs",
+    "check:phase-d": "node deploy/guardian-watcher/phase-d-check.mjs",
     "e2e:committee": "node scripts/e2e/committee-e2e.mjs",
     "e2e:selftest": "node scripts/e2e/selftest.mjs",
     "check:pin-rate": "node scripts/check-pin-rate.mjs"

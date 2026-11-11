@@ -1,0 +1,75 @@
+{
+  "comment": "Phase D check config (copy to phase-d.json on the Mini and fill the <...> values). No secret goes in this file: RPC URLs and tokens live in the macOS Keychain, entered interactively by the author.",
+  "chainId": 11155111,
+  "watcherConfig": "<path to the watcher config.json>",
+  "keychain": [
+    {
+      "purpose": "pinata-token",
+      "service": "<keychain service for the Pinata token>"
+    },
+    {
+      "purpose": "filebase-token",
+      "service": "<keychain service for the Filebase token>"
+    },
+    {
+      "purpose": "sender-keystore-password",
+      "service": "<keychain service for the watcher keystore password>"
+    },
+    {
+      "purpose": "telegram-bot-token",
+      "service": "<keychain service for the alert bot token>"
+    },
+    {
+      "purpose": "rpc-primary-url",
+      "service": "<keychain service for the primary trace RPC URL>"
+    },
+    {
+      "purpose": "rpc-second-url",
+      "service": "<keychain service for the second-provider trace RPC URL>"
+    }
+  ],
+  "rpc": {
+    "primary": {
+      "keychainService": "<keychain service for the primary trace RPC URL>"
+    },
+    "second": {
+      "keychainService": "<keychain service for the second-provider trace RPC URL>"
+    }
+  },
+  "sender": {
+    "keystore": "<path to the watcher sender JSON keystore>",
+    "forbidden": ["<guardian address>", "<owner Safe>", "<deployer address>"],
+    "minBalanceWei": "50000000000000000"
+  },
+  "contracts": {
+    "dvtValidator": "<DVTValidator address from the rc.8 manifest>",
+    "aggregator": "<BLSAggregator address from the rc.8 manifest>",
+    "manifestSafe": "<the manifest's owner Safe>"
+  },
+  "launchd": {
+    "mustBeOff": [
+      "<committee keeper launchd label>",
+      "io.aastar.dvt-apply-rotation"
+    ],
+    "mustBeOn": ["<guardian watcher launchd label>"]
+  },
+  "dvtNodes": {
+    "containers": [
+      "<dvt node container 1>",
+      "<dvt node container 2>",
+      "<dvt node container 3>"
+    ]
+  },
+  "releaseEvidence": [
+    {
+      "name": "sp-evidence-parity",
+      "path": "<report of npm run check:sp-parity -- <rc.8 SHA>>",
+      "passWhen": { "parity": "PASS", "control": "FAILED (as required)" }
+    },
+    {
+      "name": "a3-emissions",
+      "path": "<report of npm run check:a3-emissions -- <table> --json>",
+      "passWhen": { "missingFunctions": [], "missingEvents": [] }
+    }
+  ]
+}
