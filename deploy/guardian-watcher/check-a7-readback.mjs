@@ -72,11 +72,12 @@ cell("live example validates", validate(schema, live).length === 0, validate(sch
   // Codex A7 R6: a URL inside an invalid key never reaches the schema diagnostics
   const u = structuredClone(example);
   u.contracts.registry.roles = { "https://rpc.example/SYNTHETIC_API_SECRET": [true] };
+  u.contracts.registry.roles.SYNTHETIC_ID_SECRET = [true]; // an identifier-shaped key too (R7)
   const errs = validate(schema, u);
   cell(
     "R6: schema diagnostics never print an input key holding a URL (any JSON-Pointer escaping)",
     errs.length > 0 &&
-      !errs.join(" ").includes("SYNTHETIC_API_SECRET") &&
+      !/SYNTHETIC_API_SECRET|SYNTHETIC_ID_SECRET/.test(errs.join(" ")) &&
       !/https|~1/.test(errs.join(" ")),
     errs
   );

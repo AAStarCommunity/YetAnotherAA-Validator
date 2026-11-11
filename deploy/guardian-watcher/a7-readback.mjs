@@ -156,13 +156,28 @@ const COMMON = [
 const ZERO = "0x0000000000000000000000000000000000000000";
 const lc = v => String(v).toLowerCase();
 
+/** Every property name the schema itself defines (for masking input-derived diagnostic paths). */
+function schemaNames(node, out = new Set()) {
+  if (Array.isArray(node)) node.forEach(x => schemaNames(x, out));
+  else if (node && typeof node === "object") {
+    for (const k of ["properties", "patternProperties"])
+      if (node[k] && typeof node[k] === "object") for (const n of Object.keys(node[k])) out.add(n);
+    if (Array.isArray(node.required)) node.required.forEach(n => out.add(n));
+    Object.values(node).forEach(x => schemaNames(x, out));
+  }
+  return out;
+}
+
 /** Schema validation: returns the list of errors (paths only), empty when valid. */
 export function validate(schema, rb) {
   const ajv = new Ajv2020({ allErrors: true, strict: false });
   const ok = ajv.validate(schema, rb);
   // a path segment is input (a key of the read-back): only plain identifiers and indices are shown,
   // anything else (a URL, whatever its JSON-Pointer escaping) becomes "(key)" (Codex A7 R6)
-  const seg = x => (/^[A-Za-z0-9_$.-]{1,64}$/.test(x) ? x : "(key)");
+  // only names the pinned schema itself defines, the inventory, and array indices are shown; any
+  // other key comes from the input and is masked, whatever its shape (Codex A7 R7)
+  const known = new Set([...REQUIRED_CONTRACTS, ...schemaNames(schema)]);
+  const seg = x => (/^\d+$/.test(x) || known.has(x) ? x : "(key)");
   const path = p =>
     p
       ? p

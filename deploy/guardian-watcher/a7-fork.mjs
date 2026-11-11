@@ -120,13 +120,13 @@ const errors = validate(schema, rb);
 if (errors.length)
   die(1, `read-back does not validate against ${SCHEMA_ID}: ${errors.slice(0, 10).join("; ")}`);
 const h = rb.header;
-if (h.source !== "fork") die(1, `read-back source is ${h.source}: not a fork read-back`);
+if (h.source !== "fork") die(1, 'read-back source is not "fork": not a fork read-back');
 const dump = readInput(dumpPath, "--dump");
 if (sha256(dump) !== dumpSha) die(1, "dump sha256 does not match --dump-sha256");
 if (h.dumpSha256 !== dumpSha) die(1, "the read-back was taken from another dump (dumpSha256)");
 if (h.anvilCommit !== ANVIL_COMMIT)
   die(1, "the read-back was taken on another anvil commit than the pinned build");
-if (h.hardfork !== "amsterdam") die(1, `read-back hardfork is ${h.hardfork}, expected amsterdam`);
+if (h.hardfork !== "amsterdam") die(1, "read-back hardfork is not amsterdam");
 // the address book: SP's deployments/release/rc8/<chain>.pins.json at the step-13 manifest commit,
 // through the GitHub API (DSR); --address-book only for an offline copy (then unverified)
 const CHAINS = { 11155111: "sepolia", 10: "optimism", 1: "mainnet" };
@@ -240,7 +240,7 @@ try {
 if (anvilCommit !== ANVIL_COMMIT)
   die(1, `anvil commit is ${anvilCommit ?? "unknown"}, required ${ANVIL_COMMIT} (--anvil <path>)`);
 if (anvilVersion !== h.anvilVersion)
-  die(1, `anvil is "${anvilVersion}", SP dumped with "${h.anvilVersion}"`);
+  die(1, "anvil --version differs from the read-back's header.anvilVersion");
 const anvil = spawn(
   anvilBin,
   [
