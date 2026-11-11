@@ -250,11 +250,20 @@ export async function confirmPending(
       counts.malformed = (counts.malformed ?? 0) + 1;
       continue;
     }
+    // the digest once, per record: a record it cannot be computed for (e.g. nested too deep) is
+    // reported and skipped, never stopping the pass (Codex D-RPC2 R10)
+    let digest;
+    try {
+      digest = viewDigest(rec);
+    } catch {
+      counts.malformed = (counts.malformed ?? 0) + 1;
+      continue;
+    }
     const prev = getHold(store, id);
     // a confirmation counts only for the content it was made on
-    if (prev?.state === "confirmed" && prev.digest === viewDigest(rec)) continue;
+    if (prev?.state === "confirmed" && prev.digest === digest) continue;
     if (prev?.state === "unconfirmed-final") continue;
-    const sameContent = prev?.digest === viewDigest(rec);
+    const sameContent = prev?.digest === digest;
     // a deadline further away than the cap allows (the clock was ahead when it was set, or it
     // was rolled back) is not trusted: the record is retried now (Codex D-RPC2 R8 #1)
     if (
@@ -286,7 +295,7 @@ export async function confirmPending(
     const holdDoc = {
       id,
       state,
-      digest: viewDigest(rec),
+      digest: digest,
       attempts: (base?.attempts ?? 0) + 1,
       mismatches,
       unavailableStreak,

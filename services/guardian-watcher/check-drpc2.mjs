@@ -1110,6 +1110,35 @@ async function scenario(build) {
       rmSync(d, { recursive: true, force: true });
     }
   }
+  // R10: a record whose digest cannot be computed (nested too deep) is skipped, not a stalled pass
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-deep-"));
+    try {
+      const store = new Store(d);
+      const deep = { ...bls, key: "7401", proposalId: "7401", txHash: ethers.id("deep") };
+      const fine = { ...bls, key: "7402", proposalId: "7402", txHash: ethers.id("fine") };
+      store.putRecord(deep);
+      store.putRecord(fine);
+      const did = Store.recordId(deep);
+      const { writeFileSync } = await import("node:fs");
+      const f = join(d, "records", `${did}.json`);
+      const j = JSON.parse(readFileSync(f, "utf8"));
+      const nested = "[".repeat(10000) + "]".repeat(10000);
+      writeFileSync(f, JSON.stringify(j).replace(/}$/, `,"deep":${nested}}`));
+      const run = async () => ({ status: { ok: false } });
+      const c = await confirmPending(store, {}, "s", { startBlock: 0 }, null, null, {
+        runOnce: run,
+        now: 1,
+      });
+      cell(
+        "R10: a record nested too deep for its digest is reported malformed and skipped; the other record is still checked",
+        (c.malformed ?? 0) >= 1 && getHold(store, Store.recordId(fine))?.attempts === 1,
+        { c }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
   // #5: an interrupted re-arm leaves its journal entry pending, settled from the hold
   {
     const { reconcile } = await import("../../deploy/guardian-watcher/rearm-hold.mjs");
