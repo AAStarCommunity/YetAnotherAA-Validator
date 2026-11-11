@@ -63,7 +63,25 @@ export function loadConfig(path) {
   for (const a of [c.aggregator, c.roles.superPaymaster, ...Object.values(c.forwarders ?? {})]) {
     if (!ethers.isAddress(a)) throw new Error(`config: bad address ${a}`);
   }
-  return { maxBlocksPerTick: 2000, page: 5000, intervalMs: 60_000, forwarders: {}, ...c };
+  if (
+    c.maxTickFraction !== undefined &&
+    !(typeof c.maxTickFraction === "number" && c.maxTickFraction > 0 && c.maxTickFraction <= 10)
+  )
+    throw new Error("config: maxTickFraction must be a number in (0, 10]");
+  if (c.maxLagBlocks !== undefined && !(Number.isSafeInteger(c.maxLagBlocks) && c.maxLagBlocks > 0))
+    throw new Error("config: maxLagBlocks must be a positive integer");
+  return {
+    maxBlocksPerTick: 2000,
+    page: 5000,
+    intervalMs: 60_000,
+    // the cursor this far behind finalized is degraded (about 1 h of Sepolia blocks): DSR 2892c30f
+    maxLagBlocks: 300,
+    // a tick slower than this share of the poll interval is degraded (DSR 97a9d55c): the work per
+    // tick grows with the local archive, and that must show before it outruns the interval
+    maxTickFraction: 0.5,
+    forwarders: {},
+    ...c,
+  };
 }
 
 export const TRACE_VERIFY_MS = 3_600_000;
@@ -150,7 +168,20 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
   // `carry`: fields kept from the previous status while this run has not replaced them yet (the
   // last publication result, marked in progress: Codex W2c R1 M8).
   const status = { at: started, ruleset: ident, lastError: null, ...(carry ?? {}) };
-  const finish = async (stats, finalized) => {
+  // wall time of this tick and the archive it ran over, reported with every status
+  const tickStart = Date.now();
+  const timing = () => {
+    const ms = Date.now() - tickStart;
+    const limit = (cfg.maxTickFraction ?? 0.5) * (cfg.intervalMs ?? 60_000);
+    let files = null;
+    try {
+      files = store.countArchiveFiles();
+    } catch {
+      files = null;
+    }
+    return { ms, limit, files };
+  };
+  const finish = async (stats, finalized, isolated = 0, more = []) => {
     let h;
     try {
       h = await traceHealth(chain, cfg, store, stats, finalized, nowMs);
@@ -158,12 +189,26 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
       h = { trace: { capability: "unverified" }, degraded: ["trace capability check failed"] };
     }
     status.trace = h.trace;
-    status.degraded = h.degraded;
+    // A tick that had to isolate malformed RPC answers is not healthy: the data is being set aside,
+    // not read (#403 review L-2). The scan still moved on; the reason and count say why.
+    const extra = isolated ? [`${isolated} malformed RPC answer(s) isolated this tick`] : [];
+    for (const m of more) extra.push(m);
+    // measured last, after capability verification and the archive count, so the whole tick shows
+    // (follow-up #2 R12)
+    const tm = timing();
+    status.archiveFiles = tm.files;
+    status.tickMs = Date.now() - tickStart;
+    if (status.tickMs > tm.limit)
+      extra.push(
+        `tick took ${status.tickMs} ms, more than ${Math.round(tm.limit)} ms (maxTickFraction of the interval)`
+      );
+    status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
     status.healthy = status.ok === true && !status.degraded;
   };
   try {
     const s = await tick(chain, cfg, store, rs, { ruleset: ident, now: started });
     const cur = store.getCursor();
+    const totals = store.bumpCounters({ budgetStops: s.budgetStop ? 1 : 0 });
     Object.assign(status, {
       ok: true,
       finalized: s.finalized,
@@ -182,14 +227,28 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
       unreadableTotal: store.countUnreadable(),
       blsAmendments: store.countAmendments(),
       amendmentConflictsThisTick: s.amendmentConflicts ?? 0,
+      amendmentConflictsTotal: store.countAmendmentConflicts(),
       exhaustedTotal: store.countExhausted(),
+      // ticks that hit the isolation budget (stopped early, or a block overflowed into quarantine)
+      // and quarantine records (set-aside answers, nobody accused): DSR log 2892c30f
+      budgetStopThisTick: !!s.budgetStop,
+      budgetStopsTotal: totals.budgetStops ?? 0,
+      quarantinedThisTick: s.quarantined ?? 0,
+      quarantinedTotal: store.countQuarantined(),
+      ...(totals.reset ? { countersReset: true } : {}),
       bloom: {
         recovered: s.bloomRecovered,
         falsePositives: s.bloomFalsePositives,
         unchecked: s.bloomUnchecked,
       },
     });
-    await finish(s.trace, s.finalized);
+    const more = [];
+    if (s.budgetStop) more.push("isolation budget reached this tick (the rest is read next tick)");
+    const lag = cur ? s.finalized - cur.block : null;
+    const maxLag = cfg.maxLagBlocks ?? 300;
+    if (lag !== null && lag > maxLag)
+      more.push(`cursor ${lag} blocks behind finalized (> ${maxLag})`);
+    await finish(s.trace, s.finalized, s.isolated ?? 0, more);
     store.writeStatus(status);
     return { status, summary: s };
   } catch (e) {
