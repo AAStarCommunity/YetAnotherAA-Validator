@@ -328,7 +328,9 @@ async function main() {
       const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
       slowNote =
         status.iterationMs > limit
-          ? `iteration took ${status.iterationMs} ms, more than ${Math.round(limit)} ms (maxTickFraction of the interval)`
+          ? // fixed wording: the alert set's identity must not change with every duration (Codex W2c
+            // R9); the measured time is status.iterationMs
+            `iteration slower than ${Math.round(limit)} ms (maxTickFraction of the interval)`
           : null;
       if (slowNote) {
         status.degraded = [...(status.degraded ?? []), slowNote];
