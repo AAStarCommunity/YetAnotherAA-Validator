@@ -44,7 +44,11 @@ try {
   process.exit(2);
 }
 const results = [];
-const add = (id, status, detail) => results.push({ id, status, detail });
+// every line of the report passes through here: a URL-like fragment (an honest mistake such as an
+// RPC URL pasted into an operator label) is replaced, never printed (Codex, #408 review of M0 §5.5)
+const URLISH = /[a-z][a-z0-9+.-]*:\/\/\S*/gi;
+const add = (id, status, detail) =>
+  results.push({ id, status, detail: String(detail ?? "").replace(URLISH, "(a URL: not shown)") });
 const placeholder = v =>
   v === undefined || v === null || v === "" || (typeof v === "string" && /^<.*>$/.test(v));
 const expand = p => (typeof p === "string" && p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
