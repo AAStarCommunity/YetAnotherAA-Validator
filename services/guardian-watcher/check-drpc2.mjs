@@ -475,6 +475,34 @@ async function scenario(build) {
     ok.counts.held === 0 && ok.published?.published === true && ok.uploads > 0,
     ok
   );
+  // D-RPC2 Codex R2: a journal with a CID but never published does not bypass the hold
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-pub-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const id = Store.recordId(bls);
+      const { recordFile } = await import("./lib/record-file.mjs");
+      const rec = JSON.parse(readFileSync(join(d, "records", `${id}.json`), "utf8"));
+      store.putPublication(id, { cid: recordFile(rec).cid, published: false, pins: {} });
+      const s = sinks();
+      const r = await publishPending(store, {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        registry: null,
+      });
+      cell(
+        "R2: an unpublished journal that holds a CID does not bypass the hold: nothing uploaded",
+        r.counts.held === 1 &&
+          Object.values(s.calls.uploads).reduce((a, b) => a + b, 0) === 0 &&
+          s.calls.telegram === 0,
+        { counts: r.counts, uploads: s.calls.uploads }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
   // an unreadable hold file is not a confirmation
   const d = mkdtempSync(join(tmpdir(), "drpc2-pub-"));
   try {

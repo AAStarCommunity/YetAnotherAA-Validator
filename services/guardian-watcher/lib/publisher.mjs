@@ -150,7 +150,9 @@ export async function publishPending(
       // dropped. One already published goes on to publishRecord even if its content no longer
       // matches the confirmation: that is a tampered record, which publishRecord refuses to
       // republish and reports as an INCIDENT on every pass, a signal the hold must not swallow.
-      if (!prev?.cid && !mayPublish(store, rec)) {
+      // only a record that was actually PUBLISHED bypasses the hold (D-RPC2 Codex R2): a journal
+      // that merely recorded a CID (every pin and the mirror failed) authorizes nothing
+      if (prev?.published !== true && !mayPublish(store, rec)) {
         counts.held++;
         continue;
       }
