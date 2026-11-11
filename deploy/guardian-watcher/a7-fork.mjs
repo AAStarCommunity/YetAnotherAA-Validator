@@ -53,10 +53,15 @@ const sha256 = buf => createHash("sha256").update(buf).digest("hex");
 // the SAME anvil build SP dumped with (its version is in the read-back): a dump of one EVM build is
 // not proven on another, and a build without the read-back's hardfork panics on it (anvil 1.7.1 on
 // "amsterdam"). --anvil names a separately installed binary; the shared ~/.foundry is not changed.
+// SP's exact build (DSR): anvil 1.8.7-nightly, commit 4e8874b2. Stable 1.7.1 has no Amsterdam and
+// panics on it; 1.8.6 computes Amsterdam gas wrongly. Any other commit is refused, whatever --anvil names.
+const ANVIL_COMMIT = "4e8874b2bdc840929585ca73e170993c50a4a531";
+// Sepolia's Amsterdam activation (EIP-7910 eth_config "current"), as SP read it back
+const AMSTERDAM = { activationTime: 1791294816, forkId: "0x6c1d9423" };
 const anvilBin =
   opt("anvil") ??
-  (existsSync(join(homedir(), ".foundry/bin/anvil"))
-    ? join(homedir(), ".foundry/bin/anvil")
+  (existsSync(join(homedir(), ".foundry-a7/bin/anvil"))
+    ? join(homedir(), ".foundry-a7/bin/anvil")
     : "anvil");
 
 // ---- 1. inputs
@@ -77,16 +82,25 @@ if (
     .replace(/^0x/, "") !== dumpSha
 )
   die(1, "the read-back was taken from another dump (dumpSha256 differs)");
-for (const k of ["chainId", "hardfork", "forkBlock"])
-  if (rb[k] === undefined) die(1, `read-back has no ${k}`);
+for (const k of ["chainId", "hardfork", "forkBlock", "anvilVersion", "anvilCommit", "ethConfig"])
+  if (rb[k] === undefined || rb[k] === null) die(1, `read-back has no ${k}`);
+if (String(rb.anvilCommit).toLowerCase() !== ANVIL_COMMIT)
+  die(1, "the read-back was taken on another anvil commit than the pinned build");
+if (String(rb.hardfork).toLowerCase() !== "amsterdam")
+  die(1, `read-back hardfork is ${rb.hardfork}, expected amsterdam`);
 
 // ---- 2. anvil on the fork, with the dump loaded
 let anvilVersion;
+let anvilCommit;
 try {
-  anvilVersion = execFileSync(anvilBin, ["--version"], { encoding: "utf8" }).split("\n")[0].trim();
+  const v = execFileSync(anvilBin, ["--version"], { encoding: "utf8" });
+  anvilVersion = v.split("\n")[0].trim();
+  anvilCommit = v.match(/^Commit SHA:\s*([0-9a-f]{40})\s*$/m)?.[1] ?? null;
 } catch {
   die(3, "anvil not runnable (--anvil <path>)");
 }
+if (anvilCommit !== ANVIL_COMMIT)
+  die(1, `anvil commit is ${anvilCommit ?? "unknown"}, required ${ANVIL_COMMIT} (--anvil <path>)`);
 if (rb.anvilVersion && anvilVersion !== String(rb.anvilVersion).trim())
   die(
     1,
@@ -137,9 +151,11 @@ if (!up)
     `anvil did not start (${
       /panicked|unimplemented/i.test(anvilErr)
         ? "it crashed: this build cannot run the read-back's hardfork"
-        : /unknown|invalid/i.test(anvilErr)
-          ? "rejected an argument"
-          : "no RPC"
+        : /fork|connect|request|dns|timed? ?out/i.test(anvilErr)
+          ? "cannot reach or read the fork RPC"
+          : /unknown|invalid/i.test(anvilErr)
+            ? "rejected an argument"
+            : "no RPC"
     })`
   );
 
@@ -172,6 +188,7 @@ const norm = v =>
       ? v.toString()
       : v;
 const cmp = [];
+const unverified = [];
 const check = (path, theirs, ours) =>
   cmp.push({
     path,
@@ -183,6 +200,51 @@ const check = (path, theirs, ours) =>
 // the header: the fork itself
 check("chainId", rb.chainId, Number((await p.getNetwork()).chainId));
 check("forkBlock", rb.forkBlock, Number(rb.forkBlock)); // as launched
+check("anvilCommit", rb.anvilCommit, anvilCommit);
+check("hardfork", rb.hardfork, "amsterdam"); // as launched, refused above if anything else
+// (i) Amsterdam is proven from UPSTREAM, never from the local engine (DSR: a local anvil's eth_config
+// reports the engine's own configuration, not Sepolia's; SP a3a_exec.py). SP's read-back carries
+// upstream Sepolia's eth_config at the fork block, which must be Sepolia's Amsterdam activation.
+const asNum = v => {
+  try {
+    return Number(BigInt(v));
+  } catch {
+    return undefined;
+  }
+};
+check(
+  "ethConfig.activationTime=Amsterdam",
+  AMSTERDAM.activationTime,
+  asNum(rb.ethConfig?.activationTime)
+);
+check("ethConfig.forkId=Amsterdam", AMSTERDAM.forkId, norm(rb.ethConfig?.forkId));
+// (iii) behavioural positive control: SP's Amsterdam probe (EIP-8037 CREATE gas) rerun on THIS
+// loaded fork must give SP's measured value and the expected one. The probe is sent as a contract
+// creation from the funded test key (impersonated; no key is used) and measured as the receipt's
+// gasUsed. Until SP publishes the probe's init code, the probe is unverified and the run stops.
+const probe = rb.amsterdamProbe;
+if (!probe || probe.createGasUsed === undefined || probe.expected === undefined)
+  unverified.push("amsterdamProbe");
+else {
+  check("amsterdamProbe.sp=expected", String(probe.expected), String(probe.createGasUsed));
+  if (typeof probe.initcode !== "string" || !/^0x(?:[0-9a-fA-F]{2})+$/.test(probe.initcode))
+    unverified.push("amsterdamProbe.initcode");
+  else {
+    let used;
+    try {
+      await p.send("anvil_impersonateAccount", [fund]);
+      const h = await p.send("eth_sendTransaction", [
+        { from: fund, data: probe.initcode, gas: ethers.toQuantity(10_000_000) },
+      ]);
+      used = (await p.waitForTransaction(h, 1, 30_000))?.gasUsed?.toString();
+      await p.send("anvil_stopImpersonatingAccount", [fund]);
+    } catch {
+      used = undefined;
+    }
+    check("amsterdamProbe.fork=sp", String(probe.createGasUsed), used);
+    check("amsterdamProbe.fork=expected", String(probe.expected), used);
+  }
+}
 // per contract: the fields this script reads independently
 const FIELDS = {
   codehash: async c => codehash(c.address),
@@ -199,7 +261,6 @@ const FIELDS = {
   guardian: c => tryCall(c.address, "guardian()", "address"),
   version: c => tryCall(c.address, "version()", "string"),
 };
-const unverified = [];
 for (const [name, c] of Object.entries(rb.contracts ?? {})) {
   if (!ethers.isAddress(c?.address ?? "")) {
     unverified.push(`contracts.${name}.address`);
@@ -231,6 +292,7 @@ const record = {
   schema: "aoa-a7-rehearsal-fork/1",
   at: new Date().toISOString(),
   anvilVersion,
+  anvilCommit,
   forkHost: (() => {
     try {
       return new URL(forkUrl).hostname;
@@ -240,10 +302,13 @@ const record = {
   })(),
   dumpSha256: dumpSha,
   readbackSha256: sha256(rbText),
+  forkCorroboration: rb.ethConfig?.corroboration ?? null,
   spReadback: {
     spCommit: rb.spCommit ?? null,
     tag: rb.tag ?? null,
     anvilVersion: rb.anvilVersion ?? null,
+    anvilCommit: rb.anvilCommit ?? null,
+    ethConfig: rb.ethConfig ?? null,
   },
   chainId: rb.chainId,
   hardfork: rb.hardfork,
