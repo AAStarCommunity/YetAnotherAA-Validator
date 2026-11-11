@@ -2072,6 +2072,80 @@ const good = {
   }
 }
 
+// ---- DSR (#413): publication is at least once and every sink is idempotent. A crash between a
+// sink's effect and its journal write repeats that stage after a restart; the repeat must not
+// create a second registry entry or a second mirror commit (Telegram may repeat: accepted).
+{
+  class CrashOnce extends Store {
+    constructor(d, when) {
+      super(d);
+      this.when = when;
+      this.crashed = false;
+    }
+    putPublication(id, st) {
+      if (!this.crashed && this.when(st)) {
+        this.crashed = true;
+        throw new Error("killed"); // the process dies here: the effect happened, the journal did not
+      }
+      super.putPublication(id, st);
+    }
+  }
+  // `repeated` proves the stage really ran again after the restart (the cell is not vacuous)
+  const points = [
+    [
+      "after the mirror commit, before it is journalled",
+      st => !!st?.mirror?.commit,
+      c => c.mirror >= 2,
+    ],
+    [
+      "after the disclose broadcast, before 'sent' is journalled",
+      st => st?.registry?.phase === "sent",
+      c => c.broadcast >= 2,
+    ],
+  ];
+  for (const [label, when, repeated] of points) {
+    const d = tmp();
+    try {
+      const s = sinks({}); // the outside world (chain, mirror, pins) survives the restart
+      const sk = {
+        pinners: s.pinners,
+        mirror: s.mirror,
+        telegram: s.telegram,
+        registry: s.registry,
+      };
+      const crashing = new CrashOnce(d, when);
+      crashing.putRecord(bls);
+      const first = await publishPending(crashing, sk, { maxPendingMs: 60 * 60_000 });
+      const restarted = new Store(d); // a new process on the same data directory
+      for (let i = 0; i < 6; i++)
+        await publishPending(restarted, sk, { maxPendingMs: 60 * 60_000 });
+      const pub = restarted.getPublication(Store.recordId(bls));
+      cell(
+        `DSR #413: a crash ${label}: after restart one registry entry, one mirror commit, confirmed`,
+        crashing.crashed &&
+          first.stopped &&
+          repeated(s.calls) &&
+          s.chain.entries.size === 1 &&
+          s.calls.mirrorCommits === 1 &&
+          pub?.registry?.phase === "confirmed" &&
+          pub?.published === true,
+        {
+          crashed: crashing.crashed,
+          stopped: first.stopped,
+          entries: s.chain.entries.size,
+          mirrorCommits: s.calls.mirrorCommits,
+          mirrorCalls: s.calls.mirror,
+          broadcasts: s.calls.broadcast,
+          phase: pub?.registry?.phase,
+          telegram: s.calls.telegram,
+        }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

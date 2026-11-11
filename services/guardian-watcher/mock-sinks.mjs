@@ -40,7 +40,16 @@ export const owner = {
 // ---- mock sinks. The mock registry follows DisclosureRegistry: one entry per (kind, key), the
 // binding keccak256(abi.encode(kind, key, subjectToken)), entries visible at a block, finality.
 export function sinks(opts = {}) {
-  const calls = { telegram: 0, sign: 0, broadcast: 0, mirror: 0, uploads: {}, texts: [] };
+  const calls = {
+    telegram: 0,
+    sign: 0,
+    broadcast: 0,
+    mirror: 0, // commit() calls
+    mirrorCommits: 0, // new commits only: like the real sink, identical bytes at a path are a no-op
+    uploads: {},
+    texts: [],
+  };
+  const mirrored = new Map(); // path -> bytes (hex)
   const stored = new Map();
   const pinOpts = { pinata: { ...(opts.pinata ?? {}) }, filebase: { ...(opts.filebase ?? {}) } };
   const mkPinner = name => ({
@@ -91,9 +100,20 @@ export function sinks(opts = {}) {
     chain,
     pinners: [mkPinner("pinata"), mkPinner("filebase")],
     mirror: {
-      async commit(path) {
+      async commit(path, bytes) {
         calls.mirror++;
         if (opts.mirrorFail) throw new Error("push rejected");
+        const hex = bytes ? Buffer.from(bytes).toString("hex") : "";
+        if (mirrored.has(path)) {
+          if (mirrored.get(path) !== hex) throw new Error("different bytes at an existing path");
+          return {
+            commit: "c0ffee",
+            url: `https://github.com/x/y/blob/c0ffee/${path}`,
+            existing: true,
+          };
+        }
+        mirrored.set(path, hex);
+        calls.mirrorCommits++;
         return { commit: "c0ffee", url: `https://github.com/x/y/blob/c0ffee/${path}` };
       },
     },
