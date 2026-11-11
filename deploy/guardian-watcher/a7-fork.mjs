@@ -231,7 +231,10 @@ let slashLevels = null;
 let anvilVersion;
 let anvilCommit;
 try {
-  const v = execFileSync(anvilBin, ["--version"], { encoding: "utf8" });
+  const v = execFileSync(anvilBin, ["--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
   anvilVersion = v.split("\n")[0].trim();
   anvilCommit = v.match(/^Commit SHA:\s*([0-9a-f]{40})\s*$/m)?.[1] ?? null;
 } catch {
