@@ -5,8 +5,23 @@ import { ethers } from "ethers";
 import { cidV1Raw } from "./cid.mjs";
 import { Store } from "./store.mjs";
 
-export const RECORD_SCHEMA = "dvt.guardian-watcher.record.v1";
-const LOCAL_ONLY = new Set(["seenAt", "id"]); // when this host saw it, and the store's file id
+// v2 (#422): the published record leaves out every local diagnosis field, so it is exactly the
+// content D-RPC2 confirmed. There is one serialization: no older one is ever re-produced, because
+// re-producing v1 would publish fields nobody confirmed (Codex D-RPC2 R9). No publication journal
+// predates v2 (Phase D, the first deployment, needs it); one that did would have another CID and
+// surface as a bytes-change incident (alerted, nothing published), never as a publication.
+export const RECORD_SCHEMA = "dvt.guardian-watcher.record.v2";
+// Fields that record when or how often THIS host saw a record, not what it says, plus the store's
+// file id. They stay local: the published record is exactly the content the second provider
+// confirmed (D-RPC2; #422 review), which ignores the same fields (lib/confirm.mjs uses this set).
+export const LOCAL_ONLY = new Set([
+  "id",
+  "seenAt",
+  "firstSeen",
+  "exhaustedAfter",
+  "provenAt",
+  "lastReasons",
+]);
 
 function canon(v) {
   if (typeof v === "bigint") return v.toString();

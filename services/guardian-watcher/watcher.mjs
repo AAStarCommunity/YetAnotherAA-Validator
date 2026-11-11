@@ -22,6 +22,7 @@ import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick, verifyTrace } from "./lib/scan.mjs";
+import { confirmPending } from "./lib/confirm.mjs";
 import { SafeError, safeText } from "./lib/safe-error.mjs";
 import { acquireLock, DEFAULT_LOCK_PORT } from "./lib/lock.mjs";
 import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
@@ -79,9 +80,18 @@ export function loadConfig(path) {
     // a tick slower than this share of the poll interval is degraded (DSR 97a9d55c): the work per
     // tick grows with the local archive, and that must show before it outruns the interval
     maxTickFraction: 0.5,
+    // D-RPC2: nothing accusatory is published without a second provider's confirmation; running
+    // without one is degraded (RPC_URL_2)
+    requireSecondProvider: true,
     forwarders: {},
     ...c,
   };
+}
+
+/** The second provider's label for holds and status: config.secondProvider, a plain name. */
+export function secondProviderLabel(cfg) {
+  const n = cfg?.secondProvider;
+  return typeof n === "string" && /^[a-z][a-z0-9-]{0,30}$/i.test(n) ? n : "second";
 }
 
 /** The disclose stalls that make the watcher degraded (DSR, #411 F1): fixed wording, counts only. */
@@ -174,6 +184,12 @@ export async function publicationStep({
   return nextSlow;
 }
 
+/** The lock port the watcher takes for this config (one process per host), shared with every tool
+ * that must not run beside it (deploy/guardian-watcher/rearm-hold.mjs; Codex D-RPC2 R8 #3). */
+export function watcherLockPort(cfg, p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null) {
+  return p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT;
+}
+
 export const TRACE_VERIFY_MS = 3_600_000;
 
 /**
@@ -252,7 +268,12 @@ export async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
   };
 }
 
-export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {}) {
+/**
+ * One tick. `second` ({ chain, host }) is the D-RPC2 second provider: after the scan, every
+ * accusatory record not yet confirmed is re-run on it (lib/confirm.mjs). Without it, the tick is
+ * degraded, because accusatory records can never be confirmed and so never published.
+ */
+export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry } = {}) {
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
   // `carry`: fields kept from the previous status while this run has not replaced them yet (the
@@ -345,6 +366,46 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
     const maxLag = cfg.maxLagBlocks ?? 300;
     if (lag !== null && lag > maxLag)
       more.push(`cursor ${lag} blocks behind finalized (> ${maxLag})`);
+    // D-RPC2: confirm accusatory records on the second provider (never on the first)
+    if (second?.chain) {
+      try {
+        status.confirm = {
+          secondProvider: second.host ?? null,
+          ...(await confirmPending(store, second.chain, second.host ?? null, cfg, rs, ident, {
+            runOnce,
+            now: nowMs,
+          })),
+        };
+        if (status.confirm.final)
+          more.push(
+            `${status.confirm.final} accusatory record(s) final after repeated mismatches with the second provider (held; re-arm by hand: rearm-hold.mjs)`
+          );
+        // held and not publishable: a disagreement, or a second provider that keeps not answering
+        // (DSR, ded99d78): degraded, never published
+        if (status.confirm.holdUnsaved)
+          more.push(
+            `${status.confirm.holdUnsaved} D-RPC2 hold(s) could not be saved (those records stay held)`
+          );
+        if (status.confirm.cursorUnsaved)
+          more.push("D-RPC2 confirmation cursor not saved (rotating in memory)");
+        if (status.confirm.mismatch)
+          more.push(
+            `${status.confirm.mismatch} accusatory record(s) differ on the second provider (held, not published)`
+          );
+        if (status.confirm.waiting)
+          more.push(
+            `${status.confirm.waiting} accusatory record(s) not confirmable: the second provider has not answered on 2+ consecutive attempts (held, retried with backoff, not published)`
+          );
+      } catch {
+        status.confirm = { secondProvider: second.host ?? null, error: "confirmation pass failed" };
+        more.push("D-RPC2 confirmation pass failed");
+      }
+    } else {
+      status.confirm = { secondProvider: null };
+      // required in production (loadConfig defaults requireSecondProvider: true)
+      if (cfg.requireSecondProvider)
+        more.push("no second provider (D-RPC2): accusatory records stay held");
+    }
     await finish(s.trace, s.finalized, s.isolated ?? 0, more);
     store.writeStatus(status);
     return { status, summary: s, carried };
@@ -391,8 +452,15 @@ async function main() {
   // process per host: it covers scanning too, two watchers on one data dir would race the store),
   // then secrets and the writer key, loaded once. A bad setup refuses to start, never half-runs.
   const p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null;
-  await acquireLock(p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT);
+  await acquireLock(watcherLockPort(cfg, p));
   const chain = makeProvider(process.env.RPC_URL);
+  // D-RPC2: the second provider's URL comes from the environment (on the Mini, from the Keychain);
+  // only the operator's label for it is ever recorded
+  const second = process.env.RPC_URL_2
+    ? // only the operator's label for the second provider is ever stored, never anything derived
+      // from its URL: a hostname can carry an access token in a subdomain (cf. Codex A7 R16)
+      { chain: makeProvider(process.env.RPC_URL_2), host: secondProviderLabel(cfg) }
+    : null;
   // the registry signs only for the configured chain (#413 review N2): a missing chainId refuses
   // to start, and a mismatching RPC refuses each signature
   if (p && !Number.isSafeInteger(cfg.chainId))
@@ -409,7 +477,7 @@ async function main() {
       ? { publication: { ...(lastPub ?? {}), inProgress: true, since: new Date().toISOString() } }
       : undefined;
     const iterStart = Date.now();
-    const { status, carried } = await runOnce(chain, cfg, store, rs, ident, { carry });
+    const { status, carried } = await runOnce(chain, cfg, store, rs, ident, { second, carry });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
     if (pub) {

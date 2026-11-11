@@ -43,6 +43,7 @@
     "check:phase-d": "node deploy/guardian-watcher/phase-d-check.mjs",
     "check:phase-d-binding": "node deploy/guardian-watcher/check-phase-d-binding.mjs",
     "check:phase-d-redact": "node deploy/guardian-watcher/check-phase-d-redact.mjs",
+    "check:drpc2": "node services/guardian-watcher/check-drpc2.mjs",
     "check:a7-readback": "node deploy/guardian-watcher/check-a7-readback.mjs",
     "check:a7-fork": "node deploy/guardian-watcher/check-a7-fork.mjs",
     "e2e:committee": "node scripts/e2e/committee-e2e.mjs",

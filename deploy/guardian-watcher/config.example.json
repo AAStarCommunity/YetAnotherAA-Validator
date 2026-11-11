@@ -15,6 +15,7 @@
   "intervalMs": 60000,
   "maxLagBlocks": 300,
   "requireSecondProvider": true,
+  "secondProvider": "<the second RPC's provider name, e.g. tenderly (a label, never a URL)>",
   "publish": {
     "enabled": true,
     "keychainAccount": "aoa-watcher",
