@@ -13,6 +13,7 @@ import {
   liveProblems,
   parseLstart,
   staleProblems,
+  importClosure,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -300,6 +301,60 @@ cell(
   cell("same-second edit is ambiguous: fails", f(start + 400), false, "restart it");
   cell("an unstat-able file fails", f(null), false, "watcherConfig");
   cell("no start time fails", staleProblems({ startedAtMs: null, files: [] }), false, "start time");
+}
+
+// R11: the import closure reaches shared modules outside services/guardian-watcher
+{
+  const { resolve: res, dirname: dn } = await import("node:path");
+  const root = res(here, "../..");
+  const read = f => {
+    try {
+      return readFileSync(f, "utf8");
+    } catch {
+      return null;
+    }
+  };
+  const real = importClosure(join(root, "services/guardian-watcher/watcher.mjs"), read, (a, b) =>
+    res(dn(a), b)
+  ).map(x => x.path);
+  cell(
+    "R11: the real watcher's closure includes scripts/disclosure/recheck-lib.mjs and lib/scan.mjs",
+    real.includes(join(root, "scripts/disclosure/recheck-lib.mjs")) &&
+      real.includes(join(root, "services/guardian-watcher/lib/scan.mjs"))
+      ? []
+      : [real],
+    true
+  );
+  const files = {
+    "/r/a.mjs":
+      'import { x } from "./b.mjs";\n// import "./commented.mjs";\n/* from "./also-commented.mjs" */\nconst y = await import("../c/d.mjs");\nimport "./side.mjs";\nimport z from "ethers";',
+    "/r/b.mjs": 'export * from "./a.mjs";',
+    "/c/d.mjs": "",
+    "/r/side.mjs": "",
+  };
+  const got = importClosure(
+    "/r/a.mjs",
+    f => files[f] ?? null,
+    (a, b) => res(dn(a), b)
+  );
+  const paths = got.map(x => x.path).sort();
+  cell(
+    "closure: static, dynamic and side-effect imports, cycles, no bare packages, no commented imports",
+    JSON.stringify(paths) === JSON.stringify(["/c/d.mjs", "/r/a.mjs", "/r/b.mjs", "/r/side.mjs"])
+      ? []
+      : [paths],
+    true
+  );
+  const miss = importClosure(
+    "/x.mjs",
+    f => (f === "/x.mjs" ? 'import "./gone.mjs";' : null),
+    (a, b) => res(dn(a), b)
+  );
+  cell(
+    "closure: an unreadable module is reported missing",
+    miss.some(x => x.path === "/gone.mjs" && x.missing) ? [] : [miss],
+    true
+  );
 }
 
 let failed = 0;

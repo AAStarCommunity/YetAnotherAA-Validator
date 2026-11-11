@@ -181,3 +181,28 @@ export function staleProblems({ startedAtMs, files }) {
     ? [`changed after the watcher started (restart it): ${[...new Set(late)].join(", ")}`]
     : [];
 }
+
+/**
+ * Every file the watcher process loads from the checkout (Codex R11): the transitive closure of
+ * RELATIVE static and dynamic imports from the entry, so a shared module outside
+ * services/guardian-watcher (scripts/disclosure/recheck-lib.mjs) is covered. Comments are stripped
+ * before matching, so a commented-out import does not count. read(path) -> text | null; a module that
+ * cannot be read is returned with missing: true (the freshness check then fails on it).
+ */
+export function importClosure(entry, read, resolveRel) {
+  const seen = new Map();
+  const todo = [entry];
+  while (todo.length) {
+    const f = todo.pop();
+    if (seen.has(f)) continue;
+    const text = read(f);
+    seen.set(f, text === null);
+    if (text === null) continue;
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+    for (const m of code.matchAll(
+      /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)["'](\.{1,2}\/[^"']+)["']/g
+    ))
+      todo.push(resolveRel(f, m[1]));
+  }
+  return [...seen].map(([path, missing]) => ({ path, missing }));
+}

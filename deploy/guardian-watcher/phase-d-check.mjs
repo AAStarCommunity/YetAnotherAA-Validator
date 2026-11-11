@@ -22,6 +22,7 @@ import {
   liveProblems,
   parseLstart,
   staleProblems,
+  importClosure,
 } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -332,6 +333,24 @@ for (const label of ld.mustBeOn ?? []) {
       }
     };
     walk(W, "watcher source");
+    // and every module the watcher imports, wherever it lives in the checkout (Codex R11)
+    for (const m of importClosure(
+      join(W, "watcher.mjs"),
+      f => {
+        try {
+          return readFileSync(f, "utf8");
+        } catch {
+          return null;
+        }
+      },
+      (from, spec) => resolve(dirname(from), spec)
+    ))
+      watcherFiles.push({ label: "watcher module", mtimeMs: m.missing ? null : mtime(m.path) });
+    // installed packages (ethers): an npm ci after a pull changes the lockfile
+    watcherFiles.push({
+      label: "package-lock.json",
+      mtimeMs: mtime(join(ROOT, "package-lock.json")),
+    });
     problems.push(
       ...staleProblems({
         startedAtMs: st?.status === 0 ? parseLstart(st.stdout) : null,
