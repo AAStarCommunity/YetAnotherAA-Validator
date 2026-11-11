@@ -29,7 +29,8 @@ import { spawn, execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import {
   validate,
@@ -41,6 +42,8 @@ import {
   ANVIL_COMMIT,
   ABI_FILES,
   SAFE_GETTERS,
+  EXAMPLE_SHA256,
+  fieldInventory,
 } from "./a7-readback.mjs";
 
 const args = process.argv.slice(2);
@@ -130,7 +133,16 @@ if (h.hardfork !== "amsterdam") die(1, "read-back hardfork is not amsterdam");
 // the address book: SP's deployments/release/rc8/<chain>.pins.json at the step-13 manifest commit,
 // through the GitHub API (DSR); --address-book only for an offline copy (then unverified)
 const CHAINS = { 11155111: "sepolia", 10: "optimism", 1: "mainnet" };
+// the field inventory: SP's fork example pinned in this checkout (sha256), never the read-back
+const exampleText = readInput(
+  join(dirname(fileURLToPath(import.meta.url)), "fixtures/a7/aoa-a7-readback-1.example.json"),
+  "the pinned example fixture"
+);
+if (sha256(exampleText) !== EXAMPLE_SHA256)
+  die(1, "the pinned example fixture is not SP's (sha256)");
+const inventory = fieldInventory(JSON.parse(exampleText.toString("utf8")));
 let addressBook = null;
+let addressBookDoc = null;
 let addressBookSha = null;
 let addressBookSource = null;
 // DisclosureRegistry is DVT's own contract: its ABI comes from the DVT repo at the commit the
@@ -146,6 +158,7 @@ if (opt("pins-commit") || opt("address-book")) {
   addressBookSha = sha256(raw);
   try {
     const j = JSON.parse(raw.toString("utf8"));
+    addressBookDoc = j; // the whole document goes through the URL gate (Codex A7 R11)
     addressBook = j && typeof j.addresses === "object" ? j.addresses : j;
     disclosureRegistrySource = j?.disclosureRegistrySource ?? null;
   } catch {
@@ -465,6 +478,8 @@ try {
     abi,
     safe: new ethers.Interface(SAFE_GETTERS),
     addressBook,
+    addressBookDoc,
+    fieldInventory: inventory,
     slashLevels,
   });
 } catch (e) {

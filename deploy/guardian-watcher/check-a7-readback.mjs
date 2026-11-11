@@ -20,6 +20,8 @@ import {
   SAFE_GETTERS,
   ENTRY_POINT_V07,
   isState,
+  fieldInventory,
+  EXAMPLE_SHA256,
 } from "./a7-readback.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -348,6 +350,7 @@ const facts = (rb, w, over = {}) => ({
   safe: w.safe,
   addressBook,
   slashLevels: { WARNING: 0, MINOR: 1, MAJOR: 2 },
+  fieldInventory: fieldInventory(example),
   ...over,
 });
 // the chain is always built from the CONSISTENT base; the read-back under test may be mutated
@@ -940,6 +943,25 @@ await mut(
   "SP artefact contains URL-like string (address book)",
   undefined,
   { addressBook: { ...addressBook, "https:evil": A(1) } }
+);
+// Codex A7 R11: the field inventory comes from SP's pinned example, not the read-back under test
+cell(
+  "EXAMPLE_SHA256 is the pinned fork example",
+  sha(exampleText) === EXAMPLE_SHA256,
+  sha(exampleText)
+);
+for (const f of ["BLS_AGGREGATOR", "REGISTRY", "OPERATOR_WITHDRAWAL_WINDOW"])
+  await unv(
+    `R11: superPaymaster.${f} left out is unverified (the pinned example lists it)`,
+    rb => delete rb.contracts.superPaymaster[f],
+    `contracts.superPaymaster.${f} (missing`
+  );
+await mut(
+  "R11: a URL-like string anywhere in the pins document (outside addresses) stops",
+  () => {},
+  "SP artefact contains URL-like string (address book)",
+  undefined,
+  { addressBookDoc: { addresses: addressBook, note: "see https://example.test/public" } }
 );
 // the thresholds literal check (schema v8)
 await mut(

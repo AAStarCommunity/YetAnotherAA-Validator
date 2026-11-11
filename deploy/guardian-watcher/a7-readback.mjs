@@ -28,6 +28,16 @@ export const SCHEMA_SOURCE = {
   path: "docs/release/a7/aoa-a7-readback-1.schema.json",
 };
 export const ANVIL_COMMIT = "4e8874b2bdc840929585ca73e170993c50a4a531";
+/** sha256 of SP's fork example at the pinned schema commit: its per-contract field list is the
+ * field inventory (Codex A7 R11), independent of the read-back under test. */
+export const EXAMPLE_SHA256 = "62099b25d49165825199fff6f4def15c86d9b2de4661024687192a5fe60ec8ca";
+/** The field inventory from SP's pinned example: contract key -> its non-common fields. */
+export function fieldInventory(example) {
+  const out = {};
+  for (const [k, c] of Object.entries(example?.contracts ?? {}))
+    out[k] = Object.keys(c).filter(f => !COMMON.includes(f) && f !== "rolesSource");
+  return out;
+}
 /** Sepolia's Amsterdam (upstream EIP-7910 eth_config.current). */
 export const AMSTERDAM = { activationTime: 1791294816, forkId: "0x6c1d9423" };
 export const EIP1967_IMPL = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
@@ -252,7 +262,7 @@ export async function compare(rb, reader, facts) {
   // reported as a fixed category and never echoed.
   for (const [what, v] of [
     ["read-back", rb],
-    ["address book", facts.addressBook ?? {}],
+    ["address book", facts.addressBookDoc ?? facts.addressBook ?? {}],
   ])
     if (hasUrlLike(v))
       cmp.push({
@@ -351,7 +361,10 @@ export async function compare(rb, reader, facts) {
     const a = c.address;
     addrOf[key] = a;
     // the contract-specific fields the read methods require (Codex A7 R2 #1): ours, not the file's
-    for (const f of REQUIRED_FIELDS[key] ?? [])
+    for (const f of new Set([
+      ...(REQUIRED_FIELDS[key] ?? []),
+      ...(facts.fieldInventory?.[key] ?? []),
+    ]))
       if (!(f in c)) unverified.push(`${P}.${f} (missing from the read-back)`);
     if (key === "entryPoint")
       check(
