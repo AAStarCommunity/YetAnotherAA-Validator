@@ -382,10 +382,18 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       // every broadcast failed for lack of funds), the replacement is priced at the current
       // estimate, so the fee never climbs on rejections alone.
       const hashes0 = state.registry.hashes ?? [state.registry.hash];
-      const raws0 = state.registry.raws ?? [state.registry.raw];
+      // a journal written before raws existed holds only the LATEST raw: it belongs to the last
+      // hash, the earlier ones have none (W2b Codex R7)
+      const raws0 =
+        state.registry.raws?.length === hashes0.length
+          ? state.registry.raws
+          : hashes0.map((_, i) => (i === hashes0.length - 1 ? state.registry.raw : null));
       let floorRaw = null;
       for (let i = hashes0.length - 1; i >= 0 && floorRaw === null; i--)
-        if (raws0[i] && (await reg.knows(hashes0[i]))) floorRaw = raws0[i];
+        if (await reg.knows(hashes0[i]))
+          // a known tx without its raw bytes: floor on the latest journalled raw, whose fees are
+          // never below an earlier one's (each replacement only rises from its floor)
+          floorRaw = raws0[i] ?? state.registry.raw;
       let rep;
       try {
         rep = await reg.sign(

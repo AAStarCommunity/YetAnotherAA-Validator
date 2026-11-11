@@ -572,6 +572,22 @@ function sinks(opts = {}) {
   );
 }
 {
+  // W2b Codex R7: a legacy journal (hashes [h0, h1], only raw1, no raws) whose node still knows
+  // the accepted replacement h1 must floor on raw1, not sign without a floor
+  const s = sinks({ mine: "pending" });
+  const r1 = await pub(bls, s, {}, { maxPendingMs: 0 });
+  const r2 = await pub(bls, s, r1.state, { maxPendingMs: 0 }); // one replacement: h0 -> h1
+  const { raws, ...legacy } = r2.state.registry; // the pre-raws journal shape
+  s.chain.known.clear();
+  s.chain.known.add(legacy.hash); // the node dropped h0 and keeps h1
+  await pub(bls, s, { ...r2.state, registry: legacy }, { maxPendingMs: 0 });
+  cell(
+    "R7: a legacy journal's accepted replacement (raw only for the last hash) still floors the next one",
+    s.calls.lastSignOpts.replace === true && s.calls.lastSignOpts.prevRaw === legacy.raw,
+    { opts: s.calls.lastSignOpts, legacyRaw: legacy.raw }
+  );
+}
+{
   // ...and a fee above the configured ceiling stops escalation, alerted on every pass
   const s = sinks({ mine: "pending" });
   const r1 = await pub(bls, s, {}, { maxPendingMs: 0 });
