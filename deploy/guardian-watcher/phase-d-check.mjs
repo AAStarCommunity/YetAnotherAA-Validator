@@ -262,6 +262,7 @@ for (const f of placeholder(composeFile) ? [] : [composeFile]) {
     composeNodes.add(m[1]);
 }
 const runningDvt = new Set();
+const allRunning = new Set();
 {
   // A DVT node is recognised by what makes it one, not by an image name (Codex R4 #2): every running
   // container whose environment HAS the node's required VALIDATOR_CONTRACT_ADDRESS key (only key
@@ -277,6 +278,7 @@ const runningDvt = new Set();
     for (const l of r.stdout.split("\n")) {
       const [n, img] = l.trim().split("\t");
       if (!n) continue;
+      allRunning.add(n);
       if (/(^|\/)aastar-dvt(:|@|$)/.test(img ?? "")) {
         runningDvt.add(n);
         continue;
@@ -305,6 +307,20 @@ const nodes = [
     ...runningDvt,
   ]),
 ];
+// completeness (Codex R5 #2): no discovery proves it (a renamed image can take its config from a
+// mounted .env), so EVERY running container must be classified: a DVT node (configured or
+// discovered) or explicitly excluded in dvtNodes.notDvt. An unclassified one fails.
+const notDvt = new Set(Array.isArray(cfg.dvtNodes?.notDvt) ? cfg.dvtNodes.notDvt : []);
+for (const n of allRunning)
+  if (!nodes.includes(n) && !notDvt.has(n))
+    add(
+      `node-unclassified:${n}`,
+      "FAIL",
+      "running container is neither a DVT node nor listed in dvtNodes.notDvt"
+    );
+for (const n of notDvt)
+  if (nodes.includes(n))
+    add(`node-unclassified:${n}`, "FAIL", "listed in dvtNodes.notDvt but discovered as a DVT node");
 for (const n of composeNodes)
   if (!nodes.includes(n))
     add(`node-slash-off:${n}`, "MISSING", "defined in compose, neither running nor configured");

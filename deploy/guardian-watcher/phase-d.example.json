@@ -50,7 +50,12 @@
   },
   "dvtNodes": {
     "compose": "docker-compose.testnet.yml",
-    "containers": ["dvt-node-1", "dvt-node-2", "dvt-node-3"]
+    "containers": ["dvt-node-1", "dvt-node-2", "dvt-node-3"],
+    "notDvt": [
+      "dvt-cloudflared",
+      "dvt-autoheal",
+      "<every other running container on the Mini that is not a DVT node>"
+    ]
   },
   "releaseEvidence": {
     "spParity": "~/.aoa-watcher/evidence/sp-evidence-parity.json",

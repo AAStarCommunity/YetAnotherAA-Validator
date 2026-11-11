@@ -400,8 +400,14 @@ if (isMain) {
     },
     rulesetBlob,
     spCommit: table.spCommit ?? null,
-    tool: table.tool ?? null,
-    toolVersion: table.toolVersion ?? null,
+    // no free-form provenance is printed, even label-shaped (a token can look like a label: Codex
+    // R5 #1): tool, toolVersion and command are reported as their sha256 digests
+    toolSha256:
+      typeof table.tool === "string" ? createHash("sha256").update(table.tool).digest("hex") : null,
+    toolVersionSha256:
+      typeof table.toolVersion === "string"
+        ? createHash("sha256").update(table.toolVersion).digest("hex")
+        : null,
     // the generator's command can carry an RPC URL or a token: only its digest is reported
     commandSha256:
       typeof table.command === "string"
