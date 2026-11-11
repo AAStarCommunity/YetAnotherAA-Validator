@@ -2313,10 +2313,29 @@ const good = {
         });
       await tick("2026-11-11T00:00:00.000Z", false);
       const afterUnhealthy = sent.some(t => /RECOVERED/.test(t));
+      // healthy, but written while the publication is still in progress: not a recovery (R18)
+      const inProgress = await heartbeat({
+        cfg: { dataDir: d, intervalMs: 60_000, heartbeat: { label: "t" } },
+        now: Date.parse("2026-11-11T00:00:30.000Z"),
+        readStatus: () =>
+          JSON.stringify({
+            at: "2026-11-11T00:00:30.000Z",
+            healthy: true,
+            degraded: [],
+            lagBlocks: 0,
+            publication: { inProgress: true },
+          }),
+        statMtime: () => Date.parse("2026-11-11T00:00:30.000Z"),
+        send: async t => (sent.push(t), true),
+        readState: () => st,
+        writeState: x => ((st = x), true),
+      });
+      void inProgress;
+      const afterInProgress = sent.some(t => /RECOVERED/.test(t));
       await tick("2026-11-11T00:01:00.000Z", true);
       cell(
-        "N1: no RECOVERED while the fresh status is unhealthy; RECOVERED once it is healthy",
-        !afterUnhealthy && sent.some(t => /RECOVERED/.test(t)),
+        "N1/R18: no RECOVERED while the status is unhealthy or publication is in progress; RECOVERED once a completed iteration is healthy",
+        !afterUnhealthy && !afterInProgress && sent.some(t => /RECOVERED/.test(t)),
         sent
       );
     } finally {

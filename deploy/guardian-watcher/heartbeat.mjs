@@ -117,9 +117,14 @@ export async function check({
         sent = problem.key;
       }
     }
-  } else if (state.alerting && status?.healthy === true) {
-    // recovery needs a positive healthy: a fresh but unhealthy status below the unhealthy
-    // threshold is not "recovered" (#413 review N1); the alert stays open until it is
+  } else if (
+    state.alerting &&
+    status?.healthy === true &&
+    status.publication?.inProgress !== true
+  ) {
+    // recovery needs a positive healthy from a completed iteration: a fresh but unhealthy status
+    // below the unhealthy threshold (#413 review N1), or one written while publication is still
+    // in progress (Codex W2c R18), is not "recovered"; the alert stays open until it is
     const ok = await send(
       `[aoa-watcher] ${host}: RECOVERED (status fresh, lag within ${maxLag}, healthy)`
     );

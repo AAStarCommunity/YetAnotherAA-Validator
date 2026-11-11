@@ -104,6 +104,20 @@ export function stallReasons(publication) {
 }
 
 /**
+ * Why a publication result makes the watcher degraded (#413 review B1), fixed wording: a pass that
+ * threw or did not report ok, and the store-wide disclose stalls (DSR, #411 F1). The heartbeat
+ * alerts on healthy: false.
+ */
+export function publicationReasons(publication) {
+  const reasons = [];
+  if (publication?.error) reasons.push("publication pass failed (see the alerts)");
+  else if (publication?.ok !== true)
+    reasons.push("publication pass not ok (a stage failed, stopped or was skipped)");
+  reasons.push(...stallReasons(publication));
+  return reasons;
+}
+
+/**
  * One iteration's publication, as the resident loop runs it (#413 review B1): a pass that throws,
  * or that does not report ok, makes the watcher degraded (fixed wording, healthy = false) so the
  * heartbeat sees it; so do disclose stalls and a slow iteration. Returns the next slowNote.
@@ -116,13 +130,7 @@ export async function publicationStep({ status, run, slowNote, iterStart, cfg, n
   } catch (e) {
     status.publication = { error: safeText("publication", e) };
   }
-  const reasons = [];
-  if (status.publication?.error) reasons.push("publication pass failed (see the alerts)");
-  else if (status.publication?.ok !== true)
-    reasons.push("publication pass not ok (a stage failed, stopped or was skipped)");
-  // a stalled disclose is a degraded watcher (DSR, #411 F1), whatever else the pass did; fixed
-  // wording, counts only. The heartbeat alerts on healthy: false.
-  reasons.push(...stallReasons(status.publication));
+  const reasons = publicationReasons(status.publication);
   // the whole iteration (scan and publication) against the interval: a slow one is degraded,
   // and alerted by the next pass (tickMs covers the scan alone)
   status.iterationMs = now() - iterStart;
@@ -259,6 +267,9 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
       extra.push(
         `tick took ${status.tickMs} ms, more than ${Math.round(tm.limit)} ms (maxTickFraction of the interval)`
       );
+    // the status written before this iteration's publication keeps the last publication's
+    // degradation (Codex W2c R18): a scan-only "healthy" must not read as recovered
+    if (carry?.publication) extra.push(...publicationReasons(carry.publication));
     status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
     status.healthy = status.ok === true && !status.degraded;
   };
