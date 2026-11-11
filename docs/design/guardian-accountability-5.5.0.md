@@ -687,6 +687,30 @@ detection time, pause tx time.
   lag, RPC failure, low balance, stale heartbeat.
 - Sender: a new low-balance EOA, JSON keystore, password in the macOS Keychain.
   Never in `.env` or plaintext; not a guardian, owner or deployer key.
+- **Phase D pre-deploy check — trust boundary (DSR, #407).**
+  `npm run check:phase-d` defends against two things only: an **honest
+  operator's mistake** (a wrong config, a wrapper not reinstalled, a config
+  edited or a checkout pulled without restarting the watcher, the committee
+  keeper or apply-rotation job left on, a node without explicit
+  `AUDIT_ENABLED=false` and `AUDIT_EXECUTE_SLASH=false`) and **secret
+  disclosure**: no Keychain value (RPC URL, token, keystore password) is ever
+  printed; the report carries only fixed wording, Keychain service and account
+  names, and the operator labels from the Phase D config, which are public data
+  (a label that looks like a URL is replaced, not printed). It checks the
+  running watcher process itself: the live PID's command line, its `RPC_URL` /
+  `RPC_URL_2` against the Keychain, and that the process started after the
+  modification time of the files it checks (the watcher config, the wrapper, the
+  watcher's sources and their relative imports, and the lockfile); it does not
+  inspect what the process actually loaded. It does **not** defend against the
+  Mini's operator: whoever controls the Mini's user account and launchd can
+  spoof a process title, ship a fake `node`, forge environment entries or
+  backdate mtimes. The Mini operator is a trust root of the deployment, on the
+  same level as the RPC trust assumption (§5.2a: the RPC is an operator-chosen
+  node), not something Phase D verifies. Also accepted: SP's table generator,
+  the operator's own declarations (RPC operators, the notDvt container list),
+  the checkout Phase D runs from, and `node_modules` beyond the lockfile's
+  mtime. The paper's limitations section is to state the same boundary (DSR owns
+  that wording).
 
 ## 6. Random committee (D7: prepared, not enabled)
 
