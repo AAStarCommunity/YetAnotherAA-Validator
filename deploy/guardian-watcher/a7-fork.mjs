@@ -34,7 +34,7 @@ import { ethers } from "ethers";
 import {
   validate,
   compare,
-  redact,
+  sanitize,
   SCHEMA_ID,
   SCHEMA_SHA256,
   SCHEMA_SOURCE,
@@ -455,7 +455,7 @@ const record = {
   verdict: proven ? "SAME STATE: drills may run" : "STOP: the fork is not proven to be SP's state",
   rpc: args.includes("--keep") ? rpc : null,
 };
-const text = JSON.stringify(record, (k, v) => (k === "rpc" ? v : redact(k, v)), 2);
+const text = JSON.stringify(sanitize(record, new Set(["rpc"])), null, 2);
 if (recordPath) writeFileSync(recordPath, text + "\n");
 console.log(text);
 process.exit(proven ? 0 : 1);

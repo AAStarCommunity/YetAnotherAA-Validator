@@ -11,6 +11,7 @@ import {
   validate,
   compare,
   redact,
+  sanitize,
   SCHEMA_SHA256,
   ANVIL_COMMIT,
   EIP1967_IMPL,
@@ -593,6 +594,18 @@ await mut(
 {
   const t = JSON.stringify({ providers: ["https://rpc.example/KEY"], tag: "wss://x" }, redact);
   cell("R1#5: URL-like strings are redacted", !/KEY|wss:/.test(t), t);
+  // Codex A7 R4: a URL as an object KEY (e.g. a role name) is redacted too
+  const rb = clone();
+  rb.contracts.blsAggregator.roles = { "https://rpc.example/FAKE_SECRET": [] };
+  const r = await run(rb);
+  const out = JSON.stringify(
+    sanitize({ failed: r.cmp.filter(x => !x.ok), unverified: r.unverified })
+  );
+  cell(
+    "R4: a URL-shaped key in the read-back never reaches the record",
+    !/FAKE_SECRET|https:/.test(out) && /redacted key/.test(out),
+    out.slice(0, 600)
+  );
 }
 // ---- null = absent from SP's ABI, never by calling
 {

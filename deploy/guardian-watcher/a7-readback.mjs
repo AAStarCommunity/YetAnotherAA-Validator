@@ -753,5 +753,21 @@ export async function compare(rb, reader, facts) {
 }
 
 /** Any string that looks like a URL is redacted before printing or recording (Codex A7 R1 #5). */
-export const redact = (k, v) =>
-  typeof v === "string" && /[a-z][a-z0-9+.-]*:\/\//i.test(v) ? "(redacted)" : v;
+const URLISH = /[a-z][a-z0-9+.-]*:\/\//i;
+export const redact = (k, v) => (typeof v === "string" && URLISH.test(v) ? "(redacted)" : v);
+/** Deep copy with URL-like KEYS and string values redacted (Codex A7 R4): a JSON replacer can
+ * rewrite values but not keys, and read-back keys (e.g. role names) are external input. */
+export function sanitize(v, keep = new Set()) {
+  if (Array.isArray(v)) return v.map(x => sanitize(x, keep));
+  if (typeof v === "bigint") return v.toString();
+  if (v && typeof v === "object") {
+    const out = {};
+    let n = 0;
+    for (const [k, x] of Object.entries(v)) {
+      const key = URLISH.test(k) ? `(redacted key ${++n})` : k;
+      out[key] = keep.has(k) ? x : sanitize(x, keep);
+    }
+    return out;
+  }
+  return redact("", v);
+}
