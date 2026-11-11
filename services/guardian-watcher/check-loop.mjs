@@ -3448,6 +3448,58 @@ const good = {
       );
       for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
     }
+    // (h) Codex W2d R10: a replacement signed by another writer journals that writer, so the stage
+    // keeps counting as the current writer's (fill-nonce refuses it; a later switch waits for it);
+    // and the signed bytes, not a stale `from`, name the signer
+    {
+      const d = tmp();
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a1 = sinks({ registryAddress: OLD, rejectBroadcast: true });
+      a1.chain.nonce = 5;
+      await pass(store, a1);
+      const a2 = sinks({ registryAddress: OLD, rawTag: "h", writer: W2, rejectBroadcast: true });
+      a2.chain.nonce = 5;
+      await pass(store, a2, { maxPendingMs: 0 });
+      const jr = store.getPublication(id).registry;
+      a2.chain.pendingNonce = 6;
+      const held = await planFill(store, a2.registry, whereOf(OLD), 5);
+      const b = sinks({ registryAddress: NEW, rawTag: "h2", writer: W2 });
+      b.chain.nonce = 5;
+      b.chain.pendingNonce = 6;
+      await pass(store, b);
+      const jb = store.getPublication(id);
+      const { stageSigner } = await import("./lib/publish.mjs");
+      const signerW = ethers.Wallet.createRandom();
+      const realRaw = await signerW.signTransaction({
+        to: signerW.address,
+        nonce: 5,
+        chainId: 1,
+        type: 2,
+        maxFeePerGas: 1n,
+        maxPriorityFeePerGas: 1n,
+        gasLimit: 21000n,
+      });
+      const fromBytes = stageSigner({ raw: realRaw, from: ethers.getAddress(W2) });
+      cell(
+        "B2-A(h) R10: a replacement by another writer journals that writer; fill-nonce refuses the nonce on the current registry and a later switch waits for it; the signed bytes name the signer over a stale from",
+        jr.replacements === 1 &&
+          jr.from === ethers.getAddress(W2) &&
+          /on the current registry/.test(held.refuse ?? "") &&
+          jb.registryWait?.nonce === 5 &&
+          jb.registry.at?.address === OLD &&
+          b.calls.sign === 0 &&
+          fromBytes === signerW.address,
+        {
+          jr: [jr.replacements, jr.from],
+          held,
+          wait: jb.registryWait,
+          sign: b.calls.sign,
+          fromBytes,
+        }
+      );
+      rmSync(d, { recursive: true, force: true });
+    }
     // (f) another writer (the M0 §5.5a recovery) or another chain has its own nonce space: no wait;
     // a stage already waiting is archived at once when the chain changes (Codex W2d R7 #1)
     {

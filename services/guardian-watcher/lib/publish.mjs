@@ -399,16 +399,20 @@ export const sameRegistry = (at, where) =>
   !!at && at.address === where.address && at.chainId === where.chainId;
 
 const IN_FLIGHT = new Set(["signed", "sent", "landed"]);
-/** The address that signed a journalled stage's tx: its `from`, or its raw's signer; or null. */
+/**
+ * The address that signed a journalled stage's LATEST tx: its raw's signer, which the signed bytes
+ * prove; the journalled `from` only when the raw does not parse (Codex W2d R10: a stale `from`
+ * must never override the bytes); or null.
+ */
 export function stageSigner(r) {
-  if (typeof r?.from === "string" && ethers.isAddress(r.from)) return ethers.getAddress(r.from);
   if (r?.raw)
     try {
       const f = ethers.Transaction.from(r.raw).from;
-      return f ? ethers.getAddress(f) : null;
+      if (f) return ethers.getAddress(f);
     } catch {
-      return null;
+      // not a parseable signed tx: fall back to the journalled field
     }
+  if (typeof r?.from === "string" && ethers.isAddress(r.from)) return ethers.getAddress(r.from);
   return null;
 }
 /**
@@ -618,6 +622,9 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
         ...rest,
         raw: rep.raw,
         hash: rep.hash,
+        // the signer of the tx now in the journal (Codex W2d R10): a replacement signed by another
+        // writer must not keep the previous writer's identity
+        ...(rep.from ? { from: rep.from } : {}),
         // an identical re-sign (flat estimate, nothing accepted) is not journalled again (#411 N1)
         hashes: hashes0.includes(rep.hash) ? hashes0 : [...hashes0, rep.hash],
         raws: hashes0.includes(rep.hash) ? raws0 : [...raws0, rep.raw],
