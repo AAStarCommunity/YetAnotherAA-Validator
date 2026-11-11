@@ -89,6 +89,8 @@ export async function publishPending(
     parked: 0,
     deferred: 0,
     unreadable: 0,
+    feeCapped: 0, // a disclose tx whose replacement needs a fee above maxFeePerGas (#411 F1)
+    insufficientFunds: 0, // a disclose tx the writer cannot pay for (#411 F1)
   };
   const pinners = (sinks.pinners ?? []).map(p => p.name);
   const sched = getSchedule(store);
@@ -210,6 +212,10 @@ export async function publishPending(
       };
       if (done) counts.done++;
       if (openIncident(r.state)) counts.incidents++;
+      // the two disclose stalls the watcher must report as degraded, not only alert (DSR)
+      if (r.state.registry?.feeCapped) counts.feeCapped++;
+      if (/INSUFFICIENT_FUNDS/.test(String(r.state.registry?.lastBroadcastError ?? "")))
+        counts.insufficientFunds++;
     } catch (err) {
       entries[id] = { ...e, lastRunAt: now(), failing: true }; // a failure still rotates (R2)
       counts.failed++;

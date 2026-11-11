@@ -1594,6 +1594,37 @@ const good = {
   }
 }
 
+// ---- #411 F1 / DSR: a fee-capped or unfunded disclose is counted and makes the watcher degraded
+{
+  const { stallReasons } = await import("./watcher.mjs");
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(bls);
+    const s = sinks({ mine: "pending", rejectBroadcast: true });
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
+    await publishPending(store, sk, { maxPendingMs: 0 });
+    const p2 = await publishPending(store, sk, { maxPendingMs: 0 });
+    const reasons = stallReasons(p2.counts);
+    cell(
+      "F1: an unfunded disclose is counted (insufficientFunds) and becomes a fixed-wording degraded reason",
+      p2.counts.insufficientFunds === 1 &&
+        reasons.length === 1 &&
+        /insufficient funds/.test(reasons[0]),
+      { counts: p2.counts, reasons }
+    );
+    cell(
+      "F1: a fee-capped disclose becomes a degraded reason; nothing when there is no stall",
+      stallReasons({ feeCapped: 2 })[0] ===
+        "2 disclose tx(s) need a fee above registry.maxFeePerGas" &&
+        stallReasons({ feeCapped: 0, insufficientFunds: 0 }).length === 0,
+      stallReasons({ feeCapped: 2 })
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

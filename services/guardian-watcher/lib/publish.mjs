@@ -50,6 +50,25 @@ const bytesEqual = (a, b) => a.length === b.length && a.every((x, i) => x === b[
 // Never e.shortMessage / e.message of a foreign error (Codex W2b R3): see lib/safe-error.mjs.
 const errMsg = e => safeText("unexpected", e);
 
+/** Of the journalled raw txs, the one with the highest maxFeePerGas (#411 N2): a known tx whose raw
+ * is missing is floored on the most expensive raw we have, since the unfloored re-sign branch
+ * means the latest raw is not necessarily the most expensive one. */
+export function highestFeeRaw(raws) {
+  let best = null;
+  let bestFee = -1n;
+  for (const r of raws) {
+    if (!r) continue;
+    try {
+      const fee = ethers.Transaction.from(r).maxFeePerGas ?? 0n;
+      if (fee > bestFee) [best, bestFee] = [r, fee];
+    } catch {
+      // not a parseable tx (a test stub): ignored unless nothing else exists
+      if (best === null) best = r;
+    }
+  }
+  return best;
+}
+
 /** The disclose() arguments for a BLS record (registry ABI: Signed + record context). */
 export function discloseArgs(rec, file) {
   const kind = Kind[rec.kind];
@@ -427,7 +446,7 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
         if (await reg.knows(hashes0[i]))
           // a known tx without its raw bytes: floor on the latest journalled raw, whose fees are
           // never below an earlier one's (each replacement only rises from its floor)
-          floorRaw = raws0[i] ?? state.registry.raw;
+          floorRaw = raws0[i] ?? highestFeeRaw(raws0);
       let rep;
       try {
         rep = await reg.sign(
@@ -451,8 +470,9 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
         ...rest,
         raw: rep.raw,
         hash: rep.hash,
-        hashes: [...hashes0, rep.hash],
-        raws: [...raws0, rep.raw],
+        // an identical re-sign (flat estimate, nothing accepted) is not journalled again (#411 N1)
+        hashes: hashes0.includes(rep.hash) ? hashes0 : [...hashes0, rep.hash],
+        raws: hashes0.includes(rep.hash) ? raws0 : [...raws0, rep.raw],
         sentAt: new Date().toISOString(),
         replacements: (state.registry.replacements ?? 0) + 1,
       };

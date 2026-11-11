@@ -84,6 +84,18 @@ export function loadConfig(path) {
   };
 }
 
+/** The disclose stalls that make the watcher degraded (DSR, #411 F1): fixed wording, counts only. */
+export function stallReasons(publication) {
+  const out = [];
+  if (publication?.feeCapped)
+    out.push(`${publication.feeCapped} disclose tx(s) need a fee above registry.maxFeePerGas`);
+  if (publication?.insufficientFunds)
+    out.push(
+      `${publication.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
+    );
+  return out;
+}
+
 export const TRACE_VERIFY_MS = 3_600_000;
 
 /**
@@ -322,6 +334,13 @@ async function main() {
         status.publication = { error: safeText("publication", e) };
       }
       lastPub = status.publication;
+      // a stalled disclose is a degraded watcher (DSR, #411 F1), whatever else the pass did; fixed
+      // wording, counts only. The heartbeat alerts on healthy: false.
+      const stalls = stallReasons(status.publication);
+      if (stalls.length) {
+        status.degraded = [...(status.degraded ?? []), ...stalls];
+        status.healthy = false;
+      }
       // the whole iteration (scan and publication) against the interval: a slow one is degraded,
       // and alerted by the next pass (tickMs covers the scan alone)
       status.iterationMs = Date.now() - iterStart;

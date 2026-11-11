@@ -873,6 +873,38 @@ cell(
   );
 }
 
+// ---- #411 review N1 / N2
+{
+  // N1: nothing accepted, a flat estimate: the identical re-sign is not appended again
+  const s = sinks({ mine: "pending", rejectBroadcast: true, deterministicSign: true });
+  let st = {};
+  for (let i = 0; i < 5; i++) st = (await pub(bls, s, st, { maxPendingMs: 0 })).state;
+  cell(
+    "N1: repeated identical re-signs do not grow the journal",
+    st.registry.hashes.length === 1 && st.registry.raws.length === 1 && s.calls.sign >= 3,
+    { hashes: st.registry.hashes.length, sign: s.calls.sign }
+  );
+  // N2: the floor for a known tx without its raw is the most expensive raw journalled
+  const { highestFeeRaw } = await import("./lib/publish.mjs");
+  const w = ethers.Wallet.createRandom();
+  const tx = fee =>
+    w.signTransaction({
+      type: 2,
+      chainId: 1,
+      nonce: 0,
+      to: w.address,
+      maxFeePerGas: fee,
+      maxPriorityFeePerGas: 1n,
+      gasLimit: 21000n,
+    });
+  const cheapLatest = [await tx(1250n), null, await tx(1000n)];
+  cell(
+    "N2: the highest-fee journalled raw is the floor, not the latest one",
+    highestFeeRaw(cheapLatest) === cheapLatest[0],
+    null
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

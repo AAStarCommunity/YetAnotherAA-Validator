@@ -122,9 +122,14 @@ export function sinks(opts = {}) {
         calls.sign++;
         calls.lastArgs = args;
         calls.lastSignOpts = o;
-        const raw = `0xraw${calls.sign}`;
+        // deterministicSign: the same args and nonce sign to the same tx (a flat estimate)
+        const raw = opts.deterministicSign ? `0xraw0` : `0xraw${calls.sign}`;
         chain.signedArgs.set(raw, args);
-        return { raw, hash: ethers.id(`disclose-${calls.sign}`), nonce: o.nonce ?? chain.nonce };
+        return {
+          raw,
+          hash: ethers.id(`disclose-${opts.deterministicSign ? 0 : calls.sign}`),
+          nonce: o.nonce ?? chain.nonce,
+        };
       },
       async broadcast(raw) {
         calls.broadcast++;
