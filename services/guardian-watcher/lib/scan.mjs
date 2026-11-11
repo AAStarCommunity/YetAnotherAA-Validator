@@ -914,13 +914,14 @@ function largerThan(v, max) {
   const st = [v];
   while (st.length) {
     const x = st.pop();
-    if (typeof x === "string") n += x.length + 2;
+    // the string's encoded size: JSON escapes and UTF-8 bytes, not its character count (R12)
+    if (typeof x === "string") n += Buffer.byteLength(JSON.stringify(x), "utf8");
     else if (x && typeof x === "object") {
       const keys = Array.isArray(x) ? null : Object.keys(x);
       n += 2;
       if (keys)
         for (const k of keys) {
-          n += k.length + 4;
+          n += Buffer.byteLength(JSON.stringify(k), "utf8") + 2;
           st.push(x[k]);
         }
       else
@@ -1015,18 +1016,23 @@ export function rawLogKey(l) {
   // case-folded only where case carries no meaning (valid hex); a malformed string is kept exactly,
   // so "BAD" and "bad" stay two observations (follow-up #2 R11)
   const h = x => (typeof x === "string" && /^0x[0-9a-fA-F]*$/.test(x) ? x.toLowerCase() : x);
+  // Each field with its presence: a missing field and an explicit null are two observations
+  // (follow-up #2 R12). "Present" = an own property whose value is not undefined, which is what
+  // survives storage, so a stored observation keeps the identity it was seen with.
+  const f = (k, map = x => x) =>
+    l && typeof l === "object" && Object.hasOwn(l, k) && l[k] !== undefined ? [1, map(l[k])] : [0];
   return safeJson([
-    h(l?.address),
-    Array.isArray(l?.topics) ? l.topics.map(h) : l?.topics,
-    h(l?.data),
-    l?.index ?? null,
-    l?.logIndex ?? null,
-    l?.removed ?? null,
-    h(l?.transactionHash),
+    f("address", h),
+    f("topics", t => (Array.isArray(t) ? t.map(h) : t)),
+    f("data", h),
+    f("index"),
+    f("logIndex"),
+    f("removed"),
+    f("transactionHash", h),
     // block identity too: copies that disagree on their block are a conflict, not duplicates
     // (Codex follow-up R3)
-    h(l?.blockHash),
-    l?.blockNumber ?? null,
+    f("blockHash", h),
+    f("blockNumber"),
   ]);
 }
 

@@ -4956,8 +4956,22 @@ try {
     for (let i = 0; i < 4; i++) c.mine();
     const store = new Store(d);
     fast = (await runOnce(c.chain, { ...base, intervalMs: 600_000 }, store, rs, ident)).status;
-    // an interval so short that any tick exceeds half of it
-    slow = (await runOnce(c.chain, { ...base, intervalMs: 0.001 }, store, rs, ident)).status;
+    // capability verification made slow (20 ms per receipt): the tick time must include it
+    const slowChain = Object.create(c.chain);
+    slowChain.getTransactionReceipt = async h => {
+      await new Promise(r => setTimeout(r, 20));
+      return c.chain.getTransactionReceipt(h);
+    };
+    // a fresh store, so capability verification runs (no stored proof yet)
+    const d2 = mkdtempSync(join(tmpdir(), "guardian-watcher-timing2-"));
+    try {
+      // scanning starts after the owner tx: only the capability check (which samples recent
+      // blocks) reads a receipt, so the slowness can come from finish() alone
+      const cfgSlow = { ...base, startBlock: c.head() + 1, intervalMs: 20 };
+      slow = (await runOnce(slowChain, cfgSlow, new Store(d2), rs, ident)).status;
+    } finally {
+      rmSync(d2, { recursive: true, force: true });
+    }
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -4966,9 +4980,70 @@ try {
     Number.isFinite(fast.tickMs) &&
       fast.archiveFiles >= 1 &&
       !(fast.degraded ?? []).some(r => /tick took/.test(r)) &&
-      (slow.degraded ?? []).some(r => /tick took \d+ ms, more than 0 ms/.test(r)) &&
+      (slow.degraded ?? []).some(r => /tick took \d+ ms, more than 10 ms/.test(r)) &&
+      slow.tickMs >= 20 &&
       slow.healthy === false,
     { fast: [fast.tickMs, fast.archiveFiles, fast.degraded], slow: [slow.tickMs, slow.degraded] }
+  );
+}
+
+// ---- follow-up #2 R12: a missing field and an explicit null are two observations, through
+// retries; evidence size is measured as encoded bytes
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-r12-"));
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  const store = new Store(d);
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const gs = spIface.encodeEventLog("GuardianSet", [addr("r12-a"), addr("r12-b")]);
+  const h = ethers.id("r12-null");
+  const hn = ethers.id("r12-nul");
+  let w1, w3, nul;
+  try {
+    for (let i = 0; i < 4; i++) c.mine();
+    const { data, ...noData } = {
+      address: SP,
+      ...gs,
+      blockNumber: cfg.startBlock,
+      index: 0,
+      transactionHash: h,
+    };
+    void data;
+    c.injectRawResult(SP, noData);
+    c.injectRawResult(SP, { ...noData, data: null });
+    // 20 000 NUL characters: 20 000 characters, but 120 000 bytes of JSON
+    c.injectRawResult(SP, {
+      address: SP,
+      ...gs,
+      data: "\u0000".repeat(20_000),
+      blockNumber: cfg.startBlock,
+      index: 1,
+      transactionHash: hn,
+    });
+    await runOnce(c.chain, cfg, store, rs, ident);
+    w1 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    for (let i = 0; i < 2; i++) await runOnce(c.chain, cfg, store, rs, ident);
+    w3 = store.getDeadLetter(`tx-${h.toLowerCase()}`)?.watched ?? [];
+    nul = store.getDeadLetter(`tx-${hn.toLowerCase()}`)?.watched ?? [];
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  cell(
+    "follow-up R12: a log missing `data` and one with data: null are two stored observations, unchanged by retries; 20 000 NUL characters (120 KB of JSON) are a placeholder",
+    w1.length === 2 &&
+      w1.some(w => Object.hasOwn(w, "data") && w.data === null) &&
+      w1.some(w => !Object.hasOwn(w, "data")) &&
+      JSON.stringify(w3) === JSON.stringify(w1) &&
+      nul.length === 1 &&
+      /^0x[0-9a-f]{64}$/.test(nul[0].rawSha256 ?? ""),
+    { n1: w1.length, w1, n3: w3.length, nul: nul.map(x => [x.raw?.slice?.(0, 20), x.rawLength]) }
   );
 }
 

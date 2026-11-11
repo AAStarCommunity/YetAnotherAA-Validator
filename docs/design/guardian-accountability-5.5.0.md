@@ -547,16 +547,18 @@ aggregator-only.
     identity, not by its parent's keys. Store lookups do not grow with the
     archive: a BLS record is found by its kind's file name, and a dead letter's
     retirements are numbered by a durable counter.
-  - An evidence item over 64 KB of JSON is stored as the same placeholder. The
-    stored observation is the received one: every own field is kept as received
-    (including `null` and `false`), a key named `__proto__` stays a plain key,
-    and only valid hex is case-folded for comparison.
+  - An evidence item over 64 KB of encoded JSON (escapes and UTF-8 bytes
+    counted) is stored as the same placeholder. The stored observation is the
+    received one: every own field is kept as received (including `null` and
+    `false`), a key named `__proto__` stays a plain key, and only valid hex is
+    case-folded for comparison; a missing field and an explicit `null` are two
+    different observations.
   - Accepted bound (DSR 97a9d55c): each tick's work is linear in the local
     archive size (status totals are recounted from the directories). It is
-    visible: `status.json` reports `archiveFiles` and the tick's `tickMs`, and a
-    tick slower than `maxTickFraction` (default 0.5) of the poll interval is
-    degraded. An active dead-letter index with recoverable counters is planned
-    after 5.5.0.
+    visible: `status.json` reports `archiveFiles` and the whole tick's `tickMs`
+    (capability verification included), and a tick slower than `maxTickFraction`
+    (default 0.5) of the poll interval is degraded. An active dead-letter index
+    with recoverable counters is planned after 5.5.0.
   - Identities stay distinct at any depth: a deep value is keyed by the sha256
     of its full text, and the placeholder it is stored as keeps that digest, so
     distinct deep observations are never merged and a retry never duplicates

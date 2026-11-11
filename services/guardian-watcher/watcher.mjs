@@ -184,6 +184,15 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
     // not read (#403 review L-2). The scan still moved on; the reason and count say why.
     const extra = isolated ? [`${isolated} malformed RPC answer(s) isolated this tick`] : [];
     for (const m of more) extra.push(m);
+    // measured last, after capability verification and the archive count, so the whole tick shows
+    // (follow-up #2 R12)
+    const tm = timing();
+    status.archiveFiles = tm.files;
+    status.tickMs = Date.now() - tickStart;
+    if (status.tickMs > tm.limit)
+      extra.push(
+        `tick took ${status.tickMs} ms, more than ${Math.round(tm.limit)} ms (maxTickFraction of the interval)`
+      );
     status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
     status.healthy = status.ok === true && !status.degraded;
   };
@@ -224,14 +233,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
         unchecked: s.bloomUnchecked,
       },
     });
-    const tm = timing();
-    status.tickMs = tm.ms;
-    status.archiveFiles = tm.files;
     const more = [];
-    if (tm.ms > tm.limit)
-      more.push(
-        `tick took ${tm.ms} ms, more than ${Math.round(tm.limit)} ms (maxTickFraction of the interval)`
-      );
     if (s.budgetStop) more.push("isolation budget reached this tick (the rest is read next tick)");
     const lag = cur ? s.finalized - cur.block : null;
     const maxLag = cfg.maxLagBlocks ?? 300;
@@ -246,9 +248,6 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
     status.records = store.countRecords();
     status.deadLetters = store.listDeadLetters().length;
     status.cursor = store.getCursor()?.block ?? null;
-    const tm = timing();
-    status.tickMs = tm.ms;
-    status.archiveFiles = tm.files;
     await finish(null, null);
     store.writeStatus(status);
     return { status, summary: null };
