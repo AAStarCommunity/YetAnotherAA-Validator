@@ -1896,6 +1896,153 @@ const good = {
   }
 }
 
+// ---- Codex W2c R15: deferred records, lost saves across a restart, unreadable record files
+{
+  const { stallCounts } = await import("./lib/publisher.mjs");
+  const schedPath = d => join(d, "publish-schedule.json");
+  const recs = (n, tag) =>
+    Array.from({ length: n }, (_, i) => ({
+      ...bls,
+      key: String(7000 + i),
+      proposalId: String(7000 + i),
+      txHash: ethers.id(`${tag}-${i}`),
+    }));
+  const skOf = s => ({
+    pinners: s.pinners,
+    mirror: s.mirror,
+    telegram: s.telegram,
+    registry: s.registry,
+  });
+  // #1: reconstruction with deferred records (one run per pass) still counts every journal read
+  {
+    const d = tmp();
+    try {
+      const st0 = new Store(d);
+      for (const r of recs(3, "r15a")) st0.putRecord(r);
+      const sk = skOf(sinks({ mine: "pending", rejectBroadcast: true }));
+      await publishPending(st0, sk, { maxPendingMs: 0 });
+      writeFileSync(schedPath(d), "{bad");
+      const p = await publishPending(new Store(d), sk, { maxPendingMs: 0, maxRecords: 1 });
+      cell(
+        "R15#1: records deferred by the run budget are refreshed from their journals (3 stalls, not 1)",
+        p.counts.deferred === 2 && p.stalls.insufficientFunds === 3 && !p.stalls.unknown,
+        { counts: p.counts, stalls: p.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #2: saves lost over several passes, then a restart: unknown until a sweep, never a false clean
+  {
+    const d = tmp();
+    try {
+      const st = new Store(d);
+      for (const r of recs(2, "r15b")) st.putRecord(r);
+      const funded = sinks({ mine: "pending" });
+      const p0 = await publishPending(st, skOf(funded), { maxPendingMs: 60 * 60_000 });
+      const savedClean = !p0.stalls.unknown && p0.stalls.insufficientFunds === 0;
+      st.putSchedule = () => {
+        throw new Error("disk full");
+      };
+      const broke = skOf(sinks({ mine: "pending", rejectBroadcast: true }));
+      await publishPending(st, broke, { maxPendingMs: 60 * 60_000, maxParse: 1 });
+      const pm = await publishPending(st, broke, { maxPendingMs: 60 * 60_000, maxParse: 1 });
+      const restarted = new Store(d); // the saved schedule is the clean one of p0
+      const r1 = await publishPending(restarted, broke, { maxPendingMs: 60 * 60_000, maxParse: 1 });
+      const r2 = await publishPending(restarted, broke, { maxPendingMs: 60 * 60_000, maxParse: 1 });
+      cell(
+        "R15#2: after a restart over lost saves the first bounded pass reports unknown, then the sweep gives the true count",
+        savedClean &&
+          pm.stalls.insufficientFunds === 2 &&
+          r1.stalls.unknown === true &&
+          !r2.stalls.unknown &&
+          r2.stalls.insufficientFunds === 2,
+        { savedClean, pm: pm.stalls, r1: r1.stalls, r2: r2.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // the same reconciliation is invisible for a store one pass can sweep: a restart reports known
+  {
+    const d = tmp();
+    try {
+      const st = new Store(d);
+      st.putRecord(bls);
+      const sk = skOf(sinks({ mine: "pending", rejectBroadcast: true }));
+      await publishPending(st, sk, { maxPendingMs: 0 });
+      const p = await publishPending(new Store(d), sk, { maxPendingMs: 0 });
+      cell(
+        "R15#2: a restart on a store swept in one pass reports the count at once (no spurious unknown)",
+        !p.stalls.unknown && p.stalls.insufficientFunds === 1,
+        p.stalls
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // a run that fails after its journal advanced: the entry takes the journal's stall, not the
+  // listing's. Pass 1 journals an unfunded stall; in pass 2 the writer is funded, the rebroadcast
+  // goes through and the cleared state is journalled, then the next journal write fails.
+  {
+    const d = tmp();
+    try {
+      class FailAfterClear extends Store {
+        mode = "off";
+        putPublication(id, st) {
+          if (this.mode === "fire") throw new Error("disk full");
+          super.putPublication(id, st);
+          const r = st?.registry;
+          if (this.mode === "armed" && r?.phase === "sent" && r.lastBroadcastError === undefined)
+            this.mode = "fire";
+        }
+      }
+      const st = new FailAfterClear(d);
+      st.putRecord(bls);
+      const sk = skOf(sinks({ mine: "pending", rejectBroadcast: true }));
+      const p1 = await publishPending(st, sk, { maxPendingMs: 0 });
+      st.mode = "armed";
+      const sk2 = { ...sk, registry: sinks({ mine: "pending" }).registry };
+      const p2 = await publishPending(st, sk2, { maxPendingMs: 0 });
+      const disk = st.getPublication(Store.recordId(bls))?.registry;
+      cell(
+        "R15: a run that fails after journalling a cleared stall takes the journal's state (0), not the listing's (1)",
+        p1.stalls.insufficientFunds === 1 &&
+          st.mode === "fire" &&
+          p2.counts.failed >= 1 &&
+          disk?.lastBroadcastError === undefined &&
+          p2.stalls.insufficientFunds === 0,
+        { p1: p1.stalls, mode: st.mode, p2: [p2.counts, p2.stalls], disk }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #3: a record file that cannot be read keeps the state unknown, whatever its journal says
+  {
+    const d = tmp();
+    try {
+      const st = new Store(d);
+      st.putRecord(bls);
+      const sk = skOf(sinks({ mine: "pending", rejectBroadcast: true }));
+      await publishPending(st, sk, { maxPendingMs: 0 });
+      writeFileSync(join(d, "records", `${Store.recordId(bls)}.json`), "{corrupt");
+      const fresh = new Store(d);
+      const a = await publishPending(fresh, sk, { maxPendingMs: 0 });
+      const b = await publishPending(fresh, sk, { maxPendingMs: 0 });
+      cell(
+        "R15#3: an unreadable record file whose journal was never examined keeps stalls unknown after full sweeps",
+        a.stalls.unknown === true &&
+          b.stalls.unknown === true &&
+          stallCounts(fresh).unknown === true,
+        { a: a.stalls, b: b.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

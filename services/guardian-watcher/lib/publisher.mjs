@@ -141,7 +141,13 @@ export async function publishPending(
   // traversal is already part-way through).
   let stallsNeed = sched.stallsNeed;
   // (an unreadable schedule is { unreadable: true }: not tracked either)
-  if (sched.stallsTracked !== true) stallsNeed = (sched.sweeps ?? 0) + (sched.cursor ? 2 : 1);
+  // A process's first pass also re-establishes them (Codex W2c R15 #2): saves lost before a
+  // restart (rotation kept only in memory) may cover any number of passes, so the saved stalls are
+  // not trusted until a sweep has re-read every record; within the budgets, marked unknown.
+  // (its own per-process set: publishPhase may save the schedule, and fill the memo, first)
+  if (sched.stallsTracked !== true || !stallsReconciling.has(store))
+    stallsNeed = (sched.sweeps ?? 0) + (sched.cursor ? 2 : 1);
+  stallsReconciling.add(store);
   if (sched.unreadable)
     alerts.push("publication schedule unreadable; stall state unknown until a full sweep");
   // A bounded batch of record files, in sorted order from the cursor (the last file read). A
@@ -157,6 +163,12 @@ export async function publishPending(
     start = k < 0 ? 0 : k;
   }
   const candidates = names.slice(start, start + maxParse);
+  // a canonical file whose journal was never examined keeps the stall state unknown (Codex W2c
+  // R15 #3), keyed by its file name; retired with the file like any entry
+  const unknownFile = name => {
+    const nid = String(name).replace(/\.json$/, "");
+    if (/^[A-Za-z0-9-]{1,200}$/.test(nid)) entries[nid] = withStall(entries[nid], "unknown");
+  };
   const bad = [];
   const seenIds = new Set();
   const work = [];
@@ -177,6 +189,7 @@ export async function publishPending(
       // restored copy under another name would run on a stale journal (Codex W2c R3)
       if (!id || name !== `${id}.json` || seenIds.has(id)) {
         bad.push(name);
+        unknownFile(name);
         continue;
       }
       seenIds.add(id);
@@ -190,6 +203,8 @@ export async function publishPending(
         alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
         continue;
       }
+      // every record read is refreshed from its journal, deferred ones included (Codex W2c R15 #1)
+      entries[id] = withStall(entries[id], stallKind(prev));
       try {
         cid = recordFile(rec).cid;
       } catch {
@@ -197,6 +212,7 @@ export async function publishPending(
       }
     } catch {
       bad.push(name);
+      unknownFile(name);
       continue;
     }
     // Registered before any limit applies, so a deferred or newly found record still counts
@@ -207,8 +223,8 @@ export async function publishPending(
     if (!reverify && isDone(rec, prev, { pinners, cid, ignoreRegistry: isParked })) {
       if (isParked) counts.parked++;
       else counts.done++;
-      // a done record clears any stale stall (Codex W2c R12 #1)
-      entries[id] = withStall({ ...e, done: true }, stallKind(prev));
+      // its stall was refreshed from prev above: a done record clears a stale one (W2c R12 #1)
+      entries[id] = { ...e, done: true };
       if (openIncident(prev)) counts.incidents++;
       continue;
     }
@@ -328,6 +344,8 @@ export async function publishPending(
 // The schedule as last computed in this process, so a failing schedule write keeps rotation fair
 // in memory while it is retried (Codex W2c R3).
 const scheduleMemo = new WeakMap();
+// the stores whose stalls this process has started re-establishing (Codex W2c R15 #2)
+const stallsReconciling = new WeakSet();
 function getSchedule(store) {
   return scheduleMemo.get(store) ?? store.getSchedule();
 }
