@@ -861,6 +861,20 @@ export async function compare(rb, reader, facts) {
   const pr = rb.amsterdamProbe;
   if (!KNOWN_PREDICATES.includes(pr.predicate)) unverified.push("amsterdamProbe.predicate");
   else {
+    // every declared provider has an entry, and every entry is judged (Codex A7 R13): an integer
+    // outside the safe range is a failure, never filtered out; "n/a:" / "unreadable:" means that
+    // provider has no eth_simulateV1; anything else fails
+    for (const prov of h.providers)
+      if (!(prov in pr.estimateSimulate))
+        unverified.push(`amsterdamProbe.estimateSimulate.${prov} (missing)`);
+    for (const [prov, n] of Object.entries(pr.estimateSimulate))
+      if (!Number.isSafeInteger(n) && !isState(n))
+        check(
+          `amsterdamProbe.sp:estimateSimulate.${prov}`,
+          "a safe integer or n/a",
+          "(unsupported value)",
+          false
+        );
     const sims = Object.entries(pr.estimateSimulate).filter(([, n]) => Number.isSafeInteger(n));
     check("amsterdamProbe.sp:some provider has eth_simulateV1", "≥1", sims.length, sims.length > 0);
     for (const [p, n] of sims) {

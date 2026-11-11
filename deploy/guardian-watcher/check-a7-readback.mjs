@@ -1010,6 +1010,16 @@ await mut(
   "amsterdamProbe.sp:estimateSimulate.alchemy==gasUsedFork"
 );
 await mut(
+  "R13: an estimateSimulate integer beyond the safe range fails, not filtered out",
+  rb => (rb.amsterdamProbe.estimateSimulate.tenderly = 9007199254740992),
+  "amsterdamProbe.sp:estimateSimulate.tenderly"
+);
+await unv(
+  "R13: a declared provider without an estimateSimulate entry is unverified",
+  rb => delete rb.amsterdamProbe.estimateSimulate.tenderly,
+  "amsterdamProbe.estimateSimulate.tenderly (missing"
+);
+await mut(
   "probe: no provider with simulateV1: fails",
   rb => (rb.amsterdamProbe.estimateSimulate = { alchemy: "n/a:no", tenderly: "n/a:no" }),
   "amsterdamProbe.sp:some provider has eth_simulateV1"
