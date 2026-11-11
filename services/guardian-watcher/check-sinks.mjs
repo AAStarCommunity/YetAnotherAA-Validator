@@ -19,7 +19,13 @@ import { filebasePinner } from "./sinks/filebase.mjs";
 import { telegramSink } from "./sinks/telegram.mjs";
 import { request, jsonOf } from "./sinks/http.mjs";
 import { gitMirror } from "./sinks/git-mirror.mjs";
-import { registrySink, assertWriterRole, actionId, regSinkIface } from "./sinks/registry.mjs";
+import {
+  alreadyKnown,
+  registrySink,
+  assertWriterRole,
+  actionId,
+  regSinkIface,
+} from "./sinks/registry.mjs";
 
 const results = [];
 const j = v => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
@@ -527,6 +533,7 @@ try {
     } catch (e) {
       ge = e.message;
     }
+
     cell(
       "mirror: a failing fetch from a credential-bearing remote is a fixed error, no URL/secret",
       /^mirror commit: git fetch: |^git fetch: /.test(ge ?? "") &&
@@ -647,7 +654,12 @@ try {
       { race1, race2 }
     );
     const hook = join(bare, "hooks", "pre-receive");
-    writeFileSync(hook, "#!/bin/sh\necho 'denied by policy GITSECRET' >&2\nexit 1\n");
+    // DSR: the hook's stderr also carries a credential-bearing URL; the push must not land either
+    writeFileSync(
+      hook,
+      "#!/bin/sh\necho 'denied by policy GITSECRET https://tok:GITSECRET@host/r' >&2\nexit 1\n"
+    );
+    const tipBeforeHook = remoteHead();
     execFileSync("chmod", ["+x", hook]);
     let hk = null;
     try {
@@ -658,7 +670,9 @@ try {
     rmSync(hook);
     cell(
       "mirror: a hook rejection is 'push rejected by the remote', not 'the branch moved', no stderr",
-      /push: push rejected by the remote$/.test(hk ?? "") && !/GITSECRET/.test(hk ?? ""),
+      /push: push rejected by the remote$/.test(hk ?? "") &&
+        !/GITSECRET|tok:|host\/r/.test(hk ?? "") &&
+        remoteHead() === tipBeforeHook, // nothing mirrored
       hk
     );
     // #411 review F2: a push that exits 0 without updating the FETCHED branch (here: pushurl points
@@ -745,6 +759,7 @@ try {
   const fees = { maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
   provider.getFeeData = async () => ({ ...fees });
   const sink = registrySink({
+    chainId: 10,
     maxFeePerGas: FEE_CAP,
     provider,
     wallet: w,
@@ -786,6 +801,7 @@ try {
   {
     // #411 review F1: an absolute maxFeePerGas ceiling; a fee above it is refused, never sent
     const capped = registrySink({
+      chainId: 10,
       maxFeePerGas: 1200n,
       provider,
       wallet: w,
@@ -802,7 +818,7 @@ try {
     }
     let noCap = null;
     try {
-      registrySink({ provider, wallet: w, registry: REG, fromBlock: 0, roles });
+      registrySink({ chainId: 10, provider, wallet: w, registry: REG, fromBlock: 0, roles });
     } catch (e) {
       noCap = e.message;
     }
@@ -902,6 +918,7 @@ try {
     refusals
   );
   const leaky = registrySink({
+    chainId: 10,
     maxFeePerGas: FEE_CAP,
     provider: {
       async call() {
@@ -952,6 +969,7 @@ try {
     ],
   ]);
   const uriSink = registrySink({
+    chainId: 10,
     maxFeePerGas: FEE_CAP,
     provider: {
       async call() {
@@ -990,6 +1008,7 @@ try {
   ]) {
     try {
       registrySink({
+        chainId: 10,
         maxFeePerGas: FEE_CAP,
         provider,
         wallet: w,
@@ -1010,6 +1029,7 @@ try {
   let gs = null;
   try {
     await registrySink({
+      chainId: 10,
       maxFeePerGas: FEE_CAP,
       provider,
       wallet: w,
@@ -1025,6 +1045,108 @@ try {
     "registrySink: a wallet that is a guardian is refused at sign time",
     /also the guardian 1/.test(gs ?? ""),
     gs
+  );
+
+  // Codex W2c R4: rebroadcasting a tx the node already holds is not a failure; a real error is
+  {
+    const mk = err => {
+      const p = {
+        ...provider,
+        broadcastTransaction: async () => {
+          throw err;
+        },
+      };
+      return registrySink({
+        chainId: 10,
+        maxFeePerGas: FEE_CAP,
+        provider: p,
+        wallet: w,
+        registry: REG,
+        fromBlock: 0,
+        roles,
+      });
+    };
+    const known = await mk(
+      Object.assign(new Error("x"), { error: { message: "already known" } })
+    ).broadcast("0x01");
+    let real = null;
+    try {
+      await mk(Object.assign(new Error("boom TOKSECRET"), { code: "SERVER_ERROR" })).broadcast(
+        "0x01"
+      );
+    } catch (e) {
+      real = e.message;
+    }
+    cell(
+      "registrySink.broadcast: 'already known' is success; any other error still fails, without the provider's text",
+      known?.known === true &&
+        /registry broadcast: SERVER_ERROR/.test(real ?? "") &&
+        !/TOKSECRET/.test(real ?? ""),
+      { known, real }
+    );
+  }
+
+  {
+    const E = m => Object.assign(new Error("wrapper"), { error: { message: m } });
+    const yes = [
+      "already known",
+      "Known transaction",
+      "transaction already imported",
+      "rpc error: already known.",
+      "known transaction: 0x" + "ab".repeat(32),
+    ];
+    const no = [
+      "unknown transaction",
+      "failed: transaction is not already known",
+      "already known by nobody",
+      "nonce too low",
+      "replacement transaction underpriced",
+    ];
+    cell(
+      "alreadyKnown: only whole known-tx phrasings match; 'unknown transaction' and wrapped negatives do not",
+      yes.every(m => alreadyKnown(E(m))) && no.every(m => !alreadyKnown(E(m))),
+      { yes: yes.map(m => alreadyKnown(E(m))), no: no.map(m => alreadyKnown(E(m))) }
+    );
+  }
+
+  // Codex W2c R1 H2: roles are re-read immediately before each signature, and a failure refuses
+  const late = {};
+  for (const [name, cur] of [
+    ["appointed since", async () => ({ ...roles, guardians: [...roles.guardians, w.address] })],
+    [
+      "unreadable",
+      async () => {
+        throw new Error("rpc down");
+      },
+    ],
+    ["unchanged", async () => roles],
+  ]) {
+    let calls = 0;
+    try {
+      await registrySink({
+        chainId: 10,
+        maxFeePerGas: FEE_CAP,
+        provider,
+        wallet: w,
+        registry: REG,
+        fromBlock: 0,
+        roles,
+        currentRoles: () => {
+          calls++;
+          return cur();
+        },
+      }).sign(args);
+      late[name] = `signed:${calls}`;
+    } catch (e) {
+      late[name] = `${e.message}:${calls}`;
+    }
+  }
+  cell(
+    "registrySink: roles re-read at sign time; a writer appointed since the pass's read, or unreadable roles, is refused",
+    /also the guardian/.test(late["appointed since"]) &&
+      /current roles unreadable; refusing to sign:1/.test(late.unreadable) &&
+      late.unchanged === "signed:1",
+    late
   );
 
   const foreign = regSinkIface.encodeEventLog("Disclosed", [
@@ -1046,6 +1168,7 @@ try {
     [ethers.ZeroAddress, ethers.id("tx"), 100n, true, "0x" + "00".repeat(20), "u", ethers.id("r")],
   ]);
   const sink2 = registrySink({
+    chainId: 10,
     maxFeePerGas: FEE_CAP,
     provider: {
       async getTransactionReceipt() {
@@ -1070,6 +1193,139 @@ try {
     "receipt: entryId from the registry's own Disclosed log; block hash carried for canonical()",
     rc.entryId === 9n && rc.blockHash === ethers.id("b50") && rc.status === 1,
     rc
+  );
+}
+
+// ---- #413 review N2: the registry signs only for the configured chain
+{
+  const REG2 = ethers.getAddress("0x" + "ac".repeat(20));
+  const w = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const prov = chain => ({
+    async getTransactionCount() {
+      return 1;
+    },
+    async getFeeData() {
+      return { maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
+    },
+    async getNetwork() {
+      return { chainId: chain };
+    },
+    async estimateGas() {
+      return 100000n;
+    },
+  });
+  let missing = null;
+  try {
+    registrySink({
+      provider: prov(10n),
+      wallet: w,
+      registry: REG2,
+      fromBlock: 0,
+      roles,
+      maxFeePerGas: 10_000n,
+    });
+  } catch (e) {
+    missing = e.message;
+  }
+  const mk = chain =>
+    registrySink({
+      chainId: 10,
+      provider: prov(chain),
+      wallet: w,
+      registry: REG2,
+      fromBlock: 0,
+      roles,
+      currentRoles: async () => roles,
+      maxFeePerGas: 10_000n,
+    });
+  let other = null;
+  try {
+    await mk(11n).sign({
+      signed: {
+        kind: 0,
+        proposalId: 7n,
+        messageInputs: "0x1234",
+        signerMask: 3n,
+        signers: [ethers.getAddress("0x" + "d4".repeat(20))],
+        anchor: ethers.ZeroHash,
+      },
+      subjectToken: ethers.ZeroAddress,
+      txHash: ethers.id("tx"),
+      blockNumber: 100n,
+      rulesetCommit: "0x" + "ab".repeat(20),
+      recordURI: "ipfs://bafkreix",
+      recordHash: ethers.id("r"),
+    });
+  } catch (e) {
+    other = e.code ?? e.message;
+  }
+  cell(
+    "N2: no configured chainId refuses construction; an RPC on another chain refuses to sign (CHAIN)",
+    /chainId \(the configured chain\) is required/.test(missing ?? "") && other === "CHAIN",
+    { missing, other }
+  );
+}
+
+// ---- Codex W2c R23: no config string with credentials reaches a journal or Telegram
+{
+  const { PUBLIC_REPO_URL } = await import("./sinks/git-mirror.mjs");
+  const { telegramText } = await import("./lib/publish.mjs");
+  const { hostLabel } = await import("../../deploy/guardian-watcher/heartbeat.mjs");
+  const SENT = "private-TOKEN9z7q";
+  const bad = [
+    `https://user:${SENT}@github.com/o/r`,
+    `https://github.com/o/r?token=${SENT}`,
+    `https://github.com/o/r#${SENT}`,
+    `http://github.com/o/r`,
+    `https://${SENT}.example.com/o/r`,
+  ];
+  let refused = 0;
+  for (const u of bad) {
+    try {
+      gitMirror({ clone: "/nonexistent", repoUrl: u });
+    } catch (e) {
+      if (!String(e.message).includes(SENT)) refused++;
+    }
+  }
+  cell(
+    "R23#1: gitMirror refuses a repoUrl with user info, query, fragment, another scheme or host (without echoing it)",
+    refused === bad.length &&
+      PUBLIC_REPO_URL.test("https://github.com/AAStarCommunity/YetAnotherAA-Validator"),
+    { refused, of: bad.length }
+  );
+  // an already-journalled URL of another shape is not sent
+  const rec = {
+    route: "owner",
+    label: "l",
+    event: "e",
+    txHash: "0x1",
+    blockNumber: 1,
+    verdict: { reasons: [] },
+  };
+  const t1 = telegramText(rec, { cid: "bafk" }, { commit: "c0ffee0", url: bad[0] });
+  const t2 = telegramText(
+    rec,
+    { cid: "bafk" },
+    { commit: "c0ffee0", url: "https://github.com/o/r/blob/c0ffee0/a/b.json" }
+  );
+  cell(
+    "R23#1: Telegram carries a journalled mirror URL only in gitMirror's exact shape; otherwise the commit only",
+    !t1.includes(SENT) &&
+      t1.includes("mirror commit c0ffee0") &&
+      t2.includes("mirror https://github.com/o/r/blob/c0ffee0/a/b.json"),
+    { t1, t2 }
+  );
+  cell(
+    "R23#2: a heartbeat label that is not a plain identifier never reaches a message",
+    hostLabel({ label: `mini ${SENT}?x=1` }) === "invalid-label" &&
+      hostLabel({ label: "mac-mini.1" }) === "mac-mini.1" &&
+      /^[A-Za-z0-9.-]{1,40}$|^host$/.test(hostLabel({})),
+    [hostLabel({ label: `mini ${SENT}?x=1` }), hostLabel({})]
   );
 }
 

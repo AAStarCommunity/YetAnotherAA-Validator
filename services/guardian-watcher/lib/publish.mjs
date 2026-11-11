@@ -37,6 +37,7 @@ import { ethers } from "ethers";
 import { SafeError, safeCode, safeText } from "./safe-error.mjs";
 import { Kind } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { recordFile, mirrorPath } from "./record-file.mjs";
+import { MIRROR_BLOB_URL } from "../sinks/git-mirror.mjs";
 
 /** A failure to persist state: publication must stop, the returned state is NOT durable. */
 export class PersistError extends SafeError {
@@ -49,6 +50,25 @@ export class PersistError extends SafeError {
 const bytesEqual = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 // Never e.shortMessage / e.message of a foreign error (Codex W2b R3): see lib/safe-error.mjs.
 const errMsg = e => safeText("unexpected", e);
+
+/** Of the journalled raw txs, the one with the highest maxFeePerGas (#411 N2): a known tx whose raw
+ * is missing is floored on the most expensive raw we have, since the unfloored re-sign branch
+ * means the latest raw is not necessarily the most expensive one. */
+export function highestFeeRaw(raws) {
+  let best = null;
+  let bestFee = -1n;
+  for (const r of raws) {
+    if (!r) continue;
+    try {
+      const fee = ethers.Transaction.from(r).maxFeePerGas ?? 0n;
+      if (fee > bestFee) [best, bestFee] = [r, fee];
+    } catch {
+      // not a parseable tx (a test stub): ignored unless nothing else exists
+      if (best === null) best = r;
+    }
+  }
+  return best;
+}
 
 /** The disclose() arguments for a BLS record (registry ABI: Signed + record context). */
 export function discloseArgs(rec, file) {
@@ -86,7 +106,12 @@ export function telegramText(rec, file, mirror) {
     `tx ${rec.txHash} block ${rec.blockNumber}`,
     ...(rec.verdict?.reasons ?? []).map(r => `- ${r}`),
     `record ipfs://${file.cid}`,
-    mirror?.url ? `mirror ${mirror.url}` : null,
+    // a journalled URL is sent only in the exact shape gitMirror builds (Codex W2c R23 #1)
+    mirror?.url && MIRROR_BLOB_URL.test(String(mirror.url))
+      ? `mirror ${mirror.url}`
+      : /^[0-9a-f]{4,40}$/.test(String(mirror?.commit ?? ""))
+        ? `mirror commit ${mirror.commit}`
+        : null,
   ]
     .filter(Boolean)
     .join("\n");
@@ -115,6 +140,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   const file = recordFile(rec);
   const state = { ...prev, pins: { ...(prev.pins ?? {}) } };
   const alerts = [];
+  // Stage failures (a sink that errored or refused), as distinct from pending work: the pass is
+  // not "ok" while any stage failed (Codex W2c R3).
+  const failures = [];
   // Unresolved registry incidents are re-alerted on EVERY run, before anything can return early.
   const inc = prev.registry;
   if ((inc?.phase === "conflict" || inc?.phase === "reverted") && !inc.ack) {
@@ -124,12 +152,26 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
         : `registry: disclose tx reverted (${inc.reason ?? "no reason recorded"}); unresolved until acknowledged`
     );
   }
+  if (state.bytesChanged) {
+    // A recorded bytes change stands until resolved by hand (the marker is removed), even if the
+    // bytes have changed back: alerted on every pass, and nothing else runs (Codex W2c R2).
+    alerts.push(
+      `record bytes changed after first publication (${state.bytesChanged.from} -> ${state.bytesChanged.to}); not republishing; INCIDENT until resolved by hand`
+    );
+    return { state, alerts, failures };
+  }
   if (state.cid && state.cid !== file.cid) {
     // Records are immutable once stored; a different CID means the bytes changed underneath us.
+    // A durable, standing incident (Codex W2c R1 M4): it keeps the record out of "done" and is
+    // alerted on every pass until resolved by hand; it is never republished automatically.
     alerts.push(
-      `record bytes changed after first publication (${state.cid} -> ${file.cid}); not republishing`
+      `record bytes changed after first publication (${state.cid} -> ${file.cid}); not republishing; INCIDENT`
     );
-    return { state, alerts };
+    if (state.bytesChanged?.to !== file.cid) {
+      state.bytesChanged = { from: state.cid, to: file.cid, at: new Date().toISOString() };
+      await persist(state);
+    }
+    return { state, alerts, failures };
   }
   state.cid = file.cid;
   state.recordHash = file.recordHash;
@@ -139,7 +181,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   for (const p of sinks.pinners ?? []) {
     const cur = state.pins[p.name];
     const at = new Date().toISOString();
-    if (cur?.current && !opts.reverify) continue;
+    // a pin whose last re-verification could not reach the gateway is re-verified on every pass
+    // until a check succeeds (Codex W2c R20 #3)
+    if (cur?.current && !opts.reverify && !cur.checkError) continue;
     try {
       if (cur?.current) {
         // Reverify: still served, byte for byte? If not, demote and upload again below. A transport
@@ -157,7 +201,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           back &&
           bytesEqual(back instanceof Uint8Array ? back : ethers.getBytes(back), file.bytes)
         ) {
-          state.pins[p.name] = { ...cur, checkedAt: at };
+          const { checkError: _e, checkErrorAt: _a, ...kept } = cur;
+          (void _e, _a);
+          state.pins[p.name] = { ...kept, checkedAt: at };
           continue;
         }
         alerts.push(
@@ -174,6 +220,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           error: `provider CID differs from local ${file.cid}`,
         };
         alerts.push(`${p.name}: CID mismatch (local ${file.cid})`);
+        failures.push(`pin:${p.name}`);
         continue;
       }
       // Public readability by CID, byte for byte: a private or altered copy is not a publication.
@@ -189,6 +236,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           error: "public gateway did not serve the exact bytes",
         };
         alerts.push(`${p.name}: public fetch by CID did not return the record bytes`);
+        failures.push(`pin:${p.name}`);
         continue;
       }
       state.pins[p.name] = { current: true, everOk: true, at, checkedAt: at, cid: file.cid };
@@ -196,6 +244,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
       if (e instanceof PersistError) throw e;
       state.pins[p.name] = { ...state.pins[p.name], current: false, at, error: errMsg(e) };
       alerts.push(`${p.name}: ${errMsg(e)}`);
+      failures.push(`pin:${p.name}`);
     }
   }
   await persist(state);
@@ -209,6 +258,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     } catch (e) {
       if (e instanceof PersistError) throw e;
       alerts.push(`mirror: ${errMsg(e)}`);
+      failures.push("mirror");
     }
   }
 
@@ -222,7 +272,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     );
   }
   await persist(state);
-  if (!state.published) return { state, alerts };
+  if (!state.published) return { state, alerts, failures };
 
   if (sinks.telegram && !state.telegram?.at) {
     const retry = !!state.telegram?.attemptAt;
@@ -238,18 +288,21 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     } catch (e) {
       if (e instanceof PersistError) throw e;
       alerts.push(`telegram: ${errMsg(e)}`);
+      failures.push("telegram");
     }
   }
 
   if (rec.route === "bls" && sinks.registry && state.registry?.phase !== "confirmed") {
     try {
-      await advanceRegistry(rec, file, sinks.registry, state, persist, alerts, opts);
+      const ar = await advanceRegistry(rec, file, sinks.registry, state, persist, alerts, opts);
+      if (ar === "broadcast-failed") failures.push("registry");
     } catch (e) {
       if (e instanceof PersistError) throw e;
       alerts.push(`registry: ${errMsg(e)}`);
+      failures.push("registry");
     }
   }
-  return { state, alerts };
+  return { state, alerts, failures };
 }
 
 export const DEFAULT_MAX_PENDING_MS = 30 * 60_000;
@@ -296,9 +349,18 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
   if (r?.phase === "signed" || r?.phase === "sent" || r?.phase === "landed") {
     // Rebroadcast the latest raw of the journal (never a newly signed one for the same nonce
     // unless replacing a stuck tx below); a known tx is harmless.
+    let broadcastFailed = false;
     try {
       await reg.broadcast(r.raw);
+      // a broadcast that now goes through clears the earlier error, so a stall (e.g. insufficient
+      // funds, since topped up) does not stay counted as degraded forever
+      if (r.lastBroadcastError !== undefined) {
+        const { lastBroadcastError: _cleared, ...rest } = r;
+        void _cleared;
+        state.registry = rest;
+      }
     } catch (e) {
+      broadcastFailed = true;
       state.registry = { ...r, lastBroadcastError: errMsg(e) };
       // a writer without the funds cannot land anything: said plainly, every pass (#411 review F1)
       if (safeCode(e) === "INSUFFICIENT_FUNDS")
@@ -358,6 +420,12 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       return;
     }
     if (rc && rc.entryId == null) {
+      // an RPC answer that cannot be ours: marked, so the watcher is degraded until the phase moves
+      // on (Codex W2c R21 #1)
+      if (!state.registry.noEventAt) {
+        state.registry = { ...state.registry, noEventAt: new Date().toISOString() };
+        await persist(state);
+      }
       alerts.push(`registry: a disclose tx succeeded without a Disclosed event`);
       return;
     }
@@ -371,7 +439,15 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       await persist(state);
     } else {
       const age = Date.now() - Date.parse(state.registry.sentAt ?? new Date().toISOString());
-      if (age < maxPendingMs) return; // pending; next tick
+      if (age < maxPendingMs) {
+        // Pending. If this pass's rebroadcast failed and nothing has landed, the tx may not be
+        // in any mempool: a stage failure, not a normal wait (Codex W2c R4).
+        if (broadcastFailed) {
+          alerts.push("registry: rebroadcast failed and no receipt yet; retried next pass");
+          return "broadcast-failed";
+        }
+        return; // pending; next tick
+      }
       // Stuck (evicted or underpriced) with its nonce unused: replace it at the SAME nonce with a
       // higher fee, journalled before broadcast like the original.
       alerts.push(
@@ -393,7 +469,7 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
         if (await reg.knows(hashes0[i]))
           // a known tx without its raw bytes: floor on the latest journalled raw, whose fees are
           // never below an earlier one's (each replacement only rises from its floor)
-          floorRaw = raws0[i] ?? state.registry.raw;
+          floorRaw = raws0[i] ?? highestFeeRaw(raws0);
       let rep;
       try {
         rep = await reg.sign(
@@ -412,18 +488,22 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
         );
         return;
       }
-      const { feeCapped, ...rest } = state.registry;
+      // the replacement supersedes the old tx's fee cap and broadcast error (#413 review F3); a
+      // failure of the new broadcast is journalled again by broadcastJournalled
+      const { feeCapped, lastBroadcastError, ...rest } = state.registry;
+      void lastBroadcastError;
       state.registry = {
         ...rest,
         raw: rep.raw,
         hash: rep.hash,
-        hashes: [...hashes0, rep.hash],
-        raws: [...raws0, rep.raw],
+        // an identical re-sign (flat estimate, nothing accepted) is not journalled again (#411 N1)
+        hashes: hashes0.includes(rep.hash) ? hashes0 : [...hashes0, rep.hash],
+        raws: hashes0.includes(rep.hash) ? raws0 : [...raws0, rep.raw],
         sentAt: new Date().toISOString(),
         replacements: (state.registry.replacements ?? 0) + 1,
       };
       await persist(state); // journal BEFORE broadcast
-      await reg.broadcast(rep.raw);
+      await broadcastJournalled(reg, rep.raw, state, persist, alerts);
       return;
     }
   }
@@ -434,6 +514,10 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     signed = await reg.sign(discloseArgs(rec, file));
   } catch (e) {
     if (e?.code !== "FEE_CAP") throw e;
+    // the stall is journalled like a replacement's (Codex W2c R11): it counts as degraded until a
+    // signature succeeds, which replaces this state
+    state.registry = { phase: "unsigned", feeCapped: new Date().toISOString() };
+    await persist(state);
     alerts.push(
       "registry: the disclose tx needs a fee above the configured maxFeePerGas; not signed, retried next pass"
     );
@@ -448,9 +532,28 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     nonce: signed.nonce,
   };
   await persist(state); // journal BEFORE broadcast
-  await reg.broadcast(signed.raw);
+  await broadcastJournalled(reg, signed.raw, state, persist, alerts);
   state.registry = { ...state.registry, phase: "sent", sentAt: new Date().toISOString() };
   await persist(state);
+}
+
+/**
+ * A first or replacement broadcast (Codex W2c R12 #2): a failure is journalled like a rebroadcast's
+ * (lastBroadcastError, so an unfunded writer counts as a stall from the first attempt) and alerted
+ * when it is insufficient funds, then rethrown so the pass still records the failure.
+ */
+async function broadcastJournalled(reg, raw, state, persist, alerts) {
+  try {
+    await reg.broadcast(raw);
+  } catch (e) {
+    state.registry = { ...state.registry, lastBroadcastError: errMsg(e) };
+    if (safeCode(e) === "INSUFFICIENT_FUNDS")
+      alerts.push(
+        `registry: the writer has insufficient funds for the disclose tx (nonce ${state.registry.nonce}); fund the writer`
+      );
+    await persist(state); // a persist failure (PersistError) stops the pass, as everywhere else
+    throw e;
+  }
 }
 
 /** A successful receipt: confirmed only once final and the entry at the finalized block is ours. */
@@ -467,8 +570,14 @@ async function settleLanded(rec, file, reg, state, persist, alerts, rc) {
     return;
   }
   if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
-  // Final receipt but no entry at the finalized block: inconsistent RPC; stay landed, alert.
-  state.registry = { ...state.registry, phase: "landed", entryId: String(rc.entryId) };
+  // Final receipt but no entry at the finalized block: inconsistent RPC; stay landed, alert, and
+  // mark it so the watcher is degraded until a later check confirms the entry (Codex W2c R20 #2)
+  state.registry = {
+    ...state.registry,
+    phase: "landed",
+    entryId: String(rc.entryId),
+    inconsistentAt: new Date().toISOString(),
+  };
   await persist(state);
   alerts.push(`registry: receipt final but entry ${rc.entryId} not visible at the finalized block`);
 }
