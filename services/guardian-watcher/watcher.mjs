@@ -469,6 +469,9 @@ async function main() {
   // to start, and a mismatching RPC refuses each signature
   if (p && !Number.isSafeInteger(cfg.chainId))
     throw new SafeError("config: chainId required when publish is enabled");
+  // the RPC must serve the configured chain before anything is published (#425 review B1)
+  if (p && Number((await chain.getNetwork()).chainId) !== cfg.chainId)
+    throw new SafeError("config: the RPC is on another chain than chainId; not publishing");
   const pub = p ? { p, built: await buildSinks(p, chain, { chainId: cfg.chainId }) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");

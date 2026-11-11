@@ -128,6 +128,18 @@ export function sinks(opts = {}) {
     registry: {
       address: ethers.getAddress(opts.registryAddress ?? "0x" + "aa".repeat(20)),
       chainId: BigInt(opts.chainId ?? 11155111),
+      // the chain the node serves (#425 B1): by default the configured one
+      async assertChain() {
+        const served = BigInt(opts.networkChainId ?? opts.chainId ?? 11155111);
+        if (served !== this.chainId) {
+          const e = new Error("registry: the RPC is on another chain than the configured chainId");
+          e.code = "CHAIN";
+          throw e;
+        }
+      },
+      async writer() {
+        return ethers.getAddress(opts.writer ?? "0x" + "77".repeat(20));
+      },
       async finalized() {
         return chain.block - chain.finalizedLag;
       },
@@ -152,6 +164,7 @@ export function sinks(opts = {}) {
           // the same hash broadcast() derives from the raw (a tagged raw too: Codex W2d R3)
           hash: ethers.id(`disclose-${raw.slice(5)}`),
           nonce: o.nonce ?? chain.nonce,
+          from: ethers.getAddress(opts.writer ?? "0x" + "77".repeat(20)),
         };
       },
       async broadcast(raw) {

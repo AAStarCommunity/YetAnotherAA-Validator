@@ -3070,6 +3070,82 @@ const good = {
       rmSync(d, { recursive: true, force: true });
     }
   }
+  // (i) #425 review B1: the chain switched at the same address while the RPC still serves the old
+  // chain: nothing is adopted or stamped on the new chain; the stage fails (degraded)
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, chainId: 10 });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      // the same node (chain 10, the entry is there), the config now says chain 8453
+      const regB = { ...a.registry, chainId: 8453n };
+      const signs = a.calls.sign;
+      let p;
+      for (let i = 0; i < 3; i++)
+        p = await publishPending(
+          store,
+          { ...skOf(a), registry: regB },
+          { maxPendingMs: 60 * 60_000 }
+        );
+      const r = store.getPublication(Store.recordId(bls)).registry;
+      cell(
+        "W2d(i) B1: an RPC serving another chain than the configured one adopts and stamps nothing there; the stage fails, the watcher is degraded",
+        r?.phase !== "confirmed" &&
+          a.calls.sign === signs &&
+          p.counts.failed >= 1 &&
+          (p.stalls.migrating ?? 0) >= 1,
+        { r, signs: [signs, a.calls.sign], counts: p.counts, stalls: p.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (j) #425 review B2: the same writer's in-flight disclose on the same chain is replaced at its
+  // nonce by the new registry's first tx; another writer, or a consumed nonce, signs afresh
+  {
+    const run = async (bOpts, consumed = false) => {
+      const d = tmp();
+      try {
+        const store = new Store(d);
+        store.putRecord(bls);
+        const a = sinks({ registryAddress: OLD, mine: "pending" });
+        a.chain.nonce = 5;
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+        const old = store.getPublication(Store.recordId(bls)).registry;
+        const b = sinks({ registryAddress: NEW, rawTag: "j", ...bOpts });
+        b.chain.nonce = consumed ? 6 : 5;
+        await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 });
+        const j = store.getPublication(Store.recordId(bls));
+        return {
+          old,
+          opts: b.calls.lastSignOpts,
+          mig: j.registryMigrated,
+          phase: j.registry?.phase,
+        };
+      } finally {
+        rmSync(d, { recursive: true, force: true });
+      }
+    };
+    const same = await run({});
+    const other = await run({ writer: "0x" + "88".repeat(20) });
+    const gone = await run({}, true);
+    cell(
+      "W2d(j) B2: the same writer's pending tx is replaced at its nonce (replace, prevRaw); another writer or a consumed nonce signs normally",
+      same.old.phase === "sent" &&
+        same.old.nonce === 5 &&
+        same.opts?.replace === true &&
+        same.opts.nonce === 5 &&
+        same.opts.prevRaw === same.old.raw &&
+        same.mig?.replacedNonce === 5 &&
+        !same.mig.replace &&
+        !other.opts?.replace &&
+        !gone.opts?.replace,
+      { same, other: other.opts, gone: gone.opts }
+    );
+  }
   // (c) the same address on another chain is another registry
   {
     const d = tmp();

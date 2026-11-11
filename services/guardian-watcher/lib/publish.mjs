@@ -303,12 +303,40 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     !sameRegistry(registryAt(state.registry), where)
   ) {
     const from = registryAt(state.registry);
+    // An in-flight disclose of the SAME writer on the SAME chain holds a nonce: the new registry's
+    // first tx replaces it at that nonce, or every later tx of this writer would wait behind it
+    // (#425 review B2). Another writer or chain has its own nonce space: nothing to replace.
+    const old = state.registry;
+    let replace = null;
+    if (
+      (old.phase === "signed" || old.phase === "sent" || old.phase === "landed") &&
+      Number.isSafeInteger(old.nonce) &&
+      from?.chainId === where.chainId &&
+      typeof sinks.registry.writer === "function"
+    ) {
+      let oldFrom = typeof old.from === "string" ? old.from : null;
+      if (!oldFrom && old.raw)
+        try {
+          oldFrom = ethers.Transaction.from(old.raw).from ?? null;
+        } catch {
+          oldFrom = null;
+        }
+      const me = await sinks.registry.writer();
+      const prevRaw = highestFeeRaw(old.raws ?? [old.raw]) ?? old.raw;
+      if (oldFrom && me && oldFrom.toLowerCase() === me.toLowerCase() && prevRaw)
+        replace = { nonce: old.nonce, prevRaw };
+    }
     state.registryHistory = [
       ...(state.registryHistory ?? []),
       { ...state.registry, supersededAt: new Date().toISOString() },
     ];
     state.registry = null;
-    state.registryMigrated = { from, to: where, at: new Date().toISOString() };
+    state.registryMigrated = {
+      from,
+      to: where,
+      at: new Date().toISOString(),
+      ...(replace ? { replace } : {}),
+    };
     await persist(state);
     alerts.push(
       "registry: the configured registry changed; this record is disclosed again on it (the old registry's transactions are not broadcast)"
@@ -321,6 +349,8 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
       return persist(st);
     };
     try {
+      // reads at the finalized block are trusted only on the configured chain (#425 review B1)
+      if (typeof sinks.registry.assertChain === "function") await sinks.registry.assertChain();
       const ar = await advanceRegistry(rec, file, sinks.registry, state, persistAt, alerts, opts);
       if (ar === "broadcast-failed") failures.push("registry");
     } catch (e) {
@@ -562,8 +592,15 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
   // Nothing in flight: an entry may already exist (an earlier publication completed elsewhere).
   if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
   let signed;
+  // the first tx after a same-writer migration replaces the old registry's pending one at its nonce,
+  // unless that nonce is already consumed at the finalized block (#425 review B2)
+  let rep = state.registryMigrated?.replace ?? null;
+  if (rep && (await reg.nonce()) > rep.nonce) rep = null;
   try {
-    signed = await reg.sign(discloseArgs(rec, file));
+    signed = await reg.sign(
+      discloseArgs(rec, file),
+      rep ? { nonce: rep.nonce, replace: true, prevRaw: rep.prevRaw } : undefined
+    );
   } catch (e) {
     if (e?.code !== "FEE_CAP") throw e;
     // the stall is journalled like a replacement's (Codex W2c R11): it counts as degraded until a
@@ -582,7 +619,12 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     hashes: [signed.hash],
     raws: [signed.raw],
     nonce: signed.nonce,
+    ...(signed.from ? { from: signed.from } : {}),
   };
+  if (state.registryMigrated?.replace) {
+    const { replace: done, ...migrated } = state.registryMigrated;
+    state.registryMigrated = { ...migrated, replacedNonce: done.nonce };
+  }
   await persist(state); // journal BEFORE broadcast
   await broadcastJournalled(reg, signed.raw, state, persist, alerts);
   state.registry = { ...state.registry, phase: "sent", sentAt: new Date().toISOString() };

@@ -138,6 +138,19 @@ export function registrySink({
     address: addr,
     chainId,
     finalized,
+    /** Every read the registry stage makes is on the configured chain (#425 review B1): adoption
+     * and receipts are judged at the configured chainId only if the RPC serves it. */
+    async assertChain() {
+      if (BigInt((await provider.getNetwork()).chainId) !== chainId)
+        throw new SinkError(
+          "registry: the RPC is on another chain than the configured chainId",
+          "CHAIN"
+        );
+    },
+    /** The writer's address (no RPC). */
+    async writer() {
+      return wallet.getAddress();
+    },
     async canonical(n, hash) {
       const b = await provider.send("eth_getBlockByNumber", [ethers.toQuantity(Number(n)), false]);
       return !!b && String(b.hash).toLowerCase() === String(hash).toLowerCase();
@@ -256,6 +269,7 @@ export function registrySink({
       const raw = await wallet.signTransaction(tx);
       return {
         raw,
+        from,
         hash: ethers.keccak256(raw),
         nonce: n,
         fees: { maxFeePerGas: maxFee.toString(), maxPriorityFeePerGas: tip.toString() },

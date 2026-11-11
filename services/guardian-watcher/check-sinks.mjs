@@ -1395,6 +1395,47 @@ try {
   );
 }
 
+// ---- #425 review B1 (production sink): the RPC's chain is asserted before the registry stage reads
+{
+  const w = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const mk = served =>
+    registrySink({
+      chainId: 10,
+      provider: {
+        async getNetwork() {
+          return { chainId: served };
+        },
+      },
+      wallet: w,
+      registry: ethers.getAddress("0x" + "ce".repeat(20)),
+      fromBlock: 0,
+      roles,
+      maxFeePerGas: 10_000n,
+    });
+  let other = null;
+  try {
+    await mk(8453n).assertChain();
+  } catch (e) {
+    other = e.code ?? e.message;
+  }
+  let same = "ok";
+  try {
+    await mk(10n).assertChain();
+  } catch (e) {
+    same = e.code ?? e.message;
+  }
+  cell(
+    "#425 B1: the production sink refuses (CHAIN) when its RPC serves another chain, passes on the configured one; writer() is the wallet",
+    other === "CHAIN" && same === "ok" && (await mk(10n).writer()) === w.address,
+    { other, same }
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);
