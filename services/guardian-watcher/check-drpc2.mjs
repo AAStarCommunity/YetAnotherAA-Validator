@@ -132,6 +132,54 @@ async function scenario(build) {
   };
   const neg = await scenario(build(true));
   const pos = await scenario(build(false));
+  // DSR (ded99d78): end to end through runOnce, a disagreement makes the very first tick degraded
+  // with the mismatch reason (the only signal that the two providers see different chains); the
+  // honest control does not get it
+  {
+    const tick = async crafted => {
+      const d = mkdtempSync(join(tmpdir(), "drpc2-mm-e2e-"));
+      try {
+        const c = makeChain();
+        const cfg = {
+          aggregator: AGG,
+          roles: { superPaymaster: SP },
+          forwarders: FORWARDERS,
+          startBlock: c.head() + 1,
+          maxBlocksPerTick: 1000,
+          page: 5000,
+        };
+        const { primary, second } = await build(crafted)(c, cfg);
+        const store = new Store(d);
+        const st = (
+          await runOnce(primary, cfg, store, rs, ident, {
+            second: { chain: second, host: "second.example" },
+          })
+        ).status;
+        const acc = recsOf(d).filter(isAccusatory);
+        return { st, publish: acc.map(r => mayPublish(store, r)) };
+      } finally {
+        rmSync(d, { recursive: true, force: true });
+      }
+    };
+    const bad = await tick(true);
+    const good = await tick(false);
+    const why = st =>
+      (st.degraded ?? []).some(x =>
+        /differ on the second provider \(held, not published\)/.test(x)
+      );
+    cell(
+      "DSR e2e: runOnce with a disagreeing second provider is degraded on tick 1 with the mismatch reason and publishes nothing; the honest control is not",
+      bad.st.ok &&
+        bad.st.confirm?.mismatch === 1 &&
+        why(bad.st) &&
+        bad.st.healthy === false &&
+        bad.publish.every(x => x === false) &&
+        // the honest control: the keeper's public pause is not an accusation, nothing disagrees
+        !why(good.st) &&
+        good.st.confirm?.mismatch === 0,
+      { bad: [bad.st.confirm, bad.st.degraded], good: [good.st.confirm, good.st.degraded] }
+    );
+  }
   cell(
     "C2 negative: a crafted primary attributes a keeper's public pause to the owner route (an accusation); the honest second disagrees: held unconfirmed, not publishable",
     neg.acc.length === 1 &&
