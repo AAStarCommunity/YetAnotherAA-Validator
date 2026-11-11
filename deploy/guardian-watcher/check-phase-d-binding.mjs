@@ -385,15 +385,41 @@ cell(
     { chainId: 11155111 },
     { ...pc, registry: { ...pc.registry, keystore: "/tmp/x.json" } }
   );
+  const otherPw = run(
+    { chainId: 11155111 },
+    { ...pc, registry: { ...pc.registry, service: "other-item" } }
+  );
+  const otherAcct = run({ chainId: 11155111 }, { ...pc, keychainAccount: "someone-else" });
+  // the caller's predicate decides path equality: a placeholder sender.keystore never matches,
+  // and an equal path written differently does (as phase-d-check passes it)
+  const phSame = (a, b) =>
+    !/^<.*>$/.test(String(b)) && a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+  const placeholderKs = publishBindingProblems({
+    wcfg: { chainId: 11155111 },
+    pc: { ...pc, registry: { ...pc.registry, keystore: "<sender keystore>" } },
+    cfg: { ...cfg, sender: { keystore: "<sender keystore>" } },
+    samePath: phSame,
+  });
+  const ltPath = publishBindingProblems({
+    wcfg: { chainId: 11155111 },
+    pc: { ...pc, registry: { ...pc.registry, keystore: "<sender>.json" } },
+    cfg: { ...cfg, sender: { keystore: "<sender>.json" } },
+    samePath: phSame,
+  });
   results.push({
-    name: "watcher-publish: bound passes; no watcher chainId, another chainId, publication off, or another keystore each fail with fixed wording",
+    name: "watcher-publish: bound passes; no or another chainId, publication off, another keystore, password item or account, or a placeholder keystore each fail with fixed wording; a path starting with < is not a placeholder",
     ok:
       bound.length === 0 &&
       noChain.join() === "the watcher config has no chainId" &&
       otherChain.join() === "the watcher's chainId is not phase-d.json chainId" &&
       off.join() === "publication is not enabled in the watcher config" &&
-      otherKs.join() === "the watcher's registry.keystore is not sender.keystore",
-    got: { bound, noChain, otherChain, off, otherKs },
+      otherKs.join() === "the watcher's registry.keystore is not sender.keystore" &&
+      otherPw.join() ===
+        "the watcher's keystore password item is not keychain.services.keystorePassword" &&
+      otherAcct.join() === "the watcher's keychainAccount is not keychain.account" &&
+      placeholderKs.join() === "the watcher's registry.keystore is not sender.keystore" &&
+      ltPath.length === 0,
+    got: { bound, noChain, otherChain, off, otherKs, otherPw, otherAcct, placeholderKs, ltPath },
   });
   // the example configs agree: copying them as the runbook says passes this binding's chain check
   const ex = JSON.parse(readFileSync(join(here, "config.example.json"), "utf8"));

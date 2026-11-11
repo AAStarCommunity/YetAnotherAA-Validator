@@ -219,8 +219,9 @@ export function publishBindingProblems({ wcfg, pc, cfg, samePath }) {
     problems.push("publication is not enabled in the watcher config");
     return problems;
   }
-  const ks = cfg.sender?.keystore;
-  if (typeof ks !== "string" || /^</.test(ks) || !samePath(pc.registry.keystore, ks))
+  // samePath is the caller's exact predicate (a placeholder sender.keystore never matches); its
+  // exceptions propagate, as before the extraction
+  if (!samePath(pc.registry.keystore, cfg.sender?.keystore))
     problems.push("the watcher's registry.keystore is not sender.keystore");
   if (pc.registry.service !== cfg.keychain?.services?.keystorePassword)
     problems.push("the watcher's keystore password item is not keychain.services.keystorePassword");
