@@ -28,6 +28,7 @@ import {
   getHold,
   accusationView,
   CONFIRM_MAX_ATTEMPTS,
+  viewDigest,
 } from "./lib/confirm.mjs";
 
 const rs = validateRuleset(
@@ -424,7 +425,14 @@ async function scenario(build) {
   const hold = (store, rec, state) => {
     mkdirSync(join(store.dir, "holds"), { recursive: true });
     const id = Store.recordId(rec);
-    atomicWriteJson(join(store.dir, "holds", `${id}.json`), { id, state, attempts: 1 });
+    atomicWriteJson(join(store.dir, "holds", `${id}.json`), {
+      id,
+      state,
+      attempts: 1,
+      digest: viewDigest(
+        JSON.parse(readFileSync(join(store.dir, "records", `${id}.json`), "utf8"))
+      ),
+    });
   };
   const run = async (state, rec) => {
     const d = mkdtempSync(join(tmpdir(), "drpc2-pub-"));
@@ -489,6 +497,116 @@ async function scenario(build) {
     );
   } finally {
     rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// ---- D-RPC2 Codex R1: digest binding, alias files, malformed records, exhaustion replays
+{
+  const { bls, owner } = await import("./mock-sinks.mjs");
+  const { writeFileSync, mkdirSync } = await import("node:fs");
+  const stored = (store, rec) =>
+    JSON.parse(readFileSync(join(store.dir, "records", `${Store.recordId(rec)}.json`), "utf8"));
+  // a fake second-provider tick: `script(i, temp)` decides what the i-th tick leaves in the temp store
+  const fakeRun = script => {
+    let i = 0;
+    const f = async (second, c, temp) => {
+      script(i++, temp);
+      return { status: { ok: true, cursor: c.startBlock } };
+    };
+    f.calls = () => i;
+    return f;
+  };
+  // #1: a confirmation is bound to the content it was made on
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-r1-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const honest = stored(store, bls);
+      mkdirSync(join(d, "holds"), { recursive: true });
+      const id = Store.recordId(bls);
+      const { atomicWriteJson } = await import("./lib/store.mjs");
+      atomicWriteJson(join(d, "holds", `${id}.json`), {
+        id,
+        state: "confirmed",
+        digest: viewDigest(honest),
+      });
+      const fabricated = { ...honest, caller: "0x000000000000000000000000000000000000bad1" };
+      writeFileSync(join(d, "records", `${id}.json`), JSON.stringify(fabricated));
+      cell(
+        "R1#1: a confirmed hold for other content under the same id does not authorize this record",
+        mayPublish(store, honest) === true && mayPublish(store, fabricated) === false,
+        { honest: mayPublish(store, honest), fabricated: mayPublish(store, fabricated) }
+      );
+      // an alias file (same identity, another name) is never confirmed
+      writeFileSync(join(d, "records", "alias.json"), JSON.stringify(honest));
+      const run = fakeRun((i, temp) => temp.putRecord(bls));
+      const c = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
+        runOnce: run,
+      });
+      cell(
+        "R1#1: an alias record file is skipped (malformed), never confirmed",
+        (c.malformed ?? 0) >= 1,
+        c
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #2: one malformed record does not stop the pass
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-r1-"));
+    try {
+      const store = new Store(d);
+      mkdirSync(join(d, "records"), { recursive: true });
+      writeFileSync(
+        join(d, "records", "aaa-broken.json"),
+        JSON.stringify({ ...bls, key: "invalid" })
+      );
+      store.putRecord(owner);
+      const run = fakeRun((i, temp) => temp.putRecord(owner));
+      const c = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
+        runOnce: run,
+      });
+      cell(
+        "R1#2: a malformed accusatory record is isolated; the honest one after it is confirmed",
+        (c.malformed ?? 0) >= 1 && getHold(store, Store.recordId(owner))?.state === "confirmed",
+        { counts: c, hold: getHold(store, Store.recordId(owner)) }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #3: a record produced by exhaustion is reproduced by replaying the attempt budget
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-r1-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(owner);
+      const { MAX_DEADLETTER_ATTEMPTS } = await import("./lib/scan.mjs");
+      const run = fakeRun((i, temp) => {
+        if (i < MAX_DEADLETTER_ATTEMPTS)
+          temp.putDeadLetter({
+            route: "tx",
+            txHash: owner.txHash,
+            blockNumber: owner.blockNumber,
+            attempts: i + 1,
+            reasons: ["price"],
+          });
+        else temp.putRecord(owner);
+      });
+      const c = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
+        runOnce: run,
+      });
+      cell(
+        "R1#3: a dead letter on the second provider is retried up to the attempt budget, then the record confirms",
+        getHold(store, Store.recordId(owner))?.state === "confirmed" &&
+          run.calls() === MAX_DEADLETTER_ATTEMPTS + 1,
+        { counts: c, calls: run.calls(), hold: getHold(store, Store.recordId(owner)) }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
   }
 }
 

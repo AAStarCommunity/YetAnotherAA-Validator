@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { Store as BaseStore, atomicWriteJson } from "./lib/store.mjs";
+import { viewDigest } from "./lib/confirm.mjs";
 // These cells test publication itself, not D-RPC2 (check-drpc2.mjs does): every record stored here
 // is also marked confirmed by the second provider, as a confirmed hold, so publishPending's D-RPC2
 // gate (lib/confirm.mjs mayPublish) lets it through.
@@ -15,7 +16,13 @@ class Store extends BaseStore {
     const r = super.putRecord(rec);
     const id = BaseStore.recordId(rec);
     mkdirSync(join(this.dir, "holds"), { recursive: true });
-    atomicWriteJson(join(this.dir, "holds", `${id}.json`), { id, state: "confirmed", attempts: 1 });
+    atomicWriteJson(join(this.dir, "holds", `${id}.json`), {
+      id,
+      state: "confirmed",
+      attempts: 1,
+      // the digest of the content as stored (the file), as confirmPending computes it
+      digest: viewDigest(JSON.parse(readFileSync(join(this.dir, "records", `${id}.json`), "utf8"))),
+    });
     return r;
   }
 }

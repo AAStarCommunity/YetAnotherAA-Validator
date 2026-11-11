@@ -16,7 +16,9 @@
 import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { Store, atomicWriteJson, readJson } from "./store.mjs";
+import { MAX_DEADLETTER_ATTEMPTS } from "./scan.mjs";
 
 export const CONFIRM_MAX_ATTEMPTS = 10;
 
@@ -42,6 +44,9 @@ export function accusationView(rec) {
   for (const k of Object.keys(rec).sort()) if (!WHEN.has(k)) top[k] = rec[k];
   return JSON.stringify(sort(top), (k, v) => (typeof v === "bigint" ? `${v}n` : v));
 }
+
+/** The digest a confirmation is bound to: the record's content without its when-fields. */
+export const viewDigest = rec => createHash("sha256").update(accusationView(rec)).digest("hex");
 
 /** The top-level fields on which two records differ (when-fields ignored). */
 function diffFields(a, b) {
@@ -93,11 +98,26 @@ export async function reRun(second, cfg, rs, ident, rec, { runOnce, now } = {}) 
   try {
     const temp = new Store(d);
     const c = { ...cfg, startBlock: block, maxBlocksPerTick: 1, dataDir: d };
-    const { status } = await runOnce(second, c, temp, rs, ident, now === undefined ? {} : { now });
-    if (!status.ok) return { state: "unavailable", reason: "second provider tick failed" };
-    if (!(status.cursor >= block))
-      return { state: "unavailable", reason: "block not finalized on the second provider" };
-    const mine = sameAction(temp, rec);
+    // A record the first provider produced by EXHAUSTION (a dead letter retried until
+    // MAX_DEADLETTER_ATTEMPTS, e.g. price.unavailable) can only be reproduced the same way: the
+    // re-run keeps ticking on its own temporary store while it holds only a dead letter for the
+    // action, up to the same attempt budget (D-RPC2 Codex R1 #3).
+    let mine = [];
+    for (let i = 0; i < MAX_DEADLETTER_ATTEMPTS + 2; i++) {
+      const { status } = await runOnce(
+        second,
+        c,
+        temp,
+        rs,
+        ident,
+        now === undefined ? {} : { now }
+      );
+      if (!status.ok) return { state: "unavailable", reason: "second provider tick failed" };
+      if (!(status.cursor >= block))
+        return { state: "unavailable", reason: "block not finalized on the second provider" };
+      mine = sameAction(temp, rec);
+      if (mine.length || temp.listDeadLetters().length === 0) break;
+    }
     if (!mine.length) {
       const dls = temp.listDeadLetters();
       return dls.length
@@ -127,7 +147,14 @@ export function getHold(store, id) {
 /** Whether an accusatory record may be published: only once the second provider confirmed it. */
 export function mayPublish(store, rec) {
   if (!isAccusatory(rec)) return true;
-  return getHold(store, Store.recordId(rec))?.state === "confirmed";
+  try {
+    const h = getHold(store, Store.recordId(rec));
+    // bound to the content that was compared (D-RPC2 Codex R1 #1): a confirmation of another
+    // record under the same id (an alias file) does not authorize this one
+    return h?.state === "confirmed" && h.digest === viewDigest(rec);
+  } catch {
+    return false; // a record whose id cannot be derived is never published
+  }
 }
 
 /**
@@ -158,9 +185,22 @@ export async function confirmPending(
       continue;
     }
     if (!isAccusatory(rec)) continue;
-    const id = Store.recordId(rec);
+    // one malformed record must not stop the pass (Codex R1 #2), and only the canonical file of a
+    // record is confirmed: an alias file under another name never is (Codex R1 #1)
+    let id;
+    try {
+      id = Store.recordId(rec);
+    } catch {
+      counts.malformed = (counts.malformed ?? 0) + 1;
+      continue;
+    }
+    if (f !== `${id}.json`) {
+      counts.malformed = (counts.malformed ?? 0) + 1;
+      continue;
+    }
     const prev = getHold(store, id);
-    if (prev?.state === "confirmed") {
+    // a confirmation counts only for the content it was made on
+    if (prev?.state === "confirmed" && prev.digest === viewDigest(rec)) {
       counts.confirmed++;
       continue;
     }
@@ -185,6 +225,7 @@ export async function confirmPending(
     atomicWriteJson(join(holds, `${id}.json`), {
       id,
       state,
+      digest: viewDigest(rec),
       attempts,
       lastResult: r.state,
       ...(r.fields ? { fields: r.fields } : {}),

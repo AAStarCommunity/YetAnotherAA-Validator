@@ -132,13 +132,6 @@ export async function publishPending(
       }
       seenIds.add(id);
       counts.flagged++;
-      // D-RPC2: an accusatory record is published only once the second provider confirmed it
-      // field by field (lib/confirm.mjs); held records stay unpublished and are counted, never
-      // dropped. A non-accusatory record is not held.
-      if (!mayPublish(store, rec)) {
-        counts.held++;
-        continue;
-      }
       try {
         prev = store.getPublication(id) ?? {};
       } catch {
@@ -151,6 +144,15 @@ export async function publishPending(
         cid = recordFile(rec).cid;
       } catch {
         cid = null; // publishRecord fails on it, and says so
+      }
+      // D-RPC2: an accusatory record is first published only once the second provider confirmed
+      // THIS content (lib/confirm.mjs); held records stay unpublished and are counted, never
+      // dropped. One already published goes on to publishRecord even if its content no longer
+      // matches the confirmation: that is a tampered record, which publishRecord refuses to
+      // republish and reports as an INCIDENT on every pass, a signal the hold must not swallow.
+      if (!prev?.cid && !mayPublish(store, rec)) {
+        counts.held++;
+        continue;
       }
     } catch {
       bad.push(name);
