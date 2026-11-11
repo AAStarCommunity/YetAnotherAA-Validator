@@ -1,5 +1,7 @@
 // Durable local state for the watcher: records, dead letters, cursor, status. Plain JSON files,
 // written atomically (temp file + rename) so a crash never leaves a half-written record.
+import { createHash } from "node:crypto";
+import { SafeError } from "./safe-error.mjs";
 import {
   mkdirSync,
   readFileSync,
@@ -15,12 +17,6 @@ import { join, dirname } from "node:path";
 
 const bigintSafe = (_, v) => (typeof v === "bigint" ? v.toString() : v);
 
-/**
- * Atomic AND durable (#400 Low; W2c R1 H1): the bytes are fsynced before the rename and the
- * directory after it, so a power cut leaves either the old file or the complete new one, never an
- * empty file, and a returned write survives the crash (the W2 journal relies on that).
- */
-/** Write every byte of `buf` to `fd`; `write` is injectable for a fault test. */
 /** A well-formed amendment for `key`: its key, a tx hash, how it was proven, and at least one
  * event, each with a name and a position. */
 export function validAmendment(a, key) {
@@ -46,16 +42,23 @@ export function validAmendment(a, key) {
   );
 }
 
+/** Write every byte of `buf` to `fd`; `write` is injectable for a fault test. */
 export function writeAll(fd, buf, write = writeSync) {
   let off = 0;
   while (off < buf.length) {
     const n = write(fd, buf, off, buf.length - off);
-    if (!(n > 0)) throw new Error(`short write: ${off} of ${buf.length} bytes`);
+    if (!(n > 0)) throw new SafeError(`short write: ${off} of ${buf.length} bytes`);
     off += n;
   }
 }
 
-export function atomicWriteJson(path, obj) {
+/**
+ * Atomic AND durable (#400 Low; W2c R1 H1): the bytes are fsynced before the rename and the
+ * directory after it, so a power cut leaves either the old file or the complete new one, never an
+ * empty file, and a returned write survives the crash (the W2 journal relies on that). `write` is
+ * the byte writer handed to writeAll (injectable, so a cell can prove the wiring: #403 review L-3).
+ */
+export function atomicWriteJson(path, obj, write = writeSync, sync = fsyncDir) {
   const tmp = `${path}.tmp-${process.pid}`;
   const buf = Buffer.from(JSON.stringify(obj, bigintSafe, 2) + "\n", "utf8");
   const fd = openSync(tmp, "w", 0o600);
@@ -63,19 +66,68 @@ export function atomicWriteJson(path, obj) {
     // writeSync may write fewer bytes than asked (e.g. a full disk): loop until every byte is
     // written, and refuse zero progress, so a short file is never fsynced and renamed into place
     // (Codex W2c R2).
-    writeAll(fd, buf);
+    writeAll(fd, buf, write);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
   renameSync(tmp, path);
-  const d = openSync(dirname(path), "r");
+  sync(dirname(path)); // injectable for a test (#404 review L2)
+}
+
+/** A rename is durable only once its directory is fsynced (#403 review L-4). */
+/** rename, then fsync the target's directory so the rename survives a power cut; `sync` is
+ * injectable for a test (#404 review L2). */
+export function renameDurable(from, to, sync = fsyncDir) {
+  renameSync(from, to);
+  sync(dirname(to));
+}
+
+function fsyncDir(dir) {
+  const d = openSync(dir, "r");
   try {
     fsyncSync(d);
   } finally {
     closeSync(d);
   }
 }
+
+/**
+ * Reasons are diagnostics, and some grow with the RPC answer (a trace path per level): at most
+ * MAX_REASONS of at most MAX_REASON_CHARS each are stored, with the total and the sha256 of the
+ * full list when any was cut (follow-up #2 R8), so a dead letter stays small however deep the
+ * answer. Applied to `reasons` and `lastReasons`.
+ */
+const MAX_REASONS = 10;
+const MAX_REASON_CHARS = 512;
+export function boundReasons(rec) {
+  let out = rec;
+  for (const k of ["reasons", "lastReasons"]) {
+    const r = out?.[k];
+    if (!Array.isArray(r)) continue;
+    const cut =
+      r.length > MAX_REASONS || r.some(x => typeof x === "string" && x.length > MAX_REASON_CHARS);
+    if (!cut) continue;
+    const h = createHash("sha256");
+    for (const x of r) h.update(`${typeof x === "string" ? x : (JSON.stringify(x) ?? "")}\n`);
+    out = {
+      ...out,
+      [k]: r
+        .slice(0, MAX_REASONS)
+        .map(x =>
+          typeof x === "string" && x.length > MAX_REASON_CHARS
+            ? `${x.slice(0, MAX_REASON_CHARS)}…`
+            : x
+        ),
+      [`${k}Total`]: r.length,
+      [`${k}Sha256`]: `0x${h.digest("hex")}`,
+    };
+  }
+  return out;
+}
+
+/** The record kinds a BLS action can have (recheck-lib KIND_NAME). */
+const BLS_KINDS = ["SLASH", "GENERIC", "QUEUE", "REPUTATION"];
 
 export function readJson(path, fallback) {
   try {
@@ -101,6 +153,10 @@ export class Store {
     if (rec.route === "bls")
       return `bls-${rec.kind ?? "UNRECOVERED"}-${BigInt(rec.key).toString(16).padStart(64, "0")}`;
     if (rec.route === "tx") return `tx-${rec.txHash.toLowerCase()}`;
+    // a quarantine record names no tx: its own prefix, so it is counted from disk like every other
+    // total, even when the tick that wrote it failed later (follow-up #2 R4)
+    if (rec.route === "unattributed" && rec.quarantine === true)
+      return `quarantine-${rec.txHash.toLowerCase()}`;
     const route = rec.route === "public" || rec.route === "unattributed" ? rec.route : "owner";
     return `${route}-${rec.txHash.toLowerCase()}-${rec.logIndex}`;
   }
@@ -110,7 +166,8 @@ export class Store {
    * pipeline acts on it), unless the new one upgrades an UNRECOVERED placeholder for the same key.
    * Returns "new" | "same" | "upgraded".
    */
-  putRecord(rec) {
+  putRecord(recIn) {
+    const rec = boundReasons(recIn);
     const id = Store.recordId(rec);
     const path = join(this.dir, "records", `${id}.json`);
     // A file that exists but does not parse was never a valid record (#400 Low): rewrite it rather
@@ -135,7 +192,7 @@ export class Store {
       );
       if (existsSync(placeholder)) {
         atomicWriteJson(`${placeholder}.resolved`, { resolvedBy: id });
-        renameSync(placeholder, `${placeholder}.done`);
+        renameDurable(placeholder, `${placeholder}.done`);
         resolved = true;
       }
     }
@@ -144,7 +201,8 @@ export class Store {
   }
 
   /** Dead letter: an action seen but not authenticated; retried on later ticks, never dropped. */
-  putDeadLetter(rec) {
+  putDeadLetter(recIn) {
+    const rec = boundReasons(recIn);
     const id = Store.recordId({ ...rec, kind: undefined });
     const path = join(this.dir, "deadletters", `${id}.json`);
     let prev = null;
@@ -189,7 +247,7 @@ export class Store {
   resolveDeadLetter(id) {
     const path = join(this.dir, "deadletters", `${id}.json`);
     if (!existsSync(path)) return false;
-    renameSync(path, `${path}.done`);
+    renameDurable(path, `${path}.done`);
     return true;
   }
 
@@ -197,13 +255,68 @@ export class Store {
   retireDeadLetter(id) {
     const path = join(this.dir, "deadletters", `${id}.json`);
     if (!existsSync(path)) return;
-    // never overwrite an earlier retirement of the same id (#400 review L2): number them
-    let target = `${path}.exhausted`;
-    for (let k = 2; existsSync(target); k++) target = `${path}.exhausted.${k}`;
-    renameSync(path, target);
+    // never overwrite an earlier retirement of the same id (#400 review L2): number them. The next
+    // number is kept in a durable counter beside them, so a retirement probes O(1) names, not every
+    // earlier one (follow-up #2 R10); a missing or unreadable counter is rebuilt by one scan.
+    const ctr = `${path}.exhausted-next`;
+    let k = null;
+    try {
+      const v = readJson(ctr, null)?.next;
+      if (Number.isSafeInteger(v) && v >= 1) k = v;
+    } catch {
+      k = null;
+    }
+    if (k === null) {
+      k = 1;
+      while (existsSync(k === 1 ? `${path}.exhausted` : `${path}.exhausted.${k}`)) k++;
+    }
+    // a counter behind the files (a crash between rename and counter write) moves forward
+    while (existsSync(k === 1 ? `${path}.exhausted` : `${path}.exhausted.${k}`)) k++;
+    renameDurable(path, k === 1 ? `${path}.exhausted` : `${path}.exhausted.${k}`);
+    atomicWriteJson(ctr, { next: k + 1 });
   }
 
   /** Unattributed records of txs whose answers never became readable (#400 review L1). */
+  /**
+   * Running totals that no file listing can recount (DSR log 2892c30f): ticks that hit the
+   * isolation budget (counted when the tick completes). Atomic and durable like every state write; an unreadable
+   * file restarts at zero rather than stopping the scan, and says so.
+   */
+  bumpCounters(delta) {
+    const path = join(this.dir, "counters.json");
+    let prev;
+    try {
+      prev = readJson(path, {});
+    } catch {
+      prev = { reset: true };
+    }
+    const next = { ...prev };
+    for (const [k, v] of Object.entries(delta))
+      next[k] = (Number.isSafeInteger(prev[k]) ? prev[k] : 0) + v;
+    atomicWriteJson(path, next);
+    return next;
+  }
+
+  /** Files in the local archive (records, dead letters incl. retired, amendments): each tick's
+   * work is linear in this (an accepted bound, DSR 97a9d55c), so status reports it. */
+  countArchiveFiles() {
+    let n = 0;
+    for (const d of ["records", "deadletters", "amendments"]) {
+      try {
+        n += readdirSync(join(this.dir, d)).length;
+      } catch {
+        // a directory not created yet holds nothing
+      }
+    }
+    return n;
+  }
+
+  countQuarantined() {
+    return readdirSync(join(this.dir, "records")).filter(
+      f => f.startsWith("quarantine-") && f.endsWith(".json")
+    ).length;
+  }
+
   countUnreadable() {
     return readdirSync(join(this.dir, "records")).filter(f => f.endsWith("-unreadable.json"))
       .length;
@@ -236,16 +349,34 @@ export class Store {
           JSON.stringify(cur.spEvents, bigintSafe) ===
             JSON.stringify(amendment.spEvents, bigintSafe);
         if (same) return "same";
-        // a different valid proof for the same action: both kept, never one overwriting the other
-        let c = 1;
-        while (existsSync(`${path}.conflict.${c}`)) c++;
-        atomicWriteJson(`${path}.conflict.${c}`, amendment);
+        // a different valid proof for the same action: both kept, never one overwriting the other;
+        // the same conflicting proof is stored once, not again on every retry (#403 review L-5)
+        const sig = a =>
+          `${String(a?.txHash).toLowerCase()}|${JSON.stringify(a?.spEvents, bigintSafe)}`;
+        // addressed by the sha256 of its signature: one lookup, never a scan of every earlier
+        // conflict (follow-up #2 R9); an existing file for it is kept, a missing one written
+        const cpath = `${path}.conflict.${createHash("sha256").update(sig(amendment)).digest("hex")}`;
+        if (existsSync(cpath)) {
+          let ok = false;
+          try {
+            ok = sig(JSON.parse(readFileSync(cpath, "utf8"))) === sig(amendment);
+          } catch {
+            ok = false;
+          }
+          if (ok) return "conflict-same";
+          // as on the main path (#404 review L4): the bad bytes are kept for inspection, never
+          // overwritten in place
+          let k = 1;
+          while (existsSync(`${cpath}.invalid.${k}`)) k++;
+          renameDurable(cpath, `${cpath}.invalid.${k}`);
+        }
+        atomicWriteJson(cpath, amendment);
         return "conflict";
       }
       // keep the invalid bytes for inspection, then persist the valid proof (Codex follow-up R3)
       let k = 1;
       while (existsSync(`${path}.invalid.${k}`)) k++;
-      renameSync(path, `${path}.invalid.${k}`);
+      renameDurable(path, `${path}.invalid.${k}`);
       atomicWriteJson(path, amendment);
       return "repaired";
     }
@@ -264,6 +395,13 @@ export class Store {
     }
   }
 
+  /** Conflicting amendment proofs kept so far, in total (#403 review L-5). */
+  countAmendmentConflicts() {
+    return readdirSync(join(this.dir, "amendments")).filter(f =>
+      /\.conflict\.([0-9a-f]{64}|\d+)$/.test(f)
+    ).length;
+  }
+
   countAmendments() {
     return readdirSync(join(this.dir, "amendments")).filter(f => f.endsWith(".json")).length;
   }
@@ -279,12 +417,14 @@ export class Store {
    * writes the real record (Codex #400-fix R2).
    */
   hasBlsRecord(key) {
-    const suffix = `-${BigInt(key).toString(16).padStart(64, "0")}.json`;
-    return readdirSync(join(this.dir, "records")).some(f => {
-      if (!f.startsWith("bls-") || !f.endsWith(suffix)) return false;
-      // UNRECOVERED placeholders carry no kind, so the kind test excludes them too.
+    // One file per known kind, looked up directly: never a listing of the whole archive per
+    // commitment (follow-up #2 R10). UNRECOVERED placeholders carry no kind, so are not looked at.
+    const hex = BigInt(key).toString(16).padStart(64, "0");
+    return BLS_KINDS.some(kind => {
+      const p = join(this.dir, "records", `bls-${kind}-${hex}.json`);
+      if (!existsSync(p)) return false;
       try {
-        return JSON.parse(readFileSync(join(this.dir, "records", f), "utf8")).kind !== undefined;
+        return JSON.parse(readFileSync(p, "utf8")).kind !== undefined;
       } catch {
         return false;
       }
