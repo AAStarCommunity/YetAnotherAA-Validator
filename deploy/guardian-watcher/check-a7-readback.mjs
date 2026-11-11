@@ -1,313 +1,671 @@
-// Self-test of the A7 read-back comparison (a7-readback.mjs) on SP's own example file, through a
-// fake chain that is consistent with it; then one mutation per rule.
-// Run: node deploy/guardian-watcher/check-a7-readback.mjs [--schema <file> --example <file>]
-// Without the flags it uses the copies under fixtures/a7/ (sha256-pinned below).
+// Self-test of the A7 read-back comparison (a7-readback.mjs): SP's frozen schema and examples
+// (sha256-pinned fixtures), then a fake chain built consistent with a read-back and answering by
+// ABI fragment, and one mutation per rule, including Codex A7 R1's counterexamples.
+// Run: node deploy/guardian-watcher/check-a7-readback.mjs
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { AbiCoder, Interface, keccak256, getAddress, id as keccakId } from "ethers";
 import {
   validate,
   compare,
+  redact,
   SCHEMA_SHA256,
   ANVIL_COMMIT,
   EIP1967_IMPL,
+  OWNERSHIP_2STEP_SLOT,
+  REQUIRED_CONTRACTS,
+  SAFE_GETTERS,
   isState,
 } from "./a7-readback.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const args = process.argv.slice(2);
-const opt = k => (args.indexOf(`--${k}`) >= 0 ? args[args.indexOf(`--${k}`) + 1] : undefined);
-const EXAMPLE_SHA256 = "c58133b9f8dfe2317af96c6a9a43e7b2521900a69c591843f5c0afb6233b4812";
-const LIVE_EXAMPLE_SHA256 = "61926c93fee774900765f9e9eca5d2dee44921d6191751929b18932d140e2b85";
+const fx = f => readFileSync(join(here, "fixtures/a7", f));
 const sha = b => createHash("sha256").update(b).digest("hex");
-const schemaText = readFileSync(
-  opt("schema") ?? join(here, "fixtures/a7/aoa-a7-readback-1.schema.json")
-);
-const exampleText = readFileSync(
-  opt("example") ?? join(here, "fixtures/a7/aoa-a7-readback-1.example.json")
-);
 const results = [];
 const cell = (name, ok, got) =>
-  results.push({ name, ok: !!ok, got: ok ? "" : JSON.stringify(got) });
-cell("the schema file is SP's (pinned sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
+  results.push({
+    name,
+    ok: !!ok,
+    got: ok ? "" : JSON.stringify(got, (k, v) => (typeof v === "bigint" ? v.toString() : v)),
+  });
+
+const schemaText = fx("aoa-a7-readback-1.schema.json");
+const exampleText = fx("aoa-a7-readback-1.example.json");
+const liveText = fx("aoa-a7-readback-1.live.example.json");
+cell("schema is SP's frozen v4 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
 cell(
-  "the example file is SP's (pinned sha256)",
-  sha(exampleText) === EXAMPLE_SHA256,
+  "fork example is SP's (sha256)",
+  sha(exampleText) === "148224aa64140cdf287a60ee16fe8d0be7f8512657e6c4677bd55e339b455206",
   sha(exampleText)
 );
-const liveText = readFileSync(
-  opt("live-example") ?? join(here, "fixtures/a7/aoa-a7-readback-1.live.example.json")
-);
 cell(
-  "the live example file is SP's (pinned sha256)",
-  sha(liveText) === LIVE_EXAMPLE_SHA256,
+  "live example is SP's (sha256)",
+  sha(liveText) === "49c6492b73078d82aee0b5b454e65b82259107e7e568888a668731a93c602432",
   sha(liveText)
 );
-const live = JSON.parse(liveText);
 const schema = JSON.parse(schemaText);
 const example = JSON.parse(exampleText);
-// SP's example placeholders are internally inconsistent in one place: superPaymaster.extension is
-// spAdminExtension's address, yet the two report different codehashes. A real chain cannot, so the
-// comparison must catch it (cell below); the consistent base fixes that one derived value.
-const consistent = structuredClone(example);
-consistent.contracts.superPaymaster.extensionCodehash =
-  consistent.contracts.spAdminExtension.codehash;
-const clone = () => structuredClone(consistent);
+const live = JSON.parse(liveText);
+cell("fork example validates", validate(schema, example).length === 0, validate(schema, example));
+cell("live example validates", validate(schema, live).length === 0, validate(schema, live));
+{
+  const v = structuredClone(example);
+  v.contracts.superPaymaster.version = null;
+  cell(
+    "version null outside the two extensions is rejected by the schema",
+    validate(schema, v).length > 0,
+    null
+  );
+  const e = structuredClone(example);
+  e.header.rpcUrl = "https://x";
+  cell("an unknown header key is rejected by the schema", validate(schema, e).length > 0, null);
+}
 
-// ---- a fake chain consistent with a read-back: code k hashes to the reported codehash, getters
-// answer the reported values, and a valueState is a getter that returns nothing
-function fakeWorld(rb, tweak = {}) {
-  const code = new Map();
+// ---- a complete, internally consistent read-back: SP's example plus every inventory key
+const A = n => getAddress("0x" + n.toString(16).padStart(40, "0"));
+const G1 = "0x9999999999999999999999999999999999999999";
+const PK = [
+  "0x" + "11".repeat(32),
+  "0x" + "22".repeat(32),
+  "0x" + "33".repeat(32),
+  "0x" + "44".repeat(32),
+];
+const PK_TYPE = "tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b)";
+const PK_HASH = keccak256(AbiCoder.defaultAbiCoder().encode([PK_TYPE], [PK]));
+const base = structuredClone(example);
+base.contracts.superPaymaster.extensionCodehash = base.contracts.spAdminExtension.codehash;
+base.contracts.blsAggregator.guardianSet = [
+  { address: G1, pubkeyHash: PK_HASH, slot: 1, isActive: true },
+];
+const filler = i => ({
+  address: A(0x1000 + i),
+  version: "n/a:no version()",
+  codehash: "n/a:no code",
+  erc1967Impl: "n/a:not a proxy",
+  implCodehash: "n/a:not a proxy",
+  extension: "n/a:no extension",
+  extensionCodehash: "n/a:no extension",
+  owner: "n/a:no owner",
+  pendingOwner: "n/a:no owner",
+  guardian: "n/a:no guardian role",
+  roles: {},
+});
+REQUIRED_CONTRACTS.forEach((k, i) => {
+  if (!(k in base.contracts)) base.contracts[k] = filler(i);
+});
+base.contracts.multiSendCallOnly = filler(99);
+base.contracts.ownerSafe.threshold = 2;
+base.contracts.ownerSafe.owners = [A(0xa1), A(0xa2), A(0xa3)];
+base.contracts.ownerSafe.singleton = A(0x5a5a);
+base.contracts.dvtValidator.categoryCount = 0;
+// a value, so the Registry pendingOwner() / ERC-7201 cross-check runs
+base.contracts.registry.pendingOwner = A(0);
+base.checks = {
+  "dvtValidator.categoryCount": 0,
+  "blsAggregator.owner == superPaymaster.owner": true,
+};
+base.amsterdamProbe.estimateSimulate = { alchemy: 256645, tenderly: "n/a:no eth_simulateV1" };
+const addressBook = Object.fromEntries(
+  Object.entries(base.contracts).map(([k, c]) => [k, c.address])
+);
+
+// ---- the fake chain: ABIs typed from the read-back; answers by fragment and arguments
+const typeOf = v =>
+  typeof v === "boolean"
+    ? "bool"
+    : typeof v === "number"
+      ? "uint256"
+      : /^0x[0-9a-fA-F]{40}$/.test(v)
+        ? "address"
+        : /^0x[0-9a-fA-F]{64}$/.test(v)
+          ? "bytes32"
+          : /^\d+$/.test(v)
+            ? "uint256"
+            : "string";
+const SKIP = [
+  "address",
+  "codehash",
+  "erc1967Impl",
+  "implCodehash",
+  "extension",
+  "extensionCodehash",
+  "roles",
+  "rolesSource",
+];
+const argKey = args => JSON.stringify(args.map(x => (typeof x === "bigint" ? Number(x) : x)));
+function world(rb) {
+  const abi = {};
+  const answers = new Map();
+  const codes = new Map();
   const hashOf = new Map();
   const slots = new Map();
-  const getters = new Map();
   const put = (addr, hash) => {
-    if (!addr || isState(addr) || !hash || isState(hash)) return;
-    const c = `0x${Buffer.from(`code:${addr.toLowerCase()}`).toString("hex")}`;
-    code.set(addr.toLowerCase(), c);
+    if (isState(addr) || isState(hash)) return;
+    const c = "0x" + Buffer.from("code:" + addr.toLowerCase()).toString("hex");
+    codes.set(addr.toLowerCase(), c);
     hashOf.set(c, hash.toLowerCase());
   };
-  const g = (a, n, v) => getters.set(`${a.toLowerCase()}.${n}`, v);
-  for (const c of Object.values(rb.contracts)) {
+  const ans = (addr, iface, sig, args, v) =>
+    answers.set(`${addr.toLowerCase()}|${iface.getFunction(sig).selector}|${argKey(args)}`, v);
+  const word = a => "0x" + "0".repeat(24) + String(a).slice(2).toLowerCase();
+  for (const [key, c] of Object.entries(rb.contracts)) {
     if (isState(c.address)) continue;
     put(c.address, c.codehash);
     if (!isState(c.erc1967Impl)) {
-      slots.set(
-        `${c.address.toLowerCase()}.${EIP1967_IMPL}`,
-        `0x${"0".repeat(24)}${c.erc1967Impl.slice(2).toLowerCase()}`
-      );
+      slots.set(`${c.address.toLowerCase()}|${EIP1967_IMPL}`, word(c.erc1967Impl));
       put(c.erc1967Impl, c.implCodehash);
     }
     if (!isState(c.extension)) put(c.extension, c.extensionCodehash);
-    for (const [k, v] of Object.entries(c))
-      if (!isState(v) && typeof v !== "object") g(c.address, k, v);
+    const frags = [];
+    const vals = [];
+    for (const [k, v] of Object.entries(c)) {
+      if (SKIP.includes(k) || isState(v) || (v !== null && typeof v === "object")) continue;
+      frags.push(`function ${k}() view returns (${typeOf(v)})`);
+      vals.push([k, v]);
+    }
+    if (key === "superPaymaster") {
+      frags.push("function EXTENSION() view returns (address)");
+      vals.push(["EXTENSION", c.extension]);
+    }
+    if (key === "blsAggregator")
+      frags.push(
+        "function validatorAtSlot(uint8) view returns (address)",
+        `function getBLSPublicKey(address validator) view returns (${PK_TYPE} publicKey, uint8 slot, bool isActive)`,
+        "function slashThresholds(uint8) view returns (uint8)"
+      );
+    const iface = new Interface([...new Set(frags)]);
+    abi[key] = iface;
+    for (const [k, v] of vals) ans(c.address, iface, `${k}()`, [], v);
+    if (key === "registry" && !isState(c.pendingOwner))
+      slots.set(`${c.address.toLowerCase()}|${OWNERSHIP_2STEP_SLOT}`, word(c.pendingOwner));
+    if (key === "blsAggregator") {
+      for (let s = 1; s <= 64; s++)
+        ans(c.address, iface, "validatorAtSlot(uint8)", [s], s === 1 ? G1 : A(0));
+      ans(c.address, iface, "getBLSPublicKey(address)", [G1.toLowerCase()], [PK, 1n, true]);
+      ans(c.address, iface, "slashThresholds(uint8)", [1], 2n);
+      ans(c.address, iface, "slashThresholds(uint8)", [2], 3n);
+    }
   }
-  const addrOf = Object.fromEntries(
-    Object.entries(rb.contracts)
-      .filter(([, c]) => !isState(c.address))
-      .map(([k, c]) => [k, c.address])
-  );
-  for (const [k, v] of Object.entries(rb.checks)) {
-    const m = k.match(/^(\w+)\.(\w+)$/);
-    if (m && addrOf[m[1]] && !isState(v)) g(addrOf[m[1]], m[2], v);
+  const safe = new Interface(SAFE_GETTERS);
+  const sa = rb.contracts.ownerSafe;
+  if (sa && !isState(sa.address)) {
+    ans(sa.address, safe, "getThreshold()", [], BigInt(sa.threshold));
+    ans(sa.address, safe, "getOwners()", [], sa.owners);
+    slots.set(`${sa.address.toLowerCase()}|0x${"0".repeat(64)}`, word(sa.singleton));
   }
-  const h = rb.header;
-  const pr = rb.amsterdamProbe;
+  // contracts with no file in SP's abis/ get an empty ABI HERE so the mechanics are exercised;
+  // the real run marks them unverified (a7-fork.mjs)
+  for (const k of Object.keys(rb.contracts)) abi[k] ??= new Interface([]);
   const reader = {
-    chainId: async () => h.chainId,
-    block: async n => (n === h.readbackBlock ? { hash: h.readbackBlockHash } : null),
-    code: async a => code.get(a.toLowerCase()) ?? "0x",
+    chainId: async () => rb.header.chainId,
+    head: async () => rb.header.readbackBlock,
+    block: async n =>
+      n === rb.header.readbackBlock ? { hash: rb.header.readbackBlockHash } : null,
+    code: async (a, block) => (block !== undefined ? "0x" : (codes.get(a.toLowerCase()) ?? "0x")),
     keccak: c => hashOf.get(c) ?? "0x" + "e".repeat(64),
-    slot: async (a, s) => slots.get(`${a.toLowerCase()}.${s}`) ?? "0x" + "0".repeat(64),
-    call: async (a, n) => getters.get(`${a.toLowerCase()}.${n}`),
+    slot: async (a, s) => slots.get(`${a.toLowerCase()}|${s}`) ?? "0x" + "0".repeat(64),
+    call: async (a, iface, f, args = []) => {
+      const k = `${a.toLowerCase()}|${f.selector}|${argKey(args)}`;
+      return answers.has(k) ? { status: "value", v: answers.get(k) } : { status: "revert" };
+    },
+    logs: async () => [],
     upstreamHeader: async () => ({ blockAccessListHash: true, slotNumber: true }),
-    probe: async () => ({
-      estimateFork: pr.estimateFork,
-      gasUsedFork: pr.gasUsedFork,
-      estimateLive: pr.expected.estimate,
-    }),
-    ...tweak,
+    probe: async () => ({ gasUsedFork: 256645, simulate: 256645, callAtGasUsed: true }),
   };
-  return reader;
+  return { reader, abi, safe };
 }
-// SP's ABIs, consistent with the read-back: every non-null scalar key is a getter; a null one is not
-import { id as keccakId } from "ethers";
-const sel = n => keccakId(`${n}()`).slice(0, 10);
-const abiOf = rb =>
-  Object.fromEntries(
-    Object.entries(rb.contracts).map(([k, c]) => [
-      k,
-      new Set(
-        Object.entries(c)
-          .filter(([, v]) => v !== null)
-          .map(([n]) => sel(n))
-      ),
-    ])
-  );
-const facts = (rb, abi = abiOf(consistent)) => ({
-  abi,
+const facts = (rb, w, over = {}) => ({
   anvilVersion: rb.header.anvilVersion,
   anvilCommit: ANVIL_COMMIT,
   dumpSha256: rb.header.dumpSha256,
   forkBlock: rb.header.forkBlock,
+  abi: w.abi,
+  safe: w.safe,
+  addressBook,
+  slashLevels: { WARNING: 0, MINOR: 1, MAJOR: 2 },
+  ...over,
 });
 // the chain is always built from the CONSISTENT base; the read-back under test may be mutated
-const run = async (rb, tweak) => compare(rb, fakeWorld(consistent, tweak), facts(rb));
-const failedPaths = r => r.cmp.filter(x => !x.ok).map(x => x.path);
-
-cell(
-  "SP's example validates against SP's schema",
-  validate(schema, example).length === 0,
-  validate(schema, example)
-);
-{
-  const bad = clone();
-  delete bad.header.ethConfig.corroboration;
-  cell(
-    "a read-back without ethConfig.corroboration is rejected by the schema",
-    validate(schema, bad).length > 0,
-    null
-  );
-  const extra = clone();
-  extra.header.rpcUrl = "https://x";
-  cell(
-    "an unknown header key (e.g. an RPC URL) is rejected by the schema",
-    validate(schema, extra).length > 0,
-    null
-  );
-}
-
-cell(
-  "SP's live example validates against SP's schema",
-  validate(schema, live).length === 0,
-  validate(schema, live)
-);
-{
-  const v = structuredClone(live);
-  v.header.anvilVersion = "n/a:live";
-  cell(
-    'anvilVersion "n/a:live" validates (the 685ff69d oneOf double match is fixed)',
-    validate(schema, v).length === 0,
-    validate(schema, v)
-  );
-  const nv = structuredClone(example);
-  nv.contracts.superPaymaster.version = null;
-  cell(
-    "version null outside spAdminExtension / xPNTsTokenV2Ext is rejected (frozen schema)",
-    validate(schema, nv).length > 0,
-    null
-  );
-  const ev = structuredClone(example);
-  ev.contracts.spAdminExtension.version = "X-1.0";
-  cell(
-    "a version on spAdminExtension is rejected (frozen schema)",
-    validate(schema, ev).length > 0,
-    null
-  );
-  const r = await compare(live, fakeWorld(consistent), facts(live));
-  cell(
-    "a live read-back is never accepted as the fork's: header.source fails",
-    failedPaths(r).includes("header.source"),
-    failedPaths(r)
-  );
-}
-
-// the consistent world: everything compares, and what has no reader is listed (and so stops)
-const base = await run(clone());
-{
-  const r = await compare(example, fakeWorld(consistent), facts(example));
-  cell(
-    "SP's raw example: extensionCodehash != the extension's own codehash is caught",
-    failedPaths(r).includes("contracts.superPaymaster.extensionCodehash"),
-    failedPaths(r)
-  );
-}
-cell("consistent world: no mismatch", failedPaths(base).length === 0, failedPaths(base));
-cell(
-  "no reader for extension / roles / nested objects: listed unverified (the run stops)",
-  [
-    "contracts.superPaymaster.extension",
-    "contracts.superPaymaster.roles",
-    "contracts.blsAggregator.guardianSet",
-    "contracts.blsAggregator.signerMaskOrder",
-    "contracts.blsAggregator.thresholds",
-  ].every(p => base.unverified.includes(p)),
-  base.unverified
-);
-cell(
-  "a check on a contract the file does not list (dvtValidator, entryPoint, community) is unverified, not passed",
-  [
-    "checks.dvtValidator.categoryCount",
-    "checks.entryPoint.deposit(superPaymaster)",
-    "checks.community.creditPolicy",
-  ].every(p => base.unverified.includes(p)),
-  base.unverified
-);
-cell(
-  "scalar extras are read through their getter (REGISTRY, MAX_VALIDATORS, DVT_VALIDATOR, WRITER)",
-  [
-    "contracts.superPaymaster.REGISTRY",
-    "contracts.blsAggregator.MAX_VALIDATORS",
-    "contracts.blsAggregator.DVT_VALIDATOR",
-    "contracts.disclosureRegistry.WRITER",
-  ].every(p => base.cmp.some(x => x.path === p && x.ok)),
-  base.cmp.map(x => x.path)
-);
-cell(
-  "an equality check is evaluated from both getters",
-  base.cmp.some(x => x.path === "checks.blsAggregator.owner == dvtValidator.owner") ||
-    base.unverified.includes("checks.blsAggregator.owner == dvtValidator.owner"),
-  base
-);
-
-const mut = async (name, f, expectPath, tweak) => {
+const run = async (rb, tweak = () => ({}), over = {}) => {
+  const w = world(base);
+  const reader = { ...w.reader, ...tweak(w, rb) };
+  return compare(rb, reader, facts(rb, w, typeof over === "function" ? over(w) : over));
+};
+const failed = r => r.cmp.filter(x => !x.ok).map(x => x.path);
+const clone = () => structuredClone(base);
+const mut = async (name, f, expectPath, tweak, over) => {
   const rb = clone();
   f(rb);
-  const r = await run(rb, tweak?.(rb));
+  const r = await run(rb, tweak, over);
   cell(
     name,
-    failedPaths(r).some(p => p === expectPath || p.startsWith(expectPath)),
-    failedPaths(r)
+    failed(r).some(p => p === expectPath || p.startsWith(expectPath)),
+    {
+      failed: failed(r),
+      unverified: r.unverified,
+    }
   );
 };
-await mut(
-  "a different codehash on the fork fails",
-  () => {},
-  "contracts.superPaymaster.codehash",
-  () => ({ keccak: () => "0x" + "1".repeat(64) })
-);
-await mut(
-  "SP says n/a:not a proxy but the fork has an implementation slot: fails",
-  () => {},
-  "contracts.blsAggregator.erc1967Impl",
-  () => ({ slot: async () => "0x" + "0".repeat(24) + "1".repeat(40) })
-);
-await mut(
-  "owner differs: fails",
-  rb => (rb.contracts.superPaymaster.owner = "0x" + "9".repeat(40)),
-  "contracts.superPaymaster.owner"
-);
-// null = absent from SP's ABI, decided from the ABI, never by calling (DSR)
-{
-  const P = "contracts.spAdminExtension.version";
-  const fallback = { call: async (a, n) => (n === "version" ? "X-1.0" : undefined) };
-  const r1 = await compare(clone(), fakeWorld(consistent, fallback), facts(clone()));
+const unv = async (name, f, expectPrefix, tweak, over) => {
+  const rb = clone();
+  f(rb);
+  const r = await run(rb, tweak, over);
   cell(
-    "null version, a fallback contract answers version(), ABI has no version(): passes (not called)",
-    r1.cmp.some(x => x.path === P && x.ok) && !r1.unverified.some(u => u.startsWith(P)),
-    r1.cmp.filter(x => x.path === P)
+    name,
+    r.unverified.some(u => u.startsWith(expectPrefix)),
+    {
+      failed: failed(r),
+      unverified: r.unverified,
+    }
   );
-  const abi = abiOf(consistent);
-  abi.spAdminExtension = new Set([...abi.spAdminExtension, sel("version")]);
-  const r2 = await compare(clone(), fakeWorld(consistent), facts(clone(), abi));
+};
+
+// ---- positive: the complete consistent world is SAME STATE
+const pos = await run(clone());
+cell("complete consistent read-back: no mismatch", failed(pos).length === 0, failed(pos));
+cell(
+  "complete consistent read-back: nothing unverified",
+  pos.unverified.length === 0,
+  pos.unverified
+);
+cell(
+  "guardianSet, signerMaskOrder, thresholds, Safe, extension, ERC-7201 and an equality check all compared",
+  [
+    `contracts.blsAggregator.guardianSet[${G1}].pubkeyHash`,
+    "contracts.blsAggregator.signerMaskOrder.bits",
+    "contracts.blsAggregator.thresholds.MAJOR",
+    "contracts.ownerSafe.owners",
+    "contracts.ownerSafe.singleton",
+    "contracts.superPaymaster.extensionCodehash=spAdminExtension.codehash",
+    "contracts.registry.pendingOwner=ERC-7201 slot",
+    "checks.blsAggregator.owner == superPaymaster.owner",
+  ].every(p => pos.cmp.some(x => x.path === p && x.ok)),
+  pos.cmp.map(x => x.path)
+);
+
+// ---- SP's own example (placeholders) stops
+{
+  const w = world(base);
+  const r = await compare(example, w.reader, facts(example, w));
+  cell(
+    "SP's example: the contracts it does not list are unverified (an inventory gap never passes)",
+    REQUIRED_CONTRACTS.filter(k => !(k in example.contracts)).every(k =>
+      r.unverified.some(u => u.startsWith(`contracts.${k} (missing`))
+    ),
+    r.unverified
+  );
+  cell(
+    "SP's example (fixed at 248ef831): extensionCodehash equals spAdminExtension.codehash",
+    !failed(r).includes("contracts.superPaymaster.extensionCodehash=spAdminExtension.codehash") &&
+      r.cmp.some(
+        x => x.path === "contracts.superPaymaster.extensionCodehash=spAdminExtension.codehash"
+      ),
+    failed(r)
+  );
+}
+
+// ---- Codex A7 R1 #1: inventory and addresses
+await unv(
+  "R1#1: an empty contracts map is unverified",
+  rb => (rb.contracts = {}),
+  "contracts.superPaymaster (missing"
+);
+await unv("R1#1: empty checks are unverified", rb => (rb.checks = {}), "checks (empty)");
+await unv(
+  "R1#1: a valueState address without an address-book entry is unverified",
+  rb => (rb.contracts.multiSendCallOnly.address = "n/a:not used"),
+  "contracts.multiSendCallOnly.address",
+  undefined,
+  { addressBook: { ...addressBook, multiSendCallOnly: undefined } }
+);
+await mut(
+  "an address other than the address book's fails",
+  rb => (rb.contracts.registry.address = A(0xdead)),
+  "contracts.registry.address"
+);
+await unv(
+  "no address book: addresses are unverified",
+  () => {},
+  "contracts.superPaymaster.address (no address book)",
+  undefined,
+  { addressBook: null }
+);
+// ---- Codex A7 R1 #2: types from the ABI, never guessed
+await mut(
+  "R1#2: a string getter vs a reported 32 fails",
+  rb => (rb.contracts.superPaymaster.version = 32),
+  "contracts.superPaymaster.version"
+);
+await mut(
+  "R1#2: two different owners are not equal",
+  () => {},
+  "checks.blsAggregator.owner == superPaymaster.owner",
+  (w, rb) => ({
+    call: async (a, i, f, args) =>
+      a.toLowerCase() === rb.contracts.superPaymaster.address.toLowerCase() && f.name === "owner"
+        ? { status: "value", v: A(0x77) }
+        : w.reader.call(a, i, f, args),
+  })
+);
+// ---- Codex A7 R1 #3: failures are not absence
+await mut(
+  "R1#3: a decoding failure on an n/a field fails (the getter returned data)",
+  () => {},
+  "contracts.blsAggregator.pendingRotation",
+  w => ({
+    call: async (a, i, f, args) =>
+      f.name === "pendingRotation" ? { status: "decode" } : w.reader.call(a, i, f, args),
+  }),
+  w => ({
+    abi: {
+      ...w.abi,
+      blsAggregator: new Interface([
+        ...w.abi.blsAggregator.fragments.map(x => x.format("full")),
+        "function pendingRotation() view returns (address)",
+      ]),
+    },
+  })
+);
+{
+  let threw = false;
+  try {
+    await run(clone(), () => ({
+      call: async () => {
+        throw new Error("rpc down");
+      },
+    }));
+  } catch {
+    threw = true;
+  }
+  cell("R1#3: an RPC failure throws (the run stops, no verdict)", threw, null);
+}
+// ---- Codex A7 R1 #4
+await mut(
+  "R1#4: a fork head other than readbackBlock fails",
+  () => {},
+  "header.readbackBlock=fork head",
+  (w, rb) => ({ head: async () => rb.header.readbackBlock + 1 })
+);
+// ---- Codex A7 R1 #5
+{
+  const t = JSON.stringify({ providers: ["https://rpc.example/KEY"], tag: "wss://x" }, redact);
+  cell("R1#5: URL-like strings are redacted", !/KEY|wss:/.test(t), t);
+}
+// ---- null = absent from SP's ABI (DSR), never by calling
+{
+  const r1 = await run(clone(), w => ({
+    call: async (a, i, f, args) =>
+      f.name === "version" ? { status: "value", v: "X-1.0" } : w.reader.call(a, i, f, args),
+  }));
+  cell(
+    "null version, a fallback answers version(), ABI lacks it: passes",
+    r1.cmp.some(x => x.path === "contracts.spAdminExtension.version" && x.ok),
+    r1.cmp.filter(x => x.path === "contracts.spAdminExtension.version")
+  );
+  const r2 = await run(clone(), undefined, w => ({
+    abi: {
+      ...w.abi,
+      spAdminExtension: new Interface(["function version() view returns (string)"]),
+    },
+  }));
   cell(
     "null version but version() IS in SP's ABI: fails",
-    failedPaths(r2).includes(P),
-    failedPaths(r2)
+    failed(r2).includes("contracts.spAdminExtension.version"),
+    failed(r2)
   );
-  const r3 = await compare(clone(), fakeWorld(consistent), facts(clone(), {}));
+  const r3 = await run(clone(), undefined, w => {
+    const abi = { ...w.abi };
+    delete abi.spAdminExtension;
+    return { abi };
+  });
   cell(
-    "null version without SP's ABI: unverified (the run stops)",
-    r3.unverified.some(u => u.startsWith(P)) && !r3.cmp.some(x => x.path === P),
+    "null version without SP's ABI: unverified",
+    r3.unverified.some(u => u.startsWith("contracts.spAdminExtension.version")),
     r3.unverified
   );
 }
+// ---- read methods
 await mut(
-  "a scalar extra differs (OPERATOR_WITHDRAWAL_WINDOW): fails",
-  rb => (rb.contracts.superPaymaster.OPERATOR_WITHDRAWAL_WINDOW = 3600),
-  "contracts.superPaymaster.OPERATOR_WITHDRAWAL_WINDOW"
+  "guardianSet: another pubkeyHash fails",
+  rb => (rb.contracts.blsAggregator.guardianSet[0].pubkeyHash = "0x" + "ab".repeat(32)),
+  `contracts.blsAggregator.guardianSet[${G1}].pubkeyHash`
 );
+await mut(
+  "guardianSet: a guardian SP left out fails",
+  rb => (rb.contracts.blsAggregator.guardianSet = []),
+  "contracts.blsAggregator.guardianSet.length"
+);
+await mut(
+  "guardianSet: another slot fails",
+  rb => (rb.contracts.blsAggregator.guardianSet[0].slot = 2),
+  `contracts.blsAggregator.guardianSet[${G1}].slot`
+);
+await mut(
+  "signerMaskOrder: bit 0 naming another address fails",
+  rb => (rb.contracts.blsAggregator.signerMaskOrder.bits = [A(0x1)]),
+  "contracts.blsAggregator.signerMaskOrder.bits"
+);
+await mut(
+  "thresholds: MAJOR other than slashThresholds(2) fails",
+  rb => (rb.contracts.blsAggregator.thresholds.MAJOR = 2),
+  "contracts.blsAggregator.thresholds.MAJOR"
+);
+await unv(
+  "thresholds: an unknown SlashLevel order is unverified",
+  () => {},
+  "contracts.blsAggregator.thresholds.MINOR",
+  undefined,
+  { slashLevels: null }
+);
+await mut(
+  "extension: EXTENSION() other than SP's fails",
+  rb => (rb.contracts.superPaymaster.extension = A(0x4445)),
+  "contracts.superPaymaster.extension"
+);
+await mut(
+  "an extension on a contract that has none fails",
+  rb => (rb.contracts.registry.extension = A(0x4444)),
+  "contracts.registry.extension"
+);
+await mut(
+  "Safe owners differ: fails",
+  rb => (rb.contracts.ownerSafe.owners = [A(0xa1)]),
+  "contracts.ownerSafe.owners"
+);
+await mut(
+  "Safe threshold differs: fails",
+  rb => (rb.contracts.ownerSafe.threshold = 3),
+  "contracts.ownerSafe.threshold"
+);
+await mut(
+  "Safe singleton differs: fails",
+  rb => (rb.contracts.ownerSafe.singleton = A(0x5a5b)),
+  "contracts.ownerSafe.singleton"
+);
+await mut(
+  "registry: pendingOwner() disagreeing with its ERC-7201 slot fails",
+  () => {},
+  "contracts.registry.pendingOwner=ERC-7201 slot",
+  (w, rb) => ({
+    slot: async (a, s) =>
+      s === OWNERSHIP_2STEP_SLOT && a.toLowerCase() === rb.contracts.registry.address.toLowerCase()
+        ? "0x" + "0".repeat(24) + "42".repeat(20)
+        : w.reader.slot(a, s),
+  })
+);
+{
+  // a check with an address argument: registry.balanceOf(superPaymaster)
+  const over = w => ({
+    abi: {
+      ...w.abi,
+      registry: new Interface([
+        ...w.abi.registry.fragments.map(x => x.format("full")),
+        "function balanceOf(address) view returns (uint256)",
+      ]),
+    },
+  });
+  const tweak = (w, rb) => ({
+    call: async (a, i, f, args) =>
+      f.name === "balanceOf" &&
+      a.toLowerCase() === rb.contracts.registry.address.toLowerCase() &&
+      String(args[0]).toLowerCase() === rb.contracts.superPaymaster.address.toLowerCase()
+        ? { status: "value", v: 1000n }
+        : w.reader.call(a, i, f, args),
+  });
+  const ok = clone();
+  ok.checks["registry.balanceOf(superPaymaster)"] = "1000";
+  const r1 = await run(ok, tweak, over);
+  cell(
+    "a check with an argument reads fn(<that contract's address>): equal passes",
+    r1.cmp.some(x => x.path === "checks.registry.balanceOf(superPaymaster)" && x.ok),
+    failed(r1)
+  );
+  const bad = clone();
+  bad.checks["registry.balanceOf(superPaymaster)"] = "999";
+  const r2 = await run(bad, tweak, over);
+  cell(
+    "a check with an argument: a different value fails",
+    failed(r2).includes("checks.registry.balanceOf(superPaymaster)"),
+    failed(r2)
+  );
+}
+{
+  // roles from RoleGranted/RoleRevoked logs, confirmed with hasRole
+  const ROLE = keccakId("ROLE_DVT");
+  const acct = A(0xb0b);
+  const over = w => ({
+    abi: {
+      ...w.abi,
+      registry: new Interface([
+        ...w.abi.registry.fragments.map(x => x.format("full")),
+        "function hasRole(bytes32, address) view returns (bool)",
+        "event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)",
+        "event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender)",
+      ]),
+    },
+  });
+  const tweak = (w, rb) => ({
+    logs: async () => [
+      {
+        topics: [
+          keccakId("RoleGranted(bytes32,address,address)"),
+          ROLE,
+          "0x" + "0".repeat(24) + acct.slice(2).toLowerCase(),
+          "0x" + "0".repeat(64),
+        ],
+      },
+    ],
+    call: async (a, i, f, args) =>
+      f.name === "hasRole" && a.toLowerCase() === rb.contracts.registry.address.toLowerCase()
+        ? { status: "value", v: true }
+        : w.reader.call(a, i, f, args),
+  });
+  const ok = clone();
+  ok.contracts.registry.roles = { [ROLE]: [acct] };
+  ok.contracts.registry.rolesSource = { fromBlock: 100, toBlock: ok.header.readbackBlock };
+  const r1 = await run(ok, tweak, over);
+  cell(
+    "roles: logs + hasRole equal SP's members: pass",
+    !failed(r1).some(p => p.includes(".roles")) && !r1.unverified.some(u => u.includes(".roles")),
+    { f: failed(r1), u: r1.unverified }
+  );
+  const bad = clone();
+  bad.contracts.registry.roles = {};
+  bad.contracts.registry.rolesSource = { fromBlock: 100, toBlock: bad.header.readbackBlock };
+  const r2 = await run(bad, tweak, over);
+  cell(
+    "roles: a member SP left out fails",
+    failed(r2).some(p => p.startsWith("contracts.registry.roles[")),
+    failed(r2)
+  );
+  const nosrc = clone();
+  nosrc.contracts.registry.roles = { [ROLE]: [acct] };
+  const r3 = await run(nosrc, tweak, over);
+  cell(
+    "roles: an AccessControl contract without rolesSource is unverified",
+    r3.unverified.some(u => u.startsWith("contracts.registry.roles (no rolesSource")),
+    r3.unverified
+  );
+  const late = clone();
+  late.contracts.registry.roles = { [ROLE]: [acct] };
+  late.contracts.registry.rolesSource = { fromBlock: 100, toBlock: late.header.readbackBlock };
+  const r4 = await run(
+    late,
+    (w, rb) => ({
+      ...tweak(w, rb),
+      code: async (a, b) => (b !== undefined ? "0x60" : w.reader.code(a)),
+    }),
+    over
+  );
+  cell(
+    "roles: a log range starting after deployment (code before fromBlock) fails",
+    failed(r4).includes("contracts.registry.rolesSource.fromBlock<=deployment"),
+    failed(r4)
+  );
+}
+// ---- the probe (schema v4)
+await mut(
+  "probe: SP's simulateV1 differs from gasUsedFork: fails",
+  rb => (rb.amsterdamProbe.estimateSimulate.alchemy = 256646),
+  "amsterdamProbe.sp:estimateSimulate.alchemy==gasUsedFork"
+);
+await mut(
+  "probe: no provider with simulateV1: fails",
+  rb => (rb.amsterdamProbe.estimateSimulate = { alchemy: "n/a:no", tenderly: "n/a:no" }),
+  "amsterdamProbe.sp:some provider has eth_simulateV1"
+);
+await mut(
+  "probe: a provider's eth_call at gasUsed failed: fails",
+  rb => (rb.amsterdamProbe.callAtGasUsed.tenderly = false),
+  "amsterdamProbe.sp:callAtGasUsed all true"
+);
+await mut(
+  "probe: the rerun on this fork uses other gas: fails",
+  () => {},
+  "amsterdamProbe.fork:gasUsed",
+  () => ({ probe: async () => ({ gasUsedFork: 256000, simulate: 256645, callAtGasUsed: true }) })
+);
+await mut(
+  "probe: this script's own upstream simulateV1 differs: fails",
+  () => {},
+  "amsterdamProbe.upstream:simulateV1",
+  () => ({ probe: async () => ({ gasUsedFork: 256645, simulate: 259849, callAtGasUsed: true }) })
+);
+await mut(
+  "probe: this script's own upstream eth_call at gasUsed fails: fails",
+  () => {},
+  "amsterdamProbe.upstream:callAtGasUsed",
+  () => ({ probe: async () => ({ gasUsedFork: 256645, simulate: 256645, callAtGasUsed: false }) })
+);
+{
+  const rb = clone();
+  rb.amsterdamProbe.estimateLive = { alchemy: 1, tenderly: 2 };
+  rb.amsterdamProbe.estimateFork = 3;
+  rb.amsterdamProbe.callAtGasUsedMinusOne = { alchemy: true, tenderly: true };
+  const r = await run(rb);
+  cell(
+    "probe: estimates and gas-1 are recorded only, never judged",
+    failed(r).length === 0,
+    failed(r)
+  );
+  const rb2 = clone();
+  rb2.amsterdamProbe.predicate = "true";
+  const r2 = await run(rb2);
+  cell(
+    "an unknown probe predicate is never evaluated: unverified",
+    r2.unverified.includes("amsterdamProbe.predicate"),
+    r2.unverified
+  );
+}
+// ---- header
+await mut("a live read-back is never a fork's", rb => (rb.header.source = "live"), "header.source");
 await mut(
   "readbackBlockHash differs: fails",
-  rb => (rb.header.readbackBlockHash = "0x" + "1".repeat(64)),
+  rb => (rb.header.readbackBlockHash = "0x" + "12".repeat(32)),
   "header.readbackBlockHash",
-  rb => ({ block: async () => ({ hash: "0x" + "b".repeat(64) }) })
-);
-await mut(
-  "anvilCommit other than the pinned build: fails",
-  rb => (rb.header.anvilCommit = "1".repeat(40)),
-  "header.anvilCommit"
+  (w, rb) => ({ block: async () => ({ hash: base.header.readbackBlockHash }) })
 );
 await mut(
   "upstream forkId not Amsterdam: fails",
@@ -315,60 +673,23 @@ await mut(
   "header.ethConfig.forkId"
 );
 await mut(
-  "corroboration without slotNumber: fails",
-  rb => (rb.header.ethConfig.corroboration.slotNumber = false),
-  "header.ethConfig.corroboration.slotNumber"
-);
-await mut(
-  "this script's own upstream lacks the Amsterdam fields: fails",
+  "this script's own upstream lacks slotNumber: fails",
   () => {},
   "upstream.slotNumber",
   () => ({ upstreamHeader: async () => ({ blockAccessListHash: true, slotNumber: false }) })
-);
-await mut(
-  "source live is not a fork read-back: fails",
-  rb => (rb.header.source = "live"),
-  "header.source"
 );
 await mut(
   "a provider given as a URL fails",
   rb => (rb.header.providers = ["https://rpc.example/key"]),
   "header.providers"
 );
-await mut(
-  "probe: SP's live estimates disagree: fails",
-  rb => (rb.amsterdamProbe.estimateLive.tenderly = 1),
-  "amsterdamProbe.sp:estimateLive==estimateFork"
-);
-await mut(
-  "probe: the rerun on this fork measures other gas: fails",
-  () => {},
-  "amsterdamProbe.fork:gasUsed",
-  () => ({ probe: async () => ({ estimateFork: 53000, gasUsedFork: 51000, estimateLive: 53000 }) })
-);
-await mut(
-  "probe: this script's own upstream estimate differs: fails",
-  () => {},
-  "amsterdamProbe.upstream:estimate",
-  () => ({ probe: async () => ({ estimateFork: 53000, gasUsedFork: 52000, estimateLive: 60000 }) })
-);
-{
-  const rb = clone();
-  rb.amsterdamProbe.predicate = "true";
-  const r = await run(rb);
-  cell(
-    "an unknown probe predicate is never evaluated: unverified",
-    r.unverified.includes("amsterdamProbe.predicate"),
-    r.unverified
-  );
-}
 
-let failed = 0;
+let nf = 0;
 for (const r of results) {
   console.log(
-    `${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got.slice(0, 800)}`}`
+    `${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got.slice(0, 1500)}`}`
   );
-  if (!r.ok) failed++;
+  if (!r.ok) nf++;
 }
-console.log(`\n${results.length - failed}/${results.length} cells`);
-process.exit(failed ? 1 : 0);
+console.log(`\n${results.length - nf}/${results.length} cells`);
+process.exit(nf ? 1 : 0);

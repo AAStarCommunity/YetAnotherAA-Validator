@@ -5,26 +5,25 @@
 //
 //   A7_FORK_URL=<archive RPC> node deploy/guardian-watcher/a7-fork.mjs \
 //     --dump <state.json> --dump-sha256 <hex> --readback <a7-readback.json> \
-//     --fund <test key address> [--abi-dir <dir>] [--anvil <path>] [--schema <file>] [--port 8546]
-//     [--record <out.json>] [--keep]
+//     --address-book <{key: address}.json> --fund <test key address>
+//     [--anvil <path>] [--schema <file>] [--abi-dir <dir>] [--port 8546] [--record <out.json>] [--keep]
 //
 // Steps, each one fatal on failure:
-//   1. the read-back validates against SP's aoa-a7-readback/1 schema (Draft 2020-12), fetched through
-//      the GitHub API at the pinned SP commit (or --schema), its sha256 pinned; the dump's sha256
-//      equals --dump-sha256 and header.dumpSha256;
-//   2. the anvil binary is SP's build (Commit SHA 4e8874b2, header.anvilCommit, header.anvilVersion);
+//   1. the read-back validates against SP's frozen aoa-a7-readback/1 schema (Draft 2020-12), fetched
+//      through the GitHub API at the pinned SP commit (or --schema), its sha256 pinned; the dump's
+//      sha256 equals --dump-sha256 and header.dumpSha256;
+//   2. SP's committed abis/ at header.spCommit are fetched through the GitHub API (DSR: not a local
+//      build, never SP's working tree; --abi-dir only for an offline copy), each file's sha256
+//      recorded; the SlashLevel enum order is read from SP's source at the same commit;
+//   3. the anvil binary is SP's build (Commit SHA 4e8874b2 = header.anvilCommit, header.anvilVersion);
 //      anvil --fork-url $A7_FORK_URL --fork-block-number header.forkBlock --chain-id header.chainId
-//      --hardfork amsterdam --load-state <dump>;
-//   3. anvil_setBalance gives the rehearsal's own test key gas;
-//   4. every field is compared with an independent read (a7-readback.mjs): header, contracts,
-//      checks, then the Amsterdam probe (last: it sends a transaction on the fork). Amsterdam is
-//      proven from upstream (SP's ethConfig + this script's own upstream header), never from the
-//      local engine's eth_config. Any mismatch, or any field without an independent reader, stops;
-//   5. the record notes the anvil build, both sha256s, the fork block and every comparison.
-// --abi-dir holds <contractKey>.json (a forge artifact or a bare ABI array) built from SP at
-// header.spCommit: a null ("absent") field is decided from it (the selector is not in the ABI), never
-// by calling, because a contract with a fallback answers any selector (DSR). Without it, every null
-// field is unverified. Each ABI file's sha256 is recorded.
+//      --hardfork amsterdam --load-state <dump>; its head must be header.readbackBlock;
+//   4. every field is compared with an independent read at that head (a7-readback.mjs). The probe
+//      runs last, between evm_snapshot and evm_revert, so the drills get the read-back state itself.
+//      Any mismatch, or any field without an independent reader, stops;
+//   5. only then anvil_setBalance gives the rehearsal's own test key gas;
+//   6. the record notes the anvil build, every input sha256, the fork block and every comparison;
+//      any URL-like string is redacted from output and record.
 // The fork URL is read from the environment and never printed or recorded (only its host).
 import { spawn, execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -35,10 +34,13 @@ import { ethers } from "ethers";
 import {
   validate,
   compare,
+  redact,
   SCHEMA_ID,
   SCHEMA_SHA256,
   SCHEMA_SOURCE,
   ANVIL_COMMIT,
+  ABI_FILES,
+  SAFE_GETTERS,
 } from "./a7-readback.mjs";
 
 const args = process.argv.slice(2);
@@ -60,10 +62,23 @@ const forkUrl = process.env.A7_FORK_URL;
 if (!dumpPath || !/^[0-9a-f]{64}$/.test(dumpSha) || !readbackPath || !ethers.isAddress(fund ?? ""))
   die(
     2,
-    "usage: A7_FORK_URL=.. a7-fork.mjs --dump <file> --dump-sha256 <hex> --readback <file> --fund <address>"
+    "usage: A7_FORK_URL=.. a7-fork.mjs --dump <file> --dump-sha256 <hex> --readback <file> --address-book <file> --fund <address>"
   );
 if (!forkUrl) die(2, "A7_FORK_URL (an archive RPC of the forked chain) is not set");
 const sha256 = buf => createHash("sha256").update(buf).digest("hex");
+const ghRaw = (path, ref) => {
+  const r = spawnSync(
+    "gh",
+    [
+      "api",
+      "-H",
+      "Accept: application/vnd.github.raw",
+      `repos/${SCHEMA_SOURCE.repo}/contents/${path}?ref=${ref}`,
+    ],
+    { stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 << 20 }
+  );
+  return r.status === 0 ? r.stdout : null;
+};
 // SP's exact build (DSR): anvil 1.8.7-nightly, commit 4e8874b2. Stable 1.7.1 has no Amsterdam and
 // panics on it; 1.8.6 computes Amsterdam gas wrongly. Any other commit is refused, whatever --anvil
 // names; the default is the separate ~/.foundry-a7 install (the shared ~/.foundry is not changed).
@@ -73,24 +88,11 @@ const anvilBin =
     ? join(homedir(), ".foundry-a7/bin/anvil")
     : "anvil");
 
-// ---- 1. inputs: schema, read-back, dump
-let schemaText;
-if (opt("schema")) schemaText = readFileSync(opt("schema"));
-else {
-  const r = spawnSync(
-    "gh",
-    [
-      "api",
-      "-H",
-      "Accept: application/vnd.github.raw",
-      `repos/${SCHEMA_SOURCE.repo}/contents/${SCHEMA_SOURCE.path}?ref=${SCHEMA_SOURCE.ref}`,
-    ],
-    { stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1 << 20 }
-  );
-  if (r.status !== 0)
-    die(3, "cannot fetch SP's read-back schema through the GitHub API (--schema)");
-  schemaText = r.stdout;
-}
+// ---- 1. inputs: schema, read-back, dump, address book
+const schemaText = opt("schema")
+  ? readFileSync(opt("schema"))
+  : ghRaw(SCHEMA_SOURCE.path, SCHEMA_SOURCE.ref);
+if (!schemaText) die(3, "cannot fetch SP's read-back schema through the GitHub API (--schema)");
 if (sha256(schemaText) !== SCHEMA_SHA256)
   die(1, `the read-back schema is not SP's pinned file (sha256 ${SCHEMA_SHA256})`);
 const schema = JSON.parse(schemaText.toString("utf8"));
@@ -112,29 +114,67 @@ if (h.dumpSha256 !== dumpSha) die(1, "the read-back was taken from another dump 
 if (h.anvilCommit !== ANVIL_COMMIT)
   die(1, "the read-back was taken on another anvil commit than the pinned build");
 if (h.hardfork !== "amsterdam") die(1, `read-back hardfork is ${h.hardfork}, expected amsterdam`);
-
-// ABIs of SP's build at header.spCommit, for null ("absent") fields
-const abi = {};
-const abiFiles = {};
-if (opt("abi-dir")) {
-  for (const f of readdirSync(opt("abi-dir")).filter(x =>
-    /^[A-Za-z_][A-Za-z0-9_]*\.json$/.test(x)
-  )) {
-    const raw = readFileSync(join(opt("abi-dir"), f));
-    let frags;
-    try {
-      const j = JSON.parse(raw.toString("utf8"));
-      frags = new ethers.Interface(Array.isArray(j) ? j : j.abi);
-    } catch {
-      die(1, `ABI file ${f} is not an ABI or a forge artifact`);
-    }
-    const key = f.slice(0, -5);
-    abi[key] = new Set(frags.fragments.filter(x => x.type === "function").map(x => x.selector));
-    abiFiles[key] = sha256(raw);
+let addressBook = null;
+let addressBookSha = null;
+if (opt("address-book")) {
+  const raw = readFileSync(opt("address-book"));
+  addressBookSha = sha256(raw);
+  try {
+    addressBook = JSON.parse(raw.toString("utf8"));
+  } catch {
+    die(1, "address book is not JSON");
   }
+  for (const [k, v] of Object.entries(addressBook))
+    if (!ethers.isAddress(v)) die(1, `address book entry ${k} is not an address`);
 }
 
-// ---- 2. the pinned anvil on the fork, with the dump loaded
+// ---- 2. SP's committed ABIs and SlashLevel order at header.spCommit
+const abi = {};
+const abiFiles = {};
+const missingAbi = [];
+for (const [key, file] of Object.entries(ABI_FILES)) {
+  if (!(key in rb.contracts)) continue;
+  if (!file) {
+    missingAbi.push(key);
+    continue;
+  }
+  const raw = opt("abi-dir")
+    ? (() => {
+        try {
+          return readFileSync(join(opt("abi-dir"), file));
+        } catch {
+          return null;
+        }
+      })()
+    : ghRaw(`abis/${file}`, h.spCommit);
+  if (!raw) die(3, `cannot fetch SP abis/${file} at ${h.spCommit}`);
+  try {
+    const j = JSON.parse(raw.toString("utf8"));
+    abi[key] = new ethers.Interface(Array.isArray(j) ? j : j.abi);
+  } catch {
+    die(1, `abis/${file} is not an ABI`);
+  }
+  abiFiles[key] = { file, sha256: sha256(raw) };
+}
+// SlashLevel names -> index, from SP's source at spCommit (the ABI shows only uint8)
+let slashLevels = null;
+{
+  const src = opt("abi-dir")
+    ? null
+    : ghRaw("contracts/src/modules/monitoring/BLSAggregator.sol", h.spCommit);
+  const m = src?.toString("utf8").match(/enum\s+SlashLevel\s*\{([^}]*)\}/);
+  if (m)
+    slashLevels = Object.fromEntries(
+      m[1]
+        .replace(/\/\/.*$/gm, "")
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map((n, i) => [n, i])
+    );
+}
+
+// ---- 3. the pinned anvil on the fork, with the dump loaded
 let anvilVersion;
 let anvilCommit;
 try {
@@ -201,20 +241,8 @@ if (!up)
     })`
   );
 
-// ---- 3. gas for the rehearsal's own test key
-await p.send("anvil_setBalance", [fund, ethers.toQuantity(ethers.parseEther("100"))]);
-
-// ---- 4. compare; reads at header.readbackBlock (or latest when the fork does not serve it)
-const head = await p.getBlockNumber();
-const tag = h.readbackBlock <= head ? ethers.toQuantity(h.readbackBlock) : "latest";
-const TYPES = {
-  address: "address",
-  uint256: "uint256",
-  bytes32: "bytes32",
-  bool: "bool",
-  string: "string",
-};
-// raw upstream JSON-RPC (this script's own provider): Amsterdam-only header fields at forkBlock
+// ---- 4. compare at the head (which must be readbackBlock)
+// raw upstream JSON-RPC (this script's own provider); undefined result on any failure
 const upstream = async (method, params) => {
   try {
     const r = await fetch(forkUrl, {
@@ -223,80 +251,140 @@ const upstream = async (method, params) => {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
       signal: AbortSignal.timeout(20_000),
     });
-    return (await r.json())?.result;
+    const j = await r.json();
+    return j.error ? { error: j.error } : { result: j.result };
   } catch {
-    return undefined;
+    return { error: { message: "transport" } };
   }
+};
+class Infra extends Error {}
+const isRevert = e => {
+  const inner = e?.error ?? e?.info?.error ?? {};
+  return inner.code === 3 || /revert/i.test(String(inner.message ?? e?.shortMessage ?? ""));
 };
 const reader = {
   chainId: async () => Number((await p.getNetwork()).chainId),
+  head: async () => p.getBlockNumber(),
   block: async n => {
+    const b = await p.send("eth_getBlockByNumber", [ethers.toQuantity(n), false]);
+    return b ? { hash: b.hash } : null;
+  },
+  code: async (a, block) =>
+    p.send("eth_getCode", [a, block === undefined ? "latest" : ethers.toQuantity(block)]),
+  keccak: c => ethers.keccak256(c),
+  slot: async (a, s) => p.send("eth_getStorageAt", [a, s, "latest"]),
+  // distinct outcomes (Codex A7 R1 #3): value / empty / revert / decode; anything else throws
+  call: async (a, iface, f, callArgs = []) => {
+    let out;
     try {
-      const b = await p.send("eth_getBlockByNumber", [ethers.toQuantity(n), false]);
-      return b ? { hash: b.hash } : null;
+      out = await p.send("eth_call", [
+        { to: a, data: iface.encodeFunctionData(f, callArgs) },
+        "latest",
+      ]);
+    } catch (e) {
+      if (isRevert(e)) return { status: "revert" };
+      throw new Infra("eth_call failed");
+    }
+    if (out === "0x") return { status: "empty" };
+    try {
+      const r = iface.decodeFunctionResult(f, out);
+      return { status: "value", v: f.outputs.length === 1 ? r[0] : r };
     } catch {
-      return null;
+      return { status: "decode" };
     }
   },
-  code: async a => p.send("eth_getCode", [a, tag]),
-  keccak: c => ethers.keccak256(c),
-  slot: async (a, s) => p.send("eth_getStorageAt", [a, s, tag]),
-  call: async (a, name, type) => {
-    if (!TYPES[type]) return undefined;
-    const i = new ethers.Interface([`function ${name}() view returns (${TYPES[type]})`]);
-    try {
-      const out = await p.send("eth_call", [{ to: a, data: i.encodeFunctionData(name, []) }, tag]);
-      if (out === "0x") return undefined; // no such function (or an EOA)
-      const v = i.decodeFunctionResult(name, out)[0];
-      return typeof v === "bigint" ? v.toString() : v;
-    } catch {
-      return undefined;
+  logs: async ({ address, topics, fromBlock, toBlock }) => {
+    const all = [];
+    for (let b = fromBlock; b <= toBlock; b += 10_000) {
+      const to = Math.min(toBlock, b + 9_999);
+      const part = await p.send("eth_getLogs", [
+        { address, topics, fromBlock: ethers.toQuantity(b), toBlock: ethers.toQuantity(to) },
+      ]);
+      all.push(...part);
     }
+    return all;
   },
   upstreamHeader: async n => {
-    const b = await upstream("eth_getBlockByNumber", [ethers.toQuantity(n), false]);
-    return b
-      ? { blockAccessListHash: "blockAccessListHash" in b, slotNumber: "slotNumber" in b }
+    const r = await upstream("eth_getBlockByNumber", [ethers.toQuantity(n), false]);
+    return r.result
+      ? {
+          blockAccessListHash: "blockAccessListHash" in r.result,
+          slotNumber: "slotNumber" in r.result,
+        }
       : undefined;
   },
-  // last: it changes the fork. Same sender and init code as SP; the sender is impersonated (no key)
-  probe: async ({ sender, initcode, forkBlock }) => {
+  // the probe, last; snapshot/revert so the drills get the read-back state; the sender is
+  // impersonated (no key); judged: fork receipt gasUsed, upstream simulateV1 gasUsed, upstream
+  // eth_call at gas = gasUsed; recorded only: estimates and gas - 1
+  probe: async ({ sender, initcode, forkBlock, gasUsed }) => {
+    const tx = { from: sender, data: initcode };
+    const blockTag = ethers.toQuantity(forkBlock);
+    const out = {};
+    const sim = await upstream("eth_simulateV1", [
+      { blockStateCalls: [{ calls: [tx] }] },
+      blockTag,
+    ]);
+    const c0 = sim.result?.[0]?.calls?.[0];
+    if (c0 && c0.status === "0x1") out.simulate = Number(c0.gasUsed);
+    const at = await upstream("eth_call", [{ ...tx, gas: ethers.toQuantity(gasUsed) }, blockTag]);
+    out.callAtGasUsed = at.result !== undefined && !at.error;
+    const at1 = await upstream("eth_call", [
+      { ...tx, gas: ethers.toQuantity(gasUsed - 1) },
+      blockTag,
+    ]);
+    out.callAtGasUsedMinusOne = at1.result !== undefined && !at1.error;
+    const el = await upstream("eth_estimateGas", [tx, blockTag]);
+    out.estimateLive = el.result === undefined ? undefined : Number(el.result);
+    const snap = await p.send("evm_snapshot", []);
     try {
-      const tx = { from: sender, data: initcode };
-      const estimateLive = await upstream("eth_estimateGas", [tx, ethers.toQuantity(forkBlock)]);
-      const estimateFork = Number(await p.send("eth_estimateGas", [tx]));
+      out.estimateFork = Number(await p.send("eth_estimateGas", [tx]));
       await p.send("anvil_impersonateAccount", [sender]);
       const hash = await p.send("eth_sendTransaction", [
-        { ...tx, gas: ethers.toQuantity(estimateFork * 2) },
+        { ...tx, gas: ethers.toQuantity(gasUsed * 2) },
       ]);
       const rc = await p.waitForTransaction(hash, 1, 30_000);
       await p.send("anvil_stopImpersonatingAccount", [sender]);
-      return {
-        estimateFork,
-        gasUsedFork: rc && rc.status === 1 ? Number(rc.gasUsed) : undefined,
-        estimateLive: estimateLive === undefined ? undefined : Number(estimateLive),
-      };
-    } catch {
-      return undefined;
+      out.gasUsedFork = rc && rc.status === 1 ? Number(rc.gasUsed) : undefined;
+    } finally {
+      await p.send("evm_revert", [snap]);
     }
+    return out;
   },
 };
-const { cmp, unverified } = await compare(rb, reader, {
-  anvilVersion,
-  anvilCommit,
-  dumpSha256: dumpSha,
-  forkBlock: h.forkBlock,
-  abi,
-});
-
+let result;
+try {
+  result = await compare(rb, reader, {
+    anvilVersion,
+    anvilCommit,
+    dumpSha256: dumpSha,
+    forkBlock: h.forkBlock,
+    abi,
+    safe: new ethers.Interface(SAFE_GETTERS),
+    addressBook,
+    slashLevels,
+  });
+} catch (e) {
+  // a failed observation proves nothing: the run stops (fixed wording, nothing from the RPC)
+  die(3, `a read failed (${e instanceof Infra ? e.message : "RPC error"}): no verdict`);
+}
+const { cmp, unverified } = result;
+for (const k of missingAbi) unverified.push(`abis/ has no file for ${k} (ask SP)`);
 const failed = cmp.filter(x => !x.ok);
+const proven = !failed.length && !unverified.length;
+
+// ---- 5. gas for the rehearsal's own test key, only on a proven fork
+if (proven) await p.send("anvil_setBalance", [fund, ethers.toQuantity(ethers.parseEther("100"))]);
+
 const record = {
-  schema: "aoa-a7-rehearsal-fork/2",
+  schema: "aoa-a7-rehearsal-fork/3",
   at: new Date().toISOString(),
   anvilVersion,
   anvilCommit,
   readbackSchema: { ...SCHEMA_SOURCE, sha256: SCHEMA_SHA256 },
   abiFiles,
+  abiSource: opt("abi-dir") ? "offline copy (--abi-dir)" : `GitHub API at ${h.spCommit}`,
+  slashLevels,
+  addressBookSha256: addressBookSha,
   forkHost: (() => {
     try {
       return new URL(forkUrl).hostname;
@@ -310,18 +398,14 @@ const record = {
   chainId: h.chainId,
   forkBlock: h.forkBlock,
   readbackBlock: h.readbackBlock,
-  readAt: tag,
-  funded: fund,
+  funded: proven ? fund : null,
   compared: cmp.length,
   failed,
   unverified,
-  verdict:
-    failed.length || unverified.length
-      ? "STOP: the fork is not proven to be SP's state"
-      : "SAME STATE: drills may run",
+  verdict: proven ? "SAME STATE: drills may run" : "STOP: the fork is not proven to be SP's state",
   rpc: args.includes("--keep") ? rpc : null,
 };
-const text = JSON.stringify(record, null, 2);
+const text = JSON.stringify(record, (k, v) => (k === "rpc" ? v : redact(k, v)), 2);
 if (recordPath) writeFileSync(recordPath, text + "\n");
 console.log(text);
-process.exit(failed.length || unverified.length ? 1 : 0);
+process.exit(proven ? 0 : 1);
