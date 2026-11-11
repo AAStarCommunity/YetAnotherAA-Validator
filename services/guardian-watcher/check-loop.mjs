@@ -1671,29 +1671,39 @@ const good = {
   }
 }
 
-// ---- Codex W2c R12: stall index lifecycle
+// ---- Codex W2c R12–R14: per-record stalls in the publication schedule
 {
   const { stallReasons } = await import("./watcher.mjs");
-  const { stallCounts, stallKind, readStalls } = await import("./lib/publisher.mjs");
-  const sp = d => join(d, "stalls.json");
-  // #2: the FIRST broadcast failing for funds is journalled and counted from that pass
+  const { stallCounts, stallKind } = await import("./lib/publisher.mjs");
+  const schedPath = d => join(d, "publish-schedule.json");
+  const readSched = d => JSON.parse(readFileSync(schedPath(d), "utf8"));
+  const unfunded = () => {
+    const s = sinks({ mine: "pending", rejectBroadcast: true });
+    return {
+      s,
+      sk: { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry },
+    };
+  };
+  const recs = n =>
+    Array.from({ length: n }, (_, i) => ({
+      ...bls,
+      key: String(9000 + i),
+      proposalId: String(9000 + i),
+      txHash: ethers.id(`stall-${i}`),
+    }));
+  // R12 #2: the FIRST broadcast failing for funds is journalled and counted from that pass
   {
     const d = tmp();
     try {
       const store = new Store(d);
       store.putRecord(bls);
-      const s = sinks({ mine: "pending", rejectBroadcast: true });
-      const sk = {
-        pinners: s.pinners,
-        mirror: s.mirror,
-        telegram: s.telegram,
-        registry: s.registry,
-      };
+      const { sk } = unfunded();
       const p1 = await publishPending(store, sk, { maxPendingMs: 0 });
       const pub = store.getPublication(Store.recordId(bls));
       cell(
         "R12#2: an initial broadcast refused for funds is journalled, alerted and counted in the same pass",
         p1.stalls.insufficientFunds === 1 &&
+          !p1.stalls.unknown &&
           /INSUFFICIENT_FUNDS|insufficient/i.test(
             String(pub?.registry?.lastBroadcastError ?? "")
           ) &&
@@ -1704,15 +1714,20 @@ const good = {
       rmSync(d, { recursive: true, force: true });
     }
   }
-  // #1: a confirmed journal is no stall, even if it still carries feeCapped; a done record clears
+  cell(
+    "R12#1/R13#2: confirmed, reverted and conflict are never stalls, whatever markers remain",
+    stallKind({
+      registry: { phase: "confirmed", feeCapped: "t", lastBroadcastError: "INSUFFICIENT_FUNDS" },
+    }) === null &&
+      stallKind({ registry: { phase: "reverted", feeCapped: "t" } }) === null &&
+      stallKind({ registry: { phase: "conflict", lastBroadcastError: "INSUFFICIENT_FUNDS" } }) ===
+        null &&
+      stallKind({ registry: { phase: "sent", feeCapped: "t" } }) === "feeCapped" &&
+      stallKind({ registry: { phase: "unsigned", feeCapped: "t" } }) === "feeCapped",
+    null
+  );
+  // R12 #1: a done (confirmed) record clears a stale stall in its entry
   {
-    cell(
-      "R12#1: stallKind of a confirmed registry stage is null even with feeCapped / an old error",
-      stallKind({
-        registry: { phase: "confirmed", feeCapped: "t", lastBroadcastError: "INSUFFICIENT_FUNDS" },
-      }) === null && stallKind({ registry: { phase: "sent", feeCapped: "t" } }) === "feeCapped",
-      null
-    );
     const d = tmp();
     try {
       const store = new Store(d);
@@ -1727,161 +1742,157 @@ const good = {
       for (let i = 0; i < 4; i++) await publishPending(store, sk, { maxPendingMs: 0 });
       const id = Store.recordId(bls);
       const pub = store.getPublication(id);
-      // a stale marker: the journal confirmed but still carrying feeCapped, and the index entry
       store.putPublication(id, {
         ...pub,
         registry: { ...pub.registry, feeCapped: "2026-01-01T00:00:00Z" },
       });
-      writeFileSync(sp(d), JSON.stringify({ [id]: { kind: "feeCapped", since: "x" } }));
-      const p = await publishPending(store, sk, { maxPendingMs: 0 });
+      const sc = readSched(d);
+      sc.entries[id] = { ...sc.entries[id], stall: "feeCapped" };
+      writeFileSync(schedPath(d), JSON.stringify(sc));
+      const fresh = new Store(d); // a new process: nothing in memory
+      const before = stallCounts(fresh);
+      const p = await publishPending(fresh, sk, { maxPendingMs: 0 });
       cell(
-        "R12#1: a done (confirmed) record clears its stale stall entry store-wide",
+        "R12#1: a done (confirmed) record clears its stale stall store-wide",
         pub?.registry?.phase === "confirmed" &&
+          before.feeCapped === 1 &&
           p.stalls.feeCapped === 0 &&
-          !(id in (readStalls(store) ?? { [id]: 1 })),
-        { phase: pub?.registry?.phase, stalls: p.stalls, idx: readStalls(store) }
+          readSched(d).entries[id].stall === undefined,
+        { phase: pub?.registry?.phase, before, stalls: p.stalls }
       );
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
   }
-  // #3: a corrupt index is rebuilt from the journals; if that fails too, the state is "unknown"
+  // R12 #3 / R14 #2: an unreadable schedule is "unknown" until a complete sweep, each pass within
+  // its budget (no full rebuild)
+  {
+    const d = tmp();
+    try {
+      const store0 = new Store(d);
+      for (const r of recs(3)) store0.putRecord(r);
+      const { sk } = unfunded();
+      await publishPending(store0, sk, { maxPendingMs: 0 });
+      writeFileSync(schedPath(d), "{not json");
+      class Counting extends Store {
+        reads = 0;
+        getPublication(id) {
+          this.reads++;
+          return super.getPublication(id);
+        }
+      }
+      const store = new Counting(d);
+      const u0 = stallCounts(store);
+      const seen = [];
+      for (let i = 0; i < 3; i++) {
+        store.reads = 0;
+        const p = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 1 });
+        seen.push({
+          unknown: !!p.stalls.unknown,
+          n: p.stalls.insufficientFunds,
+          reads: store.reads,
+          alerts: p.alerts.filter(a => /schedule/.test(a)),
+        });
+      }
+      cell(
+        "R12#3: an unreadable schedule counts as unknown, never as zero stalls",
+        u0.unknown === true &&
+          stallReasons({ stalls: u0 })[0] ===
+            "stall state unknown: the stall index is unreadable" &&
+          seen[0].alerts.some(a =>
+            /schedule unreadable; stall state unknown until a full sweep/.test(a)
+          ),
+        { u0, seen }
+      );
+      cell(
+        "R14#2: unknown until the sweep completes (3 records, 1 per pass), then the true count; every pass reads at most its budget of journals",
+        seen[0].unknown &&
+          seen[1].unknown &&
+          !seen[2].unknown &&
+          seen[2].n === 3 &&
+          seen.every(x => x.reads <= 2),
+        seen
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // a schedule written before stalls were tracked, part-way through a traversal: one more sweep
+  {
+    const d = tmp();
+    try {
+      const store0 = new Store(d);
+      for (const r of recs(3)) store0.putRecord(r);
+      const names = store0.recordFiles();
+      writeFileSync(schedPath(d), JSON.stringify({ cursor: names[0], entries: {}, sweeps: 0 }));
+      const store = new Store(d);
+      const { sk } = unfunded();
+      const a = await publishPending(store, sk, { maxPendingMs: 0 });
+      const b = await publishPending(store, sk, { maxPendingMs: 0 });
+      cell(
+        "R14: a legacy schedule mid-traversal stays unknown after the partial sweep and is known after a full one",
+        a.stalls.unknown === true && !b.stalls.unknown && b.stalls.insufficientFunds === 3,
+        { a: a.stalls, b: b.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // R13 #1 / R14 #1: the stall travels with the rotation. An unwritable schedule is reported, the
+  // pass reports what it computed, and a restart reads "unknown", never an old zero.
   {
     const d = tmp();
     try {
       const store = new Store(d);
       store.putRecord(bls);
-      const s = sinks({ mine: "pending", rejectBroadcast: true });
-      const sk = {
-        pinners: s.pinners,
-        mirror: s.mirror,
-        telegram: s.telegram,
-        registry: s.registry,
-      };
-      await publishPending(store, sk, { maxPendingMs: 0 });
-      writeFileSync(sp(d), "{not json");
+      const { sk } = unfunded();
+      mkdirSync(join(schedPath(d), "x"), { recursive: true });
+      const p1 = await publishPending(store, sk, { maxPendingMs: 0 });
+      const p2 = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
+      const restarted = stallCounts(new Store(d));
       cell(
-        "R12#3: an unreadable index counts as unknown, never as zero stalls",
-        stallCounts(store).unknown === true &&
-          stallReasons({ stalls: stallCounts(store) })[0] ===
-            "stall state unknown: the stall index is unreadable",
-        stallCounts(store)
-      );
-      const p = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
-      cell(
-        "R12#3: the next pass rebuilds the index from the journals (the unfunded record is counted again)",
-        p.stalls.insufficientFunds === 1 &&
-          !p.stalls.unknown &&
-          p.alerts.some(a => /rebuilt from the publication journals/.test(a)),
-        { stalls: p.stalls, alerts: p.alerts }
-      );
-      writeFileSync(sp(d), "[]");
-      writeFileSync(join(d, "publications", `${Store.recordId(bls)}.json`), "{corrupt");
-      const q = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
-      cell(
-        "R12#3: index and a journal both unreadable: stall state unknown, degraded",
-        q.stalls.unknown === true &&
-          stallReasons({ stalls: q.stalls }).some(r => /stall state unknown/.test(r)) &&
-          q.alerts.some(a => /could not be rebuilt/.test(a)),
-        { stalls: q.stalls, alerts: q.alerts }
+        "R14#1: an unwritable schedule: alerted, the pass and the next (in memory) report the stall, a restart reports unknown",
+        p1.stalls.insufficientFunds === 1 &&
+          p1.alerts.some(a => /publication schedule not saved/.test(a)) &&
+          p2.stalls.insufficientFunds === 1 &&
+          restarted.unknown === true,
+        { p1: [p1.stalls, p1.alerts], p2: p2.stalls, restarted }
       );
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
   }
-}
-
-// ---- Codex W2c R13
-{
-  const { stallKind } = await import("./lib/publisher.mjs");
-  cell(
-    "R13#2: a terminal incident (reverted / conflict) is never a fee or funding stall",
-    stallKind({ registry: { phase: "reverted", feeCapped: "t" } }) === null &&
-      stallKind({ registry: { phase: "conflict", lastBroadcastError: "INSUFFICIENT_FUNDS" } }) ===
-        null &&
-      stallKind({ registry: { phase: "unsigned", feeCapped: "t" } }) === "feeCapped",
-    null
-  );
-  const d = tmp();
-  try {
-    const store = new Store(d);
-    store.putRecord(bls);
-    const s = sinks({ mine: "pending", rejectBroadcast: true });
-    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
-    // the index cannot be written (a directory in its place): the update must not be lost
-    mkdirSync(join(d, "stalls.json", "x"), { recursive: true });
-    const p1 = await publishPending(store, sk, { maxPendingMs: 0 });
-    const p2 = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
-    cell(
-      "R13#1: a failed index write is alerted, this pass reports what it computed, the next pass (record not in its batch) rebuilds",
-      p1.stalls.insufficientFunds === 1 &&
-        p1.alerts.some(a => /stall index not saved/.test(a)) &&
-        p2.stalls.insufficientFunds === 1 &&
-        !p2.stalls.unknown,
-      { p1: [p1.stalls, p1.alerts], p2: [p2.stalls, p2.alerts] }
-    );
-  } finally {
-    rmSync(d, { recursive: true, force: true });
-  }
-  // the write AND the removal fail while the old index stays readable: this process must not
-  // trust that stale file (the store root read-only; the journals' directory still writable)
-  const d3 = tmp();
-  try {
-    const store = new Store(d3);
-    store.putRecord(bls);
-    const s = sinks({ mine: "pending", rejectBroadcast: true });
-    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
-    await publishPending(store, sk, { maxPendingMs: 0 });
-    const before = JSON.parse(readFileSync(join(d3, "stalls.json"), "utf8"));
-    chmodSync(d3, 0o500);
-    let pFunded, pNext;
+  // the schedule write fails while the old one stays readable (store root read-only): after a
+  // restart the rotation resumes at the last saved cursor, so the first pass re-reads the record
+  {
+    const d = tmp();
     try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const { sk } = unfunded();
+      await publishPending(store, sk, { maxPendingMs: 0 });
+      chmodSync(d, 0o500);
+      let funded;
       const s2 = sinks({ mine: "pending" });
-      Object.assign(sk, { registry: s2.registry });
-      pFunded = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
-      pNext = await publishPending(store, sk, { maxPendingMs: 60 * 60_000, maxParse: 0 });
-    } finally {
-      chmodSync(d3, 0o700);
-    }
-    const stale = JSON.parse(readFileSync(join(d3, "stalls.json"), "utf8"));
-    // writable again: one pass repairs the index, the one after trusts it (no rebuild, no alert)
-    await publishPending(store, sk, { maxPendingMs: 60 * 60_000, maxParse: 0 });
-    const pOk = await publishPending(store, sk, { maxPendingMs: 60 * 60_000, maxParse: 0 });
-    cell(
-      "R13#1: an unremovable stale index is not trusted again in this process (rebuilt: 0, not the stale 1)",
-      Object.keys(before).length === 1 &&
-        Object.keys(stale).length === 1 &&
-        pFunded.alerts.some(a => /stall index not saved/.test(a)) &&
-        pNext.stalls.insufficientFunds === 0 &&
-        !pNext.stalls.unknown &&
-        !pOk.alerts.some(a => /stall index/.test(a)),
-      {
-        funded: [pFunded.stalls, pFunded.alerts],
-        next: [pNext.stalls, pNext.alerts],
-        ok: pOk.alerts,
-        stale,
+      const sk2 = { ...sk, registry: s2.registry };
+      try {
+        funded = await publishPending(store, sk2, { maxPendingMs: 60 * 60_000 });
+      } finally {
+        chmodSync(d, 0o700);
       }
-    );
-  } finally {
-    rmSync(d3, { recursive: true, force: true });
-  }
-  // a restart after the index was removed: absent means rebuild, never "no stalls"
-  const d2 = tmp();
-  try {
-    const store = new Store(d2);
-    store.putRecord(bls);
-    const s = sinks({ mine: "pending", rejectBroadcast: true });
-    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
-    await publishPending(store, sk, { maxPendingMs: 0 });
-    rmSync(join(d2, "stalls.json"));
-    const p = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
-    cell(
-      "R13#1: an absent index (removed after a failed write, then a restart) is rebuilt from the journals",
-      p.stalls.insufficientFunds === 1 && !p.stalls.unknown,
-      { stalls: p.stalls }
-    );
-  } finally {
-    rmSync(d2, { recursive: true, force: true });
+      const fresh = new Store(d);
+      const first = await publishPending(fresh, sk2, { maxPendingMs: 60 * 60_000 });
+      cell(
+        "R14#1: an unsaved stall change is redone by the first pass after a restart (the rotation restarts at the saved cursor)",
+        funded.stalls.insufficientFunds === 0 &&
+          funded.alerts.some(a => /publication schedule not saved/.test(a)) &&
+          first.stalls.insufficientFunds === 0 &&
+          !first.stalls.unknown,
+        { funded: [funded.stalls, funded.alerts], first: [first.stalls, first.alerts] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
   }
 }
 

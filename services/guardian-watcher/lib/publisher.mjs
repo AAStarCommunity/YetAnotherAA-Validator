@@ -3,8 +3,6 @@
 // per-record work and is crash-safe stage by stage; this module only decides what to run, reads
 // the writer's roles from chain, builds the sinks and delivers the run's alerts.
 import { ethers } from "ethers";
-import { join } from "node:path";
-import { existsSync, readFileSync, rmSync } from "node:fs";
 import { Store, atomicWriteJson } from "./store.mjs";
 import { publishRecord, PersistError } from "./publish.mjs";
 import { recordFile } from "./record-file.mjs";
@@ -68,39 +66,14 @@ function recordIdOf(rec) {
  * yet re-checked in it runs again, with reverify), or null.
  */
 /**
- * The disclose stalls of the WHOLE store (DSR): records whose journal is fee-capped or unfunded,
- * kept in stalls.json and updated whenever a record is processed. A record that is not in a pass's
- * batch keeps its entry; an entry is cleared only when that record is processed and no longer in
- * either state. Degraded is computed from this, never from one batch.
+ * The disclose stalls of the WHOLE store (DSR): each record's stall (fee-capped, unfunded, or
+ * "unknown" when its journal is unreadable) is kept in that record's entry of the publication
+ * schedule, set whenever the record is read and written atomically with the rotation itself, so
+ * a stall and the cursor past it are persisted together or not at all (Codex W2c R13/R14: a
+ * separate index could be lost or go stale independently). A record outside a pass's batch keeps
+ * its entry. When the schedule is absent or unreadable the state is unknown until one complete
+ * sweep has read every record again: bounded by the pass budgets, never a full rebuild in one go.
  */
-const stallsPath = store => join(store.dir, "stalls.json");
-/**
- * The stall index, or null when it must be rebuilt from the journals: unreadable (Codex W2c R12
- * #3), absent (never written, or removed after a failed write: R13 #1), or marked stale in this
- * process by a failed write that could not remove it.
- */
-const staleIndex = new Set();
-export function readStalls(store) {
-  if (staleIndex.has(stallsPath(store)) || !existsSync(stallsPath(store))) return null;
-  try {
-    const j = JSON.parse(readFileSync(stallsPath(store), "utf8"));
-    return j && typeof j === "object" && !Array.isArray(j) ? j : null;
-  } catch {
-    return null;
-  }
-}
-/** Store-wide counts; { unknown: true } when the index is unreadable and could not be rebuilt. */
-export function stallCounts(store) {
-  return countStalls(readStalls(store));
-}
-function countStalls(idx) {
-  if (idx === null) return { feeCapped: 0, insufficientFunds: 0, unknown: true };
-  const all = Object.values(idx);
-  return {
-    feeCapped: all.filter(x => x?.kind === "feeCapped").length,
-    insufficientFunds: all.filter(x => x?.kind === "insufficientFunds").length,
-  };
-}
 /** The stall a journal is in: none once the registry stage is final: confirmed (Codex W2c R12 #1)
  * or a terminal incident (reverted / conflict never sign again and are reported as incidents; a
  * fee cap left on them could never clear: R13 #2). */
@@ -112,17 +85,26 @@ export function stallKind(pub) {
   if (/INSUFFICIENT_FUNDS/.test(String(r.lastBroadcastError ?? ""))) return "insufficientFunds";
   return null;
 }
-/** Rebuild the index from every record's publication journal (when the index is unreadable);
- * throws if any journal is unreadable, so the state stays "unknown" rather than under-counted. */
-function rebuildStalls(store, now) {
-  const out = {};
-  for (const name of store.recordFiles()) {
-    const id = name.replace(/\.json$/, "");
-    const kind = stallKind(store.getPublication(id));
-    if (kind) out[id] = { kind, since: now, rebuilt: true };
-  }
-  return out;
+function countStalls(sched) {
+  const all = Object.values(sched?.entries ?? {}).map(e => e?.stall);
+  // unknown until the stall entries are known complete (stallsTracked, no pending sweep)
+  const unknown =
+    sched?.stallsTracked !== true || sched?.stallsNeed !== undefined || all.includes("unknown");
+  return {
+    feeCapped: all.filter(k => k === "feeCapped").length,
+    insufficientFunds: all.filter(k => k === "insufficientFunds").length,
+    ...(unknown ? { unknown: true } : {}),
+  };
 }
+/** Store-wide counts from the schedule as last computed (in memory) or saved. */
+export function stallCounts(store) {
+  return countStalls(getSchedule(store));
+}
+const withStall = (e, kind) => {
+  const { stall: _old, ...rest } = e ?? {};
+  void _old;
+  return kind ? { ...rest, stall: kind } : rest;
+};
 
 export async function publishPending(
   store,
@@ -152,33 +134,16 @@ export async function publishPending(
     insufficientFunds: 0, // a disclose tx the writer cannot pay for (#411 F1)
   };
   const pinners = (sinks.pinners ?? []).map(p => p.name);
-  // the store-wide stall index (DSR): loaded once, updated per record processed, written once;
-  // rebuilt from the journals if unreadable (Codex W2c R12 #3)
-  let stalls = readStalls(store);
-  let stallsDirty = false;
-  if (stalls === null) {
-    try {
-      stalls = rebuildStalls(store, new Date(now()).toISOString());
-      stallsDirty = true;
-      if (existsSync(stallsPath(store)) || staleIndex.has(stallsPath(store)))
-        alerts.push("stall index was unreadable; rebuilt from the publication journals");
-    } catch {
-      stalls = null;
-      alerts.push("stall index is unreadable and could not be rebuilt: stall state unknown");
-    }
-  }
-  const noteStall = (id, pub) => {
-    if (stalls === null) return;
-    const kind = stallKind(pub);
-    const had = stalls[id];
-    if (kind && had?.kind === kind) return;
-    if (!kind && !had) return;
-    if (kind) stalls[id] = { kind, since: new Date(now()).toISOString() };
-    else delete stalls[id];
-    stallsDirty = true;
-  };
   const sched = getSchedule(store);
   const entries = { ...(sched.entries ?? {}) };
+  // Absent, unreadable or written before stalls were tracked: unknown until a sweep that began at
+  // the first name has completed (the same arithmetic as reverifyGenNeed: one more sweep when a
+  // traversal is already part-way through).
+  let stallsNeed = sched.stallsNeed;
+  // (an unreadable schedule is { unreadable: true }: not tracked either)
+  if (sched.stallsTracked !== true) stallsNeed = (sched.sweeps ?? 0) + (sched.cursor ? 2 : 1);
+  if (sched.unreadable)
+    alerts.push("publication schedule unreadable; stall state unknown until a full sweep");
   // A bounded batch of record files, in sorted order from the cursor (the last file read). A
   // SWEEP is one traversal from the first name to the last; it never wraps inside a batch, so a
   // completed sweep visited every file that existed throughout it (Codex W2c R4). Listing the names
@@ -219,7 +184,8 @@ export async function publishPending(
       try {
         prev = store.getPublication(id) ?? {};
       } catch {
-        // never reset: not published (nor signed for) until repaired by hand
+        // never reset: not published (nor signed for) until repaired by hand; its stall is unknown
+        entries[id] = withStall(entries[id], "unknown");
         counts.failed++;
         alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
         continue;
@@ -241,8 +207,8 @@ export async function publishPending(
     if (!reverify && isDone(rec, prev, { pinners, cid, ignoreRegistry: isParked })) {
       if (isParked) counts.parked++;
       else counts.done++;
-      entries[id] = { ...e, done: true };
-      noteStall(id, prev); // a done record clears any stale entry (Codex W2c R12 #1)
+      // a done record clears any stale stall (Codex W2c R12 #1)
+      entries[id] = withStall({ ...e, done: true }, stallKind(prev));
       if (openIncident(prev)) counts.incidents++;
       continue;
     }
@@ -271,6 +237,7 @@ export async function publishPending(
     try {
       prev = store.getPublication(id) ?? {};
     } catch {
+      entries[id] = withStall(entries[id], "unknown");
       counts.failed++;
       alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
       continue;
@@ -287,7 +254,7 @@ export async function publishPending(
       const stageFailed = (r.failures ?? []).length > 0;
       if (stageFailed) counts.failed++; // a sink failed or refused: the pass is not ok (R3)
       entries[id] = {
-        ...e,
+        ...withStall(e, stallKind(r.state)),
         lastRunAt: now(),
         done,
         failing: false,
@@ -301,9 +268,16 @@ export async function publishPending(
       if (r.state.registry?.feeCapped) counts.feeCapped++;
       if (/INSUFFICIENT_FUNDS/.test(String(r.state.registry?.lastBroadcastError ?? "")))
         counts.insufficientFunds++;
-      noteStall(id, r.state);
     } catch (err) {
-      entries[id] = { ...e, lastRunAt: now(), failing: true }; // a failure still rotates (R2)
+      // a failure still rotates (R2); the stall is what the journal now says (it may have advanced
+      // before the failure), unknown if it cannot be read
+      let kind;
+      try {
+        kind = stallKind(store.getPublication(id));
+      } catch {
+        kind = "unknown";
+      }
+      entries[id] = { ...withStall(e, kind), lastRunAt: now(), failing: true };
       counts.failed++;
       if (err instanceof PersistError) {
         alerts.push(`${id}: ${err.message}; publication pass stopped`);
@@ -327,7 +301,18 @@ export async function publishPending(
   }
   const { sweep: _oldSweep, ...rest } = sched;
   void _oldSweep;
-  const next = { ...rest, cursor, entries, sweeps };
+  const { unreadable: _u, ...kept } = rest;
+  void _u;
+  const { stallsNeed: _n, ...kept2 } = kept;
+  void _n;
+  const next = {
+    ...kept2,
+    cursor,
+    entries,
+    sweeps,
+    stallsTracked: true,
+    ...(stallsNeed !== undefined && sweeps < stallsNeed ? { stallsNeed } : {}),
+  };
   const reverifyRemaining =
     reverifyGen === null
       ? 0
@@ -337,26 +322,7 @@ export async function publishPending(
     counts.failed++;
     alerts.push("publication schedule not saved; rotation kept in memory, retried next pass");
   }
-  if (stallsDirty && stalls !== null) {
-    try {
-      atomicWriteJson(stallsPath(store), stalls);
-      staleIndex.delete(stallsPath(store));
-    } catch {
-      // the schedule has advanced past these records, so a lost update would never be redone
-      // (Codex W2c R13 #1): drop the old index so the next pass (or a restart) rebuilds it from
-      // the journals; if even that fails, this process still rebuilds before trusting it
-      staleIndex.add(stallsPath(store));
-      try {
-        rmSync(stallsPath(store), { force: true });
-      } catch {
-        // kept stale in memory (above)
-      }
-      counts.failed++;
-      alerts.push("stall index not saved; rebuilt from the publication journals next pass");
-    }
-  }
-  // this pass's index as computed, not a re-read (a failed write must not report the old one)
-  return { alerts, counts, stopped, reverifyRemaining, sweeps, stalls: countStalls(stalls) };
+  return { alerts, counts, stopped, reverifyRemaining, sweeps, stalls: countStalls(next) };
 }
 
 // The schedule as last computed in this process, so a failing schedule write keeps rotation fair
