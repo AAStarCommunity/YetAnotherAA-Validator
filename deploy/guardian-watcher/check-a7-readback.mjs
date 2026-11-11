@@ -1219,6 +1219,33 @@ await mut(
   "header.providers"
 );
 
+// ---- Codex A7 R16: nothing derived from A7_FORK_URL reaches the record or output
+{
+  const src = readFileSync(join(here, "a7-fork.mjs"), "utf8");
+  const uses = src
+    .split("\n")
+    .filter(l => /\bforkUrl\b/.test(l))
+    .map(l => l.trim());
+  // allowed: its definition, the "not set" check, the two pre-start reads, anvil's --fork-url
+  // argument, and the upstream fetch; nothing else (no hostname, no record field)
+  const allowed = [
+    /^const forkUrl = process\.env\.A7_FORK_URL;$/,
+    /^if \(!forkUrl\) die\(/,
+    /^const up(Chain|Head) = await preRpc\(forkUrl, /,
+    /^forkUrl,$/,
+    /^const r = await fetch\(forkUrl, \{$/,
+  ];
+  const stray = uses.filter(l => !allowed.some(re => re.test(l)));
+  cell(
+    "R16: A7_FORK_URL is used only to reach the RPC; no hostname or other derivative is recorded",
+    stray.length === 0 &&
+      !/\.hostname\b/.test(src) &&
+      !/forkHost/.test(src) &&
+      /forkProvider: forkProvider/.test(src),
+    stray
+  );
+}
+
 let nf = 0;
 for (const r of results) {
   console.log(

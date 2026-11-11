@@ -6,7 +6,8 @@
 //   A7_FORK_URL=<archive RPC> node deploy/guardian-watcher/a7-fork.mjs \
 //     --dump <state.json> --dump-sha256 <hex> --readback <a7-readback.json> \
 //     (--pins-commit <SP manifest commit> | --address-book <{key: address}.json>) --fund <test key address>
-//     [--anvil <path>] [--schema <file>] [--abi-dir <dir>] [--port 8546] [--record <out.json>] [--keep]
+//     [--fork-provider <name>] [--anvil <path>] [--schema <file>] [--abi-dir <dir>] [--port 8546]
+//     [--record <out.json>] [--keep]
 //
 // Steps, each one fatal on failure:
 //   1. the read-back validates against SP's frozen aoa-a7-readback/1 schema (Draft 2020-12), fetched
@@ -24,7 +25,8 @@
 //   5. only then anvil_setBalance gives the rehearsal's own test key gas;
 //   6. the record notes the anvil build, every input sha256, the fork block and every comparison;
 //      any URL-like string is redacted from output and record.
-// The fork URL is read from the environment and never printed or recorded (only its host).
+// The fork URL is read from the environment and never printed or recorded, not even its host:
+// --fork-provider <name> is the operator's non-secret label for it.
 import { spawn, execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
@@ -76,6 +78,10 @@ const fund = opt("fund");
 const port = Number(opt("port") ?? 8546);
 const recordPath = opt("record");
 const forkUrl = process.env.A7_FORK_URL;
+// a provider NAME (e.g. "alchemy"), checked to be a plain label, never a URL or host
+const forkProvider = opt("fork-provider") ?? null;
+if (forkProvider !== null && !/^[a-z][a-z0-9-]{0,30}$/i.test(forkProvider))
+  die(2, "--fork-provider must be a plain provider name (letters, digits, dashes)");
 if (!dumpPath || !/^[0-9a-f]{64}$/.test(dumpSha) || !readbackPath || !ethers.isAddress(fund ?? ""))
   die(
     2,
@@ -531,13 +537,9 @@ const record = {
   slashLevels,
   addressBookSha256: addressBookSha,
   addressBookSource,
-  forkHost: (() => {
-    try {
-      return new URL(forkUrl).hostname;
-    } catch {
-      return null;
-    }
-  })(),
+  // the operator's own label for the fork RPC, never anything derived from A7_FORK_URL: a
+  // hostname can carry an access token in a subdomain (Codex A7 R16)
+  forkProvider: forkProvider,
   dumpSha256: dumpSha,
   readbackSha256: sha256(rbText),
   spReadback: { spCommit: h.spCommit, tag: h.tag, providers: h.providers },
