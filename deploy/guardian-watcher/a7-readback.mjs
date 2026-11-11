@@ -160,7 +160,19 @@ const lc = v => String(v).toLowerCase();
 export function validate(schema, rb) {
   const ajv = new Ajv2020({ allErrors: true, strict: false });
   const ok = ajv.validate(schema, rb);
-  return ok ? [] : (ajv.errors ?? []).map(e => `${e.instancePath || "/"} ${e.keyword}`);
+  // a path segment is input (a key of the read-back): only plain identifiers and indices are shown,
+  // anything else (a URL, whatever its JSON-Pointer escaping) becomes "(key)" (Codex A7 R6)
+  const seg = x => (/^[A-Za-z0-9_$.-]{1,64}$/.test(x) ? x : "(key)");
+  const path = p =>
+    p
+      ? p
+          .split("/")
+          .slice(1)
+          .map(x => seg(x.replace(/~1/g, "/").replace(/~0/g, "~")))
+          .map(x => `/${x}`)
+          .join("")
+      : "/";
+  return ok ? [] : (ajv.errors ?? []).map(e => `${path(e.instancePath)} ${e.keyword}`);
 }
 
 export const isState = v => v === null || (typeof v === "string" && /^(unreadable|n\/a):/.test(v));

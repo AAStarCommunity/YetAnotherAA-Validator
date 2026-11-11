@@ -69,6 +69,17 @@ cell("live example validates", validate(schema, live).length === 0, validate(sch
   const e = structuredClone(example);
   e.header.rpcUrl = "https://x";
   cell("an unknown header key is rejected by the schema", validate(schema, e).length > 0, null);
+  // Codex A7 R6: a URL inside an invalid key never reaches the schema diagnostics
+  const u = structuredClone(example);
+  u.contracts.registry.roles = { "https://rpc.example/SYNTHETIC_API_SECRET": [true] };
+  const errs = validate(schema, u);
+  cell(
+    "R6: schema diagnostics never print an input key holding a URL (any JSON-Pointer escaping)",
+    errs.length > 0 &&
+      !errs.join(" ").includes("SYNTHETIC_API_SECRET") &&
+      !/https|~1/.test(errs.join(" ")),
+    errs
+  );
 }
 
 // ---- a complete, internally consistent, schema-valid read-back built from SP's example
