@@ -306,7 +306,15 @@ function runForge() {
   } catch (e) {
     // forge exits 1 when a test fails; that output is still a result. Anything without a parseable
     // result for our test is an infrastructure failure, never counted as a control failure.
-    if (typeof e.status !== "number" || !e.stdout) infra("forge did not run");
+    // a compile failure is named (fixed wording): at an SP commit without the evidence encoding
+    // (e.g. a main that has not merged it) the harness cannot compile, which is not "forge missing"
+    if (typeof e.status !== "number") infra("forge did not run");
+    if (!e.stdout)
+      infra(
+        /Compiler run failed/.test(String(e.stderr ?? ""))
+          ? "the harness does not compile against this SP commit (no _checkEvidence / evidence categories there?)"
+          : "forge did not run"
+      );
     stdout = e.stdout;
   }
   const line = stdout.split("\n").find(l => l.trim().startsWith("{"));
