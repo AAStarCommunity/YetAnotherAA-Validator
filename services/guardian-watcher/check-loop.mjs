@@ -5,6 +5,7 @@ import {
   chmodSync,
   mkdtempSync,
   mkdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
   readdirSync,
@@ -2536,6 +2537,101 @@ const good = {
           s.calls.fetches > fetches0 &&
           !store.getPublication(Store.recordId(r)).pins.pinata.checkError,
         { rv: rv.stalls, next: [next.stalls, next.counts.done], healed: healed.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+}
+
+// ---- Codex W2c R21 (exhaustive enumeration: items 1-3)
+{
+  const skOf = s => ({
+    pinners: s.pinners,
+    mirror: s.mirror,
+    telegram: s.telegram,
+    registry: s.registry,
+  });
+  // #1: a successful receipt without the Disclosed event is "inconsistent" until resolved
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const s = sinks({});
+      const sk = skOf(s);
+      await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      const kept = new Map();
+      for (const [h, rc] of s.chain.receipts) {
+        kept.set(h, rc.entryId);
+        s.chain.receipts.set(h, { ...rc, entryId: null });
+      }
+      const odd = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      const outside = await publishPending(store, sk, { maxPendingMs: 60 * 60_000, maxParse: 0 });
+      for (const [h, id] of kept)
+        s.chain.receipts.set(h, { ...s.chain.receipts.get(h), entryId: id });
+      let ok;
+      for (let i = 0; i < 3; i++)
+        ok = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      cell(
+        "R21#1: a receipt without the Disclosed event is 'inconsistent' (also outside the batch) until the entry confirms",
+        odd.stalls.inconsistent === 1 &&
+          outside.stalls.inconsistent === 1 &&
+          store.getPublication(Store.recordId(bls)).registry.phase === "confirmed" &&
+          ok.stalls.inconsistent === 0,
+        { odd: odd.stalls, outside: outside.stalls, ok: ok.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #2: a flagged file whose name cannot be an id stays failing after the sweep, until removed
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      const r = { ...owner, txHash: ethers.id("r21-good") };
+      store.putRecord(r);
+      const rBad = { ...owner, txHash: ethers.id("r21-bad") };
+      store.putRecord(rBad);
+      renameSync(
+        join(d, "records", `${Store.recordId(rBad)}.json`),
+        join(d, "records", "a.bad.json")
+      );
+      const s = sinks();
+      const sk = { ...skOf(s), registry: null };
+      const passes = [];
+      for (let i = 0; i < 4; i++) passes.push(await publishPending(store, sk, { maxParse: 1 }));
+      rmSync(join(d, "records", "a.bad.json"));
+      const after = [];
+      for (let i = 0; i < 3; i++) after.push(await publishPending(store, sk, { maxParse: 1 }));
+      cell(
+        "R21#2: a bad file name stays counted as failing in every later batch; gone, it clears",
+        passes.every(p => p.stalls.failing >= 1) && after.at(-1).stalls.failing === 0,
+        { passes: passes.map(p => p.stalls.failing), after: after.map(p => p.stalls.failing) }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #3: a failed check on a provider that is no longer configured does not hold the record
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      const r = { ...owner, txHash: ethers.id("r21-pin") };
+      store.putRecord(r);
+      const s = sinks();
+      const sk = { ...skOf(s), registry: null };
+      for (let i = 0; i < 3; i++) await publishPending(store, sk, {});
+      s.pinOpts.pinata.fetchThrows = true;
+      const rv = await publishPending(store, sk, { reverifyGen: 1 });
+      const onlyFilebase = { ...sk, pinners: s.pinners.filter(p => p.name === "filebase") };
+      const later = await publishPending(store, onlyFilebase, {});
+      cell(
+        "R21#3: an unconfigured provider's failed check is not 'unverified' and does not keep the record from done",
+        rv.stalls.unverified === 1 && later.stalls.unverified === 0 && later.counts.done === 1,
+        { rv: rv.stalls, later: [later.stalls, later.counts.done] }
       );
     } finally {
       rmSync(d, { recursive: true, force: true });

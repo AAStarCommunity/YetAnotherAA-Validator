@@ -414,6 +414,12 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       return;
     }
     if (rc && rc.entryId == null) {
+      // an RPC answer that cannot be ours: marked, so the watcher is degraded until the phase moves
+      // on (Codex W2c R21 #1)
+      if (!state.registry.noEventAt) {
+        state.registry = { ...state.registry, noEventAt: new Date().toISOString() };
+        await persist(state);
+      }
       alerts.push(`registry: a disclose tx succeeded without a Disclosed event`);
       return;
     }

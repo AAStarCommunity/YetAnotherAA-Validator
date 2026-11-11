@@ -23,7 +23,7 @@ export function isDone(rec, st, { pinners, cid, ignoreRegistry = false } = {}) {
   if (cid !== undefined && st.cid !== cid) return false;
   if (pinners && !pinners.every(n => st.pins?.[n]?.current)) return false;
   // a pin not verified since a failed check is not done: it is retried (Codex W2c R20 #3)
-  if (Object.values(st.pins ?? {}).some(p => p?.current && p.checkError)) return false;
+  if (uncheckedPin(st, pinners)) return false;
   if (rec.route !== "bls" || ignoreRegistry) return true; // owner route: repo + Telegram only
   return st.registry?.phase === "confirmed";
 }
@@ -40,11 +40,21 @@ const openIncident = st =>
  * incident, a final receipt whose entry was not visible, a pin not verified since a failed check.
  * Kept in the record's schedule entry and counted store-wide until the journal no longer says so.
  */
-export function attentionKind(pub) {
+export function attentionKind(pub, pinners) {
   if (openIncident(pub)) return "incident";
   if (pub?.registry?.phase === "landed" && pub.registry.inconsistentAt) return "inconsistent";
-  if (Object.values(pub?.pins ?? {}).some(p => p?.current && p.checkError)) return "unverified";
+  // a receipt without the Disclosed event, while the stage has not moved on (Codex W2c R21 #1)
+  const ph = pub?.registry?.phase;
+  if (pub?.registry?.noEventAt && (ph === "signed" || ph === "sent" || ph === "landed"))
+    return "inconsistent";
+  if (uncheckedPin(pub, pinners)) return "unverified";
   return null;
+}
+/** A CONFIGURED provider's current pin whose last re-verification failed (Codex W2c R20 #3); an
+ * unconfigured provider is never retried, so it cannot hold the record (R21 #3). */
+function uncheckedPin(pub, pinners) {
+  const names = pinners ?? Object.keys(pub?.pins ?? {});
+  return names.some(n => pub?.pins?.[n]?.current && pub.pins[n].checkError);
 }
 const withAttention = (e, kind) => {
   const { attention: _old, ...rest } = e ?? {};
@@ -111,9 +121,9 @@ function countStalls(sched) {
     sched?.stallsTracked !== true || sched?.stallsNeed !== undefined || all.includes("unknown");
   // records whose publication is failing (a stage that has not succeeded since, a run that threw,
   // an unreadable file or journal): store-wide, until a retry succeeds (Codex W2c R19 #1)
-  const failing = Object.values(sched?.entries ?? {}).filter(
-    e => e?.failing === true || e?.stageFailed === true
-  ).length;
+  const failing =
+    Object.values(sched?.entries ?? {}).filter(e => e?.failing === true || e?.stageFailed === true)
+      .length + Object.keys(sched?.badFiles ?? {}).length;
   const att = Object.values(sched?.entries ?? {}).map(e => e?.attention);
   return {
     incidents: att.filter(k => k === "incident").length,
@@ -192,6 +202,7 @@ export async function publishPending(
     start = k < 0 ? 0 : k;
   }
   const candidates = names.slice(start, start + maxParse);
+  const badFiles = { ...(sched.badFiles ?? {}) };
   // a canonical file whose journal was never examined keeps the stall state unknown (Codex W2c
   // R15 #3), keyed by its file name; retired with the file like any entry
   const unknownFile = name => {
@@ -199,6 +210,9 @@ export async function publishPending(
     // failing: alerted on its own, it does not hold a reverify generation open (#413 review F2)
     if (/^[A-Za-z0-9-]{1,200}$/.test(nid))
       entries[nid] = { ...withStall(entries[nid], "unknown"), failing: true };
+    // a file name that cannot be an id is kept apart, so its failure stays counted while it is
+    // outside later batches; cleared when it reads as a valid record or is gone (Codex W2c R21 #2)
+    else badFiles[String(name).slice(0, 300)] = true;
   };
   const bad = [];
   const seenIds = new Set();
@@ -215,6 +229,7 @@ export async function publishPending(
     try {
       rec = store.readRecordFile(name, 2 * MAX_RECORD_BYTES);
       if (!rec?.verdict?.flagged) {
+        delete badFiles[String(name).slice(0, 300)];
         // an unflagged record has no publication: drop any entry its file left (e.g. "unknown"
         // while it was unreadable), so a repaired file settles the stalls and the generation
         // (Codex W2c R16)
@@ -230,6 +245,7 @@ export async function publishPending(
         continue;
       }
       seenIds.add(id);
+      delete badFiles[String(name).slice(0, 300)];
       counts.flagged++;
       try {
         prev = store.getPublication(id) ?? {};
@@ -241,7 +257,10 @@ export async function publishPending(
         continue;
       }
       // every record read is refreshed from its journal, deferred ones included (Codex W2c R15 #1)
-      entries[id] = withAttention(withStall(entries[id], stallKind(prev)), attentionKind(prev));
+      entries[id] = withAttention(
+        withStall(entries[id], stallKind(prev)),
+        attentionKind(prev, pinners)
+      );
       try {
         cid = recordFile(rec).cid;
       } catch {
@@ -307,7 +326,7 @@ export async function publishPending(
       const stageFailed = (r.failures ?? []).length > 0;
       if (stageFailed) counts.failed++; // a sink failed or refused: the pass is not ok (R3)
       entries[id] = {
-        ...withAttention(withStall(e, stallKind(r.state)), attentionKind(r.state)),
+        ...withAttention(withStall(e, stallKind(r.state)), attentionKind(r.state, pinners)),
         lastRunAt: now(),
         done,
         failing: false,
@@ -332,7 +351,7 @@ export async function publishPending(
       try {
         const cur = store.getPublication(id);
         kind = stallKind(cur);
-        att = attentionKind(cur);
+        att = attentionKind(cur, pinners);
       } catch {
         kind = "unknown";
       }
@@ -350,6 +369,7 @@ export async function publishPending(
   // listing (an orphan must not hold a generation open; a live record keeps its state: R4).
   const listed = new Set(names);
   for (const id of Object.keys(entries)) if (!listed.has(`${id}.json`)) delete entries[id];
+  for (const n of Object.keys(badFiles)) if (!listed.has(n)) delete badFiles[n];
   // The traversal advances by the files actually read; reaching the last name completes it.
   const lastRead = candidates[read - 1] ?? null;
   const reachedEnd = start + read >= names.length;
@@ -362,14 +382,15 @@ export async function publishPending(
   void _oldSweep;
   const { unreadable: _u, ...kept } = rest;
   void _u;
-  const { stallsNeed: _n, ...kept2 } = kept;
-  void _n;
+  const { stallsNeed: _n, badFiles: _b, ...kept2 } = kept;
+  (void _n, _b);
   const next = {
     ...kept2,
     cursor,
     entries,
     sweeps,
     stallsTracked: true,
+    ...(Object.keys(badFiles).length ? { badFiles } : {}),
     ...(stallsNeed !== undefined && sweeps < stallsNeed ? { stallsNeed } : {}),
   };
   const reverifyRemaining =
