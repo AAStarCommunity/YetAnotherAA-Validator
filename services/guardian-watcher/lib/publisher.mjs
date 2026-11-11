@@ -171,6 +171,7 @@ export async function publishPending(
     maxMs = PASS_MAX_MS,
     maxParse = PASS_MAX_PARSE,
     now = Date.now,
+    configuredRegistry = undefined,
   } = {}
 ) {
   // The budget covers preparation too (Codex W2c R3): it starts before the directory is read.
@@ -203,7 +204,10 @@ export async function publishPending(
   // (its own per-process set: publishPhase may save the schedule, and fill the memo, first)
   // W2d: the configured registry differs from the one this schedule was kept for: every record's
   // registry stage is re-read against it before the counts are trusted
-  const where = sinks.registry ? registryWhere(sinks.registry) : null;
+  // The configured registry, whether or not this pass may run its stage (Codex W2d R2): a pass whose
+  // writer-role check failed has no registry sink, but records are still judged against the
+  // configured registry, so the migration state cannot clear before they are reconciled there.
+  const where = configuredRegistry ?? (sinks.registry ? registryWhere(sinks.registry) : null);
   const registrySwitched = !!where && !!sched.registryAt && !sameRegistry(sched.registryAt, where);
   if (registrySwitched)
     alerts.push("the configured registry changed: every record is checked against it (W2d)");
@@ -695,7 +699,21 @@ export async function publishPhase(
   const res = await publishPending(
     store,
     { pinners: built.pinners, mirror: built.mirror, telegram: built.telegram, registry },
-    { reverifyGen: gen, maxPendingMs: p.maxPendingMs, ...(p.limits ?? {}) }
+    {
+      reverifyGen: gen,
+      maxPendingMs: p.maxPendingMs,
+      ...(p.limits ?? {}),
+      // the configured registry (the one the sink would write to), even when the role check
+      // failed and this pass has no sink (Codex W2d R2)
+      ...(p.registry?.address && Number.isSafeInteger(cfg.chainId)
+        ? {
+            configuredRegistry: {
+              address: String(p.registry.address).toLowerCase(),
+              chainId: String(cfg.chainId),
+            },
+          }
+        : {}),
+    }
   );
   const reverified =
     gen !== null && !res.stopped && res.reverifyRemaining === 0 && res.sweeps >= genNeed;

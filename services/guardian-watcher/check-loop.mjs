@@ -3011,6 +3011,65 @@ const good = {
       }
     }
   }
+  // (h) Codex W2d R2: a pass without a registry sink (writer-role check failed) still judges
+  // records against the CONFIGURED registry: migration does not clear before they are reconciled
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      const recs = [0, 1, 2].map(i => ({
+        ...bls,
+        key: String(8200 + i),
+        proposalId: String(8200 + i),
+        txHash: ethers.id(`w2d-h-${i}`),
+      }));
+      for (const r of recs) store.putRecord(r);
+      const a = sinks({ registryAddress: OLD });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const b = sinks({ registryAddress: NEW, rawTag: "h" });
+      const whereB = { address: NEW, chainId: "11155111" };
+      await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000, maxParse: 1 });
+      // the role check fails: no registry sink this pass, the configured registry is still B
+      const noSink = await publishPending(
+        store,
+        { ...skOf(b), registry: null },
+        { maxPendingMs: 60 * 60_000, configuredRegistry: whereB }
+      );
+      // publishPhase passes the configured registry itself when the role read fails
+      const { publishPhase } = await import("./lib/publisher.mjs");
+      const broken = {
+        async call() {
+          throw new Error("down");
+        },
+      };
+      const built = {
+        pinners: b.pinners,
+        mirror: b.mirror,
+        telegram: b.telegram,
+        wallet: writer,
+        registryFor: () => b.registry,
+      };
+      const ph = await publishPhase(
+        store,
+        broken,
+        { ...cfg, chainId: 11155111 },
+        { ...P, registry: { ...P.registry, address: NEW } },
+        built,
+        { now: 7 }
+      );
+      cell(
+        "W2d(h): without a registry sink (role check failed) records still on A count as migrating and not done; publishPhase passes the configured registry",
+        noSink.stalls.migrating >= 2 &&
+          noSink.counts.done <= 1 &&
+          !!ph.registrySkipped &&
+          ph.stalls.migrating >= 2,
+        { noSink: [noSink.counts, noSink.stalls], ph: [ph.registrySkipped, ph.stalls] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
   // (c) the same address on another chain is another registry
   {
     const d = tmp();
