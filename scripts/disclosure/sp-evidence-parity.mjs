@@ -2,30 +2,44 @@
 // Standing check (DSR 8c5f68e5): run SuperPaymaster's own DVTValidator._checkEvidence against this
 // repo's M0 §3.1 vectors (contracts/test/fixtures/evidence-vectors.json), byte for byte.
 //
-//   node scripts/disclosure/sp-evidence-parity.mjs <SP commit SHA> [--repo owner/name] [--out dir]
+//   node scripts/disclosure/sp-evidence-parity.mjs <SP commit SHA> [--repo owner/name] [--out empty-dir]
 //
 // Everything is read through the GitHub API (gh), at that exact commit, never from a local checkout
 // of SP. DVTValidator.sol and its whole import closure are resolved with SP's own foundry.toml
 // remappings (OpenZeppelin included: SP vendors it under singleton-paymaster/lib), so the compiled
-// code is SP's, not a stand-in. A scratch Foundry project then:
-//   1. deploys a harness that inherits DVTValidator unchanged and only exposes _checkEvidence,
+// code is SP's, not a stand-in. A fresh scratch Foundry project then:
+//   1. builds a harness that inherits DVTValidator unchanged and only exposes _checkEvidence,
 //      registering the vectors' categories with an always-accept checker (the encoding is under
 //      test, not a category's check);
-//   2. asserts, for every vector, SP's TAG_EVIDENCE, its decode of our evidence blob, and that its
-//      evidenceHash equals ours;
-//   3. reruns with one vector's evidenceHash altered, which must FAIL (a control, so a pass is
-//      never vacuous).
-// The report (stdout, JSON) records the SP commit, the solc version, every fetched file's git blob
-// SHA and the fixture's blob SHA. Exit 0 only if (2) passes and (3) fails.
+//   2. proves what was compiled: every source in the compiler input is either a fetched SP file whose
+//      content has that file's git blob SHA, forge-std, or the harness; anything else fails;
+//   3. asserts, for every vector, SP's TAG_EVIDENCE, its decode of our evidence blob, and that its
+//      evidenceHash equals ours (read from forge's JSON results, with the vector count logged);
+//   4. reruns with one vector's evidenceHash altered: the same test must FAIL, on the evidenceHash
+//      assertion (a control, so a pass is never vacuous).
+// Exit 0 only if 2 and 3 pass and 4 fails as required; 1 on a parity or control failure; 3 on an
+// infrastructure failure (fetch, compile, forge itself). The report (stdout, JSON) records the SP
+// commit, solc, every fetched file's blob SHA (foundry.toml included) and the fixture's blob SHA.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  readdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname, posix } from "node:path";
+import { join, dirname, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
 const ENTRY = "contracts/src/modules/monitoring/DVTValidator.sol";
+const TEST = "parity/SpEvidenceParity.t.sol";
+const TEST_KEY = `${TEST}:SpEvidenceParityTest`;
+const TEST_FN = "test_spDvtValidatorMatchesDvtVectors()";
 
 const args = process.argv.slice(2);
 const sha = args[0];
@@ -34,9 +48,13 @@ const opt = k => {
   return i > 0 ? args[i + 1] : undefined;
 };
 const repo = opt("repo") ?? "AAStarCommunity/SuperPaymaster";
+const infra = msg => {
+  console.error(`infrastructure failure: ${msg}`);
+  process.exit(3);
+};
 if (!/^[0-9a-f]{40}$/.test(sha ?? "")) {
   console.error(
-    "usage: sp-evidence-parity.mjs <full 40-hex SP commit SHA> [--repo owner/name] [--out dir]"
+    "usage: sp-evidence-parity.mjs <full 40-hex SP commit SHA> [--repo owner/name] [--out empty-dir]"
   );
   process.exit(2);
 }
@@ -44,26 +62,52 @@ const forge = existsSync(join(process.env.HOME ?? "", ".foundry/bin/forge"))
   ? join(process.env.HOME, ".foundry/bin/forge")
   : "forge";
 
-/** A file of `repo` at `sha` through the contents API: { text, sha } (git blob SHA). */
+/** git's blob id of a text: sha1("blob <bytes>\0" + content). */
+const gitBlob = text => {
+  const b = Buffer.from(text, "utf8");
+  return createHash("sha1")
+    .update(Buffer.concat([Buffer.from(`blob ${b.length}\0`), b]))
+    .digest("hex");
+};
+
+/** A file of `repo` at `sha` through the contents API: { text, sha } (git blob SHA, checked). */
 function fetchFile(path) {
-  const out = execFileSync("gh", ["api", `repos/${repo}/contents/${path}?ref=${sha}`], {
-    encoding: "utf8",
-    maxBuffer: 64 << 20,
-  });
+  let out;
+  try {
+    out = execFileSync("gh", ["api", `repos/${repo}/contents/${path}?ref=${sha}`], {
+      encoding: "utf8",
+      maxBuffer: 64 << 20,
+    });
+  } catch {
+    infra(`gh api could not fetch ${path} at ${sha}`);
+  }
   const j = JSON.parse(out);
-  if (j.type !== "file" || j.encoding !== "base64")
-    throw new Error(`${path}: not a plain file at ${sha} (type ${j.type})`);
-  return { text: Buffer.from(j.content, "base64").toString("utf8"), sha: j.sha };
+  if (j.type !== "file" || j.encoding !== "base64") infra(`${path}: not a plain file at ${sha}`);
+  const text = Buffer.from(j.content, "base64").toString("utf8");
+  if (gitBlob(text) !== j.sha) infra(`${path}: fetched content does not hash to its blob ${j.sha}`);
+  return { text, sha: j.sha };
 }
 
-/** SP's [profile.default] remappings and compiler settings, from its foundry.toml at `sha`. */
-function spConfig() {
-  const toml = fetchFile("foundry.toml").text;
+/** SP's [profile.default] remappings and compiler settings, from its foundry.toml at `sha`. Only the
+ * forms this check understands are accepted; anything else is refused rather than guessed. */
+function spConfig(toml) {
   const def = toml.split(/^\[profile\./m).find(s => s.startsWith("default]"));
-  if (!def) throw new Error("foundry.toml has no [profile.default]");
-  const block = def.match(/remappings\s*=\s*\[([\s\S]*?)\]/);
-  const remappings = [...(block?.[1] ?? "").matchAll(/"([^"=]+)=([^"]*)"/g)].map(m => [m[1], m[2]]);
-  const val = k => def.match(new RegExp(`^${k}\\s*=\\s*"?([^"\\n]+)"?`, "m"))?.[1]?.trim();
+  if (!def) infra("foundry.toml has no [profile.default]");
+  const block = def.match(/^remappings\s*=\s*\[([\s\S]*?)\]/m);
+  if (!block) infra("foundry.toml [profile.default] has no remappings array");
+  const remappings = [];
+  for (const raw of block[1].split("\n")) {
+    const line = raw.replace(/#.*$/, "").trim().replace(/,$/, "").trim();
+    if (!line) continue;
+    const m = line.match(/^(["'])([^"']+)\1$/);
+    if (!m) infra(`foundry.toml remapping not understood: ${line.slice(0, 80)}`);
+    const body = m[2];
+    if (/^[^=]*:/.test(body.split("=")[0])) infra(`contextual remapping not supported: ${body}`);
+    const eq = body.indexOf("=");
+    if (eq <= 0) infra(`remapping without '=': ${body}`);
+    remappings.push([body.slice(0, eq), body.slice(eq + 1)]);
+  }
+  const val = k => def.match(new RegExp(`^${k}\\s*=\\s*["']?([^"'\\n#]+)["']?`, "m"))?.[1]?.trim();
   return {
     remappings,
     solc: val("solc_version"),
@@ -74,6 +118,34 @@ function spConfig() {
   };
 }
 
+/** Import paths of a Solidity source, every form, outside comments and strings' contents. */
+export function importsOf(text) {
+  // drop comments first (block and line), keeping string literals intact
+  let s = "";
+  for (let i = 0; i < text.length;) {
+    const c = text[i];
+    if (c === '"' || c === "'") {
+      let k = i + 1;
+      while (k < text.length && text[k] !== c) k += text[k] === "\\" ? 2 : 1;
+      s += text.slice(i, k + 1);
+      i = k + 1;
+    } else if (text.startsWith("//", i)) {
+      while (i < text.length && text[i] !== "\n") i++;
+    } else if (text.startsWith("/*", i)) {
+      const e = text.indexOf("*/", i + 2);
+      i = e < 0 ? text.length : e + 2;
+    } else {
+      s += c;
+      i++;
+    }
+  }
+  const out = [];
+  // import "x"; import "x" as A; import * as A from "x"; import {a, b as c} from "x";
+  for (const m of s.matchAll(/(?:^|[;{}\s])import\s+([^;]*?)["']([^"']+)["']([^;]*);/g))
+    out.push(m[2]);
+  return out;
+}
+
 /** The repository path an import resolves to, as forge would: longest remapping prefix first. */
 function resolveImport(fromPath, spec, remappings) {
   if (spec.startsWith("./") || spec.startsWith("../"))
@@ -81,14 +153,14 @@ function resolveImport(fromPath, spec, remappings) {
   const hit = remappings
     .filter(([p]) => spec.startsWith(p))
     .sort((a, b) => b[0].length - a[0].length)[0];
-  if (!hit) throw new Error(`import ${spec} (in ${fromPath}) matches no SP remapping`);
+  if (!hit) infra(`import ${spec} (in ${fromPath}) matches no SP remapping`);
   return posix.normalize(hit[1] + spec.slice(hit[0].length));
 }
 
-const cfg = spConfig();
-if (!cfg.solc) throw new Error("SP foundry.toml names no solc_version");
-
-// the import closure of DVTValidator.sol, fetched file by file
+// ---- fetch: foundry.toml and the import closure of DVTValidator.sol
+const tomlFile = fetchFile("foundry.toml");
+const cfg = spConfig(tomlFile.text);
+if (!cfg.solc) infra("SP foundry.toml names no solc_version");
 const files = new Map(); // repo path -> { text, sha }
 const todo = [ENTRY];
 while (todo.length) {
@@ -96,24 +168,29 @@ while (todo.length) {
   if (files.has(p)) continue;
   const f = fetchFile(p);
   files.set(p, f);
-  for (const m of f.text.matchAll(/^\s*import\s+(?:[^"';]*\s+from\s+)?["']([^"']+)["']\s*;/gm))
-    todo.push(resolveImport(p, m[1], cfg.remappings));
+  for (const spec of importsOf(f.text)) todo.push(resolveImport(p, spec, cfg.remappings));
 }
 
-// the scratch project mirrors SP's tree layout, so SP's remappings apply unchanged
-const out = opt("out") ?? mkdtempSync(join(tmpdir(), "sp-evidence-parity-"));
+// ---- a fresh, empty project mirroring SP's tree layout, so SP's remappings apply unchanged
+const outArg = opt("out");
+if (outArg && existsSync(outArg) && readdirSync(outArg).length)
+  infra(`--out ${outArg} is not empty`);
+const out = outArg ? resolve(outArg) : mkdtempSync(join(tmpdir(), "sp-evidence-parity-"));
+mkdirSync(out, { recursive: true });
 for (const [p, f] of files) {
   mkdirSync(join(out, dirname(p)), { recursive: true });
   writeFileSync(join(out, p), f.text);
 }
 const fixturePath = join(ROOT, "contracts/test/fixtures/evidence-vectors.json");
 const fixture = readFileSync(fixturePath, "utf8");
-const fixtureBlob = execFileSync("git", ["hash-object", fixturePath], { encoding: "utf8" }).trim();
-mkdirSync(join(out, "fixtures"), { recursive: true });
-mkdirSync(join(out, "parity"), { recursive: true });
+const fixtureBlob = gitBlob(fixture);
+const nVectors = JSON.parse(fixture).vectors.length;
 const forgeStd = join(ROOT, "contracts/lib/forge-std");
 if (!existsSync(join(forgeStd, "src/Test.sol")))
-  throw new Error("contracts/lib/forge-std is empty: run `git submodule update --init` first");
+  infra("contracts/lib/forge-std is empty: run `git submodule update --init`");
+mkdirSync(join(out, "fixtures"), { recursive: true });
+mkdirSync(join(out, "parity"), { recursive: true });
+mkdirSync(join(out, "lib"), { recursive: true });
 writeFileSync(
   join(out, "foundry.toml"),
   `[profile.default]
@@ -132,13 +209,14 @@ ${cfg.remappings.map(([a, b]) => `  "${a}=${b}",`).join("\n")}
 ]
 `
 );
+// the harness imports the fetched entry by its repo path, not through a remapping
 writeFileSync(
-  join(out, "parity/SpEvidenceParity.t.sol"),
+  join(out, TEST),
   `// SPDX-License-Identifier: Apache-2.0
 pragma solidity ${cfg.solc};
 
 import "forge-std/Test.sol";
-import "src/modules/monitoring/DVTValidator.sol";
+import {DVTValidator} from "../${ENTRY}";
 
 /// Accepts every body: the encoding is under test, not a category's check.
 contract AcceptAll {
@@ -161,7 +239,7 @@ contract DVTValidatorHarness is DVTValidator {
 }
 
 contract SpEvidenceParityTest is Test {
-    function test_spDvtValidatorMatchesDvtVectors() public {
+    function ${TEST_FN.replace("()", "")}() public {
         string memory json = vm.readFile(string.concat(vm.projectRoot(), "/fixtures/evidence-vectors.json"));
         bytes32[] memory cats = new bytes32[](2);
         cats[0] = vm.parseJsonBytes32(json, ".categories['DVT.Evidence.OverIssue.v1']");
@@ -184,30 +262,85 @@ contract SpEvidenceParityTest is Test {
             assertEq(c, vm.parseJsonBytes32(json, string.concat(p, ".category")), "category");
             assertEq(b, vm.parseJsonBytes(json, string.concat(p, ".body")), "body");
         }
-        assertGt(n, 0, "no vectors");
+        assertEq(n, ${nVectors}, "vector count");
         console.log("vectors", n);
     }
 }
 `
 );
-mkdirSync(join(out, "lib"), { recursive: true });
+const harnessText = readFileSync(join(out, TEST), "utf8");
 
-const runForge = () => {
+/** forge test --json, parsed: { ran, status, reason, logs } of our one test, or an infra failure. */
+function runForge() {
+  let stdout = "";
   try {
-    const o = execFileSync(forge, ["test", "-vv"], {
+    stdout = execFileSync(forge, ["test", "--json", "--build-info", "-vv"], {
       cwd: out,
       encoding: "utf8",
-      stdio: "pipe",
-      maxBuffer: 64 << 20,
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 256 << 20,
     });
-    return { ok: true, out: o };
   } catch (e) {
-    return { ok: false, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
+    // forge exits 1 when a test fails; that output is still a result. Anything without a parseable
+    // result for our test is an infrastructure failure, never counted as a control failure.
+    if (typeof e.status !== "number" || !e.stdout) infra("forge did not run");
+    stdout = e.stdout;
   }
-};
+  const line = stdout.split("\n").find(l => l.trim().startsWith("{"));
+  if (!line) infra("forge printed no JSON result (compile failure?)");
+  let j;
+  try {
+    j = JSON.parse(line);
+  } catch {
+    infra("forge JSON result did not parse");
+  }
+  const t = j?.[TEST_KEY]?.test_results?.[TEST_FN];
+  if (!t) infra(`forge result has no ${TEST_KEY} ${TEST_FN}`);
+  return { status: t.status, reason: t.reason ?? null, logs: t.decoded_logs ?? [] };
+}
+
+/** Every source the compiler saw is a fetched SP file (by blob), forge-std, or the harness. */
+function verifyInputs() {
+  const dir = join(out, "out", "build-info");
+  if (!existsSync(dir)) infra("no build-info written");
+  const unknown = [];
+  const mismatched = [];
+  const seen = new Set();
+  for (const f of readdirSync(dir).filter(n => n.endsWith(".json"))) {
+    const bi = JSON.parse(readFileSync(join(dir, f), "utf8"));
+    for (const [path, src] of Object.entries(bi.input?.sources ?? {})) {
+      const rel = path.startsWith(out) ? path.slice(out.length + 1) : path;
+      if (rel === TEST) {
+        if (src.content !== undefined && src.content !== harnessText) mismatched.push(rel);
+        continue;
+      }
+      if (rel.includes("forge-std/src/")) continue;
+      const fetched = files.get(rel);
+      if (!fetched) {
+        unknown.push(rel);
+        continue;
+      }
+      seen.add(rel);
+      const text = src.content ?? readFileSync(join(out, rel), "utf8");
+      if (gitBlob(text) !== fetched.sha) mismatched.push(rel);
+    }
+  }
+  const notCompiled = [...files.keys()].filter(p => !seen.has(p));
+  return { unknown, mismatched, notCompiled };
+}
+
 writeFileSync(join(out, "fixtures/evidence-vectors.json"), fixture);
 const real = runForge();
-// control: one evidenceHash altered must fail
+const inputs = verifyInputs();
+const vectorsLogged = real.logs.map(l => String(l).match(/^vectors (\d+)$/)?.[1]).find(Boolean);
+const realOk =
+  real.status === "Success" &&
+  Number(vectorsLogged) === nVectors &&
+  !inputs.unknown.length &&
+  !inputs.mismatched.length &&
+  !inputs.notCompiled.length;
+
+// control: one evidenceHash altered must fail, on the evidenceHash assertion
 const tampered = JSON.parse(fixture);
 const last = tampered.vectors.length - 1;
 const h = tampered.vectors[last].evidenceHash;
@@ -218,28 +351,36 @@ writeFileSync(
 );
 const control = runForge();
 writeFileSync(join(out, "fixtures/evidence-vectors.json"), fixture);
+const controlOk = control.status === "Failure" && /evidenceHash/.test(control.reason ?? "");
 
-const solcLine = (real.out.match(/Solc ([0-9.]+)/) ?? [])[1] ?? cfg.solc;
-const vectors = Number((real.out.match(/vectors (\d+)/) ?? [])[1] ?? NaN);
+const solcVersion = (() => {
+  try {
+    const dir = join(out, "out", "build-info");
+    const f = readdirSync(dir).find(n => n.endsWith(".json"));
+    return JSON.parse(readFileSync(join(dir, f), "utf8")).solcLongVersion ?? cfg.solc;
+  } catch {
+    return cfg.solc;
+  }
+})();
 const report = {
   spRepo: repo,
   spCommit: sha,
-  solc: solcLine,
+  solc: solcVersion,
   compiler: { viaIr: cfg.viaIr, optimizer: cfg.optimizer, runs: cfg.runs, evm: cfg.evm },
+  foundryToml: tomlFile.sha,
   files: Object.fromEntries([...files].map(([p, f]) => [p, f.sha]).sort()),
-  fixture: { path: "contracts/test/fixtures/evidence-vectors.json", blob: fixtureBlob },
-  vectors,
-  parity: real.ok ? "PASS" : "FAIL",
-  control: control.ok ? "PASSED (BAD: the comparison is vacuous)" : "FAILED (as required)",
+  compiledInputs: inputs,
+  fixture: {
+    path: "contracts/test/fixtures/evidence-vectors.json",
+    blob: fixtureBlob,
+    vectors: nVectors,
+  },
+  vectorsChecked: vectorsLogged ? Number(vectorsLogged) : null,
+  parity: realOk ? "PASS" : "FAIL",
+  parityDetail: realOk ? null : { status: real.status, reason: real.reason },
+  control: controlOk ? "FAILED (as required)" : "DID NOT FAIL AS REQUIRED",
+  controlDetail: { status: control.status, reason: control.reason },
   workdir: out,
 };
 console.log(JSON.stringify(report, null, 2));
-if (!real.ok)
-  console.error(
-    real.out
-      .split("\n")
-      .filter(l => /FAIL|Error|error/.test(l))
-      .slice(0, 20)
-      .join("\n")
-  );
-process.exit(real.ok && !control.ok ? 0 : 1);
+process.exit(realOk && controlOk ? 0 : 1);

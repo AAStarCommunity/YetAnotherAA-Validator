@@ -4,13 +4,15 @@
 //
 //   node deploy/guardian-watcher/phase-d-check.mjs --config <phase-d.json> [--json]
 //
-// Every check reports PASS, FAIL or MISSING (a secret or deployment input not provided yet), and
-// the script exits 0 only when every check is PASS. Secrets are never printed: an RPC URL is shown
-// by its host only, and Keychain items are checked for existence (`security find-generic-password`
-// without -w); the RPC URLs themselves are read from the Keychain into memory and used, never logged.
-// See phase-d.example.json for the config; a placeholder value ("<...>") counts as MISSING.
-import { execFileSync } from "node:child_process";
+// Every check reports PASS, FAIL or MISSING (an input not provided yet), and the script exits 0 only
+// when every check is PASS. The config schema is mandatory: a section or item left out is reported
+// MISSING, never silently skipped. Secrets are never printed: RPC endpoints are shown by their
+// configured operator label only, Keychain items are checked for existence, and error output is a
+// fixed category, never an exception's text. See phase-d.example.json; a "<...>" value is MISSING.
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync, statSync, accessSync, constants } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
@@ -26,180 +28,250 @@ if (ci < 0 || !args[ci + 1]) {
   process.exit(2);
 }
 const cfgPath = resolve(args[ci + 1]);
-const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+let cfg;
+try {
+  cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+} catch {
+  console.error("config: unreadable or not JSON");
+  process.exit(2);
+}
 const results = [];
 const add = (id, status, detail) => results.push({ id, status, detail });
 const placeholder = v =>
   v === undefined || v === null || v === "" || (typeof v === "string" && /^<.*>$/.test(v));
-const host = url => {
-  try {
-    return new URL(url).host;
-  } catch {
-    return "<unparseable url>";
-  }
+const expand = p => (typeof p === "string" && p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
+const isAddr = a => typeof a === "string" && ethers.isAddress(a);
+const gitBlob = text => {
+  const b = Buffer.from(text, "utf8");
+  return createHash("sha1")
+    .update(Buffer.concat([Buffer.from(`blob ${b.length}\0`), b]))
+    .digest("hex");
 };
 
-/** A Keychain item exists (macOS `security`, no secret read). */
-function keychainHas(service, account) {
-  try {
-    execFileSync(
-      "security",
-      ["find-generic-password", "-s", service, ...(account ? ["-a", account] : [])],
-      {
-        stdio: "ignore",
-      }
-    );
-    return true;
-  } catch {
-    return false;
-  }
+// ---- 1. Keychain (DSR 0829236d: account aoa-watcher, six named services), existence only
+const KEYCHAIN_ITEMS = [
+  "pinata",
+  "filebase",
+  "keystorePassword",
+  "alertBot",
+  "rpcPrimary",
+  "rpcSecondary",
+];
+const kc = cfg.keychain ?? {};
+const kcAccount = kc.account;
+const keychainHas = service =>
+  spawnSync("security", ["find-generic-password", "-s", service, "-a", kcAccount], {
+    stdio: "ignore",
+  }).status === 0;
+function keychainRead(service) {
+  const r = spawnSync("security", ["find-generic-password", "-s", service, "-a", kcAccount, "-w"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return r.status === 0 ? r.stdout.trim() : null;
 }
-/** A Keychain secret, into memory only (never printed). null when absent. */
-function keychainRead(service, account) {
-  try {
-    return execFileSync(
-      "security",
-      ["find-generic-password", "-s", service, ...(account ? ["-a", account] : []), "-w"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
-    ).trim();
-  } catch {
-    return null;
-  }
+if (placeholder(kcAccount)) add("keychain:account", "MISSING", "keychain.account not set");
+for (const item of KEYCHAIN_ITEMS) {
+  const svc = kc.services?.[item];
+  if (placeholder(svc) || placeholder(kcAccount))
+    add(`keychain:${item}`, "MISSING", "service or account not set");
+  else add(`keychain:${item}`, keychainHas(svc) ? "PASS" : "MISSING", `${svc} / ${kcAccount}`);
 }
+const secret = item =>
+  placeholder(kc.services?.[item]) || placeholder(kcAccount)
+    ? null
+    : keychainRead(kc.services[item]);
 
-// ---- 1. Keychain items (Pinata / Filebase tokens, keystore password, Telegram, RPC URLs)
-for (const k of cfg.keychain ?? []) {
-  if (placeholder(k.service)) add(`keychain:${k.purpose}`, "MISSING", "service name not set");
-  else
-    add(
-      `keychain:${k.purpose}`,
-      keychainHas(k.service, k.account) ? "PASS" : "MISSING",
-      `${k.service}${k.account ? ` / ${k.account}` : ""}`
-    );
-}
-
-// ---- 2. Watcher config: loads with the watcher's own validation
+// ---- 2. Watcher config: loads with the watcher's own validation; bound to the contracts below
 let wcfg = null;
-if (placeholder(cfg.watcherConfig)) add("watcher-config", "MISSING", "path not set");
+if (placeholder(cfg.watcherConfig)) add("watcher-config", "MISSING", "watcherConfig path not set");
 else {
-  try {
-    const { loadConfig } = await import(join(W, "watcher.mjs"));
-    wcfg = loadConfig(resolve(dirname(cfgPath), cfg.watcherConfig));
-    accessSync(wcfg.dataDir, constants.W_OK);
-    add(
-      "watcher-config",
-      "PASS",
-      `aggregator ${wcfg.aggregator}, SP ${wcfg.roles.superPaymaster}, dataDir writable`
-    );
-  } catch (e) {
-    add(
-      "watcher-config",
-      existsSync(resolve(dirname(cfgPath), cfg.watcherConfig)) ? "FAIL" : "MISSING",
-      e.message
-    );
+  const p = resolve(dirname(cfgPath), expand(cfg.watcherConfig));
+  if (!existsSync(p)) add("watcher-config", "MISSING", "watcher config file not present");
+  else {
+    try {
+      const { loadConfig } = await import(join(W, "watcher.mjs"));
+      wcfg = loadConfig(p);
+      accessSync(wcfg.dataDir, constants.W_OK);
+      add("watcher-config", "PASS", "valid; dataDir writable");
+    } catch {
+      add(
+        "watcher-config",
+        "FAIL",
+        "does not load with the watcher's validation, or dataDir not writable"
+      );
+    }
   }
 }
 
-// ---- 3. Sender keystore: present, 0600, an address that is none of the guardian/owner/deployer keys
-let sender = null;
-if (placeholder(cfg.sender?.keystore)) add("sender-keystore", "MISSING", "keystore path not set");
-else if (!existsSync(cfg.sender.keystore))
-  add("sender-keystore", "MISSING", "keystore file not present");
+// ---- 3. Sender keystore: an encrypted keystore, mode exactly 0600, whose DECRYPTED address is none
+// of the forbidden keys (guardians, owner Safe, deployer)
+const sender = cfg.sender ?? {};
+const forbidden = Array.isArray(sender.forbidden) ? sender.forbidden : [];
+const forbiddenOk = forbidden.length > 0 && forbidden.every(isAddr);
+add(
+  "sender-forbidden-list",
+  forbiddenOk ? "PASS" : "MISSING",
+  forbiddenOk
+    ? `${forbidden.length} addresses`
+    : "sender.forbidden must list the guardian, owner and deployer addresses"
+);
+let senderAddr = null;
+const ksPath = expand(sender.keystore);
+if (placeholder(sender.keystore)) add("sender-keystore", "MISSING", "sender.keystore not set");
+else if (!existsSync(ksPath)) add("sender-keystore", "MISSING", "keystore file not present");
 else {
+  const mode = statSync(ksPath).mode & 0o777;
+  let ks = null;
   try {
-    const ks = JSON.parse(readFileSync(cfg.sender.keystore, "utf8"));
-    sender = ethers.getAddress(ks.address.startsWith("0x") ? ks.address : `0x${ks.address}`);
-    const mode = statSync(cfg.sender.keystore).mode & 0o777;
-    const forbidden = (cfg.sender.forbidden ?? []).map(a => a.toLowerCase());
-    if (mode & 0o077) add("sender-keystore", "FAIL", `mode ${mode.toString(8)}, expected 600`);
-    else if (forbidden.includes(sender.toLowerCase()))
-      add("sender-keystore", "FAIL", `${sender} is a guardian/owner/deployer key`);
-    else
+    ks = JSON.parse(readFileSync(ksPath, "utf8"));
+  } catch {
+    ks = null;
+  }
+  const c = ks && (ks.crypto ?? ks.Crypto);
+  if (!c || typeof c.ciphertext !== "string" || typeof c.kdf !== "string")
+    add("sender-keystore", "FAIL", "not an encrypted JSON keystore");
+  else if (mode !== 0o600)
+    add("sender-keystore", "FAIL", `mode ${mode.toString(8).padStart(3, "0")}, required 600`);
+  else {
+    const pw = secret("keystorePassword");
+    if (pw === null)
       add(
         "sender-keystore",
-        "PASS",
-        `${sender}, mode 600, distinct from ${forbidden.length} forbidden keys`
+        "MISSING",
+        "encrypted, mode 600; password not in the Keychain, address unverified"
       );
-  } catch (e) {
-    add("sender-keystore", "FAIL", `unreadable keystore JSON: ${e.message.slice(0, 80)}`);
+    else {
+      try {
+        senderAddr = (await ethers.Wallet.fromEncryptedJson(JSON.stringify(ks), pw)).address;
+        const hit = forbidden.some(a => isAddr(a) && a.toLowerCase() === senderAddr.toLowerCase());
+        if (!forbiddenOk)
+          add("sender-keystore", "MISSING", `decrypts to ${senderAddr}; forbidden list not set`);
+        else if (hit)
+          add("sender-keystore", "FAIL", `${senderAddr} is a guardian/owner/deployer key`);
+        else
+          add(
+            "sender-keystore",
+            "PASS",
+            `decrypts to ${senderAddr}, mode 600, not a forbidden key`
+          );
+      } catch {
+        add("sender-keystore", "FAIL", "the Keychain password does not decrypt the keystore");
+      }
+    }
   }
 }
 
-// ---- 4. launchd: jobs that must be off stay off, the watcher job is loaded
-const uid = process.getuid?.() ?? 0;
-const loaded = label => {
-  try {
-    execFileSync("launchctl", ["print", `gui/${uid}/${label}`], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-};
-for (const label of cfg.launchd?.mustBeOff ?? []) {
-  if (placeholder(label)) add(`launchd-off:${label}`, "MISSING", "label not set");
-  else
-    add(
-      `launchd-off:${label}`,
-      loaded(label) ? "FAIL" : "PASS",
-      loaded(label) ? "loaded" : "not loaded"
-    );
+// ---- 4. launchd: one inspection per label, in the configured domain; "not found" is told apart from
+// an inspection that failed
+const ld = cfg.launchd ?? {};
+const domain = placeholder(ld.domain) ? `gui/${process.getuid?.() ?? 0}` : ld.domain;
+function launchdState(label) {
+  const r = spawnSync("launchctl", ["print", `${domain}/${label}`], { encoding: "utf8" });
+  if (r.status === 0) return "loaded";
+  if (/could not find service/i.test(`${r.stdout ?? ""}${r.stderr ?? ""}`)) return "absent";
+  return "unknown";
 }
-for (const label of cfg.launchd?.mustBeOn ?? []) {
+const say = s =>
+  s === "loaded"
+    ? `loaded in ${domain}`
+    : s === "absent"
+      ? `not loaded in ${domain}`
+      : "launchctl inspection failed";
+if (!Array.isArray(ld.mustBeOff) || !ld.mustBeOff.length)
+  add("launchd-off", "MISSING", "launchd.mustBeOff not set");
+for (const label of ld.mustBeOff ?? []) {
+  if (placeholder(label)) add(`launchd-off:${label}`, "MISSING", "label not set");
+  else {
+    const s = launchdState(label);
+    add(`launchd-off:${label}`, s === "absent" ? "PASS" : "FAIL", say(s));
+  }
+}
+if (!Array.isArray(ld.mustBeOn) || !ld.mustBeOn.length)
+  add("launchd-on", "MISSING", "launchd.mustBeOn not set");
+for (const label of ld.mustBeOn ?? []) {
   if (placeholder(label)) add(`launchd-on:${label}`, "MISSING", "label not set");
-  else
+  else {
+    const s = launchdState(label);
     add(
       `launchd-on:${label}`,
-      loaded(label) ? "PASS" : "MISSING",
-      loaded(label) ? "loaded" : "not loaded yet"
+      s === "loaded" ? "PASS" : s === "absent" ? "MISSING" : "FAIL",
+      say(s)
     );
+  }
 }
 
-// ---- 5. DVT nodes: slash submission off (AUDIT_ENABLED / AUDIT_EXECUTE_SLASH not "true")
-for (const c of cfg.dvtNodes?.containers ?? []) {
+// ---- 5. DVT nodes: slash submission explicitly off. In the node's NestJS ConfigModule a variable set
+// in the process environment takes precedence over .env, so an explicit AUDIT_ENABLED=false and
+// AUDIT_EXECUTE_SLASH=false in the container's environment are binding; an ABSENT variable could
+// still be switched on by a .env file, so absence does not pass.
+const nodes = cfg.dvtNodes?.containers;
+if (!Array.isArray(nodes) || !nodes.length)
+  add("node-slash-off", "MISSING", "dvtNodes.containers not set");
+for (const c of nodes ?? []) {
   if (placeholder(c)) {
     add(`node-slash-off:${c}`, "MISSING", "container name not set");
     continue;
   }
-  let env = null;
-  try {
-    env = JSON.parse(
-      execFileSync("docker", ["inspect", "--format", "{{json .Config.Env}}", c], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      })
-    );
-  } catch {
+  const r = spawnSync("docker", ["inspect", "--format", "{{json .Config.Env}}", c], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (r.status !== 0) {
     add(`node-slash-off:${c}`, "MISSING", "container not found or docker unavailable");
     continue;
   }
-  const on = ["AUDIT_ENABLED", "AUDIT_EXECUTE_SLASH"].filter(k => env.includes(`${k}=true`));
+  let env;
+  try {
+    env = JSON.parse(r.stdout);
+  } catch {
+    add(`node-slash-off:${c}`, "FAIL", "docker inspect output unreadable");
+    continue;
+  }
+  const bad = ["AUDIT_ENABLED", "AUDIT_EXECUTE_SLASH"].filter(k => !env.includes(`${k}=false`));
   add(
     `node-slash-off:${c}`,
-    on.length ? "FAIL" : "PASS",
-    on.length ? `${on.join(", ")} set` : "audit slash submission off"
+    bad.length ? "FAIL" : "PASS",
+    bad.length
+      ? `${bad.join(", ")} not explicitly false`
+      : "AUDIT_ENABLED=false, AUDIT_EXECUTE_SLASH=false"
   );
 }
 
-// ---- 6. RPCs: primary and second provider, both trace-verified, different operators
-const rpcUrl = r =>
-  placeholder(r?.keychainService) ? null : keychainRead(r.keychainService, r.keychainAccount);
-// PHASE_D_RPC_PRIMARY / PHASE_D_RPC_SECOND override the Keychain for a dry run of this script only
-// (an environment variable, never a file); the value is never printed either.
-const primaryUrl = process.env.PHASE_D_RPC_PRIMARY || rpcUrl(cfg.rpc?.primary);
-const secondUrl = process.env.PHASE_D_RPC_SECOND || rpcUrl(cfg.rpc?.second);
-const site = h => h.split(".").slice(-2).join("."); // registrable domain, close enough for an operator
-async function rpcCheck(id, url) {
-  if (!url) return add(id, "MISSING", "RPC URL not in the Keychain");
+// ---- 6. RPCs: primary and second provider, chainId, trace capability positively verified, and two
+// DECLARED different operators on different hosts. Shown by operator label, never by URL or host.
+// Different hosts are necessary, not sufficient: the declared operator is the author's statement.
+const rpcCfg = cfg.rpc ?? {};
+// PHASE_D_RPC_PRIMARY / PHASE_D_RPC_SECOND override the Keychain for a dry run only (environment,
+// never a file); like the Keychain values, they are never printed.
+const primaryUrl = process.env.PHASE_D_RPC_PRIMARY || secret("rpcPrimary");
+const secondUrl = process.env.PHASE_D_RPC_SECOND || secret("rpcSecondary");
+const label = which => (placeholder(rpcCfg[which]?.operator) ? which : rpcCfg[which].operator);
+const errCode = e =>
+  typeof e?.code === "string" && /^[A-Z_]{2,40}$/.test(e.code) ? e.code : "error";
+const hostname = url => {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+};
+if (!Number.isSafeInteger(cfg.chainId)) add("chain-id", "MISSING", "chainId not set");
+async function rpcCheck(which, url) {
+  const id = `rpc-${which}`;
+  if (!url) return add(id, "MISSING", `${label(which)}: URL not in the Keychain`);
+  if (!Number.isSafeInteger(cfg.chainId))
+    return add(id, "MISSING", `${label(which)}: chainId not set`);
   try {
     const p = new ethers.JsonRpcProvider(url, undefined, { staticNetwork: true });
     const net = await p.getNetwork();
-    if (cfg.chainId && Number(net.chainId) !== cfg.chainId)
-      return add(id, "FAIL", `${host(url)}: chainId ${net.chainId}, expected ${cfg.chainId}`);
+    if (Number(net.chainId) !== cfg.chainId)
+      return add(id, "FAIL", `${label(which)}: chainId ${net.chainId}, expected ${cfg.chainId}`);
     if (!wcfg)
       return add(
         id,
         "MISSING",
-        `${host(url)}: reachable, chainId ok; trace check needs the watcher config`
+        `${label(which)}: chainId ok; trace check needs the watcher config`
       );
     const { verifyTrace } = await import(join(W, "lib/scan.mjs"));
     const fin = await p.getBlock("finalized");
@@ -207,30 +279,44 @@ async function rpcCheck(id, url) {
     add(
       id,
       v.state === "verified" ? "PASS" : "FAIL",
-      `${host(url)}: trace capability ${v.state}${v.reason ? ` (${v.reason})` : ""}`
+      `${label(which)}: trace capability ${v.state}`
     );
   } catch (e) {
-    add(id, "FAIL", `${host(url)}: ${e.code ?? "error"}`);
+    add(id, "FAIL", `${label(which)}: ${errCode(e)}`);
   }
 }
-await rpcCheck("rpc-primary", primaryUrl);
-await rpcCheck("rpc-second", secondUrl);
-if (primaryUrl && secondUrl) {
-  const a = site(host(primaryUrl));
-  const b = site(host(secondUrl));
-  add(
-    "rpc-independent",
-    a !== b ? "PASS" : "FAIL",
-    a !== b ? `${a} vs ${b}` : `both ${a}: D-RPC2 needs a different operator`
-  );
-} else add("rpc-independent", "MISSING", "needs both RPC URLs");
+await rpcCheck("primary", primaryUrl);
+await rpcCheck("second", secondUrl);
+{
+  const opA = rpcCfg.primary?.operator;
+  const opB = rpcCfg.second?.operator;
+  if (placeholder(opA) || placeholder(opB))
+    add("rpc-independent", "MISSING", "declare rpc.primary.operator and rpc.second.operator");
+  else if (!primaryUrl || !secondUrl) add("rpc-independent", "MISSING", "needs both RPC URLs");
+  else {
+    const hA = hostname(primaryUrl);
+    const hB = hostname(secondUrl);
+    if (opA.trim().toLowerCase() === opB.trim().toLowerCase())
+      add("rpc-independent", "FAIL", `both declared as ${opA}`);
+    else if (!hA || !hB || hA === hB) add("rpc-independent", "FAIL", "both endpoints on one host");
+    else add("rpc-independent", "PASS", `declared operators ${opA} and ${opB}, different hosts`);
+  }
+}
 
-// ---- 7. On-chain deployment facts (§9 item 7), read through the primary RPC
+// ---- 7. On-chain facts (§9 item 7), bound to the watcher config, read through the primary RPC
 const C = cfg.contracts ?? {};
-if (!primaryUrl) add("onchain", "MISSING", "needs the primary RPC");
-else if ([C.dvtValidator, C.aggregator, C.manifestSafe].some(placeholder))
-  add("onchain", "MISSING", "contract addresses not set");
+if ([C.dvtValidator, C.aggregator, C.manifestSafe].some(a => !isAddr(a)))
+  add("onchain", "MISSING", "contracts.dvtValidator / aggregator / manifestSafe not set");
+else if (!wcfg) add("onchain", "MISSING", "needs the watcher config");
+else if (C.aggregator.toLowerCase() !== String(wcfg.aggregator).toLowerCase())
+  add(
+    "onchain:binding",
+    "FAIL",
+    "contracts.aggregator is not the aggregator the watcher config watches"
+  );
+else if (!primaryUrl) add("onchain", "MISSING", "needs the primary RPC");
 else {
+  add("onchain:binding", "PASS", "contracts.aggregator equals the watcher config");
   const p = new ethers.JsonRpcProvider(primaryUrl, undefined, { staticNetwork: true });
   const read = async (to, sig, ret) => {
     const i = new ethers.Interface([`function ${sig} view returns (${ret})`]);
@@ -244,8 +330,8 @@ else {
     try {
       const v = await f();
       add(id, want(v) ? "PASS" : "FAIL", show(v));
-    } catch (e) {
-      add(id, "FAIL", `read failed: ${e.code ?? "error"}`);
+    } catch {
+      add(id, "FAIL", "read failed");
     }
   };
   await fact(
@@ -263,35 +349,64 @@ else {
     () => read(C.aggregator, "owner()", "address"),
     v => v.toLowerCase() === C.manifestSafe.toLowerCase()
   );
-  if (sender && cfg.sender?.minBalanceWei)
+  if (!/^[0-9]+$/.test(String(sender.minBalanceWei ?? "")))
+    add("sender-balance", "MISSING", "sender.minBalanceWei not set");
+  else if (!senderAddr) add("sender-balance", "MISSING", "sender address not verified yet");
+  else
     await fact(
-      "sender balance",
-      () => p.getBalance(sender),
-      v => v >= BigInt(cfg.sender.minBalanceWei),
-      v =>
-        `${ethers.formatEther(v)} ETH (min ${ethers.formatEther(BigInt(cfg.sender.minBalanceWei))})`
+      "sender-balance",
+      () => p.getBalance(senderAddr),
+      v => v >= BigInt(sender.minBalanceWei),
+      v => `${ethers.formatEther(v)} ETH (min ${ethers.formatEther(BigInt(sender.minBalanceWei))})`
     );
 }
 
-// ---- 8. Release checks that run elsewhere: their recorded results must be present
-for (const r of cfg.releaseEvidence ?? []) {
-  if (placeholder(r.path)) add(`evidence:${r.name}`, "MISSING", "report path not set");
-  else if (!existsSync(r.path)) add(`evidence:${r.name}`, "MISSING", "report not produced yet");
+// ---- 8. Release reports, bound to this release: the predicates are fixed here, not configurable
+const relCommit = /^[0-9a-f]{40}$/.test(cfg.release?.spCommit ?? "") ? cfg.release.spCommit : null;
+if (!relCommit) add("release:spCommit", "MISSING", "release.spCommit (the rc.8 commit) not set");
+const ev = cfg.releaseEvidence ?? {};
+const fixtureBlob = gitBlob(
+  readFileSync(join(ROOT, "contracts/test/fixtures/evidence-vectors.json"), "utf8")
+);
+const rulesetBlob = gitBlob(readFileSync(join(W, "ruleset.json"), "utf8"));
+const empty = x => Array.isArray(x) && x.length === 0;
+const PREDICATES = {
+  spParity: j =>
+    j.parity === "PASS" &&
+    j.control === "FAILED (as required)" &&
+    j.spCommit === relCommit &&
+    j.fixture?.blob === fixtureBlob &&
+    empty(j.compiledInputs?.unknown) &&
+    empty(j.compiledInputs?.mismatched) &&
+    empty(j.compiledInputs?.notCompiled),
+  a3: j =>
+    j.spCommit === relCommit &&
+    j.rulesetBlob === rulesetBlob &&
+    empty(j.missingFunctions) &&
+    empty(j.missingEvents) &&
+    empty(j.restrictedOnPublicRoute),
+};
+for (const [name, pred] of Object.entries(PREDICATES)) {
+  const p = expand(ev[name]);
+  if (placeholder(ev[name])) add(`evidence:${name}`, "MISSING", `releaseEvidence.${name} not set`);
+  else if (!existsSync(p)) add(`evidence:${name}`, "MISSING", "report not produced yet");
   else {
+    let j = null;
     try {
-      const j = JSON.parse(readFileSync(r.path, "utf8"));
-      // compared as JSON, so a report can require e.g. an empty gap list
-      const ok = r.passWhen
-        ? Object.entries(r.passWhen).every(([k, v]) => JSON.stringify(j[k]) === JSON.stringify(v))
-        : true;
-      add(
-        `evidence:${r.name}`,
-        ok ? "PASS" : "FAIL",
-        ok ? `${r.path} as required` : `${r.path} does not show ${JSON.stringify(r.passWhen)}`
-      );
-    } catch (e) {
-      add(`evidence:${r.name}`, "FAIL", `unreadable: ${e.message.slice(0, 80)}`);
+      j = JSON.parse(readFileSync(p, "utf8"));
+    } catch {
+      j = null;
     }
+    if (!j) add(`evidence:${name}`, "FAIL", "report unreadable");
+    else if (!relCommit) add(`evidence:${name}`, "MISSING", "release.spCommit not set");
+    else
+      add(
+        `evidence:${name}`,
+        pred(j) ? "PASS" : "FAIL",
+        pred(j)
+          ? "passing, for this release, fixture and ruleset"
+          : "not a passing report for this release, fixture and ruleset"
+      );
   }
 }
 

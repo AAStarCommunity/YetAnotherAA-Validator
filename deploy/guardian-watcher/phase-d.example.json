@@ -1,75 +1,48 @@
 {
-  "comment": "Phase D check config (copy to phase-d.json on the Mini and fill the <...> values). No secret goes in this file: RPC URLs and tokens live in the macOS Keychain, entered interactively by the author.",
+  "comment": "Phase D check config. Copy to phase-d.json on the Mini; fill the <...> values (public data only). No secret goes in this file: tokens, the keystore password and both RPC URLs live in the macOS Keychain under the account and services below (DSR 0829236d), entered interactively by the author.",
   "chainId": 11155111,
-  "watcherConfig": "<path to the watcher config.json>",
-  "keychain": [
-    {
-      "purpose": "pinata-token",
-      "service": "<keychain service for the Pinata token>"
-    },
-    {
-      "purpose": "filebase-token",
-      "service": "<keychain service for the Filebase token>"
-    },
-    {
-      "purpose": "sender-keystore-password",
-      "service": "<keychain service for the watcher keystore password>"
-    },
-    {
-      "purpose": "telegram-bot-token",
-      "service": "<keychain service for the alert bot token>"
-    },
-    {
-      "purpose": "rpc-primary-url",
-      "service": "<keychain service for the primary trace RPC URL>"
-    },
-    {
-      "purpose": "rpc-second-url",
-      "service": "<keychain service for the second-provider trace RPC URL>"
-    }
-  ],
-  "rpc": {
-    "primary": {
-      "keychainService": "<keychain service for the primary trace RPC URL>"
-    },
-    "second": {
-      "keychainService": "<keychain service for the second-provider trace RPC URL>"
+  "release": { "spCommit": "<full 40-hex SP commit of the rc.8 release tag>" },
+  "watcherConfig": "~/.aoa-watcher/config.json",
+  "keychain": {
+    "account": "aoa-watcher",
+    "services": {
+      "pinata": "aoa-dvt-pinata-jwt",
+      "filebase": "aoa-dvt-filebase-token",
+      "keystorePassword": "aoa-dvt-watcher-keystore-pw",
+      "alertBot": "aoa-dvt-alert-bot-token",
+      "rpcPrimary": "aoa-dvt-rpc-primary",
+      "rpcSecondary": "aoa-dvt-rpc-secondary"
     }
   },
+  "rpc": {
+    "primary": { "operator": "<operator name of the primary trace RPC>" },
+    "second": { "operator": "<a different operator for the second trace RPC>" }
+  },
   "sender": {
-    "keystore": "<path to the watcher sender JSON keystore>",
-    "forbidden": ["<guardian address>", "<owner Safe>", "<deployer address>"],
+    "keystore": "~/.aoa-watcher/sender.keystore.json",
+    "forbidden": [
+      "<guardian addresses, from the step-13 manifest and the on-chain guardian set>",
+      "<owner Safe>",
+      "<deployer>"
+    ],
     "minBalanceWei": "50000000000000000"
   },
   "contracts": {
-    "dvtValidator": "<DVTValidator address from the rc.8 manifest>",
-    "aggregator": "<BLSAggregator address from the rc.8 manifest>",
-    "manifestSafe": "<the manifest's owner Safe>"
+    "dvtValidator": "<DVTValidator address from the step-13 manifest>",
+    "aggregator": "<BLSAggregator address from the step-13 manifest (must equal the watcher config)>",
+    "manifestSafe": "<owner Safe from the step-13 manifest>"
   },
   "launchd": {
+    "domain": "<launchd domain, default gui/<uid>>",
     "mustBeOff": [
-      "<committee keeper launchd label>",
+      "io.aastar.dvt-committee-keeper",
       "io.aastar.dvt-apply-rotation"
     ],
-    "mustBeOn": ["<guardian watcher launchd label>"]
+    "mustBeOn": ["ai.aastar.aoa-watcher"]
   },
-  "dvtNodes": {
-    "containers": [
-      "<dvt node container 1>",
-      "<dvt node container 2>",
-      "<dvt node container 3>"
-    ]
-  },
-  "releaseEvidence": [
-    {
-      "name": "sp-evidence-parity",
-      "path": "<report of npm run check:sp-parity -- <rc.8 SHA>>",
-      "passWhen": { "parity": "PASS", "control": "FAILED (as required)" }
-    },
-    {
-      "name": "a3-emissions",
-      "path": "<report of npm run check:a3-emissions -- <table> --json>",
-      "passWhen": { "missingFunctions": [], "missingEvents": [] }
-    }
-  ]
+  "dvtNodes": { "containers": ["dvt-node-1", "dvt-node-2", "dvt-node-3"] },
+  "releaseEvidence": {
+    "spParity": "~/.aoa-watcher/evidence/sp-evidence-parity.json",
+    "a3": "~/.aoa-watcher/evidence/a3-emissions.json"
+  }
 }

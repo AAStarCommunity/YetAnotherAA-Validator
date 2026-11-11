@@ -37,6 +37,10 @@ services:
       # Owner-authorization gate is always on (eth_call isValidOwnerAuth).
       POLICY_ENABLED: ${POLICY_ENABLED:-false}
       POLICY_REGISTRY_ADDRESS: ${POLICY_REGISTRY_ADDRESS:-}
+      # 5.5.0: node slash submission OFF, explicitly (DSR 918b553d). Hard-coded: the process
+      # environment beats .env in the node's ConfigModule.
+      AUDIT_ENABLED: "false"
+      AUDIT_EXECUTE_SLASH: "false"
       # Relay (gasless) — needs a funded mainnet operator key (KEEP SEPARATE from BLS key).
       RELAY_ENABLED: ${RELAY_ENABLED:-false}
       RELAY_OPERATOR_PK: ${RELAY_OPERATOR_PK:-}
