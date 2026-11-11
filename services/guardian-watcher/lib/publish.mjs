@@ -142,8 +142,17 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     if (cur?.current && !opts.reverify) continue;
     try {
       if (cur?.current) {
-        // Reverify: still served, byte for byte? If not, demote and upload again below.
-        const back = await p.fetchPublic(file.cid);
+        // Reverify: still served, byte for byte? If not, demote and upload again below. A transport
+        // error is no evidence either way (#409 review N1): the pin keeps its state, alerted.
+        let back;
+        try {
+          back = await p.fetchPublic(file.cid);
+        } catch (e) {
+          if (e instanceof PersistError) throw e;
+          state.pins[p.name] = { ...cur, checkError: errMsg(e), checkErrorAt: at };
+          alerts.push(`${p.name}: re-verification could not reach the gateway; pin state kept`);
+          continue;
+        }
         if (
           back &&
           bytesEqual(back instanceof Uint8Array ? back : ethers.getBytes(back), file.bytes)

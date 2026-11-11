@@ -33,6 +33,17 @@ export function recordFile(record, { recheck } = {}) {
 
 /** Path of a record in the GitHub mirror branch: a function of the record and its CID only. */
 export function mirrorPath(record, cid) {
+  // the path is built from chain data; make its shape an invariant (#409 review N2)
+  if (!/^[a-z2-7]+$/.test(String(cid))) throw new Error("mirrorPath: CID is not base32");
+  if (
+    record.route !== "bls" &&
+    (!/^0x[0-9a-fA-F]{64}$/.test(String(record.txHash)) ||
+      !Number.isSafeInteger(record.logIndex) ||
+      record.logIndex < 0)
+  )
+    throw new Error(
+      "mirrorPath: owner-route record needs a 32-byte txHash and an integer logIndex"
+    );
   const id =
     record.route === "bls"
       ? `bls-${record.kind}-${BigInt(record.key).toString(16).padStart(64, "0")}`

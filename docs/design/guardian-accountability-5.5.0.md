@@ -86,12 +86,18 @@ TAG_EVIDENCE = keccak256("SuperPaymaster.DVT.Evidence.v2")
 Vectors: `contracts/test/fixtures/evidence-vectors.json`, generated from
 `scripts/disclosure/recheck-lib.mjs` (`npm run check:disclosure` diffs it) and
 recomputed in Solidity by `contracts/test/EvidenceHashParity.t.sol` (an
-independent recomputation, not SP's contract). Running SP's DVTValidator 0.8.0
-against the same file is planned once its branch is published; until then the
-parity covers our two implementations only. `abi.encode`, never `encodePacked`:
-for `evidenceHash` the two coincide (three static `bytes32` words), but for
-`evidence` they differ, since `bytes` is dynamic and `abi.encode` adds its
-offset and length.
+independent recomputation, not SP's contract). SP's own DVTValidator is run
+against the same file by `npm run check:sp-parity -- <SP commit SHA>`
+(`scripts/disclosure/sp-evidence-parity.mjs`): it fetches DVTValidator and its
+import closure through the GitHub API at that commit, resolved with SP's own
+remappings (OpenZeppelin is vendored in SP), compiles them with SP's compiler
+settings, checks every vector byte for byte, and runs a tampered-vector control
+that must fail. Its JSON report records the commit, solc and every file's blob
+SHA. Run at SP d13bb0f0 (DVTValidator-0.8.0): 5/5 match, control failed (DSR
+8c5f68e5). It needs network access and `gh`, so it is a release check (Phase D /
+manifest), not a CI job. `abi.encode`, never `encodePacked`: for `evidenceHash`
+the two coincide (three static `bytes32` words), but for `evidence` they differ,
+since `bytes` is dynamic and `abi.encode` adds its offset and length.
 
 The DVT node does not yet build proposals this way (it files
 `evidenceHash = proofHash`, and over-issue uses its own tag). That is closed in
@@ -465,6 +471,16 @@ aggregator-only.
   transaction becomes a dead letter (route `tx`) and is retried each tick. An
   event that only privileged functions can emit is the owner route whatever the
   trace says. Its caller is recorded when known.
+- That rule is only as good as `publicRoute.functions`: a watched event a
+  permissionless function can also emit, missing from it, would be attributed to
+  the owner. Release check (DSR 19557717): SP generates, on the release tree, a
+  table of every function of the contracts the watcher reads, with its caller
+  restriction and every event it can emit (through internal calls and
+  delegatecall too), keyed by topic0. `npm run check:a3-emissions -- <table>`
+  (`scripts/disclosure/a3-emission-diff.mjs`) recomputes every selector and
+  topic0, then fails on any permissionless function emitting a watched event
+  that is not on the public route, or not with that event. It is a manifest-PR
+  (step 13) and Phase D item.
 
 - **Scope of the trace and receipt checks.** They defend against an RPC that is
   honest but inconsistent, lagging or only partly supporting the tracer, and
@@ -671,6 +687,30 @@ detection time, pause tx time.
   lag, RPC failure, low balance, stale heartbeat.
 - Sender: a new low-balance EOA, JSON keystore, password in the macOS Keychain.
   Never in `.env` or plaintext; not a guardian, owner or deployer key.
+- **Phase D pre-deploy check — trust boundary (DSR, #407).**
+  `npm run check:phase-d` defends against two things only: an **honest
+  operator's mistake** (a wrong config, a wrapper not reinstalled, a config
+  edited or a checkout pulled without restarting the watcher, the committee
+  keeper or apply-rotation job left on, a node without explicit
+  `AUDIT_ENABLED=false` and `AUDIT_EXECUTE_SLASH=false`) and **secret
+  disclosure**: no Keychain value (RPC URL, token, keystore password) is ever
+  printed; the report carries only fixed wording, Keychain service and account
+  names, and the operator labels from the Phase D config, which are public data
+  (a label that looks like a URL is replaced, not printed). It checks the
+  running watcher process itself: the live PID's command line, its `RPC_URL` /
+  `RPC_URL_2` against the Keychain, and that the process started after the
+  modification time of the files it checks (the watcher config, the wrapper, the
+  watcher's sources and their relative imports, and the lockfile); it does not
+  inspect what the process actually loaded. It does **not** defend against the
+  Mini's operator: whoever controls the Mini's user account and launchd can
+  spoof a process title, ship a fake `node`, forge environment entries or
+  backdate mtimes. The Mini operator is a trust root of the deployment, on the
+  same level as the RPC trust assumption (§5.2a: the RPC is an operator-chosen
+  node), not something Phase D verifies. Also accepted: SP's table generator,
+  the operator's own declarations (RPC operators, the notDvt container list),
+  the checkout Phase D runs from, and `node_modules` beyond the lockfile's
+  mtime. The paper's limitations section is to state the same boundary (DSR owns
+  that wording).
 
 ## 6. Random committee (D7: prepared, not enabled)
 

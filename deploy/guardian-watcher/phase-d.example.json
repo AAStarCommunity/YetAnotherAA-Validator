@@ -1,0 +1,65 @@
+{
+  "comment": "Phase D check config. Copy to phase-d.json on the Mini; fill the <...> values (public data only). No secret goes in this file: tokens, the keystore password and both RPC URLs live in the macOS Keychain under the account and services below (DSR 0829236d), entered interactively by the author.",
+  "chainId": 11155111,
+  "release": {
+    "spCommit": "<full 40-hex SP commit of the rc.8 release tag>"
+  },
+  "watcherConfig": "~/.aoa-watcher/config.json",
+  "keychain": {
+    "account": "aoa-watcher",
+    "services": {
+      "pinata": "aoa-dvt-pinata-jwt",
+      "filebase": "aoa-dvt-filebase-token",
+      "keystorePassword": "aoa-dvt-watcher-keystore-pw",
+      "alertBot": "aoa-dvt-alert-bot-token",
+      "rpcPrimary": "aoa-dvt-rpc-primary",
+      "rpcSecondary": "aoa-dvt-rpc-secondary"
+    }
+  },
+  "rpc": {
+    "primary": {
+      "operator": "<operator name of the primary trace RPC>"
+    },
+    "second": {
+      "operator": "<a different operator for the second trace RPC>"
+    }
+  },
+  "sender": {
+    "keystore": "~/.aoa-watcher/sender.keystore.json",
+    "forbidden": {
+      "guardians": [
+        "<every guardian address: step-13 manifest and the on-chain guardian set>"
+      ],
+      "ownerSafe": "<owner Safe (= contracts.manifestSafe)>",
+      "deployer": "<deployer address>"
+    },
+    "minBalanceWei": "50000000000000000"
+  },
+  "contracts": {
+    "dvtValidator": "<DVTValidator address from the step-13 manifest>",
+    "aggregator": "<BLSAggregator address from the step-13 manifest (must equal the watcher config)>",
+    "manifestSafe": "<owner Safe from the step-13 manifest>"
+  },
+  "launchd": {
+    "domain": "<launchd domain, default gui/<uid>>",
+    "mustBeOff": [
+      "io.aastar.dvt-committee-keeper",
+      "io.aastar.dvt-apply-rotation"
+    ],
+    "mustBeOn": ["ai.aastar.aoa-watcher", "ai.aastar.aoa-watcher-heartbeat"],
+    "watcherWrapper": "~/.aoa-watcher/run-watcher.sh"
+  },
+  "dvtNodes": {
+    "compose": "docker-compose.testnet.yml",
+    "containers": ["dvt-node-1", "dvt-node-2", "dvt-node-3"],
+    "notDvt": [
+      "dvt-cloudflared",
+      "dvt-autoheal",
+      "<every other running container on the Mini that is not a DVT node>"
+    ]
+  },
+  "releaseEvidence": {
+    "spParity": "~/.aoa-watcher/evidence/sp-evidence-parity.json",
+    "a3": "~/.aoa-watcher/evidence/a3-emissions.json"
+  }
+}

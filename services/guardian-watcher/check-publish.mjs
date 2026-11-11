@@ -125,6 +125,7 @@ function sinks(opts = {}) {
     },
     async fetchPublic(cid) {
       const o = pinOpts[name];
+      if (o.fetchThrows) throw new Error("gateway timeout"); // transport error, not a mismatch
       if (o.private || o.gone) return null; // private upload, or unpinned later
       return stored.get(`${name}:${cid}`) ?? null;
     },
@@ -178,6 +179,7 @@ function sinks(opts = {}) {
       async entryOf(kind, key, { blockTag } = {}) {
         const id = chain.byAction.get(`${kind}:${key}`);
         if (!id) return 0n;
+        if (opts.ignoreBlockTag) return id; // an RPC that answers head state for any blockTag
         return chain.entries.get(id).block <= (blockTag ?? chain.block) ? id : 0n;
       },
       async entry(id) {
@@ -266,7 +268,8 @@ function sinks(opts = {}) {
   );
   cell(
     "Telegram text names the record CID and the mirror URL",
-    s.calls.texts[0].includes(`ipfs://${f1.cid}`) && s.calls.texts[0].includes("github.com"),
+    s.calls.texts[0].includes(`ipfs://${f1.cid}`) &&
+      s.calls.texts[0].includes(`https://github.com/x/y/blob/c0ffee/${mirrorPath(bls, f1.cid)}`),
     s.calls.texts[0]
   );
   const r2 = await pub(bls, s, r1.state);
@@ -443,6 +446,25 @@ function sinks(opts = {}) {
 }
 
 // ---- finality, revert, drop, stuck
+{
+  // #409 review M1: the receipt's own block must be final before it is confirmed, even when an RPC
+  // already shows the entry at the finalized tag (it answers head state for any blockTag)
+  const s = sinks({ ignoreBlockTag: true });
+  s.chain.finalizedLag = 100;
+  const r1 = await settle(bls, s, {}, {}, 3);
+  cell(
+    "a receipt above the finalized block stays 'landed' even if the RPC shows the entry at that tag",
+    r1.state.registry.phase === "landed",
+    r1.state.registry
+  );
+  s.chain.finalizedLag = 0;
+  const r2 = await pub(bls, s, r1.state);
+  cell(
+    "…and settles once its block is final",
+    r2.state.registry.phase === "confirmed" && s.calls.sign === 1,
+    { reg: r2.state.registry, calls: s.calls }
+  );
+}
 {
   const s = sinks();
   s.chain.finalizedLag = 100; // receipts land above the finalized block
@@ -735,7 +757,52 @@ function sinks(opts = {}) {
   );
 }
 
+{
+  // #409 review N2: the owner-route mirror path only from a well-formed txHash and logIndex
+  const ok = { route: "owner", txHash: "0x" + "ab".repeat(32), logIndex: 3 };
+  const bad = [
+    { ...ok, txHash: "../../etc" },
+    { ...ok, txHash: "0x" + "ab".repeat(31) },
+    { ...ok, logIndex: "3/../x" },
+    { ...ok, logIndex: -1 },
+  ];
+  let threw = 0;
+  for (const r of bad) {
+    try {
+      mirrorPath(r, f1.cid);
+    } catch {
+      threw++;
+    }
+  }
+  cell(
+    "mirror path: a malformed owner-route txHash or logIndex is refused; a good one is accepted",
+    threw === bad.length && mirrorPath(ok, f1.cid).startsWith("records/owner/owner-0x"),
+    { threw }
+  );
+}
+
 // ---- other stages
+{
+  // #409 review N1: a transport error while re-verifying is no evidence: the pin stays current
+  const s = sinks();
+  const r1 = await pub(bls, s);
+  const uploads = { ...s.calls.uploads };
+  s.pinOpts.pinata.fetchThrows = true;
+  const r2 = await pub(bls, s, r1.state, { reverify: true });
+  cell(
+    "reverify: a gateway transport error keeps the pin current and the record published, alerted, no re-upload",
+    r2.state.pins.pinata.current &&
+      r2.state.published &&
+      s.calls.uploads.pinata === uploads.pinata &&
+      r2.alerts.some(x => /could not reach the gateway/.test(x)),
+    {
+      pins: r2.state.pins,
+      published: r2.state.published,
+      alerts: r2.alerts,
+      uploads: s.calls.uploads,
+    }
+  );
+}
 {
   const s = sinks();
   const r1 = await pub(bls, s);
