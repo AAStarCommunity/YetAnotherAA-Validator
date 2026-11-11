@@ -1825,7 +1825,7 @@ const good = {
         "R12#3: an unreadable schedule counts as unknown, never as zero stalls",
         u0.unknown === true &&
           stallReasons({ stalls: u0 })[0] ===
-            "stall state unknown: the stall index is unreadable" &&
+            "stall state unknown: records not all re-read yet, or a record or journal unreadable" &&
           seen[0].alerts.some(a =>
             /schedule unreadable; stall state unknown until a full sweep/.test(a)
           ),
