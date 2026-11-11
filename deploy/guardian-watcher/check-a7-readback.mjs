@@ -21,6 +21,7 @@ import {
   ENTRY_POINT_V07,
   isState,
   fieldInventory,
+  checkInventory,
   EXAMPLE_SHA256,
 } from "./a7-readback.mjs";
 
@@ -38,15 +39,15 @@ const cell = (name, ok, got) =>
 const schemaText = fx("aoa-a7-readback-1.schema.json");
 const exampleText = fx("aoa-a7-readback-1.example.json");
 const liveText = fx("aoa-a7-readback-1.live.example.json");
-cell("schema is SP's frozen v8 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
+cell("schema is SP's frozen v9 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
 cell(
   "fork example is SP's (sha256)",
-  sha(exampleText) === "62099b25d49165825199fff6f4def15c86d9b2de4661024687192a5fe60ec8ca",
+  sha(exampleText) === "a5effd05cf469c01d05090b0e56704f4ccc9b55021c294f57c4d2d1e498706c2",
   sha(exampleText)
 );
 cell(
   "live example is SP's (sha256)",
-  sha(liveText) === "3498c29bec7f665e8e0f7a9f7858cf988384de1c68f6577f450b73c0ce6b9507",
+  sha(liveText) === "8558aa7d74460c9c8bb74e5dab4bbfe98436ea76777a460aa79ba998cc18116f",
   sha(liveText)
 );
 const schema = JSON.parse(schemaText);
@@ -71,6 +72,13 @@ cell("live example validates", validate(schema, live).length === 0, validate(sch
   const e = structuredClone(example);
   e.header.rpcUrl = "https://x";
   cell("an unknown header key is rejected by the schema", validate(schema, e).length > 0, null);
+  const g = structuredClone(example);
+  delete g.contracts.blsAggregator.guardianSet[0].isActive;
+  cell(
+    "v9 schema: a guardian entry without isActive is rejected",
+    validate(schema, g).length > 0,
+    null
+  );
   // Codex A7 R6: a URL inside an invalid key never reaches the schema diagnostics
   const u = structuredClone(example);
   u.contracts.registry.roles = { "https://rpc.example/SYNTHETIC_API_SECRET": [true] };
@@ -144,6 +152,9 @@ const base = structuredClone(example);
     "dvtValidator.categoryCount": 0,
     "superPaymaster.fraudProofVerifier": "0x0000000000000000000000000000000000000000",
     "blsAggregator.owner == superPaymaster.owner": true,
+    "blsAggregator.owner == dvtValidator.owner":
+      base.contracts.blsAggregator.owner.toLowerCase() ===
+      String(base.contracts.dvtValidator.owner).toLowerCase(),
     "evaluationCommunityToken.creditPolicy == evaluationCommunityToken.POLICY_OFF": true,
     "blsAggregator.thresholds == {WARNING:2, MINOR:3, MAJOR:3}": true,
   };
@@ -351,6 +362,7 @@ const facts = (rb, w, over = {}) => ({
   addressBook,
   slashLevels: { WARNING: 0, MINOR: 1, MAJOR: 2 },
   fieldInventory: fieldInventory(example),
+  checkInventory: checkInventory(example),
   ...over,
 });
 // the chain is always built from the CONSISTENT base; the read-back under test may be mutated
@@ -963,6 +975,13 @@ await mut(
   undefined,
   { addressBookDoc: { addresses: addressBook, note: "see https://example.test/public" } }
 );
+// Codex A7 R12: a check the pinned example lists cannot be omitted
+for (const k of checkInventory(example))
+  await unv(
+    `R12: the check "${k}" left out is unverified`,
+    rb => delete rb.checks[k],
+    `checks.${k} (missing`
+  );
 // the thresholds literal check (schema v8)
 await mut(
   "thresholds literal: a chain threshold other than the literal makes the check false",

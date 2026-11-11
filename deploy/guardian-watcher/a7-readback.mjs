@@ -1,4 +1,4 @@
-// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 769e17d2, frozen v8;
+// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 8f330504, frozen v9;
 // docs/release/a7/aoa-a7-readback-1.schema.json, read methods in its "x-readMethods") with what THIS
 // script reads from the loaded fork. Pure: every chain read goes through an injected reader, so the
 // rules are self-tested (check-a7-readback.mjs) without a chain.
@@ -19,18 +19,20 @@ import Ajv2020 from "ajv/dist/2020.js";
 import { AbiCoder, keccak256 } from "ethers";
 
 export const SCHEMA_ID = "aoa-a7-readback/1";
-/** sha256 of SP's FROZEN schema file at 769e17d2 (v8, DSR-verified; any later change needs DSR
+/** sha256 of SP's FROZEN schema file at 8f330504 (v9, DSR-verified; any later change needs DSR
  * acceptance and a new hash). */
-export const SCHEMA_SHA256 = "b58405f1d0a70375f9bd67bd5a26d92d64f6434aa4fbafd81d529fa917b93e6e";
+export const SCHEMA_SHA256 = "bc009b278348c25be8858ef04b0dd3decf24489421a6dbc98d67956e619dc106";
 export const SCHEMA_SOURCE = {
   repo: "AAStarCommunity/SuperPaymaster",
-  ref: "769e17d2edbe86cdeeec44e06b5116e11a9050d5",
+  ref: "8f3305047a72f3f0132827447d70af1375debe8a",
   path: "docs/release/a7/aoa-a7-readback-1.schema.json",
 };
 export const ANVIL_COMMIT = "4e8874b2bdc840929585ca73e170993c50a4a531";
 /** sha256 of SP's fork example at the pinned schema commit: its per-contract field list is the
  * field inventory (Codex A7 R11), independent of the read-back under test. */
-export const EXAMPLE_SHA256 = "62099b25d49165825199fff6f4def15c86d9b2de4661024687192a5fe60ec8ca";
+export const EXAMPLE_SHA256 = "a5effd05cf469c01d05090b0e56704f4ccc9b55021c294f57c4d2d1e498706c2";
+/** The check inventory from SP's pinned example: every check key it lists (Codex A7 R12). */
+export const checkInventory = example => Object.keys(example?.checks ?? {});
 /** The field inventory from SP's pinned example: contract key -> its non-common fields. */
 export function fieldInventory(example) {
   const out = {};
@@ -305,6 +307,9 @@ export async function compare(rb, reader, facts) {
   for (const k of REQUIRED_CONTRACTS)
     if (!(k in rb.contracts)) unverified.push(`contracts.${k} (missing from the read-back)`);
   if (Object.keys(rb.checks).length === 0) unverified.push("checks (empty)");
+  // every check SP's pinned example lists must be in the read-back (Codex A7 R12)
+  for (const k of facts.checkInventory ?? [])
+    if (!(k in rb.checks)) unverified.push(`checks.${k} (missing from the read-back)`);
   // optional in the schema; required when the manifest's address book declares one (DSR)
   if (facts.addressBook?.timelockController && !("timelockController" in rb.contracts))
     unverified.push(

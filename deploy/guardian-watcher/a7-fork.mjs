@@ -44,6 +44,7 @@ import {
   SAFE_GETTERS,
   EXAMPLE_SHA256,
   fieldInventory,
+  checkInventory,
 } from "./a7-readback.mjs";
 
 const args = process.argv.slice(2);
@@ -140,7 +141,9 @@ const exampleText = readInput(
 );
 if (sha256(exampleText) !== EXAMPLE_SHA256)
   die(1, "the pinned example fixture is not SP's (sha256)");
-const inventory = fieldInventory(JSON.parse(exampleText.toString("utf8")));
+const exampleJson = JSON.parse(exampleText.toString("utf8"));
+const inventory = fieldInventory(exampleJson);
+const checksInv = checkInventory(exampleJson);
 let addressBook = null;
 let addressBookDoc = null;
 let addressBookSha = null;
@@ -480,6 +483,7 @@ try {
     addressBook,
     addressBookDoc,
     fieldInventory: inventory,
+    checkInventory: checksInv,
     slashLevels,
   });
 } catch (e) {
