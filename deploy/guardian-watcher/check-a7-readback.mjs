@@ -1246,6 +1246,23 @@ await mut(
   );
 }
 
+// ---- Codex A7 R17: a reader response that is a URL without "//" is redacted in the output too
+{
+  const r = await run(clone(), w => ({
+    call: async (a, i, f, args) =>
+      f.name === "version" &&
+      a.toLowerCase() === base.contracts.superPaymaster.address.toLowerCase()
+        ? { status: "value", v: "https:rpc.example/SYNTHETIC_R17_SECRET" }
+        : w.reader.call(a, i, f, args),
+  }));
+  const out = JSON.stringify(sanitize({ failed: r.cmp.filter(x => !x.ok) }));
+  cell(
+    "R17: a response string 'https:host/x' never reaches the record",
+    failed(r).includes("contracts.superPaymaster.version") && !/SYNTHETIC_R17_SECRET/.test(out),
+    out.slice(0, 300)
+  );
+}
+
 let nf = 0;
 for (const r of results) {
   console.log(

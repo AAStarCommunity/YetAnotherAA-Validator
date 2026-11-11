@@ -173,7 +173,7 @@ const COMMON = [
 const ZERO = "0x0000000000000000000000000000000000000000";
 const lc = v => String(v).toLowerCase();
 
-const URL_LIKE = /[a-z][a-z0-9+.-]*:\/\/|\b(?:https?|wss?|ftp|file):/i;
+export const URL_LIKE = /[a-z][a-z0-9+.-]*:\/\/|\b(?:https?|wss?|ftp|file):/i;
 /** Any string value or object key, at any depth, that looks like a URL. */
 export function hasUrlLike(v) {
   if (typeof v === "string") return URL_LIKE.test(v);
@@ -956,7 +956,8 @@ export async function compare(rb, reader, facts) {
 }
 
 /** Any string that looks like a URL is redacted before printing or recording (Codex A7 R1 #5). */
-const URLISH = /[a-z][a-z0-9+.-]*:\/\//i;
+// the same predicate as the artefact gate (Codex A7 R17): a scheme with or without "//"
+const URLISH = URL_LIKE;
 export const redact = (k, v) => (typeof v === "string" && URLISH.test(v) ? "(redacted)" : v);
 /** Deep copy with URL-like KEYS and string values redacted (Codex A7 R4): a JSON replacer can
  * rewrite values but not keys, and read-back keys (e.g. role names) are external input. */

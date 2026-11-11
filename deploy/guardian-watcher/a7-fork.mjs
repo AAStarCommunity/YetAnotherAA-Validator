@@ -57,7 +57,7 @@ const opt = k => {
 // every diagnostic is redacted (Codex A7 R2 #5): an input echoed into a message can hold a URL
 const die = (code, msg) => {
   console.error(
-    `a7-fork: ${String(msg).replace(/[a-z][a-z0-9+.-]*:\/\/\S*/gi, "(a URL: not shown)")}`
+    `a7-fork: ${String(msg).replace(/(?:[a-z][a-z0-9+.-]*:\/\/|\b(?:https?|wss?|ftp|file):)\S*/gi, "(a URL: not shown)")}`
   );
   process.exit(code);
 };
