@@ -292,9 +292,75 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     }
   }
 
-  if (rec.route === "bls" && sinks.registry && state.registry?.phase !== "confirmed") {
+  // W2d: the registry stage belongs to the registry it was written for. A stage written for another
+  // address or chain is archived and the record is disclosed again on the configured one; its
+  // signed transactions are never broadcast again (they target the old registry).
+  const where = sinks.registry ? registryWhere(sinks.registry) : null;
+  if (
+    rec.route === "bls" &&
+    where &&
+    state.registry &&
+    !sameRegistry(registryAt(state.registry), where)
+  ) {
+    const from = registryAt(state.registry);
+    // A disclose of the SAME writer on the SAME chain still in flight holds a nonce: disclosing again
+    // now would sign at the next nonce behind it, and if the old tx were evicted that nonce would
+    // stay empty for good (#425 review B2). So the stage is NOT archived until the old nonce is
+    // consumed at the finalized block (DSR, option A): meanwhile the record waits, degraded, and
+    // nothing is broadcast to the old registry (no rebroadcast, no fee bump; what a mempool
+    // already holds is left alone). Another writer (the M0 §5.5a recovery) or another chain has its
+    // own nonce space: archived at once.
+    let wait;
     try {
-      const ar = await advanceRegistry(rec, file, sinks.registry, state, persist, alerts, opts);
+      wait = await nonceWait(state.registry, from, where, sinks.registry);
+    } catch (e) {
+      if (e instanceof PersistError) throw e;
+      alerts.push(`registry: ${errMsg(e)}`);
+      failures.push("registry");
+      return { state, alerts, failures };
+    }
+    if (wait) {
+      const w0 = state.registryWait;
+      if (
+        !w0 ||
+        w0.nonce !== wait.nonce ||
+        w0.chainId !== wait.chainId ||
+        String(w0.from).toLowerCase() !== wait.from.toLowerCase()
+      ) {
+        state.registryWait = { ...wait, since: new Date().toISOString() };
+        await persist(state);
+      }
+      alerts.push(
+        `registry: the configured registry changed while this record's disclose tx (nonce ${wait.nonce}) is pending for the same writer; waiting for nonce ${wait.nonce} to be consumed at the finalized block (nothing is broadcast to the old registry; runbook: a new writer, or fill-nonce)`
+      );
+      return { state, alerts, failures };
+    }
+    state.registryHistory = [
+      ...(state.registryHistory ?? []),
+      { ...state.registry, supersededAt: new Date().toISOString() },
+    ];
+    state.registry = null;
+    delete state.registryWait;
+    state.registryMigrated = { from, to: where, at: new Date().toISOString() };
+    await persist(state);
+    alerts.push(
+      "registry: the configured registry changed; this record is disclosed again on it (the old registry's transactions are not broadcast)"
+    );
+  } else if (rec.route === "bls" && where && state.registryWait) {
+    // the stage it waited for is on the configured registry again (switched back): it resumes
+    delete state.registryWait;
+    await persist(state);
+  }
+  if (rec.route === "bls" && sinks.registry && state.registry?.phase !== "confirmed") {
+    // every journal write of this stage records the registry it is for
+    const persistAt = st => {
+      if (st.registry && !st.registry.at) st.registry = { ...st.registry, at: where };
+      return persist(st);
+    };
+    try {
+      // reads at the finalized block are trusted only on the configured chain (#425 review B1)
+      if (typeof sinks.registry.assertChain === "function") await sinks.registry.assertChain();
+      const ar = await advanceRegistry(rec, file, sinks.registry, state, persistAt, alerts, opts);
       if (ar === "broadcast-failed") failures.push("registry");
     } catch (e) {
       if (e instanceof PersistError) throw e;
@@ -306,6 +372,66 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
 }
 
 export const DEFAULT_MAX_PENDING_MS = 30 * 60_000;
+
+/** The registry a sink writes to (W2d): { address (lowercase), chainId (decimal string) }. */
+export function registryWhere(reg) {
+  return { address: String(reg.address).toLowerCase(), chainId: String(reg.chainId) };
+}
+/**
+ * The registry a journalled stage was written for: its `at`, or for a stage journalled before
+ * W2d, the address and chain of its signed transaction. Null when neither exists (a stage
+ * journalled before W2d without a transaction): its registry is unknown, so it matches no registry
+ * and is checked on chain against the configured one before it counts (DSR; Codex W2d R1 #2).
+ */
+export function registryAt(r) {
+  if (r?.at?.address) return r.at;
+  if (r?.raw) {
+    try {
+      const tx = ethers.Transaction.from(r.raw);
+      if (tx.to) return { address: tx.to.toLowerCase(), chainId: String(tx.chainId) };
+    } catch {
+      // not a parseable transaction: no evidence either way
+    }
+  }
+  return null;
+}
+export const sameRegistry = (at, where) =>
+  !!at && at.address === where.address && at.chainId === where.chainId;
+
+const IN_FLIGHT = new Set(["signed", "sent", "landed"]);
+/**
+ * The address that signed a journalled stage's LATEST tx: its raw's signer, which the signed bytes
+ * prove; the journalled `from` only when the raw does not parse (Codex W2d R10: a stale `from`
+ * must never override the bytes); or null.
+ */
+export function stageSigner(r) {
+  if (r?.raw)
+    try {
+      const f = ethers.Transaction.from(r.raw).from;
+      if (f) return ethers.getAddress(f);
+    } catch {
+      // not a parseable signed tx: fall back to the journalled field
+    }
+  if (typeof r?.from === "string" && ethers.isAddress(r.from)) return ethers.getAddress(r.from);
+  return null;
+}
+/**
+ * Whether a stage written for another registry holds a nonce the configured writer still needs
+ * (#425 review B2, DSR option A): the same writer, on the same chain, with its tx in flight and
+ * that nonce not consumed at the finalized block. Returns { nonce, from, chainId, registry } or
+ * null. Reads only on the configured chain (#425 review B1).
+ */
+export async function nonceWait(old, from, where, reg) {
+  if (!IN_FLIGHT.has(old?.phase) || !Number.isSafeInteger(old.nonce)) return null;
+  if (!from || from.chainId !== where.chainId) return null; // another chain: its own nonce space
+  const signer = stageSigner(old);
+  if (!signer || typeof reg.writer !== "function") return null;
+  const me = await reg.writer();
+  if (!me || String(me).toLowerCase() !== signer.toLowerCase()) return null; // another writer
+  if (typeof reg.assertChain === "function") await reg.assertChain();
+  if ((await reg.nonce()) > old.nonce) return null; // consumed at the finalized block
+  return { nonce: old.nonce, from: signer, chainId: where.chainId, registry: from };
+}
 
 /**
  * On-chain content is untrusted text, and its shape proves nothing (a base32-shaped string can
@@ -429,12 +555,33 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       alerts.push(`registry: a disclose tx succeeded without a Disclosed event`);
       return;
     }
-    // No receipt. Nonce consumed at the FINALIZED block without any of our hashes landing: the
-    // journalled txs are dead. On-chain uniqueness makes a re-sign safe.
-    if ((await reg.nonce()) > state.registry.nonce) {
+    // A stage signed by ANOTHER writer than the configured one (a writer change on this registry)
+    // is not this writer's to judge or replace: its nonce lives in the other writer's nonce space.
+    // It is archived, never dropped, so its txs stay visible to fill-nonce's guard, and the
+    // configured writer discloses afresh (Codex W2d R12).
+    const me = typeof reg.writer === "function" ? await reg.writer() : null;
+    const signer = stageSigner(state.registry);
+    if (me && signer && signer.toLowerCase() !== String(me).toLowerCase()) {
+      alerts.push(
+        `registry: the disclose tx (nonce ${state.registry.nonce}) was signed by another writer; archived, disclosed again by the configured writer`
+      );
+      state.registryHistory = [
+        ...(state.registryHistory ?? []),
+        { ...state.registry, supersededAt: new Date().toISOString(), supersededBy: "writer" },
+      ];
+      state.registry = null;
+      await persist(state);
+    } else if ((await reg.nonce()) > state.registry.nonce) {
+      // No receipt. Nonce consumed at the FINALIZED block without any of our hashes landing: the
+      // journalled txs are dead. On-chain uniqueness makes a re-sign safe. They are archived, not
+      // erased (Codex W2d R12), so every journalled tx stays visible.
       alerts.push(
         `registry: disclose tx (nonce ${state.registry.nonce}) was dropped or replaced; re-signing`
       );
+      state.registryHistory = [
+        ...(state.registryHistory ?? []),
+        { ...state.registry, supersededAt: new Date().toISOString(), supersededBy: "dropped" },
+      ];
       state.registry = null;
       await persist(state);
     } else {
@@ -496,6 +643,9 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
         ...rest,
         raw: rep.raw,
         hash: rep.hash,
+        // the signer of the tx now in the journal (Codex W2d R10): a replacement signed by another
+        // writer must not keep the previous writer's identity
+        ...(rep.from ? { from: rep.from } : {}),
         // an identical re-sign (flat estimate, nothing accepted) is not journalled again (#411 N1)
         hashes: hashes0.includes(rep.hash) ? hashes0 : [...hashes0, rep.hash],
         raws: hashes0.includes(rep.hash) ? raws0 : [...raws0, rep.raw],
@@ -530,6 +680,7 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     hashes: [signed.hash],
     raws: [signed.raw],
     nonce: signed.nonce,
+    ...(signed.from ? { from: signed.from } : {}),
   };
   await persist(state); // journal BEFORE broadcast
   await broadcastJournalled(reg, signed.raw, state, persist, alerts);

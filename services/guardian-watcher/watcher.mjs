@@ -114,6 +114,19 @@ export function stallReasons(publication) {
       `${st.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
     );
   // what still needs attention (Codex W2c R20), store-wide until the journal no longer says so
+  if (st.migrating)
+    out.push(
+      `${st.migrating} record(s) not yet confirmed on the configured registry (registry switched)`
+    );
+  if (st.nonceWait)
+    out.push(
+      `${st.nonceWait} record(s) wait after a registry switch for the writer's nonce(s) ${(st.waitNonces ?? []).join(", ")} to be consumed at the finalized block (runbook: new writer, or fill-nonce)`
+    );
+  if (st.nonceGaps?.length)
+    out.push(
+      `writer nonce(s) ${st.nonceGaps.join(", ")} pending or skipped but held by no journal (runbook: fill-nonce)`
+    );
+  if (st.nonceGapUnknown) out.push("writer nonce gap check failed");
   if (st.incidents)
     out.push(`${st.incidents} unresolved registry or bytes incident(s) (acknowledge or resolve)`);
   if (st.inconsistent)
@@ -465,6 +478,9 @@ async function main() {
   // to start, and a mismatching RPC refuses each signature
   if (p && !Number.isSafeInteger(cfg.chainId))
     throw new SafeError("config: chainId required when publish is enabled");
+  // the RPC must serve the configured chain before anything is published (#425 review B1)
+  if (p && Number((await chain.getNetwork()).chainId) !== cfg.chainId)
+    throw new SafeError("config: the RPC is on another chain than chainId; not publishing");
   const pub = p ? { p, built: await buildSinks(p, chain, { chainId: cfg.chainId }) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");

@@ -126,6 +126,20 @@ export function sinks(opts = {}) {
       },
     },
     registry: {
+      address: ethers.getAddress(opts.registryAddress ?? "0x" + "aa".repeat(20)),
+      chainId: BigInt(opts.chainId ?? 11155111),
+      // the chain the node serves (#425 B1): by default the configured one
+      async assertChain() {
+        const served = BigInt(opts.networkChainId ?? opts.chainId ?? 11155111);
+        if (served !== this.chainId) {
+          const e = new Error("registry: the RPC is on another chain than the configured chainId");
+          e.code = "CHAIN";
+          throw e;
+        }
+      },
+      async writer() {
+        return ethers.getAddress(opts.writer ?? "0x" + "77".repeat(20));
+      },
       async finalized() {
         return chain.block - chain.finalizedLag;
       },
@@ -143,17 +157,26 @@ export function sinks(opts = {}) {
         calls.lastArgs = args;
         calls.lastSignOpts = o;
         // deterministicSign: the same args and nonce sign to the same tx (a flat estimate)
-        const raw = opts.deterministicSign ? `0xraw0` : `0xraw${calls.sign}`;
+        const raw = opts.deterministicSign ? `0xraw0` : `0xraw${opts.rawTag ?? ""}${calls.sign}`; // rawTag tells two sinks' raws apart
         chain.signedArgs.set(raw, args);
         return {
           raw,
-          hash: ethers.id(`disclose-${opts.deterministicSign ? 0 : calls.sign}`),
-          nonce: o.nonce ?? chain.nonce,
+          // the same hash broadcast() derives from the raw (a tagged raw too: Codex W2d R3)
+          hash: ethers.id(`disclose-${raw.slice(5)}`),
+          nonce: o.nonce ?? chain.pendingNonce ?? chain.nonce,
+          from: ethers.getAddress(opts.writer ?? "0x" + "77".repeat(20)),
         };
       },
       async broadcast(raw) {
         calls.broadcast++;
         calls.lastRaw = raw;
+        (calls.raws ??= []).push(raw); // every raw this registry was asked to broadcast (W2d)
+        if (String(raw).startsWith("0xfill")) {
+          const n = Number(String(raw).slice(6));
+          chain.known.add(ethers.id(`fill-${n}`));
+          if (opts.fillMines) chain.nonce = Math.max(chain.nonce, n + 1);
+          return;
+        }
         const hash = ethers.id(`disclose-${raw.slice(5)}`);
         if (opts.rejectBroadcast || opts.rejectRaw?.(raw)) {
           // a node refusing every broadcast (e.g. a writer without funds): never known
@@ -203,6 +226,23 @@ export function sinks(opts = {}) {
       },
       async nonce() {
         return chain.nonce;
+      },
+      // the writer's counts at latest and pending (#425 B2 gap check): by default no gap
+      async nonceRange() {
+        if (opts.nonceRangeFail) throw new Error("rpc down");
+        const latest = chain.latestNonce ?? chain.nonce;
+        return { latest, pending: chain.pendingNonce ?? latest };
+      },
+      // the fill-nonce tx (DSR): broadcast() consumes its nonce when opts.fillMines
+      async signFill(nonce) {
+        calls.fills = [...(calls.fills ?? []), nonce];
+        const raw = `0xfill${nonce}`;
+        return {
+          raw,
+          from: ethers.getAddress(opts.writer ?? "0x" + "77".repeat(20)),
+          hash: ethers.id(`fill-${nonce}`),
+          nonce,
+        };
       },
     },
   };

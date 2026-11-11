@@ -506,7 +506,11 @@ const cfg = { aggregator: AGG };
     await publishPending(store, sk);
     await publishPending(store, sk);
     const st = store.getPublication(id);
-    store.putPublication(id, { ...st, registry: { phase: "conflict", ack: true } });
+    // written by this code, the stage names its registry (W2d)
+    store.putPublication(id, {
+      ...st,
+      registry: { phase: "conflict", ack: true, at: st.registry.at },
+    });
     const signBefore = s.calls.sign;
     const pk = await publishPending(store, sk);
     // a pin is lost: it is repaired, and the registry is still not touched
@@ -2718,6 +2722,932 @@ const good = {
     ) && !!ok,
     msgs
   );
+}
+
+// ---- W2d (DSR): the registry stage is bound to its registry (address and chain)
+{
+  const skOf = s => ({
+    pinners: s.pinners,
+    mirror: s.mirror,
+    telegram: s.telegram,
+    registry: s.registry,
+  });
+  const OLD = "0x" + "aa".repeat(20);
+  const NEW = "0x" + "bb".repeat(20);
+  // (a) a record confirmed on the old registry is disclosed again on the new one; degraded until
+  // it is confirmed there
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const before = store.getPublication(Store.recordId(bls)).registry;
+      const b = sinks({ registryAddress: NEW });
+      const passes = [];
+      for (let i = 0; i < 5; i++)
+        passes.push(await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 }));
+      const after = store.getPublication(Store.recordId(bls));
+      cell(
+        "W2d(a): a record confirmed on the old registry is disclosed again on the new one, degraded (migrating) until confirmed there",
+        before.phase === "confirmed" &&
+          before.at?.address === OLD &&
+          b.chain.entries.size === 1 &&
+          after.registry.phase === "confirmed" &&
+          after.registry.at?.address === NEW &&
+          after.registryHistory?.[0]?.at?.address === OLD &&
+          passes[0].stalls.migrating === 1 &&
+          passes.at(-1).stalls.migrating === 0 &&
+          !passes.at(-1).stalls.unknown,
+        {
+          before: [before.phase, before.at],
+          entries: b.chain.entries.size,
+          after: [after.registry.phase, after.registry.at],
+          stalls: passes.map(p => p.stalls),
+        }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (b) a disclose signed for the old registry and not confirmed is never broadcast again; the new
+  // registry's writer signs a new one
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, mine: "pending" });
+      await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const oldReg = store.getPublication(Store.recordId(bls)).registry;
+      const oldRaws = oldReg.raws ?? [oldReg.raw];
+      const aBroadcasts = a.calls.broadcast;
+      const b = sinks({ registryAddress: NEW, rawTag: "b" });
+      b.chain.nonce = oldReg.nonce + 1; // its nonce consumed (else the switch waits: B2-A)
+      for (let i = 0; i < 4; i++) await publishPending(store, skOf(b), { maxPendingMs: 0 });
+      const after = store.getPublication(Store.recordId(bls)).registry;
+      cell(
+        "W2d(b): an old registry's unconfirmed disclose is never broadcast again (not through the new sink, not to the old one); a new one is signed and confirmed",
+        oldReg.phase === "sent" &&
+          a.calls.broadcast === aBroadcasts &&
+          !(b.calls.raws ?? []).some(r => oldRaws.includes(r)) &&
+          b.calls.sign >= 1 &&
+          after.phase === "confirmed" &&
+          after.at?.address === NEW,
+        {
+          oldPhase: oldReg.phase,
+          aB: [aBroadcasts, a.calls.broadcast],
+          bRaws: b.calls.raws,
+          oldRaws,
+          after: [after.phase, after.at],
+        }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (d) after a switch the store-wide counts are unknown until a sweep has re-read every record
+  // (3 records, one read per pass)
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      const recs = [0, 1, 2].map(i => ({
+        ...bls,
+        key: String(8100 + i),
+        proposalId: String(8100 + i),
+        txHash: ethers.id(`w2d-d-${i}`),
+      }));
+      for (const r of recs) store.putRecord(r);
+      const a = sinks({ registryAddress: OLD });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const b = sinks({ registryAddress: NEW, rawTag: "d" });
+      const p1 = await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000, maxParse: 1 });
+      cell(
+        "W2d(d): right after a registry switch the counts are unknown (degraded) until a sweep re-read every record",
+        p1.stalls.unknown === true && p1.alerts.some(x => /configured registry changed/.test(x)),
+        { stalls: p1.stalls }
+      );
+      // records read but deferred by the run budget are counted as migrating from their journal
+      const p2 = await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000, maxRecords: 0 });
+      const { stallReasons } = await import("./watcher.mjs");
+      cell(
+        "W2d(d): deferred records whose stage is for another registry count as migrating (a fixed degraded reason)",
+        p2.counts.ran === 0 &&
+          p2.stalls.migrating === 3 &&
+          stallReasons({ stalls: p2.stalls }).includes(
+            "3 record(s) not yet confirmed on the configured registry (registry switched)"
+          ),
+        { counts: p2.counts, stalls: p2.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (e) an incident acknowledged on the old registry does not park the record on the new one
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, mine: "revert" });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const id = Store.recordId(bls);
+      const j = store.getPublication(id);
+      store.putPublication(id, { ...j, registry: { ...j.registry, ack: { by: "t", at: "t" } } });
+      const b = sinks({ registryAddress: NEW, rawTag: "e" });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 });
+      const after = store.getPublication(id).registry;
+      cell(
+        "W2d(e): an incident acknowledged on the old registry is not parked on the new one: disclosed and confirmed there",
+        j.registry.phase === "reverted" && after.phase === "confirmed" && after.at?.address === NEW,
+        { old: j.registry.phase, after: [after.phase, after.at] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (f) a stage journalled before W2d (no `at`) is bound by its signed transaction's to/chainId;
+  // without a transaction it is taken as the configured registry (no deployment predates W2d)
+  {
+    const { registryAt, sameRegistry } = await import("./lib/publish.mjs");
+    const w = ethers.Wallet.createRandom();
+    const raw = await w.signTransaction({
+      type: 2,
+      to: ethers.getAddress(OLD),
+      chainId: 10,
+      nonce: 0,
+      gasLimit: 100000n,
+      maxFeePerGas: 1000n,
+      maxPriorityFeePerGas: 1n,
+      data: "0x",
+    });
+    const fromRaw = registryAt({ phase: "sent", raw });
+    const none = registryAt({ phase: "confirmed" });
+    const here = { address: OLD, chainId: "10" };
+    cell(
+      "W2d(f): a pre-W2d journal is bound by its signed tx (to, chainId); one without a tx matches no registry (checked on chain)",
+      fromRaw?.address === OLD &&
+        fromRaw.chainId === "10" &&
+        sameRegistry(fromRaw, here) &&
+        !sameRegistry(fromRaw, { address: NEW, chainId: "10" }) &&
+        !sameRegistry(fromRaw, { address: OLD, chainId: "11155111" }) &&
+        none === null &&
+        !sameRegistry(none, here),
+      { fromRaw, none }
+    );
+  }
+  // (g) DSR: a legacy stage without `at` or a tx is checked ON CHAIN against the configured
+  // registry before it counts: (i) a matching entry there -> confirmed without signing;
+  // (ii) no entry -> disclosed again; (iii) the query fails -> not done, degraded
+  {
+    const { expectedBinding } = await import("./lib/publish.mjs");
+    const { recordFile } = await import("./lib/record-file.mjs");
+    const legacy = (store, phase = "confirmed") => {
+      const id = Store.recordId(bls);
+      const j = store.getPublication(id);
+      const { at: _a, raw: _r, raws: _rs, ...rest } = j.registry;
+      (void _a, _r, _rs);
+      store.putPublication(id, { ...j, registry: { ...rest, phase } });
+    };
+    const publishAll = async (store, s) => {
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(s), { maxPendingMs: 60 * 60_000 });
+    };
+    // (i)
+    {
+      const d = tmp();
+      try {
+        const store = new Store(d);
+        store.putRecord(bls);
+        const f = recordFile(
+          JSON.parse(readFileSync(join(d, "records", `${Store.recordId(bls)}.json`), "utf8"))
+        );
+        const s = sinks({
+          registryAddress: OLD,
+          existing: {
+            binding: expectedBinding(bls),
+            recordURI: `ipfs://${f.cid}`,
+            recordHash: f.recordHash,
+          },
+        });
+        await publishAll(store, s);
+        legacy(store);
+        const signs = s.calls.sign;
+        await publishAll(store, s);
+        const r = store.getPublication(Store.recordId(bls)).registry;
+        cell(
+          "W2d(g-i): a legacy confirmed stage with a matching entry on the current registry is confirmed by that entry, without signing",
+          r.phase === "confirmed" &&
+            r.entryId === "9" &&
+            r.at?.address === OLD &&
+            s.calls.sign === signs,
+          { r, signs: [signs, s.calls.sign] }
+        );
+      } finally {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+    // (ii)
+    {
+      const d = tmp();
+      try {
+        const store = new Store(d);
+        store.putRecord(bls);
+        const a = sinks({ registryAddress: OLD });
+        await publishAll(store, a);
+        legacy(store);
+        const fresh = sinks({ registryAddress: OLD, rawTag: "g" }); // the same address, no entry on it
+        await publishAll(store, fresh);
+        const r = store.getPublication(Store.recordId(bls)).registry;
+        cell(
+          "W2d(g-ii): a legacy confirmed stage with no entry on the current registry is disclosed again there",
+          fresh.calls.sign >= 1 &&
+            fresh.chain.entries.size === 1 &&
+            r.phase === "confirmed" &&
+            r.at?.address === OLD,
+          { r, sign: fresh.calls.sign, entries: fresh.chain.entries.size }
+        );
+      } finally {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+    // (iii)
+    {
+      const d = tmp();
+      try {
+        const store = new Store(d);
+        store.putRecord(bls);
+        const a = sinks({ registryAddress: OLD });
+        await publishAll(store, a);
+        legacy(store);
+        const down = sinks({ registryAddress: OLD });
+        const reg = {
+          ...down.registry,
+          entryOf: async () => {
+            throw new Error("rpc down");
+          },
+        };
+        const p = await publishPending(
+          store,
+          { ...skOf(down), registry: reg },
+          { maxPendingMs: 60 * 60_000 }
+        );
+        const r = store.getPublication(Store.recordId(bls)).registry;
+        cell(
+          "W2d(g-iii): a legacy stage whose check on the current registry fails is not done and the watcher is degraded",
+          p.counts.done === 0 &&
+            p.counts.failed >= 1 &&
+            (p.stalls.failing >= 1 || p.stalls.migrating >= 1) &&
+            r?.phase !== "confirmed",
+          { counts: p.counts, stalls: p.stalls, r }
+        );
+      } finally {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+  }
+  // (h) Codex W2d R2: a pass without a registry sink (writer-role check failed) still judges
+  // records against the CONFIGURED registry: migration does not clear before they are reconciled
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      const recs = [0, 1, 2].map(i => ({
+        ...bls,
+        key: String(8200 + i),
+        proposalId: String(8200 + i),
+        txHash: ethers.id(`w2d-h-${i}`),
+      }));
+      for (const r of recs) store.putRecord(r);
+      const a = sinks({ registryAddress: OLD });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const b = sinks({ registryAddress: NEW, rawTag: "h" });
+      const whereB = { address: NEW, chainId: "11155111" };
+      await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000, maxParse: 1 });
+      // the role check fails: no registry sink this pass, the configured registry is still B
+      const noSink = await publishPending(
+        store,
+        { ...skOf(b), registry: null },
+        { maxPendingMs: 60 * 60_000, configuredRegistry: whereB }
+      );
+      // publishPhase passes the configured registry itself when the role read fails
+      const { publishPhase } = await import("./lib/publisher.mjs");
+      const broken = {
+        async call() {
+          throw new Error("down");
+        },
+      };
+      const built = {
+        pinners: b.pinners,
+        mirror: b.mirror,
+        telegram: b.telegram,
+        wallet: writer,
+        registryFor: () => b.registry,
+      };
+      const ph = await publishPhase(
+        store,
+        broken,
+        { ...cfg, chainId: 11155111 },
+        { ...P, registry: { ...P.registry, address: NEW } },
+        built,
+        { now: 7 }
+      );
+      cell(
+        "W2d(h): without a registry sink (role check failed) records still on A count as migrating and not done; publishPhase passes the configured registry",
+        noSink.stalls.migrating >= 2 &&
+          noSink.counts.done <= 1 &&
+          !!ph.registrySkipped &&
+          ph.stalls.migrating >= 2,
+        { noSink: [noSink.counts, noSink.stalls], ph: [ph.registrySkipped, ph.stalls] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (i) #425 review B1: the chain switched at the same address while the RPC still serves the old
+  // chain: nothing is adopted or stamped on the new chain; the stage fails (degraded)
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, chainId: 10 });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      // the same node (chain 10, the entry is there), the config now says chain 8453
+      const regB = { ...a.registry, chainId: 8453n };
+      const signs = a.calls.sign;
+      let p;
+      for (let i = 0; i < 3; i++)
+        p = await publishPending(
+          store,
+          { ...skOf(a), registry: regB },
+          { maxPendingMs: 60 * 60_000 }
+        );
+      const r = store.getPublication(Store.recordId(bls)).registry;
+      cell(
+        "W2d(i) B1: an RPC serving another chain than the configured one adopts and stamps nothing there; the stage fails, the watcher is degraded",
+        r?.phase !== "confirmed" &&
+          a.calls.sign === signs &&
+          p.counts.failed >= 1 &&
+          (p.stalls.migrating ?? 0) >= 1,
+        { r, signs: [signs, a.calls.sign], counts: p.counts, stalls: p.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // ---- #425 review B2, DSR option A: a same-writer, same-chain switch waits for the old nonce
+  {
+    const { stallReasons } = await import("./watcher.mjs");
+    const { nonceGaps } = await import("./lib/publisher.mjs");
+    const { planFill, runFill } = await import("../../deploy/guardian-watcher/fill-nonce.mjs");
+    const CC = "0x" + "cc".repeat(20);
+    const W2 = "0x" + "88".repeat(20);
+    const whereOf = (address, chainId = "11155111") => ({ address, chainId });
+    const id = Store.recordId(bls);
+    // the record's disclose on A by the default writer, sent at nonce 5 and still pending
+    const onA = async () => {
+      const d = tmp();
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, mine: "pending" });
+      a.chain.nonce = 5;
+      await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      return { d, store, old: store.getPublication(id).registry };
+    };
+    const pass = (store, s, o = {}) =>
+      publishPending(store, skOf(s), { maxPendingMs: 60 * 60_000, ...o });
+    // (a) waits until the old nonce is consumed at the FINALIZED block, then archives and discloses
+    // again; an entry already on the new registry is not adopted while waiting (Codex W2d R7 #3)
+    {
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "a" });
+      b.chain.nonce = 5;
+      b.chain.known.add(x.old.hash);
+      const p1 = await pass(x.store, b);
+      const j1 = x.store.getPublication(id);
+      b.chain.latestNonce = 6; // mined, not yet finalized
+      const p2 = await pass(x.store, b);
+      const j2 = x.store.getPublication(id);
+      const signsWaiting = b.calls.sign;
+      b.chain.nonce = 6; // consumed at the finalized block
+      b.chain.latestNonce = undefined;
+      const after = [];
+      for (let i = 0; i < 4; i++) after.push(await pass(x.store, b));
+      const jf = x.store.getPublication(id);
+      // R7 #3: the same record's entry is already on B (published from another store)
+      const y = await onA();
+      const b2 = sinks({ registryAddress: NEW, rawTag: "a2" });
+      {
+        const d2 = tmp();
+        const other = new Store(d2);
+        other.putRecord(bls);
+        for (let i = 0; i < 4; i++) await pass(other, b2);
+        rmSync(d2, { recursive: true, force: true });
+      }
+      b2.chain.nonce = 5;
+      b2.chain.known.add(y.old.hash);
+      const signs0 = b2.calls.sign;
+      await pass(y.store, b2);
+      await pass(y.store, b2);
+      const yw = y.store.getPublication(id);
+      b2.chain.nonce = 6;
+      for (let i = 0; i < 3; i++) await pass(y.store, b2);
+      const yf = y.store.getPublication(id);
+      cell(
+        "B2-A(a): a same-writer same-chain switch waits (degraded, nonce named) until the old nonce is consumed at the finalized block, then archives and is confirmed on the new registry; an existing entry there is adopted only after the wait",
+        x.old.phase === "sent" &&
+          x.old.nonce === 5 &&
+          j1.registry.at?.address === OLD &&
+          j1.registryWait?.nonce === 5 &&
+          !j1.registryHistory &&
+          p1.stalls.nonceWait === 1 &&
+          p1.stalls.waitNonces?.[0] === 5 &&
+          stallReasons({ stalls: p1.stalls }).some(r => /nonce\(s\) 5 to be consumed/.test(r)) &&
+          j2.registryWait?.nonce === 5 &&
+          p2.stalls.nonceWait === 1 &&
+          signsWaiting === 0 &&
+          b.calls.sign >= 1 &&
+          b.calls.lastSignOpts?.nonce === undefined &&
+          jf.registry.phase === "confirmed" &&
+          jf.registry.at?.address === NEW &&
+          jf.registryHistory?.[0]?.nonce === 5 &&
+          !jf.registryWait &&
+          after.at(-1).stalls.nonceWait === 0 &&
+          yw.registryWait?.nonce === 5 &&
+          yw.registry.at?.address === OLD &&
+          yf.registry.phase === "confirmed" &&
+          yf.registry.at?.address === NEW &&
+          b2.calls.sign === signs0,
+        {
+          j1: [j1.registry.at, j1.registryWait, p1.stalls],
+          j2: [j2.registryWait, p2.stalls],
+          signs: [signsWaiting, b.calls.sign, b.calls.lastSignOpts],
+          jf: [jf.registry.phase, jf.registry.at, jf.registryWait],
+          y: [yw.registryWait, yw.registry.at, yf.registry.phase, b2.calls.sign, signs0],
+        }
+      );
+      for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
+    }
+    // (b) while waiting nothing is broadcast or re-priced, past maxPendingMs and through a second
+    // switch (A -> B -> C, Codex W2d R6): still waiting for A's nonce
+    {
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "b", mine: "pending" });
+      b.chain.nonce = 5;
+      b.chain.known.add(x.old.hash);
+      for (let i = 0; i < 4; i++) await pass(x.store, b, { maxPendingMs: 0 });
+      const jb = x.store.getPublication(id);
+      const c = sinks({ registryAddress: CC, rawTag: "c", mine: "pending" });
+      c.chain.nonce = 5;
+      c.chain.known.add(x.old.hash);
+      const pc = await pass(x.store, c, { maxPendingMs: 0 });
+      const jc = x.store.getPublication(id);
+      cell(
+        "B2-A(b): waiting, nothing is signed, broadcast or replaced (past maxPendingMs too), the old tx's journal is unchanged; a further switch (A -> B -> C) still waits for A's nonce",
+        b.calls.sign === 0 &&
+          b.calls.broadcast === 0 &&
+          c.calls.sign === 0 &&
+          c.calls.broadcast === 0 &&
+          JSON.stringify(jb.registry.hashes) === JSON.stringify(x.old.hashes) &&
+          jb.registry.replacements === undefined &&
+          jc.registryWait?.nonce === 5 &&
+          jc.registry.at?.address === OLD &&
+          pc.stalls.nonceWait === 1,
+        {
+          b: [b.calls.sign, b.calls.broadcast],
+          c: [c.calls.sign, c.calls.broadcast],
+          jb: [jb.registry.hashes, jb.registry.replacements],
+          jc: [jc.registryWait, jc.registry.at, pc.stalls],
+        }
+      );
+      rmSync(x.d, { recursive: true, force: true });
+    }
+    // (c) the old tx evicted: degraded for good; fill-nonce consumes the nonce and the record then
+    // completes on the new registry
+    {
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "c", fillMines: true });
+      b.chain.nonce = 5; // evicted: A's hash is not known
+      const waiting = [];
+      for (let i = 0; i < 5; i++) waiting.push(await pass(x.store, b));
+      const signsWaiting = b.calls.sign;
+      const r = await runFill(
+        x.store,
+        b.registry,
+        whereOf(NEW),
+        5,
+        "old disclose evicted",
+        () => "T"
+      );
+      let fills = [];
+      try {
+        fills = JSON.parse(readFileSync(join(x.d, "nonce-fills.json"), "utf8")).fills;
+      } catch {
+        fills = []; // no fill journalled
+      }
+      const after = [];
+      for (let i = 0; i < 4; i++) after.push(await pass(x.store, b));
+      const jf = x.store.getPublication(id);
+      cell(
+        "B2-A(c): the old tx evicted, the record stays waiting and degraded on every pass; fill-nonce fills nonce 5 (journalled pending -> applied), then the record is archived and confirmed on the new registry",
+        waiting.every(p => p.stalls.nonceWait === 1) &&
+          signsWaiting === 0 &&
+          r.code === 0 &&
+          JSON.stringify(b.calls.fills) === "[5]" &&
+          fills.length === 1 &&
+          fills[0].applied === true &&
+          fills[0].basis === "wait" &&
+          fills[0].ids?.[0] === id &&
+          typeof fills[0].hash === "string" &&
+          jf.registry.phase === "confirmed" &&
+          jf.registry.at?.address === NEW &&
+          !jf.registryWait &&
+          after.at(-1).stalls.nonceWait === 0,
+        {
+          waiting: waiting.map(p => p.stalls.nonceWait),
+          r,
+          fills,
+          jf: [jf.registry.phase, jf.registry.at, jf.registryWait],
+        }
+      );
+      rmSync(x.d, { recursive: true, force: true });
+    }
+    // (d) the store-wide nonce gap: W1 -> W2 -> W1 (Codex W2d R7 #2), through publishPhase
+    {
+      const x = await onA(); // W1 (default writer), nonce 5, pending
+      const b = sinks({ registryAddress: NEW, rawTag: "d", writer: W2, mine: "pending" });
+      await pass(x.store, b); // another writer: archived at once, disclosed by W2 on B
+      const c = sinks({ registryAddress: CC, rawTag: "d2", mine: "pending" });
+      c.chain.nonce = 5;
+      c.chain.latestNonce = 5;
+      c.chain.pendingNonce = 6; // A's tx at 5 still in a mempool, held by no active stage
+      c.chain.known.add(x.old.hash);
+      const built = {
+        pinners: c.pinners,
+        mirror: c.mirror,
+        telegram: c.telegram,
+        wallet: writer,
+        registryFor: () => c.registry,
+      };
+      const healthy = {
+        owner: ethers.getAddress("0x" + "5a".repeat(20)),
+        max: 3,
+        slots: { 1: G1 },
+      };
+      const phP = { ...P, registry: { ...P.registry, address: CC } };
+      const phCfg = { ...cfg, chainId: 11155111 };
+      let ph;
+      for (let i = 0; i < 3; i++)
+        ph = await publishPhase(x.store, roleChain(healthy), phCfg, phP, built, { now: 7 + i });
+      const failing = sinks({ registryAddress: CC, rawTag: "d3", nonceRangeFail: true });
+      const phF = await publishPhase(
+        x.store,
+        roleChain(healthy),
+        phCfg,
+        phP,
+        { ...built, registryFor: () => failing.registry },
+        { now: 20 }
+      );
+      const w = "0x" + "ab".repeat(20);
+      const held = n => ({ nonceUse: { from: w, chainId: "1", nonce: n } });
+      const inPool = nonceGaps({}, w, "1", { latest: 5, pending: 6 });
+      const below = nonceGaps({ r: held(6) }, w, "1", { latest: 5, pending: 5 });
+      const none = nonceGaps({ r: held(5), s: held(6) }, w, "1", { latest: 5, pending: 7 });
+      cell(
+        "B2-A(d): a writer nonce pending or skipped that no active stage holds is degraded (W1 -> W2 -> W1 through publishPhase; an eviction below a held nonce); a failed check is degraded too; a fully held range is not",
+        ph.stalls.nonceGaps?.includes(5) &&
+          stallReasons(ph).some(r => /nonce\(s\) 5\b.*held by no journal/.test(r)) &&
+          phF.stalls.nonceGapUnknown === true &&
+          stallReasons(phF).includes("writer nonce gap check failed") &&
+          JSON.stringify(inPool) === "[5]" &&
+          JSON.stringify(below) === "[5]" &&
+          JSON.stringify(none) === "[]",
+        { ph: [ph.registrySkipped, ph.stalls], phF: phF.stalls, inPool, below, none }
+      );
+      rmSync(x.d, { recursive: true, force: true });
+    }
+    // (e) fill-nonce refuses: a nonce held on the current registry, a nonce that is no gap, a
+    // consumed one, an old tx still known, a reason with a URL; a real gap is accepted
+    {
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "e", writer: W2, mine: "pending" });
+      b.chain.nonce = 7;
+      await pass(x.store, b); // W2 holds nonce 7 on the current registry B
+      b.chain.known.clear(); // not even known: only the current-registry rule refuses it
+      const held = await planFill(x.store, b.registry, whereOf(NEW), 7);
+      const noGap = await planFill(x.store, b.registry, whereOf(NEW), 9);
+      const consumed = await planFill(x.store, b.registry, whereOf(NEW), 3);
+      b.chain.pendingNonce = 9; // 8 pending in a mempool, held by no journal
+      const gap = await planFill(x.store, b.registry, whereOf(NEW), 8);
+      const url = await runFill(x.store, b.registry, whereOf(NEW), 8, "see https://x/y");
+      // a waiting record whose old tx a node still knows
+      const y = await onA();
+      const c = sinks({ registryAddress: NEW, rawTag: "e2" });
+      c.chain.nonce = 5;
+      c.chain.known.add(y.old.hash);
+      await pass(y.store, c);
+      const known = await planFill(y.store, c.registry, whereOf(NEW), 5);
+      cell(
+        "B2-A(e): fill-nonce refuses a nonce held by a current-registry stage, one that is no gap, a consumed one, an old tx still known, a reason with a URL; a real gap is accepted",
+        /held by .* on the current registry/.test(held.refuse ?? "") &&
+          /neither waited for/.test(noGap.refuse ?? "") &&
+          /already consumed/.test(consumed.refuse ?? "") &&
+          gap.basis === "gap" &&
+          url.code === 1 &&
+          !(b.calls.fills ?? []).length &&
+          /still known/.test(known.refuse ?? "") &&
+          !(c.calls.fills ?? []).length,
+        { held, noGap, consumed, gap, url, known }
+      );
+      for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
+    }
+    // (g) Codex W2d R8: fill-nonce refuses a current-registry nonce even under a stale wait marker
+    // (#1), refuses while an ARCHIVED journalled tx at the nonce is known (#2), and a lost
+    // broadcast answer leaves the entry pending, settled from the node on the next run (#3)
+    {
+      // #1: waiting on B for A's nonce 5 (evicted), then A configured again before a pass
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "g" });
+      b.chain.nonce = 5;
+      await pass(x.store, b);
+      const marker = x.store.getPublication(id).registryWait?.nonce;
+      const stale = await planFill(x.store, b.registry, whereOf(OLD), 5);
+      // #2: W1's nonce-5 tx archived by a switch to W2, then back to W1 while it is still known
+      const y = await onA();
+      const w2 = sinks({ registryAddress: NEW, rawTag: "g2", writer: W2, mine: "pending" });
+      await pass(y.store, w2);
+      const c = sinks({ registryAddress: CC, rawTag: "g3" });
+      c.chain.nonce = 5;
+      c.chain.latestNonce = 5;
+      c.chain.pendingNonce = 6;
+      c.chain.known.add(y.old.hash);
+      const archivedKnown = await planFill(y.store, c.registry, whereOf(CC), 5);
+      c.chain.known.delete(y.old.hash); // evicted
+      const archivedGone = await planFill(y.store, c.registry, whereOf(CC), 5);
+      // #3: the node accepts the fill, the answer is lost
+      const lossy = {
+        ...c.registry,
+        async broadcast(raw) {
+          await c.registry.broadcast(raw);
+          throw new Error("socket hang up");
+        },
+      };
+      const r1 = await runFill(
+        y.store,
+        lossy,
+        whereOf(CC),
+        5,
+        "evicted after round trip",
+        () => "T1"
+      );
+      const f1 = JSON.parse(readFileSync(join(y.d, "nonce-fills.json"), "utf8")).fills;
+      const r2 = await runFill(y.store, c.registry, whereOf(CC), 5, "retry", () => "T2");
+      const f2 = JSON.parse(readFileSync(join(y.d, "nonce-fills.json"), "utf8")).fills;
+      // R9: that fill (writer 0x77) does not block another writer's fill at the same nonce
+      const other = sinks({ registryAddress: CC, rawTag: "g4", writer: W2 });
+      other.chain.nonce = 5;
+      other.chain.latestNonce = 5;
+      other.chain.pendingNonce = 6;
+      for (const h of c.chain.known) other.chain.known.add(h);
+      const otherWriter = await planFill(y.store, other.registry, whereOf(CC), 5);
+      cell(
+        "B2-A(g) R8: a stale wait marker does not open a current-registry nonce; a known archived tx at the nonce refuses a gap fill (accepted once evicted); a lost broadcast answer stays pending and is settled applied, never sent twice",
+        marker === 5 &&
+          /on the current registry/.test(stale.refuse ?? "") &&
+          /still known/.test(archivedKnown.refuse ?? "") &&
+          archivedGone.basis === "gap" &&
+          r1.code === 3 &&
+          f1.length === 1 &&
+          f1[0].applied === "pending" &&
+          r2.code === 1 &&
+          f2.length === 1 &&
+          f2[0].applied === true &&
+          JSON.stringify(c.calls.fills) === "[5]" &&
+          otherWriter.basis === "gap",
+        {
+          marker,
+          stale,
+          archivedKnown,
+          archivedGone,
+          r1,
+          f1,
+          r2,
+          f2,
+          fills: c.calls.fills,
+          otherWriter,
+        }
+      );
+      for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
+    }
+    // (h) Codex W2d R10: a replacement signed by another writer journals that writer, so the stage
+    // keeps counting as the current writer's (fill-nonce refuses it; a later switch waits for it);
+    // and the signed bytes, not a stale `from`, name the signer
+    {
+      const d = tmp();
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a1 = sinks({ registryAddress: OLD, rejectBroadcast: true });
+      a1.chain.nonce = 5;
+      await pass(store, a1);
+      const a2 = sinks({ registryAddress: OLD, rawTag: "h", writer: W2, rejectBroadcast: true });
+      a2.chain.nonce = 5;
+      await pass(store, a2, { maxPendingMs: 0 });
+      const jr = store.getPublication(id).registry;
+      a2.chain.pendingNonce = 6;
+      const held = await planFill(store, a2.registry, whereOf(OLD), 5);
+      const b = sinks({ registryAddress: NEW, rawTag: "h2", writer: W2 });
+      b.chain.nonce = 5;
+      b.chain.pendingNonce = 6;
+      await pass(store, b);
+      const jb = store.getPublication(id);
+      const { stageSigner } = await import("./lib/publish.mjs");
+      const signerW = ethers.Wallet.createRandom();
+      const realRaw = await signerW.signTransaction({
+        to: signerW.address,
+        nonce: 5,
+        chainId: 1,
+        type: 2,
+        maxFeePerGas: 1n,
+        maxPriorityFeePerGas: 1n,
+        gasLimit: 21000n,
+      });
+      const fromBytes = stageSigner({ raw: realRaw, from: ethers.getAddress(W2) });
+      // R12: W1's tx archived (not erased) when W2 takes over even with W2's nonce past it, so
+      // fill-nonce as W1 still sees it; a same-writer drop is archived too
+      const y = await onA();
+      const z2 = sinks({ registryAddress: OLD, rawTag: "h3", writer: W2 });
+      z2.chain.nonce = 6;
+      await pass(y.store, z2);
+      const yh = y.store.getPublication(id).registryHistory ?? [];
+      const w1 = sinks({ registryAddress: CC, rawTag: "h4" });
+      w1.chain.nonce = 5;
+      w1.chain.latestNonce = 5;
+      w1.chain.pendingNonce = 6;
+      w1.chain.known.add(y.old.hash);
+      const w1Fill = await planFill(y.store, w1.registry, whereOf(CC), 5);
+      const q = await onA();
+      const qd = sinks({ registryAddress: OLD, rawTag: "h5" });
+      qd.chain.nonce = 6; // same writer, nonce consumed, no receipt: dropped
+      await pass(q.store, qd);
+      const qh = q.store.getPublication(id).registryHistory ?? [];
+      cell(
+        "B2-A(h) R10/R12: another writer's stage is archived (never erased), the configured writer signs afresh and journals itself; fill-nonce refuses its nonce on the current registry, a later switch waits for it, and the archived tx still refuses a fill; a dropped stage is archived; the signed bytes name the signer over a stale from",
+        !jr.replacements &&
+          jr.from === ethers.getAddress(W2) &&
+          yh.some(h => h.supersededBy === "writer" && h.hash === y.old.hash) &&
+          /still known/.test(w1Fill.refuse ?? "") &&
+          qh.some(h => h.supersededBy === "dropped" && h.hash === q.old.hash) &&
+          /on the current registry/.test(held.refuse ?? "") &&
+          jb.registryWait?.nonce === 5 &&
+          jb.registry.at?.address === OLD &&
+          b.calls.sign === 0 &&
+          fromBytes === signerW.address,
+        {
+          jr: [jr.replacements, jr.from],
+          held,
+          wait: jb.registryWait,
+          sign: b.calls.sign,
+          fromBytes,
+          yh,
+          w1Fill,
+          qh,
+        }
+      );
+      for (const z of [y, q]) rmSync(z.d, { recursive: true, force: true });
+      rmSync(d, { recursive: true, force: true });
+    }
+    // (i) Codex W2d R11: a stage holding two writers' txs (a replacement after a writer change):
+    // fill-nonce checks each tx under its own signer, nonce and chain (real signed bytes)
+    {
+      const d = tmp();
+      const store = new Store(d);
+      store.putRecord(bls);
+      const w1 = ethers.Wallet.createRandom();
+      const w2 = ethers.Wallet.createRandom();
+      const tx = {
+        to: OLD,
+        nonce: 5,
+        chainId: 11155111,
+        type: 2,
+        maxFeePerGas: 2n,
+        maxPriorityFeePerGas: 1n,
+        gasLimit: 90000n,
+      };
+      const r1 = await w1.signTransaction(tx);
+      const r2 = await w2.signTransaction(tx);
+      const h1 = ethers.keccak256(r1);
+      const h2 = ethers.keccak256(r2);
+      const base = store.getPublication(id) ?? {};
+      store.putPublication(id, {
+        ...base,
+        registry: null,
+        registryHistory: [
+          {
+            phase: "sent",
+            nonce: 5,
+            hash: h2,
+            raw: r2,
+            hashes: [h1, h2],
+            raws: [r1, r2],
+            at: { address: OLD, chainId: "11155111" },
+          },
+        ],
+      });
+      const asW = (w, known) => {
+        const s = sinks({ registryAddress: CC, rawTag: "i", writer: w.address });
+        s.chain.nonce = 5;
+        s.chain.latestNonce = 5;
+        s.chain.pendingNonce = 6;
+        for (const h of known) s.chain.known.add(h);
+        return s.registry;
+      };
+      const asW1 = await planFill(store, asW(w1, [h1]), whereOf(CC), 5);
+      const asW2 = await planFill(store, asW(w2, [h1]), whereOf(CC), 5);
+      const asW2known = await planFill(store, asW(w2, [h2]), whereOf(CC), 5);
+      cell(
+        "B2-A(i) R11: in a stage with two writers' txs, fill-nonce refuses W1 while W1's tx is known, lets W2 fill when only W1's is known, refuses W2 while W2's is known",
+        /still known/.test(asW1.refuse ?? "") &&
+          asW2.basis === "gap" &&
+          /still known/.test(asW2known.refuse ?? ""),
+        { asW1, asW2, asW2known }
+      );
+      rmSync(d, { recursive: true, force: true });
+    }
+    // (f) another writer (the M0 §5.5a recovery) or another chain has its own nonce space: no wait;
+    // a stage already waiting is archived at once when the chain changes (Codex W2d R7 #1)
+    {
+      const x = await onA();
+      const b = sinks({ registryAddress: NEW, rawTag: "f", writer: W2 });
+      b.chain.nonce = 5;
+      b.chain.known.add(x.old.hash);
+      for (let i = 0; i < 4; i++) await pass(x.store, b);
+      const jw = x.store.getPublication(id);
+      const y = await onA();
+      const c = sinks({ registryAddress: NEW, rawTag: "f2" });
+      c.chain.nonce = 5;
+      c.chain.known.add(y.old.hash);
+      await pass(y.store, c); // waiting on the same chain
+      const yw = y.store.getPublication(id);
+      const c10 = sinks({ registryAddress: NEW, rawTag: "f3", chainId: 10 });
+      c10.chain.nonce = 0;
+      for (let i = 0; i < 4; i++) await pass(y.store, c10);
+      const yc = y.store.getPublication(id);
+      cell(
+        "B2-A(f): a new writer (M0 §5.5a) or a new chain does not wait: archived at once, disclosed and confirmed without a forced nonce; a waiting stage is released at once by a chain change",
+        !jw.registryWait &&
+          jw.registryHistory?.[0]?.nonce === 5 &&
+          jw.registry.phase === "confirmed" &&
+          jw.registry.at?.address === NEW &&
+          b.calls.lastSignOpts?.nonce === undefined &&
+          yw.registryWait?.nonce === 5 &&
+          !yc.registryWait &&
+          yc.registry.phase === "confirmed" &&
+          yc.registry.at?.chainId === "10" &&
+          c10.calls.lastSignOpts?.nonce === undefined,
+        {
+          jw: [jw.registryWait, jw.registry.phase, jw.registry.at, b.calls.lastSignOpts],
+          yw: yw.registryWait,
+          yc: [yc.registryWait, yc.registry.phase, yc.registry.at],
+        }
+      );
+      for (const z of [x, y]) rmSync(z.d, { recursive: true, force: true });
+    }
+  }
+  // (c) the same address on another chain is another registry
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, chainId: 11155111 });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const b = sinks({ registryAddress: OLD, chainId: 10 });
+      const first = await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 });
+      const after = store.getPublication(Store.recordId(bls)).registry;
+      cell(
+        "W2d(c): the same address with another chainId triggers the switch: disclosed again on the configured chain",
+        first.stalls.migrating === 1 &&
+          b.chain.entries.size === 1 &&
+          after.phase === "confirmed" &&
+          after.at?.chainId === "10",
+        { first: first.stalls, entries: b.chain.entries.size, after: [after.phase, after.at] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
 }
 
 // ---- Codex D-RPC2 R6: a permanent hold does not keep the store's reverify generation open

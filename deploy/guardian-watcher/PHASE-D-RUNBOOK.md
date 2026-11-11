@@ -282,3 +282,46 @@ explorer or another RPC, for the fields listed in the hold.
   the sender key; an entry cannot be deleted, and readers take the latest
   `Amended` and recheck it (M0 §5.5a). There is no amend tool in this repository
   yet.
+
+## After a registry switch: a record waits for a nonce, or a nonce gap (W2d)
+
+**How it shows.** One of two degraded reasons:
+
+- `N record(s) wait after a registry switch for the writer's nonce(s) n to be consumed at the finalized block`:
+  `publish.registry` changed while a disclose of the same writer, on the same
+  chain, was still in flight. The record discloses again on the new registry
+  only once nonce `n` is used, so the writer's nonces stay contiguous. Nothing
+  is rebroadcast or re-priced meanwhile. Usually this clears by itself: the old
+  transaction is mined.
+- `writer nonce(s) n pending or skipped but held by no journal`: a nonce of the
+  writer is in a mempool, or was skipped below a journalled one, and no record's
+  current stage holds it. Example: the writer was switched away and back while
+  an old transaction was pending.
+
+**If it does not clear.** It stays this way when the old transaction was evicted
+and nothing will ever use the nonce. There are two ways out:
+
+1. **Preferred: a new writer (M0 §5.5a recovery).** A new writer has its own
+   nonce space, so after the switch nothing waits.
+2. **For one stuck nonce: `fill-nonce`.** It sends one 0-value transfer from the
+   writer to itself at nonce `n` and touches no registry. It refuses:
+   - a nonce held by a stage on the current registry;
+   - a nonce that no record waits for and that is not a reported gap;
+   - a consumed nonce;
+   - a nonce whose old transaction a node still knows (wait for that one).
+
+   It needs the watcher stopped and `RPC_URL` set, as for the watcher. It
+   journals every run in `<dataDir>/nonce-fills.json`: `pending` before signing,
+   the hash before the broadcast, then `applied`. Run it again to settle an
+   interrupted run.
+
+```sh
+launchctl bootout gui/$(id -u)/ai.aastar.aoa-watcher
+RPC_URL="$(security find-generic-password -a aoa-watcher -s aoa-dvt-rpc-primary -w)" \
+  node $REPO/deploy/guardian-watcher/fill-nonce.mjs --config ~/.aoa-watcher/config.json \
+  --nonce <n> --reason "<why, one plain line, no URL>"
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.aastar.aoa-watcher.plist
+```
+
+Once the fill is consumed at the finalized block, the waiting record is archived
+and disclosed again on the new registry as usual.

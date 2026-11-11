@@ -7,6 +7,8 @@ import { recordFile, mirrorPath } from "./lib/record-file.mjs";
 import { publishRecord, discloseArgs, expectedBinding, PersistError } from "./lib/publish.mjs";
 import { acquireLock } from "./lib/lock.mjs";
 import { bls, owner, signers, sinks } from "./mock-sinks.mjs";
+// the mock registry's identity: a stage journalled by this code names its registry (W2d)
+const AT = { address: ("0x" + "aa".repeat(20)).toLowerCase(), chainId: "11155111" };
 
 const results = [];
 const j = v => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
@@ -475,7 +477,9 @@ cell(
 {
   // An unresolved incident is re-alerted even when publication returns early (no current pin).
   const s = sinks({ pinata: { fail: true }, filebase: { fail: true } });
-  const prev = { registry: { phase: "conflict", entryId: "9", conflict: "a different binding" } };
+  const prev = {
+    registry: { at: AT, phase: "conflict", entryId: "9", conflict: "a different binding" },
+  };
   const r = await pub(bls, s, prev);
   cell(
     "an unresolved incident is re-alerted even when nothing can be published this run",
@@ -504,6 +508,7 @@ cell(
   });
   const r = await pub(bls, s, {
     registry: {
+      at: AT,
       phase: "sent",
       raw: "0xrawx",
       hash: ethers.id("disclose-x"),
@@ -543,6 +548,7 @@ cell(
   });
   const prev = {
     registry: {
+      at: AT,
       phase: "sent",
       raw: "0xrawy",
       hash: ethers.id("disclose-y"),
@@ -579,6 +585,7 @@ cell(
   s.chain.orphans.add(ethers.id("orphan"));
   const prev = {
     registry: {
+      at: AT,
       phase: "landed",
       raw: "0xraw77",
       hash: ethers.id("disclose-77"),
@@ -605,7 +612,7 @@ cell(
   const s = sinks({ mine: "pending" });
   s.chain.signedArgs.set("0xraw1", discloseArgs(bls, f1));
   const legacy = {
-    registry: { phase: "sent", raw: "0xraw1", hash: ethers.id("disclose-1"), nonce: 0 },
+    registry: { at: AT, phase: "sent", raw: "0xraw1", hash: ethers.id("disclose-1"), nonce: 0 },
   };
   const r1 = await pub(bls, s, legacy, { maxPendingMs: 60_000 });
   cell(
@@ -643,6 +650,7 @@ cell(
   };
   const prev = {
     registry: {
+      at: AT,
       phase: "sent",
       raw: "0xrawz",
       hash: ethers.id("disclose-z"),

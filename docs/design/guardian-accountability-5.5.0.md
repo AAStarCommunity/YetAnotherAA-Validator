@@ -803,17 +803,23 @@ or as the author's attestation: nothing in the repository proves them.
      registry sink re-reads the roles from chain before every signature and
      refuses otherwise (W2c), and Phase D's `sender-keystore` checks the same at
      acceptance.
-   - **Not yet automated:** a publication journal does not record which registry
-     it disclosed to. After a switch, records already confirmed in the old
-     registry count as done and are not disclosed again in the new one, and a
-     signed but unconfirmed disclose would be rebroadcast to the old address.
-     Until W2d, switching registries therefore needs each journal's registry
-     stage reset by hand. W2d (planned) records the registry address and chain
-     id in each journal's registry stage, treats a mismatch with the current
-     `publish.registry` as not done (old signed transactions are voided and
-     never broadcast to a non-current address; the record is re-signed by the
-     new writer and disclosed again), and keeps the watcher degraded until every
-     record is confirmed on the new registry.
+   - **The switch itself (W2d):** each journal's registry stage records the
+     registry address and chain id it was written for. A stage written for
+     another registry than the current `publish.registry` is not done: it is
+     archived (`registryHistory`), its signed transactions are never broadcast
+     to the old address again, the record is disclosed again on the current
+     registry (an entry already there is adopted), and the watcher is degraded
+     until every record is confirmed there. One exception keeps the writer's
+     nonces contiguous: if the SAME writer, on the SAME chain, still has that
+     stage's disclose in flight, the stage is archived only after its nonce is
+     consumed at the finalized block. Until then the record waits, degraded (the
+     reason names the nonce), and nothing is rebroadcast or re-priced. With a
+     new writer, the recovery above, nothing waits. If the old transaction was
+     evicted and never will be mined, the operator either moves to a new writer
+     or consumes the nonce with `fill-nonce` (a 0-value transfer to the writer
+     itself, journalled); the runbook has both. Separately, a writer nonce that
+     is pending or skipped while no journal's active stage holds it is degraded
+     too.
 3. **After an alert.**
    - Alerts go to the Telegram chat configured in `publish.telegram.chatId`; the
      heartbeat uses the same bot and chat unless configured otherwise. By the

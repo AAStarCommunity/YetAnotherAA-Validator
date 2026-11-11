@@ -1329,6 +1329,175 @@ try {
   );
 }
 
+// ---- Codex W2d R1 #1 (DSR): the PRODUCTION registry sink's identity reaches the journal
+{
+  const { publishRecord } = await import("./lib/publish.mjs");
+  const { registryWhere } = await import("./lib/publish.mjs");
+  const { bls, sinks } = await import("./mock-sinks.mjs");
+  const REGW = ethers.getAddress("0x" + "cd".repeat(20));
+  const zero = ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [0n]);
+  const provider = {
+    async send(m) {
+      if (m === "eth_getBlockByNumber") return { number: "0x64", hash: ethers.id("b100") };
+      throw new Error(`unexpected ${m}`);
+    },
+    async call() {
+      return zero; // entryOf: no entry for this action yet
+    },
+    async getTransactionCount() {
+      return 0;
+    },
+    async getFeeData() {
+      return { maxFeePerGas: 10_000n, maxPriorityFeePerGas: 100n }; // above the cap: FEE_CAP
+    },
+    async getNetwork() {
+      return { chainId: 10n };
+    },
+    async estimateGas() {
+      return 100000n;
+    },
+  };
+  const wallet = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const reg = registrySink({
+    chainId: 10,
+    provider,
+    wallet,
+    registry: REGW,
+    fromBlock: 0,
+    roles,
+    currentRoles: async () => roles,
+    maxFeePerGas: 1_000n,
+  });
+  const where = registryWhere(reg);
+  const m = sinks();
+  let journal = null;
+  const r = await publishRecord(
+    bls,
+    { pinners: m.pinners, mirror: m.mirror, telegram: m.telegram, registry: reg },
+    {},
+    { persist: st => void (journal = JSON.parse(JSON.stringify(st))) }
+  );
+  cell(
+    "W2d R1#1: the production registrySink keeps address and chainId as data, and its journal stage records them",
+    typeof reg.address === "string" &&
+      reg.chainId === 10n &&
+      where.address === REGW.toLowerCase() &&
+      where.chainId === "10" &&
+      journal?.registry?.feeCapped &&
+      journal.registry.at?.address === REGW.toLowerCase() &&
+      journal.registry.at?.chainId === "10",
+    { where, at: journal?.registry?.at, phase: journal?.registry?.phase, alerts: r.alerts }
+  );
+}
+
+// ---- #425 review B1 (production sink): the RPC's chain is asserted before the registry stage reads
+{
+  const w = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const mk = served =>
+    registrySink({
+      chainId: 10,
+      provider: {
+        async getNetwork() {
+          return { chainId: served };
+        },
+      },
+      wallet: w,
+      registry: ethers.getAddress("0x" + "ce".repeat(20)),
+      fromBlock: 0,
+      roles,
+      maxFeePerGas: 10_000n,
+    });
+  let other = null;
+  try {
+    await mk(8453n).assertChain();
+  } catch (e) {
+    other = e.code ?? e.message;
+  }
+  let same = "ok";
+  try {
+    await mk(10n).assertChain();
+  } catch (e) {
+    same = e.code ?? e.message;
+  }
+  cell(
+    "#425 B1: the production sink refuses (CHAIN) when its RPC serves another chain, passes on the configured one; writer() is the wallet",
+    other === "CHAIN" && same === "ok" && (await mk(10n).writer()) === w.address,
+    { other, same }
+  );
+}
+
+// ---- #425 review B2 (DSR): the production sink's fill-nonce tx and nonce range
+{
+  const w = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const mk = ({ served = 10n, fee = 1000n, cur } = {}) =>
+    registrySink({
+      chainId: 10,
+      provider: {
+        async getNetwork() {
+          return { chainId: served };
+        },
+        async getFeeData() {
+          return { maxFeePerGas: fee, maxPriorityFeePerGas: 100n };
+        },
+        async getTransactionCount(_a, tag) {
+          return tag === "latest" ? 5 : 7;
+        },
+      },
+      wallet: w,
+      registry: ethers.getAddress("0x" + "ce".repeat(20)),
+      fromBlock: 0,
+      roles,
+      currentRoles: cur,
+      maxFeePerGas: 10_000n,
+    });
+  const f = await mk().signFill(5);
+  const t = ethers.Transaction.from(f.raw);
+  const code = async o => {
+    try {
+      await mk(o).signFill(5);
+      return "ok";
+    } catch (e) {
+      return e.code ?? e.message;
+    }
+  };
+  const chain = await code({ served: 8453n });
+  const capped = await code({ fee: 20_000n });
+  const role = await code({ cur: async () => ({ ...roles, guardians: [w.address] }) });
+  const range = await mk().nonceRange();
+  cell(
+    "#425 B2: signFill is a 0-value transfer from the writer to itself at the nonce, on the configured chain, under the fee ceiling and the role re-read; nonceRange reads latest and pending",
+    t.to === w.address &&
+      t.from === w.address &&
+      t.value === 0n &&
+      t.data === "0x" &&
+      t.nonce === 5 &&
+      t.chainId === 10n &&
+      t.gasLimit === 21000n &&
+      f.hash === t.hash &&
+      chain === "CHAIN" &&
+      capped === "FEE_CAP" &&
+      /also the guardian/.test(role) &&
+      range.latest === 5 &&
+      range.pending === 7,
+    { to: t.to, value: t.value, nonce: t.nonce, chain, capped, role, range }
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);
