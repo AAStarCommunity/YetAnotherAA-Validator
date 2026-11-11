@@ -4,7 +4,11 @@
   "roles": {
     "superPaymaster": "<SuperPaymaster proxy address from the step-13 manifest>"
   },
-  "forwarders": {},
+  "forwarders": {
+    "dvtValidator": "<DVTValidator address from the step-13 manifest (= phase-d.json contracts.dvtValidator)>",
+    "ownerSafe": "<owner Safe address from the step-13 manifest>",
+    "multiSendCallOnly": "<MultiSendCallOnly address from the step-13 manifest>"
+  },
   "startBlock": 0,
   "dataDir": "/Users/REPLACE_USER/.aoa-watcher/data",
   "intervalMs": 60000,
@@ -28,7 +32,8 @@
       "address": "<DisclosureRegistry address from the step-13 manifest>",
       "fromBlock": 0,
       "deployer": "<deployer address from the step-13 manifest>",
-      "keystore": "/Users/REPLACE_USER/.aoa-watcher/sender.keystore.json"
+      "keystore": "/Users/REPLACE_USER/.aoa-watcher/sender.keystore.json",
+      "maxFeePerGas": "<absolute ceiling in wei, e.g. 200000000000 for 200 gwei>"
     }
   },
   "heartbeat": { "label": "mini" }

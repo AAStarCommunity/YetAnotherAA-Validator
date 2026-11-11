@@ -35,12 +35,22 @@ export async function check({
   writeState,
   readState,
 }) {
-  const interval = cfg.intervalMs ?? 60_000;
+  // The heartbeat reads config.json on its own (no watcher validation): every number it uses or
+  // prints must be a positive safe integer, or the default is used and the bad setting is alerted
+  // in fixed wording, never echoed (Codex W2c R24)
+  let badSetting = false;
+  const posInt = (v, def) => {
+    if (v === undefined || v === null) return def;
+    if (Number.isSafeInteger(v) && v > 0) return v;
+    badSetting = true;
+    return def;
+  };
   const hb = cfg.heartbeat ?? {};
-  const staleAfter = hb.staleAfterMs ?? 3 * interval;
-  const realert = hb.realertMs ?? 3_600_000;
-  const unhealthyAfter = hb.unhealthyAfter ?? 2;
-  const maxLag = cfg.maxLagBlocks ?? 300;
+  const interval = posInt(cfg.intervalMs, 60_000);
+  const staleAfter = posInt(hb.staleAfterMs, 3 * interval);
+  const realert = posInt(hb.realertMs, 3_600_000);
+  const unhealthyAfter = posInt(hb.unhealthyAfter, 2);
+  const maxLag = posInt(cfg.maxLagBlocks, 300);
   const state = readState() ?? { alerting: null, lastSentAt: 0, unhealthyRuns: 0 };
 
   // what is wrong now, in fixed wording
@@ -88,6 +98,11 @@ export async function check({
       key: "lag",
       text: `cursor ${status.lagBlocks} blocks behind finalized (> ${maxLag})`,
     };
+  if (!problem && badSetting)
+    problem = {
+      key: "config",
+      text: "heartbeat config invalid: a numeric setting is not a positive integer (defaults used)",
+    };
   const unhealthyRuns = status && status.healthy === false ? state.unhealthyRuns + 1 : 0;
   if (!problem && unhealthyRuns >= unhealthyAfter) {
     // only a count leaves the Mini: status.degraded is the watcher's text, and truncation is not
@@ -99,7 +114,7 @@ export async function check({
     };
   }
 
-  const host = hb.label ?? hostname();
+  const host = hostLabel(hb);
   const next = {
     ...state,
     unhealthyRuns,
@@ -117,7 +132,14 @@ export async function check({
         sent = problem.key;
       }
     }
-  } else if (state.alerting) {
+  } else if (
+    state.alerting &&
+    status?.healthy === true &&
+    status.publication?.inProgress !== true
+  ) {
+    // recovery needs a positive healthy from a completed iteration: a fresh but unhealthy status
+    // below the unhealthy threshold (#413 review N1), or one written while publication is still
+    // in progress (Codex W2c R18), is not "recovered"; the alert stays open until it is
     const ok = await send(
       `[aoa-watcher] ${host}: RECOVERED (status fresh, lag within ${maxLag}, healthy)`
     );
@@ -188,7 +210,7 @@ if (process.argv[1] && process.argv[1].endsWith("heartbeat.mjs") && ci >= 0) {
   const send = telegramSend(cfg);
   if (args.includes("--test")) {
     const ok = await send(
-      `[aoa-watcher] ${cfg.heartbeat?.label ?? hostname()}: heartbeat TEST at ${new Date().toISOString()}`
+      `[aoa-watcher] ${hostLabel(cfg.heartbeat ?? {})}: heartbeat TEST at ${new Date().toISOString()}`
     );
     process.exit(ok ? 0 : 1);
   }
@@ -216,4 +238,16 @@ if (process.argv[1] && process.argv[1].endsWith("heartbeat.mjs") && ci >= 0) {
   });
   console.log(JSON.stringify({ at: new Date().toISOString(), ...r }));
   process.exit(r.problem ? 1 : 0);
+}
+
+/** The host name in a message: a plain identifier only, never arbitrary config text (Codex W2c
+ * R23 #2). A label outside that shape is replaced, the hostname is reduced to safe characters. */
+export function hostLabel(hb) {
+  if (hb?.label !== undefined)
+    return /^[A-Za-z0-9._-]{1,40}$/.test(String(hb.label)) ? String(hb.label) : "invalid-label";
+  return (
+    hostname()
+      .replace(/[^A-Za-z0-9.-]/g, "")
+      .slice(0, 40) || "host"
+  );
 }

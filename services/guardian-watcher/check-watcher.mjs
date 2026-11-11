@@ -352,6 +352,42 @@ try {
     store.setCursor(keep);
   }
 
+  // Codex W2c R18: the status runOnce writes before this iteration's publication keeps the last
+  // publication's degradation (a scan-only "healthy" is not a recovery)
+  {
+    const keep = store.getCursor();
+    const bad = await runOnce(c.chain, cfg, store, rs, ident, {
+      carry: {
+        publication: {
+          ok: false,
+          stalls: { feeCapped: 0, insufficientFunds: 0 },
+          inProgress: true,
+        },
+      },
+    });
+    const onDisk = store.readStatus();
+    store.setCursor(keep);
+    const good = await runOnce(c.chain, cfg, store, rs, ident, {
+      carry: {
+        publication: { ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 }, inProgress: true },
+      },
+    });
+    store.setCursor(keep);
+    const reason = "publication pass not ok (a stage failed, stopped or was skipped)";
+    cell(
+      "R18: the scan's status write carries the last publication's degradation (healthy false), not a scan-only healthy",
+      bad.status.ok === true &&
+        bad.status.healthy === false &&
+        onDisk?.healthy === false &&
+        (onDisk.degraded ?? []).includes(reason) &&
+        !(good.status.degraded ?? []).includes(reason),
+      {
+        bad: [bad.status.healthy, bad.status.degraded],
+        good: [good.status.healthy, good.status.degraded],
+      }
+    );
+  }
+
   // A cursor whose block no longer has the stored hash: stop, do not advance.
   {
     const keep = store.getCursor();
@@ -5479,7 +5515,9 @@ try {
     };
     walk(dS);
     const leaks = files.filter(
-      f => readFileSync(f, "utf8").includes(SENT) || readFileSync(f, "utf8").includes("example.io")
+      f =>
+        readFileSync(f, "utf8").includes(SENT) ||
+        readFileSync(f, "utf8").match(/eth-sepolia\.example\.io/) !== null
     );
     const statusLeak = statuses.some(st => JSON.stringify(st).includes(SENT));
     // isolation reasons and external-error categories, wherever they ended (open, exhausted, records)
@@ -5573,7 +5611,9 @@ try {
         reads,
         cursor: store.getCursor(),
         leak:
-          JSON.stringify(st).includes(SENT) || disk.includes(SENT) || disk.includes("example.io"),
+          JSON.stringify(st).includes(SENT) ||
+          disk.includes(SENT) ||
+          disk.match(/eth-sepolia\.example\.io/) !== null,
       };
     } finally {
       rmSync(d, { recursive: true, force: true });

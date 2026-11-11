@@ -522,7 +522,7 @@ export class Store {
     try {
       return readJson(join(this.dir, "publish-schedule.json"), null) ?? {};
     } catch {
-      return {};
+      return { unreadable: true }; // rotation restarts; the publisher treats stalls as unknown
     }
   }
 

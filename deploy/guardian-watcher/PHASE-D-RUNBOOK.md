@@ -76,10 +76,16 @@ sed -i '' "s|REPLACE_USER|$(id -un)|g" ~/.aoa-watcher/config.json
 ```
 
 Fill every `<...>` from the step-13 manifest (public data only): `aggregator`,
-`roles.superPaymaster`, `startBlock` (the aggregator's deployment block),
-`publish.registry` (DisclosureRegistry address, its deployment block as
-`fromBlock`, the deployer), the Pinata gateway, the Telegram chat id. The git
-mirror needs a bare clone whose push key is in the ssh-agent:
+`roles.superPaymaster`, `forwarders.dvtValidator` / `ownerSafe` /
+`multiSendCallOnly` (Phase D's `onchain:binding` compares
+`forwarders.dvtValidator` with `phase-d.json` `contracts.dvtValidator`),
+`startBlock` (the aggregator's deployment block), `publish.registry`
+(DisclosureRegistry address, its deployment block as `fromBlock`, the deployer,
+and `maxFeePerGas`: the absolute fee ceiling in wei as a decimal string; its
+`keystore` must be the same file as `phase-d.json` `sender.keystore`), the
+Pinata gateway, the Telegram chat id. Keep `publish.enabled: true`
+(`watcher-publish`). The git mirror needs a bare clone whose push key is in the
+ssh-agent:
 `git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git`.
 
 ## 5. The Phase D config
@@ -154,7 +160,10 @@ container at a time, 2 of 3 always up, no BLS proposal in flight, then
 
 ```sh
 docker compose -f docker-compose.testnet.yml up -d --no-build dvt-node-1
-docker inspect dvt-node-1 --format '{{.State.Health.Status}} {{range .Config.Env}}{{println .}}{{end}}' | grep -E "healthy|AUDIT_"
+docker inspect -f '{{.State.Health.Status}}' dvt-node-1     # expect: healthy
+# only the two audit variables, matched by exact name (other variables can hold credentials):
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' dvt-node-1 \
+  | grep -E '^AUDIT_(ENABLED|EXECUTE_SLASH)=' # expect both =false
 ```
 
 ## 10. Run Phase D
@@ -170,6 +179,7 @@ line:
 | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `keychain:account`, `keychain:<item>`                     | the six Keychain items of step 2 exist under `aoa-watcher`                                                                                                                                                                                                                           |
 | `watcher-config`                                          | `~/.aoa-watcher/config.json` loads with the watcher's own validation and its data dir is writable                                                                                                                                                                                    |
+| `watcher-publish`                                         | publication is enabled, the watcher's publish config validates, and it uses `sender.keystore` and the Keychain items of step 2                                                                                                                                                       |
 | `sender-keystore`                                         | encrypted, mode 600, decrypts with the Keychain password, address not a guardian / owner Safe / deployer, not SP's guardian                                                                                                                                                          |
 | `sender-balance`                                          | the sender holds at least `sender.minBalanceWei`                                                                                                                                                                                                                                     |
 | `launchd-off:<job>`                                       | the committee keeper and apply-rotation jobs are not loaded                                                                                                                                                                                                                          |

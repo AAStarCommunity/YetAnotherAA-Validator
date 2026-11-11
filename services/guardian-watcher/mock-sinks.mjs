@@ -40,7 +40,16 @@ export const owner = {
 // ---- mock sinks. The mock registry follows DisclosureRegistry: one entry per (kind, key), the
 // binding keccak256(abi.encode(kind, key, subjectToken)), entries visible at a block, finality.
 export function sinks(opts = {}) {
-  const calls = { telegram: 0, sign: 0, broadcast: 0, mirror: 0, uploads: {}, texts: [] };
+  const calls = {
+    telegram: 0,
+    sign: 0,
+    broadcast: 0,
+    mirror: 0, // commit() calls
+    mirrorCommits: 0, // new commits only: like the real sink, identical bytes at a path are a no-op
+    uploads: {},
+    texts: [],
+  };
+  const mirrored = new Map(); // path -> bytes (hex)
   const stored = new Map();
   const pinOpts = { pinata: { ...(opts.pinata ?? {}) }, filebase: { ...(opts.filebase ?? {}) } };
   const mkPinner = name => ({
@@ -57,6 +66,7 @@ export function sinks(opts = {}) {
     async fetchPublic(cid) {
       const o = pinOpts[name];
       calls.fetches = (calls.fetches ?? 0) + 1;
+      if (o.fetchThrows) throw new Error("gateway timeout"); // transport error, not a mismatch
       if (o.private || o.gone) return null; // private upload, or unpinned later
       return stored.get(`${name}:${cid}`) ?? null;
     },
@@ -71,6 +81,7 @@ export function sinks(opts = {}) {
     receipts: new Map(),
     signedArgs: new Map(),
     orphans: new Set(), // block hashes no longer canonical
+    known: new Set(), // tx hashes some node accepted
   };
   if (opts.existing) {
     chain.entries.set(9n, { amendments: [], block: 1, ...opts.existing });
@@ -89,9 +100,20 @@ export function sinks(opts = {}) {
     chain,
     pinners: [mkPinner("pinata"), mkPinner("filebase")],
     mirror: {
-      async commit(path) {
+      async commit(path, bytes) {
         calls.mirror++;
         if (opts.mirrorFail) throw new Error("push rejected");
+        const hex = bytes ? Buffer.from(bytes).toString("hex") : "";
+        if (mirrored.has(path)) {
+          if (mirrored.get(path) !== hex) throw new Error("different bytes at an existing path");
+          return {
+            commit: "c0ffee",
+            url: `https://github.com/x/y/blob/c0ffee/${path}`,
+            existing: true,
+          };
+        }
+        mirrored.set(path, hex);
+        calls.mirrorCommits++;
         return { commit: "c0ffee", url: `https://github.com/x/y/blob/c0ffee/${path}` };
       },
     },
@@ -110,6 +132,7 @@ export function sinks(opts = {}) {
       async entryOf(kind, key, { blockTag } = {}) {
         const id = chain.byAction.get(`${kind}:${key}`);
         if (!id) return 0n;
+        if (opts.ignoreBlockTag) return id; // an RPC that answers head state for any blockTag
         return chain.entries.get(id).block <= (blockTag ?? chain.block) ? id : 0n;
       },
       async entry(id) {
@@ -119,14 +142,26 @@ export function sinks(opts = {}) {
         calls.sign++;
         calls.lastArgs = args;
         calls.lastSignOpts = o;
-        const raw = `0xraw${calls.sign}`;
+        // deterministicSign: the same args and nonce sign to the same tx (a flat estimate)
+        const raw = opts.deterministicSign ? `0xraw0` : `0xraw${calls.sign}`;
         chain.signedArgs.set(raw, args);
-        return { raw, hash: ethers.id(`disclose-${calls.sign}`), nonce: o.nonce ?? chain.nonce };
+        return {
+          raw,
+          hash: ethers.id(`disclose-${opts.deterministicSign ? 0 : calls.sign}`),
+          nonce: o.nonce ?? chain.nonce,
+        };
       },
       async broadcast(raw) {
         calls.broadcast++;
         calls.lastRaw = raw;
         const hash = ethers.id(`disclose-${raw.slice(5)}`);
+        if (opts.rejectBroadcast || opts.rejectRaw?.(raw)) {
+          // a node refusing every broadcast (e.g. a writer without funds): never known
+          const e = new Error("insufficient funds for gas * price + value");
+          e.code = "INSUFFICIENT_FUNDS";
+          throw e;
+        }
+        chain.known.add(hash);
         if (chain.mined === "pending" || chain.receipts.has(hash)) return;
         const a = chain.signedArgs.get(raw);
         const act = `${a.signed.kind}:${a.signed.proposalId}`;
@@ -159,6 +194,9 @@ export function sinks(opts = {}) {
       },
       async receipt(hash) {
         return chain.receipts.get(hash) ?? null;
+      },
+      async knows(hash) {
+        return chain.known.has(hash);
       },
       async canonical(_n, h) {
         return !chain.orphans.has(h);

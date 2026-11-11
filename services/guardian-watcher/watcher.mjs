@@ -23,7 +23,7 @@ import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick, verifyTrace } from "./lib/scan.mjs";
 import { confirmPending } from "./lib/confirm.mjs";
-import { safeText } from "./lib/safe-error.mjs";
+import { SafeError, safeText } from "./lib/safe-error.mjs";
 import { acquireLock, DEFAULT_LOCK_PORT } from "./lib/lock.mjs";
 import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
 import { publishPhase } from "./lib/publisher.mjs";
@@ -92,6 +92,93 @@ export function loadConfig(path) {
 export function secondProviderLabel(cfg) {
   const n = cfg?.secondProvider;
   return typeof n === "string" && /^[a-z][a-z0-9-]{0,30}$/i.test(n) ? n : "second";
+}
+
+/** The disclose stalls that make the watcher degraded (DSR, #411 F1): fixed wording, counts only. */
+export function stallReasons(publication) {
+  // store-wide counts (lib/publisher.mjs stallCounts), never the batch's (DSR)
+  const out = [];
+  // no store-wide counts at all (the pass threw, or never reported them) is not "no stalls"
+  // (#413 review B1)
+  if (!publication?.stalls) return ["stall state unknown: no publication result"];
+  const st = publication.stalls;
+  // an unreadable, unrebuildable index is not "no stalls" (Codex W2c R12 #3)
+  if (st.unknown) out.push("stall state unknown: the stall index is unreadable");
+  if (st.feeCapped)
+    out.push(`${st.feeCapped} disclose tx(s) need a fee above registry.maxFeePerGas`);
+  if (st.insufficientFunds)
+    out.push(
+      `${st.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
+    );
+  // what still needs attention (Codex W2c R20), store-wide until the journal no longer says so
+  if (st.incidents)
+    out.push(`${st.incidents} unresolved registry or bytes incident(s) (acknowledge or resolve)`);
+  if (st.inconsistent)
+    out.push(
+      `${st.inconsistent} disclose receipt(s) final but the entry not visible (RPC inconsistent)`
+    );
+  if (st.unverified)
+    out.push(`${st.unverified} pin(s) not re-verified since a failed check (retried every pass)`);
+  // the generic count last: a specific cause above names the same record more precisely
+  if (st.failing)
+    out.push(`${st.failing} record(s) failing publication (retried every pass; see the alerts)`);
+  return out;
+}
+
+/**
+ * Why a publication result makes the watcher degraded (#413 review B1), fixed wording: a pass that
+ * threw or did not report ok, and the store-wide disclose stalls (DSR, #411 F1). The heartbeat
+ * alerts on healthy: false.
+ */
+export function publicationReasons(publication) {
+  const reasons = [];
+  if (publication?.error) reasons.push("publication pass failed (see the alerts)");
+  else if (publication?.ok !== true)
+    reasons.push("publication pass not ok (a stage failed, stopped or was skipped)");
+  reasons.push(...stallReasons(publication));
+  return reasons;
+}
+
+/**
+ * One iteration's publication, as the resident loop runs it (#413 review B1): a pass that throws,
+ * or that does not report ok, makes the watcher degraded (fixed wording, healthy = false) so the
+ * heartbeat sees it; so do disclose stalls and a slow iteration. Returns the next slowNote.
+ */
+export async function publicationStep({
+  status,
+  run,
+  slowNote,
+  iterStart,
+  cfg,
+  carried = [],
+  now = Date.now,
+}) {
+  // the interim status carried the last publication's reasons (runOnce); they are replaced by this
+  // pass's, so health is the scan's plus the current publication's (Codex W2c R19 #2)
+  const scanDegraded = (status.degraded ?? []).filter(r => !carried.includes(r));
+  try {
+    // the previous iteration's slowness is only known after its publication: carried here
+    const degraded = [...scanDegraded, ...(slowNote ? [slowNote] : [])];
+    status.publication = await run(degraded.length ? degraded : undefined);
+  } catch (e) {
+    status.publication = { error: safeText("publication", e) };
+  }
+  const reasons = publicationReasons(status.publication);
+  // the whole iteration (scan and publication) against the interval: a slow one is degraded,
+  // and alerted by the next pass (tickMs covers the scan alone)
+  status.iterationMs = now() - iterStart;
+  const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
+  const nextSlow =
+    status.iterationMs > limit
+      ? // fixed wording: the alert set's identity must not change with every duration (Codex W2c
+        // R9); the measured time is status.iterationMs
+        `iteration slower than ${Math.round(limit)} ms (maxTickFraction of the interval)`
+      : null;
+  if (nextSlow) reasons.push(nextSlow);
+  const all = [...scanDegraded, ...reasons];
+  status.degraded = all.length ? all : null;
+  status.healthy = status.ok === true && all.length === 0;
+  return nextSlow;
 }
 
 export const TRACE_VERIFY_MS = 3_600_000;
@@ -183,6 +270,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
   // `carry`: fields kept from the previous status while this run has not replaced them yet (the
   // last publication result, marked in progress: Codex W2c R1 M8).
   const status = { at: started, ruleset: ident, lastError: null, ...(carry ?? {}) };
+  let carried = []; // the reasons taken from the carried publication (replaced by publicationStep)
   // wall time of this tick and the archive it ran over, reported with every status
   const tickStart = Date.now();
   const timing = () => {
@@ -217,6 +305,12 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
       extra.push(
         `tick took ${status.tickMs} ms, more than ${Math.round(tm.limit)} ms (maxTickFraction of the interval)`
       );
+    // the status written before this iteration's publication keeps the last publication's
+    // degradation (Codex W2c R18): a scan-only "healthy" must not read as recovered
+    if (carry?.publication) {
+      carried = publicationReasons(carry.publication);
+      extra.push(...carried);
+    }
     status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
     status.healthy = status.ok === true && !status.degraded;
   };
@@ -299,7 +393,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
     }
     await finish(s.trace, s.finalized, s.isolated ?? 0, more);
     store.writeStatus(status);
-    return { status, summary: s };
+    return { status, summary: s, carried };
   } catch (e) {
     status.ok = false;
     status.lastError = safeText("tick", e); // never a foreign error's text (lib/safe-error.mjs)
@@ -308,7 +402,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
     status.cursor = store.getCursor()?.block ?? null;
     await finish(null, null);
     store.writeStatus(status);
-    return { status, summary: null };
+    return { status, summary: null, carried };
   }
 }
 
@@ -352,7 +446,11 @@ async function main() {
       // from its URL: a hostname can carry an access token in a subdomain (cf. Codex A7 R16)
       { chain: makeProvider(process.env.RPC_URL_2), host: secondProviderLabel(cfg) }
     : null;
-  const pub = p ? { p, built: await buildSinks(p, chain) } : null;
+  // the registry signs only for the configured chain (#413 review N2): a missing chainId refuses
+  // to start, and a mismatching RPC refuses each signature
+  if (p && !Number.isSafeInteger(cfg.chainId))
+    throw new SafeError("config: chainId required when publish is enabled");
+  const pub = p ? { p, built: await buildSinks(p, chain, { chainId: cfg.chainId }) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
   let lastPub = store.readStatus()?.publication ?? null;
@@ -364,34 +462,19 @@ async function main() {
       ? { publication: { ...(lastPub ?? {}), inProgress: true, since: new Date().toISOString() } }
       : undefined;
     const iterStart = Date.now();
-    const { status } = await runOnce(chain, cfg, store, rs, ident, { second, carry });
+    const { status, carried } = await runOnce(chain, cfg, store, rs, ident, { second, carry });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
     if (pub) {
-      try {
-        // the previous iteration's slowness is only known after its publication: carried here
-        const degraded = [...(status.degraded ?? []), ...(slowNote ? [slowNote] : [])];
-        status.publication = await publishPhase(store, chain, cfg, pub.p, pub.built, {
-          degraded: degraded.length ? degraded : undefined,
-        });
-      } catch (e) {
-        status.publication = { error: safeText("publication", e) };
-      }
+      slowNote = await publicationStep({
+        status,
+        slowNote,
+        iterStart,
+        cfg,
+        carried,
+        run: degraded => publishPhase(store, chain, cfg, pub.p, pub.built, { degraded }),
+      });
       lastPub = status.publication;
-      // the whole iteration (scan and publication) against the interval: a slow one is degraded,
-      // and alerted by the next pass (tickMs covers the scan alone)
-      status.iterationMs = Date.now() - iterStart;
-      const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
-      slowNote =
-        status.iterationMs > limit
-          ? // fixed wording: the alert set's identity must not change with every duration (Codex W2c
-            // R9); the measured time is status.iterationMs
-            `iteration slower than ${Math.round(limit)} ms (maxTickFraction of the interval)`
-          : null;
-      if (slowNote) {
-        status.degraded = [...(status.degraded ?? []), slowNote];
-        status.healthy = false;
-      }
       store.writeStatus(status);
     }
     console.log(JSON.stringify(status));

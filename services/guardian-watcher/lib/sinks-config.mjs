@@ -15,8 +15,9 @@
 //     "telegram": { "chatId": "-100…" },
 //     "mirror": { "clone": "/path/to/bare/clone.git", "branch": "disclosure-records",
 //                 "repoUrl": "https://github.com/AAStarCommunity/YetAnotherAA-Validator" },
-//     "registry": { "address": "0x…", "fromBlock": N, "deployer": "0x…",
-//                   "keystore": "~/.aoa-watcher/sender.keystore.json" },
+//     "registry": { "address": "0x…", "fromBlock": N, "deployer": "0x…", "maxFeePerGas": "<wei>",
+//                   "keystore": "/Users/<you>/.aoa-watcher/sender.keystore.json" },
+//     (an absolute path: "~" is not expanded, #413 review N3)
 //     "lockPort": 47331, "maxPendingMs": 1800000, "reverifyEveryMs": 604800000, "alertRepeatMs": 3600000 }
 import { readFileSync } from "node:fs";
 import { ethers } from "ethers";
@@ -25,7 +26,7 @@ import { SafeError } from "./safe-error.mjs";
 import { pinataPinner } from "../sinks/pinata.mjs";
 import { filebasePinner } from "../sinks/filebase.mjs";
 import { telegramSink } from "../sinks/telegram.mjs";
-import { gitMirror } from "../sinks/git-mirror.mjs";
+import { gitMirror, PUBLIC_REPO_URL } from "../sinks/git-mirror.mjs";
 import { registrySink } from "../sinks/registry.mjs";
 
 const DEFAULTS = {
@@ -65,11 +66,18 @@ export function publishConfig(c) {
   p.telegram = { ...p.telegram, service: p.telegram.service ?? SERVICE_DEFAULTS.telegram };
   need(okService(p.telegram.service), "telegram.service must be a Keychain service name");
   need(p.mirror?.clone, "mirror.clone required");
+  if (p.mirror.repoUrl !== undefined && !PUBLIC_REPO_URL.test(String(p.mirror.repoUrl)))
+    throw new SafeError("config.publish: mirror.repoUrl must be https://github.com/<owner>/<repo>");
   const r = p.registry ?? {};
   need(ethers.isAddress(r.address ?? ""), "registry.address required");
   need(Number.isSafeInteger(r.fromBlock) && r.fromBlock >= 0, "registry.fromBlock required");
   need(ethers.isAddress(r.deployer ?? ""), "registry.deployer (release manifest) required");
   need(r.keystore, "registry.keystore required");
+  // the absolute fee ceiling (DSR, #411 F1): a decimal wei string, required, no default
+  need(
+    typeof r.maxFeePerGas === "string" && /^[1-9][0-9]{0,30}$/.test(r.maxFeePerGas),
+    "registry.maxFeePerGas (decimal wei ceiling) required"
+  );
   p.registry = { ...r, service: r.service ?? SERVICE_DEFAULTS.registry };
   need(okService(p.registry.service), "registry.service must be a Keychain service name");
   need(okService(p.keychainAccount), "keychainAccount must be a Keychain account name");
@@ -82,7 +90,7 @@ export function publishConfig(c) {
  * Read every secret and decrypt the writer keystore. `readSecret(service, account)` is injectable
  * for tests. Returns { pinners, telegram, mirror, wallet, registryFor(roles) }.
  */
-export async function buildSinks(p, provider, { readSecret = keychainRead } = {}) {
+export async function buildSinks(p, provider, { readSecret = keychainRead, chainId } = {}) {
   const acct = p.keychainAccount;
   const pinners = [];
   for (const x of p.pinners) {
@@ -134,6 +142,8 @@ export async function buildSinks(p, provider, { readSecret = keychainRead } = {}
       fromBlock: p.registry.fromBlock,
       roles,
       currentRoles,
+      maxFeePerGas: BigInt(p.registry.maxFeePerGas),
+      chainId,
     });
   return { pinners, telegram, mirror, wallet, registryFor };
 }

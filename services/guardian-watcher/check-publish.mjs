@@ -101,7 +101,8 @@ cell(
   );
   cell(
     "Telegram text names the record CID and the mirror URL",
-    s.calls.texts[0].includes(`ipfs://${f1.cid}`) && s.calls.texts[0].includes("github.com"),
+    s.calls.texts[0].includes(`ipfs://${f1.cid}`) &&
+      s.calls.texts[0].includes(`https://github.com/x/y/blob/c0ffee/${mirrorPath(bls, f1.cid)}`),
     s.calls.texts[0]
   );
   const r2 = await pub(bls, s, r1.state);
@@ -279,6 +280,25 @@ cell(
 
 // ---- finality, revert, drop, stuck
 {
+  // #409 review M1: the receipt's own block must be final before it is confirmed, even when an RPC
+  // already shows the entry at the finalized tag (it answers head state for any blockTag)
+  const s = sinks({ ignoreBlockTag: true });
+  s.chain.finalizedLag = 100;
+  const r1 = await settle(bls, s, {}, {}, 3);
+  cell(
+    "a receipt above the finalized block stays 'landed' even if the RPC shows the entry at that tag",
+    r1.state.registry.phase === "landed",
+    r1.state.registry
+  );
+  s.chain.finalizedLag = 0;
+  const r2 = await pub(bls, s, r1.state);
+  cell(
+    "…and settles once its block is final",
+    r2.state.registry.phase === "confirmed" && s.calls.sign === 1,
+    { reg: r2.state.registry, calls: s.calls }
+  );
+}
+{
   const s = sinks();
   s.chain.finalizedLag = 100; // receipts land above the finalized block
   const r1 = await settle(bls, s, {}, {}, 3);
@@ -338,6 +358,78 @@ cell(
     "a dropped tx is detected and re-signed once (on-chain uniqueness makes this safe)",
     s.calls.sign === 2 && r3.alerts.some(x => /dropped or replaced/.test(x)),
     { calls: s.calls, alerts: r3.alerts }
+  );
+}
+{
+  // #411 review F1: no node ever accepted a broadcast (a writer without funds). Replacements are
+  // priced at the current estimate (no floor from a rejected tx), so the fee cannot climb on
+  // rejections alone; the lack of funds is alerted plainly.
+  const s = sinks({ mine: "pending", rejectBroadcast: true });
+  let st = {};
+  const optsSeen = [];
+  const alertsSeen = [];
+  for (let i = 0; i < 4; i++) {
+    const r = await pub(bls, s, st, { maxPendingMs: 0 });
+    st = r.state;
+    optsSeen.push({ ...s.calls.lastSignOpts });
+    alertsSeen.push(...r.alerts);
+  }
+  cell(
+    "F1: replacements of never-accepted txs carry no fee floor (no replace/prevRaw), and insufficient funds is alerted",
+    s.calls.sign >= 3 &&
+      optsSeen.slice(1).every(o => !o.replace && o.prevRaw === undefined) &&
+      alertsSeen.some(x => /insufficient funds/.test(x)),
+    { sign: s.calls.sign, optsSeen, alerts: alertsSeen.slice(0, 6) }
+  );
+}
+{
+  // ...and once a node knows a tx, the replacement is floored on THAT tx
+  const s = sinks({ mine: "pending" });
+  const r1 = await pub(bls, s, {}, { maxPendingMs: 0 });
+  await pub(bls, s, r1.state, { maxPendingMs: 0 });
+  cell(
+    "F1: a replacement of an accepted tx is floored on that tx's journalled raw bytes",
+    s.calls.lastSignOpts.replace === true && s.calls.lastSignOpts.prevRaw === r1.state.registry.raw,
+    s.calls.lastSignOpts
+  );
+}
+{
+  // W2b Codex R7: a legacy journal (hashes [h0, h1], only raw1, no raws) whose node still knows
+  // the accepted replacement h1 must floor on raw1, not sign without a floor
+  const s = sinks({ mine: "pending" });
+  const r1 = await pub(bls, s, {}, { maxPendingMs: 0 });
+  const r2 = await pub(bls, s, r1.state, { maxPendingMs: 0 }); // one replacement: h0 -> h1
+  const { raws, ...legacy } = r2.state.registry; // the pre-raws journal shape
+  s.chain.known.clear();
+  s.chain.known.add(legacy.hash); // the node dropped h0 and keeps h1
+  await pub(bls, s, { ...r2.state, registry: legacy }, { maxPendingMs: 0 });
+  cell(
+    "R7: a legacy journal's accepted replacement (raw only for the last hash) still floors the next one",
+    s.calls.lastSignOpts.replace === true && s.calls.lastSignOpts.prevRaw === legacy.raw,
+    { opts: s.calls.lastSignOpts, legacyRaw: legacy.raw }
+  );
+}
+{
+  // ...and a fee above the configured ceiling stops escalation, alerted on every pass
+  const s = sinks({ mine: "pending" });
+  const r1 = await pub(bls, s, {}, { maxPendingMs: 0 });
+  const realSign = s.registry.sign;
+  s.registry.sign = async (args, o) => {
+    if (o?.replace) {
+      const e = new Error("registry: the fee needed exceeds the configured maxFeePerGas");
+      e.code = "FEE_CAP";
+      throw e;
+    }
+    return realSign(args, o);
+  };
+  const r2 = await pub(bls, s, r1.state, { maxPendingMs: 0 });
+  const r3 = await pub(bls, s, r2.state, { maxPendingMs: 0 });
+  cell(
+    "F1: a replacement above maxFeePerGas is not sent; the journal is flagged and every pass alerts",
+    !!r2.state.registry.feeCapped &&
+      r2.state.registry.raw === r1.state.registry.raw &&
+      [r2, r3].every(r => r.alerts.some(x => /above the configured maxFeePerGas/.test(x))),
+    { reg: r2.state.registry, a2: r2.alerts, a3: r3.alerts }
   );
 }
 {
@@ -570,7 +662,52 @@ cell(
   );
 }
 
+{
+  // #409 review N2: the owner-route mirror path only from a well-formed txHash and logIndex
+  const ok = { route: "owner", txHash: "0x" + "ab".repeat(32), logIndex: 3 };
+  const bad = [
+    { ...ok, txHash: "../../etc" },
+    { ...ok, txHash: "0x" + "ab".repeat(31) },
+    { ...ok, logIndex: "3/../x" },
+    { ...ok, logIndex: -1 },
+  ];
+  let threw = 0;
+  for (const r of bad) {
+    try {
+      mirrorPath(r, f1.cid);
+    } catch {
+      threw++;
+    }
+  }
+  cell(
+    "mirror path: a malformed owner-route txHash or logIndex is refused; a good one is accepted",
+    threw === bad.length && mirrorPath(ok, f1.cid).startsWith("records/owner/owner-0x"),
+    { threw }
+  );
+}
+
 // ---- other stages
+{
+  // #409 review N1: a transport error while re-verifying is no evidence: the pin stays current
+  const s = sinks();
+  const r1 = await pub(bls, s);
+  const uploads = { ...s.calls.uploads };
+  s.pinOpts.pinata.fetchThrows = true;
+  const r2 = await pub(bls, s, r1.state, { reverify: true });
+  cell(
+    "reverify: a gateway transport error keeps the pin current and the record published, alerted, no re-upload",
+    r2.state.pins.pinata.current &&
+      r2.state.published &&
+      s.calls.uploads.pinata === uploads.pinata &&
+      r2.alerts.some(x => /could not reach the gateway/.test(x)),
+    {
+      pins: r2.state.pins,
+      published: r2.state.published,
+      alerts: r2.alerts,
+      uploads: s.calls.uploads,
+    }
+  );
+}
 {
   const s = sinks();
   const r1 = await pub(bls, s);
@@ -725,14 +862,46 @@ cell(
     event: "UNREADABLE",
   };
   const own = { route: "owner", txHash: tx, logIndex: 5, event: "GuardianSet" };
-  const paths = [pub, una, q, own].map(r => mirrorPath(r, "bafkCID"));
+  const paths = [pub, una, q, own].map(r => mirrorPath(r, "bafkcid"));
   cell(
     "mirror path: public, unattributed and quarantine records keep their own id; only the owner route is named owner-",
-    paths[0] === `records/public/public-${tx}-3.bafkCID.json` &&
-      paths[1] === `records/unattributed/unattributed-${tx}-4.bafkCID.json` &&
-      paths[2] === `records/unattributed/quarantine-0x${"cd".repeat(32)}.bafkCID.json` &&
-      paths[3] === `records/owner/owner-${tx}-5.bafkCID.json`,
+    paths[0] === `records/public/public-${tx}-3.bafkcid.json` &&
+      paths[1] === `records/unattributed/unattributed-${tx}-4.bafkcid.json` &&
+      paths[2] === `records/unattributed/quarantine-0x${"cd".repeat(32)}.bafkcid.json` &&
+      paths[3] === `records/owner/owner-${tx}-5.bafkcid.json`,
     paths
+  );
+}
+
+// ---- #411 review N1 / N2
+{
+  // N1: nothing accepted, a flat estimate: the identical re-sign is not appended again
+  const s = sinks({ mine: "pending", rejectBroadcast: true, deterministicSign: true });
+  let st = {};
+  for (let i = 0; i < 5; i++) st = (await pub(bls, s, st, { maxPendingMs: 0 })).state;
+  cell(
+    "N1: repeated identical re-signs do not grow the journal",
+    st.registry.hashes.length === 1 && st.registry.raws.length === 1 && s.calls.sign >= 3,
+    { hashes: st.registry.hashes.length, sign: s.calls.sign }
+  );
+  // N2: the floor for a known tx without its raw is the most expensive raw journalled
+  const { highestFeeRaw } = await import("./lib/publish.mjs");
+  const w = ethers.Wallet.createRandom();
+  const tx = fee =>
+    w.signTransaction({
+      type: 2,
+      chainId: 1,
+      nonce: 0,
+      to: w.address,
+      maxFeePerGas: fee,
+      maxPriorityFeePerGas: 1n,
+      gasLimit: 21000n,
+    });
+  const cheapLatest = [await tx(1250n), null, await tx(1000n)];
+  cell(
+    "N2: the highest-fee journalled raw is the floor, not the latest one",
+    highestFeeRaw(cheapLatest) === cheapLatest[0],
+    null
   );
 }
 

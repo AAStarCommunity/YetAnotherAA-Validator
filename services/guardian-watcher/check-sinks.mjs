@@ -31,6 +31,8 @@ const results = [];
 const j = v => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
 const cell = (name, ok, got) => results.push({ name, ok: !!ok, got: ok ? "" : j(got) });
 
+// an absolute fee ceiling for the registry sink in these cells: 1000 gwei, far above any estimate here
+const FEE_CAP = 1_000_000_000_000n;
 // ---- keychain (injected runner: no real Keychain access in CI)
 {
   const ok = await readSecret("svc", "acct", (_c, args, _o, cb) => cb(null, "s3cret\n"));
@@ -80,6 +82,38 @@ const cell = (name, ok, got) => results.push({ name, ok: !!ok, got: ok ? "" : j(
     j(codes) === j(["op: error", "op: CALL_EXCEPTION", "op: error"]),
     codes
   );
+  {
+    // #411 review F4: classification itself never throws or rethrows the raw value
+    const getterThrows = Object.defineProperty(new Error("PLANTED_SECRET"), "code", {
+      get() {
+        throw new Error("PLANTED_SECRET from the getter");
+      },
+    });
+    const protoThrows = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error("PLANTED_SECRET from the trap");
+        },
+      }
+    );
+    const texts = [];
+    for (const e of [getterThrows, protoThrows]) {
+      try {
+        texts.push(safeText("op", e));
+        await guarded("op", async () => {
+          throw e;
+        });
+      } catch (x) {
+        texts.push(String(x?.message));
+      }
+    }
+    cell(
+      "F4: an error whose code getter or prototype trap throws is 'op: error', never rethrown raw",
+      j(texts) === j(["op: error", "op: error", "op: error", "op: error"]),
+      texts
+    );
+  }
   const pr = await readPrice(
     {
       async call() {
@@ -208,10 +242,13 @@ const srv = createServer(async (req, res) => {
     pump();
     return;
   } else if (req.url.startsWith("/tgecho")) {
-    // A hostile/buggy upstream that echoes the request path (with the token) everywhere.
+    // A hostile/buggy upstream that echoes the token everywhere. The echo is built from the test's
+    // own known token when the request carried it, not by reflecting req.url (CodeQL js/reflected-xss).
     res.statusCode = req.url.includes("500") ? 500 : 200;
+    res.setHeader("content-type", "application/json");
+    const echoed = req.url.includes("TOKSECRET") ? "/botTOKSECRET/sendMessage" : "/";
     return res.end(
-      JSON.stringify({ ok: false, error_code: 401, description: `bad ${req.url}`, path: req.url })
+      JSON.stringify({ ok: false, error_code: 401, description: `bad ${echoed}`, path: echoed })
     );
   } else if (req.url.startsWith("/tg/bot")) {
     const m = JSON.parse(body.toString());
@@ -608,8 +645,8 @@ try {
       }
     };
     cell(
-      "mirror: a push racing another writer is refused, then the retry lands on the new tip",
-      race1?.error &&
+      "mirror: a push racing another writer is refused as 'the branch moved', then the retry lands on the new tip",
+      /push: rejected \(the branch moved\)$/.test(race1?.error ?? "") &&
         race2.commit === remoteHead() &&
         g(bare, "rev-parse", `${race2.commit}^`) === theirs &&
         has(race2.commit, "records/b.json") &&
@@ -638,6 +675,27 @@ try {
         remoteHead() === tipBeforeHook, // nothing mirrored
       hk
     );
+    // #411 review F2: a push that exits 0 without updating the FETCHED branch (here: pushurl points
+    // at another repository) is caught by the read-back's ancestry check
+    {
+      const elsewhere = join(d, "elsewhere.git");
+      const clone2 = join(d, "clone2.git");
+      execFileSync("git", ["clone", "--quiet", "--bare", bare, elsewhere], { stdio: "pipe" });
+      execFileSync("git", ["clone", "--quiet", "--bare", bare, clone2], { stdio: "pipe" });
+      execFileSync("git", ["-C", clone2, "config", "remote.origin.pushurl", elsewhere]);
+      const m2 = gitMirror({ clone: clone2, repoUrl: "https://github.com/o/r" });
+      let pe = null;
+      try {
+        await m2.commit("records/bls/pushurl-only.json", rec, "pushurl");
+      } catch (e) {
+        pe = e.message;
+      }
+      cell(
+        "mirror: a push that lands elsewhere (pushurl != url) is 'not on the remote branch'",
+        /not on the remote branch/.test(pe ?? ""),
+        pe
+      );
+    }
   } finally {
     rmSync(d, { recursive: true, force: true });
   }
@@ -700,7 +758,15 @@ try {
   };
   const fees = { maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
   provider.getFeeData = async () => ({ ...fees });
-  const sink = registrySink({ provider, wallet: w, registry: REG, fromBlock: 0, roles });
+  const sink = registrySink({
+    chainId: 10,
+    maxFeePerGas: FEE_CAP,
+    provider,
+    wallet: w,
+    registry: REG,
+    fromBlock: 0,
+    roles,
+  });
   const args = {
     signed: {
       kind: 0,
@@ -732,6 +798,59 @@ try {
       t1.gasLimit === 120000n,
     { to: t1.to, nonce: t1.nonce, name: dec?.name }
   );
+  {
+    // #411 review F1: an absolute maxFeePerGas ceiling; a fee above it is refused, never sent
+    const capped = registrySink({
+      chainId: 10,
+      maxFeePerGas: 1200n,
+      provider,
+      wallet: w,
+      registry: REG,
+      fromBlock: 0,
+      roles,
+    });
+    const c0 = await capped.sign(args, { nonce: 4 }); // 1000 <= 1200
+    let capErr = null;
+    try {
+      await capped.sign(args, { nonce: 4, replace: true, prevRaw: c0.raw }); // 1250 > 1200
+    } catch (e) {
+      capErr = { code: e.code, message: e.message };
+    }
+    let noCap = null;
+    try {
+      registrySink({ chainId: 10, provider, wallet: w, registry: REG, fromBlock: 0, roles });
+    } catch (e) {
+      noCap = e.message;
+    }
+    cell(
+      "F1: a fee above the configured maxFeePerGas is refused (FEE_CAP); a sink without a cap is refused",
+      ethers.Transaction.from(c0.raw).maxFeePerGas === 1000n &&
+        capErr?.code === "FEE_CAP" &&
+        /maxFeePerGas/.test(noCap ?? ""),
+      { capErr, noCap }
+    );
+  }
+  {
+    // W2b Codex R8: a zero-tip original and a zero-tip estimate: every fee field still rises
+    fees.maxFeePerGas = 1000n;
+    fees.maxPriorityFeePerGas = 0n;
+    const z0 = await sink.sign(args, { nonce: 5 });
+    const z1 = await sink.sign(args, { nonce: 5, replace: true, prevRaw: z0.raw });
+    const t0 = ethers.Transaction.from(z0.raw);
+    const t1 = ethers.Transaction.from(z1.raw);
+    cell(
+      "R8: a replacement of a zero-tip tx raises both fee fields (tip 0 -> >= 1 wei)",
+      t0.maxPriorityFeePerGas === 0n &&
+        t1.maxPriorityFeePerGas >= 1n &&
+        t1.maxFeePerGas > t0.maxFeePerGas,
+      {
+        t0: [t0.maxFeePerGas, t0.maxPriorityFeePerGas].map(String),
+        t1: [t1.maxFeePerGas, t1.maxPriorityFeePerGas].map(String),
+      }
+    );
+    fees.maxFeePerGas = 1000n;
+    fees.maxPriorityFeePerGas = 100n;
+  }
   // Replacement fees come from the REPLACED tx, not from the current estimate (Codex R1 H4).
   const s0 = await sink.sign(args, { nonce: 3 });
   fees.maxFeePerGas = 500n; // the estimate FELL since the original was sent
@@ -799,6 +918,8 @@ try {
     refusals
   );
   const leaky = registrySink({
+    chainId: 10,
+    maxFeePerGas: FEE_CAP,
     provider: {
       async call() {
         throw Object.assign(new Error("request to https://rpc.example/v2/RPCSECRET failed"), {
@@ -848,6 +969,8 @@ try {
     ],
   ]);
   const uriSink = registrySink({
+    chainId: 10,
+    maxFeePerGas: FEE_CAP,
     provider: {
       async call() {
         return ethers.AbiCoder.defaultAbiCoder().encode(["bytes32"], [ethers.id("b")]);
@@ -879,9 +1002,20 @@ try {
     ["no guardians", { ...roles, guardians: [] }],
     ["no deployer", { ...roles, deployer: undefined }],
     ["bad owner", { ...roles, aggregatorOwner: "0x1234" }],
+    // #411 review F5: a zero address is unknown, not a role to compare against
+    ["zero guardian", { ...roles, guardians: [ethers.ZeroAddress] }],
+    ["zero deployer", { ...roles, deployer: ethers.ZeroAddress }],
   ]) {
     try {
-      registrySink({ provider, wallet: w, registry: REG, fromBlock: 0, roles: r });
+      registrySink({
+        chainId: 10,
+        maxFeePerGas: FEE_CAP,
+        provider,
+        wallet: w,
+        registry: REG,
+        fromBlock: 0,
+        roles: r,
+      });
       ctor[name] = "accepted";
     } catch (e) {
       ctor[name] = /unknown; refusing/.test(e.message) ? true : e.message;
@@ -895,6 +1029,8 @@ try {
   let gs = null;
   try {
     await registrySink({
+      chainId: 10,
+      maxFeePerGas: FEE_CAP,
       provider,
       wallet: w,
       registry: REG,
@@ -920,7 +1056,15 @@ try {
           throw err;
         },
       };
-      return registrySink({ provider: p, wallet: w, registry: REG, fromBlock: 0, roles });
+      return registrySink({
+        chainId: 10,
+        maxFeePerGas: FEE_CAP,
+        provider: p,
+        wallet: w,
+        registry: REG,
+        fromBlock: 0,
+        roles,
+      });
     };
     const known = await mk(
       Object.assign(new Error("x"), { error: { message: "already known" } })
@@ -980,6 +1124,8 @@ try {
     let calls = 0;
     try {
       await registrySink({
+        chainId: 10,
+        maxFeePerGas: FEE_CAP,
         provider,
         wallet: w,
         registry: REG,
@@ -1022,6 +1168,8 @@ try {
     [ethers.ZeroAddress, ethers.id("tx"), 100n, true, "0x" + "00".repeat(20), "u", ethers.id("r")],
   ]);
   const sink2 = registrySink({
+    chainId: 10,
+    maxFeePerGas: FEE_CAP,
     provider: {
       async getTransactionReceipt() {
         return {
@@ -1045,6 +1193,139 @@ try {
     "receipt: entryId from the registry's own Disclosed log; block hash carried for canonical()",
     rc.entryId === 9n && rc.blockHash === ethers.id("b50") && rc.status === 1,
     rc
+  );
+}
+
+// ---- #413 review N2: the registry signs only for the configured chain
+{
+  const REG2 = ethers.getAddress("0x" + "ac".repeat(20));
+  const w = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const prov = chain => ({
+    async getTransactionCount() {
+      return 1;
+    },
+    async getFeeData() {
+      return { maxFeePerGas: 1000n, maxPriorityFeePerGas: 100n };
+    },
+    async getNetwork() {
+      return { chainId: chain };
+    },
+    async estimateGas() {
+      return 100000n;
+    },
+  });
+  let missing = null;
+  try {
+    registrySink({
+      provider: prov(10n),
+      wallet: w,
+      registry: REG2,
+      fromBlock: 0,
+      roles,
+      maxFeePerGas: 10_000n,
+    });
+  } catch (e) {
+    missing = e.message;
+  }
+  const mk = chain =>
+    registrySink({
+      chainId: 10,
+      provider: prov(chain),
+      wallet: w,
+      registry: REG2,
+      fromBlock: 0,
+      roles,
+      currentRoles: async () => roles,
+      maxFeePerGas: 10_000n,
+    });
+  let other = null;
+  try {
+    await mk(11n).sign({
+      signed: {
+        kind: 0,
+        proposalId: 7n,
+        messageInputs: "0x1234",
+        signerMask: 3n,
+        signers: [ethers.getAddress("0x" + "d4".repeat(20))],
+        anchor: ethers.ZeroHash,
+      },
+      subjectToken: ethers.ZeroAddress,
+      txHash: ethers.id("tx"),
+      blockNumber: 100n,
+      rulesetCommit: "0x" + "ab".repeat(20),
+      recordURI: "ipfs://bafkreix",
+      recordHash: ethers.id("r"),
+    });
+  } catch (e) {
+    other = e.code ?? e.message;
+  }
+  cell(
+    "N2: no configured chainId refuses construction; an RPC on another chain refuses to sign (CHAIN)",
+    /chainId \(the configured chain\) is required/.test(missing ?? "") && other === "CHAIN",
+    { missing, other }
+  );
+}
+
+// ---- Codex W2c R23: no config string with credentials reaches a journal or Telegram
+{
+  const { PUBLIC_REPO_URL } = await import("./sinks/git-mirror.mjs");
+  const { telegramText } = await import("./lib/publish.mjs");
+  const { hostLabel } = await import("../../deploy/guardian-watcher/heartbeat.mjs");
+  const SENT = "private-TOKEN9z7q";
+  const bad = [
+    `https://user:${SENT}@github.com/o/r`,
+    `https://github.com/o/r?token=${SENT}`,
+    `https://github.com/o/r#${SENT}`,
+    `http://github.com/o/r`,
+    `https://${SENT}.example.com/o/r`,
+  ];
+  let refused = 0;
+  for (const u of bad) {
+    try {
+      gitMirror({ clone: "/nonexistent", repoUrl: u });
+    } catch (e) {
+      if (!String(e.message).includes(SENT)) refused++;
+    }
+  }
+  cell(
+    "R23#1: gitMirror refuses a repoUrl with user info, query, fragment, another scheme or host (without echoing it)",
+    refused === bad.length &&
+      PUBLIC_REPO_URL.test("https://github.com/AAStarCommunity/YetAnotherAA-Validator"),
+    { refused, of: bad.length }
+  );
+  // an already-journalled URL of another shape is not sent
+  const rec = {
+    route: "owner",
+    label: "l",
+    event: "e",
+    txHash: "0x1",
+    blockNumber: 1,
+    verdict: { reasons: [] },
+  };
+  const t1 = telegramText(rec, { cid: "bafk" }, { commit: "c0ffee0", url: bad[0] });
+  const t2 = telegramText(
+    rec,
+    { cid: "bafk" },
+    { commit: "c0ffee0", url: "https://github.com/o/r/blob/c0ffee0/a/b.json" }
+  );
+  cell(
+    "R23#1: Telegram carries a journalled mirror URL only in gitMirror's exact shape; otherwise the commit only",
+    !t1.includes(SENT) &&
+      t1.includes("mirror commit c0ffee0") &&
+      t2.includes("mirror https://github.com/o/r/blob/c0ffee0/a/b.json"),
+    { t1, t2 }
+  );
+  cell(
+    "R23#2: a heartbeat label that is not a plain identifier never reaches a message",
+    hostLabel({ label: `mini ${SENT}?x=1` }) === "invalid-label" &&
+      hostLabel({ label: "mac-mini.1" }) === "mac-mini.1" &&
+      /^[A-Za-z0-9.-]{1,40}$|^host$/.test(hostLabel({})),
+    [hostLabel({ label: `mini ${SENT}?x=1` }), hostLabel({})]
   );
 }
 

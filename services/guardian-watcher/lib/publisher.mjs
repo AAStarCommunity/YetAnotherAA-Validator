@@ -4,7 +4,7 @@
 // the writer's roles from chain, builds the sinks and delivers the run's alerts.
 import { mayPublish } from "./confirm.mjs";
 import { ethers } from "ethers";
-import { Store } from "./store.mjs";
+import { Store, atomicWriteJson } from "./store.mjs";
 import { publishRecord, PersistError } from "./publish.mjs";
 import { recordFile } from "./record-file.mjs";
 import { MAX_RECORD_BYTES } from "./cid.mjs";
@@ -23,6 +23,8 @@ export function isDone(rec, st, { pinners, cid, ignoreRegistry = false } = {}) {
   if (st.bytesChanged) return false;
   if (cid !== undefined && st.cid !== cid) return false;
   if (pinners && !pinners.every(n => st.pins?.[n]?.current)) return false;
+  // a pin not verified since a failed check is not done: it is retried (Codex W2c R20 #3)
+  if (uncheckedPin(st, pinners)) return false;
   if (rec.route !== "bls" || ignoreRegistry) return true; // owner route: repo + Telegram only
   return st.registry?.phase === "confirmed";
 }
@@ -33,6 +35,33 @@ const openIncident = st =>
   ((st?.registry?.phase === "conflict" || st?.registry?.phase === "reverted") &&
     !st.registry.ack) ||
   !!st?.bytesChanged;
+
+/**
+ * What still needs someone's attention in a journal, beyond stalls (Codex W2c R20): an unresolved
+ * incident, a final receipt whose entry was not visible, a pin not verified since a failed check.
+ * Kept in the record's schedule entry and counted store-wide until the journal no longer says so.
+ */
+export function attentionKind(pub, pinners) {
+  if (openIncident(pub)) return "incident";
+  if (pub?.registry?.phase === "landed" && pub.registry.inconsistentAt) return "inconsistent";
+  // a receipt without the Disclosed event, while the stage has not moved on (Codex W2c R21 #1)
+  const ph = pub?.registry?.phase;
+  if (pub?.registry?.noEventAt && (ph === "signed" || ph === "sent" || ph === "landed"))
+    return "inconsistent";
+  if (uncheckedPin(pub, pinners)) return "unverified";
+  return null;
+}
+/** A CONFIGURED provider's current pin whose last re-verification failed (Codex W2c R20 #3); an
+ * unconfigured provider is never retried, so it cannot hold the record (R21 #3). */
+function uncheckedPin(pub, pinners) {
+  const names = pinners ?? Object.keys(pub?.pins ?? {});
+  return names.some(n => pub?.pins?.[n]?.current && pub.pins[n].checkError);
+}
+const withAttention = (e, kind) => {
+  const { attention: _old, ...rest } = e ?? {};
+  void _old;
+  return kind ? { ...rest, attention: kind } : rest;
+};
 
 /** An acknowledged registry incident: the registry stage is parked; everything else still runs. */
 const parked = st =>
@@ -66,6 +95,57 @@ function recordIdOf(rec) {
  * others. `reverifyGen`: the open weekly reverify generation (a done record whose pins were not
  * yet re-checked in it runs again, with reverify), or null.
  */
+/**
+ * The disclose stalls of the WHOLE store (DSR): each record's stall (fee-capped, unfunded, or
+ * "unknown" when its journal is unreadable) is kept in that record's entry of the publication
+ * schedule, set whenever the record is read and written atomically with the rotation itself, so
+ * a stall and the cursor past it are persisted together or not at all (Codex W2c R13/R14: a
+ * separate index could be lost or go stale independently). A record outside a pass's batch keeps
+ * its entry. When the schedule is absent or unreadable the state is unknown until one complete
+ * sweep has read every record again: bounded by the pass budgets, never a full rebuild in one go.
+ */
+/** The stall a journal is in: none once the registry stage is final: confirmed (Codex W2c R12 #1)
+ * or a terminal incident (reverted / conflict never sign again and are reported as incidents; a
+ * fee cap left on them could never clear: R13 #2). */
+const NO_STALL_PHASES = new Set(["confirmed", "reverted", "conflict"]);
+export function stallKind(pub) {
+  const r = pub?.registry;
+  if (!r || NO_STALL_PHASES.has(r.phase)) return null;
+  if (r.feeCapped) return "feeCapped";
+  if (/INSUFFICIENT_FUNDS/.test(String(r.lastBroadcastError ?? ""))) return "insufficientFunds";
+  return null;
+}
+function countStalls(sched) {
+  const all = Object.values(sched?.entries ?? {}).map(e => e?.stall);
+  // unknown until the stall entries are known complete (stallsTracked, no pending sweep)
+  const unknown =
+    sched?.stallsTracked !== true || sched?.stallsNeed !== undefined || all.includes("unknown");
+  // records whose publication is failing (a stage that has not succeeded since, a run that threw,
+  // an unreadable file or journal): store-wide, until a retry succeeds (Codex W2c R19 #1)
+  const failing =
+    Object.values(sched?.entries ?? {}).filter(e => e?.failing === true || e?.stageFailed === true)
+      .length + Object.keys(sched?.badFiles ?? {}).length;
+  const att = Object.values(sched?.entries ?? {}).map(e => e?.attention);
+  return {
+    incidents: att.filter(k => k === "incident").length,
+    inconsistent: att.filter(k => k === "inconsistent").length,
+    unverified: att.filter(k => k === "unverified").length,
+    feeCapped: all.filter(k => k === "feeCapped").length,
+    insufficientFunds: all.filter(k => k === "insufficientFunds").length,
+    failing,
+    ...(unknown ? { unknown: true } : {}),
+  };
+}
+/** Store-wide counts from the schedule as last computed (in memory) or saved. */
+export function stallCounts(store) {
+  return countStalls(getSchedule(store));
+}
+const withStall = (e, kind) => {
+  const { stall: _old, ...rest } = e ?? {};
+  void _old;
+  return kind ? { ...rest, stall: kind } : rest;
+};
+
 export async function publishPending(
   store,
   sinks,
@@ -91,10 +171,26 @@ export async function publishPending(
     deferred: 0,
     unreadable: 0,
     held: 0,
+    feeCapped: 0, // a disclose tx whose replacement needs a fee above maxFeePerGas (#411 F1)
+    insufficientFunds: 0, // a disclose tx the writer cannot pay for (#411 F1)
   };
   const pinners = (sinks.pinners ?? []).map(p => p.name);
   const sched = getSchedule(store);
   const entries = { ...(sched.entries ?? {}) };
+  // Absent, unreadable or written before stalls were tracked: unknown until a sweep that began at
+  // the first name has completed (the same arithmetic as reverifyGenNeed: one more sweep when a
+  // traversal is already part-way through).
+  let stallsNeed = sched.stallsNeed;
+  // (an unreadable schedule is { unreadable: true }: not tracked either)
+  // A process's first pass also re-establishes them (Codex W2c R15 #2): saves lost before a
+  // restart (rotation kept only in memory) may cover any number of passes, so the saved stalls are
+  // not trusted until a sweep has re-read every record; within the budgets, marked unknown.
+  // (its own per-process set: publishPhase may save the schedule, and fill the memo, first)
+  if (sched.stallsTracked !== true || !stallsReconciling.has(store))
+    stallsNeed = (sched.sweeps ?? 0) + (sched.cursor ? 2 : 1);
+  stallsReconciling.add(store);
+  if (sched.unreadable)
+    alerts.push("publication schedule unreadable; stall state unknown until a full sweep");
   // A bounded batch of record files, in sorted order from the cursor (the last file read). A
   // SWEEP is one traversal from the first name to the last; it never wraps inside a batch, so a
   // completed sweep visited every file that existed throughout it (Codex W2c R4). Listing the names
@@ -108,6 +204,18 @@ export async function publishPending(
     start = k < 0 ? 0 : k;
   }
   const candidates = names.slice(start, start + maxParse);
+  const badFiles = { ...(sched.badFiles ?? {}) };
+  // a canonical file whose journal was never examined keeps the stall state unknown (Codex W2c
+  // R15 #3), keyed by its file name; retired with the file like any entry
+  const unknownFile = name => {
+    const nid = String(name).replace(/\.json$/, "");
+    // failing: alerted on its own, it does not hold a reverify generation open (#413 review F2)
+    if (/^[A-Za-z0-9-]{1,200}$/.test(nid))
+      entries[nid] = { ...withStall(entries[nid], "unknown"), failing: true };
+    // a file name that cannot be an id is kept apart, so its failure stays counted while it is
+    // outside later batches; cleared when it reads as a valid record or is gone (Codex W2c R21 #2)
+    else badFiles[String(name).slice(0, 300)] = true;
+  };
   const bad = [];
   const seenIds = new Set();
   const work = [];
@@ -122,24 +230,39 @@ export async function publishPending(
     let cid;
     try {
       rec = store.readRecordFile(name, 2 * MAX_RECORD_BYTES);
-      if (!rec?.verdict?.flagged) continue;
+      if (!rec?.verdict?.flagged) {
+        delete badFiles[String(name).slice(0, 300)];
+        // an unflagged record has no publication: drop any entry its file left (e.g. "unknown"
+        // while it was unreadable), so a repaired file settles the stalls and the generation
+        // (Codex W2c R16)
+        delete entries[String(name).replace(/\.json$/, "")];
+        continue;
+      }
       id = recordIdOf(rec);
       // the file name, the derived id and the stored id must agree, and one id is one record: a
       // restored copy under another name would run on a stale journal (Codex W2c R3)
       if (!id || name !== `${id}.json` || seenIds.has(id)) {
         bad.push(name);
+        unknownFile(name);
         continue;
       }
       seenIds.add(id);
+      delete badFiles[String(name).slice(0, 300)];
       counts.flagged++;
       try {
         prev = store.getPublication(id) ?? {};
       } catch {
-        // never reset: not published (nor signed for) until repaired by hand
+        // never reset: not published (nor signed for) until repaired by hand; its stall is unknown
+        entries[id] = { ...withStall(entries[id], "unknown"), failing: true };
         counts.failed++;
         alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
         continue;
       }
+      // every record read is refreshed from its journal, deferred ones included (Codex W2c R15 #1)
+      entries[id] = withAttention(
+        withStall(entries[id], stallKind(prev)),
+        attentionKind(prev, pinners)
+      );
       try {
         cid = recordFile(rec).cid;
       } catch {
@@ -158,6 +281,7 @@ export async function publishPending(
       }
     } catch {
       bad.push(name);
+      unknownFile(name);
       continue;
     }
     // Registered before any limit applies, so a deferred or newly found record still counts
@@ -168,7 +292,8 @@ export async function publishPending(
     if (!reverify && isDone(rec, prev, { pinners, cid, ignoreRegistry: isParked })) {
       if (isParked) counts.parked++;
       else counts.done++;
-      entries[id] = { ...e, done: true };
+      // its stall was refreshed from prev above: a done record clears a stale one (W2c R12 #1)
+      entries[id] = { ...e, done: true, failing: false, stageFailed: false };
       if (openIncident(prev)) counts.incidents++;
       continue;
     }
@@ -178,7 +303,9 @@ export async function publishPending(
     counts.unreadable += bad.length;
     counts.failed += bad.length;
     alerts.push(
-      `${bad.length} record file(s) unreadable, oversized, duplicated or without a matching id; not published (first: ${bad.slice(0, 5).join(", ")})`
+      // a count only: a file name is the directory's content and may carry anything (a token
+      // pasted into a name), so it never reaches an alert, alerts-latest.json or Telegram (R22)
+      `${bad.length} record file(s) unreadable, oversized, duplicated or without a matching id; not published (see records/ on the host)`
     );
   }
   // Least recently run first (failures included), so a bounded pass rotates through a backlog.
@@ -197,6 +324,7 @@ export async function publishPending(
     try {
       prev = store.getPublication(id) ?? {};
     } catch {
+      entries[id] = { ...withStall(entries[id], "unknown"), failing: true };
       counts.failed++;
       alerts.push(`${id}: publication journal unreadable; record skipped, journal kept as is`);
       continue;
@@ -213,18 +341,36 @@ export async function publishPending(
       const stageFailed = (r.failures ?? []).length > 0;
       if (stageFailed) counts.failed++; // a sink failed or refused: the pass is not ok (R3)
       entries[id] = {
-        ...e,
+        ...withAttention(withStall(e, stallKind(r.state)), attentionKind(r.state, pinners)),
         lastRunAt: now(),
         done,
         failing: false,
+        // an unresolved stage failure stays on the record until a retry succeeds, so it counts
+        // store-wide while the record is outside later batches (Codex W2c R19 #1)
+        stageFailed: stageFailed && !done,
         // re-checked in this generation even if a stage failed: the failure is reported (ok =
         // false, alerts), and a broken provider must not hold every generation open
         ...(reverify ? { reverifiedGen: reverifyGen } : {}),
       };
       if (done) counts.done++;
       if (openIncident(r.state)) counts.incidents++;
+      // the two disclose stalls the watcher must report as degraded, store-wide (DSR)
+      if (r.state.registry?.feeCapped) counts.feeCapped++;
+      if (/INSUFFICIENT_FUNDS/.test(String(r.state.registry?.lastBroadcastError ?? "")))
+        counts.insufficientFunds++;
     } catch (err) {
-      entries[id] = { ...e, lastRunAt: now(), failing: true }; // a failure still rotates (R2)
+      // a failure still rotates (R2); the stall is what the journal now says (it may have advanced
+      // before the failure), unknown if it cannot be read
+      let kind;
+      let att = e.attention ?? null;
+      try {
+        const cur = store.getPublication(id);
+        kind = stallKind(cur);
+        att = attentionKind(cur, pinners);
+      } catch {
+        kind = "unknown";
+      }
+      entries[id] = { ...withAttention(withStall(e, kind), att), lastRunAt: now(), failing: true };
       counts.failed++;
       if (err instanceof PersistError) {
         alerts.push(`${id}: ${err.message}; publication pass stopped`);
@@ -238,6 +384,7 @@ export async function publishPending(
   // listing (an orphan must not hold a generation open; a live record keeps its state: R4).
   const listed = new Set(names);
   for (const id of Object.keys(entries)) if (!listed.has(`${id}.json`)) delete entries[id];
+  for (const n of Object.keys(badFiles)) if (!listed.has(n)) delete badFiles[n];
   // The traversal advances by the files actually read; reaching the last name completes it.
   const lastRead = candidates[read - 1] ?? null;
   const reachedEnd = start + read >= names.length;
@@ -248,7 +395,19 @@ export async function publishPending(
   }
   const { sweep: _oldSweep, ...rest } = sched;
   void _oldSweep;
-  const next = { ...rest, cursor, entries, sweeps };
+  const { unreadable: _u, ...kept } = rest;
+  void _u;
+  const { stallsNeed: _n, badFiles: _b, ...kept2 } = kept;
+  (void _n, _b);
+  const next = {
+    ...kept2,
+    cursor,
+    entries,
+    sweeps,
+    stallsTracked: true,
+    ...(Object.keys(badFiles).length ? { badFiles } : {}),
+    ...(stallsNeed !== undefined && sweeps < stallsNeed ? { stallsNeed } : {}),
+  };
   const reverifyRemaining =
     reverifyGen === null
       ? 0
@@ -258,12 +417,14 @@ export async function publishPending(
     counts.failed++;
     alerts.push("publication schedule not saved; rotation kept in memory, retried next pass");
   }
-  return { alerts, counts, stopped, reverifyRemaining, sweeps };
+  return { alerts, counts, stopped, reverifyRemaining, sweeps, stalls: countStalls(next) };
 }
 
 // The schedule as last computed in this process, so a failing schedule write keeps rotation fair
 // in memory while it is retried (Codex W2c R3).
 const scheduleMemo = new WeakMap();
+// the stores whose stalls this process has started re-establishing (Codex W2c R15 #2)
+const stallsReconciling = new WeakSet();
 function getSchedule(store) {
   return scheduleMemo.get(store) ?? store.getSchedule();
 }
@@ -461,6 +622,17 @@ export async function publishPhase(
   // is registered and re-checked, whatever the bounded batches had reached). A record added later
   // is not done, so it needs no re-check: it is published by the normal path when reached.
   const schedFailures = []; // generation-transition schedule writes that failed (Codex W2c R4)
+  // an unreadable alerts.json must not abort every pass (#413 review B1): it only holds the digest
+  // dedupe and lastReverifyAt, so it is reset (a digest may repeat, a re-check may run early),
+  // alerted, and the pass is not ok. If the reset fails too, the pass throws and is degraded.
+  let alertStateReset = false;
+  try {
+    store.getAlertState();
+  } catch {
+    store.putAlertState({});
+    alertStateReset = true;
+    alerts.push("alert state (alerts.json) was unreadable; reset");
+  }
   const meta = store.getAlertState() ?? {};
   let gen = getSchedule(store).reverifyGen ?? null;
   if (gen === null && now - (meta.lastReverifyAt ?? 0) >= p.reverifyEveryMs) {
@@ -515,6 +687,7 @@ export async function publishPhase(
   return {
     ...out,
     ...res.counts,
+    stalls: res.stalls, // store-wide (DSR), not this batch's counts
     failed: res.counts.failed + schedFailures.length,
     stopped: res.stopped,
     reverifying: gen !== null && !reverified ? { gen, remaining: res.reverifyRemaining } : null,
@@ -528,6 +701,7 @@ export async function publishPhase(
       res.counts.failed === 0 &&
       !schedFailures.length &&
       !out.registrySkipped &&
+      !alertStateReset &&
       deliveredOk,
   };
 }

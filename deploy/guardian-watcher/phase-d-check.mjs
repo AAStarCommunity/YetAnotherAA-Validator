@@ -47,8 +47,9 @@ const results = [];
 // every line of the report passes through here: a URL-like fragment (an honest mistake such as an
 // RPC URL pasted into an operator label) is replaced, never printed (Codex, #408 review of M0 §5.5)
 const URLISH = /[a-z][a-z0-9+.-]*:\/\/\S*/gi;
-const add = (id, status, detail) =>
-  results.push({ id, status, detail: String(detail ?? "").replace(URLISH, "(a URL: not shown)") });
+// both channels: the id interpolates config values too (launchd labels, container names), #408 N1
+const scrub = v => String(v ?? "").replace(URLISH, "(a URL: not shown)");
+const add = (id, status, detail) => results.push({ id: scrub(id), status, detail: scrub(detail) });
 const placeholder = v =>
   v === undefined || v === null || v === "" || (typeof v === "string" && /^<.*>$/.test(v));
 const expand = p => (typeof p === "string" && p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -106,6 +107,34 @@ else {
       wcfg = loadConfig(p);
       accessSync(wcfg.dataDir, constants.W_OK);
       add("watcher-config", "PASS", "valid; dataDir writable");
+      // the watcher that runs must publish, through the very keystore and Keychain items this
+      // check verifies (Codex W2c R11): a disabled or differently configured publisher passes nothing
+      try {
+        const { publishConfig } = await import(join(W, "lib/sinks-config.mjs"));
+        const pc = wcfg.publish?.enabled === true ? publishConfig(wcfg.publish) : null;
+        const ks = cfg.sender?.keystore;
+        const problems = [];
+        if (!pc) problems.push("publication is not enabled in the watcher config");
+        else {
+          if (placeholder(ks) || resolve(expand(pc.registry.keystore)) !== resolve(expand(ks)))
+            problems.push("the watcher's registry.keystore is not sender.keystore");
+          if (pc.registry.service !== cfg.keychain?.services?.keystorePassword)
+            problems.push(
+              "the watcher's keystore password item is not keychain.services.keystorePassword"
+            );
+          if (pc.keychainAccount !== cfg.keychain?.account)
+            problems.push("the watcher's keychainAccount is not keychain.account");
+        }
+        add(
+          "watcher-publish",
+          problems.length ? "FAIL" : "PASS",
+          problems.length
+            ? problems.join("; ")
+            : "publication enabled, bound to this sender and Keychain"
+        );
+      } catch {
+        add("watcher-publish", "FAIL", "the watcher's publish config does not validate");
+      }
     } catch {
       add(
         "watcher-config",
