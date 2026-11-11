@@ -1,9 +1,11 @@
-// Phase D "watcher-job-binding" predicate (Codex R6, R7): is the running launchd job exactly the
-// configured wrapper, and does that wrapper run the watcher with this config and the RPC URLs from
-// the very Keychain items Phase D verified? Pure: launchctl output and the wrapper text come in.
+// Phase D "watcher-job binding" predicate (Codex R6, R7, R8): is the running launchd job exactly the
+// configured wrapper, and is that wrapper byte-for-byte this checkout's run-watcher.sh template with
+// only its two placeholders filled (config = Phase D's watcherConfig, entry = this checkout's
+// watcher.mjs)? Text matching line by line is not enough (R8: an `exec sleep` before the expected
+// lines, a here-document around them, or a later reassignment all kept matching), so the wrapper must
+// EQUAL the canonical rendering. The template reads the RPC URLs from fixed Keychain items; the
+// Phase D config must name those same items. Pure: launchctl output, file texts and paths come in.
 // Self-test: node deploy/guardian-watcher/check-phase-d-binding.mjs
-
-const reEsc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** program and argv as `launchctl print` shows them. */
 export function parseLaunchd(out) {
@@ -16,19 +18,49 @@ export function parseLaunchd(out) {
   return { program, argv };
 }
 
+// a value placed between double quotes in the wrapper: no shell expansion, no quote, no newline
+const SAFE_PATH = /^\/[A-Za-z0-9._\-/ ]+$/;
+
+/** The wrapper Phase D accepts, or null when a value cannot be placed safely. */
+export function canonicalWrapper(template, { config, entry }) {
+  if (!SAFE_PATH.test(config ?? "") || !SAFE_PATH.test(entry ?? "")) return null;
+  // only the two assignment lines are filled; every other byte (comments included) stays the template's
+  const C = 'WATCHER_CONFIG="__WATCHER_CONFIG__"';
+  const E = 'WATCHER_ENTRY="__WATCHER_ENTRY__"';
+  const lines = template.split("\n");
+  if (lines.filter(l => l === C).length !== 1 || lines.filter(l => l === E).length !== 1)
+    return null;
+  return lines
+    .map(l => (l === C ? `WATCHER_CONFIG="${config}"` : l === E ? `WATCHER_ENTRY="${entry}"` : l))
+    .join("\n");
+}
+
+/** The Keychain service names the template reads, in order (RPC_URL, RPC_URL_2), and its account. */
+export function templateKeychain(template) {
+  const m = [
+    ...template.matchAll(
+      /^(RPC_URL|RPC_URL_2)="\$\(security find-generic-password -s ([A-Za-z0-9._-]+) -a ([A-Za-z0-9._-]+) -w\)"$/gm
+    ),
+  ];
+  const a = m.find(x => x[1] === "RPC_URL");
+  const b = m.find(x => x[1] === "RPC_URL_2");
+  if (m.length !== 2 || !a || !b || a[3] !== b[3]) return null;
+  return { rpcPrimary: a[2], rpcSecondary: b[2], account: a[3] };
+}
+
 /**
  * @returns {string[]} problems, empty when bound. Fixed wording; nothing from the inputs is echoed.
- * ok(v) says a config value is set (not a placeholder).
  */
 export function bindingProblems({
   program,
   argv,
   wrapper,
   text,
+  template,
   wantConfig,
+  wantEntry,
   services,
   account,
-  ok,
 }) {
   const problems = [];
   // the executable AND the whole argument list form one allowed invocation (Codex R7 #1): the
@@ -41,30 +73,30 @@ export function bindingProblems({
     (argv[0] === "/bin/bash" || argv[0] === "bash") &&
     argv[1] === wrapper;
   if (!direct && !viaBash) problems.push("the job does not run exactly the configured wrapper");
-  if (text === null || text === undefined) {
+  if (typeof template !== "string") {
+    problems.push("this checkout's run-watcher.sh template unreadable");
+    return problems;
+  }
+  // the Phase D config names the very Keychain items the template reads (Codex R7 #2)
+  const kc = templateKeychain(template);
+  if (
+    !kc ||
+    services?.rpcPrimary !== kc.rpcPrimary ||
+    services?.rpcSecondary !== kc.rpcSecondary ||
+    account !== kc.account
+  )
+    problems.push("Phase D's RPC Keychain items are not the ones the wrapper reads");
+  if (typeof text !== "string") {
     problems.push("wrapper unreadable");
     return problems;
   }
-  if (!wantConfig || !text.includes(`WATCHER_CONFIG="${wantConfig}"`))
-    problems.push("wrapper names another config than watcherConfig");
-  // the wrapper reads the SAME Keychain items Phase D tested (Codex R7 #2), each into its own
-  // variable: built from the configured services and account, so a Phase D config pointing at other
-  // items than the wrapper reads cannot pass
-  const reads = (v, svc) =>
-    ok(svc) &&
-    ok(account) &&
-    new RegExp(
-      `^${v}="\\$\\(security find-generic-password -s ${reEsc(svc)} -a ${reEsc(account)} -w\\)"$`,
-      "m"
-    ).test(text);
-  if (!reads("RPC_URL", services?.rpcPrimary) || !reads("RPC_URL_2", services?.rpcSecondary))
+  // the whole wrapper is the canonical rendering (Codex R8 #1, #2): config AND entry bound
+  const want = canonicalWrapper(template, { config: wantConfig, entry: wantEntry });
+  if (want === null)
+    problems.push("watcherConfig or the watcher entry cannot be placed in the wrapper");
+  else if (text !== want)
     problems.push(
-      "wrapper does not read both RPC URLs from the Keychain items this check verified"
+      "wrapper is not this checkout's run-watcher.sh with watcherConfig and this checkout's watcher.mjs"
     );
-  if ((text.match(/security find-generic-password/g) ?? []).length !== 2)
-    problems.push("wrapper reads more Keychain items than the two RPC URLs");
-  if (/https?:\/\//i.test(text)) problems.push("wrapper holds a URL");
-  if (!/^exec node "\$WATCHER_ENTRY" --config "\$WATCHER_CONFIG"$/m.test(text))
-    problems.push("wrapper does not exec the watcher with that config");
   return problems;
 }

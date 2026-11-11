@@ -239,9 +239,9 @@ for (const label of ld.mustBeOn ?? []) {
   }
 }
 
-// ---- 4b. the running watcher job IS this deployment (Codex R6): its program is the configured
-// wrapper (run-watcher.sh), which names the same config and entry, reads exactly the two Keychain RPC
-// services and holds no URL; and the job's arguments are only that wrapper. Nothing is printed.
+// ---- 4b. the running watcher job IS this deployment (Codex R6-R8): it runs exactly the configured
+// wrapper, and that wrapper is byte-for-byte this checkout's run-watcher.sh with watcherConfig and
+// this checkout's watcher.mjs filled in (phase-d-binding.mjs). Nothing is printed.
 {
   const out = launchdOut.get("ai.aastar.aoa-watcher");
   const wrapper = placeholder(ld.watcherWrapper) ? null : resolve(expand(ld.watcherWrapper));
@@ -260,15 +260,23 @@ for (const label of ld.mustBeOn ?? []) {
     } catch {
       text = null;
     }
+    let template = null;
+    try {
+      template = readFileSync(join(HERE, "run-watcher.sh"), "utf8");
+    } catch {
+      template = null;
+    }
+    // the entry is this checkout's watcher, the same one whose loadConfig validated watcherConfig
     const problems = bindingProblems({
       program,
       argv,
       wrapper,
       text,
+      template,
       wantConfig,
+      wantEntry: join(W, "watcher.mjs"),
       services: kc.services,
       account: kcAccount,
-      ok: v => !placeholder(v),
     });
     add(
       "watcher-job-binding",
