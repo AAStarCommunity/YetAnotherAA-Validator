@@ -38,7 +38,7 @@ import {
 } from "./lib/scan.mjs";
 import { bloomOf, mayHaveLog } from "./lib/bloom.mjs";
 import { Store, writeAll, validAmendment, atomicWriteJson, boundReasons } from "./lib/store.mjs";
-import { runOnce, rulesetIdentity, traceHealth } from "./watcher.mjs";
+import { runOnce, rulesetIdentity, traceHealth, loadConfig } from "./watcher.mjs";
 import {
   attributeLogs,
   flattenTraceLogs,
@@ -5044,6 +5044,62 @@ try {
       nul.length === 1 &&
       /^0x[0-9a-f]{64}$/.test(nul[0].rawSha256 ?? ""),
     { n1: w1.length, w1, n3: w3.length, nul: nul.map(x => [x.raw?.slice?.(0, 20), x.rawLength]) }
+  );
+}
+
+// ---- config: maxLagBlocks / maxTickFraction are validated; a non-array eth_getLogs answer fails
+// the tick (cursor unchanged), never treated as an empty range
+{
+  const d = mkdtempSync(join(tmpdir(), "guardian-watcher-cfg-"));
+  const p = join(d, "c.json");
+  const baseCfg = { aggregator: AGG, dataDir: d, startBlock: 1, roles: { superPaymaster: SP } };
+  const tryCfg = extra => {
+    writeFileSync(p, JSON.stringify({ ...baseCfg, ...extra }));
+    try {
+      return loadConfig(p);
+    } catch (e) {
+      return { error: e.message };
+    }
+  };
+  const ok = tryCfg({});
+  const bads = [
+    { maxLagBlocks: 0 },
+    { maxLagBlocks: 1.5 },
+    { maxTickFraction: 0 },
+    { maxTickFraction: "0.5" },
+    { maxTickFraction: 11 },
+  ].map(tryCfg);
+  const good = tryCfg({ maxLagBlocks: 10, maxTickFraction: 0.25 });
+  // a node answering eth_getLogs with an object, not an array
+  const c = makeChain();
+  const cfg = {
+    aggregator: AGG,
+    roles: { superPaymaster: SP },
+    forwarders: FORWARDERS,
+    startBlock: c.head() + 1,
+    maxBlocksPerTick: 1000,
+    page: 5000,
+  };
+  for (let i = 0; i < 4; i++) c.mine();
+  const odd = Object.create(c.chain);
+  odd.send = async (m, params) => (m === "eth_getLogs" ? { length: 0 } : c.chain.send(m, params));
+  const store = new Store(join(d, "s"));
+  const ident = { commit: "0".repeat(40), hash: ethers.id("ruleset"), verified: true };
+  const st = (await runOnce(odd, cfg, store, rs, ident)).status;
+  const cur = store.getCursor();
+  rmSync(d, { recursive: true, force: true });
+  cell(
+    "config: maxLagBlocks and maxTickFraction are validated (defaults 300 and 0.5); a non-array eth_getLogs answer fails the tick and leaves the cursor unset",
+    !ok.error &&
+      ok.maxLagBlocks === 300 &&
+      ok.maxTickFraction === 0.5 &&
+      bads.every(b => /config: (maxLagBlocks|maxTickFraction)/.test(b.error ?? "")) &&
+      good.maxLagBlocks === 10 &&
+      good.maxTickFraction === 0.25 &&
+      st.ok === false &&
+      /not an array/.test(st.lastError ?? "") &&
+      cur === null,
+    { ok, bads, good: [good.maxLagBlocks, good.maxTickFraction], st: [st.ok, st.lastError], cur }
   );
 }
 
