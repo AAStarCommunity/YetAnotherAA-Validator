@@ -28,11 +28,19 @@ import { LOCAL_ONLY } from "./record-file.mjs";
 
 /** Mismatches (the second provider reproduced something else) before a hold is final. */
 export const CONFIRM_MAX_ATTEMPTS = 10;
-/** Backoff after an unavailable answer: 60 s doubling per consecutive one, at most 1 h. */
+/** Backoff after an unavailable answer (60 s doubling per consecutive one) or a mismatch (doubling
+ * per mismatch), at most 1 h: the CONFIRM_MAX_ATTEMPTS-th mismatch comes at least
+ * finalAfterMismatchesMs() after the first. */
 export const CONFIRM_BACKOFF_BASE_MS = 60_000;
 export const CONFIRM_BACKOFF_MAX_MS = 3_600_000;
 /** Record files read per confirmation pass (like the publisher's bound), rotating. */
 export const CONFIRM_MAX_PARSE = 500;
+/** The least time from a hold's first mismatch to its CONFIRM_MAX_ATTEMPTS-th (it is final then). */
+export const finalAfterMismatchesMs = () => {
+  let t = 0;
+  for (let m = 1; m < CONFIRM_MAX_ATTEMPTS; m++) t += backoffMs(m);
+  return t;
+};
 export const backoffMs = streak =>
   Math.min(CONFIRM_BACKOFF_MAX_MS, CONFIRM_BACKOFF_BASE_MS * 2 ** Math.max(0, streak - 1));
 
@@ -303,7 +311,14 @@ export async function confirmPending(
       attempts: num(base?.attempts) + 1,
       mismatches,
       unavailableStreak,
-      ...(r.state === "unavailable" ? { nextAttemptAt: nowMs + backoffMs(unavailableStreak) } : {}),
+      // both kinds of failure back off (#422 re-review L1): an unavailable answer by its streak, a
+      // mismatch by the mismatch count, so CONFIRM_MAX_ATTEMPTS mismatches take hours (a provider's
+      // transient inconsistency is not made final within minutes)
+      ...(r.state === "unavailable"
+        ? { nextAttemptAt: nowMs + backoffMs(unavailableStreak) }
+        : r.state === "mismatch" && state !== "unconfirmed-final"
+          ? { nextAttemptAt: nowMs + backoffMs(mismatches) }
+          : {}),
       lastResult: r.state,
       ...(r.fields ? { fields: r.fields } : {}),
       ...(r.reason ? { reason: r.reason } : {}),

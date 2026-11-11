@@ -503,17 +503,21 @@ aggregator-only.
   bypass) re-fetches every accusatory record's tx from a second, independently
   operated RPC (a different provider) and holds the record as unconfirmed unless
   both agree; records that confirm no violation are exempt. A disagreement makes
-  the watcher degraded at once and counts toward a cap of 10 mismatches, after
-  which the hold is final and is re-armed only by hand (`rearm-hold.mjs`,
-  journalled). An unavailable second provider never counts toward the cap: the
-  record is retried with a persisted backoff of at most one hour, for as long as
-  it takes, and the watcher is degraded from the second consecutive unavailable
-  attempt. The published record is exactly the content the second provider
-  confirmed (local diagnosis fields stay local). Holds, status and alerts name
-  the second provider only by its declared operator label (`secondProvider`),
-  never by URL or hostname: some providers put the API key in a subdomain, so a
-  hostname can be a secret. Comparing several independent RPCs on every scan is
-  backlog after 5.5.0.
+  the watcher degraded at once and counts toward a cap of 10 mismatches, retried
+  with the same backoff (so the tenth comes about four hours after the first,
+  not within minutes), after which the hold is final and is re-armed only by
+  hand (`rearm-hold.mjs`, journalled). An unavailable second provider never
+  counts toward the cap: the record is retried with a persisted backoff of at
+  most one hour, for as long as it takes, and the watcher is degraded from the
+  second consecutive unavailable attempt. The published record is exactly the
+  content the second provider confirmed (local diagnosis fields stay local).
+  This applies to every record, including those that accuse nobody: an
+  UNREADABLE or quarantine record's `lastReasons`, often its only specific
+  explanation, stays in the local store and is not published. Holds, status and
+  alerts name the second provider only by its declared operator label
+  (`secondProvider`), never by URL or hostname: some providers put the API key
+  in a subdomain, so a hostname can be a secret. Comparing several independent
+  RPCs on every scan is backlog after 5.5.0.
 
 #### 5.2b Dead letters, exhaustion and read integrity
 

@@ -31,6 +31,7 @@ import {
   CONFIRM_MAX_ATTEMPTS,
   CONFIRM_BACKOFF_MAX_MS,
   backoffMs,
+  finalAfterMismatchesMs,
   viewDigest,
 } from "./lib/confirm.mjs";
 
@@ -839,6 +840,44 @@ async function scenario(build) {
       rmSync(d, { recursive: true, force: true });
     }
   }
+  // #422 re-review L1 (DSR): mismatches back off too, so a hold cannot become final within minutes;
+  // a pass every minute reaches final no earlier than finalAfterMismatchesMs() after the first one
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-mmbo-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const mm = async (second, c, temp) => {
+        temp.putRecord({ ...bls, signerMask: "1" });
+        return { status: { ok: true, cursor: c.startBlock } };
+      };
+      const t0 = 1_000_000;
+      let finalAt = null;
+      let runs = 0;
+      for (let t = t0; t <= t0 + 6 * 3_600_000 && finalAt === null; t += 60_000) {
+        const c = await confirmPending(store, {}, "s", { startBlock: 0 }, null, null, {
+          runOnce: mm,
+          now: t,
+        });
+        runs += c.checked;
+        if (getHold(store, Store.recordId(bls))?.state === "unconfirmed-final") finalAt = t;
+      }
+      cell(
+        "L1: with a pass every minute, 10 mismatches make the hold final no earlier than ~4 h after the first (not within 10 minutes)",
+        finalAt !== null &&
+          finalAt - t0 >= finalAfterMismatchesMs() &&
+          finalAfterMismatchesMs() >= 3 * 3_600_000 &&
+          runs === CONFIRM_MAX_ATTEMPTS,
+        {
+          finalAfterMin: finalAt && (finalAt - t0) / 60_000,
+          bound: finalAfterMismatchesMs() / 60_000,
+          runs,
+        }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
   // only mismatches make a hold final; re-arming it is a journalled, refused-unless-final step
   {
     const d = mkdtempSync(join(tmpdir(), "drpc2-final-"));
@@ -850,10 +889,14 @@ async function scenario(build) {
         return { status: { ok: true, cursor: c.startBlock } };
       };
       let c;
-      for (let i = 0; i < CONFIRM_MAX_ATTEMPTS; i++)
+      let now = 1_000_000;
+      for (let i = 0; i < CONFIRM_MAX_ATTEMPTS; i++) {
         c = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
           runOnce: mm,
+          now,
         });
+        now += 2 * CONFIRM_BACKOFF_MAX_MS; // past the mismatch backoff
+      }
       const id = Store.recordId(bls);
       const h = getHold(store, id);
       const { refusal, rearmed } = await import("../../deploy/guardian-watcher/rearm-hold.mjs");
@@ -1321,6 +1364,116 @@ async function scenario(build) {
       !/RPC_URL_2\)\.hostname/.test(src),
     null
   );
+}
+
+// ---- #422 re-review I5 (DSR): the rearm-hold CLI itself: refused, re-armed (journalled), and
+// refused while the watcher's lock is held
+{
+  const { spawnSync, spawn } = await import("node:child_process");
+  const { createServer } = await import("node:net");
+  const { writeFileSync, mkdirSync } = await import("node:fs");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const cli = join(here, "../../deploy/guardian-watcher/rearm-hold.mjs");
+  const port = await new Promise(res => {
+    const srv = createServer().listen(0, "127.0.0.1", () => {
+      const p = srv.address().port;
+      srv.close(() => res(p));
+    });
+  });
+  const d = mkdtempSync(join(tmpdir(), "drpc2-cli-"));
+  let holder = null;
+  const reap = async c => {
+    if (!c || c.exitCode !== null || c.signalCode !== null) return;
+    c.kill("SIGKILL");
+    await new Promise(res => {
+      const t = setTimeout(res, 5_000);
+      c.once("exit", () => (clearTimeout(t), res()));
+    });
+  };
+  try {
+    for (const sub of ["holds", "records", "publications"])
+      mkdirSync(join(d, "data", sub), { recursive: true });
+    const id = `bls-SLASH-${"7".padStart(64, "0")}`;
+    const A = "0x" + "ab".repeat(20);
+    const cfgPath = join(d, "cfg.json");
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        chainId: 11155111,
+        aggregator: A,
+        roles: { superPaymaster: A },
+        startBlock: 0,
+        dataDir: join(d, "data"),
+        lockPort: port,
+      })
+    );
+    const holdPath = join(d, "data", "holds", `${id}.json`);
+    const run = () =>
+      spawnSync(
+        process.execPath,
+        [cli, "--config", cfgPath, "--id", id, "--reason", "fixed the provider"],
+        {
+          encoding: "utf8",
+          timeout: 30_000,
+        }
+      );
+    writeFileSync(holdPath, JSON.stringify({ id, state: "unconfirmed", mismatches: 3 }));
+    const refused = run();
+    writeFileSync(
+      holdPath,
+      JSON.stringify({
+        id,
+        state: "unconfirmed-final",
+        mismatches: 10,
+        attempts: 12,
+        lastResult: "mismatch",
+      })
+    );
+    // the watcher's lock held by another process: refused, nothing written. The holder is bounded:
+    // ready within 10 s or the cell fails, and it is always killed and reaped (finally below)
+    holder = spawn(
+      process.execPath,
+      ["-e", `require("net").createServer().listen(${port},"127.0.0.1",()=>console.log("up"))`],
+      { stdio: ["ignore", "pipe", "ignore"] }
+    );
+    const ready = await new Promise(res => {
+      const t = setTimeout(() => res(false), 10_000);
+      holder.stdout.once("data", () => (clearTimeout(t), res(true)));
+      holder.once("exit", () => (clearTimeout(t), res(false)));
+      holder.once("error", () => (clearTimeout(t), res(false)));
+    });
+    const locked = ready ? run() : { status: null, stderr: "lock holder not ready" };
+    await reap(holder);
+    holder = null;
+    const heldAfterLock = JSON.parse(readFileSync(holdPath, "utf8")).state;
+    const ok = run();
+    const hold = JSON.parse(readFileSync(holdPath, "utf8"));
+    const journal = JSON.parse(readFileSync(join(d, "data", "publications", `${id}.json`), "utf8"));
+    cell(
+      "I5: the rearm-hold CLI refuses a non-final hold (exit 1), refuses while the watcher's lock is held (exit 2, nothing changed), and re-arms a final hold (exit 0, hold reset, journal applied)",
+      refused.status === 1 &&
+        /only an unconfirmed-final hold/.test(refused.stderr) &&
+        locked.status === 2 &&
+        /the watcher is running/.test(locked.stderr) &&
+        heldAfterLock === "unconfirmed-final" &&
+        ok.status === 0 &&
+        hold.state === "unconfirmed" &&
+        hold.mismatches === 0 &&
+        hold.rearmed?.at(-1)?.before?.state === "unconfirmed-final" &&
+        journal.holdRearms?.at(-1)?.applied === true &&
+        journal.holdRearms.at(-1).reason === "fixed the provider",
+      {
+        refused: [refused.status, refused.stderr],
+        locked: [locked.status, locked.stderr],
+        ok: [ok.status, ok.stderr],
+        hold: hold.state,
+        journal: journal.holdRearms,
+      }
+    );
+  } finally {
+    await reap(holder);
+    rmSync(d, { recursive: true, force: true });
+  }
 }
 
 let failed = 0;
