@@ -3622,12 +3622,13 @@ const good = {
       const pb = await pass(x.store, back);
       const jb = x.store.getPublication(id);
       cell(
-        "B2-A(j): switched back to the old registry while waiting, the wait marker clears and the old stage resumes as current: no fresh signature, no nonce-wait, not migrating",
+        "B2-A(j): switched back to the old registry while waiting, the wait marker clears and the old stage resumes as current (its own tx rebroadcast to the old registry, no fresh signature), no nonce-wait, not migrating",
         waited === 5 &&
           !jb.registryWait &&
           jb.registry.at?.address === OLD &&
           jb.registry.hash === x.old.hash &&
           back.calls.sign === 0 &&
+          (back.calls.raws ?? []).includes(x.old.raw) &&
           pb.stalls.nonceWait === 0 &&
           pb.stalls.migrating === 0,
         {
