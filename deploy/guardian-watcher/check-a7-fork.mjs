@@ -74,6 +74,20 @@ const pre = o => preflight({ ...H, forkUrl: FORK, ...o });
   );
 }
 {
+  // declared tightenings over the inline code: a null chain id is no answer (exit 3; it was 1);
+  // a head that is not a hex quantity is refused (a non-numeric one used to pass: NaN < n is false)
+  const nullChain = await pre({ rpc: rpcOf({ chain: null }).rpc });
+  const decimalHead = await pre({ rpc: rpcOf({ head: "1000" }).rpc });
+  const junkHead = await pre({ rpc: rpcOf({ head: "latest" }).rpc });
+  cell(
+    "F2 (declared): a null chain id is no verdict (exit 3); a decimal or non-numeric head is STOP",
+    nullChain?.code === EXIT.NO_VERDICT &&
+      decimalHead?.code === EXIT.STOP &&
+      junkHead?.code === EXIT.STOP,
+    { nullChain, decimalHead, junkHead }
+  );
+}
+{
   const below = await pre({ rpc: rpcOf({ head: "0x3e7" }).rpc }); // 999 < 1000
   const at = await pre({ rpc: rpcOf({ head: "0x3e8" }).rpc }); // 1000
   const none = await pre({ rpc: rpcOf({ head: undefined }).rpc });
@@ -178,6 +192,28 @@ const sleep = async () => {};
   cell("N1: anvil exiting while the port answers: not up", up === false, up);
 }
 {
+  // a child killed by a signal keeps exitCode null and sets signalCode (Codex M1 R1)
+  let pinged = 0;
+  const killed = await waitForAnvil({
+    proc: { exitCode: null, signalCode: "SIGTERM" },
+    sleep,
+    ping: async () => void pinged++,
+  });
+  const proc = { exitCode: null, signalCode: null };
+  const late = await waitForAnvil({
+    proc,
+    sleep,
+    ping: async () => {
+      proc.signalCode = "SIGKILL";
+    },
+  });
+  cell(
+    "N1: an anvil killed by a signal is never up (before or while the port answers)",
+    killed === false && pinged === 0 && late === false,
+    { killed, pinged, late }
+  );
+}
+{
   const up = await waitForAnvil({
     proc: { exitCode: null },
     sleep,
@@ -211,26 +247,34 @@ const sleep = async () => {};
 // ---- the verdict and its exit code
 {
   const good = [{ ok: true }, { ok: true }];
-  const same = verdict({ cmp: good, unverified: [], anvilExitCode: null });
-  const exited = verdict({ cmp: good, unverified: [], anvilExitCode: 0 });
+  const live = { exitCode: null, signalCode: null };
+  const same = verdict({ cmp: good, unverified: [], anvil: live });
+  const exited = verdict({ cmp: good, unverified: [], anvil: { exitCode: 0, signalCode: null } });
+  const signalled = verdict({
+    cmp: good,
+    unverified: [],
+    anvil: { exitCode: null, signalCode: "SIGTERM" },
+  });
   const bad = verdict({
     cmp: [{ ok: true }, { path: "x", ok: false }],
     unverified: [],
-    anvilExitCode: null,
+    anvil: live,
   });
-  const unv = verdict({ cmp: good, unverified: ["y"], anvilExitCode: null });
-  const empty = verdict({ cmp: [], unverified: [], anvilExitCode: null });
+  const unv = verdict({ cmp: good, unverified: ["y"], anvil: live });
   cell(
     "verdict: SAME STATE (exit 0) only with every comparison ok, nothing unverified and anvil still running",
     same.proven && same.exitCode === EXIT.SAME_STATE && same.failed.length === 0,
     same
   );
   cell(
-    "N1: anvil exited before the verdict: STOP (exit 1) with that line",
-    !exited.proven &&
-      exited.exitCode === EXIT.STOP &&
-      exited.failed.some(f => f.path === "anvil exited before the verdict"),
-    exited
+    "N1: anvil exited, or was killed by a signal, before the verdict: STOP (exit 1) with that line",
+    [exited, signalled].every(
+      v =>
+        !v.proven &&
+        v.exitCode === EXIT.STOP &&
+        v.failed.some(f => f.path === "anvil exited before the verdict")
+    ),
+    { exited, signalled }
   );
   cell(
     "verdict: a failed comparison or an unverified field: STOP (exit 1)",
@@ -241,7 +285,6 @@ const sleep = async () => {};
       unv.exitCode === EXIT.STOP,
     { bad, unv }
   );
-  void empty;
 }
 cell(
   "exit codes are the documented ones",
@@ -313,6 +356,30 @@ const okArgs = [
   const { ABI_FILES } = await import("./a7-readback.mjs");
   const d = fs.mkdtempSync(join(tmpdir(), "a7fork-"));
   const servers = [];
+  const anvilLog = join(d, "anvil.log");
+  const anvilPids = join(d, "anvil.pids");
+  const readLog = () => (fs.existsSync(anvilLog) ? fs.readFileSync(anvilLog, "utf8") : "");
+  const startedPids = () =>
+    fs.existsSync(anvilPids)
+      ? fs.readFileSync(anvilPids, "utf8").split("\n").filter(Boolean).map(Number)
+      : [];
+  const alive = pid => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const killAnvils = () => {
+    for (const pid of startedPids())
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+  };
+  process.on("exit", killAnvils); // the harness interrupted: no fake anvil survives it
   const serve = handler =>
     new Promise(res => {
       const srv = createServer((req, rsp) => {
@@ -350,7 +417,11 @@ const okArgs = [
       let err = "";
       c.stdout.on("data", x => (out += x));
       c.stderr.on("data", x => (err += x));
-      const t = setTimeout(() => c.kill("SIGKILL"), 90_000);
+      // on timeout the script and every anvil it started are killed (SIGKILL skips its cleanup)
+      const t = setTimeout(() => {
+        c.kill("SIGKILL");
+        killAnvils();
+      }, 90_000);
       c.on("exit", status => {
         clearTimeout(t);
         res({ status, err: err.trim(), out });
@@ -374,6 +445,22 @@ const okArgs = [
       fakeAnvil,
       `#!${process.execPath}
 const a = process.argv.slice(2);
+const fs = await import("node:fs");
+// every invocation is logged, so a case can prove anvil was never reached (Codex M1 R1 #2)
+fs.appendFileSync(process.env.FAKE_ANVIL_LOG, (a.includes("--version") ? "version" : "start") + "\\n");
+if (!a.includes("--version")) {
+  fs.appendFileSync(process.env.FAKE_ANVIL_PIDS, process.pid + "\\n");
+  // never outlives the a7-fork that started it, nor a hard deadline (Codex M1 R1 #1)
+  const parent = process.ppid;
+  setInterval(() => {
+    try {
+      process.kill(parent, 0);
+    } catch {
+      process.exit(0);
+    }
+  }, 200).unref();
+  setTimeout(() => process.exit(0), 60_000).unref();
+}
 if (a.includes("--version")) {
   process.stdout.write(process.env.FAKE_ANVIL_VERSION);
   process.exit(0);
@@ -414,6 +501,7 @@ if (process.env.FAKE_ANVIL_SERVE) {
       rsp.end(JSON.stringify(Array.isArray(JSON.parse(b)) ? out : out[0]));
     });
   }).listen(port, "127.0.0.1");
+  setInterval(() => {}, 1000); // keep serving until killed or orphaned
 } else {
   process.stderr.write(process.env.FAKE_ANVIL_ERR ?? "");
   process.exit(1);
@@ -457,26 +545,49 @@ if (process.env.FAKE_ANVIL_SERVE) {
     );
     const busy = await serve(() => "0x7a69");
     const url = p => `http://127.0.0.1:${p}/KEY`;
+    const fakeEnv = { FAKE_ANVIL_LOG: anvilLog, FAKE_ANVIL_PIDS: anvilPids };
+    const clearLog = () => fs.rmSync(anvilLog, { force: true });
     const p1 = await freePort();
 
-    const wrongChain = await runAsync(args(p1), { A7_FORK_URL: url(mainnet) });
+    clearLog();
+    const wrongChain = await runAsync([...args(p1), "--anvil", fakeAnvil], {
+      A7_FORK_URL: url(mainnet),
+      FAKE_ANVIL_VERSION: goodVersion,
+      ...fakeEnv,
+    });
+    wrongChain.anvilLog = readLog();
     cell(
       "e2e F2: the script stops (exit 1) on an upstream of another chain, before anvil",
-      wrongChain.status === EXIT.STOP &&
+      wrongChain.anvilLog === "" &&
+        wrongChain.status === EXIT.STOP &&
         wrongChain.err === "a7-fork: the fork RPC is not the read-back's chain (eth_chainId)",
       wrongChain
     );
-    const early = await runAsync(args(p1), { A7_FORK_URL: url(sepolia) });
+    clearLog();
+    const early = await runAsync([...args(p1), "--anvil", fakeAnvil], {
+      A7_FORK_URL: url(sepolia),
+      FAKE_ANVIL_VERSION: goodVersion,
+      ...fakeEnv,
+    });
+    early.anvilLog = readLog();
     cell(
       "e2e F2: the script stops (exit 1) on an upstream below header.forkBlock",
-      early.status === EXIT.STOP &&
+      early.anvilLog === "" &&
+        early.status === EXIT.STOP &&
         early.err === "a7-fork: the fork RPC does not have header.forkBlock yet",
       early
     );
-    const occupied = await runAsync(args(busy), { A7_FORK_URL: url(sepoliaAt) });
+    clearLog();
+    const occupied = await runAsync([...args(busy), "--anvil", fakeAnvil], {
+      A7_FORK_URL: url(sepoliaAt),
+      FAKE_ANVIL_VERSION: goodVersion,
+      ...fakeEnv,
+    });
+    occupied.anvilLog = readLog();
     cell(
       "e2e N1: the script stops (exit 1) when --port already answers, before anvil",
-      occupied.status === EXIT.STOP &&
+      occupied.anvilLog === "" &&
+        occupied.status === EXIT.STOP &&
         occupied.err ===
           `a7-fork: something already listens on --port ${busy}: refusing to compare against it`,
       occupied
@@ -493,6 +604,7 @@ if (process.env.FAKE_ANVIL_SERVE) {
     const otherBuild = await runAsync([...args(p1), "--anvil", fakeAnvil], {
       A7_FORK_URL: url(sepoliaAt),
       FAKE_ANVIL_VERSION: `anvil Version: 1.8.7-nightly\nCommit SHA: ${"a".repeat(40)}\n`,
+      ...fakeEnv,
     });
     cell(
       "e2e: another anvil build is refused (exit 1)",
@@ -503,6 +615,7 @@ if (process.env.FAKE_ANVIL_SERVE) {
       A7_FORK_URL: url(sepoliaAt),
       FAKE_ANVIL_VERSION: goodVersion,
       FAKE_ANVIL_ERR: `thread 'main' panicked; fork ${url(sepoliaAt)}`,
+      ...fakeEnv,
     });
     cell(
       "e2e N1: the pinned anvil exiting at start is no verdict (exit 3), a fixed category, nothing of its output",
@@ -517,7 +630,13 @@ if (process.env.FAKE_ANVIL_SERVE) {
       A7_FORK_URL: url(sepoliaAt),
       FAKE_ANVIL_VERSION: goodVersion,
       FAKE_ANVIL_SERVE: JSON.stringify(rb.header),
+      ...fakeEnv,
     });
+    // the anvil the full run started is gone once a7-fork exits (its exit handler, or orphan exit)
+    const deadline = Date.now() + 5_000;
+    while (startedPids().some(alive) && Date.now() < deadline)
+      await new Promise(r => setTimeout(r, 100));
+    const leftover = startedPids().filter(alive);
     let rec = null;
     try {
       rec = JSON.parse(full.out);
@@ -532,24 +651,27 @@ if (process.env.FAKE_ANVIL_SERVE) {
         rec.rpc === null &&
         (rec.failed.length > 0 || rec.unverified.length > 0) &&
         !full.out.includes("KEY") &&
-        !full.out.includes("127.0.0.1"),
-      { status: full.status, err: full.err, verdict: rec?.verdict }
+        !full.out.includes("127.0.0.1") &&
+        startedPids().length >= 1 &&
+        leftover.length === 0,
+      { status: full.status, err: full.err, verdict: rec?.verdict, leftover }
     );
   } finally {
+    killAnvils();
     for (const s of servers) s.close();
     fs.rmSync(d, { recursive: true, force: true });
   }
 }
 
 // ---- the one wiring the e2e cells cannot reach deterministically (anvil exiting between the
-// last read and the verdict is a race): the verdict is given the live process's exitCode, and the
+// last read and the verdict is a race): the verdict is given the live child process, and the
 // script's exit status is the verdict's
 {
   const src = readFileSync(join(here, "a7-fork.mjs"), "utf8");
   const exits = src.match(/process\.exit\([^)]*\)/g) ?? [];
   cell(
-    "wiring (structural): verdict gets anvil.exitCode; the only exits are die()'s and the verdict's",
-    /verdict\(\{ cmp, unverified, anvilExitCode: anvil\.exitCode \}\)/.test(src) &&
+    "wiring (structural): verdict gets the anvil child process; the only exits are die()'s and the verdict's",
+    /verdict\(\{ cmp, unverified, anvil \}\)/.test(src) &&
       exits.length === 2 &&
       exits.includes("process.exit(code)") &&
       exits.includes("process.exit(exitCode)"),

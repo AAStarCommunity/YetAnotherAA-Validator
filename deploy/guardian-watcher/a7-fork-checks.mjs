@@ -8,11 +8,18 @@
 
 export const EXIT = Object.freeze({ SAME_STATE: 0, STOP: 1, USAGE: 2, NO_VERDICT: 3 });
 
+/** A child process is alive only while it has neither exited nor been killed by a signal (a
+ * signal-terminated child keeps exitCode null and sets signalCode: Codex M1 R1). */
+export const isAlive = proc => proc.exitCode === null && (proc.signalCode ?? null) === null;
+
 /**
  * Before anything starts (#412 review F2, N1): the UPSTREAM is the read-back's chain and has the
  * fork block (anvil's own chainId is whatever --chain-id says, so it proves nothing), and nothing
  * already answers on --port (the tool would otherwise compare against that process).
  * `rpc(url, method, params)` resolves to the JSON-RPC result, or undefined when there is none.
+ * Stricter than the inline code it replaces (declared, each with a cell): a null chain id is no
+ * answer (exit 3, was 1 via Number(null) = 0); chain id and head must be hex quantities (a
+ * non-numeric head used to pass, since NaN < forkBlock is false).
  */
 export async function preflight({ rpc, forkUrl, chainId, forkBlock, port }) {
   const upChain = await rpc(forkUrl, "eth_chainId", []);
@@ -70,10 +77,10 @@ export function anvilBuild(versionText, { pinnedCommit, headerVersion }) {
 export async function waitForAnvil({ proc, ping, sleep, tries = 120 }) {
   for (let i = 0; i < tries; i++) {
     await sleep();
-    if (proc.exitCode !== null) return false;
+    if (!isAlive(proc)) return false;
     try {
       await ping();
-      return proc.exitCode === null;
+      return isAlive(proc);
     } catch {
       // starting
     }
@@ -96,12 +103,12 @@ export function startFailure(anvilErr) {
 
 /**
  * The verdict: SAME STATE only with no failed comparison, nothing unverified, and the anvil this
- * tool started still running (#412 review N1). Returns the failed list (with that line added when
- * anvil exited), proven, and the process exit code.
+ * tool started still running (#412 review N1; `anvil` is that child process). Returns the failed
+ * list (with that line added when anvil is gone), proven, and the process exit code.
  */
-export function verdict({ cmp, unverified, anvilExitCode }) {
+export function verdict({ cmp, unverified, anvil }) {
   const failed = cmp.filter(x => !x.ok);
-  if (anvilExitCode !== null)
+  if (!isAlive(anvil))
     failed.push({ path: "anvil exited before the verdict", sp: null, fork: null, ok: false });
   const proven = failed.length === 0 && unverified.length === 0;
   return { failed, proven, exitCode: proven ? EXIT.SAME_STATE : EXIT.STOP };

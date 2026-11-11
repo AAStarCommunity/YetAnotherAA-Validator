@@ -501,7 +501,7 @@ if (opt("address-book") && !opt("pins-commit"))
   });
 }
 // the anvil this tool started must still be the one answering (#412 review N1)
-const { failed, proven, exitCode } = verdict({ cmp, unverified, anvilExitCode: anvil.exitCode });
+const { failed, proven, exitCode } = verdict({ cmp, unverified, anvil });
 
 // ---- 5. gas for the rehearsal's own test key, only on a proven fork
 if (proven) await p.send("anvil_setBalance", [fund, ethers.toQuantity(ethers.parseEther("100"))]);
