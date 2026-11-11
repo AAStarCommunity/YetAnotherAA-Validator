@@ -1381,6 +1381,15 @@ async function scenario(build) {
     });
   });
   const d = mkdtempSync(join(tmpdir(), "drpc2-cli-"));
+  let holder = null;
+  const reap = async c => {
+    if (!c || c.exitCode !== null || c.signalCode !== null) return;
+    c.kill("SIGKILL");
+    await new Promise(res => {
+      const t = setTimeout(res, 5_000);
+      c.once("exit", () => (clearTimeout(t), res()));
+    });
+  };
   try {
     for (const sub of ["holds", "records", "publications"])
       mkdirSync(join(d, "data", sub), { recursive: true });
@@ -1420,16 +1429,22 @@ async function scenario(build) {
         lastResult: "mismatch",
       })
     );
-    // the watcher's lock held by another process: refused, nothing written
-    const holder = spawn(
+    // the watcher's lock held by another process: refused, nothing written. The holder is bounded:
+    // ready within 10 s or the cell fails, and it is always killed and reaped (finally below)
+    holder = spawn(
       process.execPath,
       ["-e", `require("net").createServer().listen(${port},"127.0.0.1",()=>console.log("up"))`],
       { stdio: ["ignore", "pipe", "ignore"] }
     );
-    await new Promise(res => holder.stdout.once("data", res));
-    const locked = run();
-    holder.kill();
-    await new Promise(res => holder.once("exit", res));
+    const ready = await new Promise(res => {
+      const t = setTimeout(() => res(false), 10_000);
+      holder.stdout.once("data", () => (clearTimeout(t), res(true)));
+      holder.once("exit", () => (clearTimeout(t), res(false)));
+      holder.once("error", () => (clearTimeout(t), res(false)));
+    });
+    const locked = ready ? run() : { status: null, stderr: "lock holder not ready" };
+    await reap(holder);
+    holder = null;
     const heldAfterLock = JSON.parse(readFileSync(holdPath, "utf8")).state;
     const ok = run();
     const hold = JSON.parse(readFileSync(holdPath, "utf8"));
@@ -1456,6 +1471,7 @@ async function scenario(build) {
       }
     );
   } finally {
+    await reap(holder);
     rmSync(d, { recursive: true, force: true });
   }
 }

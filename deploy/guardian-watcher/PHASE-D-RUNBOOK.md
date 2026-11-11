@@ -253,16 +253,26 @@ explorer or another RPC, for the fields listed in the hold.
   disagrees, so nothing on chain needs correcting. To have the record produced
   again from a corrected primary:
   1. stop the watcher (`launchctl bootout gui/$(id -u)/ai.aastar.aoa-watcher`);
-  2. move `records/<record id>.json` and `holds/<record id>.json` into a new
-     `manual-quarantine/` directory under the data directory (keep them as
-     evidence; the watcher does not read that directory);
+  2. set aside, under a new `manual-quarantine/` directory in the data directory
+     (keep everything as evidence; the watcher does not read it), each into its
+     own subdirectory so no file overwrites another:
+     - `records/<record id>.json` to `manual-quarantine/records/`;
+     - `holds/<record id>.json` to `manual-quarantine/holds/`;
+     - every file under `deadletters/` that belongs to the record's transaction
+       (its `txHash`; a dead letter keeps the classified record and is retried
+       before the scan, so it would write the old record back) to
+       `manual-quarantine/deadletters/`;
+     - `publications/<record id>.json` to `manual-quarantine/publications/` if
+       it carries a `cid` (a journal committed to the old bytes would stop the
+       new record as a bytes-change incident); a journal without `cid`, e.g. one
+       that only holds `holdRearms`, can stay;
   3. fix or replace the primary (Keychain item `aoa-dvt-rpc-primary`);
-  4. rewind `cursor.json` to the block before the record's block:
+  4. rewind `cursor.json` to the block before the record's block, B:
      `{"block": <B-1>, "hash": "<hash of block B-1 from a trusted source>"}`.
      The watcher checks that hash against its RPC and refuses to scan on a
-     mismatch, so a wrong hash stops the tick instead of skipping anything.
-     Rescanning a range creates no duplicates; the blocks from `B-1` on are read
-     again, at most `maxBlocksPerTick` per tick;
+     mismatch, so a wrong hash stops the tick instead of skipping anything. The
+     scan then starts at block B; rescanning creates no duplicates; the blocks
+     from B on are read again, at most `maxBlocksPerTick` per tick;
   5. start the watcher (`launchctl bootstrap …`). The record is written again
      and goes through D-RPC2 like any new one. There is no tool for steps 2 and
      4 yet.
