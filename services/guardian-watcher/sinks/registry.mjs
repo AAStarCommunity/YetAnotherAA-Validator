@@ -134,6 +134,9 @@ export function registrySink({
   const finalized = async () =>
     Number((await provider.send("eth_getBlockByNumber", ["finalized", false])).number);
   const api = {
+    // which registry this sink writes to (W2d): every journal's registry stage is bound to it
+    address: addr,
+    chainId,
     finalized,
     async canonical(n, hash) {
       const b = await provider.send("eth_getBlockByNumber", [ethers.toQuantity(Number(n)), false]);

@@ -126,6 +126,8 @@ export function sinks(opts = {}) {
       },
     },
     registry: {
+      address: ethers.getAddress(opts.registryAddress ?? "0x" + "aa".repeat(20)),
+      chainId: BigInt(opts.chainId ?? 11155111),
       async finalized() {
         return chain.block - chain.finalizedLag;
       },
@@ -143,7 +145,7 @@ export function sinks(opts = {}) {
         calls.lastArgs = args;
         calls.lastSignOpts = o;
         // deterministicSign: the same args and nonce sign to the same tx (a flat estimate)
-        const raw = opts.deterministicSign ? `0xraw0` : `0xraw${calls.sign}`;
+        const raw = opts.deterministicSign ? `0xraw0` : `0xraw${opts.rawTag ?? ""}${calls.sign}`; // rawTag tells two sinks' raws apart
         chain.signedArgs.set(raw, args);
         return {
           raw,
@@ -154,6 +156,7 @@ export function sinks(opts = {}) {
       async broadcast(raw) {
         calls.broadcast++;
         calls.lastRaw = raw;
+        (calls.raws ??= []).push(raw); // every raw this registry was asked to broadcast (W2d)
         const hash = ethers.id(`disclose-${raw.slice(5)}`);
         if (opts.rejectBroadcast || opts.rejectRaw?.(raw)) {
           // a node refusing every broadcast (e.g. a writer without funds): never known

@@ -101,6 +101,10 @@ export function stallReasons(publication) {
       `${st.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
     );
   // what still needs attention (Codex W2c R20), store-wide until the journal no longer says so
+  if (st.migrating)
+    out.push(
+      `${st.migrating} record(s) not yet confirmed on the configured registry (registry switched)`
+    );
   if (st.incidents)
     out.push(`${st.incidents} unresolved registry or bytes incident(s) (acknowledge or resolve)`);
   if (st.inconsistent)

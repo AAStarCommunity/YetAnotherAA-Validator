@@ -4,7 +4,13 @@
 // the writer's roles from chain, builds the sinks and delivers the run's alerts.
 import { ethers } from "ethers";
 import { Store, atomicWriteJson } from "./store.mjs";
-import { publishRecord, PersistError } from "./publish.mjs";
+import {
+  publishRecord,
+  PersistError,
+  registryWhere,
+  registryAt,
+  sameRegistry,
+} from "./publish.mjs";
 import { recordFile } from "./record-file.mjs";
 import { MAX_RECORD_BYTES } from "./cid.mjs";
 import { SafeError, safeText, guarded } from "./safe-error.mjs";
@@ -17,7 +23,7 @@ import { assertWriterRole } from "../sinks/registry.mjs";
  * recorded bytes change is never done (M4). `ignoreRegistry`: everything but the registry stage
  * (an acknowledged registry incident parks only that stage: R2).
  */
-export function isDone(rec, st, { pinners, cid, ignoreRegistry = false } = {}) {
+export function isDone(rec, st, { pinners, cid, ignoreRegistry = false, registry } = {}) {
   if (!st?.published || !st.telegram?.at) return false;
   if (st.bytesChanged) return false;
   if (cid !== undefined && st.cid !== cid) return false;
@@ -25,7 +31,11 @@ export function isDone(rec, st, { pinners, cid, ignoreRegistry = false } = {}) {
   // a pin not verified since a failed check is not done: it is retried (Codex W2c R20 #3)
   if (uncheckedPin(st, pinners)) return false;
   if (rec.route !== "bls" || ignoreRegistry) return true; // owner route: repo + Telegram only
-  return st.registry?.phase === "confirmed";
+  // confirmed on the CONFIGURED registry (W2d): confirmed on another one is not done
+  return (
+    st.registry?.phase === "confirmed" &&
+    (!registry || sameRegistry(registryAt(st.registry), registry))
+  );
 }
 
 /** An unresolved, unacknowledged registry incident, or a recorded bytes change: alerted on every
@@ -40,7 +50,11 @@ const openIncident = st =>
  * incident, a final receipt whose entry was not visible, a pin not verified since a failed check.
  * Kept in the record's schedule entry and counted store-wide until the journal no longer says so.
  */
-export function attentionKind(pub, pinners) {
+export function attentionKind(pub, pinners, where) {
+  // W2d: a registry stage written for another registry, or a record disclosed again after a switch
+  // and not yet confirmed on the configured one
+  if (where && pub?.registry && !sameRegistry(registryAt(pub.registry), where)) return "migrating";
+  if (pub?.registryMigrated && pub.registry?.phase !== "confirmed") return "migrating";
   if (openIncident(pub)) return "incident";
   if (pub?.registry?.phase === "landed" && pub.registry.inconsistentAt) return "inconsistent";
   // a receipt without the Disclosed event, while the stage has not moved on (Codex W2c R21 #1)
@@ -127,6 +141,7 @@ function countStalls(sched) {
   const att = Object.values(sched?.entries ?? {}).map(e => e?.attention);
   return {
     incidents: att.filter(k => k === "incident").length,
+    migrating: att.filter(k => k === "migrating").length,
     inconsistent: att.filter(k => k === "inconsistent").length,
     unverified: att.filter(k => k === "unverified").length,
     feeCapped: all.filter(k => k === "feeCapped").length,
@@ -184,7 +199,13 @@ export async function publishPending(
   // restart (rotation kept only in memory) may cover any number of passes, so the saved stalls are
   // not trusted until a sweep has re-read every record; within the budgets, marked unknown.
   // (its own per-process set: publishPhase may save the schedule, and fill the memo, first)
-  if (sched.stallsTracked !== true || !stallsReconciling.has(store))
+  // W2d: the configured registry differs from the one this schedule was kept for: every record's
+  // registry stage is re-read against it before the counts are trusted
+  const where = sinks.registry ? registryWhere(sinks.registry) : null;
+  const registrySwitched = !!where && !!sched.registryAt && !sameRegistry(sched.registryAt, where);
+  if (registrySwitched)
+    alerts.push("the configured registry changed: every record is checked against it (W2d)");
+  if (sched.stallsTracked !== true || !stallsReconciling.has(store) || registrySwitched)
     stallsNeed = (sched.sweeps ?? 0) + (sched.cursor ? 2 : 1);
   stallsReconciling.add(store);
   if (sched.unreadable)
@@ -259,7 +280,7 @@ export async function publishPending(
       // every record read is refreshed from its journal, deferred ones included (Codex W2c R15 #1)
       entries[id] = withAttention(
         withStall(entries[id], stallKind(prev)),
-        attentionKind(prev, pinners)
+        attentionKind(prev, pinners, where)
       );
       try {
         cid = recordFile(rec).cid;
@@ -275,8 +296,12 @@ export async function publishPending(
     // toward the reverify generation (Codex W2c R3).
     const e = (entries[id] = { ...(entries[id] ?? {}) });
     const reverify = reverifyGen !== null && e.reverifiedGen !== reverifyGen;
-    const isParked = parked(prev);
-    if (!reverify && isDone(rec, prev, { pinners, cid, ignoreRegistry: isParked })) {
+    // an acknowledged incident parks the registry stage only for the registry it happened on (W2d)
+    const isParked = parked(prev) && (!where || sameRegistry(registryAt(prev.registry), where));
+    if (
+      !reverify &&
+      isDone(rec, prev, { pinners, cid, ignoreRegistry: isParked, registry: where ?? undefined })
+    ) {
       if (isParked) counts.parked++;
       else counts.done++;
       // its stall was refreshed from prev above: a done record clears a stale one (W2c R12 #1)
@@ -324,11 +349,16 @@ export async function publishPending(
         { persist: st => store.putPublication(id, st), reverify, maxPendingMs }
       );
       for (const a of r.alerts) alerts.push(`${id}: ${a}`);
-      const done = isDone(rec, r.state, { pinners, cid, ignoreRegistry: isParked });
+      const done = isDone(rec, r.state, {
+        pinners,
+        cid,
+        ignoreRegistry: isParked,
+        registry: where ?? undefined,
+      });
       const stageFailed = (r.failures ?? []).length > 0;
       if (stageFailed) counts.failed++; // a sink failed or refused: the pass is not ok (R3)
       entries[id] = {
-        ...withAttention(withStall(e, stallKind(r.state)), attentionKind(r.state, pinners)),
+        ...withAttention(withStall(e, stallKind(r.state)), attentionKind(r.state, pinners, where)),
         lastRunAt: now(),
         done,
         failing: false,
@@ -353,7 +383,7 @@ export async function publishPending(
       try {
         const cur = store.getPublication(id);
         kind = stallKind(cur);
-        att = attentionKind(cur, pinners);
+        att = attentionKind(cur, pinners, where);
       } catch {
         kind = "unknown";
       }
@@ -392,6 +422,7 @@ export async function publishPending(
     entries,
     sweeps,
     stallsTracked: true,
+    ...(where ? { registryAt: where } : sched.registryAt ? { registryAt: sched.registryAt } : {}),
     ...(Object.keys(badFiles).length ? { badFiles } : {}),
     ...(stallsNeed !== undefined && sweeps < stallsNeed ? { stallsNeed } : {}),
   };

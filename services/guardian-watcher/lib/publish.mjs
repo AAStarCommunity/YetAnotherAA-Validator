@@ -292,9 +292,36 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     }
   }
 
+  // W2d: the registry stage belongs to the registry it was written for. A stage written for another
+  // address or chain is archived and the record is disclosed again on the configured one; its
+  // signed transactions are never broadcast again (they target the old registry).
+  const where = sinks.registry ? registryWhere(sinks.registry) : null;
+  if (
+    rec.route === "bls" &&
+    where &&
+    state.registry &&
+    !sameRegistry(registryAt(state.registry), where)
+  ) {
+    const from = registryAt(state.registry);
+    state.registryHistory = [
+      ...(state.registryHistory ?? []),
+      { ...state.registry, supersededAt: new Date().toISOString() },
+    ];
+    state.registry = null;
+    state.registryMigrated = { from, to: where, at: new Date().toISOString() };
+    await persist(state);
+    alerts.push(
+      "registry: the configured registry changed; this record is disclosed again on it (the old registry's transactions are not broadcast)"
+    );
+  }
   if (rec.route === "bls" && sinks.registry && state.registry?.phase !== "confirmed") {
+    // every journal write of this stage records the registry it is for
+    const persistAt = st => {
+      if (st.registry && !st.registry.at) st.registry = { ...st.registry, at: where };
+      return persist(st);
+    };
     try {
-      const ar = await advanceRegistry(rec, file, sinks.registry, state, persist, alerts, opts);
+      const ar = await advanceRegistry(rec, file, sinks.registry, state, persistAt, alerts, opts);
       if (ar === "broadcast-failed") failures.push("registry");
     } catch (e) {
       if (e instanceof PersistError) throw e;
@@ -306,6 +333,31 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
 }
 
 export const DEFAULT_MAX_PENDING_MS = 30 * 60_000;
+
+/** The registry a sink writes to (W2d): { address (lowercase), chainId (decimal string) }. */
+export function registryWhere(reg) {
+  return { address: String(reg.address).toLowerCase(), chainId: String(reg.chainId) };
+}
+/**
+ * The registry a journalled stage was written for: its `at`, or for a stage journalled before
+ * W2d, the address and chain of its signed transaction. Null when neither exists; such a stage
+ * (journalled before W2d without a transaction) is taken as the registry configured at upgrade:
+ * no deployment ran before W2d (Phase D needs it), so there is no other registry it could be for.
+ */
+export function registryAt(r) {
+  if (r?.at?.address) return r.at;
+  if (r?.raw) {
+    try {
+      const tx = ethers.Transaction.from(r.raw);
+      if (tx.to) return { address: tx.to.toLowerCase(), chainId: String(tx.chainId) };
+    } catch {
+      // not a parseable transaction: no evidence either way
+    }
+  }
+  return null;
+}
+export const sameRegistry = (at, where) =>
+  !at || (at.address === where.address && at.chainId === where.chainId);
 
 /**
  * On-chain content is untrusted text, and its shape proves nothing (a base32-shaped string can

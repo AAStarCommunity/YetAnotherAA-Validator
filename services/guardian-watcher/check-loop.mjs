@@ -2701,6 +2701,211 @@ const good = {
   );
 }
 
+// ---- W2d (DSR): the registry stage is bound to its registry (address and chain)
+{
+  const skOf = s => ({
+    pinners: s.pinners,
+    mirror: s.mirror,
+    telegram: s.telegram,
+    registry: s.registry,
+  });
+  const OLD = "0x" + "aa".repeat(20);
+  const NEW = "0x" + "bb".repeat(20);
+  // (a) a record confirmed on the old registry is disclosed again on the new one; degraded until
+  // it is confirmed there
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const before = store.getPublication(Store.recordId(bls)).registry;
+      const b = sinks({ registryAddress: NEW });
+      const passes = [];
+      for (let i = 0; i < 5; i++)
+        passes.push(await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 }));
+      const after = store.getPublication(Store.recordId(bls));
+      cell(
+        "W2d(a): a record confirmed on the old registry is disclosed again on the new one, degraded (migrating) until confirmed there",
+        before.phase === "confirmed" &&
+          before.at?.address === OLD &&
+          b.chain.entries.size === 1 &&
+          after.registry.phase === "confirmed" &&
+          after.registry.at?.address === NEW &&
+          after.registryHistory?.[0]?.at?.address === OLD &&
+          passes[0].stalls.migrating === 1 &&
+          passes.at(-1).stalls.migrating === 0 &&
+          !passes.at(-1).stalls.unknown,
+        {
+          before: [before.phase, before.at],
+          entries: b.chain.entries.size,
+          after: [after.registry.phase, after.registry.at],
+          stalls: passes.map(p => p.stalls),
+        }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (b) a disclose signed for the old registry and not confirmed is never broadcast again; the new
+  // registry's writer signs a new one
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, mine: "pending" });
+      await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const oldReg = store.getPublication(Store.recordId(bls)).registry;
+      const oldRaws = oldReg.raws ?? [oldReg.raw];
+      const aBroadcasts = a.calls.broadcast;
+      const b = sinks({ registryAddress: NEW, rawTag: "b" });
+      for (let i = 0; i < 4; i++) await publishPending(store, skOf(b), { maxPendingMs: 0 });
+      const after = store.getPublication(Store.recordId(bls)).registry;
+      cell(
+        "W2d(b): an old registry's unconfirmed disclose is never broadcast again (not through the new sink, not to the old one); a new one is signed and confirmed",
+        oldReg.phase === "sent" &&
+          a.calls.broadcast === aBroadcasts &&
+          !(b.calls.raws ?? []).some(r => oldRaws.includes(r)) &&
+          b.calls.sign >= 1 &&
+          after.phase === "confirmed" &&
+          after.at?.address === NEW,
+        {
+          oldPhase: oldReg.phase,
+          aB: [aBroadcasts, a.calls.broadcast],
+          bRaws: b.calls.raws,
+          oldRaws,
+          after: [after.phase, after.at],
+        }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (d) after a switch the store-wide counts are unknown until a sweep has re-read every record
+  // (3 records, one read per pass)
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      const recs = [0, 1, 2].map(i => ({
+        ...bls,
+        key: String(8100 + i),
+        proposalId: String(8100 + i),
+        txHash: ethers.id(`w2d-d-${i}`),
+      }));
+      for (const r of recs) store.putRecord(r);
+      const a = sinks({ registryAddress: OLD });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const b = sinks({ registryAddress: NEW, rawTag: "d" });
+      const p1 = await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000, maxParse: 1 });
+      cell(
+        "W2d(d): right after a registry switch the counts are unknown (degraded) until a sweep re-read every record",
+        p1.stalls.unknown === true && p1.alerts.some(x => /configured registry changed/.test(x)),
+        { stalls: p1.stalls }
+      );
+      // records read but deferred by the run budget are counted as migrating from their journal
+      const p2 = await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000, maxRecords: 0 });
+      const { stallReasons } = await import("./watcher.mjs");
+      cell(
+        "W2d(d): deferred records whose stage is for another registry count as migrating (a fixed degraded reason)",
+        p2.counts.ran === 0 &&
+          p2.stalls.migrating === 3 &&
+          stallReasons({ stalls: p2.stalls }).includes(
+            "3 record(s) not yet confirmed on the configured registry (registry switched)"
+          ),
+        { counts: p2.counts, stalls: p2.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (e) an incident acknowledged on the old registry does not park the record on the new one
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, mine: "revert" });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const id = Store.recordId(bls);
+      const j = store.getPublication(id);
+      store.putPublication(id, { ...j, registry: { ...j.registry, ack: { by: "t", at: "t" } } });
+      const b = sinks({ registryAddress: NEW, rawTag: "e" });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 });
+      const after = store.getPublication(id).registry;
+      cell(
+        "W2d(e): an incident acknowledged on the old registry is not parked on the new one: disclosed and confirmed there",
+        j.registry.phase === "reverted" && after.phase === "confirmed" && after.at?.address === NEW,
+        { old: j.registry.phase, after: [after.phase, after.at] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // (f) a stage journalled before W2d (no `at`) is bound by its signed transaction's to/chainId;
+  // without a transaction it is taken as the configured registry (no deployment predates W2d)
+  {
+    const { registryAt, sameRegistry } = await import("./lib/publish.mjs");
+    const w = ethers.Wallet.createRandom();
+    const raw = await w.signTransaction({
+      type: 2,
+      to: ethers.getAddress(OLD),
+      chainId: 10,
+      nonce: 0,
+      gasLimit: 100000n,
+      maxFeePerGas: 1000n,
+      maxPriorityFeePerGas: 1n,
+      data: "0x",
+    });
+    const fromRaw = registryAt({ phase: "sent", raw });
+    const none = registryAt({ phase: "confirmed" });
+    const here = { address: OLD, chainId: "10" };
+    cell(
+      "W2d(f): a pre-W2d journal is bound by its signed tx (to, chainId); one without a tx is taken as the configured registry",
+      fromRaw?.address === OLD &&
+        fromRaw.chainId === "10" &&
+        sameRegistry(fromRaw, here) &&
+        !sameRegistry(fromRaw, { address: NEW, chainId: "10" }) &&
+        !sameRegistry(fromRaw, { address: OLD, chainId: "11155111" }) &&
+        none === null &&
+        sameRegistry(none, here),
+      { fromRaw, none }
+    );
+  }
+  // (c) the same address on another chain is another registry
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, chainId: 11155111 });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const b = sinks({ registryAddress: OLD, chainId: 10 });
+      const first = await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 });
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 });
+      const after = store.getPublication(Store.recordId(bls)).registry;
+      cell(
+        "W2d(c): the same address with another chainId triggers the switch: disclosed again on the configured chain",
+        first.stalls.migrating === 1 &&
+          b.chain.entries.size === 1 &&
+          after.phase === "confirmed" &&
+          after.at?.chainId === "10",
+        { first: first.stalls, entries: b.chain.entries.size, after: [after.phase, after.at] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);
