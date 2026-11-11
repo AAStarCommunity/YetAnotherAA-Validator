@@ -189,14 +189,16 @@ else {
 const ld = cfg.launchd ?? {};
 // required members (Codex R2 #3): whatever the config lists, these are always checked
 const REQUIRED_OFF = ["io.aastar.dvt-committee-keeper", "io.aastar.dvt-apply-rotation"];
-const REQUIRED_ON = ["ai.aastar.aoa-watcher"];
+const REQUIRED_ON = ["ai.aastar.aoa-watcher", "ai.aastar.aoa-watcher-heartbeat"];
 ld.mustBeOff = [
   ...new Set([...REQUIRED_OFF, ...(Array.isArray(ld.mustBeOff) ? ld.mustBeOff : [])]),
 ];
 ld.mustBeOn = [...new Set([...REQUIRED_ON, ...(Array.isArray(ld.mustBeOn) ? ld.mustBeOn : [])])];
 const domain = placeholder(ld.domain) ? `gui/${process.getuid?.() ?? 0}` : ld.domain;
+const launchdOut = new Map();
 function launchdState(label) {
   const r = spawnSync("launchctl", ["print", `${domain}/${label}`], { encoding: "utf8" });
+  launchdOut.set(label, r.status === 0 ? (r.stdout ?? "") : null);
   // loaded is not running (Codex R3 #3): a required job must be running with a live pid
   if (r.status === 0) {
     const out = r.stdout ?? "";
@@ -232,6 +234,61 @@ for (const label of ld.mustBeOn ?? []) {
       `launchd-on:${label}`,
       s === "running" ? "PASS" : s === "absent" ? "MISSING" : "FAIL",
       say(s)
+    );
+  }
+}
+
+// ---- 4b. the running watcher job IS this deployment (Codex R6): its program is the configured
+// wrapper (run-watcher.sh), which names the same config and entry, reads exactly the two Keychain RPC
+// services and holds no URL; and the job's arguments are only that wrapper. Nothing is printed.
+{
+  const out = launchdOut.get("ai.aastar.aoa-watcher");
+  const wrapper = placeholder(ld.watcherWrapper) ? null : resolve(expand(ld.watcherWrapper));
+  const wantConfig = placeholder(cfg.watcherConfig)
+    ? null
+    : resolve(dirname(cfgPath), expand(cfg.watcherConfig));
+  if (!wrapper)
+    add("watcher-job-binding", "MISSING", "launchd.watcherWrapper (run-watcher.sh path) not set");
+  else if (!out)
+    add("watcher-job-binding", "MISSING", "watcher job not running, binding not checkable");
+  else {
+    const program = out.match(/^\s*program = (.+)$/m)?.[1]?.trim();
+    const argsBlock = out.match(/^\s*arguments = \{\n([\s\S]*?)\n\s*\}/m)?.[1] ?? "";
+    const argv = argsBlock
+      .split("\n")
+      .map(x => x.trim())
+      .filter(Boolean);
+    let text = null;
+    try {
+      text = readFileSync(wrapper, "utf8");
+    } catch {
+      text = null;
+    }
+    const problems = [];
+    const progOk =
+      program === wrapper ||
+      (argv.length === 2 && /\/bash$/.test(argv[0]) && argv[1] === wrapper) ||
+      argv[0] === wrapper;
+    if (!progOk) problems.push("the job does not run the configured wrapper");
+    if (text === null) problems.push("wrapper unreadable");
+    else {
+      if (!wantConfig || !text.includes(`WATCHER_CONFIG="${wantConfig}"`))
+        problems.push("wrapper names another config than watcherConfig");
+      if (
+        !/security find-generic-password -s aoa-dvt-rpc-primary -a aoa-watcher -w/.test(text) ||
+        !/security find-generic-password -s aoa-dvt-rpc-secondary -a aoa-watcher -w/.test(text)
+      )
+        problems.push("wrapper does not read both RPC URLs from the Keychain");
+      if (/https?:\/\//i.test(text)) problems.push("wrapper holds a URL");
+      if (!/exec node "\$WATCHER_ENTRY" --config "\$WATCHER_CONFIG"/.test(text))
+        problems.push("wrapper does not exec the watcher with that config");
+    }
+    add(
+      "watcher-job-binding",
+      problems.length ? "FAIL" : "PASS",
+      problems.length
+        ? problems.join("; ")
+        : "the running job is the wrapper for this config, RPCs from the Keychain"
     );
   }
 }

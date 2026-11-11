@@ -46,7 +46,8 @@
       "io.aastar.dvt-committee-keeper",
       "io.aastar.dvt-apply-rotation"
     ],
-    "mustBeOn": ["ai.aastar.aoa-watcher"]
+    "mustBeOn": ["ai.aastar.aoa-watcher", "ai.aastar.aoa-watcher-heartbeat"],
+    "watcherWrapper": "~/.aoa-watcher/run-watcher.sh"
   },
   "dvtNodes": {
     "compose": "docker-compose.testnet.yml",
