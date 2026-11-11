@@ -183,7 +183,13 @@ export async function publishPending(
     let cid;
     try {
       rec = store.readRecordFile(name, 2 * MAX_RECORD_BYTES);
-      if (!rec?.verdict?.flagged) continue;
+      if (!rec?.verdict?.flagged) {
+        // an unflagged record has no publication: drop any entry its file left (e.g. "unknown"
+        // while it was unreadable), so a repaired file settles the stalls and the generation
+        // (Codex W2c R16)
+        delete entries[String(name).replace(/\.json$/, "")];
+        continue;
+      }
       id = recordIdOf(rec);
       // the file name, the derived id and the stored id must agree, and one id is one record: a
       // restored copy under another name would run on a stale journal (Codex W2c R3)

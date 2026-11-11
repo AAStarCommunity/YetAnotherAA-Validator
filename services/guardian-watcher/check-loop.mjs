@@ -2018,6 +2018,35 @@ const good = {
       rmSync(d, { recursive: true, force: true });
     }
   }
+  // R16: a bad file repaired into a valid UNflagged record no longer holds stalls or reverify open
+  {
+    const d = tmp();
+    try {
+      const st = new Store(d);
+      st.putRecord(bls);
+      const sk = skOf(sinks({ mine: "pending" }));
+      const plain = {
+        ...owner,
+        txHash: ethers.id("r16-plain"),
+        verdict: { flagged: false, reasons: [] },
+      };
+      const name = `${Store.recordId(plain)}.json`;
+      writeFileSync(join(d, "records", name), "{corrupt");
+      const bad = await publishPending(st, sk, { maxPendingMs: 60 * 60_000, reverifyGen: 1 });
+      st.putRecord(plain); // repaired
+      const after = await publishPending(st, sk, { maxPendingMs: 60 * 60_000, reverifyGen: 1 });
+      cell(
+        "R16: a repaired unflagged record file clears its unknown entry and leaves no reverify obligation",
+        bad.stalls.unknown === true &&
+          !after.stalls.unknown &&
+          after.reverifyRemaining === 0 &&
+          !(Store.recordId(plain) in (st.getSchedule().entries ?? {})),
+        { bad: bad.stalls, after: [after.stalls, after.reverifyRemaining] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
   // #3: a record file that cannot be read keeps the state unknown, whatever its journal says
   {
     const d = tmp();
