@@ -412,9 +412,21 @@ export async function currentRoles(provider, aggregator, deployer) {
  * registry stage is skipped this pass (pins, mirror and Telegram still run) and that is alerted.
  * Returns the status block for status.json.
  */
-export async function publishPhase(store, chain, cfg, p, built, { now = Date.now() } = {}) {
+export async function publishPhase(
+  store,
+  chain,
+  cfg,
+  p,
+  built,
+  { now = Date.now(), degraded = null } = {}
+) {
   const out = { at: new Date(now).toISOString() };
   const alerts = [];
+  // a degraded watcher (lag past maxLagBlocks, a budget stop, a slow tick, trace capability, no
+  // second provider...) is alerted through the same de-duplicated channel (DSR, W2c). The reasons are
+  // the watcher's own wording (SafeError rule), never an RPC's text.
+  if (Array.isArray(degraded) && degraded.length)
+    alerts.push(`watcher degraded: ${degraded.filter(x => typeof x === "string").join("; ")}`);
   let registry = null;
   try {
     const roles = await readRoles(chain, cfg.aggregator, p.registry.deployer);

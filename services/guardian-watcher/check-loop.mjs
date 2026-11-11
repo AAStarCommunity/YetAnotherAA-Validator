@@ -207,6 +207,22 @@ const cfg = { aggregator: AGG };
         s.calls.telegram === before.telegram,
       { again, before, after: s.calls }
     );
+    // A degraded watcher (here: lag past maxLagBlocks) is alerted through the same channel (W2c)
+    const tgBefore = s.calls.telegram;
+    const deg = await publishPhase(store, roleChain(roles), cfg, P, built, {
+      now: (now += 60_000),
+      degraded: ["cursor 400 blocks behind finalized (> 300)"],
+    });
+    const latest = JSON.parse(readFileSync(join(store.dir, "alerts-latest.json"), "utf8"));
+    cell(
+      "publishPhase: a degraded watcher (lag) is alerted: 'watcher degraded: …' in the alert list, delivered to Telegram",
+      deg.alerts >= 1 &&
+        latest.alerts.some(
+          x => x === "watcher degraded: cursor 400 blocks behind finalized (> 300)"
+        ) &&
+        s.calls.telegram > tgBefore,
+      { alerts: latest.alerts, tg: [tgBefore, s.calls.telegram], delivery: deg.delivery }
+    );
     // A pin that was valid is gone by the weekly pass: the reverify must read it and repair it.
     s.pinOpts.pinata.gone = true;
     const fetchesBefore = s.calls.fetches ?? 0;

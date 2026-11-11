@@ -306,16 +306,30 @@ async function main() {
     const carry = pub
       ? { publication: { ...(lastPub ?? {}), inProgress: true, since: new Date().toISOString() } }
       : undefined;
+    const iterStart = Date.now();
     const { status } = await runOnce(chain, cfg, store, rs, ident, { carry });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
     if (pub) {
       try {
-        status.publication = await publishPhase(store, chain, cfg, pub.p, pub.built);
+        status.publication = await publishPhase(store, chain, cfg, pub.p, pub.built, {
+          degraded: status.degraded,
+        });
       } catch (e) {
         status.publication = { error: safeText("publication", e) };
       }
       lastPub = status.publication;
+      // the whole iteration (scan and publication) against the interval: a slow one is degraded,
+      // and alerted by the next pass (tickMs covers the scan alone)
+      status.iterationMs = Date.now() - iterStart;
+      const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
+      if (status.iterationMs > limit) {
+        status.degraded = [
+          ...(status.degraded ?? []),
+          `iteration took ${status.iterationMs} ms, more than ${Math.round(limit)} ms (maxTickFraction of the interval)`,
+        ];
+        status.healthy = false;
+      }
       store.writeStatus(status);
     }
     console.log(JSON.stringify(status));
