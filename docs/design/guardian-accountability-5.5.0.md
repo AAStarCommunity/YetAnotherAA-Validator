@@ -712,6 +712,114 @@ detection time, pause tx time.
   mtime. The paper's limitations section is to state the same boundary (DSR owns
   that wording).
 
+#### 5.5a Operating boundary (what the deployment commits to)
+
+Each item is a statement that can be checked against the code, the runbook
+(`deploy/guardian-watcher/PHASE-D-RUNBOOK.md`) or the Mini. Where a statement
+depends on the W2c publication loop (#413) or the D-RPC2 gate, it describes the
+behaviour those land; Phase D requires both (§5.2a, §5.5).
+
+1. **Who operates the Mini.**
+   - The watcher, its heartbeat and its Keychain items run under one macOS user
+     account on the Mini, the author's (`id -un` in runbook step 0; launchd
+     domain `gui/<uid>` in `phase-d.json`).
+   - The Mini is reached by SSH with public-key authentication only: its sshd
+     has `PubkeyAuthentication yes`, `PasswordAuthentication no` and
+     `KbdInteractiveAuthentication no` (read from `/etc/ssh/sshd_config` on
+     2026-11-12).
+   - Who else holds a login on the Mini is the author's statement: the Mini has
+     more than one interactive account, and this document does not verify who
+     uses them. Whoever controls the watcher's account is the trust root of
+     item 5.
+2. **Keys and tokens.**
+   - The secrets are exactly the six Keychain items of runbook step 2, account
+     `aoa-watcher`: `aoa-dvt-pinata-jwt`, `aoa-dvt-filebase-token`,
+     `aoa-dvt-watcher-keystore-pw`, `aoa-dvt-alert-bot-token`,
+     `aoa-dvt-rpc-primary`, `aoa-dvt-rpc-secondary`. None is in a file, `.env`
+     or a command line; the sender key is the encrypted keystore
+     `~/.aoa-watcher/sender.keystore.json` (mode 600), whose password is the
+     third item.
+   - Rotation is triggered by the author only (a provider notice, a suspected
+     leak, or a scheduled change). The author replaces an item interactively
+     with `security add-generic-password -U -a aoa-watcher -s <item> -w` (the
+     value is typed at the prompt, never on the command line) and then restarts
+     the watcher (`launchctl kickstart -k gui/<uid>/ai.aastar.aoa-watcher`): the
+     watcher reads its secrets once at start. For the two RPC items, Phase D's
+     `watcher-job-binding` compares the live process's environment with the
+     Keychain and fails until the restart; for the other four nothing checks
+     that the restart happened, so the author restarts every time.
+   - **A leaked sender key.** The DisclosureRegistry's writer is immutable
+     (`WRITER`, set in the constructor; the contract has no admin, owner or
+     upgrade), so a sender key cannot be re-authorised in place. Recovery is:
+     create a new sender (`new-sender-keystore.mjs`, which refuses to overwrite,
+     so the old keystore is moved aside first), deploy a new DisclosureRegistry
+     with the new writer, pin it in the release manifest, and point
+     `publish.registry` at it. Entries in the old registry stay on chain; with
+     the stolen key an attacker can append or amend entries there as claims
+     (every entry is a claim to recheck, §5.3), but cannot delete or rewrite any
+     entry, and the old registry is no longer the pinned one. The sender is
+     never a guardian, the owner Safe or the deployer: the registry sink refuses
+     to sign otherwise (roles re-read before every signature), and Phase D's
+     `sender-keystore` checks the same.
+3. **After an alert.**
+   - Alerts go to one Telegram chat, the author's (`publish.telegram.chatId`;
+     the heartbeat uses the same bot and chat unless configured otherwise). No
+     one else is paged.
+   - On **degraded**: the reasons are in `status.json` (`degraded`, fixed
+     wording) and the full alert list in `alerts-latest.json`, both on the Mini
+     only. Each reason names its cause (a stalled or unfunded disclose, a record
+     failing publication, an unverified pin, records held by D-RPC2, a lagging
+     cursor, a slow iteration); the author fixes that cause (funds the sender,
+     raises `registry.maxFeePerGas`, repairs a provider or the RPC, repairs or
+     removes a bad file). The state clears on its own once the cause is gone.
+   - On an **incident** (an unacknowledged conflict or reverted disclose, or a
+     record whose bytes changed after first publication): the author inspects
+     the record and its journal (`store/publications/<id>.json`) and resolves it
+     by hand: a registry incident is acknowledged by setting `registry.ack` in
+     the journal, a bytes change by removing the `bytesChanged` marker. There is
+     no tool for this yet; until resolved it is alerted every pass and the
+     watcher stays degraded.
+   - **The watcher takes no punitive action on chain.** Its only signed
+     transaction is `DisclosureRegistry.disclose` (`sinks/registry.mjs`); it
+     never calls a slash, pause, role or stake function. It discloses; any
+     penalty is decided elsewhere (§5.2b; the DVT nodes run with
+     `AUDIT_ENABLED=false` and `AUDIT_EXECUTE_SLASH=false`, Phase D
+     `node-slash-off`).
+4. **Downtime.**
+   - While the Mini or the watcher is down, nothing new is disclosed and the
+     heartbeat (a separate launchd job) alerts on a stale or missing
+     `status.json`; if the Mini itself is down, the heartbeat is down with it
+     and no alert is sent (the absence of the heartbeat's messages is then the
+     only signal).
+   - On restart the watcher resumes at its persisted cursor and scans the missed
+     blocks, at most `maxBlocksPerTick` (default 2000) blocks per tick, one tick
+     per `intervalMs` (default 60 s); the cursor is never skipped forward. While
+     the cursor is more than `maxLagBlocks` (default 300) behind finality, the
+     watcher is degraded.
+   - The watcher itself sets no limit on how far back it catches up; the limit
+     is the RPC's: both providers must still serve the logs and traces of the
+     missed range (trace capability is verified, §5.2a). If they no longer serve
+     the logs of a range, the tick fails there: the cursor does not move and the
+     watcher is degraded until a provider that serves it is configured. A
+     transaction whose details cannot be fetched becomes a dead letter, retried
+     and then recorded (§5.2b). Nothing is skipped silently.
+   - Publication is at least once with idempotent sinks: a record interrupted
+     between a sink's effect and its journal write repeats that stage after the
+     restart, without a second registry entry (the registry refuses a second
+     primary for the same `(kind, key)`, and a resumed broadcast resends the
+     journalled transaction) or a second mirror commit (deterministic path,
+     identical bytes return the existing commit); IPFS is content-addressed;
+     only a Telegram message can repeat. Records are published in bounded passes
+     (at most 25 per pass), so a large backlog drains over several passes.
+5. **Not defended.**
+   - The Mini's operator: whoever controls the watcher's account can stop, alter
+     or impersonate the watcher, its configuration and its secrets (§5.5, Phase
+     D trust boundary).
+   - Collusion of the two RPC providers: D-RPC2 holds an accusation unless both
+     providers reproduce it, so two providers that return the same false answer
+     pass it; they are chosen as independent operators, which is an assumption,
+     not a check of their honesty.
+
 ## 6. Random committee (D7: prepared, not enabled)
 
 - Selection: `index_i = H(seed, proposalId, i) mod N` with rejection of
