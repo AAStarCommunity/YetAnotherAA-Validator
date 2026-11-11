@@ -1271,6 +1271,64 @@ try {
   );
 }
 
+// ---- Codex W2c R23: no config string with credentials reaches a journal or Telegram
+{
+  const { PUBLIC_REPO_URL } = await import("./sinks/git-mirror.mjs");
+  const { telegramText } = await import("./lib/publish.mjs");
+  const { hostLabel } = await import("../../deploy/guardian-watcher/heartbeat.mjs");
+  const SENT = "private-TOKEN9z7q";
+  const bad = [
+    `https://user:${SENT}@github.com/o/r`,
+    `https://github.com/o/r?token=${SENT}`,
+    `https://github.com/o/r#${SENT}`,
+    `http://github.com/o/r`,
+    `https://${SENT}.example.com/o/r`,
+  ];
+  let refused = 0;
+  for (const u of bad) {
+    try {
+      gitMirror({ clone: "/nonexistent", repoUrl: u });
+    } catch (e) {
+      if (!String(e.message).includes(SENT)) refused++;
+    }
+  }
+  cell(
+    "R23#1: gitMirror refuses a repoUrl with user info, query, fragment, another scheme or host (without echoing it)",
+    refused === bad.length &&
+      PUBLIC_REPO_URL.test("https://github.com/AAStarCommunity/YetAnotherAA-Validator"),
+    { refused, of: bad.length }
+  );
+  // an already-journalled URL of another shape is not sent
+  const rec = {
+    route: "owner",
+    label: "l",
+    event: "e",
+    txHash: "0x1",
+    blockNumber: 1,
+    verdict: { reasons: [] },
+  };
+  const t1 = telegramText(rec, { cid: "bafk" }, { commit: "c0ffee0", url: bad[0] });
+  const t2 = telegramText(
+    rec,
+    { cid: "bafk" },
+    { commit: "c0ffee0", url: "https://github.com/o/r/blob/c0ffee0/a/b.json" }
+  );
+  cell(
+    "R23#1: Telegram carries a journalled mirror URL only in gitMirror's exact shape; otherwise the commit only",
+    !t1.includes(SENT) &&
+      t1.includes("mirror commit c0ffee0") &&
+      t2.includes("mirror https://github.com/o/r/blob/c0ffee0/a/b.json"),
+    { t1, t2 }
+  );
+  cell(
+    "R23#2: a heartbeat label that is not a plain identifier never reaches a message",
+    hostLabel({ label: `mini ${SENT}?x=1` }) === "invalid-label" &&
+      hostLabel({ label: "mac-mini.1" }) === "mac-mini.1" &&
+      /^[A-Za-z0-9.-]{1,40}$|^host$/.test(hostLabel({})),
+    [hostLabel({ label: `mini ${SENT}?x=1` }), hostLabel({})]
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

@@ -99,7 +99,7 @@ export async function check({
     };
   }
 
-  const host = hb.label ?? hostname();
+  const host = hostLabel(hb);
   const next = {
     ...state,
     unhealthyRuns,
@@ -195,7 +195,7 @@ if (process.argv[1] && process.argv[1].endsWith("heartbeat.mjs") && ci >= 0) {
   const send = telegramSend(cfg);
   if (args.includes("--test")) {
     const ok = await send(
-      `[aoa-watcher] ${cfg.heartbeat?.label ?? hostname()}: heartbeat TEST at ${new Date().toISOString()}`
+      `[aoa-watcher] ${hostLabel(cfg.heartbeat ?? {})}: heartbeat TEST at ${new Date().toISOString()}`
     );
     process.exit(ok ? 0 : 1);
   }
@@ -223,4 +223,16 @@ if (process.argv[1] && process.argv[1].endsWith("heartbeat.mjs") && ci >= 0) {
   });
   console.log(JSON.stringify({ at: new Date().toISOString(), ...r }));
   process.exit(r.problem ? 1 : 0);
+}
+
+/** The host name in a message: a plain identifier only, never arbitrary config text (Codex W2c
+ * R23 #2). A label outside that shape is replaced, the hostname is reduced to safe characters. */
+export function hostLabel(hb) {
+  if (hb?.label !== undefined)
+    return /^[A-Za-z0-9._-]{1,40}$/.test(String(hb.label)) ? String(hb.label) : "invalid-label";
+  return (
+    hostname()
+      .replace(/[^A-Za-z0-9.-]/g, "")
+      .slice(0, 40) || "host"
+  );
 }

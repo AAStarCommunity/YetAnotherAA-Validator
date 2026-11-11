@@ -26,7 +26,7 @@ import { SafeError } from "./safe-error.mjs";
 import { pinataPinner } from "../sinks/pinata.mjs";
 import { filebasePinner } from "../sinks/filebase.mjs";
 import { telegramSink } from "../sinks/telegram.mjs";
-import { gitMirror } from "../sinks/git-mirror.mjs";
+import { gitMirror, PUBLIC_REPO_URL } from "../sinks/git-mirror.mjs";
 import { registrySink } from "../sinks/registry.mjs";
 
 const DEFAULTS = {
@@ -66,6 +66,8 @@ export function publishConfig(c) {
   p.telegram = { ...p.telegram, service: p.telegram.service ?? SERVICE_DEFAULTS.telegram };
   need(okService(p.telegram.service), "telegram.service must be a Keychain service name");
   need(p.mirror?.clone, "mirror.clone required");
+  if (p.mirror.repoUrl !== undefined && !PUBLIC_REPO_URL.test(String(p.mirror.repoUrl)))
+    throw new SafeError("config.publish: mirror.repoUrl must be https://github.com/<owner>/<repo>");
   const r = p.registry ?? {};
   need(ethers.isAddress(r.address ?? ""), "registry.address required");
   need(Number.isSafeInteger(r.fromBlock) && r.fromBlock >= 0, "registry.fromBlock required");

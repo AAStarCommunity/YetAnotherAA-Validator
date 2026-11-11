@@ -37,6 +37,7 @@ import { ethers } from "ethers";
 import { SafeError, safeCode, safeText } from "./safe-error.mjs";
 import { Kind } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { recordFile, mirrorPath } from "./record-file.mjs";
+import { MIRROR_BLOB_URL } from "../sinks/git-mirror.mjs";
 
 /** A failure to persist state: publication must stop, the returned state is NOT durable. */
 export class PersistError extends SafeError {
@@ -105,7 +106,12 @@ export function telegramText(rec, file, mirror) {
     `tx ${rec.txHash} block ${rec.blockNumber}`,
     ...(rec.verdict?.reasons ?? []).map(r => `- ${r}`),
     `record ipfs://${file.cid}`,
-    mirror?.url ? `mirror ${mirror.url}` : null,
+    // a journalled URL is sent only in the exact shape gitMirror builds (Codex W2c R23 #1)
+    mirror?.url && MIRROR_BLOB_URL.test(String(mirror.url))
+      ? `mirror ${mirror.url}`
+      : /^[0-9a-f]{4,40}$/.test(String(mirror?.commit ?? ""))
+        ? `mirror commit ${mirror.commit}`
+        : null,
   ]
     .filter(Boolean)
     .join("\n");

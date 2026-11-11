@@ -2676,6 +2676,31 @@ const good = {
   }
 }
 
+// ---- Codex W2c R23 #1: the publish config refuses a credentialed mirror.repoUrl
+{
+  const SENT = "private-TOKEN9z7q";
+  const msgs = [];
+  for (const u of [`https://user:${SENT}@github.com/o/r`, `https://github.com/o/r?t=${SENT}`]) {
+    try {
+      publishConfig({ ...good, mirror: { ...good.mirror, repoUrl: u } });
+      msgs.push(null);
+    } catch (e) {
+      msgs.push(e.message);
+    }
+  }
+  const ok = publishConfig({
+    ...good,
+    mirror: { ...good.mirror, repoUrl: "https://github.com/o/r" },
+  });
+  cell(
+    "R23#1: publishConfig refuses a mirror.repoUrl with credentials or a query, names the rule, never echoes it",
+    msgs.every(
+      m => m === "config.publish: mirror.repoUrl must be https://github.com/<owner>/<repo>"
+    ) && !!ok,
+    msgs
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);
