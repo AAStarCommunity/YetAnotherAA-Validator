@@ -90,9 +90,15 @@ function countStalls(sched) {
   // unknown until the stall entries are known complete (stallsTracked, no pending sweep)
   const unknown =
     sched?.stallsTracked !== true || sched?.stallsNeed !== undefined || all.includes("unknown");
+  // records whose publication is failing (a stage that has not succeeded since, a run that threw,
+  // an unreadable file or journal): store-wide, until a retry succeeds (Codex W2c R19 #1)
+  const failing = Object.values(sched?.entries ?? {}).filter(
+    e => e?.failing === true || e?.stageFailed === true
+  ).length;
   return {
     feeCapped: all.filter(k => k === "feeCapped").length,
     insufficientFunds: all.filter(k => k === "insufficientFunds").length,
+    failing,
     ...(unknown ? { unknown: true } : {}),
   };
 }
@@ -232,7 +238,7 @@ export async function publishPending(
       if (isParked) counts.parked++;
       else counts.done++;
       // its stall was refreshed from prev above: a done record clears a stale one (W2c R12 #1)
-      entries[id] = { ...e, done: true };
+      entries[id] = { ...e, done: true, failing: false, stageFailed: false };
       if (openIncident(prev)) counts.incidents++;
       continue;
     }
@@ -282,6 +288,9 @@ export async function publishPending(
         lastRunAt: now(),
         done,
         failing: false,
+        // an unresolved stage failure stays on the record until a retry succeeds, so it counts
+        // store-wide while the record is outside later batches (Codex W2c R19 #1)
+        stageFailed: stageFailed && !done,
         // re-checked in this generation even if a stage failed: the failure is reported (ok =
         // false, alerts), and a broken provider must not hold every generation open
         ...(reverify ? { reverifiedGen: reverifyGen } : {}),

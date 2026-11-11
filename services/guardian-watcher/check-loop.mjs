@@ -2154,7 +2154,7 @@ const good = {
 {
   const { publicationStep } = await import("./watcher.mjs");
   const step = async run => {
-    const status = { healthy: true, degraded: undefined };
+    const status = { ok: true, healthy: true, degraded: undefined }; // a scan that succeeded
     await publicationStep({
       status,
       run,
@@ -2193,7 +2193,7 @@ const good = {
       noCounts.healthy === false &&
       noCounts.degraded.includes("stall state unknown: no publication result") &&
       fine.healthy === true &&
-      fine.degraded === undefined,
+      !fine.degraded,
     { notOk, noCounts, fine }
   );
   // B1 (the trigger): an unreadable alerts.json is reset and alerted; it no longer aborts every pass
@@ -2341,6 +2341,103 @@ const good = {
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
+  }
+}
+
+// ---- Codex W2c R19
+{
+  const { publicationStep, stallReasons } = await import("./watcher.mjs");
+  // #1: an unresolved stage failure stays store-wide while the record is outside later batches
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      store.putRecord({ ...owner, txHash: ethers.id("r19-mirror") });
+      const o = { mirrorFail: true };
+      const s = sinks(o);
+      const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+      const a = await publishPending(store, sk, {});
+      const b = await publishPending(store, sk, { maxParse: 0 });
+      const c = await publishPending(store, sk, { maxParse: 0 });
+      o.mirrorFail = false;
+      const fixed = await publishPending(store, sk, {});
+      cell(
+        "R19#1: a failing stage keeps the record failing store-wide in later batches without it; a successful retry clears it",
+        a.stalls.failing === 1 &&
+          b.stalls.failing === 1 &&
+          c.stalls.failing === 1 &&
+          stallReasons({ stalls: c.stalls }).some(r =>
+            /1 record\(s\) failing publication/.test(r)
+          ) &&
+          fixed.stalls.failing === 0,
+        { a: a.stalls, b: b.stalls, c: c.stalls, fixed: fixed.stalls }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // a done record skipped by the listing clears an old failure (its journal restored after being
+  // unreadable): the store is not left "failing" by a record that is complete
+  {
+    const d = tmp();
+    try {
+      const store = new Store(d);
+      const r = { ...owner, txHash: ethers.id("r19-done") };
+      store.putRecord(r);
+      const s = sinks();
+      const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: null };
+      for (let i = 0; i < 3; i++) await publishPending(store, sk, {});
+      const jp = join(d, "publications", `${Store.recordId(r)}.json`);
+      const good = readFileSync(jp, "utf8");
+      writeFileSync(jp, "{corrupt");
+      const broken = await publishPending(store, sk, {});
+      writeFileSync(jp, good);
+      const back = await publishPending(store, sk, {});
+      cell(
+        "R19: a complete record skipped as done clears the failure its unreadable journal left",
+        broken.stalls.failing === 1 &&
+          back.counts.done === 1 &&
+          back.counts.ran === 0 &&
+          back.stalls.failing === 0,
+        { broken: broken.stalls, back: [back.counts, back.stalls] }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #2: the reasons carried into the interim status are replaced by this pass's result
+  {
+    const carriedReason = "publication pass not ok (a stage failed, stopped or was skipped)";
+    const scanReason = "cursor 999 blocks behind finalized (> 300)";
+    const mk = () => ({ ok: true, healthy: false, degraded: [carriedReason] });
+    const ok = mk();
+    await publicationStep({
+      status: ok,
+      carried: [carriedReason],
+      run: async () => ({ ok: true, stalls: { feeCapped: 0, insufficientFunds: 0, failing: 0 } }),
+      slowNote: null,
+      iterStart: 0,
+      cfg: { intervalMs: 60_000 },
+      now: () => 1,
+    });
+    const withScan = { ok: true, healthy: false, degraded: [scanReason, carriedReason] };
+    await publicationStep({
+      status: withScan,
+      carried: [carriedReason],
+      run: async () => ({ ok: true, stalls: { feeCapped: 0, insufficientFunds: 0, failing: 0 } }),
+      slowNote: null,
+      iterStart: 0,
+      cfg: { intervalMs: 60_000 },
+      now: () => 1,
+    });
+    cell(
+      "R19#2: a successful pass replaces the carried reasons (healthy); a scan reason stays",
+      ok.healthy === true &&
+        !ok.degraded &&
+        withScan.healthy === false &&
+        JSON.stringify(withScan.degraded) === JSON.stringify([scanReason]),
+      { ok, withScan }
+    );
   }
 }
 

@@ -100,6 +100,9 @@ export function stallReasons(publication) {
     out.push(
       `${st.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
     );
+  // the generic count last: a specific cause above names the same record more precisely
+  if (st.failing)
+    out.push(`${st.failing} record(s) failing publication (retried every pass; see the alerts)`);
   return out;
 }
 
@@ -122,10 +125,21 @@ export function publicationReasons(publication) {
  * or that does not report ok, makes the watcher degraded (fixed wording, healthy = false) so the
  * heartbeat sees it; so do disclose stalls and a slow iteration. Returns the next slowNote.
  */
-export async function publicationStep({ status, run, slowNote, iterStart, cfg, now = Date.now }) {
+export async function publicationStep({
+  status,
+  run,
+  slowNote,
+  iterStart,
+  cfg,
+  carried = [],
+  now = Date.now,
+}) {
+  // the interim status carried the last publication's reasons (runOnce); they are replaced by this
+  // pass's, so health is the scan's plus the current publication's (Codex W2c R19 #2)
+  const scanDegraded = (status.degraded ?? []).filter(r => !carried.includes(r));
   try {
     // the previous iteration's slowness is only known after its publication: carried here
-    const degraded = [...(status.degraded ?? []), ...(slowNote ? [slowNote] : [])];
+    const degraded = [...scanDegraded, ...(slowNote ? [slowNote] : [])];
     status.publication = await run(degraded.length ? degraded : undefined);
   } catch (e) {
     status.publication = { error: safeText("publication", e) };
@@ -142,10 +156,9 @@ export async function publicationStep({ status, run, slowNote, iterStart, cfg, n
         `iteration slower than ${Math.round(limit)} ms (maxTickFraction of the interval)`
       : null;
   if (nextSlow) reasons.push(nextSlow);
-  if (reasons.length) {
-    status.degraded = [...(status.degraded ?? []), ...reasons];
-    status.healthy = false;
-  }
+  const all = [...scanDegraded, ...reasons];
+  status.degraded = all.length ? all : null;
+  status.healthy = status.ok === true && all.length === 0;
   return nextSlow;
 }
 
@@ -233,6 +246,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
   // `carry`: fields kept from the previous status while this run has not replaced them yet (the
   // last publication result, marked in progress: Codex W2c R1 M8).
   const status = { at: started, ruleset: ident, lastError: null, ...(carry ?? {}) };
+  let carried = []; // the reasons taken from the carried publication (replaced by publicationStep)
   // wall time of this tick and the archive it ran over, reported with every status
   const tickStart = Date.now();
   const timing = () => {
@@ -269,7 +283,10 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
       );
     // the status written before this iteration's publication keeps the last publication's
     // degradation (Codex W2c R18): a scan-only "healthy" must not read as recovered
-    if (carry?.publication) extra.push(...publicationReasons(carry.publication));
+    if (carry?.publication) {
+      carried = publicationReasons(carry.publication);
+      extra.push(...carried);
+    }
     status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
     status.healthy = status.ok === true && !status.degraded;
   };
@@ -318,7 +335,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
       more.push(`cursor ${lag} blocks behind finalized (> ${maxLag})`);
     await finish(s.trace, s.finalized, s.isolated ?? 0, more);
     store.writeStatus(status);
-    return { status, summary: s };
+    return { status, summary: s, carried };
   } catch (e) {
     status.ok = false;
     status.lastError = safeText("tick", e); // never a foreign error's text (lib/safe-error.mjs)
@@ -327,7 +344,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {})
     status.cursor = store.getCursor()?.block ?? null;
     await finish(null, null);
     store.writeStatus(status);
-    return { status, summary: null };
+    return { status, summary: null, carried };
   }
 }
 
@@ -380,7 +397,7 @@ async function main() {
       ? { publication: { ...(lastPub ?? {}), inProgress: true, since: new Date().toISOString() } }
       : undefined;
     const iterStart = Date.now();
-    const { status } = await runOnce(chain, cfg, store, rs, ident, { carry });
+    const { status, carried } = await runOnce(chain, cfg, store, rs, ident, { carry });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
     if (pub) {
@@ -389,6 +406,7 @@ async function main() {
         slowNote,
         iterStart,
         cfg,
+        carried,
         run: degraded => publishPhase(store, chain, cfg, pub.p, pub.built, { degraded }),
       });
       lastPub = status.publication;
