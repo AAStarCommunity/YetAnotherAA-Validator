@@ -36,7 +36,9 @@ const arg = n => {
 export function refusal(hold, reason) {
   if (!hold) return "no hold for this record";
   if (hold.state !== "unconfirmed-final")
-    return `only an unconfirmed-final hold can be re-armed (this one is ${String(hold.state).slice(0, 40)})`;
+    return `only an unconfirmed-final hold can be re-armed (this one is ${
+      typeof hold.state === "string" ? hold.state.slice(0, 40) : "a damaged state"
+    })`;
   if (typeof reason !== "string" || reason.trim().length === 0) return "--reason is required";
   // one plain line, kept local; never an endpoint (a URL can carry a key)
   if (

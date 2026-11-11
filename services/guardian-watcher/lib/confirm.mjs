@@ -222,7 +222,8 @@ export async function confirmPending(
   if (cursorMemo.has(store)) cursor = cursorMemo.get(store);
   else
     try {
-      cursor = readJson(passFile, null)?.cursor ?? null;
+      const c = readJson(passFile, null)?.cursor;
+      cursor = typeof c === "string" ? c : null; // a damaged cursor starts over (Codex D-RPC2 R12)
     } catch {
       cursor = null; // unreadable: start over (only the order is lost)
     }

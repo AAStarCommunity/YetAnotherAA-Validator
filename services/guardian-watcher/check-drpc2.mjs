@@ -1191,6 +1191,46 @@ async function scenario(build) {
       rmSync(d, { recursive: true, force: true });
     }
   }
+  // R12: a damaged cursor or hold state is never coerced
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-cur2-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const { writeFileSync, mkdirSync } = await import("node:fs");
+      mkdirSync(join(d, "holds"), { recursive: true });
+      writeFileSync(
+        join(d, "holds", "_pass.json"),
+        JSON.stringify({ cursor: { toString: null, valueOf: null } })
+      );
+      const run = async () => ({ status: { ok: false } });
+      let err = null;
+      let c = null;
+      try {
+        c = await confirmPending(new Store(d), {}, "s", { startBlock: 0 }, null, null, {
+          runOnce: run,
+          now: 1,
+        });
+      } catch (e) {
+        err = String(e);
+      }
+      const { refusal } = await import("../../deploy/guardian-watcher/rearm-hold.mjs");
+      let why = null;
+      let rerr = null;
+      try {
+        why = refusal({ state: { toString: null, valueOf: null } }, "r");
+      } catch (e) {
+        rerr = String(e);
+      }
+      cell(
+        "R12: a damaged confirmation cursor starts over (no throw, the record is checked); a damaged hold state is refused in fixed wording",
+        err === null && c.checked === 1 && rerr === null && /a damaged state/.test(why ?? ""),
+        { err, c, why, rerr }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
   // #5: an interrupted re-arm leaves its journal entry pending, settled from the hold
   {
     const { reconcile } = await import("../../deploy/guardian-watcher/rearm-hold.mjs");
