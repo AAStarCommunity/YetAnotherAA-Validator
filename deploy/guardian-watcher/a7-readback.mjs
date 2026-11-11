@@ -1,4 +1,4 @@
-// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 543f3498, frozen v7;
+// Comparison of SuperPaymaster's aoa-a7-readback/1 file (SP 769e17d2, frozen v8;
 // docs/release/a7/aoa-a7-readback-1.schema.json, read methods in its "x-readMethods") with what THIS
 // script reads from the loaded fork. Pure: every chain read goes through an injected reader, so the
 // rules are self-tested (check-a7-readback.mjs) without a chain.
@@ -19,12 +19,12 @@ import Ajv2020 from "ajv/dist/2020.js";
 import { AbiCoder, keccak256 } from "ethers";
 
 export const SCHEMA_ID = "aoa-a7-readback/1";
-/** sha256 of SP's FROZEN schema file at 543f3498 (v7, DSR-verified; any later change needs DSR
+/** sha256 of SP's FROZEN schema file at 769e17d2 (v8, DSR-verified; any later change needs DSR
  * acceptance and a new hash). */
-export const SCHEMA_SHA256 = "b1505b47ae871800a7f7569bfe89ad852951b669dbfb17afc87265205396194f";
+export const SCHEMA_SHA256 = "b58405f1d0a70375f9bd67bd5a26d92d64f6434aa4fbafd81d529fa917b93e6e";
 export const SCHEMA_SOURCE = {
   repo: "AAStarCommunity/SuperPaymaster",
-  ref: "543f349889b21d32ff9b738bc26b1aea5d5ec47c",
+  ref: "769e17d2edbe86cdeeec44e06b5116e11a9050d5",
   path: "docs/release/a7/aoa-a7-readback-1.schema.json",
 };
 export const ANVIL_COMMIT = "4e8874b2bdc840929585ca73e170993c50a4a531";
@@ -156,6 +156,16 @@ const COMMON = [
 const ZERO = "0x0000000000000000000000000000000000000000";
 const lc = v => String(v).toLowerCase();
 
+const URL_LIKE = /[a-z][a-z0-9+.-]*:\/\/|\b(?:https?|wss?|ftp|file):/i;
+/** Any string value or object key, at any depth, that looks like a URL. */
+export function hasUrlLike(v) {
+  if (typeof v === "string") return URL_LIKE.test(v);
+  if (Array.isArray(v)) return v.some(hasUrlLike);
+  if (v && typeof v === "object")
+    return Object.entries(v).some(([k, x]) => URL_LIKE.test(k) || hasUrlLike(x));
+  return false;
+}
+
 /** Every property name the schema itself defines (for masking input-derived diagnostic paths). */
 function schemaNames(node, out = new Set()) {
   if (Array.isArray(node)) node.forEach(x => schemaNames(x, out));
@@ -237,6 +247,20 @@ export async function compare(rb, reader, facts) {
   const h = rb.header;
 
   // ---- header
+  // data-quality gate (DSR): SP's read-back and address book carry names only; a URL-like string
+  // anywhere (any "scheme://", or http/https/ws/wss/ftp/file followed by ":") is an SP defect. It is
+  // reported as a fixed category and never echoed.
+  for (const [what, v] of [
+    ["read-back", rb],
+    ["address book", facts.addressBook ?? {}],
+  ])
+    if (hasUrlLike(v))
+      cmp.push({
+        path: `SP artefact contains URL-like string (${what})`,
+        sp: null,
+        fork: null,
+        ok: false,
+      });
   eq("header.source", "fork", h.source);
   eq("header.chainId", h.chainId, await reader.chainId());
   eq("header.forkBlock", h.forkBlock, facts.forkBlock);
@@ -348,6 +372,13 @@ export async function compare(rb, reader, facts) {
     const impl = BigInt(implWord) !== 0n ? wordAddr(implWord) : undefined;
     if (isState(c.erc1967Impl)) check(`${P}.erc1967Impl`, c.erc1967Impl, impl, impl === undefined);
     else check(`${P}.erc1967Impl`, c.erc1967Impl, impl, impl === lc(c.erc1967Impl));
+    // the SDK pins' spImpl / registryImpl are these proxies' erc1967Impl (schema v5, #412 F4)
+    const pinImpl = { superPaymaster: "spImpl", registry: "registryImpl" }[key];
+    if (pinImpl && facts.addressBook) {
+      const want = facts.addressBook[pinImpl];
+      if (!want) unverified.push(`${P}.erc1967Impl (address book has no ${pinImpl})`);
+      else check(`${P}.erc1967Impl=pins.${pinImpl}`, want, impl, !!impl && impl === lc(want));
+    }
     const implHash = impl ? await codehashAt(impl) : undefined;
     if (isState(c.implCodehash))
       check(`${P}.implCodehash`, c.implCodehash, implHash, implHash === undefined);
@@ -366,6 +397,11 @@ export async function compare(rb, reader, facts) {
           g.v,
           !isState(c.extension) && lc(g.v) === lc(c.extension)
         );
+        const bookAdmin = facts.addressBook?.spAdminExtension;
+        if (facts.addressBook && !bookAdmin)
+          unverified.push(`${P}.extension (address book has no spAdminExtension)`);
+        else if (bookAdmin)
+          check(`${P}.extension=pins.spAdminExtension`, bookAdmin, g.v, lc(g.v) === lc(bookAdmin));
         const eh = await codehashAt(g.v);
         check(
           `${P}.extensionCodehash`,
@@ -521,6 +557,9 @@ export async function compare(rb, reader, facts) {
     for (const [name, members] of Object.entries(c.roles)) {
       let id = /^0x[0-9a-fA-F]{64}$/.test(name) ? lc(name) : null;
       if (!id) {
+        // a name that is not an identifier cannot be a getter (and is not echoed)
+        if (!IDENT.test(name))
+          return unverified.push(`${P}.roles.(key) (not a role id or getter name)`);
         const g = await read(iface, a, `${name}()`);
         if (g.kind !== "value" || g.f.outputs[0].type !== "bytes32")
           return unverified.push(`${P}.roles.${name} (role id not resolvable from the ABI)`);
@@ -608,8 +647,12 @@ export async function compare(rb, reader, facts) {
             continue;
           }
           check(`${Q}.pubkeyHash`, e.pubkeyHash, o.pubkeyHash, lc(e.pubkeyHash) === o.pubkeyHash);
-          if ("slot" in e) eq(`${Q}.slot`, e.slot, o.slot);
-          if ("isActive" in e) eq(`${Q}.isActive`, e.isActive, o.isActive);
+          // the read method defines an entry as pubkeyHash + slot + isActive (#412 review F1):
+          // a field SP left out is unverified, never skipped
+          for (const k of ["slot", "isActive"])
+            if (e[k] === undefined || e[k] === null)
+              unverified.push(`${Q}.${k} (missing from the read-back)`);
+            else eq(`${Q}.${k}`, e[k], o[k]);
           for (const k of Object.keys(e))
             if (!["address", "pubkeyHash", "slot", "isActive"].includes(k))
               unverified.push(`${Q}.${k} (no read method)`);
@@ -688,7 +731,8 @@ export async function compare(rb, reader, facts) {
           `${P}.owners`,
           c.owners,
           o,
-          !!sp && JSON.stringify([...sp].sort()) === JSON.stringify([...o].sort())
+          // in order (#412 review F4): a drill's prevOwner is taken from this list
+          !!sp && JSON.stringify(sp) === JSON.stringify(o)
         );
       } else check(`${P}.threshold`, c.threshold, r.v, sameTyped("uint256", c.threshold, r.v));
     }
@@ -718,6 +762,34 @@ export async function compare(rb, reader, facts) {
       : read(facts.abi?.[r.key], r.addr, `${r.name}()`);
   for (const [k, v] of Object.entries(rb.checks)) {
     const P = `checks.${k}`;
+    // "<key>.thresholds == {WARNING:2, MINOR:3, MAJOR:3}" (schema v8): every SlashLevel read on
+    // chain with slashThresholds(level) and compared with the literal; the literal must name them all
+    const lit = k.match(/^([A-Za-z_][A-Za-z0-9_]*)\.thresholds == \{([^{}]*)\}$/);
+    if (lit) {
+      const at = addrOf[lit[1]];
+      const iface = facts.abi?.[lit[1]];
+      const pairs = lit[2].split(",").map(x => x.trim().match(/^([A-Z_]+):(\d+)$/));
+      if (!at || !iface || !facts.slashLevels || typeof v !== "boolean" || pairs.some(x => !x)) {
+        unverified.push(`${P} (unresolvable)`);
+        continue;
+      }
+      const want = Object.fromEntries(pairs.map(m => [m[1], BigInt(m[2])]));
+      const levels = Object.keys(facts.slashLevels);
+      if (JSON.stringify(Object.keys(want).sort()) !== JSON.stringify([...levels].sort())) {
+        check(P, "every SlashLevel listed", Object.keys(want), false);
+        continue;
+      }
+      let equal = true;
+      let failed = null;
+      for (const lvl of levels) {
+        const g = await read(iface, at, "slashThresholds(uint8)", [facts.slashLevels[lvl]]);
+        if (g.kind !== "value") failed = g.kind;
+        else if (BigInt(g.v) !== want[lvl]) equal = false;
+      }
+      if (failed) check(P, v, failed, false);
+      else check(P, v, equal, v === equal);
+      continue;
+    }
     const two = k.match(/^(\S+) == (\S+)$/);
     if (two) {
       const l = ref(two[1]);
@@ -777,6 +849,10 @@ export async function compare(rb, reader, facts) {
       eq(`amsterdamProbe.sp:estimateSimulate.${p}==gasUsedFork`, pr.gasUsedFork, n);
       eq(`amsterdamProbe.sp:estimateSimulate.${p}==expected.gasUsed`, pr.expected.gasUsed, n);
     }
+    // every declared provider, not only the keys SP wrote (#412 review F4)
+    for (const prov of h.providers)
+      if (!(prov in pr.callAtGasUsed))
+        unverified.push(`amsterdamProbe.callAtGasUsed.${prov} (missing)`);
     const calls = Object.entries(pr.callAtGasUsed);
     check(
       "amsterdamProbe.sp:callAtGasUsed all true",
@@ -792,8 +868,11 @@ export async function compare(rb, reader, facts) {
     });
     eq("amsterdamProbe.fork:gasUsed", pr.expected.gasUsed, ours?.gasUsedFork);
     // this script's own upstream: simulateV1 when it has it, and eth_call at gas = gasUsed
-    if (ours?.simulate !== undefined)
-      eq("amsterdamProbe.upstream:simulateV1", pr.expected.gasUsed, ours.simulate);
+    // judged, not skipped (#412 review F3): no eth_simulateV1 upstream is unverified; a revert or
+    // an RPC error is a failure
+    if (ours?.simulate === "unsupported")
+      unverified.push("amsterdamProbe.upstream:simulateV1 (not offered)");
+    else eq("amsterdamProbe.upstream:simulateV1", pr.expected.gasUsed, ours?.simulate);
     eq("amsterdamProbe.upstream:callAtGasUsed", true, ours?.callAtGasUsed);
   }
   return { cmp, unverified };

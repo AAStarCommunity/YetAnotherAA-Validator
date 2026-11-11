@@ -228,6 +228,33 @@ let slashLevels = null;
 }
 
 // ---- 3. the pinned anvil on the fork, with the dump loaded
+// Before anything starts (#412 review F2, N1): the UPSTREAM is the read-back's chain and has the
+// fork block (anvil's own chainId is whatever --chain-id says, so it proves nothing), and nothing
+// is already listening on --port (the tool would otherwise compare against that process).
+const preRpc = async (url, method, params) => {
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return (await r.json())?.result;
+  } catch {
+    return undefined;
+  }
+};
+{
+  const upChain = await preRpc(forkUrl, "eth_chainId", []);
+  if (upChain === undefined) die(3, "the fork RPC does not answer eth_chainId");
+  if (Number(upChain) !== h.chainId)
+    die(1, "the fork RPC is not the read-back's chain (eth_chainId)");
+  const upHead = await preRpc(forkUrl, "eth_blockNumber", []);
+  if (upHead === undefined || Number(upHead) < h.forkBlock)
+    die(1, "the fork RPC does not have header.forkBlock yet");
+  if ((await preRpc(`http://127.0.0.1:${port}`, "eth_chainId", [])) !== undefined)
+    die(1, `something already listens on --port ${port}: refusing to compare against it`);
+}
 let anvilVersion;
 let anvilCommit;
 try {
@@ -387,7 +414,15 @@ const reader = {
       blockTag,
     ]);
     const c0 = sim.result?.[0]?.calls?.[0];
+    // judged (#412 review F3): a number on success; "unsupported" only when the method does not
+    // exist (-32601); anything else (a revert, an RPC error) is "failed" and fails the comparison
     if (c0 && c0.status === "0x1") out.simulate = Number(c0.gasUsed);
+    else if (
+      sim.error?.code === -32601 ||
+      /not (found|supported|available)/i.test(String(sim.error?.message ?? ""))
+    )
+      out.simulate = "unsupported";
+    else out.simulate = "failed";
     const at = await upstream("eth_call", [{ ...tx, gas: ethers.toQuantity(gasUsed) }, blockTag]);
     out.callAtGasUsed = at.result !== undefined && !at.error;
     const at1 = await upstream("eth_call", [
@@ -458,6 +493,9 @@ if (opt("address-book") && !opt("pins-commit"))
   });
 }
 const failed = cmp.filter(x => !x.ok);
+// the anvil this tool started must still be the one answering (#412 review N1)
+if (anvil.exitCode !== null)
+  failed.push({ path: "anvil exited before the verdict", sp: null, fork: null, ok: false });
 const proven = !failed.length && !unverified.length;
 
 // ---- 5. gas for the rehearsal's own test key, only on a proven fork

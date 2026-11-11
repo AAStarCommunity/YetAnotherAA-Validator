@@ -36,15 +36,15 @@ const cell = (name, ok, got) =>
 const schemaText = fx("aoa-a7-readback-1.schema.json");
 const exampleText = fx("aoa-a7-readback-1.example.json");
 const liveText = fx("aoa-a7-readback-1.live.example.json");
-cell("schema is SP's frozen v7 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
+cell("schema is SP's frozen v8 (sha256)", sha(schemaText) === SCHEMA_SHA256, sha(schemaText));
 cell(
   "fork example is SP's (sha256)",
-  sha(exampleText) === "20fd1d952f52b195ab3379038be27ac63619ec76eff8a04796318b3d7a4da11b",
+  sha(exampleText) === "62099b25d49165825199fff6f4def15c86d9b2de4661024687192a5fe60ec8ca",
   sha(exampleText)
 );
 cell(
   "live example is SP's (sha256)",
-  sha(liveText) === "a184468e12e157781433bef06dbe4c187710f1306c53d9824495d59200da9e7e",
+  sha(liveText) === "3498c29bec7f665e8e0f7a9f7858cf988384de1c68f6577f450b73c0ce6b9507",
   sha(liveText)
 );
 const schema = JSON.parse(schemaText);
@@ -86,6 +86,7 @@ cell("live example validates", validate(schema, live).length === 0, validate(sch
 // ---- a complete, internally consistent, schema-valid read-back built from SP's example
 const A = n => getAddress("0x" + n.toString(16).padStart(40, "0"));
 const G1 = "0x9999999999999999999999999999999999999999";
+const G2 = "0x6464646464646464646464646464646464646464"; // in slot 64: the traversal's upper bound
 const PK = [
   "0x" + "11".repeat(32),
   "0x" + "22".repeat(32),
@@ -94,6 +95,16 @@ const PK = [
 ];
 const PK_TYPE = "tuple(bytes32 x_a, bytes32 x_b, bytes32 y_a, bytes32 y_b)";
 const PK_HASH = keccak256(AbiCoder.defaultAbiCoder().encode([PK_TYPE], [PK]));
+const PK2 = [
+  "0x" + "55".repeat(32),
+  "0x" + "66".repeat(32),
+  "0x" + "77".repeat(32),
+  "0x" + "88".repeat(32),
+];
+const PK2_HASH = keccak256(AbiCoder.defaultAbiCoder().encode([PK_TYPE], [PK2]));
+const SLOTS = Array.from({ length: 64 }, (_, i) =>
+  i === 0 ? G1 : i === 63 ? G2 : "0x0000000000000000000000000000000000000000"
+);
 const ROLE = keccakId("ROLE_COMMUNITY");
 const MEMBER = "0x6666666666666666666666666666666666666666";
 const base = structuredClone(example);
@@ -110,10 +121,14 @@ const base = structuredClone(example);
   for (const [k, c] of Object.entries(C)) if (k !== "registry") c.roles = "n/a:no role system";
   C.registry.roles = { ROLE_COMMUNITY: [MEMBER] };
   C.registry.rolesSource = { fromBlock: 12000000, toBlock: base.header.readbackBlock };
-  C.blsAggregator.guardianSet = [{ address: G1, pubkeyHash: PK_HASH, slot: 1, isActive: true }];
-  C.blsAggregator.thresholds = { WARNING: 1, MINOR: 2, MAJOR: 3 };
+  C.blsAggregator.guardianSet = [
+    { address: G1, pubkeyHash: PK_HASH, slot: 1, isActive: true },
+    { address: G2, pubkeyHash: PK2_HASH, slot: 64, isActive: true },
+  ];
+  C.blsAggregator.signerMaskOrder = { source: "BLSAggregator.sol:1281-1284", bits: SLOTS };
+  C.blsAggregator.thresholds = { WARNING: 2, MINOR: 3, MAJOR: 3 }; // schema v8: initialised 2/3/3
   Object.assign(C.blsAggregator, {
-    N: 1, // one occupied slot in this world
+    N: 2, // two occupied slots in this world (1 and 64)
     pendingFraudProofVerifier: "0x0000000000000000000000000000000000000000",
     pendingFraudProofVerifierReadyAt: 0,
     minThreshold: 2,
@@ -128,6 +143,7 @@ const base = structuredClone(example);
     "superPaymaster.fraudProofVerifier": "0x0000000000000000000000000000000000000000",
     "blsAggregator.owner == superPaymaster.owner": true,
     "evaluationCommunityToken.creditPolicy == evaluationCommunityToken.POLICY_OFF": true,
+    "blsAggregator.thresholds == {WARNING:2, MINOR:3, MAJOR:3}": true,
   };
   base.amsterdamProbe.estimateSimulate = { alchemy: 256645, tenderly: "n/a:no eth_simulateV1" };
 }
@@ -141,6 +157,12 @@ const addressBook = Object.fromEntries(
     .filter(([, c]) => !isState(c.address))
     .map(([k, c]) => [k, c.address])
 );
+// the SDK pins carry the two proxies' implementations as spImpl / registryImpl
+for (const [k, pin] of [
+  ["superPaymaster", "spImpl"],
+  ["registry", "registryImpl"],
+])
+  if (!isState(base.contracts[k].erc1967Impl)) addressBook[pin] = base.contracts[k].erc1967Impl;
 
 // ---- the fake chain: ABIs typed from the read-back; answers by fragment and arguments
 const typeOf = v =>
@@ -257,9 +279,10 @@ function world(rb) {
     }
     if (key === "blsAggregator") {
       for (let s = 1; s <= 64; s++)
-        ans(c.address, iface, "validatorAtSlot(uint8)", [s], s === 1 ? G1 : A(0));
+        ans(c.address, iface, "validatorAtSlot(uint8)", [s], SLOTS[s - 1]);
       ans(c.address, iface, "getBLSPublicKey(address)", [G1], [PK, 1n, true]);
-      [1n, 2n, 3n].forEach((v, i) => ans(c.address, iface, "slashThresholds(uint8)", [i], v));
+      ans(c.address, iface, "getBLSPublicKey(address)", [G2], [PK2, 64n, true]);
+      [2n, 3n, 3n].forEach((v, i) => ans(c.address, iface, "slashThresholds(uint8)", [i], v));
     }
     if (key === "entryPoint") {
       const e = c;
@@ -771,6 +794,174 @@ await mut(
       s === OWNERSHIP_2STEP_SLOT ? "0x" + "0".repeat(24) + "42".repeat(20) : w.reader.slot(a, s),
   })
 );
+// ---- #412 review: F1, F3, F4, the URL gate, the thresholds literal, and the mutants it found alive
+for (const k of ["slot", "isActive"])
+  await unv(
+    `F1: a guardian entry without ${k} is unverified, never skipped`,
+    rb => delete rb.contracts.blsAggregator.guardianSet[0][k],
+    `contracts.blsAggregator.guardianSet[${G1}].${k} (missing`
+  );
+await mut(
+  "F1: a reported isActive other than the chain's fails",
+  rb => (rb.contracts.blsAggregator.guardianSet[1].isActive = false),
+  `contracts.blsAggregator.guardianSet[${G2}].isActive`
+);
+await mut(
+  "the slot traversal reaches slot 64: a wrong pubkeyHash there fails",
+  rb => (rb.contracts.blsAggregator.guardianSet[1].pubkeyHash = "0x" + "ab".repeat(32)),
+  `contracts.blsAggregator.guardianSet[${G2}].pubkeyHash`
+);
+await mut(
+  "N counts slot 64 too: N = 1 fails",
+  rb => (rb.contracts.blsAggregator.N = 1),
+  "contracts.blsAggregator.N=occupied slots"
+);
+await unv(
+  "F3: own upstream without eth_simulateV1 is unverified",
+  () => {},
+  "amsterdamProbe.upstream:simulateV1 (not offered)",
+  () => ({
+    probe: async () => ({ gasUsedFork: 256645, simulate: "unsupported", callAtGasUsed: true }),
+  })
+);
+await mut(
+  "F3: own upstream simulateV1 that reverts or errors fails",
+  () => {},
+  "amsterdamProbe.upstream:simulateV1",
+  () => ({ probe: async () => ({ gasUsedFork: 256645, simulate: "failed", callAtGasUsed: true }) })
+);
+await unv(
+  "F4: callAtGasUsed missing a declared provider is unverified",
+  rb => delete rb.amsterdamProbe.callAtGasUsed.tenderly,
+  "amsterdamProbe.callAtGasUsed.tenderly (missing"
+);
+await mut(
+  "an empty callAtGasUsed fails",
+  rb => (rb.amsterdamProbe.callAtGasUsed = {}),
+  "amsterdamProbe.sp:callAtGasUsed all true"
+);
+await mut(
+  "F4: Safe owners in another order fail (a drill's prevOwner comes from this list)",
+  rb => rb.contracts.ownerSafe.owners.reverse(),
+  "contracts.ownerSafe.owners"
+);
+await mut(
+  "Safe owners of the same length but other members fail",
+  rb => (rb.contracts.ownerSafe.owners[2] = A(0xa4)),
+  "contracts.ownerSafe.owners"
+);
+await mut(
+  "F4: EXTENSION() other than the pins' spAdminExtension fails",
+  () => {},
+  "contracts.superPaymaster.extension=pins.spAdminExtension",
+  undefined,
+  { addressBook: { ...addressBook, spAdminExtension: A(0x4445) } }
+);
+await mut(
+  "F4: erc1967Impl other than the pins' spImpl fails",
+  () => {},
+  "contracts.superPaymaster.erc1967Impl=pins.spImpl",
+  undefined,
+  { addressBook: { ...addressBook, spImpl: A(0x3334) } }
+);
+await unv(
+  "F4: pins without spImpl leave the proxy's implementation unverified",
+  () => {},
+  "contracts.superPaymaster.erc1967Impl (address book has no spImpl)",
+  undefined,
+  {
+    addressBook: (() => {
+      const b = { ...addressBook };
+      delete b.spImpl;
+      return b;
+    })(),
+  }
+);
+await mut(
+  "SP's erc1967Impl other than the chain's fails, even when the pins agree with the chain",
+  rb => (rb.contracts.superPaymaster.erc1967Impl = A(0x3334)),
+  "contracts.superPaymaster.erc1967Impl"
+);
+await mut(
+  "implCodehash other than the implementation's code fails",
+  rb => (rb.contracts.superPaymaster.implCodehash = "0x" + "21".repeat(32)),
+  "contracts.superPaymaster.implCodehash"
+);
+await mut(
+  "extensionCodehash equal to the extension but not to spAdminExtension.codehash fails",
+  rb => (rb.contracts.spAdminExtension.codehash = "0x" + "31".repeat(32)),
+  "contracts.superPaymaster.extensionCodehash=spAdminExtension.codehash"
+);
+await mut(
+  "own upstream without blockAccessListHash fails",
+  () => {},
+  "upstream.blockAccessListHash",
+  () => ({ upstreamHeader: async () => ({ blockAccessListHash: false, slotNumber: true }) })
+);
+await unv(
+  "rolesSource.toBlock other than readbackBlock is unverified",
+  rb => (rb.contracts.registry.rolesSource.toBlock = rb.header.readbackBlock - 1),
+  "contracts.registry.roles (no rolesSource"
+);
+await mut(
+  "a log candidate that hasRole denies is not a member: SP listing it fails",
+  () => {},
+  "contracts.registry.roles[",
+  (w, rb) => ({
+    call: async (a, i, f, args) =>
+      f.name === "hasRole" && a.toLowerCase() === rb.contracts.registry.address.toLowerCase()
+        ? { status: "value", v: false }
+        : w.reader.call(a, i, f, args),
+  })
+);
+// the data-quality gate (DSR): a URL-like string anywhere in SP's artefacts stops, never echoed
+for (const [name, f] of [
+  ["a scheme without //", rb => (rb.header.tag = "https:rpc.example/SYNTHETIC_SECRET")],
+  [
+    "a URL in a nested string",
+    rb => (rb.contracts.superPaymaster.version = "see wss://x/SYNTHETIC_SECRET"),
+  ],
+  ["a URL as a key", rb => (rb.contracts.registry.roles = { "ftp:host/SYNTHETIC_SECRET": [] })],
+]) {
+  const rb = clone();
+  f(rb);
+  const r = await run(rb);
+  const out = JSON.stringify(sanitize({ failed: r.cmp.filter(x => !x.ok) }));
+  cell(
+    `URL gate: ${name} stops as "SP artefact contains URL-like string", not echoed by the gate`,
+    failed(r).includes("SP artefact contains URL-like string (read-back)") &&
+      !r.cmp.find(x => x.path.startsWith("SP artefact"))?.sp,
+    failed(r).slice(0, 5)
+  );
+}
+await mut(
+  "URL gate: a URL-like key in the address book stops",
+  () => {},
+  "SP artefact contains URL-like string (address book)",
+  undefined,
+  { addressBook: { ...addressBook, "https:evil": A(1) } }
+);
+// the thresholds literal check (schema v8)
+await mut(
+  "thresholds literal: a chain threshold other than the literal makes the check false",
+  () => {},
+  "checks.blsAggregator.thresholds == {WARNING:2, MINOR:3, MAJOR:3}",
+  (w, rb) => ({
+    call: async (a, i, f, args) =>
+      f.name === "slashThresholds" && Number(args[0]) === 0
+        ? { status: "value", v: 1n }
+        : w.reader.call(a, i, f, args),
+  })
+);
+await mut(
+  "thresholds literal: a literal that omits a SlashLevel fails",
+  rb => {
+    delete rb.checks["blsAggregator.thresholds == {WARNING:2, MINOR:3, MAJOR:3}"];
+    rb.checks["blsAggregator.thresholds == {MINOR:3, MAJOR:3}"] = true;
+  },
+  "checks.blsAggregator.thresholds == {MINOR:3, MAJOR:3}"
+);
+
 // ---- the probe (v4/v5)
 await mut(
   "probe: SP's simulateV1 differs from gasUsedFork: fails",
