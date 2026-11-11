@@ -814,6 +814,27 @@ try {
       { capErr, noCap }
     );
   }
+  {
+    // W2b Codex R8: a zero-tip original and a zero-tip estimate: every fee field still rises
+    fees.maxFeePerGas = 1000n;
+    fees.maxPriorityFeePerGas = 0n;
+    const z0 = await sink.sign(args, { nonce: 5 });
+    const z1 = await sink.sign(args, { nonce: 5, replace: true, prevRaw: z0.raw });
+    const t0 = ethers.Transaction.from(z0.raw);
+    const t1 = ethers.Transaction.from(z1.raw);
+    cell(
+      "R8: a replacement of a zero-tip tx raises both fee fields (tip 0 -> >= 1 wei)",
+      t0.maxPriorityFeePerGas === 0n &&
+        t1.maxPriorityFeePerGas >= 1n &&
+        t1.maxFeePerGas > t0.maxFeePerGas,
+      {
+        t0: [t0.maxFeePerGas, t0.maxPriorityFeePerGas].map(String),
+        t1: [t1.maxFeePerGas, t1.maxPriorityFeePerGas].map(String),
+      }
+    );
+    fees.maxFeePerGas = 1000n;
+    fees.maxPriorityFeePerGas = 100n;
+  }
   // Replacement fees come from the REPLACED tx, not from the current estimate (Codex R1 H4).
   const s0 = await sink.sign(args, { nonce: 3 });
   fees.maxFeePerGas = 500n; // the estimate FELL since the original was sent

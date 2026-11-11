@@ -86,7 +86,11 @@ export function registrySink({
   // completeness now (a zero address counts as unknown, #411 review F5); the wallet before signing
   assertRolesComplete(roles);
   const bumpNum = BigInt(Math.ceil(feeBump * 1000));
-  const bumpUp = x => (x * bumpNum + 999n) / 1000n; // rounded up
+  // rounded up, and at least +1 wei, so a zero (or tiny) fee field still strictly rises (W2b R8)
+  const bumpUp = x => {
+    const b = (x * bumpNum + 999n) / 1000n;
+    return b > x ? b : x + 1n;
+  };
   const big = x => (x == null ? null : BigInt(x));
   const max = (a, b) => (a > b ? a : b);
   const call = async (fn, args, blockTag) =>
