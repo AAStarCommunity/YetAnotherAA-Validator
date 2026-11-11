@@ -277,6 +277,16 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
           more.push(
             `${status.confirm.final} accusatory record(s) never confirmed by the second provider (held for good)`
           );
+        // held and not publishable: a disagreement, or a second provider that keeps not answering
+        // (DSR, ded99d78): degraded, never published
+        if (status.confirm.mismatch)
+          more.push(
+            `${status.confirm.mismatch} accusatory record(s) differ on the second provider (held, not published)`
+          );
+        if (status.confirm.waiting)
+          more.push(
+            `${status.confirm.waiting} accusatory record(s) not confirmable: the second provider has not answered on 2+ attempts (held, not published)`
+          );
       } catch {
         status.confirm = { secondProvider: second.host ?? null, error: "confirmation pass failed" };
         more.push("D-RPC2 confirmation pass failed");

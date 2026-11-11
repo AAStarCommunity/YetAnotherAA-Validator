@@ -172,7 +172,10 @@ export async function confirmPending(
   ident,
   { runOnce, now } = {}
 ) {
-  const counts = { confirmed: 0, unconfirmed: 0, final: 0, checked: 0 };
+  // mismatch: the second provider reproduced something else; waiting: it could not answer on two or
+  // more attempts in a row (one attempt is the normal finality gap). Both make the watcher degraded
+  // while the record is held (DSR, ded99d78).
+  const counts = { confirmed: 0, unconfirmed: 0, final: 0, checked: 0, mismatch: 0, waiting: 0 };
   const dir = join(store.dir, "records");
   const holds = join(store.dir, "holds");
   if (!existsSync(holds)) {
@@ -239,6 +242,10 @@ export async function confirmPending(
     counts[
       state === "confirmed" ? "confirmed" : state === "unconfirmed-final" ? "final" : "unconfirmed"
     ]++;
+    if (state === "unconfirmed") {
+      if (r.state === "mismatch") counts.mismatch++;
+      else if (attempts >= 2) counts.waiting++;
+    }
   }
   return counts;
 }

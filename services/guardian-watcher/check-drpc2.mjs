@@ -416,6 +416,58 @@ async function scenario(build) {
   }
 }
 
+// ---- DSR (ded99d78): a held accusation is degraded while it cannot be confirmed: at once on a
+// disagreement, and after two attempts when the second provider does not answer (one attempt is
+// the normal finality gap); it is never published meanwhile
+{
+  const d = mkdtempSync(join(tmpdir(), "drpc2-wait-"));
+  try {
+    const c = makeChain();
+    const cfg = {
+      aggregator: AGG,
+      roles: { superPaymaster: SP },
+      forwarders: FORWARDERS,
+      startBlock: c.head() + 1,
+      maxBlocksPerTick: 1000,
+      page: 5000,
+    };
+    const t = c.ownerTx([{ name: "GuardianSet", args: [addr("wt-a"), addr("wt-b")] }]);
+    for (let i = 0; i < 4; i++) c.mine();
+    const down = wrap(c.chain, {
+      getBlock: async () => {
+        throw new Error("second provider down");
+      },
+      send: async () => {
+        throw new Error("down");
+      },
+    });
+    const store = new Store(d);
+    const ticks = [];
+    for (let i = 0; i < 3; i++)
+      ticks.push(
+        (
+          await runOnce(c.chain, cfg, store, rs, ident, {
+            second: { chain: down, host: "second.example" },
+          })
+        ).status
+      );
+    const rec = recsOf(d).find(r => r.txHash === t.hash);
+    const why = st =>
+      (st.degraded ?? []).some(x => /second provider has not answered on 2\+ attempts/.test(x));
+    cell(
+      "DSR: a second provider that does not answer: tick 1 not yet degraded for it, ticks 2+ degraded; the accusation is never publishable",
+      !why(ticks[0]) &&
+        why(ticks[1]) &&
+        why(ticks[2]) &&
+        ticks[2].healthy === false &&
+        !mayPublish(store, rec),
+      ticks.map(st => [st.confirm, st.degraded])
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
 // ---- the publisher's gate (lib/publisher.mjs publishPending): held records are never published
 {
   const { publishPending } = await import("./lib/publisher.mjs");
@@ -623,6 +675,32 @@ async function scenario(build) {
         "R1#1: an alias record file is skipped (malformed), never confirmed",
         (c.malformed ?? 0) >= 1,
         c
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-mm-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      let n = 0;
+      const run = async (second, c, temp) => {
+        n++;
+        temp.putRecord({ ...bls, signerMask: "1" }); // the second provider reproduces other signers
+        return { status: { ok: true, cursor: c.startBlock } };
+      };
+      const c1 = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
+        runOnce: run,
+      });
+      cell(
+        "DSR: a disagreement with the second provider counts as mismatch from the first attempt (degraded), and the record stays held",
+        n === 1 &&
+          c1.mismatch === 1 &&
+          c1.unconfirmed === 1 &&
+          !mayPublish(store, stored(store, bls)),
+        c1
       );
     } finally {
       rmSync(d, { recursive: true, force: true });
