@@ -118,6 +118,15 @@ export function stallReasons(publication) {
     out.push(
       `${st.migrating} record(s) not yet confirmed on the configured registry (registry switched)`
     );
+  if (st.nonceWait)
+    out.push(
+      `${st.nonceWait} record(s) wait after a registry switch for the writer's nonce(s) ${(st.waitNonces ?? []).join(", ")} to be consumed at the finalized block (runbook: new writer, or fill-nonce)`
+    );
+  if (st.nonceGaps?.length)
+    out.push(
+      `writer nonce(s) ${st.nonceGaps.join(", ")} pending or skipped but held by no journal (runbook: fill-nonce)`
+    );
+  if (st.nonceGapUnknown) out.push("writer nonce gap check failed");
   if (st.incidents)
     out.push(`${st.incidents} unresolved registry or bytes incident(s) (acknowledge or resolve)`);
   if (st.inconsistent)

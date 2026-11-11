@@ -303,67 +303,53 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
     !sameRegistry(registryAt(state.registry), where)
   ) {
     const from = registryAt(state.registry);
-    // An in-flight disclose of the SAME writer on the SAME chain holds a nonce: the new registry's
-    // first tx replaces it at that nonce, or every later tx of this writer would wait behind it
-    // (#425 review B2). Another writer or chain has its own nonce space: nothing to replace.
-    const old = state.registry;
-    let replace = null;
-    if (
-      (old.phase === "signed" || old.phase === "sent" || old.phase === "landed") &&
-      Number.isSafeInteger(old.nonce) &&
-      from?.chainId === where.chainId &&
-      typeof sinks.registry.writer === "function"
-    ) {
-      let oldFrom = typeof old.from === "string" ? old.from : null;
-      if (!oldFrom && old.raw)
-        try {
-          oldFrom = ethers.Transaction.from(old.raw).from ?? null;
-        } catch {
-          oldFrom = null;
-        }
-      const me = await sinks.registry.writer();
-      const hashes = old.hashes?.length ? old.hashes : old.hash ? [old.hash] : [];
-      const raws =
-        old.raws?.length === hashes.length
-          ? old.raws
-          : hashes.map((_, i) => (i === hashes.length - 1 ? old.raw : null));
-      // the old txs are kept as FEE-FLOOR candidates only (R5): never broadcast again, and their
-      // receipts are never taken as the new registry's completion. A stage that itself came from a
-      // migration carries its inherited floor candidates on (Codex W2d R6: A -> B -> C keeps A's)
-      const inherited =
-        old.floorHashes?.length &&
-        String(old.floorFrom ?? "").toLowerCase() === String(oldFrom ?? "").toLowerCase()
-          ? { hashes: old.floorHashes, raws: old.floorRaws ?? old.floorHashes.map(() => null) }
-          : { hashes: [], raws: [] };
-      if (oldFrom && me && oldFrom.toLowerCase() === me.toLowerCase() && hashes.length)
-        replace = {
-          nonce: old.nonce,
-          from: oldFrom,
-          hashes: [...inherited.hashes, ...hashes],
-          raws: [...inherited.raws, ...raws],
-        };
+    // A disclose of the SAME writer on the SAME chain still in flight holds a nonce: disclosing again
+    // now would sign at the next nonce behind it, and if the old tx were evicted that nonce would
+    // stay empty for good (#425 review B2). So the stage is NOT archived until the old nonce is
+    // consumed at the finalized block (DSR, option A): meanwhile the record waits, degraded, and
+    // nothing is broadcast to the old registry (no rebroadcast, no fee bump; what a mempool
+    // already holds is left alone). Another writer (the M0 §5.5a recovery) or another chain has its
+    // own nonce space: archived at once.
+    let wait;
+    try {
+      wait = await nonceWait(state.registry, from, where, sinks.registry);
+    } catch (e) {
+      if (e instanceof PersistError) throw e;
+      alerts.push(`registry: ${errMsg(e)}`);
+      failures.push("registry");
+      return { state, alerts, failures };
     }
-    // a stage with no tx yet (unsigned, e.g. fee-capped) after an earlier migration: that
-    // migration's outstanding replacement instruction carries over (Codex W2d R6); it is
-    // re-validated on every attempt (signer, nonce) as always
-    if (!replace && state.registryMigrated?.replace && from?.chainId === where.chainId) {
-      replace = state.registryMigrated.replace;
+    if (wait) {
+      const w0 = state.registryWait;
+      if (
+        !w0 ||
+        w0.nonce !== wait.nonce ||
+        w0.chainId !== wait.chainId ||
+        String(w0.from).toLowerCase() !== wait.from.toLowerCase()
+      ) {
+        state.registryWait = { ...wait, since: new Date().toISOString() };
+        await persist(state);
+      }
+      alerts.push(
+        `registry: the configured registry changed while this record's disclose tx (nonce ${wait.nonce}) is pending for the same writer; waiting for nonce ${wait.nonce} to be consumed at the finalized block (nothing is broadcast to the old registry; runbook: a new writer, or fill-nonce)`
+      );
+      return { state, alerts, failures };
     }
     state.registryHistory = [
       ...(state.registryHistory ?? []),
       { ...state.registry, supersededAt: new Date().toISOString() },
     ];
     state.registry = null;
-    state.registryMigrated = {
-      from,
-      to: where,
-      at: new Date().toISOString(),
-      ...(replace ? { replace } : {}),
-    };
+    delete state.registryWait;
+    state.registryMigrated = { from, to: where, at: new Date().toISOString() };
     await persist(state);
     alerts.push(
       "registry: the configured registry changed; this record is disclosed again on it (the old registry's transactions are not broadcast)"
     );
+  } else if (rec.route === "bls" && where && state.registryWait) {
+    // the stage it waited for is on the configured registry again (switched back): it resumes
+    delete state.registryWait;
+    await persist(state);
   }
   if (rec.route === "bls" && sinks.registry && state.registry?.phase !== "confirmed") {
     // every journal write of this stage records the registry it is for
@@ -411,6 +397,37 @@ export function registryAt(r) {
 }
 export const sameRegistry = (at, where) =>
   !!at && at.address === where.address && at.chainId === where.chainId;
+
+const IN_FLIGHT = new Set(["signed", "sent", "landed"]);
+/** The address that signed a journalled stage's tx: its `from`, or its raw's signer; or null. */
+export function stageSigner(r) {
+  if (typeof r?.from === "string" && ethers.isAddress(r.from)) return ethers.getAddress(r.from);
+  if (r?.raw)
+    try {
+      const f = ethers.Transaction.from(r.raw).from;
+      return f ? ethers.getAddress(f) : null;
+    } catch {
+      return null;
+    }
+  return null;
+}
+/**
+ * Whether a stage written for another registry holds a nonce the configured writer still needs
+ * (#425 review B2, DSR option A): the same writer, on the same chain, with its tx in flight and
+ * that nonce not consumed at the finalized block. Returns { nonce, from, chainId, registry } or
+ * null. Reads only on the configured chain (#425 review B1).
+ */
+export async function nonceWait(old, from, where, reg) {
+  if (!IN_FLIGHT.has(old?.phase) || !Number.isSafeInteger(old.nonce)) return null;
+  if (!from || from.chainId !== where.chainId) return null; // another chain: its own nonce space
+  const signer = stageSigner(old);
+  if (!signer || typeof reg.writer !== "function") return null;
+  const me = await reg.writer();
+  if (!me || String(me).toLowerCase() !== signer.toLowerCase()) return null; // another writer
+  if (typeof reg.assertChain === "function") await reg.assertChain();
+  if ((await reg.nonce()) > old.nonce) return null; // consumed at the finalized block
+  return { nonce: old.nonce, from: signer, chainId: where.chainId, registry: from };
+}
 
 /**
  * On-chain content is untrusted text, and its shape proves nothing (a base32-shaped string can
@@ -575,16 +592,6 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
           // a known tx without its raw bytes: floor on the latest journalled raw, whose fees are
           // never below an earlier one's (each replacement only rises from its floor)
           floorRaw = raws0[i] ?? highestFeeRaw(raws0);
-      // the old registry's tx at this nonce (a same-writer migration, Codex W2d R5 #1), while the
-      // writer is still its signer and a node still knows it: a floor only, never broadcast
-      if (floorRaw === null && state.registry.floorHashes?.length) {
-        const me = typeof reg.writer === "function" ? await reg.writer() : null;
-        if (me && String(me).toLowerCase() === String(state.registry.floorFrom ?? "").toLowerCase())
-          for (let i = state.registry.floorHashes.length - 1; i >= 0 && floorRaw === null; i--)
-            if (await reg.knows(state.registry.floorHashes[i]))
-              floorRaw =
-                state.registry.floorRaws?.[i] ?? highestFeeRaw(state.registry.floorRaws ?? []);
-      }
       let rep;
       try {
         rep = await reg.sign(
@@ -625,34 +632,8 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
   // Nothing in flight: an entry may already exist (an earlier publication completed elsewhere).
   if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
   let signed;
-  // The first tx after a same-writer migration takes the old registry's pending nonce (#425 review
-  // B2), re-checked on EVERY attempt (Codex W2d R5): only while the writer is still the one that
-  // signed the old tx (#3) and that nonce is not consumed at the finalized block; the fee floor is
-  // the old tx only while a node still knows it (#2: after an eviction the nonce is kept, unfloored).
-  let rep = state.registryMigrated?.replace ?? null;
-  if (rep) {
-    const me = typeof reg.writer === "function" ? await reg.writer() : null;
-    if (!me || String(me).toLowerCase() !== String(rep.from ?? "").toLowerCase()) rep = null;
-    else if ((await reg.nonce()) > rep.nonce) rep = null;
-    if (!rep) {
-      const { replace: _gone, ...migrated } = state.registryMigrated;
-      void _gone;
-      state.registryMigrated = migrated;
-    }
-  }
-  let repFloor = null;
-  if (rep)
-    for (let i = (rep.hashes ?? []).length - 1; i >= 0 && repFloor === null; i--)
-      if (await reg.knows(rep.hashes[i])) repFloor = rep.raws?.[i] ?? highestFeeRaw(rep.raws ?? []);
   try {
-    signed = await reg.sign(
-      discloseArgs(rec, file),
-      rep
-        ? repFloor
-          ? { nonce: rep.nonce, replace: true, prevRaw: repFloor }
-          : { nonce: rep.nonce }
-        : undefined
-    );
+    signed = await reg.sign(discloseArgs(rec, file));
   } catch (e) {
     if (e?.code !== "FEE_CAP") throw e;
     // the stall is journalled like a replacement's (Codex W2c R11): it counts as degraded until a
@@ -672,14 +653,7 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     raws: [signed.raw],
     nonce: signed.nonce,
     ...(signed.from ? { from: signed.from } : {}),
-    // the old registry's txs at this nonce stay fee-floor candidates for later replacements (R5
-    // #1); they are never broadcast and their receipts never complete this stage
-    ...(rep ? { floorHashes: rep.hashes, floorRaws: rep.raws, floorFrom: rep.from } : {}),
   };
-  if (state.registryMigrated?.replace) {
-    const { replace: done, ...migrated } = state.registryMigrated;
-    state.registryMigrated = { ...migrated, replacedNonce: done.nonce };
-  }
   await persist(state); // journal BEFORE broadcast
   await broadcastJournalled(reg, signed.raw, state, persist, alerts);
   state.registry = { ...state.registry, phase: "sent", sentAt: new Date().toISOString() };

@@ -308,6 +308,62 @@ export function registrySink({
     async nonce() {
       return provider.getTransactionCount(await wallet.getAddress(), await finalized());
     },
+    /** The writer's nonce counts at the latest block and in the node's pending view (the store-wide
+     * nonce gap check, #425 review B2). */
+    async nonceRange() {
+      const from = await wallet.getAddress();
+      const [latest, pending] = await Promise.all([
+        provider.getTransactionCount(from, "latest"),
+        provider.getTransactionCount(from, "pending"),
+      ]);
+      return { latest: Number(latest), pending: Number(pending) };
+    },
+    /**
+     * Sign the fill-nonce tx (DSR): a 0-value transfer from the writer to itself at `nonce`, so a
+     * nonce no tx will ever consume is consumed. It touches no registry. Same chain check, role
+     * check and fee ceiling as a disclose.
+     */
+    async signFill(nonce) {
+      if (!Number.isSafeInteger(nonce) || nonce < 0) throw new SinkError("registry: bad nonce");
+      const from = await wallet.getAddress();
+      assertWriterRole(from, roles);
+      if (currentRoles) {
+        let now;
+        try {
+          now = await currentRoles();
+        } catch {
+          throw new SinkError("writer role check: current roles unreadable; refusing to sign");
+        }
+        assertWriterRole(from, now);
+      }
+      const fee = await provider.getFeeData();
+      let maxFee = big(fee.maxFeePerGas);
+      const tip = big(fee.maxPriorityFeePerGas);
+      if (maxFee == null || tip == null) throw new SinkError("registry: no EIP-1559 fee data");
+      if (tip > maxFee) maxFee = tip;
+      if (maxFee > feeCap)
+        throw new SinkError(
+          "registry: the fee needed exceeds the configured maxFeePerGas",
+          "FEE_CAP"
+        );
+      if (BigInt((await provider.getNetwork()).chainId) !== chainId)
+        throw new SinkError(
+          "registry: the RPC is on another chain than the configured chainId",
+          "CHAIN"
+        );
+      const raw = await wallet.signTransaction({
+        to: from,
+        value: 0n,
+        data: "0x",
+        nonce,
+        chainId,
+        type: 2,
+        maxFeePerGas: maxFee,
+        maxPriorityFeePerGas: tip,
+        gasLimit: 21000n,
+      });
+      return { raw, from, hash: ethers.keccak256(raw), nonce };
+    },
   };
   // Error boundary (Codex W2b R2 H3): an RPC failure leaves as "registry <op>: <code>", never with
   // the provider's message, URL or response.

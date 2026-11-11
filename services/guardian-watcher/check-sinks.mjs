@@ -1436,6 +1436,68 @@ try {
   );
 }
 
+// ---- #425 review B2 (DSR): the production sink's fill-nonce tx and nonce range
+{
+  const w = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const mk = ({ served = 10n, fee = 1000n, cur } = {}) =>
+    registrySink({
+      chainId: 10,
+      provider: {
+        async getNetwork() {
+          return { chainId: served };
+        },
+        async getFeeData() {
+          return { maxFeePerGas: fee, maxPriorityFeePerGas: 100n };
+        },
+        async getTransactionCount(_a, tag) {
+          return tag === "latest" ? 5 : 7;
+        },
+      },
+      wallet: w,
+      registry: ethers.getAddress("0x" + "ce".repeat(20)),
+      fromBlock: 0,
+      roles,
+      currentRoles: cur,
+      maxFeePerGas: 10_000n,
+    });
+  const f = await mk().signFill(5);
+  const t = ethers.Transaction.from(f.raw);
+  const code = async o => {
+    try {
+      await mk(o).signFill(5);
+      return "ok";
+    } catch (e) {
+      return e.code ?? e.message;
+    }
+  };
+  const chain = await code({ served: 8453n });
+  const capped = await code({ fee: 20_000n });
+  const role = await code({ cur: async () => ({ ...roles, guardians: [w.address] }) });
+  const range = await mk().nonceRange();
+  cell(
+    "#425 B2: signFill is a 0-value transfer from the writer to itself at the nonce, on the configured chain, under the fee ceiling and the role re-read; nonceRange reads latest and pending",
+    t.to === w.address &&
+      t.from === w.address &&
+      t.value === 0n &&
+      t.data === "0x" &&
+      t.nonce === 5 &&
+      t.chainId === 10n &&
+      t.gasLimit === 21000n &&
+      f.hash === t.hash &&
+      chain === "CHAIN" &&
+      capped === "FEE_CAP" &&
+      /also the guardian/.test(role) &&
+      range.latest === 5 &&
+      range.pending === 7,
+    { to: t.to, value: t.value, nonce: t.nonce, chain, capped, role, range }
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

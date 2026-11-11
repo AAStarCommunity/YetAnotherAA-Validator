@@ -163,7 +163,7 @@ export function sinks(opts = {}) {
           raw,
           // the same hash broadcast() derives from the raw (a tagged raw too: Codex W2d R3)
           hash: ethers.id(`disclose-${raw.slice(5)}`),
-          nonce: o.nonce ?? chain.nonce,
+          nonce: o.nonce ?? chain.pendingNonce ?? chain.nonce,
           from: ethers.getAddress(opts.writer ?? "0x" + "77".repeat(20)),
         };
       },
@@ -171,6 +171,12 @@ export function sinks(opts = {}) {
         calls.broadcast++;
         calls.lastRaw = raw;
         (calls.raws ??= []).push(raw); // every raw this registry was asked to broadcast (W2d)
+        if (String(raw).startsWith("0xfill")) {
+          const n = Number(String(raw).slice(6));
+          chain.known.add(ethers.id(`fill-${n}`));
+          if (opts.fillMines) chain.nonce = Math.max(chain.nonce, n + 1);
+          return;
+        }
         const hash = ethers.id(`disclose-${raw.slice(5)}`);
         if (opts.rejectBroadcast || opts.rejectRaw?.(raw)) {
           // a node refusing every broadcast (e.g. a writer without funds): never known
@@ -220,6 +226,23 @@ export function sinks(opts = {}) {
       },
       async nonce() {
         return chain.nonce;
+      },
+      // the writer's counts at latest and pending (#425 B2 gap check): by default no gap
+      async nonceRange() {
+        if (opts.nonceRangeFail) throw new Error("rpc down");
+        const latest = chain.latestNonce ?? chain.nonce;
+        return { latest, pending: chain.pendingNonce ?? latest };
+      },
+      // the fill-nonce tx (DSR): broadcast() consumes its nonce when opts.fillMines
+      async signFill(nonce) {
+        calls.fills = [...(calls.fills ?? []), nonce];
+        const raw = `0xfill${nonce}`;
+        return {
+          raw,
+          from: ethers.getAddress(opts.writer ?? "0x" + "77".repeat(20)),
+          hash: ethers.id(`fill-${nonce}`),
+          nonce,
+        };
       },
     },
   };
