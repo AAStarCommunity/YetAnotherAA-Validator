@@ -191,6 +191,10 @@ jobs:
       - name: Check the Phase D watcher-job binding
         run: npm run check:phase-d-binding
 
+      # Phase D never prints a URL-like fragment, even from a mistaken operator label
+      - name: Check the Phase D report redaction
+        run: npm run check:phase-d-redact
+
   # Job 3: Build project
   build:
     name: Build
