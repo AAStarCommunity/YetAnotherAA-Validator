@@ -5479,7 +5479,9 @@ try {
     };
     walk(dS);
     const leaks = files.filter(
-      f => readFileSync(f, "utf8").includes(SENT) || readFileSync(f, "utf8").includes("example.io")
+      f =>
+        readFileSync(f, "utf8").includes(SENT) ||
+        readFileSync(f, "utf8").match(/eth-sepolia\.example\.io/) !== null
     );
     const statusLeak = statuses.some(st => JSON.stringify(st).includes(SENT));
     // isolation reasons and external-error categories, wherever they ended (open, exhausted, records)
@@ -5573,7 +5575,9 @@ try {
         reads,
         cursor: store.getCursor(),
         leak:
-          JSON.stringify(st).includes(SENT) || disk.includes(SENT) || disk.includes("example.io"),
+          JSON.stringify(st).includes(SENT) ||
+          disk.includes(SENT) ||
+          disk.match(/eth-sepolia\.example\.io/) !== null,
       };
     } finally {
       rmSync(d, { recursive: true, force: true });

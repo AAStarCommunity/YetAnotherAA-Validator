@@ -15,7 +15,7 @@
 //     "telegram": { "chatId": "-100…" },
 //     "mirror": { "clone": "/path/to/bare/clone.git", "branch": "disclosure-records",
 //                 "repoUrl": "https://github.com/AAStarCommunity/YetAnotherAA-Validator" },
-//     "registry": { "address": "0x…", "fromBlock": N, "deployer": "0x…",
+//     "registry": { "address": "0x…", "fromBlock": N, "deployer": "0x…", "maxFeePerGas": "<wei>",
 //                   "keystore": "~/.aoa-watcher/sender.keystore.json" },
 //     "lockPort": 47331, "maxPendingMs": 1800000, "reverifyEveryMs": 604800000, "alertRepeatMs": 3600000 }
 import { readFileSync } from "node:fs";
@@ -70,6 +70,11 @@ export function publishConfig(c) {
   need(Number.isSafeInteger(r.fromBlock) && r.fromBlock >= 0, "registry.fromBlock required");
   need(ethers.isAddress(r.deployer ?? ""), "registry.deployer (release manifest) required");
   need(r.keystore, "registry.keystore required");
+  // the absolute fee ceiling (DSR, #411 F1): a decimal wei string, required, no default
+  need(
+    typeof r.maxFeePerGas === "string" && /^[1-9][0-9]{0,30}$/.test(r.maxFeePerGas),
+    "registry.maxFeePerGas (decimal wei ceiling) required"
+  );
   p.registry = { ...r, service: r.service ?? SERVICE_DEFAULTS.registry };
   need(okService(p.registry.service), "registry.service must be a Keychain service name");
   need(okService(p.keychainAccount), "keychainAccount must be a Keychain account name");
@@ -134,6 +139,7 @@ export async function buildSinks(p, provider, { readSecret = keychainRead } = {}
       fromBlock: p.registry.fromBlock,
       roles,
       currentRoles,
+      maxFeePerGas: BigInt(p.registry.maxFeePerGas),
     });
   return { pinners, telegram, mirror, wallet, registryFor };
 }

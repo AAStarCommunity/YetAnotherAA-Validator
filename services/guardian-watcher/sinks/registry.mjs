@@ -18,17 +18,26 @@ export const regSinkIface = new ethers.Interface(REGISTRY_SINK_ABI);
  * Refuse a writer that holds any other role (M0 §5.5, DSR). Fail closed: every role must be known
  * (deployer and aggregator owner as addresses, a non-empty guardian list), or nothing is signed.
  */
-export function assertWriterRole(writer, roles) {
+/** The role set is complete and real: every address present and none of them zero. */
+export function assertRolesComplete(roles) {
   const { deployer, aggregatorOwner, guardians } = roles ?? {};
+  const real = a => ethers.isAddress(a) && ethers.getAddress(a) !== ethers.ZeroAddress;
+  for (const [n, a] of [
+    ["deployer", deployer],
+    ["aggregator owner", aggregatorOwner],
+  ])
+    if (!real(a)) throw new SinkError(`writer role check: ${n} unknown; refusing to run`);
+  if (!Array.isArray(guardians) || guardians.length === 0 || !guardians.every(real))
+    throw new SinkError("writer role check: guardian list unknown; refusing to run");
+}
+
+export function assertWriterRole(writer, roles) {
+  assertRolesComplete(roles);
+  const { deployer, aggregatorOwner, guardians } = roles;
   const need = [
     ["deployer", deployer],
     ["aggregator owner", aggregatorOwner],
   ];
-  for (const [n, a] of need)
-    if (!ethers.isAddress(a))
-      throw new SinkError(`writer role check: ${n} unknown; refusing to run`);
-  if (!Array.isArray(guardians) || guardians.length === 0 || !guardians.every(ethers.isAddress))
-    throw new SinkError("writer role check: guardian list unknown; refusing to run");
   const w = ethers.getAddress(writer);
   const bad = [...need, ...guardians.map((g, i) => [`guardian ${i}`, g])].filter(
     ([, a]) => ethers.getAddress(a) === w
@@ -83,13 +92,28 @@ export function registrySink({
   roles,
   currentRoles,
   feeBump = 1.25,
+  maxFeePerGas: feeCapIn,
 }) {
   const addr = ethers.getAddress(registry);
   if (!(feeBump >= 1.125))
     throw new SinkError("registry: feeBump must be >= 1.125 (replacement rule)");
-  assertWriterRole(ethers.ZeroAddress, roles); // completeness now, the real wallet before signing
+  // An absolute ceiling on maxFeePerGas, from config (#411 review F1, DSR): no fee ever above it.
+  let feeCap;
+  try {
+    feeCap = BigInt(feeCapIn);
+  } catch {
+    feeCap = 0n;
+  }
+  if (!(feeCap > 0n))
+    throw new SinkError("registry: maxFeePerGas (an absolute wei ceiling) is required");
+  // completeness now (a zero address counts as unknown, #411 review F5); the wallet before signing
+  assertRolesComplete(roles);
   const bumpNum = BigInt(Math.ceil(feeBump * 1000));
-  const bumpUp = x => (x * bumpNum + 999n) / 1000n; // rounded up
+  // rounded up, and at least +1 wei, so a zero (or tiny) fee field still strictly rises (W2b R8)
+  const bumpUp = x => {
+    const b = (x * bumpNum + 999n) / 1000n;
+    return b > x ? b : x + 1n;
+  };
   const big = x => (x == null ? null : BigInt(x));
   const max = (a, b) => (a > b ? a : b);
   const call = async (fn, args, blockTag) =>
@@ -195,6 +219,12 @@ export function registrySink({
         tip = max(tip, bumpUp(pt));
       }
       if (tip > maxFee) maxFee = tip;
+      // never above the configured ceiling: the caller alerts (degraded) instead of escalating
+      if (maxFee > feeCap)
+        throw new SinkError(
+          "registry: the fee needed exceeds the configured maxFeePerGas",
+          "FEE_CAP"
+        );
       const tx = {
         to: addr,
         data,
@@ -222,6 +252,11 @@ export function registrySink({
         if (alreadyKnown(e)) return { known: true };
         throw e;
       }
+    },
+    /** Does the node know this tx (pending or mined)? A replacement's fee floor is taken only
+     * from a tx some node accepted (#411 review F1). */
+    async knows(hash) {
+      return (await provider.send("eth_getTransactionByHash", [hash])) != null;
     },
     async receipt(hash) {
       const rc = await provider.getTransactionReceipt(hash);

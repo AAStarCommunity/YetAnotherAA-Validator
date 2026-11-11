@@ -50,12 +50,28 @@ export const KNOWN_CODES = new Set([
   "EADDRINUSE",
 ]);
 
-export const safeCode = e =>
-  typeof e?.code === "string" && KNOWN_CODES.has(e.code) ? e.code : "error";
+// classification never throws (#411 review F4): a `code` getter or a Proxy trap that throws, or
+// anything else odd about the value, falls back to the fixed "error"
+const isOurs = e => {
+  try {
+    return e instanceof SafeError;
+  } catch {
+    return false;
+  }
+};
+export { isOurs };
+export const safeCode = e => {
+  try {
+    const c = e?.code;
+    return typeof c === "string" && KNOWN_CODES.has(c) ? c : "error";
+  } catch {
+    return "error";
+  }
+};
 
 /** Text for any caught error: our own message, or `<op>: <allowlisted code | "error">`. */
 export function safeText(op, e) {
-  if (e instanceof SafeError) return e.message;
+  if (isOurs(e)) return e.message;
   return `${op}: ${safeCode(e)}`;
 }
 
@@ -64,7 +80,7 @@ export async function guarded(op, fn) {
   try {
     return await fn();
   } catch (e) {
-    if (e instanceof SafeError) throw e;
+    if (isOurs(e)) throw e;
     const code = safeCode(e);
     throw new SafeError(`${op}: ${code}`, code === "error" ? undefined : code);
   }

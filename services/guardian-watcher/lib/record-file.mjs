@@ -36,6 +36,20 @@ export function recordFile(record, { recheck } = {}) {
  * the store's own (Store.recordId), so a public, unattributed or quarantine record is never named
  * like an owner-route one. */
 export function mirrorPath(record, cid) {
+  // the path is built from chain data; make its shape an invariant (#409 review N2): the CID here,
+  // the id below (the store's own record id, path-safe)
+  if (!/^[a-z2-7]+$/.test(String(cid))) throw new Error("mirrorPath: CID is not base32");
+  // an owner-route record is named by its tx and log position: both well-formed (#409 review N2);
+  // unattributed and quarantine records keep their own ids (W2c)
+  if (
+    record.route === "owner" &&
+    (!/^0x[0-9a-fA-F]{64}$/.test(String(record.txHash)) ||
+      !Number.isSafeInteger(record.logIndex) ||
+      record.logIndex < 0)
+  )
+    throw new Error(
+      "mirrorPath: owner-route record needs a 32-byte txHash and an integer logIndex"
+    );
   const id = Store.recordId(record);
   if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error("record id not path-safe");
   return `records/${record.route}/${id}.${cid}.json`;

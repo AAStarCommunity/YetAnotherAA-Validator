@@ -1455,6 +1455,7 @@ const good = {
     fromBlock: 1,
     deployer: DEPLOYER,
     keystore: "/nonexistent",
+    maxFeePerGas: "200000000000",
   },
 };
 {
@@ -1476,6 +1477,9 @@ const good = {
     ["bad registry", { ...good, registry: { ...good.registry, address: "0x12" } }],
     ["no deployer", { ...good, registry: { ...good.registry, deployer: undefined } }],
     ["no keystore", { ...good, registry: { ...good.registry, keystore: "" } }],
+    // the absolute fee ceiling is required, a decimal wei string (DSR, #411 F1)
+    ["no fee cap", { ...good, registry: { ...good.registry, maxFeePerGas: undefined } }],
+    ["fee cap not decimal", { ...good, registry: { ...good.registry, maxFeePerGas: "200 gwei" } }],
     ["bad interval", { ...good, alertRepeatMs: -1 }],
   ]) {
     try {

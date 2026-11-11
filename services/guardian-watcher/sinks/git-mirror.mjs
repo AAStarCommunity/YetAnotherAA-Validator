@@ -44,7 +44,9 @@ function git(cwd, args, { input, env } = {}) {
       if (code === 0) return res(Buffer.concat(out));
       // stderr is untrusted (it can carry a remote URL with credentials): it only selects one of
       // these fixed categories and is then dropped (Codex W2b R2 H2).
-      const se = Buffer.concat(err).toString();
+      // with --porcelain git reports a push's per-ref status ("[rejected] (stale info)") on stdout
+      // (#411 review F3), so both streams select the category; neither is ever kept
+      const se = Buffer.concat([...out, ...err]).toString();
       const cat = /non-fast-forward|fetch first|stale info/i.test(se)
         ? "rejected (the branch moved)"
         : /could not read from remote|permission denied|authentication|could not resolve|connection|timed out/i.test(
