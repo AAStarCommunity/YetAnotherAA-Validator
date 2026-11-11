@@ -300,6 +300,11 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       await reg.broadcast(r.raw);
     } catch (e) {
       state.registry = { ...r, lastBroadcastError: errMsg(e) };
+      // a writer without the funds cannot land anything: said plainly, every pass (#411 review F1)
+      if (safeCode(e) === "INSUFFICIENT_FUNDS")
+        alerts.push(
+          `registry: the writer has insufficient funds for the disclose tx (nonce ${r.nonce}); fund the writer`
+        );
     }
     // A resumed in-flight journal (including one written before sentAt existed) gets its sentAt
     // once, so the stuck-tx timeout can elapse.
@@ -372,19 +377,40 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       alerts.push(
         `registry: disclose tx pending ${Math.round(age / 60000)} min; replacing at nonce ${state.registry.nonce}`
       );
-      // The sink takes its fee floor from the tx being replaced (its journalled raw bytes, the
-      // source of truth), so each replacement clears the node's >= 10% rule (W2b R1 H4).
-      const rep = await reg.sign(discloseArgs(rec, file), {
-        nonce: state.registry.nonce,
-        replace: true,
-        prevRaw: state.registry.raw,
-      });
-      const hashes = [...(state.registry.hashes ?? [state.registry.hash]), rep.hash];
+      // The fee floor comes from the newest journalled tx a node KNOWS (#411 review F1): only an
+      // accepted tx must be outbid (>= 10% rule, W2b R1 H4). If no node ever accepted one (e.g.
+      // every broadcast failed for lack of funds), the replacement is priced at the current
+      // estimate, so the fee never climbs on rejections alone.
+      const hashes0 = state.registry.hashes ?? [state.registry.hash];
+      const raws0 = state.registry.raws ?? [state.registry.raw];
+      let floorRaw = null;
+      for (let i = hashes0.length - 1; i >= 0 && floorRaw === null; i--)
+        if (raws0[i] && (await reg.knows(hashes0[i]))) floorRaw = raws0[i];
+      let rep;
+      try {
+        rep = await reg.sign(
+          discloseArgs(rec, file),
+          floorRaw
+            ? { nonce: state.registry.nonce, replace: true, prevRaw: floorRaw }
+            : { nonce: state.registry.nonce }
+        );
+      } catch (e) {
+        if (e?.code !== "FEE_CAP") throw e;
+        // the configured ceiling stops escalation; never silently: alerted on every pass
+        state.registry = { ...state.registry, feeCapped: new Date().toISOString() };
+        await persist(state);
+        alerts.push(
+          `registry: replacing the disclose tx (nonce ${state.registry.nonce}) needs a fee above the configured maxFeePerGas; disclosure stalled until the cap is raised or the fee falls`
+        );
+        return;
+      }
+      const { feeCapped, ...rest } = state.registry;
       state.registry = {
-        ...state.registry,
+        ...rest,
         raw: rep.raw,
         hash: rep.hash,
-        hashes,
+        hashes: [...hashes0, rep.hash],
+        raws: [...raws0, rep.raw],
         sentAt: new Date().toISOString(),
         replacements: (state.registry.replacements ?? 0) + 1,
       };
@@ -395,12 +421,22 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
   }
   // Nothing in flight: an entry may already exist (an earlier publication completed elsewhere).
   if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
-  const signed = await reg.sign(discloseArgs(rec, file));
+  let signed;
+  try {
+    signed = await reg.sign(discloseArgs(rec, file));
+  } catch (e) {
+    if (e?.code !== "FEE_CAP") throw e;
+    alerts.push(
+      "registry: the disclose tx needs a fee above the configured maxFeePerGas; not signed, retried next pass"
+    );
+    return;
+  }
   state.registry = {
     phase: "signed",
     raw: signed.raw,
     hash: signed.hash,
     hashes: [signed.hash],
+    raws: [signed.raw],
     nonce: signed.nonce,
   };
   await persist(state); // journal BEFORE broadcast

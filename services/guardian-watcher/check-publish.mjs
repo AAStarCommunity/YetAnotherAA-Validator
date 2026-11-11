@@ -140,6 +140,7 @@ function sinks(opts = {}) {
     receipts: new Map(),
     signedArgs: new Map(),
     orphans: new Set(), // block hashes no longer canonical
+    known: new Set(), // tx hashes some node accepted
   };
   if (opts.existing) {
     chain.entries.set(9n, { amendments: [], block: 1, ...opts.existing });
@@ -197,6 +198,13 @@ function sinks(opts = {}) {
         calls.broadcast++;
         calls.lastRaw = raw;
         const hash = ethers.id(`disclose-${raw.slice(5)}`);
+        if (opts.rejectBroadcast) {
+          // a node refusing every broadcast (e.g. a writer without funds): never known
+          const e = new Error("insufficient funds for gas * price + value");
+          e.code = "INSUFFICIENT_FUNDS";
+          throw e;
+        }
+        chain.known.add(hash);
         if (chain.mined === "pending" || chain.receipts.has(hash)) return;
         const a = chain.signedArgs.get(raw);
         const act = `${a.signed.kind}:${a.signed.proposalId}`;
@@ -229,6 +237,9 @@ function sinks(opts = {}) {
       },
       async receipt(hash) {
         return chain.receipts.get(hash) ?? null;
+      },
+      async knows(hash) {
+        return chain.known.has(hash);
       },
       async canonical(_n, h) {
         return !chain.orphans.has(h);
@@ -525,6 +536,62 @@ function sinks(opts = {}) {
     "a dropped tx is detected and re-signed once (on-chain uniqueness makes this safe)",
     s.calls.sign === 2 && r3.alerts.some(x => /dropped or replaced/.test(x)),
     { calls: s.calls, alerts: r3.alerts }
+  );
+}
+{
+  // #411 review F1: no node ever accepted a broadcast (a writer without funds). Replacements are
+  // priced at the current estimate (no floor from a rejected tx), so the fee cannot climb on
+  // rejections alone; the lack of funds is alerted plainly.
+  const s = sinks({ mine: "pending", rejectBroadcast: true });
+  let st = {};
+  const optsSeen = [];
+  const alertsSeen = [];
+  for (let i = 0; i < 4; i++) {
+    const r = await pub(bls, s, st, { maxPendingMs: 0 });
+    st = r.state;
+    optsSeen.push({ ...s.calls.lastSignOpts });
+    alertsSeen.push(...r.alerts);
+  }
+  cell(
+    "F1: replacements of never-accepted txs carry no fee floor (no replace/prevRaw), and insufficient funds is alerted",
+    s.calls.sign >= 3 &&
+      optsSeen.slice(1).every(o => !o.replace && o.prevRaw === undefined) &&
+      alertsSeen.some(x => /insufficient funds/.test(x)),
+    { sign: s.calls.sign, optsSeen, alerts: alertsSeen.slice(0, 6) }
+  );
+}
+{
+  // ...and once a node knows a tx, the replacement is floored on THAT tx
+  const s = sinks({ mine: "pending" });
+  const r1 = await pub(bls, s, {}, { maxPendingMs: 0 });
+  await pub(bls, s, r1.state, { maxPendingMs: 0 });
+  cell(
+    "F1: a replacement of an accepted tx is floored on that tx's journalled raw bytes",
+    s.calls.lastSignOpts.replace === true && s.calls.lastSignOpts.prevRaw === r1.state.registry.raw,
+    s.calls.lastSignOpts
+  );
+}
+{
+  // ...and a fee above the configured ceiling stops escalation, alerted on every pass
+  const s = sinks({ mine: "pending" });
+  const r1 = await pub(bls, s, {}, { maxPendingMs: 0 });
+  const realSign = s.registry.sign;
+  s.registry.sign = async (args, o) => {
+    if (o?.replace) {
+      const e = new Error("registry: the fee needed exceeds the configured maxFeePerGas");
+      e.code = "FEE_CAP";
+      throw e;
+    }
+    return realSign(args, o);
+  };
+  const r2 = await pub(bls, s, r1.state, { maxPendingMs: 0 });
+  const r3 = await pub(bls, s, r2.state, { maxPendingMs: 0 });
+  cell(
+    "F1: a replacement above maxFeePerGas is not sent; the journal is flagged and every pass alerts",
+    !!r2.state.registry.feeCapped &&
+      r2.state.registry.raw === r1.state.registry.raw &&
+      [r2, r3].every(r => r.alerts.some(x => /above the configured maxFeePerGas/.test(x))),
+    { reg: r2.state.registry, a2: r2.alerts, a3: r3.alerts }
   );
 }
 {

@@ -13,7 +13,7 @@ import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.m
 import { attributeLogs, receiptPos, validLog, parsePosition, traceDepthOk } from "./attribute.mjs";
 import { mayHaveLog } from "./bloom.mjs";
 import { Store } from "./store.mjs";
-import { SafeError, safeText, guarded } from "./safe-error.mjs";
+import { SafeError, safeText, guarded, safeCode, isOurs } from "./safe-error.mjs";
 
 // Chain data in our own error text only when it is a well-formed hash (RPC answers are untrusted).
 const hx = v => (/^0x[0-9a-fA-F]{64}$/.test(String(v)) ? String(v) : "<malformed>");
@@ -631,10 +631,9 @@ export function txOfEvidence(watched, cfg, block) {
  * category, never a foreign message (RPC answers are untrusted text). */
 function isolatedReason(e) {
   // our own wording (a SafeError never carries foreign text: lib/safe-error.mjs) is kept as is
-  if (e instanceof SafeError) return `tx processing failed: ${e.message}`;
-  const code = typeof e?.code === "string" && /^[A-Z_]{2,40}$/.test(e.code) ? e.code : null;
-  const name = typeof e?.name === "string" && /^[A-Za-z]{2,40}$/.test(e.name) ? e.name : "Error";
-  return `tx processing failed (${code ?? name})`;
+  if (isOurs(e)) return `tx processing failed: ${e.message}`;
+  // the same allowlist as every other error path (#411 review F4), never a free-form code or name
+  return `tx processing failed (${safeCode(e)})`;
 }
 
 /**
