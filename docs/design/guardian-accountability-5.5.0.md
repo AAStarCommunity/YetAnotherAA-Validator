@@ -717,10 +717,10 @@ detection time, pause tx time.
 Each item is a statement that can be checked against the code, the contract, the
 runbook (`deploy/guardian-watcher/PHASE-D-RUNBOOK.md`) or the Mini. The
 publication loop, the runbook, the sender helper and the role re-read before
-signing land with W2c (#413), the second-provider gate with D-RPC2; Phase D
-requires both (§5.2a, §5.5), and this section describes their behaviour.
-Statements about the deployed Mini are marked as observations or as the author's
-attestation: nothing in the repository proves them.
+signing landed with W2c (#413, merge `8a22bff6`); the second-provider gate lands
+with D-RPC2. Phase D requires both (§5.2a, §5.5), and this section describes
+their behaviour. Statements about the deployed Mini are marked as observations
+or as the author's attestation: nothing in the repository proves them.
 
 1. **Who operates the Mini.**
    - The watcher, its heartbeat and its Keychain items run under one macOS user
