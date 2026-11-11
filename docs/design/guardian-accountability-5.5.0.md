@@ -577,6 +577,10 @@ aggregator-only.
     `false`), a key named `__proto__` stays a plain key, and only valid hex is
     case-folded for comparison; a missing field and an explicit `null` are two
     different observations.
+  - Bound: `quarantinedTotal` counts records, and a quarantine's id covers its
+    query range. If the same junk is returned again for a later range (for
+    example after an early stop), it is a second record and is counted again.
+    Nothing is lost; the count can only overstate (#404 review Info).
   - Bound: the logsBloom cross-check traverses the returned logs once per block
     and watched topic, so its work is the answer size times the capped block
     range (`maxBlocksPerTick`) times the fixed topic count.
