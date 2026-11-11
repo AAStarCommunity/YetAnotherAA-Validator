@@ -200,6 +200,11 @@ jobs:
       - name: Check the A7 read-back comparison
         run: npm run check:a7-readback
 
+      # A7 fork checks (#412 review M1): F2/N1 preflight, the anvil build, the start wait and the
+      # verdict, as units and end to end against a local fake upstream and a fake anvil
+      - name: A7 fork checks
+        run: npm run check:a7-fork
+
   # Job 3: Build project
   build:
     name: Build

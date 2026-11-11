@@ -34,6 +34,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
+import { preflight, anvilBuild, waitForAnvil, startFailure, verdict } from "./a7-fork-checks.mjs";
 import {
   validate,
   compare,
@@ -267,32 +268,30 @@ const preRpc = async (url, method, params) => {
   }
 };
 {
-  const upChain = await preRpc(forkUrl, "eth_chainId", []);
-  if (upChain === undefined) die(3, "the fork RPC does not answer eth_chainId");
-  if (Number(upChain) !== h.chainId)
-    die(1, "the fork RPC is not the read-back's chain (eth_chainId)");
-  const upHead = await preRpc(forkUrl, "eth_blockNumber", []);
-  if (upHead === undefined || Number(upHead) < h.forkBlock)
-    die(1, "the fork RPC does not have header.forkBlock yet");
-  if ((await preRpc(`http://127.0.0.1:${port}`, "eth_chainId", [])) !== undefined)
-    die(1, `something already listens on --port ${port}: refusing to compare against it`);
+  const f = await preflight({
+    rpc: preRpc,
+    forkUrl,
+    chainId: h.chainId,
+    forkBlock: h.forkBlock,
+    port,
+  });
+  if (f) die(f.code, f.msg);
 }
-let anvilVersion;
-let anvilCommit;
+let versionText = null;
 try {
-  const v = execFileSync(anvilBin, ["--version"], {
+  versionText = execFileSync(anvilBin, ["--version"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });
-  anvilVersion = v.split("\n")[0].trim();
-  anvilCommit = v.match(/^Commit SHA:\s*([0-9a-f]{40})\s*$/m)?.[1] ?? null;
 } catch {
-  die(3, "anvil not runnable (--anvil <path>)");
+  // not runnable: anvilBuild reports it
 }
-if (anvilCommit !== ANVIL_COMMIT)
-  die(1, `anvil commit is ${anvilCommit ?? "unknown"}, required ${ANVIL_COMMIT} (--anvil <path>)`);
-if (anvilVersion !== h.anvilVersion)
-  die(1, "anvil --version differs from the read-back's header.anvilVersion");
+const build = anvilBuild(versionText, {
+  pinnedCommit: ANVIL_COMMIT,
+  headerVersion: h.anvilVersion,
+});
+if (build.fail) die(build.fail.code, build.fail.msg);
+const { version: anvilVersion, commit: anvilCommit } = build;
 const anvil = spawn(
   anvilBin,
   [
@@ -320,31 +319,15 @@ const stop = () => {
 process.on("exit", stop);
 const rpc = `http://127.0.0.1:${port}`;
 const p = new ethers.JsonRpcProvider(rpc, undefined, { staticNetwork: true });
-let up = false;
-for (let i = 0; i < 120 && !up; i++) {
-  await new Promise(r => setTimeout(r, 500));
-  if (anvil.exitCode !== null) break;
-  try {
-    await p.send("eth_blockNumber", []);
-    up = true;
-  } catch {
-    // starting
-  }
+const up = await waitForAnvil({
+  proc: anvil,
+  ping: () => p.send("eth_blockNumber", []),
+  sleep: () => new Promise(r => setTimeout(r, 500)),
+});
+if (!up) {
+  const f = startFailure(anvilErr);
+  die(f.code, f.msg);
 }
-// anvil's own message may echo the fork URL: only a fixed category is shown
-if (!up)
-  die(
-    3,
-    `anvil did not start (${
-      /panicked|unimplemented/i.test(anvilErr)
-        ? "it crashed: this build cannot run the read-back's hardfork"
-        : /fork|connect|request|dns|timed? ?out/i.test(anvilErr)
-          ? "cannot reach or read the fork RPC"
-          : /unknown|invalid/i.test(anvilErr)
-            ? "rejected an argument"
-            : "no RPC"
-    })`
-  );
 
 // ---- 4. compare at the head (which must be readbackBlock)
 // raw upstream JSON-RPC (this script's own provider); undefined result on any failure
@@ -517,11 +500,8 @@ if (opt("address-book") && !opt("pins-commit"))
       b.hash.toLowerCase() === h.readbackBlockHash.toLowerCase(),
   });
 }
-const failed = cmp.filter(x => !x.ok);
 // the anvil this tool started must still be the one answering (#412 review N1)
-if (anvil.exitCode !== null)
-  failed.push({ path: "anvil exited before the verdict", sp: null, fork: null, ok: false });
-const proven = !failed.length && !unverified.length;
+const { failed, proven, exitCode } = verdict({ cmp, unverified, anvilExitCode: anvil.exitCode });
 
 // ---- 5. gas for the rehearsal's own test key, only on a proven fork
 if (proven) await p.send("anvil_setBalance", [fund, ethers.toQuantity(ethers.parseEther("100"))]);
@@ -556,4 +536,4 @@ const record = {
 const text = JSON.stringify(sanitize(record, new Set(["rpc"])), null, 2);
 if (recordPath) writeFileSync(recordPath, text + "\n");
 console.log(text);
-process.exit(proven ? 0 : 1);
+process.exit(exitCode);
