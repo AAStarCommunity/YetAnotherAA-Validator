@@ -154,7 +154,10 @@ container at a time, 2 of 3 always up, no BLS proposal in flight, then
 
 ```sh
 docker compose -f docker-compose.testnet.yml up -d --no-build dvt-node-1
-docker inspect dvt-node-1 --format '{{.State.Health.Status}} {{range .Config.Env}}{{println .}}{{end}}' | grep -E "healthy|AUDIT_"
+docker inspect -f '{{.State.Health.Status}}' dvt-node-1     # expect: healthy
+# only the two audit variables, matched by exact name (other variables can hold credentials):
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' dvt-node-1 \
+  | grep -E '^AUDIT_(ENABLED|EXECUTE_SLASH)=' # expect both =false
 ```
 
 ## 10. Run Phase D
