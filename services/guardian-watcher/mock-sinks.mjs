@@ -149,7 +149,8 @@ export function sinks(opts = {}) {
         chain.signedArgs.set(raw, args);
         return {
           raw,
-          hash: ethers.id(`disclose-${opts.deterministicSign ? 0 : calls.sign}`),
+          // the same hash broadcast() derives from the raw (a tagged raw too: Codex W2d R3)
+          hash: ethers.id(`disclose-${raw.slice(5)}`),
           nonce: o.nonce ?? chain.nonce,
         };
       },
