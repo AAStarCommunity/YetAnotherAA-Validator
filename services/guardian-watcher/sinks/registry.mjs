@@ -297,8 +297,11 @@ export function registrySink({
   };
   // Error boundary (Codex W2b R2 H3): an RPC failure leaves as "registry <op>: <code>", never with
   // the provider's message, URL or response.
+  // Only the operations are wrapped: the sink's identity (address, chainId) stays plain data, or a
+  // journal would record wrapper functions and every registry would look the same (Codex W2d R1 #1)
   for (const k of Object.keys(api)) {
     const f = api[k];
+    if (typeof f !== "function") continue;
     api[k] = (...a) => guarded(`registry ${k}`, () => f(...a));
   }
   return api;

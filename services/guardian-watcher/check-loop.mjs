@@ -506,7 +506,11 @@ const cfg = { aggregator: AGG };
     await publishPending(store, sk);
     await publishPending(store, sk);
     const st = store.getPublication(id);
-    store.putPublication(id, { ...st, registry: { phase: "conflict", ack: true } });
+    // written by this code, the stage names its registry (W2d)
+    store.putPublication(id, {
+      ...st,
+      registry: { phase: "conflict", ack: true, at: st.registry.at },
+    });
     const signBefore = s.calls.sign;
     const pk = await publishPending(store, sk);
     // a pin is lost: it is repaired, and the registry is still not touched
@@ -2886,16 +2890,126 @@ const good = {
     const none = registryAt({ phase: "confirmed" });
     const here = { address: OLD, chainId: "10" };
     cell(
-      "W2d(f): a pre-W2d journal is bound by its signed tx (to, chainId); one without a tx is taken as the configured registry",
+      "W2d(f): a pre-W2d journal is bound by its signed tx (to, chainId); one without a tx matches no registry (checked on chain)",
       fromRaw?.address === OLD &&
         fromRaw.chainId === "10" &&
         sameRegistry(fromRaw, here) &&
         !sameRegistry(fromRaw, { address: NEW, chainId: "10" }) &&
         !sameRegistry(fromRaw, { address: OLD, chainId: "11155111" }) &&
         none === null &&
-        sameRegistry(none, here),
+        !sameRegistry(none, here),
       { fromRaw, none }
     );
+  }
+  // (g) DSR: a legacy stage without `at` or a tx is checked ON CHAIN against the configured
+  // registry before it counts: (i) a matching entry there -> confirmed without signing;
+  // (ii) no entry -> disclosed again; (iii) the query fails -> not done, degraded
+  {
+    const { expectedBinding } = await import("./lib/publish.mjs");
+    const { recordFile } = await import("./lib/record-file.mjs");
+    const legacy = (store, phase = "confirmed") => {
+      const id = Store.recordId(bls);
+      const j = store.getPublication(id);
+      const { at: _a, raw: _r, raws: _rs, ...rest } = j.registry;
+      (void _a, _r, _rs);
+      store.putPublication(id, { ...j, registry: { ...rest, phase } });
+    };
+    const publishAll = async (store, s) => {
+      for (let i = 0; i < 4; i++)
+        await publishPending(store, skOf(s), { maxPendingMs: 60 * 60_000 });
+    };
+    // (i)
+    {
+      const d = tmp();
+      try {
+        const store = new Store(d);
+        store.putRecord(bls);
+        const f = recordFile(
+          JSON.parse(readFileSync(join(d, "records", `${Store.recordId(bls)}.json`), "utf8"))
+        );
+        const s = sinks({
+          registryAddress: OLD,
+          existing: {
+            binding: expectedBinding(bls),
+            recordURI: `ipfs://${f.cid}`,
+            recordHash: f.recordHash,
+          },
+        });
+        await publishAll(store, s);
+        legacy(store);
+        const signs = s.calls.sign;
+        await publishAll(store, s);
+        const r = store.getPublication(Store.recordId(bls)).registry;
+        cell(
+          "W2d(g-i): a legacy confirmed stage with a matching entry on the current registry is confirmed by that entry, without signing",
+          r.phase === "confirmed" &&
+            r.entryId === "9" &&
+            r.at?.address === OLD &&
+            s.calls.sign === signs,
+          { r, signs: [signs, s.calls.sign] }
+        );
+      } finally {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+    // (ii)
+    {
+      const d = tmp();
+      try {
+        const store = new Store(d);
+        store.putRecord(bls);
+        const a = sinks({ registryAddress: OLD });
+        await publishAll(store, a);
+        legacy(store);
+        const fresh = sinks({ registryAddress: OLD, rawTag: "g" }); // the same address, no entry on it
+        await publishAll(store, fresh);
+        const r = store.getPublication(Store.recordId(bls)).registry;
+        cell(
+          "W2d(g-ii): a legacy confirmed stage with no entry on the current registry is disclosed again there",
+          fresh.calls.sign >= 1 &&
+            fresh.chain.entries.size === 1 &&
+            r.phase === "confirmed" &&
+            r.at?.address === OLD,
+          { r, sign: fresh.calls.sign, entries: fresh.chain.entries.size }
+        );
+      } finally {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
+    // (iii)
+    {
+      const d = tmp();
+      try {
+        const store = new Store(d);
+        store.putRecord(bls);
+        const a = sinks({ registryAddress: OLD });
+        await publishAll(store, a);
+        legacy(store);
+        const down = sinks({ registryAddress: OLD });
+        const reg = {
+          ...down.registry,
+          entryOf: async () => {
+            throw new Error("rpc down");
+          },
+        };
+        const p = await publishPending(
+          store,
+          { ...skOf(down), registry: reg },
+          { maxPendingMs: 60 * 60_000 }
+        );
+        const r = store.getPublication(Store.recordId(bls)).registry;
+        cell(
+          "W2d(g-iii): a legacy stage whose check on the current registry fails is not done and the watcher is degraded",
+          p.counts.done === 0 &&
+            p.counts.failed >= 1 &&
+            (p.stalls.failing >= 1 || p.stalls.migrating >= 1) &&
+            r?.phase !== "confirmed",
+          { counts: p.counts, stalls: p.stalls, r }
+        );
+      } finally {
+        rmSync(d, { recursive: true, force: true });
+      }
+    }
   }
   // (c) the same address on another chain is another registry
   {

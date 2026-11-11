@@ -1329,6 +1329,72 @@ try {
   );
 }
 
+// ---- Codex W2d R1 #1 (DSR): the PRODUCTION registry sink's identity reaches the journal
+{
+  const { publishRecord } = await import("./lib/publish.mjs");
+  const { registryWhere } = await import("./lib/publish.mjs");
+  const { bls, sinks } = await import("./mock-sinks.mjs");
+  const REGW = ethers.getAddress("0x" + "cd".repeat(20));
+  const zero = ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [0n]);
+  const provider = {
+    async send(m) {
+      if (m === "eth_getBlockByNumber") return { number: "0x64", hash: ethers.id("b100") };
+      throw new Error(`unexpected ${m}`);
+    },
+    async call() {
+      return zero; // entryOf: no entry for this action yet
+    },
+    async getTransactionCount() {
+      return 0;
+    },
+    async getFeeData() {
+      return { maxFeePerGas: 10_000n, maxPriorityFeePerGas: 100n }; // above the cap: FEE_CAP
+    },
+    async getNetwork() {
+      return { chainId: 10n };
+    },
+    async estimateGas() {
+      return 100000n;
+    },
+  };
+  const wallet = ethers.Wallet.createRandom();
+  const roles = {
+    deployer: ethers.getAddress("0x" + "d1".repeat(20)),
+    aggregatorOwner: ethers.getAddress("0x" + "d2".repeat(20)),
+    guardians: [ethers.getAddress("0x" + "d3".repeat(20))],
+  };
+  const reg = registrySink({
+    chainId: 10,
+    provider,
+    wallet,
+    registry: REGW,
+    fromBlock: 0,
+    roles,
+    currentRoles: async () => roles,
+    maxFeePerGas: 1_000n,
+  });
+  const where = registryWhere(reg);
+  const m = sinks();
+  let journal = null;
+  const r = await publishRecord(
+    bls,
+    { pinners: m.pinners, mirror: m.mirror, telegram: m.telegram, registry: reg },
+    {},
+    { persist: st => void (journal = JSON.parse(JSON.stringify(st))) }
+  );
+  cell(
+    "W2d R1#1: the production registrySink keeps address and chainId as data, and its journal stage records them",
+    typeof reg.address === "string" &&
+      reg.chainId === 10n &&
+      where.address === REGW.toLowerCase() &&
+      where.chainId === "10" &&
+      journal?.registry?.feeCapped &&
+      journal.registry.at?.address === REGW.toLowerCase() &&
+      journal.registry.at?.chainId === "10",
+    { where, at: journal?.registry?.at, phase: journal?.registry?.phase, alerts: r.alerts }
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

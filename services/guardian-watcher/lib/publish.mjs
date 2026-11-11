@@ -340,9 +340,9 @@ export function registryWhere(reg) {
 }
 /**
  * The registry a journalled stage was written for: its `at`, or for a stage journalled before
- * W2d, the address and chain of its signed transaction. Null when neither exists; such a stage
- * (journalled before W2d without a transaction) is taken as the registry configured at upgrade:
- * no deployment ran before W2d (Phase D needs it), so there is no other registry it could be for.
+ * W2d, the address and chain of its signed transaction. Null when neither exists (a stage
+ * journalled before W2d without a transaction): its registry is unknown, so it matches no registry
+ * and is checked on chain against the configured one before it counts (DSR; Codex W2d R1 #2).
  */
 export function registryAt(r) {
   if (r?.at?.address) return r.at;
@@ -357,7 +357,7 @@ export function registryAt(r) {
   return null;
 }
 export const sameRegistry = (at, where) =>
-  !at || (at.address === where.address && at.chainId === where.chainId);
+  !!at && at.address === where.address && at.chainId === where.chainId;
 
 /**
  * On-chain content is untrusted text, and its shape proves nothing (a base32-shaped string can
