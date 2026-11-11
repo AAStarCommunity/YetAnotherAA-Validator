@@ -1,7 +1,15 @@
 // CI self-test for W2c: the publication loop (lib/publisher.mjs), sink construction from config
 // (lib/sinks-config.mjs) and the store's publication journal, against the shared mock sinks.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  readdirSync,
+  readFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1780,6 +1788,100 @@ const good = {
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
+  }
+}
+
+// ---- Codex W2c R13
+{
+  const { stallKind } = await import("./lib/publisher.mjs");
+  cell(
+    "R13#2: a terminal incident (reverted / conflict) is never a fee or funding stall",
+    stallKind({ registry: { phase: "reverted", feeCapped: "t" } }) === null &&
+      stallKind({ registry: { phase: "conflict", lastBroadcastError: "INSUFFICIENT_FUNDS" } }) ===
+        null &&
+      stallKind({ registry: { phase: "unsigned", feeCapped: "t" } }) === "feeCapped",
+    null
+  );
+  const d = tmp();
+  try {
+    const store = new Store(d);
+    store.putRecord(bls);
+    const s = sinks({ mine: "pending", rejectBroadcast: true });
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
+    // the index cannot be written (a directory in its place): the update must not be lost
+    mkdirSync(join(d, "stalls.json", "x"), { recursive: true });
+    const p1 = await publishPending(store, sk, { maxPendingMs: 0 });
+    const p2 = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
+    cell(
+      "R13#1: a failed index write is alerted, this pass reports what it computed, the next pass (record not in its batch) rebuilds",
+      p1.stalls.insufficientFunds === 1 &&
+        p1.alerts.some(a => /stall index not saved/.test(a)) &&
+        p2.stalls.insufficientFunds === 1 &&
+        !p2.stalls.unknown,
+      { p1: [p1.stalls, p1.alerts], p2: [p2.stalls, p2.alerts] }
+    );
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+  // the write AND the removal fail while the old index stays readable: this process must not
+  // trust that stale file (the store root read-only; the journals' directory still writable)
+  const d3 = tmp();
+  try {
+    const store = new Store(d3);
+    store.putRecord(bls);
+    const s = sinks({ mine: "pending", rejectBroadcast: true });
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
+    await publishPending(store, sk, { maxPendingMs: 0 });
+    const before = JSON.parse(readFileSync(join(d3, "stalls.json"), "utf8"));
+    chmodSync(d3, 0o500);
+    let pFunded, pNext;
+    try {
+      const s2 = sinks({ mine: "pending" });
+      Object.assign(sk, { registry: s2.registry });
+      pFunded = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+      pNext = await publishPending(store, sk, { maxPendingMs: 60 * 60_000, maxParse: 0 });
+    } finally {
+      chmodSync(d3, 0o700);
+    }
+    const stale = JSON.parse(readFileSync(join(d3, "stalls.json"), "utf8"));
+    // writable again: one pass repairs the index, the one after trusts it (no rebuild, no alert)
+    await publishPending(store, sk, { maxPendingMs: 60 * 60_000, maxParse: 0 });
+    const pOk = await publishPending(store, sk, { maxPendingMs: 60 * 60_000, maxParse: 0 });
+    cell(
+      "R13#1: an unremovable stale index is not trusted again in this process (rebuilt: 0, not the stale 1)",
+      Object.keys(before).length === 1 &&
+        Object.keys(stale).length === 1 &&
+        pFunded.alerts.some(a => /stall index not saved/.test(a)) &&
+        pNext.stalls.insufficientFunds === 0 &&
+        !pNext.stalls.unknown &&
+        !pOk.alerts.some(a => /stall index/.test(a)),
+      {
+        funded: [pFunded.stalls, pFunded.alerts],
+        next: [pNext.stalls, pNext.alerts],
+        ok: pOk.alerts,
+        stale,
+      }
+    );
+  } finally {
+    rmSync(d3, { recursive: true, force: true });
+  }
+  // a restart after the index was removed: absent means rebuild, never "no stalls"
+  const d2 = tmp();
+  try {
+    const store = new Store(d2);
+    store.putRecord(bls);
+    const s = sinks({ mine: "pending", rejectBroadcast: true });
+    const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
+    await publishPending(store, sk, { maxPendingMs: 0 });
+    rmSync(join(d2, "stalls.json"));
+    const p = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
+    cell(
+      "R13#1: an absent index (removed after a failed write, then a restart) is rebuilt from the journals",
+      p.stalls.insufficientFunds === 1 && !p.stalls.unknown,
+      { stalls: p.stalls }
+    );
+  } finally {
+    rmSync(d2, { recursive: true, force: true });
   }
 }
 
