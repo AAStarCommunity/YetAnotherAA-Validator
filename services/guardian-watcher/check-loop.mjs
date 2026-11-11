@@ -3308,7 +3308,8 @@ const good = {
       let ph;
       for (let i = 0; i < 3; i++)
         ph = await publishPhase(x.store, roleChain(healthy), phCfg, phP, built, { now: 7 + i });
-      const failing = sinks({ registryAddress: CC, rawTag: "d3", nonceRangeFail: true });
+      const fOpts = { registryAddress: CC, rawTag: "d3", nonceRangeFail: true };
+      const failing = sinks(fOpts);
       const phF = await publishPhase(
         x.store,
         roleChain(healthy),
@@ -3317,21 +3318,45 @@ const good = {
         { ...built, registryFor: () => failing.registry },
         { now: 20 }
       );
+      // DSR: the failed check clears by itself once its cause is gone (the node answers again, and
+      // the range is fully held): no gap and no unknown reason left
+      fOpts.nonceRangeFail = false;
+      failing.chain.nonce = 7;
+      failing.chain.latestNonce = 7;
+      failing.chain.pendingNonce = 7;
+      const phR = await publishPhase(
+        x.store,
+        roleChain(healthy),
+        phCfg,
+        phP,
+        { ...built, registryFor: () => failing.registry },
+        { now: 21 }
+      );
       const w = "0x" + "ab".repeat(20);
       const held = n => ({ nonceUse: { from: w, chainId: "1", nonce: n } });
       const inPool = nonceGaps({}, w, "1", { latest: 5, pending: 6 });
       const below = nonceGaps({ r: held(6) }, w, "1", { latest: 5, pending: 5 });
       const none = nonceGaps({ r: held(5), s: held(6) }, w, "1", { latest: 5, pending: 7 });
       cell(
-        "B2-A(d): a writer nonce pending or skipped that no active stage holds is degraded (W1 -> W2 -> W1 through publishPhase; an eviction below a held nonce); a failed check is degraded too; a fully held range is not",
+        "B2-A(d): a writer nonce pending or skipped that no active stage holds is degraded (W1 -> W2 -> W1 through publishPhase; an eviction below a held nonce); a failed check is degraded too and clears by itself once the node answers again; a fully held range is not",
         ph.stalls.nonceGaps?.includes(5) &&
           stallReasons(ph).some(r => /nonce\(s\) 5\b.*held by no journal/.test(r)) &&
           phF.stalls.nonceGapUnknown === true &&
+          !phR.stalls.nonceGapUnknown &&
+          !phR.stalls.nonceGaps &&
+          !stallReasons(phR).some(r => /nonce gap check failed|held by no journal/.test(r)) &&
           stallReasons(phF).includes("writer nonce gap check failed") &&
           JSON.stringify(inPool) === "[5]" &&
           JSON.stringify(below) === "[5]" &&
           JSON.stringify(none) === "[]",
-        { ph: [ph.registrySkipped, ph.stalls], phF: phF.stalls, inPool, below, none }
+        {
+          ph: [ph.registrySkipped, ph.stalls],
+          phF: phF.stalls,
+          phR: phR.stalls,
+          inPool,
+          below,
+          none,
+        }
       );
       rmSync(x.d, { recursive: true, force: true });
     }
