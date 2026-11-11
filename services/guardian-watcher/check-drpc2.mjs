@@ -28,6 +28,8 @@ import {
   getHold,
   accusationView,
   CONFIRM_MAX_ATTEMPTS,
+  CONFIRM_BACKOFF_MAX_MS,
+  backoffMs,
   viewDigest,
 } from "./lib/confirm.mjs";
 
@@ -358,9 +360,11 @@ async function scenario(build) {
   );
 }
 
-// ---- the cap: a record the second provider can never reproduce ends unconfirmed-final, still unpublishable
+// ---- #422 review (DSR): an outage of the second provider never buries an accusation. Unavailable
+// answers do not count toward the cap; they are retried with a persisted backoff (at most 1 h), and
+// once the provider answers, the hold is confirmed and the record is published.
 {
-  const d = mkdtempSync(join(tmpdir(), "drpc2-cap-"));
+  const d = mkdtempSync(join(tmpdir(), "drpc2-outage-"));
   try {
     const c = makeChain();
     const cfg = {
@@ -383,19 +387,57 @@ async function scenario(build) {
         throw new Error("down");
       },
     });
+    const N = CONFIRM_MAX_ATTEMPTS + 3;
+    let now = 1_000_000;
     let last;
-    for (let i = 0; i < CONFIRM_MAX_ATTEMPTS + 2; i++)
-      last = await confirmPending(store, down, "second.example", cfg, rs, ident, { runOnce });
+    for (let i = 0; i < N; i++) {
+      last = await confirmPending(store, down, "second.example", cfg, rs, ident, { runOnce, now });
+      now += 2 * CONFIRM_BACKOFF_MAX_MS; // past any backoff
+    }
     const rec = recsOf(d).find(r => r.txHash === t.hash);
-    const h = getHold(store, Store.recordId(rec));
+    const id = Store.recordId(rec);
+    const h = getHold(store, id);
+    // right after a failed attempt the record backs off: not re-run before nextAttemptAt
+    const early = await confirmPending(store, down, "second.example", cfg, rs, ident, {
+      runOnce,
+      now: h.nextAttemptAt - 1,
+    });
     cell(
-      "cap: a second provider that never answers leaves the accusation unconfirmed-final after the cap, never publishable, no further attempts",
-      h?.state === "unconfirmed-final" &&
-        h.attempts === CONFIRM_MAX_ATTEMPTS &&
-        !mayPublish(store, rec) &&
-        last.final === 1 &&
-        last.checked === 0,
-      { h, last }
+      `#422: ${N} unavailable answers in a row (more than the cap) leave the accusation unconfirmed, never final, backing off, never publishable`,
+      h?.state === "unconfirmed" &&
+        h.mismatches === 0 &&
+        h.unavailableStreak === N &&
+        h.nextAttemptAt - (now - 2 * CONFIRM_BACKOFF_MAX_MS) === backoffMs(N) &&
+        backoffMs(N) === CONFIRM_BACKOFF_MAX_MS &&
+        last.final === 0 &&
+        last.waiting === 1 &&
+        early.checked === 0 &&
+        early.backingOff === 1 &&
+        !mayPublish(store, rec),
+      { h, last, early }
+    );
+    // the provider recovers: confirmed, and the publisher publishes it
+    const ok = await confirmPending(store, c.chain, "second.example", cfg, rs, ident, {
+      runOnce,
+      now: h.nextAttemptAt,
+    });
+    const { sinks } = await import("./mock-sinks.mjs");
+    const { publishPending } = await import("./lib/publisher.mjs");
+    const s = sinks();
+    const pub = await publishPending(store, {
+      pinners: s.pinners,
+      mirror: s.mirror,
+      telegram: s.telegram,
+      registry: null,
+    });
+    cell(
+      "#422: once the second provider answers again the hold is confirmed and the record is published",
+      ok.confirmed === 1 &&
+        getHold(store, id)?.state === "confirmed" &&
+        mayPublish(store, rec) &&
+        pub.counts.held === 0 &&
+        store.getPublication(id)?.published === true,
+      { ok, counts: pub.counts }
     );
   } finally {
     rmSync(d, { recursive: true, force: true });
@@ -496,12 +538,15 @@ async function scenario(build) {
         (
           await runOnce(c.chain, cfg, store, rs, ident, {
             second: { chain: down, host: "second.example" },
+            now: 5_000_000 + i * 2 * CONFIRM_BACKOFF_MAX_MS, // past the backoff each tick
           })
         ).status
       );
     const rec = recsOf(d).find(r => r.txHash === t.hash);
     const why = st =>
-      (st.degraded ?? []).some(x => /second provider has not answered on 2\+ attempts/.test(x));
+      (st.degraded ?? []).some(x =>
+        /second provider has not answered on 2\+ consecutive attempts/.test(x)
+      );
     cell(
       "DSR: a second provider that does not answer: tick 1 not yet degraded for it, ticks 2+ degraded; the accusation is never publishable",
       !why(ticks[0]) &&
@@ -749,6 +794,137 @@ async function scenario(build) {
           c1.unconfirmed === 1 &&
           !mayPublish(store, stored(store, bls)),
         c1
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #422 (DSR): one mismatch among many unavailable answers never makes the hold final
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-mix-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      let n = 0;
+      const mixed = async (second, c, temp) => {
+        n++;
+        if (n === 1) temp.putRecord({ ...bls, signerMask: "1" }); // a mismatch first
+        return n === 1 ? { status: { ok: true, cursor: c.startBlock } } : { status: { ok: false } }; // then the provider keeps failing
+      };
+      let now = 1_000_000;
+      let c;
+      for (let i = 0; i < CONFIRM_MAX_ATTEMPTS + 3; i++) {
+        c = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
+          runOnce: mixed,
+          now,
+        });
+        now += 2 * CONFIRM_BACKOFF_MAX_MS;
+      }
+      const h = getHold(store, Store.recordId(bls));
+      cell(
+        "#422 (DSR): one mismatch then many unavailable answers: still unconfirmed (mismatches 1), never final, waiting",
+        h.state === "unconfirmed" && h.mismatches === 1 && c.final === 0 && c.waiting === 1,
+        { h, c }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // only mismatches make a hold final; re-arming it is a journalled, refused-unless-final step
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-final-"));
+    try {
+      const store = new Store(d);
+      store.putRecord(bls);
+      const mm = async (second, c, temp) => {
+        temp.putRecord({ ...bls, signerMask: "1" });
+        return { status: { ok: true, cursor: c.startBlock } };
+      };
+      let c;
+      for (let i = 0; i < CONFIRM_MAX_ATTEMPTS; i++)
+        c = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
+          runOnce: mm,
+        });
+      const id = Store.recordId(bls);
+      const h = getHold(store, id);
+      const { refusal, rearmed } = await import("../../deploy/guardian-watcher/rearm-hold.mjs");
+      const notFinal = refusal({ ...h, state: "unconfirmed" }, "checked by hand");
+      const noReason = refusal(h, "");
+      const urlReason = refusal(h, "see https://rpc.example/?key=x");
+      const ok = refusal(h, "the second provider was misconfigured; fixed");
+      const { hold: after, entry } = rearmed(
+        h,
+        "the second provider was misconfigured; fixed",
+        "t"
+      );
+      cell(
+        "#422: CONFIRM_MAX_ATTEMPTS mismatches make the hold final; re-arm is refused unless final, without a reason, or with a URL; it resets the hold and records before/after and the reason",
+        c.final === 1 &&
+          h.state === "unconfirmed-final" &&
+          h.mismatches === CONFIRM_MAX_ATTEMPTS &&
+          /only an unconfirmed-final hold/.test(notFinal ?? "") &&
+          /--reason is required/.test(noReason ?? "") &&
+          /without a URL/.test(urlReason ?? "") &&
+          ok === null &&
+          after.state === "unconfirmed" &&
+          after.mismatches === 0 &&
+          after.rearmed.at(-1).before.state === "unconfirmed-final" &&
+          entry.after.state === "unconfirmed" &&
+          entry.reason === "the second provider was misconfigured; fixed",
+        { c, h: h.state, notFinal, noReason, urlReason, ok, after: after.state }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // #422 review (Low-Medium): what is published is exactly what was confirmed
+  {
+    const { recordFile } = await import("./lib/record-file.mjs");
+    const rec = {
+      ...bls,
+      firstSeen: "2026-11-01T00:00:00Z",
+      lastReasons: ["local diagnosis"],
+      exhaustedAfter: 20,
+      provenAt: "2026-11-02T00:00:00Z",
+      seenAt: "2026-11-03T00:00:00Z",
+    };
+    const published = JSON.parse(new TextDecoder().decode(recordFile(rec).bytes)).record;
+    const local = ["firstSeen", "lastReasons", "exhaustedAfter", "provenAt", "seenAt", "id"];
+    cell(
+      "#422: the published record carries none of the local diagnosis fields, and its digest is the confirmed digest",
+      local.every(k => !(k in published)) && viewDigest(published) === viewDigest(rec),
+      { keys: Object.keys(published) }
+    );
+  }
+  // #422 review (Low): a confirmation pass reads a bounded, rotating batch of record files
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-bound-"));
+    try {
+      const store = new Store(d);
+      const r1 = { ...bls, key: "7101", proposalId: "7101", txHash: ethers.id("b1") };
+      const r2 = { ...bls, key: "7102", proposalId: "7102", txHash: ethers.id("b2") };
+      store.putRecord(r1);
+      store.putRecord(r2);
+      const seen = [];
+      const run = async (second, c, temp) => {
+        seen.push(c.startBlock);
+        return { status: { ok: false } };
+      };
+      const a = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
+        runOnce: run,
+        maxParse: 1,
+        now: 1,
+      });
+      const b = await confirmPending(store, {}, "second.example", { startBlock: 0 }, null, null, {
+        runOnce: run,
+        maxParse: 1,
+        now: 2,
+      });
+      const ids = [r1, r2].map(r => getHold(store, Store.recordId(r))?.attempts ?? 0);
+      cell(
+        "#422: one record file per pass with maxParse 1, rotating: each of two records is re-run once over two passes",
+        a.checked === 1 && b.checked === 1 && ids[0] === 1 && ids[1] === 1,
+        { a: a.checked, b: b.checked, ids }
       );
     } finally {
       rmSync(d, { recursive: true, force: true });

@@ -10,8 +10,12 @@
 //
 // States (persisted under holds/<record id>.json, first-write-wins on the record itself):
 //   confirmed          the second provider reproduced the record: it may be published;
-//   unconfirmed        a mismatch, or the second provider could not answer yet: retried each tick;
-//   unconfirmed-final  still unconfirmed after CONFIRM_MAX_ATTEMPTS: never published, reported.
+//   unconfirmed        a mismatch, or the second provider could not answer: retried. An answer that
+//                      is not there yet (unavailable) is retried with a backoff and never counts
+//                      toward the cap, so an outage of the second provider cannot bury an
+//                      accusation (#422 review);
+//   unconfirmed-final  CONFIRM_MAX_ATTEMPTS MISMATCHES: never published, reported; re-armed only by
+//                      hand (deploy/guardian-watcher/rearm-hold.mjs, journalled).
 // There is no bypass. Only the operator's label for the second provider is stored, never its URL or
 // host.
 import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync } from "node:fs";
@@ -20,8 +24,17 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Store, atomicWriteJson, readJson } from "./store.mjs";
 import { MAX_DEADLETTER_ATTEMPTS } from "./scan.mjs";
+import { LOCAL_ONLY } from "./record-file.mjs";
 
+/** Mismatches (the second provider reproduced something else) before a hold is final. */
 export const CONFIRM_MAX_ATTEMPTS = 10;
+/** Backoff after an unavailable answer: 60 s doubling per consecutive one, at most 1 h. */
+export const CONFIRM_BACKOFF_BASE_MS = 60_000;
+export const CONFIRM_BACKOFF_MAX_MS = 3_600_000;
+/** Record files read per confirmation pass (like the publisher's bound), rotating. */
+export const CONFIRM_MAX_PARSE = 500;
+export const backoffMs = streak =>
+  Math.min(CONFIRM_BACKOFF_MAX_MS, CONFIRM_BACKOFF_BASE_MS * 2 ** Math.max(0, streak - 1));
 
 /** A record that names someone as having done wrong: flagged, on the owner route or a BLS action.
  * Unattributed and public-route records accuse nobody, so they are not held. */
@@ -29,8 +42,9 @@ export function isAccusatory(rec) {
   return !!rec?.verdict?.flagged && (rec.route === "owner" || rec.route === "bls");
 }
 
-/** Fields that record when or how often a record was seen, not what it says. */
-const WHEN = new Set(["id", "seenAt", "firstSeen", "exhaustedAfter", "provenAt", "lastReasons"]);
+/** Fields that record when or how often a record was seen, not what it says: the same set the
+ * published record leaves out (lib/record-file.mjs), so what is published is what was confirmed. */
+const WHEN = LOCAL_ONLY;
 
 /** The record without its when-fields, as stable JSON (keys sorted at every level). */
 export function accusationView(rec) {
@@ -159,9 +173,15 @@ export function mayPublish(store, rec) {
 }
 
 /**
- * One confirmation pass over every accusatory record not yet confirmed or final. `secondHost` (the
- * operator's provider label, never a URL or host) is
- * stored with each hold (never the URL). Returns counts.
+ * One confirmation pass. At most CONFIRM_MAX_PARSE record files are read, rotating from a persisted
+ * cursor (holds/_pass.json); each accusatory record not yet confirmed (for its current content),
+ * not final, and not backing off is re-run on the second provider. `secondHost` (the operator's
+ * provider label, never a URL or host) is stored with each hold. The returned counts are
+ * store-wide, from every hold whose record still exists:
+ *   confirmed, unconfirmed, final;
+ *   mismatch  unconfirmed and the last answer was a mismatch (degraded at once);
+ *   waiting   unconfirmed and the last 2+ attempts in a row were unavailable (degraded);
+ * and for this pass: checked (re-runs), backingOff (skipped until nextAttemptAt).
  */
 export async function confirmPending(
   store,
@@ -170,19 +190,41 @@ export async function confirmPending(
   cfg,
   rs,
   ident,
-  { runOnce, now } = {}
+  { runOnce, now, maxParse = CONFIRM_MAX_PARSE } = {}
 ) {
-  // mismatch: the second provider reproduced something else; waiting: it could not answer on two or
-  // more attempts in a row (one attempt is the normal finality gap). Both make the watcher degraded
-  // while the record is held (DSR, ded99d78).
-  const counts = { confirmed: 0, unconfirmed: 0, final: 0, checked: 0, mismatch: 0, waiting: 0 };
+  const nowMs = now ?? Date.now();
+  const counts = {
+    confirmed: 0,
+    unconfirmed: 0,
+    final: 0,
+    checked: 0,
+    mismatch: 0,
+    waiting: 0,
+    backingOff: 0,
+  };
   const dir = join(store.dir, "records");
   const holds = join(store.dir, "holds");
   if (!existsSync(holds)) {
     const { mkdirSync } = await import("node:fs");
     mkdirSync(holds, { recursive: true, mode: 0o700 });
   }
-  for (const f of readdirSync(dir).filter(n => n.endsWith(".json"))) {
+  const names = readdirSync(dir)
+    .filter(n => n.endsWith(".json"))
+    .sort();
+  const passFile = join(holds, "_pass.json");
+  let cursor = null;
+  try {
+    cursor = readJson(passFile, null)?.cursor ?? null;
+  } catch {
+    cursor = null; // unreadable: start over (only the order is lost)
+  }
+  let start = 0;
+  if (cursor) {
+    const k = names.findIndex(n => n > cursor);
+    start = k < 0 ? 0 : k;
+  }
+  const batch = names.slice(start, start + maxParse);
+  for (const f of batch) {
     let rec;
     try {
       rec = JSON.parse(readFileSync(join(dir, f), "utf8"));
@@ -205,12 +247,11 @@ export async function confirmPending(
     }
     const prev = getHold(store, id);
     // a confirmation counts only for the content it was made on
-    if (prev?.state === "confirmed" && prev.digest === viewDigest(rec)) {
-      counts.confirmed++;
-      continue;
-    }
-    if (prev?.state === "unconfirmed-final") {
-      counts.final++;
+    if (prev?.state === "confirmed" && prev.digest === viewDigest(rec)) continue;
+    if (prev?.state === "unconfirmed-final") continue;
+    const sameContent = prev?.digest === viewDigest(rec);
+    if (sameContent && Number.isFinite(prev?.nextAttemptAt) && nowMs < prev.nextAttemptAt) {
+      counts.backingOff++;
       continue;
     }
     counts.checked++;
@@ -220,31 +261,57 @@ export async function confirmPending(
     } catch {
       r = { state: "unavailable", reason: "confirmation run threw" };
     }
-    const attempts = (prev?.attempts ?? 0) + 1;
+    // new content starts afresh; the same content carries its counters
+    const base = sameContent ? prev : null;
+    const mismatches = (base?.mismatches ?? 0) + (r.state === "mismatch" ? 1 : 0);
+    const unavailableStreak = r.state === "unavailable" ? (base?.unavailableStreak ?? 0) + 1 : 0;
     const state =
       r.state === "confirmed"
         ? "confirmed"
-        : attempts >= CONFIRM_MAX_ATTEMPTS
+        : mismatches >= CONFIRM_MAX_ATTEMPTS
           ? "unconfirmed-final"
           : "unconfirmed";
     atomicWriteJson(join(holds, `${id}.json`), {
       id,
       state,
       digest: viewDigest(rec),
-      attempts,
+      attempts: (base?.attempts ?? 0) + 1,
+      mismatches,
+      unavailableStreak,
+      ...(r.state === "unavailable" ? { nextAttemptAt: nowMs + backoffMs(unavailableStreak) } : {}),
       lastResult: r.state,
       ...(r.fields ? { fields: r.fields } : {}),
       ...(r.reason ? { reason: r.reason } : {}),
       secondProvider: secondHost,
-      firstHeldAt: prev?.firstHeldAt ?? new Date(now ?? Date.now()).toISOString(),
-      lastCheckedAt: new Date(now ?? Date.now()).toISOString(),
+      ...(prev?.rearmed ? { rearmed: prev.rearmed } : {}),
+      firstHeldAt: prev?.firstHeldAt ?? new Date(nowMs).toISOString(),
+      lastCheckedAt: new Date(nowMs).toISOString(),
     });
-    counts[
-      state === "confirmed" ? "confirmed" : state === "unconfirmed-final" ? "final" : "unconfirmed"
-    ]++;
-    if (state === "unconfirmed") {
-      if (r.state === "mismatch") counts.mismatch++;
-      else if (attempts >= 2) counts.waiting++;
+  }
+  // the rotation: the traversal advances by the batch; reaching the last name starts over
+  const last = batch.at(-1) ?? null;
+  const next = start + batch.length >= names.length ? null : last;
+  try {
+    atomicWriteJson(passFile, { cursor: next });
+  } catch {
+    // the next pass starts at the beginning again: only the order is lost
+  }
+  // store-wide counts from the holds of records that still exist
+  const present = new Set(names);
+  for (const h of readdirSync(holds).filter(n => n.endsWith(".json") && n !== "_pass.json")) {
+    if (!present.has(h)) continue;
+    let hold;
+    try {
+      hold = JSON.parse(readFileSync(join(holds, h), "utf8"));
+    } catch {
+      continue;
+    }
+    if (hold?.state === "confirmed") counts.confirmed++;
+    else if (hold?.state === "unconfirmed-final") counts.final++;
+    else if (hold?.state === "unconfirmed") {
+      counts.unconfirmed++;
+      if (hold.lastResult === "mismatch") counts.mismatch++;
+      else if ((hold.unavailableStreak ?? 0) >= 2) counts.waiting++;
     }
   }
   return counts;

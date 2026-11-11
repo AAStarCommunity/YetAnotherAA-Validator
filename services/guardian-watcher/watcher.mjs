@@ -369,7 +369,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
         };
         if (status.confirm.final)
           more.push(
-            `${status.confirm.final} accusatory record(s) never confirmed by the second provider (held for good)`
+            `${status.confirm.final} accusatory record(s) final after repeated mismatches with the second provider (held; re-arm by hand: rearm-hold.mjs)`
           );
         // held and not publishable: a disagreement, or a second provider that keeps not answering
         // (DSR, ded99d78): degraded, never published
@@ -379,7 +379,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
           );
         if (status.confirm.waiting)
           more.push(
-            `${status.confirm.waiting} accusatory record(s) not confirmable: the second provider has not answered on 2+ attempts (held, not published)`
+            `${status.confirm.waiting} accusatory record(s) not confirmable: the second provider has not answered on 2+ consecutive attempts (held, retried with backoff, not published)`
           );
       } catch {
         status.confirm = { secondProvider: second.host ?? null, error: "confirmation pass failed" };
