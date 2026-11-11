@@ -632,7 +632,6 @@ async function scenario(build) {
       const rec = JSON.parse(readFileSync(join(d, "records", `${id}.json`), "utf8"));
       store.putPublication(id, {
         cid: recordFile(rec).cid,
-        recordVersion: 2,
         published: false,
         pins: {},
       });
@@ -671,7 +670,6 @@ async function scenario(build) {
       const rec = JSON.parse(readFileSync(join(d, "records", `${id}.json`), "utf8"));
       store.putPublication(id, {
         cid: recordFile(rec).cid,
-        recordVersion: 2,
         published: true,
         pins: {},
       });
@@ -991,57 +989,46 @@ async function scenario(build) {
       rmSync(d, { recursive: true, force: true });
     }
   }
-  // #2: a journal that committed to a v1 CID keeps it; a new record is published as v2
+  // #2 (R9): one serialization. A journal whose CID came from another one (none exists before
+  // Phase D) is a bytes-change incident: nothing is uploaded, nothing unconfirmed is published
   {
-    const { recordFile, recordVersionOf } = await import("./lib/record-file.mjs");
+    const { recordFile } = await import("./lib/record-file.mjs");
     const { publishPending } = await import("./lib/publisher.mjs");
     const { sinks } = await import("./mock-sinks.mjs");
     const d = mkdtempSync(join(tmpdir(), "drpc2-v1-"));
     try {
       const store = new Store(d);
       const old = { ...owner, txHash: ethers.id("v1-old"), lastReasons: ["local"], firstSeen: "t" };
-      const neu = { ...owner, txHash: ethers.id("v1-new"), lastReasons: ["local"], firstSeen: "t" };
       store.putRecord(old);
-      store.putRecord(neu);
       const oid = Store.recordId(old);
-      const nid = Store.recordId(neu);
-      const v1 = recordFile(stored(store, old), { version: 1 });
-      const v2 = recordFile(stored(store, old), { version: 2 });
-      // published before #422: the journal committed to the v1 CID (no recordVersion field)
-      store.putPublication(oid, { cid: v1.cid, recordHash: v1.recordHash });
-      // both confirmed, so the gate lets them through
       const { atomicWriteJson } = await import("./lib/store.mjs");
       const { mkdirSync } = await import("node:fs");
       mkdirSync(join(d, "holds"), { recursive: true });
-      for (const [rid, r] of [
-        [oid, old],
-        [nid, neu],
-      ])
-        atomicWriteJson(join(d, "holds", `${rid}.json`), {
-          id: rid,
-          state: "confirmed",
-          digest: viewDigest(stored(store, r)),
-        });
+      atomicWriteJson(join(d, "holds", `${oid}.json`), {
+        id: oid,
+        state: "confirmed",
+        digest: viewDigest(stored(store, old)),
+      });
+      // a journal committed to some other serialization's CID
+      store.putPublication(oid, { cid: "bafkreiotherserialization", published: false, pins: {} });
       const s = sinks();
-      await publishPending(store, {
+      const r = await publishPending(store, {
         pinners: s.pinners,
         mirror: s.mirror,
         telegram: s.telegram,
         registry: null,
       });
       const jo = store.getPublication(oid);
-      const jn = store.getPublication(nid);
+      const uploads = Object.values(s.calls.uploads).reduce((a, b) => a + b, 0);
       cell(
-        "R8#2: a v1 journal keeps its v1 CID (no bytes-change incident); a record first published now is v2",
-        v1.cid !== v2.cid &&
-          recordVersionOf({ cid: "x" }) === 1 &&
-          recordVersionOf({}) === 2 &&
-          !jo.bytesChanged &&
-          jo.cid === v1.cid &&
-          jo.recordVersion === 1 &&
-          jn.recordVersion === 2 &&
-          jn.cid === recordFile(stored(store, neu), { version: 2 }).cid,
-        { jo: [jo.cid === v1.cid, jo.bytesChanged, jo.recordVersion], jn: jn.recordVersion }
+        "R9: a journal from another serialization is a bytes-change incident: no upload, no mirror, no Telegram",
+        !!jo.bytesChanged &&
+          uploads === 0 &&
+          s.calls.mirror === 0 &&
+          s.calls.telegram === 0 &&
+          r.stalls.incidents === 1 &&
+          recordFile(stored(store, old)).cid !== "bafkreiotherserialization",
+        { jo: jo.bytesChanged, uploads, r: r.stalls }
       );
     } finally {
       rmSync(d, { recursive: true, force: true });
@@ -1091,6 +1078,33 @@ async function scenario(build) {
         "R8#4: an unsaved confirmation cursor is reported and the batch still rotates in memory (both records re-run)",
         a.cursorUnsaved === true && b.cursorUnsaved === true && att[0] === 1 && att[1] === 1,
         { a, b, att }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+  // R9 #3: one hold that cannot be written does not stop the pass for the others
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-holdfail-"));
+    try {
+      const store = new Store(d);
+      const r1 = { ...bls, key: "7301", proposalId: "7301", txHash: ethers.id("h1") };
+      const r2 = { ...bls, key: "7302", proposalId: "7302", txHash: ethers.id("h2") };
+      store.putRecord(r1);
+      store.putRecord(r2);
+      const ids = [r1, r2].map(r => Store.recordId(r)).sort();
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(join(d, "holds", `${ids[0]}.json`, "x"), { recursive: true }); // the first is unwritable
+      const run = async () => ({ status: { ok: false } });
+      const c = await confirmPending(store, {}, "s", { startBlock: 0 }, null, null, {
+        runOnce: run,
+        now: 1,
+      });
+      const second = getHold(store, ids[1]);
+      cell(
+        "R9#3: an unwritable hold is reported and skipped; the next record's hold is still written",
+        c.holdUnsaved === 1 && c.checked === 2 && second?.attempts === 1,
+        { c, second }
       );
     } finally {
       rmSync(d, { recursive: true, force: true });

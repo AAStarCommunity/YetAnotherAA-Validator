@@ -283,7 +283,7 @@ export async function confirmPending(
         : mismatches >= CONFIRM_MAX_ATTEMPTS
           ? "unconfirmed-final"
           : "unconfirmed";
-    atomicWriteJson(join(holds, `${id}.json`), {
+    const holdDoc = {
       id,
       state,
       digest: viewDigest(rec),
@@ -298,7 +298,14 @@ export async function confirmPending(
       ...(prev?.rearmed ? { rearmed: prev.rearmed } : {}),
       firstHeldAt: prev?.firstHeldAt ?? new Date(nowMs).toISOString(),
       lastCheckedAt: new Date(nowMs).toISOString(),
-    });
+    };
+    // one hold that cannot be written does not stop the pass (Codex D-RPC2 R9 #3): it stays
+    // unconfirmed (mayPublish reads the old hold, or none), it is reported, and the traversal goes on
+    try {
+      atomicWriteJson(join(holds, `${id}.json`), holdDoc);
+    } catch {
+      counts.holdUnsaved = (counts.holdUnsaved ?? 0) + 1;
+    }
   }
   // the rotation: the traversal advances by the batch; reaching the last name starts over
   const last = batch.at(-1) ?? null;

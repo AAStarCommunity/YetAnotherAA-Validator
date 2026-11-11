@@ -6,13 +6,11 @@ import { cidV1Raw } from "./cid.mjs";
 import { Store } from "./store.mjs";
 
 // v2 (#422): the published record leaves out every local diagnosis field, so it is exactly the
-// content D-RPC2 confirmed. v1 is kept for a record whose journal already committed to its v1 CID
-// (its CID and recordHash are never rewritten); a record first published now is v2.
+// content D-RPC2 confirmed. There is one serialization: no older one is ever re-produced, because
+// re-producing v1 would publish fields nobody confirmed (Codex D-RPC2 R9). No publication journal
+// predates v2 (Phase D, the first deployment, needs it); one that did would have another CID and
+// surface as a bytes-change incident (alerted, nothing published), never as a publication.
 export const RECORD_SCHEMA = "dvt.guardian-watcher.record.v2";
-export const RECORD_SCHEMA_V1 = "dvt.guardian-watcher.record.v1";
-const LOCAL_ONLY_V1 = new Set(["seenAt", "id"]);
-/** The serialization a journal is on: v1 if it committed to a CID before v2 existed. */
-export const recordVersionOf = journal => (journal?.cid ? (journal.recordVersion ?? 1) : 2);
 // Fields that record when or how often THIS host saw a record, not what it says, plus the store's
 // file id. They stay local: the published record is exactly the content the second provider
 // confirmed (D-RPC2; #422 review), which ignores the same fields (lib/confirm.mjs uses this set).
@@ -40,12 +38,10 @@ function canon(v) {
 }
 
 /** { bytes, cid, recordHash, json } for a record. Throws if the file exceeds the CID cap. */
-export function recordFile(record, { recheck, version = 2 } = {}) {
-  const local = version === 1 ? LOCAL_ONLY_V1 : LOCAL_ONLY;
+export function recordFile(record, { recheck } = {}) {
   const body = {};
-  for (const [k, v] of Object.entries(record)) if (!local.has(k)) body[k] = v;
-  const schema = version === 1 ? RECORD_SCHEMA_V1 : RECORD_SCHEMA;
-  const doc = canon({ schema, record: body, ...(recheck ? { recheck } : {}) });
+  for (const [k, v] of Object.entries(record)) if (!LOCAL_ONLY.has(k)) body[k] = v;
+  const doc = canon({ schema: RECORD_SCHEMA, record: body, ...(recheck ? { recheck } : {}) });
   const json = JSON.stringify(doc, null, 2) + "\n";
   const bytes = new TextEncoder().encode(json);
   return { bytes, json, cid: cidV1Raw(bytes), recordHash: ethers.keccak256(bytes) };

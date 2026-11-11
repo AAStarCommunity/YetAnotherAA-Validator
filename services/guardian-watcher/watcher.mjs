@@ -379,6 +379,10 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
           );
         // held and not publishable: a disagreement, or a second provider that keeps not answering
         // (DSR, ded99d78): degraded, never published
+        if (status.confirm.holdUnsaved)
+          more.push(
+            `${status.confirm.holdUnsaved} D-RPC2 hold(s) could not be saved (those records stay held)`
+          );
         if (status.confirm.cursorUnsaved)
           more.push("D-RPC2 confirmation cursor not saved (rotating in memory)");
         if (status.confirm.mismatch)
