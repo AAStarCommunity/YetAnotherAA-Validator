@@ -12,7 +12,8 @@
 //   confirmed          the second provider reproduced the record: it may be published;
 //   unconfirmed        a mismatch, or the second provider could not answer yet: retried each tick;
 //   unconfirmed-final  still unconfirmed after CONFIRM_MAX_ATTEMPTS: never published, reported.
-// There is no bypass. Only the second provider's host is stored, never its URL.
+// There is no bypass. Only the operator's label for the second provider is stored, never its URL or
+// host.
 import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -158,7 +159,8 @@ export function mayPublish(store, rec) {
 }
 
 /**
- * One confirmation pass over every accusatory record not yet confirmed or final. `secondHost` is
+ * One confirmation pass over every accusatory record not yet confirmed or final. `secondHost` (the
+ * operator's provider label, never a URL or host) is
  * stored with each hold (never the URL). Returns counts.
  */
 export async function confirmPending(

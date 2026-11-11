@@ -685,6 +685,20 @@ async function scenario(build) {
   }
 }
 
+// ---- the second provider is recorded by label only, never by anything derived from its URL
+{
+  const { secondProviderLabel } = await import("./watcher.mjs");
+  const src = readFileSync(new URL("./watcher.mjs", import.meta.url), "utf8");
+  cell(
+    "the second provider's label is the config name (validated), never its URL's hostname",
+    secondProviderLabel({ secondProvider: "tenderly" }) === "tenderly" &&
+      secondProviderLabel({ secondProvider: "tok3n.rpc.example" }) === "second" &&
+      secondProviderLabel({}) === "second" &&
+      !/RPC_URL_2\)\.hostname/.test(src),
+    null
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(

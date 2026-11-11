@@ -88,6 +88,12 @@ export function loadConfig(path) {
   };
 }
 
+/** The second provider's label for holds and status: config.secondProvider, a plain name. */
+export function secondProviderLabel(cfg) {
+  const n = cfg?.secondProvider;
+  return typeof n === "string" && /^[a-z][a-z0-9-]{0,30}$/i.test(n) ? n : "second";
+}
+
 export const TRACE_VERIFY_MS = 3_600_000;
 
 /**
@@ -330,9 +336,11 @@ async function main() {
   await acquireLock(p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT);
   const chain = makeProvider(process.env.RPC_URL);
   // D-RPC2: the second provider's URL comes from the environment (on the Mini, from the Keychain);
-  // only its host is ever recorded
+  // only the operator's label for it is ever recorded
   const second = process.env.RPC_URL_2
-    ? { chain: makeProvider(process.env.RPC_URL_2), host: new URL(process.env.RPC_URL_2).hostname }
+    ? // only the operator's label for the second provider is ever stored, never anything derived
+      // from its URL: a hostname can carry an access token in a subdomain (cf. Codex A7 R16)
+      { chain: makeProvider(process.env.RPC_URL_2), host: secondProviderLabel(cfg) }
     : null;
   const pub = p ? { p, built: await buildSinks(p, chain) } : null;
   const store = new Store(cfg.dataDir);
