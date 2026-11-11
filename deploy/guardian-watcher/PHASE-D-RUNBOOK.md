@@ -227,3 +227,58 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.aastar.aoa-watcher.pl
 
 The record id is the file name (without `.json`) under `holds/` in the data
 directory; `status.json` counts the held records (`confirm.final`).
+
+## After acceptance: when the primary provider wrote a bad record (D-RPC2)
+
+**How it shows.** The watcher is degraded with
+`N accusatory record(s) differ on the second provider (held, not published)`
+(or, after repeated mismatches, `… final after repeated mismatches …`). The
+record's hold, `holds/<record id>.json` in the data directory, names the fields
+the two providers disagree on (`fields`, `reason`). An incident alert can also
+point at the record.
+
+**It is already contained.** A held record is not uploaded, mirrored, sent to
+Telegram or disclosed; nothing has to be stopped to keep it from spreading.
+
+**Find out which provider is wrong.** Compare the record's transaction (its
+`txHash` and block) against a third, independent source, such as a block
+explorer or another RPC, for the fields listed in the hold.
+
+- **The second provider was wrong.** Fix or replace it (Keychain item
+  `aoa-dvt-rpc-secondary`, then
+  `launchctl kickstart -k gui/$(id -u)/ai.aastar.aoa-watcher`). The record is
+  confirmed on a later pass; if it had become final, re-arm it (previous
+  section).
+- **The primary provider's record is wrong.** It is never published while it
+  disagrees, so nothing on chain needs correcting. To have the record produced
+  again from a corrected primary:
+  1. stop the watcher (`launchctl bootout gui/$(id -u)/ai.aastar.aoa-watcher`);
+  2. set aside, under a new `manual-quarantine/` directory in the data directory
+     (keep everything as evidence; the watcher does not read it), each into its
+     own subdirectory so no file overwrites another:
+     - `records/<record id>.json` to `manual-quarantine/records/`;
+     - `holds/<record id>.json` to `manual-quarantine/holds/`;
+     - every file under `deadletters/` that belongs to the record's transaction
+       (its `txHash`; a dead letter keeps the classified record and is retried
+       before the scan, so it would write the old record back) to
+       `manual-quarantine/deadletters/`;
+     - `publications/<record id>.json` to `manual-quarantine/publications/` if
+       it carries a `cid` (a journal committed to the old bytes would stop the
+       new record as a bytes-change incident); a journal without `cid`, e.g. one
+       that only holds `holdRearms`, can stay;
+  3. fix or replace the primary (Keychain item `aoa-dvt-rpc-primary`);
+  4. rewind `cursor.json` to the block before the record's block, B:
+     `{"block": <B-1>, "hash": "<hash of block B-1 from a trusted source>"}`.
+     The watcher checks that hash against its RPC and refuses to scan on a
+     mismatch, so a wrong hash stops the tick instead of skipping anything. The
+     scan then starts at block B; rescanning creates no duplicates; the blocks
+     from B on are read again, at most `maxBlocksPerTick` per tick;
+  5. start the watcher (`launchctl bootstrap …`). The record is written again
+     and goes through D-RPC2 like any new one. There is no tool for steps 2 and
+     4 yet.
+- **Already on chain.** An accusation reaches DisclosureRegistry only after both
+  providers agreed, so a wrong entry means both were wrong (not defended, M0
+  §5.5a item 5). Its claim fields are corrected with the registry's `amend` from
+  the sender key; an entry cannot be deleted, and readers take the latest
+  `Amended` and recheck it (M0 §5.5a). There is no amend tool in this repository
+  yet.
