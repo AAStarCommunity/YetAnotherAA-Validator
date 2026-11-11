@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Guardian watcher (M0 §5): detection + records only (W1). Runs on the Mac Mini under launchd.
+// Guardian watcher (M0 §5): detection + records (W1) and, with config.publish, their publication
+// (W2: IPFS pins, git mirror, Telegram, DisclosureRegistry). Runs on the Mac Mini under launchd.
 //
 //   RPC_URL=... node services/guardian-watcher/watcher.mjs --config <config.json> [--once]
 //
@@ -7,7 +8,8 @@
 //   { "chainId": 10, "aggregator": "0x..", "startBlock": N, "dataDir": "/path",
 //     "roles": { "superPaymaster": "0x.." },
 //     "forwarders": { "dvtValidator": "0x..", "ownerSafe": "0x..", "multiSendCallOnly": "0x.." },
-//     "maxBlocksPerTick": 2000, "page": 5000, "intervalMs": 60000 }
+//     "maxBlocksPerTick": 2000, "page": 5000, "intervalMs": 60000,
+//     "publish": { "enabled": true, ... }   (lib/sinks-config.mjs; secrets are Keychain items) }
 //
 // Fail-open on errors: a failed tick is recorded in status.json and retried; the process keeps
 // running, because a watcher that stops is the outcome it exists to prevent.
@@ -20,7 +22,10 @@ import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick, verifyTrace } from "./lib/scan.mjs";
-import { safeText } from "./lib/safe-error.mjs";
+import { SafeError, safeText } from "./lib/safe-error.mjs";
+import { acquireLock, DEFAULT_LOCK_PORT } from "./lib/lock.mjs";
+import { publishConfig, buildSinks } from "./lib/sinks-config.mjs";
+import { publishPhase } from "./lib/publisher.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -77,6 +82,93 @@ export function loadConfig(path) {
     forwarders: {},
     ...c,
   };
+}
+
+/** The disclose stalls that make the watcher degraded (DSR, #411 F1): fixed wording, counts only. */
+export function stallReasons(publication) {
+  // store-wide counts (lib/publisher.mjs stallCounts), never the batch's (DSR)
+  const out = [];
+  // no store-wide counts at all (the pass threw, or never reported them) is not "no stalls"
+  // (#413 review B1)
+  if (!publication?.stalls) return ["stall state unknown: no publication result"];
+  const st = publication.stalls;
+  // an unreadable, unrebuildable index is not "no stalls" (Codex W2c R12 #3)
+  if (st.unknown) out.push("stall state unknown: the stall index is unreadable");
+  if (st.feeCapped)
+    out.push(`${st.feeCapped} disclose tx(s) need a fee above registry.maxFeePerGas`);
+  if (st.insufficientFunds)
+    out.push(
+      `${st.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
+    );
+  // what still needs attention (Codex W2c R20), store-wide until the journal no longer says so
+  if (st.incidents)
+    out.push(`${st.incidents} unresolved registry or bytes incident(s) (acknowledge or resolve)`);
+  if (st.inconsistent)
+    out.push(
+      `${st.inconsistent} disclose receipt(s) final but the entry not visible (RPC inconsistent)`
+    );
+  if (st.unverified)
+    out.push(`${st.unverified} pin(s) not re-verified since a failed check (retried every pass)`);
+  // the generic count last: a specific cause above names the same record more precisely
+  if (st.failing)
+    out.push(`${st.failing} record(s) failing publication (retried every pass; see the alerts)`);
+  return out;
+}
+
+/**
+ * Why a publication result makes the watcher degraded (#413 review B1), fixed wording: a pass that
+ * threw or did not report ok, and the store-wide disclose stalls (DSR, #411 F1). The heartbeat
+ * alerts on healthy: false.
+ */
+export function publicationReasons(publication) {
+  const reasons = [];
+  if (publication?.error) reasons.push("publication pass failed (see the alerts)");
+  else if (publication?.ok !== true)
+    reasons.push("publication pass not ok (a stage failed, stopped or was skipped)");
+  reasons.push(...stallReasons(publication));
+  return reasons;
+}
+
+/**
+ * One iteration's publication, as the resident loop runs it (#413 review B1): a pass that throws,
+ * or that does not report ok, makes the watcher degraded (fixed wording, healthy = false) so the
+ * heartbeat sees it; so do disclose stalls and a slow iteration. Returns the next slowNote.
+ */
+export async function publicationStep({
+  status,
+  run,
+  slowNote,
+  iterStart,
+  cfg,
+  carried = [],
+  now = Date.now,
+}) {
+  // the interim status carried the last publication's reasons (runOnce); they are replaced by this
+  // pass's, so health is the scan's plus the current publication's (Codex W2c R19 #2)
+  const scanDegraded = (status.degraded ?? []).filter(r => !carried.includes(r));
+  try {
+    // the previous iteration's slowness is only known after its publication: carried here
+    const degraded = [...scanDegraded, ...(slowNote ? [slowNote] : [])];
+    status.publication = await run(degraded.length ? degraded : undefined);
+  } catch (e) {
+    status.publication = { error: safeText("publication", e) };
+  }
+  const reasons = publicationReasons(status.publication);
+  // the whole iteration (scan and publication) against the interval: a slow one is degraded,
+  // and alerted by the next pass (tickMs covers the scan alone)
+  status.iterationMs = now() - iterStart;
+  const limit = (cfg.maxTickFraction ?? 0.5) * cfg.intervalMs;
+  const nextSlow =
+    status.iterationMs > limit
+      ? // fixed wording: the alert set's identity must not change with every duration (Codex W2c
+        // R9); the measured time is status.iterationMs
+        `iteration slower than ${Math.round(limit)} ms (maxTickFraction of the interval)`
+      : null;
+  if (nextSlow) reasons.push(nextSlow);
+  const all = [...scanDegraded, ...reasons];
+  status.degraded = all.length ? all : null;
+  status.healthy = status.ok === true && all.length === 0;
+  return nextSlow;
 }
 
 export const TRACE_VERIFY_MS = 3_600_000;
@@ -157,10 +249,13 @@ export async function traceHealth(chain, cfg, store, stats, finalized, nowMs) {
   };
 }
 
-export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
+export async function runOnce(chain, cfg, store, rs, ident, { now, carry } = {}) {
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
-  const status = { at: started, ruleset: ident, lastError: null };
+  // `carry`: fields kept from the previous status while this run has not replaced them yet (the
+  // last publication result, marked in progress: Codex W2c R1 M8).
+  const status = { at: started, ruleset: ident, lastError: null, ...(carry ?? {}) };
+  let carried = []; // the reasons taken from the carried publication (replaced by publicationStep)
   // wall time of this tick and the archive it ran over, reported with every status
   const tickStart = Date.now();
   const timing = () => {
@@ -195,6 +290,12 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
       extra.push(
         `tick took ${status.tickMs} ms, more than ${Math.round(tm.limit)} ms (maxTickFraction of the interval)`
       );
+    // the status written before this iteration's publication keeps the last publication's
+    // degradation (Codex W2c R18): a scan-only "healthy" must not read as recovered
+    if (carry?.publication) {
+      carried = publicationReasons(carry.publication);
+      extra.push(...carried);
+    }
     status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
     status.healthy = status.ok === true && !status.degraded;
   };
@@ -243,7 +344,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
       more.push(`cursor ${lag} blocks behind finalized (> ${maxLag})`);
     await finish(s.trace, s.finalized, s.isolated ?? 0, more);
     store.writeStatus(status);
-    return { status, summary: s };
+    return { status, summary: s, carried };
   } catch (e) {
     status.ok = false;
     status.lastError = safeText("tick", e); // never a foreign error's text (lib/safe-error.mjs)
@@ -252,8 +353,16 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
     status.cursor = store.getCursor()?.block ?? null;
     await finish(null, null);
     store.writeStatus(status);
-    return { status, summary: null };
+    return { status, summary: null, carried };
   }
+}
+
+/** `--once` exit code: 0 only for a healthy scan (trace capability verified, DSR #400) AND, when
+ * publication ran, a pass that reported ok (no failed record, stop, skipped registry stage or
+ * undelivered alerts: Codex W2c R2). */
+export function onceExitCode(status) {
+  const pubOk = !status.publication || status.publication.ok === true;
+  return status.healthy === true && pubOk ? 0 : 1;
 }
 
 async function main() {
@@ -274,16 +383,46 @@ async function main() {
     console.error(
       "WARNING: ruleset.json does not match a committed version; records carry ruleset.verified = false"
     );
+  // W2c: publication is opt-in (config.publish.enabled). Everything that can refuse is checked
+  // BEFORE anything is created or read from the network: the publish config, then the lock (one
+  // process per host: it covers scanning too, two watchers on one data dir would race the store),
+  // then secrets and the writer key, loaded once. A bad setup refuses to start, never half-runs.
+  const p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null;
+  await acquireLock(p?.lockPort ?? cfg.lockPort ?? DEFAULT_LOCK_PORT);
   const chain = makeProvider(process.env.RPC_URL);
+  // the registry signs only for the configured chain (#413 review N2): a missing chainId refuses
+  // to start, and a mismatching RPC refuses each signature
+  if (p && !Number.isSafeInteger(cfg.chainId))
+    throw new SafeError("config: chainId required when publish is enabled");
+  const pub = p ? { p, built: await buildSinks(p, chain, { chainId: cfg.chainId }) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
+  let lastPub = store.readStatus()?.publication ?? null;
   let first = true;
+  let slowNote = null; // the last iteration was slower than maxTickFraction of the interval
   for (;;) {
-    const { status } = await runOnce(chain, cfg, store, rs, ident);
+    // The last publication result stays visible, marked in progress, until this pass replaces it.
+    const carry = pub
+      ? { publication: { ...(lastPub ?? {}), inProgress: true, since: new Date().toISOString() } }
+      : undefined;
+    const iterStart = Date.now();
+    const { status, carried } = await runOnce(chain, cfg, store, rs, ident, { carry });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
+    if (pub) {
+      slowNote = await publicationStep({
+        status,
+        slowNote,
+        iterStart,
+        cfg,
+        carried,
+        run: degraded => publishPhase(store, chain, cfg, pub.p, pub.built, { degraded }),
+      });
+      lastPub = status.publication;
+      store.writeStatus(status);
+    }
     console.log(JSON.stringify(status));
-    if (once) process.exit(status.healthy ? 0 : 1);
+    if (once) process.exit(onceExitCode(status));
     await new Promise(r => setTimeout(r, cfg.intervalMs));
   }
 }

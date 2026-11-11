@@ -117,6 +117,10 @@ export function gitMirror({
     return { mode, type, blob };
   };
   const blobBytes = blob => git(clone, ["cat-file", "blob", blob]);
+  // the public repository only: no user info, query or fragment can reach a journal or Telegram
+  // (Codex W2c R23 #1)
+  if (repoUrl !== undefined && repoUrl !== null && !PUBLIC_REPO_URL.test(String(repoUrl)))
+    throw new SinkError("mirror: repoUrl must be https://github.com/<owner>/<repo>");
   const url = (c, path) => (repoUrl ? `${repoUrl}/blob/${c}/${path}` : null);
 
   return {
@@ -192,3 +196,9 @@ export function gitMirror({
     return { commit, url: url(commit, path) };
   }
 }
+
+/** A public GitHub repository URL, nothing else (Codex W2c R23 #1). */
+export const PUBLIC_REPO_URL = /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
+/** A blob URL in such a repository, as gitMirror builds it. */
+export const MIRROR_BLOB_URL =
+  /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/blob\/[0-9a-f]{4,40}\/[A-Za-z0-9._\/-]{1,300}$/;

@@ -3,6 +3,7 @@
 // same bytes, the same CID and the same recordHash. Local-only fields are stripped.
 import { ethers } from "ethers";
 import { cidV1Raw } from "./cid.mjs";
+import { Store } from "./store.mjs";
 
 export const RECORD_SCHEMA = "dvt.guardian-watcher.record.v1";
 const LOCAL_ONLY = new Set(["seenAt", "id"]); // when this host saw it, and the store's file id
@@ -31,12 +32,17 @@ export function recordFile(record, { recheck } = {}) {
   return { bytes, json, cid: cidV1Raw(bytes), recordHash: ethers.keccak256(bytes) };
 }
 
-/** Path of a record in the GitHub mirror branch: a function of the record and its CID only. */
+/** Path of a record in the GitHub mirror branch: a function of the record and its CID only. The id is
+ * the store's own (Store.recordId), so a public, unattributed or quarantine record is never named
+ * like an owner-route one. */
 export function mirrorPath(record, cid) {
-  // the path is built from chain data; make its shape an invariant (#409 review N2)
+  // the path is built from chain data; make its shape an invariant (#409 review N2): the CID here,
+  // the id below (the store's own record id, path-safe)
   if (!/^[a-z2-7]+$/.test(String(cid))) throw new Error("mirrorPath: CID is not base32");
+  // an owner-route record is named by its tx and log position: both well-formed (#409 review N2);
+  // unattributed and quarantine records keep their own ids (W2c)
   if (
-    record.route !== "bls" &&
+    record.route === "owner" &&
     (!/^0x[0-9a-fA-F]{64}$/.test(String(record.txHash)) ||
       !Number.isSafeInteger(record.logIndex) ||
       record.logIndex < 0)
@@ -44,9 +50,7 @@ export function mirrorPath(record, cid) {
     throw new Error(
       "mirrorPath: owner-route record needs a 32-byte txHash and an integer logIndex"
     );
-  const id =
-    record.route === "bls"
-      ? `bls-${record.kind}-${BigInt(record.key).toString(16).padStart(64, "0")}`
-      : `owner-${String(record.txHash).toLowerCase()}-${record.logIndex}`;
+  const id = Store.recordId(record);
+  if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error("record id not path-safe");
   return `records/${record.route}/${id}.${cid}.json`;
 }

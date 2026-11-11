@@ -6,6 +6,7 @@ import { MAX_RECORD_BYTES, cidV1Raw } from "./lib/cid.mjs";
 import { recordFile, mirrorPath } from "./lib/record-file.mjs";
 import { publishRecord, discloseArgs, expectedBinding, PersistError } from "./lib/publish.mjs";
 import { acquireLock } from "./lib/lock.mjs";
+import { bls, owner, signers, sinks } from "./mock-sinks.mjs";
 
 const results = [];
 const j = v => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x));
@@ -53,40 +54,6 @@ try {
 }
 cell("CID: 262,145 bytes is refused (would not be a single raw block)", refused, null);
 
-// ---- records
-const signers = [
-  ethers.getAddress("0x" + "11".repeat(20)),
-  ethers.getAddress("0x" + "22".repeat(20)),
-];
-const bls = {
-  route: "bls",
-  kind: "SLASH",
-  key: "7",
-  proposalId: "7",
-  messageHash: ethers.id("m"),
-  messageInputs: "0x1234",
-  signerMask: "3",
-  signers,
-  anchor: ethers.id("anchor"),
-  txHash: ethers.id("tx"),
-  blockNumber: 100,
-  logIndex: 0,
-  ruleset: { commit: "ab".repeat(20), hash: ethers.id("rs"), verified: true },
-  verdict: { flagged: true, reasons: ["BLS operator slash executed"], rule: "bls.SLASH" },
-  seenAt: "2026-11-10T00:00:00Z",
-};
-const owner = {
-  route: "owner",
-  label: "owner/guardian route: not BLS, no on-chain signer verification",
-  event: "OperatorSlashed",
-  args: { operator: signers[0], amount: 5n, level: 1n },
-  txHash: ethers.id("otx"),
-  logIndex: 2,
-  blockNumber: 101,
-  verdict: { flagged: true, reasons: ["owner route: OperatorSlashed"] },
-  seenAt: "x",
-};
-
 const f1 = recordFile(bls);
 const reordered = Object.fromEntries(Object.entries(bls).reverse());
 cell(
@@ -105,151 +72,6 @@ cell(
     mirrorPath(bls, f1.cid).endsWith(`.${f1.cid}.json`),
   mirrorPath(bls, f1.cid)
 );
-
-// ---- mock sinks. The mock registry follows DisclosureRegistry: one entry per (kind, key), the
-// binding keccak256(abi.encode(kind, key, subjectToken)), entries visible at a block, finality.
-function sinks(opts = {}) {
-  const calls = { telegram: 0, sign: 0, broadcast: 0, mirror: 0, uploads: {}, texts: [] };
-  const stored = new Map();
-  const pinOpts = { pinata: { ...(opts.pinata ?? {}) }, filebase: { ...(opts.filebase ?? {}) } };
-  const mkPinner = name => ({
-    name,
-    async upload(bytes) {
-      const o = pinOpts[name];
-      calls.uploads[name] = (calls.uploads[name] ?? 0) + 1;
-      if (o.fail) throw new Error(`${name} down`);
-      const real = cidV1Raw(bytes);
-      const cid = o.wrongCid ? "bafkreiwrong" : real; // reports a wrong CID, still serves the bytes
-      stored.set(`${name}:${real}`, o.alterBytes ? Uint8Array.from([...bytes, 0x20]) : bytes);
-      return { cid };
-    },
-    async fetchPublic(cid) {
-      const o = pinOpts[name];
-      if (o.fetchThrows) throw new Error("gateway timeout"); // transport error, not a mismatch
-      if (o.private || o.gone) return null; // private upload, or unpinned later
-      return stored.get(`${name}:${cid}`) ?? null;
-    },
-  });
-  const chain = {
-    nonce: 0,
-    block: 1000,
-    finalizedLag: 0, // finalized = block - finalizedLag
-    mined: opts.mine ?? "success", // success | revert | pending
-    entries: new Map(), // id -> { binding, recordURI, recordHash, amendments, block }
-    byAction: new Map(), // "kind:key" -> id
-    receipts: new Map(),
-    signedArgs: new Map(),
-    orphans: new Set(), // block hashes no longer canonical
-    known: new Set(), // tx hashes some node accepted
-  };
-  if (opts.existing) {
-    chain.entries.set(9n, { amendments: [], block: 1, ...opts.existing });
-    chain.byAction.set(`${opts.existing.kind ?? 0}:${opts.existing.key ?? 7n}`, 9n);
-  }
-  const bindingOf = a =>
-    ethers.keccak256(
-      ethers.AbiCoder.defaultAbiCoder().encode(
-        ["uint8", "uint256", "address"],
-        [a.signed.kind, a.signed.proposalId, a.subjectToken]
-      )
-    );
-  return {
-    calls,
-    pinOpts,
-    chain,
-    pinners: [mkPinner("pinata"), mkPinner("filebase")],
-    mirror: {
-      async commit(path) {
-        calls.mirror++;
-        if (opts.mirrorFail) throw new Error("push rejected");
-        return { commit: "c0ffee", url: `https://github.com/x/y/blob/c0ffee/${path}` };
-      },
-    },
-    telegram: {
-      async send(t) {
-        calls.telegram++;
-        calls.texts.push(t);
-        if (opts.telegramAckLost && calls.telegram === 1)
-          throw new Error("connection reset after delivery");
-      },
-    },
-    registry: {
-      async finalized() {
-        return chain.block - chain.finalizedLag;
-      },
-      async entryOf(kind, key, { blockTag } = {}) {
-        const id = chain.byAction.get(`${kind}:${key}`);
-        if (!id) return 0n;
-        if (opts.ignoreBlockTag) return id; // an RPC that answers head state for any blockTag
-        return chain.entries.get(id).block <= (blockTag ?? chain.block) ? id : 0n;
-      },
-      async entry(id) {
-        return chain.entries.get(BigInt(id));
-      },
-      async sign(args, o = {}) {
-        calls.sign++;
-        calls.lastArgs = args;
-        calls.lastSignOpts = o;
-        const raw = `0xraw${calls.sign}`;
-        chain.signedArgs.set(raw, args);
-        return { raw, hash: ethers.id(`disclose-${calls.sign}`), nonce: o.nonce ?? chain.nonce };
-      },
-      async broadcast(raw) {
-        calls.broadcast++;
-        calls.lastRaw = raw;
-        const hash = ethers.id(`disclose-${raw.slice(5)}`);
-        if (opts.rejectBroadcast) {
-          // a node refusing every broadcast (e.g. a writer without funds): never known
-          const e = new Error("insufficient funds for gas * price + value");
-          e.code = "INSUFFICIENT_FUNDS";
-          throw e;
-        }
-        chain.known.add(hash);
-        if (chain.mined === "pending" || chain.receipts.has(hash)) return;
-        const a = chain.signedArgs.get(raw);
-        const act = `${a.signed.kind}:${a.signed.proposalId}`;
-        chain.block++;
-        if (chain.mined === "revert" || chain.byAction.has(act)) {
-          chain.receipts.set(hash, {
-            status: 0,
-            entryId: null,
-            blockNumber: chain.block,
-            blockHash: ethers.id(`b${chain.block}`),
-          });
-        } else {
-          const id = BigInt(chain.entries.size + 1);
-          chain.entries.set(id, {
-            binding: bindingOf(a),
-            recordURI: a.recordURI,
-            recordHash: a.recordHash,
-            amendments: [],
-            block: chain.block,
-          });
-          chain.byAction.set(act, id);
-          chain.receipts.set(hash, {
-            status: 1,
-            entryId: id,
-            blockNumber: chain.block,
-            blockHash: ethers.id(`b${chain.block}`),
-          });
-        }
-        chain.nonce = Math.max(chain.nonce, 1);
-      },
-      async receipt(hash) {
-        return chain.receipts.get(hash) ?? null;
-      },
-      async knows(hash) {
-        return chain.known.has(hash);
-      },
-      async canonical(_n, h) {
-        return !chain.orphans.has(h);
-      },
-      async nonce() {
-        return chain.nonce;
-      },
-    },
-  };
-}
 
 {
   const s = sinks();
@@ -1024,6 +846,63 @@ function sinks(opts = {}) {
     null
   );
   await again();
+}
+
+// ---- mirror path = the store's own record id (follow-up #2): a public, unattributed or quarantine
+// record is never named like an owner-route one
+{
+  const tx = "0x" + "ab".repeat(32);
+  const pub = { route: "public", txHash: tx, logIndex: 3, event: "PriceUpdated" };
+  const una = { route: "unattributed", txHash: tx, logIndex: 4, event: "OperatorPaused" };
+  const q = {
+    route: "unattributed",
+    quarantine: true,
+    txHash: "0x" + "cd".repeat(32),
+    logIndex: "unreadable",
+    event: "UNREADABLE",
+  };
+  const own = { route: "owner", txHash: tx, logIndex: 5, event: "GuardianSet" };
+  const paths = [pub, una, q, own].map(r => mirrorPath(r, "bafkcid"));
+  cell(
+    "mirror path: public, unattributed and quarantine records keep their own id; only the owner route is named owner-",
+    paths[0] === `records/public/public-${tx}-3.bafkcid.json` &&
+      paths[1] === `records/unattributed/unattributed-${tx}-4.bafkcid.json` &&
+      paths[2] === `records/unattributed/quarantine-0x${"cd".repeat(32)}.bafkcid.json` &&
+      paths[3] === `records/owner/owner-${tx}-5.bafkcid.json`,
+    paths
+  );
+}
+
+// ---- #411 review N1 / N2
+{
+  // N1: nothing accepted, a flat estimate: the identical re-sign is not appended again
+  const s = sinks({ mine: "pending", rejectBroadcast: true, deterministicSign: true });
+  let st = {};
+  for (let i = 0; i < 5; i++) st = (await pub(bls, s, st, { maxPendingMs: 0 })).state;
+  cell(
+    "N1: repeated identical re-signs do not grow the journal",
+    st.registry.hashes.length === 1 && st.registry.raws.length === 1 && s.calls.sign >= 3,
+    { hashes: st.registry.hashes.length, sign: s.calls.sign }
+  );
+  // N2: the floor for a known tx without its raw is the most expensive raw journalled
+  const { highestFeeRaw } = await import("./lib/publish.mjs");
+  const w = ethers.Wallet.createRandom();
+  const tx = fee =>
+    w.signTransaction({
+      type: 2,
+      chainId: 1,
+      nonce: 0,
+      to: w.address,
+      maxFeePerGas: fee,
+      maxPriorityFeePerGas: 1n,
+      gasLimit: 21000n,
+    });
+  const cheapLatest = [await tx(1250n), null, await tx(1000n)];
+  cell(
+    "N2: the highest-fee journalled raw is the floor, not the latest one",
+    highestFeeRaw(cheapLatest) === cheapLatest[0],
+    null
+  );
 }
 
 let failed = 0;
