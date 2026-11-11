@@ -471,6 +471,16 @@ aggregator-only.
   transaction becomes a dead letter (route `tx`) and is retried each tick. An
   event that only privileged functions can emit is the owner route whatever the
   trace says. Its caller is recorded when known.
+- That rule is only as good as `publicRoute.functions`: a watched event a
+  permissionless function can also emit, missing from it, would be attributed to
+  the owner. Release check (DSR 19557717): SP generates, on the release tree, a
+  table of every function of the contracts the watcher reads, with its caller
+  restriction and every event it can emit (through internal calls and
+  delegatecall too), keyed by topic0. `npm run check:a3-emissions -- <table>`
+  (`scripts/disclosure/a3-emission-diff.mjs`) recomputes every selector and
+  topic0, then fails on any permissionless function emitting a watched event
+  that is not on the public route, or not with that event. It is a manifest-PR
+  (step 13) and Phase D item.
 
 - **Scope of the trace and receipt checks.** They defend against an RPC that is
   honest but inconsistent, lagging or only partly supporting the tracer, and
