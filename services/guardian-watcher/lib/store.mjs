@@ -1,6 +1,7 @@
 // Durable local state for the watcher: records, dead letters, cursor, status. Plain JSON files,
 // written atomically (temp file + rename) so a crash never leaves a half-written record.
 import { createHash } from "node:crypto";
+import { SafeError } from "./safe-error.mjs";
 import {
   mkdirSync,
   readFileSync,
@@ -46,7 +47,7 @@ export function writeAll(fd, buf, write = writeSync) {
   let off = 0;
   while (off < buf.length) {
     const n = write(fd, buf, off, buf.length - off);
-    if (!(n > 0)) throw new Error(`short write: ${off} of ${buf.length} bytes`);
+    if (!(n > 0)) throw new SafeError(`short write: ${off} of ${buf.length} bytes`);
     off += n;
   }
 }

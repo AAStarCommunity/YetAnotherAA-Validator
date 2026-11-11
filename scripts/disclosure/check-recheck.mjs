@@ -64,6 +64,7 @@ const {
   revertedOnOrphan,
   reorgAfterSends,
   reorgHeadAfterCountRead,
+  corruptHeadHash,
   receiptWithoutStatus,
   setTrace,
   setStorage,
@@ -97,7 +98,15 @@ async function expectCase(name, entryId, want, opts = {}) {
       );
   else if (want.diff)
     ok = r.status === "MISMATCH" && !r.ok && r.diffs.some(d => d.field === want.diff);
-  else ok = r.status === want.status && !r.ok && r.reasons.some(x => x.includes(want.reason));
+  else
+    ok =
+      r.status === want.status &&
+      !r.ok &&
+      r.reasons.some(x => x.includes(want.reason)) &&
+      (!want.absent ||
+        !JSON.stringify(r, (_, v) => (typeof v === "bigint" ? v.toString() : v)).includes(
+          want.absent
+        ));
   results.push({
     name,
     ok,
@@ -168,6 +177,16 @@ await expectCase("never-issued entry id is MISMATCH", 999n, {
   status: "MISMATCH",
   reason: "not issued as of block",
 });
+{
+  // A malformed head hash is never trusted nor echoed into the (stored) reason (Codex W2b R5).
+  const restore = corruptHeadHash("HASHSECRET-not-a-bytes32");
+  await expectCase("a malformed head hash is INCONCLUSIVE and never echoed", 999n, {
+    status: "INCONCLUSIVE",
+    reason: "header unavailable",
+    absent: "HASHSECRET",
+  });
+  restore();
+}
 
 const aW = execute(Kind.SLASH, 11n, slashF, 0b011n, { to: WRAPPER });
 await expectCase("wrapped action call is INCONCLUSIVE", disclose(Kind.SLASH, 11n, slashIn, aW), {
@@ -392,6 +411,15 @@ await expectCase("reorg during the entryCount read is INCONCLUSIVE", 998n, {
   await expectCase("receipt without status is INCONCLUSIVE, not 'reverted'", eN, {
     status: "INCONCLUSIVE",
     reason: "no valid status",
+  });
+  // The RPC's status value is untrusted text and the reason is stored: it is never echoed.
+  const aX = execute(Kind.SLASH, 33n, slashF, 0b011n);
+  const eX = disclose(Kind.SLASH, 33n, slashIn, aX);
+  receiptWithoutStatus("RCPTSECRET");
+  await expectCase("a non-numeric receipt status is INCONCLUSIVE and is not echoed", eX, {
+    status: "INCONCLUSIVE",
+    reason: "no valid status",
+    absent: "RCPTSECRET",
   });
   const aT = execute(Kind.SLASH, 32n, slashF, 0b011n);
   const eT = disclose(Kind.SLASH, 32n, slashIn, aT);

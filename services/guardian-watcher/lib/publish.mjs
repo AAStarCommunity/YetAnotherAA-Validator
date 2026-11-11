@@ -29,30 +29,31 @@
 //   registry: { finalized() -> block number,
 //               entryOf(kind, key, { blockTag }) -> entryId (0 = none),
 //               entry(entryId, { blockTag }) -> { binding, recordURI, recordHash, amendments[] },
-//               sign(args, { nonce?, replace? }) -> { raw, hash, nonce }, broadcast(raw) -> void,
+//               sign(args, { nonce?, replace?, prevRaw? }) -> { raw, hash, nonce }, broadcast(raw) -> void,
 //               receipt(hash) -> { status, entryId, blockNumber, blockHash } | null,
 //               canonical(blockNumber, blockHash) -> bool,
 //               nonce() -> the writer's nonce at the FINALIZED block }
 import { ethers } from "ethers";
+import { SafeError, safeCode, safeText } from "./safe-error.mjs";
 import { Kind } from "../../../scripts/disclosure/recheck-lib.mjs";
 import { recordFile, mirrorPath } from "./record-file.mjs";
 
 /** A failure to persist state: publication must stop, the returned state is NOT durable. */
-export class PersistError extends Error {
+export class PersistError extends SafeError {
   constructor(cause) {
-    super(`persist failed: ${cause?.message ?? cause}`);
+    super(`persist failed: ${safeCode(cause)}`); // the cause is not kept: its text is untrusted
     this.name = "PersistError";
-    this.cause = cause;
   }
 }
 
 const bytesEqual = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
-const errMsg = e => e?.shortMessage ?? e?.message ?? String(e);
+// Never e.shortMessage / e.message of a foreign error (Codex W2b R3): see lib/safe-error.mjs.
+const errMsg = e => safeText("unexpected", e);
 
 /** The disclose() arguments for a BLS record (registry ABI: Signed + record context). */
 export function discloseArgs(rec, file) {
   const kind = Kind[rec.kind];
-  if (kind === undefined) throw new Error(`record kind ${rec.kind} has no registry kind`);
+  if (kind === undefined) throw new SafeError(`record kind ${rec.kind} has no registry kind`);
   const commit =
     rec.ruleset?.verified && rec.ruleset?.commit
       ? `0x${rec.ruleset.commit}`
@@ -99,7 +100,7 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
   // The journal is the crash-safety guarantee; without a durable persist there is none, so it is
   // required. Only an explicitly unsafe test mode may skip it.
   if (typeof opts.persist !== "function" && opts.unsafeNoJournal !== true) {
-    throw new Error(
+    throw new SafeError(
       "publishRecord needs opts.persist (durable state); unsafeNoJournal is for tests only"
     );
   }
@@ -170,9 +171,9 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           ...state.pins[p.name],
           current: false,
           at,
-          error: `provider CID ${up?.cid} != local ${file.cid}`,
+          error: `provider CID differs from local ${file.cid}`,
         };
-        alerts.push(`${p.name}: CID mismatch (${up?.cid} vs ${file.cid})`);
+        alerts.push(`${p.name}: CID mismatch (local ${file.cid})`);
         continue;
       }
       // Public readability by CID, byte for byte: a private or altered copy is not a publication.
@@ -253,11 +254,30 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
 
 export const DEFAULT_MAX_PENDING_MS = 30 * 60_000;
 
+/**
+ * On-chain content is untrusted text, and its shape proves nothing (a base32-shaped string can
+ * still carry a secret; Codex W2b R4). A URI is kept in plain text only when it EQUALS the URI we
+ * expect; otherwise only the digest of the original string is kept, which still tells two
+ * different conflicting values apart.
+ */
+export function storable(c, expectedURI) {
+  const same = c.recordURI != null && c.recordURI === expectedURI;
+  const digest =
+    c.recordURIKeccak ??
+    (c.recordURI == null ? null : ethers.keccak256(ethers.toUtf8Bytes(String(c.recordURI))));
+  return {
+    recordURI: same ? c.recordURI : null,
+    recordURIKeccak: digest,
+    recordHash: /^0x[0-9a-f]{64}$/.test(c.recordHash) ? c.recordHash : null,
+  };
+}
+
 /** Effective record content of an existing entry: the latest amendment wins, in order. */
 function effectiveContent(entry) {
   const last = (entry.amendments ?? []).at(-1);
   return {
     recordURI: last?.recordURI ?? entry.recordURI,
+    recordURIKeccak: last ? last.recordURIKeccak : entry.recordURIKeccak,
     recordHash: String(last?.recordHash ?? entry.recordHash).toLowerCase(),
   };
 }
@@ -279,7 +299,12 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     try {
       await reg.broadcast(r.raw);
     } catch (e) {
-      state.registry = { ...r, lastBroadcastError: String(e?.message ?? e) };
+      state.registry = { ...r, lastBroadcastError: errMsg(e) };
+      // a writer without the funds cannot land anything: said plainly, every pass (#411 review F1)
+      if (safeCode(e) === "INSUFFICIENT_FUNDS")
+        alerts.push(
+          `registry: the writer has insufficient funds for the disclose tx (nonce ${r.nonce}); fund the writer`
+        );
     }
     // A resumed in-flight journal (including one written before sentAt existed) gets its sentAt
     // once, so the stuck-tx timeout can elapse.
@@ -352,16 +377,48 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
       alerts.push(
         `registry: disclose tx pending ${Math.round(age / 60000)} min; replacing at nonce ${state.registry.nonce}`
       );
-      const rep = await reg.sign(discloseArgs(rec, file), {
-        nonce: state.registry.nonce,
-        replace: true,
-      });
-      const hashes = [...(state.registry.hashes ?? [state.registry.hash]), rep.hash];
+      // The fee floor comes from the newest journalled tx a node KNOWS (#411 review F1): only an
+      // accepted tx must be outbid (>= 10% rule, W2b R1 H4). If no node ever accepted one (e.g.
+      // every broadcast failed for lack of funds), the replacement is priced at the current
+      // estimate, so the fee never climbs on rejections alone.
+      const hashes0 = state.registry.hashes ?? [state.registry.hash];
+      // a journal written before raws existed holds only the LATEST raw: it belongs to the last
+      // hash, the earlier ones have none (W2b Codex R7)
+      const raws0 =
+        state.registry.raws?.length === hashes0.length
+          ? state.registry.raws
+          : hashes0.map((_, i) => (i === hashes0.length - 1 ? state.registry.raw : null));
+      let floorRaw = null;
+      for (let i = hashes0.length - 1; i >= 0 && floorRaw === null; i--)
+        if (await reg.knows(hashes0[i]))
+          // a known tx without its raw bytes: floor on the latest journalled raw, whose fees are
+          // never below an earlier one's (each replacement only rises from its floor)
+          floorRaw = raws0[i] ?? state.registry.raw;
+      let rep;
+      try {
+        rep = await reg.sign(
+          discloseArgs(rec, file),
+          floorRaw
+            ? { nonce: state.registry.nonce, replace: true, prevRaw: floorRaw }
+            : { nonce: state.registry.nonce }
+        );
+      } catch (e) {
+        if (e?.code !== "FEE_CAP") throw e;
+        // the configured ceiling stops escalation; never silently: alerted on every pass
+        state.registry = { ...state.registry, feeCapped: new Date().toISOString() };
+        await persist(state);
+        alerts.push(
+          `registry: replacing the disclose tx (nonce ${state.registry.nonce}) needs a fee above the configured maxFeePerGas; disclosure stalled until the cap is raised or the fee falls`
+        );
+        return;
+      }
+      const { feeCapped, ...rest } = state.registry;
       state.registry = {
-        ...state.registry,
+        ...rest,
         raw: rep.raw,
         hash: rep.hash,
-        hashes,
+        hashes: [...hashes0, rep.hash],
+        raws: [...raws0, rep.raw],
         sentAt: new Date().toISOString(),
         replacements: (state.registry.replacements ?? 0) + 1,
       };
@@ -372,12 +429,22 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
   }
   // Nothing in flight: an entry may already exist (an earlier publication completed elsewhere).
   if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
-  const signed = await reg.sign(discloseArgs(rec, file));
+  let signed;
+  try {
+    signed = await reg.sign(discloseArgs(rec, file));
+  } catch (e) {
+    if (e?.code !== "FEE_CAP") throw e;
+    alerts.push(
+      "registry: the disclose tx needs a fee above the configured maxFeePerGas; not signed, retried next pass"
+    );
+    return;
+  }
   state.registry = {
     phase: "signed",
     raw: signed.raw,
     hash: signed.hash,
     hashes: [signed.hash],
+    raws: [signed.raw],
     nonce: signed.nonce,
   };
   await persist(state); // journal BEFORE broadcast
@@ -449,7 +516,7 @@ async function adoptExisting(rec, file, reg, state, persist, alerts) {
     entryId: id.toString(),
     conflict: why,
     storedBinding: e.binding,
-    storedContent: eff,
+    storedContent: storable(eff, `ipfs://${file.cid}`),
   };
   await persist(state);
   alerts.push(

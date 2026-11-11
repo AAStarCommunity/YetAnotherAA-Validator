@@ -13,21 +13,29 @@ import { evaluate, wantsPrice, publicFunction, ambiguousEvents } from "./rules.m
 import { attributeLogs, receiptPos, validLog, parsePosition, traceDepthOk } from "./attribute.mjs";
 import { mayHaveLog } from "./bloom.mjs";
 import { Store } from "./store.mjs";
+import { SafeError, safeText, guarded, safeCode, isOurs } from "./safe-error.mjs";
+
+// Chain data in our own error text only when it is a well-formed hash (RPC answers are untrusted).
+const hx = v => (/^0x[0-9a-fA-F]{64}$/.test(String(v)) ? String(v) : "<malformed>");
 
 export const MAX_DEADLETTER_ATTEMPTS = 20;
 
 async function header(chain, tag) {
-  const b = await chain.send("eth_getBlockByNumber", [
-    typeof tag === "number" ? ethers.toQuantity(tag) : tag,
-    false,
-  ]);
-  if (!b || !b.hash) throw new Error(`block ${tag} unavailable`);
+  // Each RPC stage is named (Codex W2b R4): status says WHICH read failed and its allowlisted code.
+  const b = await guarded("block header read", () =>
+    chain.send("eth_getBlockByNumber", [
+      typeof tag === "number" ? ethers.toQuantity(tag) : tag,
+      false,
+    ])
+  );
+  if (!b || !b.hash) throw new SafeError(`block ${tag} unavailable`);
   // A header is accepted only with a 32-byte hash and a parseable height: a malformed one fails the
   // tick (the cursor is never set from it) and is never interpolated (Codex follow-up R10).
   const number = parsePosition(b.number);
   if (typeof b.hash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(b.hash) || number === null)
-    throw new Error("malformed block header");
-  if (typeof tag === "number" && number !== tag) throw new Error("block header for another height");
+    throw new SafeError("malformed block header");
+  if (typeof tag === "number" && number !== tag)
+    throw new SafeError("block header for another height");
   return { number, hash: b.hash, logsBloom: b.logsBloom };
 }
 
@@ -49,7 +57,8 @@ export async function rawGetLogs(chain, { address, topics, fromBlock, toBlock, b
           toBlock: ethers.toQuantity(toBlock),
         };
   const r = await chain.send("eth_getLogs", [filter]);
-  if (!Array.isArray(r)) throw new Error("eth_getLogs answer is not an array");
+  // our own wording, so it survives sanitising (W2b SafeError rule)
+  if (!Array.isArray(r)) throw new SafeError("eth_getLogs answer is not an array");
   return r;
 }
 
@@ -75,7 +84,7 @@ export async function pagedLogs(chain, address, topics, from, to, page = 5_000) 
   return out;
 }
 
-async function readPrice(chain, sp, blockTag) {
+export async function readPrice(chain, sp, blockTag) {
   try {
     const ret = await chain.call({
       to: sp,
@@ -85,7 +94,7 @@ async function readPrice(chain, sp, blockTag) {
     const r = spIface.decodeFunctionResult("cachedPrice", ret);
     return { price: r.price.toString(), updatedAt: r.updatedAt.toString(), block: blockTag };
   } catch (e) {
-    return { error: e.shortMessage ?? e.message, block: blockTag };
+    return { error: safeText("cachedPrice read", e), block: blockTag };
   }
 }
 
@@ -106,7 +115,8 @@ function decodeSp(log) {
 /** ethers v6 `Log` carries its position as `index`; other providers use `logIndex`. */
 export function logPos(l) {
   const n = receiptPos(l); // strict, and `index` / `logIndex` must agree when both are present
-  if (n === null) throw new Error(`log without a valid position in tx ${l.transactionHash}`);
+  if (n === null)
+    throw new SafeError(`log without a valid position in tx ${hx(l.transactionHash)}`);
   return n;
 }
 
@@ -377,7 +387,7 @@ function identityGuard(chain, block) {
         return async h => {
           const tx = await target.getTransaction(h);
           if (tx && (!same(tx.hash, h) || !inBlock(tx)))
-            throw new Error("transaction response names another tx or block");
+            throw new SafeError("transaction response names another tx or block");
           return tx;
         };
       if (prop === "getTransactionReceipt")
@@ -386,7 +396,7 @@ function identityGuard(chain, block) {
           if (rc) {
             const ids = [rc.transactionHash, rc.hash].filter(x => x !== undefined && x !== null);
             if (!ids.length || !ids.every(x => same(x, h)) || !inBlock(rc))
-              throw new Error("receipt names another tx or block");
+              throw new SafeError("receipt names another tx or block");
           }
           return rc;
         };
@@ -449,7 +459,7 @@ async function blsRecord(chain, cfg, rs, ctx, log, spEvents, snapshot) {
       deadLetter: {
         ...base,
         status: "ERROR",
-        reasons: [`rebuild failed: ${e.shortMessage ?? e.message}`],
+        reasons: [`rebuild failed: ${safeText("rebuild", e)}`],
         verdict: evaluate(rs, cfg.roles, { ...base, kind: undefined }),
         spEvents,
       },
@@ -620,9 +630,10 @@ export function txOfEvidence(watched, cfg, block) {
 /** A safe reason for an exception thrown while processing one tx: our own wording and the error's
  * category, never a foreign message (RPC answers are untrusted text). */
 function isolatedReason(e) {
-  const code = typeof e?.code === "string" && /^[A-Z_]{2,40}$/.test(e.code) ? e.code : null;
-  const name = typeof e?.name === "string" && /^[A-Za-z]{2,40}$/.test(e.name) ? e.name : "Error";
-  return `tx processing failed (${code ?? name})`;
+  // our own wording (a SafeError never carries foreign text: lib/safe-error.mjs) is kept as is
+  if (isOurs(e)) return `tx processing failed: ${e.message}`;
+  // the same allowlist as every other error path (#411 review F4), never a free-form code or name
+  return `tx processing failed (${safeCode(e)})`;
 }
 
 /**
@@ -1081,51 +1092,54 @@ function splitLogs(logs, cfg, block) {
 async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapshot) {
   // A watched log must be well formed, and an aggregator log must carry its 32-byte key: anything
   // else is a malformed RPC answer, isolated by the caller (#400 review L1).
-  if (t.malformed) throw new Error("malformed or unclassifiable watched log");
-  if (!Number.isSafeInteger(t.block) || t.block < 0) throw new Error("invalid block number");
+  if (t.malformed) throw new SafeError("malformed or unclassifiable watched log");
+  if (!Number.isSafeInteger(t.block) || t.block < 0) throw new SafeError("invalid block number");
   for (const l of [...t.agg, ...t.sp])
     if (parsePosition(l.blockNumber) !== t.block)
-      throw new Error("watched logs name different blocks");
-  if (!/^0x[0-9a-fA-F]{64}$/.test(str(txHash))) throw new Error("watched log without a tx hash");
-  for (const l of [...t.agg, ...t.sp]) if (!validLog(l)) throw new Error("malformed watched log");
+      throw new SafeError("watched logs name different blocks");
+  if (!/^0x[0-9a-fA-F]{64}$/.test(str(txHash)))
+    throw new SafeError("watched log without a tx hash");
+  for (const l of [...t.agg, ...t.sp])
+    if (!validLog(l)) throw new SafeError("malformed watched log");
   // a log the RPC marks removed is never evidence, on any path (Codex follow-up R2)
   for (const l of [...t.agg, ...t.sp])
-    if (l.removed === true) throw new Error("removed watched log");
-  for (const l of t.agg) if (l.topics.length < 2) throw new Error("aggregator log without a key");
+    if (l.removed === true) throw new SafeError("removed watched log");
+  for (const l of t.agg)
+    if (l.topics.length < 2) throw new SafeError("aggregator log without a key");
   // a log must match the query that returned it: the configured emitter and a watched topic
   // (an RPC whose address filter is wrong must not get another contract's event attributed)
   const spT = new Set(spTopics().map(x => x.toLowerCase()));
   for (const l of t.agg)
     if (!lcEq(l.address, cfg.aggregator) || !lcEq(l.topics[0], SIGNERS_COMMITTED()))
-      throw new Error("aggregator query returned a log of another emitter or topic");
+      throw new SafeError("aggregator query returned a log of another emitter or topic");
   for (const l of t.sp)
     if (!lcEq(l.address, cfg.roles.superPaymaster) || !spT.has(str(l.topics[0]).toLowerCase()))
-      throw new Error("SP query returned a log of another emitter or topic");
+      throw new SafeError("SP query returned a log of another emitter or topic");
   // positions are judged here, inside the isolation, for every watched log
   {
     // one position, one log: conflicting copies at a position are a malformed answer
     const pos = [...t.agg, ...t.sp].map(l => logPos(l));
     if (new Set(pos).size !== pos.length)
-      throw new Error("conflicting watched logs at one position");
+      throw new SafeError("conflicting watched logs at one position");
   }
   // a watched SP log must decode against the pinned ABI: one that does not (a recognised topic
   // but missing indexed topics, say) is a malformed answer, isolated, never silently dropped
-  for (const l of t.sp) if (!decodeSp(l)) throw new Error("watched SP log does not decode");
+  for (const l of t.sp) if (!decodeSp(l)) throw new SafeError("watched SP log does not decode");
   t.sp.sort((a, b) => logPos(a) - logPos(b));
   // Inclusion, on every path (Codex follow-up R5): the block must be inside the range that was
   // asked for and not past the finalized block, and every log must name the CANONICAL block at
   // that height (a stale fork, or a backend lagging behind another, is refused here).
-  if (t.block > snapshot) throw new Error("watched log beyond the finalized block");
+  if (t.block > snapshot) throw new SafeError("watched log beyond the finalized block");
   if (t.range && (t.block < t.range[0] || t.block > t.range[1]))
-    throw new Error("watched log outside the requested range");
+    throw new SafeError("watched log outside the requested range");
   // each observation also against the range it came from (merged evidence keeps one per log)
   for (const l of [...t.agg, ...t.sp])
     if (Array.isArray(l.range) && (t.block < l.range[0] || t.block > l.range[1]))
-      throw new Error("watched log outside the requested range");
+      throw new SafeError("watched log outside the requested range");
   const canon = (await header(chain, t.block)).hash;
   for (const l of [...t.agg, ...t.sp])
     if (l.blockHash !== undefined && l.blockHash !== null && !lcEq(l.blockHash, canon))
-      throw new Error("watched log from a non-canonical block");
+      throw new SafeError("watched log from a non-canonical block");
   const SP = cfg.roles.superPaymaster;
   let tx;
   try {
@@ -1138,15 +1152,15 @@ async function processTx(chain, cfg, rs, ctx, store, summary, txHash, t, snapsho
   if (tx) {
     // a response must name this tx: one without a hash is not trusted either (Codex follow-up R6)
     if (typeof tx.hash !== "string" || !lcEq(tx.hash, txHash))
-      throw new Error("transaction response names another tx");
+      throw new SafeError("transaction response names another tx");
     if (tx.blockHash !== undefined && tx.blockHash !== null && !lcEq(tx.blockHash, canon))
-      throw new Error("transaction response from another block");
+      throw new SafeError("transaction response from another block");
     if (
       tx.blockNumber !== undefined &&
       tx.blockNumber !== null &&
       parsePosition(tx.blockNumber) !== t.block
     )
-      throw new Error("transaction response from another block");
+      throw new SafeError("transaction response from another block");
   }
   const direct = tx && tx.to && lcEq(tx.to, SP);
   // SP events of a BLS tx count as an action's effects only when the trace, aligned log by log
@@ -1558,7 +1572,7 @@ async function bloomCheck(chain, cfg, from, to, aggLogs, spLogs, summary) {
         try {
           got = await rawGetLogs(chain, { address: addr, topics: [topics], blockHash: h.hash });
         } catch {
-          throw new Error(
+          throw new SafeError(
             `block ${n}: logsBloom shows a watched log that getLogs did not return, and the by-hash re-read failed; retrying`
           );
         }
@@ -1589,8 +1603,8 @@ export async function tick(chain, cfg, store, rs, ctx) {
     // Finalized blocks cannot reorg; if the cursor's block changed anyway, stop and say so.
     const now = await header(chain, cursor.block);
     if (!lcEq(now.hash, cursor.hash)) {
-      throw new Error(
-        `cursor block ${cursor.block} hash changed (${cursor.hash} -> ${now.hash}): finality violated, not advancing`
+      throw new SafeError(
+        `cursor block ${cursor.block} hash changed (${hx(cursor.hash)} -> ${hx(now.hash)}): finality violated, not advancing`
       );
     }
   }
@@ -1739,9 +1753,14 @@ export async function tick(chain, cfg, store, rs, ctx) {
     return ok;
   };
   // The bloom check compares against the RAW answers (quarantined entries included), so an entry
-  // set aside at intake is not mistaken for a missing log and read again (follow-up #2 R3).
-  const rawAgg = await pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page);
-  const rawSp = await pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page);
+  // set aside at intake is not mistaken for a missing log and read again (follow-up #2 R3). Each
+  // read is guarded (W2b): a failure surfaces only the watcher's own wording.
+  const rawAgg = await guarded("aggregator log read", () =>
+    pagedLogs(chain, cfg.aggregator, [SIGNERS_COMMITTED()], from, to, cfg.page)
+  );
+  const rawSp = await guarded("superpaymaster log read", () =>
+    pagedLogs(chain, cfg.roles.superPaymaster, [spTopics()], from, to, cfg.page)
+  );
   const bc = await bloomCheck(chain, cfg, from, to, rawAgg, rawSp, summary);
   const aggLogs = intake(rawAgg.concat(bc.extraAgg), "agg");
   const spLogs = intake(rawSp.concat(bc.extraSp), "sp");

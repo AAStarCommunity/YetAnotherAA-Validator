@@ -20,6 +20,7 @@ import { makeProvider } from "../../scripts/disclosure/recheck-lib.mjs";
 import { validateRuleset } from "./lib/rules.mjs";
 import { Store } from "./lib/store.mjs";
 import { tick, verifyTrace } from "./lib/scan.mjs";
+import { safeText } from "./lib/safe-error.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -34,12 +35,13 @@ export function rulesetIdentity(bytes, dir = HERE) {
     const commit = execFileSync(
       "git",
       ["-C", dir, "log", "-1", "--format=%H", "--", "ruleset.json"],
-      {
-        encoding: "utf8",
-      }
+      // stderr is not inherited: git's diagnostics never reach our output (Codex W2b R4).
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
     ).trim();
     if (!/^[0-9a-f]{40}$/.test(commit)) return { commit: null, hash, verified: false };
-    const committed = execFileSync("git", ["-C", dir, "show", `${commit}:./ruleset.json`]);
+    const committed = execFileSync("git", ["-C", dir, "show", `${commit}:./ruleset.json`], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
     const same = ethers.keccak256(committed) === hash;
     return same ? { commit, hash, verified: true } : { commit: null, hash, verified: false };
   } catch {
@@ -244,7 +246,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now } = {}) {
     return { status, summary: s };
   } catch (e) {
     status.ok = false;
-    status.lastError = e.shortMessage ?? e.message;
+    status.lastError = safeText("tick", e); // never a foreign error's text (lib/safe-error.mjs)
     status.records = store.countRecords();
     status.deadLetters = store.listDeadLetters().length;
     status.cursor = store.getCursor()?.block ?? null;
@@ -286,4 +288,11 @@ async function main() {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main();
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  // Last boundary (Codex W2b R4): nothing reaches Node's default handler, which would print a
+  // foreign error's message and properties.
+  main().catch(e => {
+    console.error(safeText("watcher fatal", e));
+    process.exit(1);
+  });
+}
