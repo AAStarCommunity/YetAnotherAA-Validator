@@ -197,16 +197,22 @@ ld.mustBeOn = [...new Set([...REQUIRED_ON, ...(Array.isArray(ld.mustBeOn) ? ld.m
 const domain = placeholder(ld.domain) ? `gui/${process.getuid?.() ?? 0}` : ld.domain;
 function launchdState(label) {
   const r = spawnSync("launchctl", ["print", `${domain}/${label}`], { encoding: "utf8" });
-  if (r.status === 0) return "loaded";
+  // loaded is not running (Codex R3 #3): a required job must be running with a live pid
+  if (r.status === 0) {
+    const out = r.stdout ?? "";
+    return /^\s*state = running\s*$/m.test(out) && /^\s*pid = \d+\s*$/m.test(out)
+      ? "running"
+      : "loaded";
+  }
   if (/could not find service/i.test(`${r.stdout ?? ""}${r.stderr ?? ""}`)) return "absent";
   return "unknown";
 }
 const say = s =>
-  s === "loaded"
-    ? `loaded in ${domain}`
-    : s === "absent"
-      ? `not loaded in ${domain}`
-      : "launchctl inspection failed";
+  ({
+    running: `running in ${domain}`,
+    loaded: `loaded in ${domain} but not running`,
+    absent: `not loaded in ${domain}`,
+  })[s] ?? "launchctl inspection failed";
 if (!Array.isArray(ld.mustBeOff) || !ld.mustBeOff.length)
   add("launchd-off", "MISSING", "launchd.mustBeOff not set");
 for (const label of ld.mustBeOff ?? []) {
@@ -224,7 +230,7 @@ for (const label of ld.mustBeOn ?? []) {
     const s = launchdState(label);
     add(
       `launchd-on:${label}`,
-      s === "loaded" ? "PASS" : s === "absent" ? "MISSING" : "FAIL",
+      s === "running" ? "PASS" : s === "absent" ? "MISSING" : "FAIL",
       say(s)
     );
   }
@@ -246,8 +252,12 @@ for (const f of placeholder(composeFile) ? [] : [composeFile]) {
   try {
     text = readFileSync(join(ROOT, f), "utf8");
   } catch {
+    // an unreadable compose file is a failure, never an empty inventory (Codex R3 #2)
+    add("node-compose", "FAIL", "the deployment's compose file is unreadable");
     continue;
   }
+  if (!/container_name:/.test(text))
+    add("node-compose", "FAIL", "the compose file names no container");
   for (const m of text.matchAll(/container_name:\s*([A-Za-z0-9_.-]*node[A-Za-z0-9_.-]*)/g))
     composeNodes.add(m[1]);
 }
@@ -257,6 +267,9 @@ const runningDvt = new Set();
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });
+  // discovery that fails is a failure, never "no node running" (Codex R3 #2)
+  if (r.status !== 0)
+    add("node-discovery", "FAIL", "docker ps failed: the running DVT nodes are unknown");
   if (r.status === 0)
     for (const l of r.stdout.split("\n")) {
       const [n, img] = l.trim().split(/\s+/);
@@ -458,6 +471,11 @@ const rulesetBlob = gitBlob(readFileSync(join(W, "ruleset.json"), "utf8"));
 const empty = x => Array.isArray(x) && x.length === 0;
 const PREDICATES = {
   spParity: j =>
+    j.schema === "aoa-sp-evidence-parity/2" &&
+    j.entry === "contracts/src/modules/monitoring/DVTValidator.sol" &&
+    Array.isArray(j.compiledInputs?.validatorAt) &&
+    j.compiledInputs.validatorAt.length === 1 &&
+    j.compiledInputs.validatorAt[0] === j.entry &&
     j.parity === "PASS" &&
     j.control === "FAILED (as required)" &&
     j.spCommit === relCommit &&
@@ -466,6 +484,10 @@ const PREDICATES = {
     empty(j.compiledInputs?.mismatched) &&
     empty(j.compiledInputs?.notCompiled),
   a3: j =>
+    j.schema === "aoa-a3-emissions/2" &&
+    j.inventoryChecked?.selectors > 0 &&
+    Array.isArray(j.inventoryChecked?.required) &&
+    j.inventoryChecked.required.includes("SuperPaymaster") &&
     j.spCommit === relCommit &&
     j.rulesetBlob === rulesetBlob &&
     empty(j.missingFunctions) &&

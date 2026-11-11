@@ -86,8 +86,13 @@ export function diffEmissions(table, ruleset, watched) {
 export const gaps = d =>
   d.missingFunctions.length + d.missingEvents.length + d.restrictedOnPublicRoute.length;
 
-/** A refusal written by this script (fixed text, safe to print). */
+/** A refusal written by this script: fixed text plus positions, never a value from the input
+ * (Codex R3 #4), so it is safe to print. */
 class TableError extends Error {}
+// what may reach output from a table is restricted to these shapes: an identifier, or an ABI
+// signature (identifier and type characters only; no space, colon or slash, so no URL or token)
+const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const SIG = /^[A-Za-z_$][A-Za-z0-9_$]*\([A-Za-z0-9_$\[\](),]*\)$/;
 
 /** Contracts the watcher reads whose every external function must be in the table. */
 const REQUIRED_CONTRACTS = ["SuperPaymaster"];
@@ -111,19 +116,22 @@ function validateTableInner(t, watched) {
     fail("table: `inventory` (contract -> all external selectors) is required");
   for (const c of REQUIRED_CONTRACTS)
     if (!Array.isArray(t.inventory[c]) || !t.inventory[c].length)
-      fail(`table: inventory has no selectors for ${c}`);
+      fail(
+        `table: inventory has no selectors for a required contract (${REQUIRED_CONTRACTS.indexOf(c)})`
+      );
   const rowsBy = new Map();
   for (const r of Array.isArray(t.rows) ? t.rows : []) {
     if (typeof r?.contract !== "string" || typeof r?.selector !== "string") continue;
     rowsBy.set(`${r.contract}|${r.selector.toLowerCase()}`, true);
   }
-  for (const [c, sels] of Object.entries(t.inventory)) {
-    if (!Array.isArray(sels)) fail(`table: inventory.${c} must be an array of selectors`);
-    for (const sel of sels) {
+  for (const [n, [c, sels]] of Object.entries(t.inventory).entries()) {
+    if (!IDENT.test(c)) fail(`table: inventory entry ${n} is not a contract name`);
+    if (!Array.isArray(sels)) fail(`table: inventory entry ${n} must be an array of selectors`);
+    for (const [k, sel] of sels.entries()) {
       if (typeof sel !== "string" || !/^0x[0-9a-fA-F]{8}$/.test(sel))
-        fail(`table: inventory.${c} has a malformed selector`);
+        fail(`table: inventory entry ${n} selector ${k} is malformed`);
       if (!rowsBy.has(`${c}|${sel.toLowerCase()}`))
-        fail(`table: ${c} ${sel} is in the inventory but has no row`);
+        fail(`table: inventory entry ${n} selector ${k} has no row`);
     }
   }
   if (!t || !Array.isArray(t.rows)) throw new TableError("table: `rows` must be an array");
@@ -139,12 +147,12 @@ function validateTableInner(t, watched) {
   const hex = (x, n) => typeof x === "string" && new RegExp(`^0x[0-9a-fA-F]{${n}}$`).test(x);
   for (const [i, r] of t.rows.entries()) {
     const at = `rows[${i}]`;
-    if (typeof r?.contract !== "string" || !r.contract.trim())
-      throw new TableError(`${at}.contract must be stated`);
-    if (typeof r?.function !== "string" || !/^[A-Za-z_$][\w$]*\(.*\)$/.test(r.function))
-      throw new TableError(`${at}.function must be a function signature`);
+    if (typeof r?.contract !== "string" || !IDENT.test(r.contract))
+      throw new TableError(`${at}.contract must be a contract name`);
+    if (typeof r?.function !== "string" || !SIG.test(r.function))
+      throw new TableError(`${at}.function must be an ABI function signature`);
     if (!hex(r.selector, 8) || ethers.id(r.function).slice(0, 10) !== r.selector.toLowerCase())
-      throw new TableError(`${at}.selector is not keccak256(${r.function})[0:4]`);
+      throw new TableError(`${at}.selector is not keccak256 of its function`);
     if (typeof r.callerRestricted !== "boolean")
       throw new TableError(`${at}.callerRestricted must be true or false (no default)`);
     if (!Array.isArray(r.events)) throw new TableError(`${at}.events must be an array`);
@@ -156,20 +164,22 @@ function validateTableInner(t, watched) {
       [...r.events.map(e => e.topic0.toLowerCase())].sort(),
     ]);
     if (seen.has(dupKey) && seen.get(dupKey) !== canon)
-      throw new TableError(`${at}: conflicting duplicate row for ${dupKey}`);
+      throw new TableError(
+        `${at}: conflicting duplicate of an earlier row (same contract and selector)`
+      );
     seen.set(dupKey, canon);
     for (const [k, e] of r.events.entries()) {
       const ea = `${at}.events[${k}]`;
-      if (typeof e?.signature !== "string" || !hex(e.topic0, 64))
-        throw new TableError(`${ea} needs a signature and a 32-byte topic0`);
+      if (typeof e?.signature !== "string" || !SIG.test(e.signature) || !hex(e.topic0, 64))
+        throw new TableError(`${ea} needs an ABI event signature and a 32-byte topic0`);
+      if (typeof e.name !== "string" || !IDENT.test(e.name))
+        throw new TableError(`${ea}.name must be an event name`);
       if (ethers.id(e.signature) !== e.topic0.toLowerCase())
-        throw new TableError(`${ea}.topic0 is not keccak256(${e.signature})`);
+        throw new TableError(`${ea}.topic0 is not keccak256 of its signature`);
       // a name that disagrees with its topic0 would make the diff misread the row
       const known = byTopic.get(e.topic0.toLowerCase());
       if (known && e.name !== known)
-        throw new TableError(
-          `${ea}: topic0 is the watched ${known}, but the row names it ${e.name}`
-        );
+        throw new TableError(`${ea}: topic0 is a watched event under another name`);
     }
   }
 }
@@ -376,6 +386,13 @@ if (isMain) {
     .update(Buffer.concat([Buffer.from(`blob ${rb.length}\0`), rb]))
     .digest("hex");
   const report = {
+    // versioned (Codex R3 #1): Phase D accepts only this version, whose inventory was checked
+    schema: "aoa-a3-emissions/2",
+    inventoryChecked: {
+      contracts: Object.keys(table.inventory).length,
+      selectors: Object.values(table.inventory).reduce((n, v) => n + v.length, 0),
+      required: REQUIRED_CONTRACTS,
+    },
     rulesetBlob,
     spCommit: table.spCommit ?? null,
     tool: table.tool ?? null,

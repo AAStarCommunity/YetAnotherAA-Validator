@@ -404,6 +404,9 @@ const solcVersion = (() => {
   }
 })();
 const report = {
+  // versioned (Codex R3 #1): Phase D accepts only this version (compiled-input and validatorAt proof)
+  schema: "aoa-sp-evidence-parity/2",
+  entry: ENTRY,
   spRepo: repo,
   spCommit: sha,
   solc: solcVersion,
