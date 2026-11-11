@@ -342,6 +342,13 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     let broadcastFailed = false;
     try {
       await reg.broadcast(r.raw);
+      // a broadcast that now goes through clears the earlier error, so a stall (e.g. insufficient
+      // funds, since topped up) does not stay counted as degraded forever
+      if (r.lastBroadcastError !== undefined) {
+        const { lastBroadcastError: _cleared, ...rest } = r;
+        void _cleared;
+        state.registry = rest;
+      }
     } catch (e) {
       broadcastFailed = true;
       state.registry = { ...r, lastBroadcastError: errMsg(e) };
@@ -488,6 +495,10 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     signed = await reg.sign(discloseArgs(rec, file));
   } catch (e) {
     if (e?.code !== "FEE_CAP") throw e;
+    // the stall is journalled like a replacement's (Codex W2c R11): it counts as degraded until a
+    // signature succeeds, which replaces this state
+    state.registry = { phase: "unsigned", feeCapped: new Date().toISOString() };
+    await persist(state);
     alerts.push(
       "registry: the disclose tx needs a fee above the configured maxFeePerGas; not signed, retried next pass"
     );

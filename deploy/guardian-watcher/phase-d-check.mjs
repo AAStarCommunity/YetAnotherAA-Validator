@@ -107,6 +107,34 @@ else {
       wcfg = loadConfig(p);
       accessSync(wcfg.dataDir, constants.W_OK);
       add("watcher-config", "PASS", "valid; dataDir writable");
+      // the watcher that runs must publish, through the very keystore and Keychain items this
+      // check verifies (Codex W2c R11): a disabled or differently configured publisher passes nothing
+      try {
+        const { publishConfig } = await import(join(W, "lib/sinks-config.mjs"));
+        const pc = wcfg.publish?.enabled === true ? publishConfig(wcfg.publish) : null;
+        const ks = cfg.sender?.keystore;
+        const problems = [];
+        if (!pc) problems.push("publication is not enabled in the watcher config");
+        else {
+          if (placeholder(ks) || resolve(expand(pc.registry.keystore)) !== resolve(expand(ks)))
+            problems.push("the watcher's registry.keystore is not sender.keystore");
+          if (pc.registry.service !== cfg.keychain?.services?.keystorePassword)
+            problems.push(
+              "the watcher's keystore password item is not keychain.services.keystorePassword"
+            );
+          if (pc.keychainAccount !== cfg.keychain?.account)
+            problems.push("the watcher's keychainAccount is not keychain.account");
+        }
+        add(
+          "watcher-publish",
+          problems.length ? "FAIL" : "PASS",
+          problems.length
+            ? problems.join("; ")
+            : "publication enabled, bound to this sender and Keychain"
+        );
+      } catch {
+        add("watcher-publish", "FAIL", "the watcher's publish config does not validate");
+      }
     } catch {
       add(
         "watcher-config",

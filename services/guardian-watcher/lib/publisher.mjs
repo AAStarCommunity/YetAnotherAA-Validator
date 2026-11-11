@@ -3,7 +3,8 @@
 // per-record work and is crash-safe stage by stage; this module only decides what to run, reads
 // the writer's roles from chain, builds the sinks and delivers the run's alerts.
 import { ethers } from "ethers";
-import { Store } from "./store.mjs";
+import { join } from "node:path";
+import { Store, atomicWriteJson, readJson } from "./store.mjs";
 import { publishRecord, PersistError } from "./publish.mjs";
 import { recordFile } from "./record-file.mjs";
 import { MAX_RECORD_BYTES } from "./cid.mjs";
@@ -65,6 +66,43 @@ function recordIdOf(rec) {
  * others. `reverifyGen`: the open weekly reverify generation (a done record whose pins were not
  * yet re-checked in it runs again, with reverify), or null.
  */
+/**
+ * The disclose stalls of the WHOLE store (DSR): records whose journal is fee-capped or unfunded,
+ * kept in stalls.json and updated whenever a record is processed. A record that is not in a pass's
+ * batch keeps its entry; an entry is cleared only when that record is processed and no longer in
+ * either state. Degraded is computed from this, never from one batch.
+ */
+const stallsPath = store => join(store.dir, "stalls.json");
+export function readStalls(store) {
+  try {
+    const j = readJson(stallsPath(store), {});
+    return j && typeof j === "object" && !Array.isArray(j) ? j : {};
+  } catch {
+    return {};
+  }
+}
+export function stallCounts(store) {
+  const all = Object.values(readStalls(store));
+  return {
+    feeCapped: all.filter(x => x?.kind === "feeCapped").length,
+    insufficientFunds: all.filter(x => x?.kind === "insufficientFunds").length,
+  };
+}
+function updateStall(store, id, regState, now) {
+  const kind = regState?.feeCapped
+    ? "feeCapped"
+    : /INSUFFICIENT_FUNDS/.test(String(regState?.lastBroadcastError ?? ""))
+      ? "insufficientFunds"
+      : null;
+  const all = readStalls(store);
+  const had = all[id];
+  if (kind && had?.kind === kind) return;
+  if (!kind && !had) return;
+  if (kind) all[id] = { kind, since: had?.kind === kind ? had.since : now };
+  else delete all[id];
+  atomicWriteJson(stallsPath(store), all);
+}
+
 export async function publishPending(
   store,
   sinks,
@@ -212,10 +250,11 @@ export async function publishPending(
       };
       if (done) counts.done++;
       if (openIncident(r.state)) counts.incidents++;
-      // the two disclose stalls the watcher must report as degraded, not only alert (DSR)
+      // the two disclose stalls the watcher must report as degraded, store-wide (DSR)
       if (r.state.registry?.feeCapped) counts.feeCapped++;
       if (/INSUFFICIENT_FUNDS/.test(String(r.state.registry?.lastBroadcastError ?? "")))
         counts.insufficientFunds++;
+      updateStall(store, id, r.state.registry, new Date(now()).toISOString());
     } catch (err) {
       entries[id] = { ...e, lastRunAt: now(), failing: true }; // a failure still rotates (R2)
       counts.failed++;
@@ -251,7 +290,7 @@ export async function publishPending(
     counts.failed++;
     alerts.push("publication schedule not saved; rotation kept in memory, retried next pass");
   }
-  return { alerts, counts, stopped, reverifyRemaining, sweeps };
+  return { alerts, counts, stopped, reverifyRemaining, sweeps, stalls: stallCounts(store) };
 }
 
 // The schedule as last computed in this process, so a failing schedule write keeps rotation fair
@@ -508,6 +547,7 @@ export async function publishPhase(
   return {
     ...out,
     ...res.counts,
+    stalls: res.stalls, // store-wide (DSR), not this batch's counts
     failed: res.counts.failed + schedFailures.length,
     stopped: res.stopped,
     reverifying: gen !== null && !reverified ? { gen, remaining: res.reverifyRemaining } : null,

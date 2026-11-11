@@ -1594,9 +1594,11 @@ const good = {
   }
 }
 
-// ---- #411 F1 / DSR: a fee-capped or unfunded disclose is counted and makes the watcher degraded
+// ---- #411 F1 / DSR: fee-capped or unfunded discloses are a store-wide, persistent degraded state
 {
   const { stallReasons } = await import("./watcher.mjs");
+  const { stallCounts } = await import("./lib/publisher.mjs");
+  const { check: heartbeat } = await import("../../deploy/guardian-watcher/heartbeat.mjs");
   const d = tmp();
   try {
     const store = new Store(d);
@@ -1605,20 +1607,56 @@ const good = {
     const sk = { pinners: s.pinners, mirror: s.mirror, telegram: s.telegram, registry: s.registry };
     await publishPending(store, sk, { maxPendingMs: 0 });
     const p2 = await publishPending(store, sk, { maxPendingMs: 0 });
-    const reasons = stallReasons(p2.counts);
     cell(
-      "F1: an unfunded disclose is counted (insufficientFunds) and becomes a fixed-wording degraded reason",
-      p2.counts.insufficientFunds === 1 &&
-        reasons.length === 1 &&
-        /insufficient funds/.test(reasons[0]),
-      { counts: p2.counts, reasons }
+      "F1: an unfunded disclose is recorded store-wide and becomes a fixed-wording degraded reason",
+      p2.stalls.insufficientFunds === 1 &&
+        /insufficient funds/.test(stallReasons({ stalls: p2.stalls })[0] ?? ""),
+      { stalls: p2.stalls }
+    );
+    // later passes whose batch does NOT contain the record: the stall persists, degraded stays true
+    const statuses = [];
+    let hb = null;
+    const sent = [];
+    for (let i = 0; i < 3; i++) {
+      const pi = await publishPending(store, sk, { maxPendingMs: 0, maxParse: 0 });
+      const reasons = stallReasons({ stalls: pi.stalls });
+      statuses.push(reasons.length > 0);
+      const at = new Date(1_000_000 + i * 60_000).toISOString();
+      const r = await heartbeat({
+        cfg: { dataDir: d, intervalMs: 60_000, heartbeat: { label: "t" } },
+        now: Date.parse(at),
+        readStatus: () =>
+          JSON.stringify({ at, healthy: reasons.length === 0, degraded: reasons, lagBlocks: 0 }),
+        statMtime: () => Date.parse(at),
+        send: async t => (sent.push(t), true),
+        readState: () => hb,
+        writeState: x => ((hb = x), true),
+      });
+      void r;
+    }
+    cell(
+      "DSR: a fee-capped/unfunded record outside the batch keeps degraded true pass after pass; the heartbeat's two-in-a-row fires",
+      statuses.every(Boolean) &&
+        stallCounts(store).insufficientFunds === 1 &&
+        sent.some(t => /degraded for 2 checks/.test(t)),
+      { statuses, sent }
+    );
+    // the writer is funded again: the next pass that processes the record clears the stall
+    s.chain.known.clear();
+    const s2 = sinks({ mine: "pending" });
+    Object.assign(sk, { registry: s2.registry });
+    const after = await publishPending(store, sk, { maxPendingMs: 60 * 60_000 });
+    cell(
+      "F1: once broadcasts go through again, the record's stall is cleared store-wide",
+      after.stalls.insufficientFunds === 0 && stallReasons({ stalls: after.stalls }).length === 0,
+      { stalls: after.stalls }
     );
     cell(
-      "F1: a fee-capped disclose becomes a degraded reason; nothing when there is no stall",
-      stallReasons({ feeCapped: 2 })[0] ===
-        "2 disclose tx(s) need a fee above registry.maxFeePerGas" &&
-        stallReasons({ feeCapped: 0, insufficientFunds: 0 }).length === 0,
-      stallReasons({ feeCapped: 2 })
+      "F1: no stall, no degraded reason",
+      stallReasons({ stalls: { feeCapped: 0, insufficientFunds: 0 } }).length === 0 &&
+        stallReasons({ stalls: { feeCapped: 2 } })[0] ===
+          "2 disclose tx(s) need a fee above registry.maxFeePerGas",
+      null
     );
   } finally {
     rmSync(d, { recursive: true, force: true });

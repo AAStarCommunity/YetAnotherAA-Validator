@@ -86,12 +86,14 @@ export function loadConfig(path) {
 
 /** The disclose stalls that make the watcher degraded (DSR, #411 F1): fixed wording, counts only. */
 export function stallReasons(publication) {
+  // store-wide counts (lib/publisher.mjs stallCounts), never the batch's (DSR)
+  const st = publication?.stalls ?? {};
   const out = [];
-  if (publication?.feeCapped)
-    out.push(`${publication.feeCapped} disclose tx(s) need a fee above registry.maxFeePerGas`);
-  if (publication?.insufficientFunds)
+  if (st.feeCapped)
+    out.push(`${st.feeCapped} disclose tx(s) need a fee above registry.maxFeePerGas`);
+  if (st.insufficientFunds)
     out.push(
-      `${publication.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
+      `${st.insufficientFunds} disclose tx(s) not payable: the writer has insufficient funds`
     );
   return out;
 }
