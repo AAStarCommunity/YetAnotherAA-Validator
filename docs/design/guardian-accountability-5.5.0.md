@@ -85,11 +85,13 @@ TAG_EVIDENCE = keccak256("SuperPaymaster.DVT.Evidence.v2")
 
 Vectors: `contracts/test/fixtures/evidence-vectors.json`, generated from
 `scripts/disclosure/recheck-lib.mjs` (`npm run check:disclosure` diffs it) and
-recomputed in Solidity by `contracts/test/EvidenceHashParity.t.sol`; SP's
-DVTValidator is checked against the same file. `abi.encode`, never
-`encodePacked`: for `evidenceHash` the two coincide (three static `bytes32`
-words), but for `evidence` they differ, since `bytes` is dynamic and
-`abi.encode` adds its offset and length.
+recomputed in Solidity by `contracts/test/EvidenceHashParity.t.sol` (an
+independent recomputation, not SP's contract). Running SP's DVTValidator 0.8.0
+against the same file is planned once its branch is published; until then the
+parity covers our two implementations only. `abi.encode`, never `encodePacked`:
+for `evidenceHash` the two coincide (three static `bytes32` words), but for
+`evidence` they differ, since `bytes` is dynamic and `abi.encode` adds its
+offset and length.
 
 The DVT node does not yet build proposals this way (it files
 `evidenceHash = proofHash`, and over-issue uses its own tag). That is closed in
