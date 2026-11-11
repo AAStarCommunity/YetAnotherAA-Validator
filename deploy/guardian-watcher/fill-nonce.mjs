@@ -22,6 +22,7 @@
 import { dirname, join } from "node:path";
 import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { ethers } from "ethers";
 
 const W = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "services", "guardian-watcher");
 const { Store, atomicWriteJson, readJson } = await import(join(W, "lib", "store.mjs"));
@@ -53,6 +54,42 @@ function journals(store) {
   return out;
 }
 
+/**
+ * Each journalled tx of a stage with its OWN identity (Codex W2d R11): a stage can hold txs of two
+ * writers (a replacement signed after a writer change), so signer, nonce and chain come from each
+ * tx's signed raw; a tx without a parseable raw takes the stage's journalled identity.
+ */
+export function stageTxs(st) {
+  if (!st) return [];
+  const hashes = st.hashes ?? (st.hash ? [st.hash] : []);
+  const raws =
+    st.raws?.length === hashes.length
+      ? st.raws
+      : hashes.map((_, i) => (i === hashes.length - 1 ? st.raw : null));
+  const at = registryAt(st);
+  const signer0 = stageSigner(st);
+  return hashes.map((hash, i) => {
+    try {
+      const tx = ethers.Transaction.from(raws[i]);
+      if (tx.from)
+        return {
+          hash,
+          signer: tx.from.toLowerCase(),
+          nonce: tx.nonce,
+          chainId: String(tx.chainId),
+        };
+    } catch {
+      // no parseable raw: the stage's identity
+    }
+    return {
+      hash,
+      signer: signer0 ? signer0.toLowerCase() : null,
+      nonce: st.nonce,
+      chainId: at?.chainId ?? null,
+    };
+  });
+}
+
 const fillsPath = store => join(store.dir, "nonce-fills.json");
 const readFills = store => readJson(fillsPath(store), { fills: [] }).fills ?? [];
 const writeFills = (store, fills) => atomicWriteJson(fillsPath(store), { fills });
@@ -81,14 +118,10 @@ export async function planFill(store, reg, where, n) {
   for (const { id, pub } of pubs) {
     const u = nonceUseOf(pub);
     entries[id] = u ? { nonceUse: u } : {};
-    for (const st of [pub.registry, ...(pub.registryHistory ?? [])]) {
-      if (!st || st.nonce !== n) continue;
-      const at = registryAt(st);
-      const signer = stageSigner(st);
-      if (!at || at.chainId !== where.chainId || !signer || signer.toLowerCase() !== writer)
-        continue;
-      for (const h of st.hashes ?? (st.hash ? [st.hash] : [])) known.push({ id, h });
-    }
+    for (const st of [pub.registry, ...(pub.registryHistory ?? [])])
+      for (const t of stageTxs(st))
+        if (t.signer === writer && t.nonce === n && t.chainId === where.chainId)
+          known.push({ id, h: t.hash });
     if (!u || u.from !== writer || u.chainId !== where.chainId || u.nonce !== n) continue;
     // a stage on the current registry is the watcher's own to finish, whatever a wait marker says
     // (a marker left from an earlier configuration is stale: Codex W2d R8 #1)

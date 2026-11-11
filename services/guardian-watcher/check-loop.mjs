@@ -3500,6 +3500,63 @@ const good = {
       );
       rmSync(d, { recursive: true, force: true });
     }
+    // (i) Codex W2d R11: a stage holding two writers' txs (a replacement after a writer change):
+    // fill-nonce checks each tx under its own signer, nonce and chain (real signed bytes)
+    {
+      const d = tmp();
+      const store = new Store(d);
+      store.putRecord(bls);
+      const w1 = ethers.Wallet.createRandom();
+      const w2 = ethers.Wallet.createRandom();
+      const tx = {
+        to: OLD,
+        nonce: 5,
+        chainId: 11155111,
+        type: 2,
+        maxFeePerGas: 2n,
+        maxPriorityFeePerGas: 1n,
+        gasLimit: 90000n,
+      };
+      const r1 = await w1.signTransaction(tx);
+      const r2 = await w2.signTransaction(tx);
+      const h1 = ethers.keccak256(r1);
+      const h2 = ethers.keccak256(r2);
+      const base = store.getPublication(id) ?? {};
+      store.putPublication(id, {
+        ...base,
+        registry: null,
+        registryHistory: [
+          {
+            phase: "sent",
+            nonce: 5,
+            hash: h2,
+            raw: r2,
+            hashes: [h1, h2],
+            raws: [r1, r2],
+            at: { address: OLD, chainId: "11155111" },
+          },
+        ],
+      });
+      const asW = (w, known) => {
+        const s = sinks({ registryAddress: CC, rawTag: "i", writer: w.address });
+        s.chain.nonce = 5;
+        s.chain.latestNonce = 5;
+        s.chain.pendingNonce = 6;
+        for (const h of known) s.chain.known.add(h);
+        return s.registry;
+      };
+      const asW1 = await planFill(store, asW(w1, [h1]), whereOf(CC), 5);
+      const asW2 = await planFill(store, asW(w2, [h1]), whereOf(CC), 5);
+      const asW2known = await planFill(store, asW(w2, [h2]), whereOf(CC), 5);
+      cell(
+        "B2-A(i) R11: in a stage with two writers' txs, fill-nonce refuses W1 while W1's tx is known, lets W2 fill when only W1's is known, refuses W2 while W2's is known",
+        /still known/.test(asW1.refuse ?? "") &&
+          asW2.basis === "gap" &&
+          /still known/.test(asW2known.refuse ?? ""),
+        { asW1, asW2, asW2known }
+      );
+      rmSync(d, { recursive: true, force: true });
+    }
     // (f) another writer (the M0 §5.5a recovery) or another chain has its own nonce space: no wait;
     // a stage already waiting is archived at once when the chain changes (Codex W2d R7 #1)
     {
