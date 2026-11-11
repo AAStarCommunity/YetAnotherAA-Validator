@@ -1,0 +1,197 @@
+#!/usr/bin/env node
+// External heartbeat / lag check on the guardian watcher (M0 §5.5; DSR: drill item 4, kill-alert).
+// It runs as its own launchd job (ai.aastar.aoa-watcher-heartbeat), never inside the watcher: a
+// degraded flag the watcher writes cannot report that the watcher itself is dead. It reads only the
+// watcher's status.json and alerts through the same Telegram bot and chat.
+//
+//   node deploy/guardian-watcher/heartbeat.mjs --config <watcher config.json> [--test]
+//
+// Rules (state in <dataDir>/heartbeat/, written atomically):
+//   status.json missing, unreadable, or older than staleAfterMs (default 3 x intervalMs)
+//       -> "watcher not running or stuck", at once, repeated at most every realertMs (1 h)
+//   status.lagBlocks > maxLagBlocks                         -> "cursor N blocks behind", likewise
+//   status.healthy === false on unhealthyAfter (2) checks in a row -> the watcher's degraded reasons
+//   back to healthy after an alert                          -> one RECOVERED message
+//   state that cannot be written                            -> an alert at once (it would mute the rules)
+// The bot token comes from the macOS Keychain (service aoa-dvt-alert-bot-token, account aoa-watcher,
+// DSR 0829236d); it is handed to curl through stdin, never on a command line. Degraded reasons are
+// the watcher's own wording (SafeError rule); nothing else from status.json is sent.
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { hostname } from "node:os";
+
+const args = process.argv.slice(2);
+const ci = args.indexOf("--config");
+
+/** One check. Everything external is injectable for the self-test. */
+export async function check({
+  cfg,
+  now = Date.now(),
+  readStatus = p => readFileSync(p, "utf8"),
+  statMtime = p => statSync(p).mtimeMs,
+  send,
+  writeState,
+  readState,
+}) {
+  const interval = cfg.intervalMs ?? 60_000;
+  const hb = cfg.heartbeat ?? {};
+  const staleAfter = hb.staleAfterMs ?? 3 * interval;
+  const realert = hb.realertMs ?? 3_600_000;
+  const unhealthyAfter = hb.unhealthyAfter ?? 2;
+  const maxLag = cfg.maxLagBlocks ?? 300;
+  const state = readState() ?? { alerting: null, lastSentAt: 0, unhealthyRuns: 0 };
+
+  // what is wrong now, in fixed wording
+  let problem = null;
+  let status = null;
+  try {
+    status = JSON.parse(readStatus(join(cfg.dataDir, "status.json")));
+  } catch {
+    status = null;
+  }
+  const at = status && Date.parse(status.at);
+  let age = null;
+  try {
+    age = now - Math.max(Number.isFinite(at) ? at : 0, statMtime(join(cfg.dataDir, "status.json")));
+  } catch {
+    age = null;
+  }
+  if (!status || age === null)
+    problem = { key: "stale", text: "watcher not running or stuck: no readable status.json" };
+  else if (age > staleAfter)
+    problem = {
+      key: "stale",
+      text: `watcher not running or stuck: status.json is ${Math.round(age / 60_000)} min old`,
+    };
+  else if (Number.isSafeInteger(status.lagBlocks) && status.lagBlocks > maxLag)
+    problem = {
+      key: "lag",
+      text: `cursor ${status.lagBlocks} blocks behind finalized (> ${maxLag})`,
+    };
+  const unhealthyRuns = status && status.healthy === false ? state.unhealthyRuns + 1 : 0;
+  if (!problem && unhealthyRuns >= unhealthyAfter) {
+    const reasons = Array.isArray(status.degraded)
+      ? status.degraded
+          .filter(x => typeof x === "string")
+          .slice(0, 5)
+          .map(x => x.slice(0, 200))
+      : [];
+    problem = {
+      key: "unhealthy",
+      text: `watcher degraded for ${unhealthyRuns} checks: ${reasons.join("; ") || "no reason given"}`,
+    };
+  }
+
+  const host = hb.label ?? hostname();
+  const next = { ...state, unhealthyRuns };
+  let sent = null;
+  if (problem) {
+    const changed = state.alerting !== problem.key;
+    if (changed || now - (state.lastSentAt ?? 0) >= realert) {
+      const ok = await send(`[aoa-watcher] ${host}: ${problem.text}`);
+      if (ok) {
+        next.lastSentAt = now;
+        next.alerting = problem.key;
+        sent = problem.key;
+      }
+    }
+  } else if (state.alerting) {
+    const ok = await send(
+      `[aoa-watcher] ${host}: RECOVERED (status fresh, lag within ${maxLag}, healthy)`
+    );
+    if (ok) {
+      next.alerting = null;
+      next.lastSentAt = now;
+      sent = "recovered";
+    }
+  }
+  if (!writeState(next)) {
+    await send(
+      `[aoa-watcher] ${host}: heartbeat cannot write its state; alerts may be muted until fixed`
+    );
+    return { problem: problem?.key ?? null, sent, stateWritten: false };
+  }
+  return { problem: problem?.key ?? null, sent, stateWritten: true };
+}
+
+/** Telegram through curl, the token in curl's config on stdin (never in argv). */
+function telegramSend(cfg) {
+  const svc = cfg.heartbeat?.keychainService ?? "aoa-dvt-alert-bot-token";
+  const acct = cfg.heartbeat?.keychainAccount ?? cfg.publish?.keychainAccount ?? "aoa-watcher";
+  const chatId = cfg.heartbeat?.chatId ?? cfg.publish?.telegram?.chatId;
+  return async text => {
+    const tok = spawnSync("security", ["find-generic-password", "-s", svc, "-a", acct, "-w"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (tok.status !== 0 || !chatId) {
+      console.error("heartbeat: no bot token in the Keychain or no chat id; cannot alert");
+      return false;
+    }
+    const r = spawnSync(
+      "curl",
+      [
+        "-sS",
+        "-m",
+        "20",
+        "-K",
+        "-",
+        "--data-urlencode",
+        `chat_id=${chatId}`,
+        "--data-urlencode",
+        `text=${text}`,
+      ],
+      {
+        input: `url = "https://api.telegram.org/bot${tok.stdout.trim()}/sendMessage"\n`,
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+      }
+    );
+    let ok = false;
+    try {
+      ok = r.status === 0 && JSON.parse(r.stdout).ok === true;
+    } catch {
+      ok = false;
+    }
+    if (!ok) console.error("heartbeat: telegram send failed");
+    return ok;
+  };
+}
+
+if (process.argv[1] && process.argv[1].endsWith("heartbeat.mjs") && ci >= 0) {
+  const cfg = JSON.parse(readFileSync(args[ci + 1], "utf8"));
+  const dir = join(cfg.dataDir, "heartbeat");
+  const statePath = join(dir, "state.json");
+  const send = telegramSend(cfg);
+  if (args.includes("--test")) {
+    const ok = await send(
+      `[aoa-watcher] ${cfg.heartbeat?.label ?? hostname()}: heartbeat TEST at ${new Date().toISOString()}`
+    );
+    process.exit(ok ? 0 : 1);
+  }
+  const r = await check({
+    cfg,
+    send,
+    readState: () => {
+      try {
+        return JSON.parse(readFileSync(statePath, "utf8"));
+      } catch {
+        return null;
+      }
+    },
+    writeState: s => {
+      try {
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const tmp = `${statePath}.tmp-${process.pid}`;
+        writeFileSync(tmp, JSON.stringify(s) + "\n", { mode: 0o600 });
+        renameSync(tmp, statePath);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+  console.log(JSON.stringify({ at: new Date().toISOString(), ...r }));
+  process.exit(r.problem ? 1 : 0);
+}
