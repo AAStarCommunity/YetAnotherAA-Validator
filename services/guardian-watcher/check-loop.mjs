@@ -1431,18 +1431,14 @@ cell(
 // ---- publishConfig + buildSinks
 const good = {
   enabled: true,
-  pinners: [
-    { type: "pinata", gateway: "https://x.mypinata.cloud", account: "pinata-jwt" },
-    { type: "filebase", account: "filebase-token" },
-  ],
-  telegram: { chatId: "-100", account: "tg-token" },
+  pinners: [{ type: "pinata", gateway: "https://x.mypinata.cloud" }, { type: "filebase" }],
+  telegram: { chatId: "-100" },
   mirror: { clone: "/tmp/none.git" },
   registry: {
     address: ethers.getAddress("0x" + "ab".repeat(20)),
     fromBlock: 1,
     deployer: DEPLOYER,
     keystore: "/nonexistent",
-    account: "writer-pass",
   },
 };
 {
@@ -1454,10 +1450,10 @@ const good = {
   const bad = {};
   for (const [name, c] of [
     ["no pinners", { ...good, pinners: [] }],
-    ["unknown pinner", { ...good, pinners: [{ type: "web3", account: "a" }] }],
+    ["unknown pinner", { ...good, pinners: [{ type: "web3" }] }],
     [
       "pinata without https gateway",
-      { ...good, pinners: [{ type: "pinata", gateway: "http://x", account: "a" }] },
+      { ...good, pinners: [{ type: "pinata", gateway: "http://x" }] },
     ],
     ["no telegram", { ...good, telegram: undefined }],
     ["no mirror", { ...good, mirror: {} }],
@@ -1492,14 +1488,14 @@ const good = {
     );
     const asked = [];
     const secrets = {
-      "pinata-jwt": "pj",
-      "filebase-token": "fb",
-      "tg-token": "tg",
-      "writer-pass": "PASSWORDSECRET",
+      "aoa-dvt-pinata-jwt": "pj",
+      "aoa-dvt-filebase-token": "fb",
+      "aoa-dvt-alert-bot-token": "tg",
+      "aoa-dvt-watcher-keystore-pw": "PASSWORDSECRET",
     };
     const readSecret = async (svc, acct) => {
       asked.push(`${svc}/${acct}`);
-      return secrets[acct];
+      return acct === "aoa-watcher" ? secrets[svc] : undefined;
     };
     const p = publishConfig({ ...good, registry: { ...good.registry, keystore: ks } });
     const b = await buildSinks(
@@ -1508,22 +1504,22 @@ const good = {
       { readSecret }
     );
     cell(
-      "buildSinks: every secret from the Keychain service, the keystore decrypted to the writer",
+      "buildSinks: every secret from its own Keychain service under the aoa-watcher account (DSR 0829236d), the keystore decrypted to the writer",
       b.wallet.address === writer.address &&
         b.pinners.map(x => x.name).join() === "pinata,filebase" &&
         j(asked) ===
           j([
-            "dvt-guardian-watcher/pinata-jwt",
-            "dvt-guardian-watcher/filebase-token",
-            "dvt-guardian-watcher/tg-token",
-            "dvt-guardian-watcher/writer-pass",
+            "aoa-dvt-pinata-jwt/aoa-watcher",
+            "aoa-dvt-filebase-token/aoa-watcher",
+            "aoa-dvt-alert-bot-token/aoa-watcher",
+            "aoa-dvt-watcher-keystore-pw/aoa-watcher",
           ]),
       { asked, addr: b.wallet.address }
     );
     let e = null;
     try {
       await buildSinks(p, null, {
-        readSecret: async (s2, a) => (a === "writer-pass" ? "wrong" : secrets[a]),
+        readSecret: async (s2, a) => (s2 === "aoa-dvt-watcher-keystore-pw" ? "wrong" : secrets[s2]),
       });
     } catch (x) {
       e = x.message;

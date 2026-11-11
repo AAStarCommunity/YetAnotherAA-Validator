@@ -711,6 +711,31 @@ cell(
   await again();
 }
 
+// ---- mirror path = the store's own record id (follow-up #2): a public, unattributed or quarantine
+// record is never named like an owner-route one
+{
+  const tx = "0x" + "ab".repeat(32);
+  const pub = { route: "public", txHash: tx, logIndex: 3, event: "PriceUpdated" };
+  const una = { route: "unattributed", txHash: tx, logIndex: 4, event: "OperatorPaused" };
+  const q = {
+    route: "unattributed",
+    quarantine: true,
+    txHash: "0x" + "cd".repeat(32),
+    logIndex: "unreadable",
+    event: "UNREADABLE",
+  };
+  const own = { route: "owner", txHash: tx, logIndex: 5, event: "GuardianSet" };
+  const paths = [pub, una, q, own].map(r => mirrorPath(r, "bafkCID"));
+  cell(
+    "mirror path: public, unattributed and quarantine records keep their own id; only the owner route is named owner-",
+    paths[0] === `records/public/public-${tx}-3.bafkCID.json` &&
+      paths[1] === `records/unattributed/unattributed-${tx}-4.bafkCID.json` &&
+      paths[2] === `records/unattributed/quarantine-0x${"cd".repeat(32)}.bafkCID.json` &&
+      paths[3] === `records/owner/owner-${tx}-5.bafkCID.json`,
+    paths
+  );
+}
+
 let failed = 0;
 for (const r of results) {
   console.log(`${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got}`}`);

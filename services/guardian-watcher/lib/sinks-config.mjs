@@ -3,15 +3,20 @@
 // encrypted keystore JSON whose password is a Keychain item (M0 §5.5). The registry sink is
 // rebuilt on every run with the roles read from chain at that moment (lib/publisher.mjs).
 //
+// Keychain layout (DSR 0829236d): ONE account, "aoa-watcher", and one service per secret:
+//   aoa-dvt-pinata-jwt, aoa-dvt-filebase-token, aoa-dvt-alert-bot-token,
+//   aoa-dvt-watcher-keystore-pw (the writer = the watcher sender keystore's password).
+// Each item's service defaults to that name; config may name another.
+//
 // config.publish:
-//   { "enabled": true, "keychainService": "dvt-guardian-watcher",
-//     "pinners": [ { "type": "pinata", "gateway": "https://<name>.mypinata.cloud", "account": "pinata-jwt" },
-//                  { "type": "filebase", "account": "filebase-bucket-token" } ],
-//     "telegram": { "chatId": "-100…", "account": "telegram-bot-token" },
+//   { "enabled": true, "keychainAccount": "aoa-watcher",
+//     "pinners": [ { "type": "pinata", "gateway": "https://<name>.mypinata.cloud" },
+//                  { "type": "filebase" } ],
+//     "telegram": { "chatId": "-100…" },
 //     "mirror": { "clone": "/path/to/bare/clone.git", "branch": "disclosure-records",
 //                 "repoUrl": "https://github.com/AAStarCommunity/YetAnotherAA-Validator" },
 //     "registry": { "address": "0x…", "fromBlock": N, "deployer": "0x…",
-//                   "keystore": "/path/writer-keystore.json", "account": "writer-keystore-password" },
+//                   "keystore": "~/.aoa-watcher/sender.keystore.json" },
 //     "lockPort": 47331, "maxPendingMs": 1800000, "reverifyEveryMs": 604800000, "alertRepeatMs": 3600000 }
 import { readFileSync } from "node:fs";
 import { ethers } from "ethers";
@@ -28,8 +33,16 @@ const DEFAULTS = {
   maxPendingMs: 30 * 60_000,
   reverifyEveryMs: 7 * 24 * 3_600_000,
   alertRepeatMs: 3_600_000,
-  keychainService: "dvt-guardian-watcher",
+  keychainAccount: "aoa-watcher",
 };
+/** The Keychain service of each secret, unless the config names another (DSR 0829236d). */
+export const SERVICE_DEFAULTS = {
+  pinata: "aoa-dvt-pinata-jwt",
+  filebase: "aoa-dvt-filebase-token",
+  telegram: "aoa-dvt-alert-bot-token",
+  registry: "aoa-dvt-watcher-keystore-pw",
+};
+const okService = s => typeof s === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(s);
 
 /** Validate config.publish; throws SafeError naming the first problem. */
 export function publishConfig(c) {
@@ -43,20 +56,23 @@ export function publishConfig(c) {
       x.type === "pinata" || x.type === "filebase",
       `pinners[${i}].type must be pinata or filebase`
     );
-    need(
-      typeof x.account === "string" && x.account,
-      `pinners[${i}].account (Keychain item) required`
-    );
+    if (x.service === undefined) x.service = SERVICE_DEFAULTS[x.type];
+    need(okService(x.service), `pinners[${i}].service must be a Keychain service name`);
     if (x.type === "pinata")
       need(/^https:\/\//.test(x.gateway ?? ""), `pinners[${i}].gateway https URL required`);
   }
-  need(p.telegram?.chatId && p.telegram?.account, "telegram.chatId and telegram.account required");
+  need(p.telegram?.chatId, "telegram.chatId required");
+  p.telegram = { ...p.telegram, service: p.telegram.service ?? SERVICE_DEFAULTS.telegram };
+  need(okService(p.telegram.service), "telegram.service must be a Keychain service name");
   need(p.mirror?.clone, "mirror.clone required");
   const r = p.registry ?? {};
   need(ethers.isAddress(r.address ?? ""), "registry.address required");
   need(Number.isSafeInteger(r.fromBlock) && r.fromBlock >= 0, "registry.fromBlock required");
   need(ethers.isAddress(r.deployer ?? ""), "registry.deployer (release manifest) required");
-  need(r.keystore && r.account, "registry.keystore and registry.account required");
+  need(r.keystore, "registry.keystore required");
+  p.registry = { ...r, service: r.service ?? SERVICE_DEFAULTS.registry };
+  need(okService(p.registry.service), "registry.service must be a Keychain service name");
+  need(okService(p.keychainAccount), "keychainAccount must be a Keychain account name");
   for (const k of ["lockPort", "maxPendingMs", "reverifyEveryMs", "alertRepeatMs"])
     need(Number.isSafeInteger(p[k]) && p[k] > 0, `${k} must be a positive integer`);
   return p;
@@ -67,10 +83,10 @@ export function publishConfig(c) {
  * for tests. Returns { pinners, telegram, mirror, wallet, registryFor(roles) }.
  */
 export async function buildSinks(p, provider, { readSecret = keychainRead } = {}) {
-  const svc = p.keychainService;
+  const acct = p.keychainAccount;
   const pinners = [];
   for (const x of p.pinners) {
-    const token = await readSecret(svc, x.account);
+    const token = await readSecret(x.service, acct);
     pinners.push(
       x.type === "pinata"
         ? pinataPinner({
@@ -86,7 +102,7 @@ export async function buildSinks(p, provider, { readSecret = keychainRead } = {}
     );
   }
   const telegram = telegramSink({
-    token: await readSecret(svc, p.telegram.account),
+    token: await readSecret(p.telegram.service, acct),
     chatId: String(p.telegram.chatId),
     ...(p.telegram.apiBase ? { apiBase: p.telegram.apiBase } : {}),
   });
@@ -104,7 +120,7 @@ export async function buildSinks(p, provider, { readSecret = keychainRead } = {}
   let wallet;
   try {
     wallet = (
-      await ethers.Wallet.fromEncryptedJson(json, await readSecret(svc, p.registry.account))
+      await ethers.Wallet.fromEncryptedJson(json, await readSecret(p.registry.service, acct))
     ).connect(provider);
   } catch (e) {
     if (e instanceof SafeError) throw e;
