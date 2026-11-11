@@ -75,17 +75,19 @@ cp $REPO/deploy/guardian-watcher/config.example.json ~/.aoa-watcher/config.json
 sed -i '' "s|REPLACE_USER|$(id -un)|g" ~/.aoa-watcher/config.json
 ```
 
-Fill every `<...>` from the step-13 manifest (public data only): `aggregator`,
-`roles.superPaymaster`, `forwarders.dvtValidator` / `ownerSafe` /
-`multiSendCallOnly` (Phase D's `onchain:binding` compares
-`forwarders.dvtValidator` with `phase-d.json` `contracts.dvtValidator`),
-`startBlock` (the aggregator's deployment block), `publish.registry`
-(DisclosureRegistry address, its deployment block as `fromBlock`, the deployer,
-and `maxFeePerGas`: the absolute fee ceiling in wei as a decimal string; its
-`keystore` must be the same file as `phase-d.json` `sender.keystore`), the
-Pinata gateway, the Telegram chat id. Keep `publish.enabled: true`
-(`watcher-publish`). The git mirror needs a bare clone whose push key is in the
-ssh-agent:
+Check `chainId` (the example's is Sepolia, 11155111; it must equal
+`phase-d.json` `chainId`: the watcher refuses to publish without it, and
+`watcher-publish` compares the two). Fill every `<...>` from the step-13
+manifest (public data only): `aggregator`, `roles.superPaymaster`,
+`forwarders.dvtValidator` / `ownerSafe` / `multiSendCallOnly` (Phase D's
+`onchain:binding` compares `forwarders.dvtValidator` with `phase-d.json`
+`contracts.dvtValidator`), `startBlock` (the aggregator's deployment block),
+`publish.registry` (DisclosureRegistry address, its deployment block as
+`fromBlock`, the deployer, and `maxFeePerGas`: the absolute fee ceiling in wei
+as a decimal string; its `keystore` must be the same file as `phase-d.json`
+`sender.keystore`), the Pinata gateway, the Telegram chat id. Keep
+`publish.enabled: true` (`watcher-publish`). The git mirror needs a bare clone
+whose push key is in the ssh-agent:
 `git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git`.
 
 ## 5. The Phase D config

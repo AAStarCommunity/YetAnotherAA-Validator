@@ -93,7 +93,10 @@ export function stallReasons(publication) {
   if (!publication?.stalls) return ["stall state unknown: no publication result"];
   const st = publication.stalls;
   // an unreadable, unrebuildable index is not "no stalls" (Codex W2c R12 #3)
-  if (st.unknown) out.push("stall state unknown: the stall index is unreadable");
+  // unknown: not every record re-read since a restart or an unreadable schedule, or a record file
+  // or its journal unreadable (#413 review nit: the wording named only the index)
+  if (st.unknown)
+    out.push("stall state unknown: records not all re-read yet, or a record or journal unreadable");
   if (st.feeCapped)
     out.push(`${st.feeCapped} disclose tx(s) need a fee above registry.maxFeePerGas`);
   if (st.insufficientFunds)

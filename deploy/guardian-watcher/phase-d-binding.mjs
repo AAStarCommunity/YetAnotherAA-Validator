@@ -206,3 +206,30 @@ export function importClosure(entry, read, resolveRel) {
   }
   return [...seen].map(([path, missing]) => ({ path, missing }));
 }
+
+/**
+ * The watcher-publish binding (Codex W2c R11; #413 review N2 follow-up): the watcher that runs must
+ * publish, through the keystore and Keychain items Phase D verifies, on the chain Phase D checks.
+ * `pc` is the watcher's validated publish config (null when publication is off); `samePath(a, b)`
+ * compares two configured paths after expansion. Returns the problems, in fixed wording.
+ */
+export function publishBindingProblems({ wcfg, pc, cfg, samePath }) {
+  const problems = [];
+  if (!pc) {
+    problems.push("publication is not enabled in the watcher config");
+    return problems;
+  }
+  const ks = cfg.sender?.keystore;
+  if (typeof ks !== "string" || /^</.test(ks) || !samePath(pc.registry.keystore, ks))
+    problems.push("the watcher's registry.keystore is not sender.keystore");
+  if (pc.registry.service !== cfg.keychain?.services?.keystorePassword)
+    problems.push("the watcher's keystore password item is not keychain.services.keystorePassword");
+  if (pc.keychainAccount !== cfg.keychain?.account)
+    problems.push("the watcher's keychainAccount is not keychain.account");
+  // the watcher refuses to publish without chainId, and signs only for it (#413 review N2): it must
+  // be the chain Phase D verifies its RPCs and contracts on
+  if (!Number.isSafeInteger(wcfg?.chainId)) problems.push("the watcher config has no chainId");
+  else if (wcfg.chainId !== cfg.chainId)
+    problems.push("the watcher's chainId is not phase-d.json chainId");
+  return problems;
+}
