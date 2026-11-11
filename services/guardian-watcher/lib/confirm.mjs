@@ -184,6 +184,9 @@ export function mayPublish(store, rec) {
  * and for this pass: checked (re-runs), backingOff (skipped until nextAttemptAt).
  */
 const cursorMemo = new WeakMap();
+/** A counter read from a hold file: a non-negative safe integer, anything else counts as 0 (a hold
+ * is a local file and may be damaged; Codex D-RPC2 R11). */
+const num = v => (Number.isSafeInteger(v) && v >= 0 ? v : 0);
 export async function confirmPending(
   store,
   second,
@@ -268,7 +271,7 @@ export async function confirmPending(
     // was rolled back) is not trusted: the record is retried now (Codex D-RPC2 R8 #1)
     if (
       sameContent &&
-      Number.isFinite(prev?.nextAttemptAt) &&
+      Number.isSafeInteger(prev?.nextAttemptAt) &&
       nowMs < prev.nextAttemptAt &&
       prev.nextAttemptAt - nowMs <= CONFIRM_BACKOFF_MAX_MS
     ) {
@@ -284,8 +287,8 @@ export async function confirmPending(
     }
     // new content starts afresh; the same content carries its counters
     const base = sameContent ? prev : null;
-    const mismatches = (base?.mismatches ?? 0) + (r.state === "mismatch" ? 1 : 0);
-    const unavailableStreak = r.state === "unavailable" ? (base?.unavailableStreak ?? 0) + 1 : 0;
+    const mismatches = num(base?.mismatches) + (r.state === "mismatch" ? 1 : 0);
+    const unavailableStreak = r.state === "unavailable" ? num(base?.unavailableStreak) + 1 : 0;
     const state =
       r.state === "confirmed"
         ? "confirmed"
@@ -296,7 +299,7 @@ export async function confirmPending(
       id,
       state,
       digest: digest,
-      attempts: (base?.attempts ?? 0) + 1,
+      attempts: num(base?.attempts) + 1,
       mismatches,
       unavailableStreak,
       ...(r.state === "unavailable" ? { nextAttemptAt: nowMs + backoffMs(unavailableStreak) } : {}),
@@ -332,6 +335,7 @@ export async function confirmPending(
     let hold;
     try {
       hold = JSON.parse(readFileSync(join(holds, h), "utf8"));
+      if (!hold || typeof hold !== "object") continue;
     } catch {
       continue;
     }
@@ -340,7 +344,7 @@ export async function confirmPending(
     else if (hold?.state === "unconfirmed") {
       counts.unconfirmed++;
       if (hold.lastResult === "mismatch") counts.mismatch++;
-      else if ((hold.unavailableStreak ?? 0) >= 2) counts.waiting++;
+      else if (num(hold.unavailableStreak) >= 2) counts.waiting++;
     }
   }
   return counts;

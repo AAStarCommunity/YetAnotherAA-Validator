@@ -1139,6 +1139,58 @@ async function scenario(build) {
       rmSync(d, { recursive: true, force: true });
     }
   }
+  // R11: damaged counters in a hold file neither abort the pass nor the store-wide counts
+  {
+    const d = mkdtempSync(join(tmpdir(), "drpc2-poison-"));
+    try {
+      const store = new Store(d);
+      const bad = { ...bls, key: "7501", proposalId: "7501", txHash: ethers.id("poison") };
+      const ok = { ...bls, key: "7502", proposalId: "7502", txHash: ethers.id("ok") };
+      store.putRecord(bad);
+      store.putRecord(ok);
+      const bid = Store.recordId(bad);
+      const { writeFileSync, mkdirSync } = await import("node:fs");
+      mkdirSync(join(d, "holds"), { recursive: true });
+      const poison = { toString: null, valueOf: null };
+      writeFileSync(
+        join(d, "holds", `${bid}.json`),
+        JSON.stringify({
+          id: bid,
+          state: "unconfirmed",
+          digest: viewDigest(stored(store, bad)),
+          mismatches: poison,
+          unavailableStreak: poison,
+          attempts: poison,
+          nextAttemptAt: poison,
+          lastResult: "unavailable",
+        })
+      );
+      const run = async () => ({ status: { ok: false } });
+      let c = null;
+      let err = null;
+      try {
+        c = await confirmPending(store, {}, "s", { startBlock: 0 }, null, null, {
+          runOnce: run,
+          now: 1,
+        });
+      } catch (e) {
+        err = String(e);
+      }
+      const h = getHold(store, bid);
+      cell(
+        "R11: damaged counters (objects without toString/valueOf) count as 0: no throw, both records re-run, the damaged hold rewritten clean",
+        err === null &&
+          c.checked === 2 &&
+          getHold(store, Store.recordId(ok))?.attempts === 1 &&
+          h.attempts === 1 &&
+          h.unavailableStreak === 1 &&
+          h.mismatches === 0,
+        { err, c, h }
+      );
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
   // #5: an interrupted re-arm leaves its journal entry pending, settled from the hold
   {
     const { reconcile } = await import("../../deploy/guardian-watcher/rearm-hold.mjs");
