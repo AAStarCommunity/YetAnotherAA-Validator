@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.aastar.aoa-watcher</string>
+  <!-- The guardian watcher (M0 §5). It runs the installed wrapper and nothing else: Phase D
+       (phase-d-check.mjs, watcher-job-binding) requires the job's program and its whole argument
+       list to be exactly the wrapper, and the live process to be node <watcher.mjs> - -config <config>. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/REPLACE_USER/.aoa-watcher/run-watcher.sh</string>
+  </array>
+  <!-- Top-level keys. Nested inside another dict they pass plutil -lint and launchd ignores them;
+       verify with: launchctl print gui/$(id -u)/ai.aastar.aoa-watcher -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_USER/.aoa-watcher/watcher.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_USER/.aoa-watcher/watcher.log</string>
+</dict>
+</plist>

@@ -1,0 +1,34 @@
+{
+  "comment": "Guardian watcher config. Copy to ~/.aoa-watcher/config.json on the Mini and fill the <...> values (public data only). No secret goes here: the RPC URLs come from the Keychain through run-watcher.sh, the sink tokens and the keystore password from the Keychain through lib/sinks-config.mjs.",
+  "aggregator": "<BLSAggregator address from the step-13 manifest (= phase-d.json contracts.aggregator)>",
+  "roles": {
+    "superPaymaster": "<SuperPaymaster proxy address from the step-13 manifest>"
+  },
+  "forwarders": {},
+  "startBlock": 0,
+  "dataDir": "/Users/REPLACE_USER/.aoa-watcher/data",
+  "intervalMs": 60000,
+  "maxLagBlocks": 300,
+  "requireSecondProvider": true,
+  "publish": {
+    "enabled": true,
+    "keychainAccount": "aoa-watcher",
+    "pinners": [
+      { "type": "pinata", "gateway": "https://<your-gateway>.mypinata.cloud" },
+      { "type": "filebase" }
+    ],
+    "telegram": { "chatId": "<the alert chat id>" },
+    "mirror": {
+      "clone": "/Users/REPLACE_USER/.aoa-watcher/mirror.git",
+      "branch": "disclosure-records",
+      "repoUrl": "https://github.com/AAStarCommunity/YetAnotherAA-Validator"
+    },
+    "registry": {
+      "address": "<DisclosureRegistry address from the step-13 manifest>",
+      "fromBlock": 0,
+      "deployer": "<deployer address from the step-13 manifest>",
+      "keystore": "/Users/REPLACE_USER/.aoa-watcher/sender.keystore.json"
+    }
+  },
+  "heartbeat": { "label": "mini" }
+}
