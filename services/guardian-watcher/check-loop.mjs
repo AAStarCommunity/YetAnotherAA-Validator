@@ -3103,48 +3103,94 @@ const good = {
       rmSync(d, { recursive: true, force: true });
     }
   }
-  // (j) #425 review B2: the same writer's in-flight disclose on the same chain is replaced at its
-  // nonce by the new registry's first tx; another writer, or a consumed nonce, signs afresh
+  // (j) #425 review B2 + Codex W2d R5: the same writer's in-flight disclose on the same chain
+  // keeps its nonce for the new registry's first tx, floored on the old tx only while a node still
+  // knows it; re-checked on every attempt; the old tx stays a floor for later replacements and is
+  // never broadcast again
   {
-    const run = async (bOpts, consumed = false) => {
+    const setup = async (bOpts = {}) => {
       const d = tmp();
-      try {
-        const store = new Store(d);
-        store.putRecord(bls);
-        const a = sinks({ registryAddress: OLD, mine: "pending" });
-        a.chain.nonce = 5;
-        await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
-        const old = store.getPublication(Store.recordId(bls)).registry;
-        const b = sinks({ registryAddress: NEW, rawTag: "j", ...bOpts });
-        b.chain.nonce = consumed ? 6 : 5;
-        await publishPending(store, skOf(b), { maxPendingMs: 60 * 60_000 });
-        const j = store.getPublication(Store.recordId(bls));
-        return {
-          old,
-          opts: b.calls.lastSignOpts,
-          mig: j.registryMigrated,
-          phase: j.registry?.phase,
-        };
-      } finally {
-        rmSync(d, { recursive: true, force: true });
-      }
+      const store = new Store(d);
+      store.putRecord(bls);
+      const a = sinks({ registryAddress: OLD, mine: "pending" });
+      a.chain.nonce = 5;
+      await publishPending(store, skOf(a), { maxPendingMs: 60 * 60_000 });
+      const old = store.getPublication(Store.recordId(bls)).registry;
+      const b = sinks({ registryAddress: NEW, rawTag: "j", mine: "pending", ...bOpts });
+      b.chain.nonce = 5;
+      return { d, store, old, b };
     };
-    const same = await run({});
-    const other = await run({ writer: "0x" + "88".repeat(20) });
-    const gone = await run({}, true);
+    const j = st => st.getPublication(Store.recordId(bls));
+    // known old tx: replaced at nonce 5 with the old raw as the floor
+    const k = await setup();
+    k.b.chain.known.add(k.old.hash);
+    await publishPending(k.store, skOf(k.b), { maxPendingMs: 60 * 60_000 });
+    const kj = j(k.store);
+    // evicted old tx: nonce 5 kept, no floor (R5 #2)
+    const e = await setup();
+    await publishPending(e.store, skOf(e.b), { maxPendingMs: 60 * 60_000 });
+    // a replacement already persisted (e.g. the first signature was fee-capped), then the writer
+    // changes: the instruction is dropped on the next attempt, a normal signature follows (R5 #3)
+    const w = await setup({ writer: "0x" + "88".repeat(20) });
+    {
+      const id = Store.recordId(bls);
+      const jw = w.store.getPublication(id);
+      w.store.putPublication(id, {
+        ...jw,
+        registry: null,
+        registryMigrated: {
+          from: w.old.at,
+          to: { address: NEW, chainId: "11155111" },
+          at: "t",
+          replace: { nonce: 5, from: w.old.from, hashes: [w.old.hash], raws: [w.old.raw] },
+        },
+      });
+    }
+    await publishPending(w.store, skOf(w.b), { maxPendingMs: 60 * 60_000 });
+    // nonce consumed at the finalized block: normal signature
+    const c = await setup();
+    c.b.chain.nonce = 6;
+    await publishPending(c.store, skOf(c.b), { maxPendingMs: 60 * 60_000 });
+    // transient broadcast failures: the replacement still floors on the old tx (R5 #1), and the
+    // old raw is never broadcast through the new sink
+    // every broadcast of a new raw fails (transiently): the new tx never reaches the pool
+    const t = await setup({ rejectRaw: r => String(r).startsWith("0xrawj") });
+    t.b.chain.known.add(t.old.hash);
+    const oldRaw = t.old.raw;
+    await publishPending(t.store, skOf(t.b), { maxPendingMs: 60 * 60_000 });
+    const first = j(t.store).registry.raw;
+    await publishPending(t.store, skOf(t.b), { maxPendingMs: 0 });
+    const tOpts = t.b.calls.lastSignOpts;
     cell(
-      "W2d(j) B2: the same writer's pending tx is replaced at its nonce (replace, prevRaw); another writer or a consumed nonce signs normally",
-      same.old.phase === "sent" &&
-        same.old.nonce === 5 &&
-        same.opts?.replace === true &&
-        same.opts.nonce === 5 &&
-        same.opts.prevRaw === same.old.raw &&
-        same.mig?.replacedNonce === 5 &&
-        !same.mig.replace &&
-        !other.opts?.replace &&
-        !gone.opts?.replace,
-      { same, other: other.opts, gone: gone.opts }
+      "W2d(j) B2/R5: known old tx -> replaced at its nonce (floored); evicted -> same nonce unfloored; writer changed -> dropped; nonce consumed -> normal; after a lost broadcast the replacement still floors on the old tx, never rebroadcast",
+      k.old.phase === "sent" &&
+        k.old.nonce === 5 &&
+        k.b.calls.lastSignOpts?.replace === true &&
+        k.b.calls.lastSignOpts.nonce === 5 &&
+        k.b.calls.lastSignOpts.prevRaw === k.old.raw &&
+        kj.registry.floorHashes?.includes(k.old.hash) &&
+        kj.registryMigrated?.replacedNonce === 5 &&
+        !kj.registryMigrated.replace &&
+        e.b.calls.lastSignOpts?.nonce === 5 &&
+        !e.b.calls.lastSignOpts.replace &&
+        !w.b.calls.lastSignOpts?.replace &&
+        w.b.calls.lastSignOpts?.nonce === undefined &&
+        !j(w.store).registryMigrated?.replace &&
+        !c.b.calls.lastSignOpts?.replace &&
+        c.b.calls.lastSignOpts?.nonce === undefined &&
+        first !== oldRaw &&
+        tOpts?.replace === true &&
+        tOpts.prevRaw === oldRaw &&
+        !(t.b.calls.raws ?? []).includes(oldRaw),
+      {
+        known: k.b.calls.lastSignOpts,
+        evicted: e.b.calls.lastSignOpts,
+        writer: w.b.calls.lastSignOpts,
+        consumed: c.b.calls.lastSignOpts,
+        lost: tOpts,
+      }
     );
+    for (const x of [k, e, w, c, t]) rmSync(x.d, { recursive: true, force: true });
   }
   // (c) the same address on another chain is another registry
   {

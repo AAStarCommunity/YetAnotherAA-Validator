@@ -322,9 +322,15 @@ export async function publishRecord(rec, sinks, prev = {}, opts = {}) {
           oldFrom = null;
         }
       const me = await sinks.registry.writer();
-      const prevRaw = highestFeeRaw(old.raws ?? [old.raw]) ?? old.raw;
-      if (oldFrom && me && oldFrom.toLowerCase() === me.toLowerCase() && prevRaw)
-        replace = { nonce: old.nonce, prevRaw };
+      const hashes = old.hashes?.length ? old.hashes : old.hash ? [old.hash] : [];
+      const raws =
+        old.raws?.length === hashes.length
+          ? old.raws
+          : hashes.map((_, i) => (i === hashes.length - 1 ? old.raw : null));
+      // the old txs are kept as FEE-FLOOR candidates only (R5): never broadcast again, and their
+      // receipts are never taken as the new registry's completion
+      if (oldFrom && me && oldFrom.toLowerCase() === me.toLowerCase() && hashes.length)
+        replace = { nonce: old.nonce, from: oldFrom, hashes, raws };
     }
     state.registryHistory = [
       ...(state.registryHistory ?? []),
@@ -552,6 +558,16 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
           // a known tx without its raw bytes: floor on the latest journalled raw, whose fees are
           // never below an earlier one's (each replacement only rises from its floor)
           floorRaw = raws0[i] ?? highestFeeRaw(raws0);
+      // the old registry's tx at this nonce (a same-writer migration, Codex W2d R5 #1), while the
+      // writer is still its signer and a node still knows it: a floor only, never broadcast
+      if (floorRaw === null && state.registry.floorHashes?.length) {
+        const me = typeof reg.writer === "function" ? await reg.writer() : null;
+        if (me && String(me).toLowerCase() === String(state.registry.floorFrom ?? "").toLowerCase())
+          for (let i = state.registry.floorHashes.length - 1; i >= 0 && floorRaw === null; i--)
+            if (await reg.knows(state.registry.floorHashes[i]))
+              floorRaw =
+                state.registry.floorRaws?.[i] ?? highestFeeRaw(state.registry.floorRaws ?? []);
+      }
       let rep;
       try {
         rep = await reg.sign(
@@ -592,14 +608,33 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
   // Nothing in flight: an entry may already exist (an earlier publication completed elsewhere).
   if (await adoptExisting(rec, file, reg, state, persist, alerts)) return;
   let signed;
-  // the first tx after a same-writer migration replaces the old registry's pending one at its nonce,
-  // unless that nonce is already consumed at the finalized block (#425 review B2)
+  // The first tx after a same-writer migration takes the old registry's pending nonce (#425 review
+  // B2), re-checked on EVERY attempt (Codex W2d R5): only while the writer is still the one that
+  // signed the old tx (#3) and that nonce is not consumed at the finalized block; the fee floor is
+  // the old tx only while a node still knows it (#2: after an eviction the nonce is kept, unfloored).
   let rep = state.registryMigrated?.replace ?? null;
-  if (rep && (await reg.nonce()) > rep.nonce) rep = null;
+  if (rep) {
+    const me = typeof reg.writer === "function" ? await reg.writer() : null;
+    if (!me || String(me).toLowerCase() !== String(rep.from ?? "").toLowerCase()) rep = null;
+    else if ((await reg.nonce()) > rep.nonce) rep = null;
+    if (!rep) {
+      const { replace: _gone, ...migrated } = state.registryMigrated;
+      void _gone;
+      state.registryMigrated = migrated;
+    }
+  }
+  let repFloor = null;
+  if (rep)
+    for (let i = (rep.hashes ?? []).length - 1; i >= 0 && repFloor === null; i--)
+      if (await reg.knows(rep.hashes[i])) repFloor = rep.raws?.[i] ?? highestFeeRaw(rep.raws ?? []);
   try {
     signed = await reg.sign(
       discloseArgs(rec, file),
-      rep ? { nonce: rep.nonce, replace: true, prevRaw: rep.prevRaw } : undefined
+      rep
+        ? repFloor
+          ? { nonce: rep.nonce, replace: true, prevRaw: repFloor }
+          : { nonce: rep.nonce }
+        : undefined
     );
   } catch (e) {
     if (e?.code !== "FEE_CAP") throw e;
@@ -620,6 +655,9 @@ async function advanceRegistry(rec, file, reg, state, persist, alerts, opts) {
     raws: [signed.raw],
     nonce: signed.nonce,
     ...(signed.from ? { from: signed.from } : {}),
+    // the old registry's txs at this nonce stay fee-floor candidates for later replacements (R5
+    // #1); they are never broadcast and their receipts never complete this stage
+    ...(rep ? { floorHashes: rep.hashes, floorRaws: rep.raws, floorFrom: rep.from } : {}),
   };
   if (state.registryMigrated?.replace) {
     const { replace: done, ...migrated } = state.registryMigrated;
