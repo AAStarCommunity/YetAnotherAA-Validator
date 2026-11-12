@@ -113,14 +113,21 @@ export function stateProblems(st, { allowOverCap = false } = {}) {
  * only; an included one has already left the balance too, at its provisional cost. Any included
  * cost still unknown refuses; a balance above cap - spent - included costs is a top-up. Pure.
  */
+/** An alert when any included transaction's cost is still unknown, else null. Pure. */
+export function unknownCostAlert(st) {
+  const unknown = st.ledger.txs.filter(t => t.status === "included" && t.includedCost == null);
+  return unknown.length
+    ? {
+        key: "cost-unknown",
+        text: `the cost of included pause(s) ${unknown.map(t => t.nonce).join(", ")} cannot be read yet; nothing broadcast until it is`,
+      }
+    : null;
+}
+
 export function fundingGate(st, balance) {
   const inc = st.ledger.txs.filter(t => t.status === "included");
-  const unknown = inc.filter(t => t.includedCost == null);
-  if (unknown.length)
-    return {
-      key: "cost-unknown",
-      text: `the cost of included pause(s) ${unknown.map(t => t.nonce).join(", ")} cannot be read yet; nothing broadcast until it is`,
-    };
+  const u = unknownCostAlert(st);
+  if (u) return u;
   const included = inc.reduce((x, t) => x + big(t.includedCost), 0n);
   const budgetLeft = big(st.ledger.cap) - big(st.ledger.spent) - included;
   if (balance > budgetLeft)
@@ -703,6 +710,13 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
   }
   for (const op of candidates) {
     if (pending()) break;
+    // before EVERY new send: an inclusion whose cost is unknown (from the recovery wait above or
+    // the previous send) stops the round (Codex R11 P2)
+    const stop = unknownCostAlert(st);
+    if (stop) {
+      alerts.push(stop);
+      break;
+    }
     if (st.ledger.txs.some(t => HELD.has(t.status) && t.operator === op)) continue; // on its way
     const r = await send(st, { chain, signer, persist, cfg }, op);
     if (r) alerts.push(r);
@@ -713,12 +727,6 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     }
     report.sent.push(op);
     await waitIncluded();
-    // an inclusion whose cost could not be read stops the round (Codex R10 P2)
-    const g = st.ledger.txs.some(t => t.status === "included" && t.includedCost == null);
-    if (g) {
-      alerts.push(fundingGate(st, 0n));
-      break;
-    }
   }
   return { alerts, report };
 }

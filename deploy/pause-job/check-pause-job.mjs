@@ -17,6 +17,7 @@ import {
   costOf,
   provisionalCost,
   fundingGate,
+  unknownCostAlert,
   PIN,
   spIface,
 } from "./lib/core.mjs";
@@ -176,6 +177,20 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     cell(
       "fundingGate: a balance of exactly cap - spent - included passes",
       fundingGate(led([inc("15")]), 85n) === null
+    );
+    cell(
+      "unknownCostAlert: any included transaction with an unknown cost raises it; none, no alert",
+      unknownCostAlert(led([inc(null)]))?.key === "cost-unknown" &&
+        unknownCostAlert(led([inc("15")])) === null
+    );
+    // the control flow cannot be driven on anvil (an L1 chain never reads the OP oracle): this
+    // structural cell pins that the gate runs at the top of the send loop, BEFORE send() (R11 P2)
+    const src = readFileSync(join(here, "lib/core.mjs"), "utf8");
+    const loop = src.slice(src.indexOf("for (const op of candidates) {"));
+    cell(
+      "the unknown-cost gate runs before every new send in the candidate loop (structural)",
+      loop.indexOf("unknownCostAlert(st)") > 0 &&
+        loop.indexOf("unknownCostAlert(st)") < loop.indexOf("await send(")
     );
   }
   cell(
