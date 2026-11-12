@@ -167,8 +167,9 @@ file's absolute path (`/Users/<you>/.aoa-watcher/mirror_deploy_key`). Phase D
 checks the key file (`mirror-key`), a dry-run push with it (`mirror-push`), that
 it is the mirror repository's write deploy key (`mirror-deploy-key`), the
 ruleset (`mirror-ruleset`) and the repository's isolation
-(`mirror-repo-isolation`: Actions off, no secrets, one branch; listing secrets
-needs the repository admin's `gh`, so run Phase D as that admin).
+(`mirror-repo-isolation`: Actions off, no secrets, one branch). Listing the
+secrets and a ruleset's bypass list both need the mirror repository's admin, so
+run Phase D with that admin's `gh`: without it, both checks fail, never pass.
 
 ## 5. The Phase D config
 

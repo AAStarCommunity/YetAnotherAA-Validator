@@ -1820,6 +1820,8 @@ try {
       !hostsSeen.includes("other.example") &&
       typeof vcs === "string" &&
       vcs !== "ok" &&
+      // the error names the subcommand, not a leading "-c" (#428 review Low)
+      /^git fetch: /.test(vcs) &&
       vcsRan === false &&
       /deploy key file is missing/.test(dirKey ?? "") &&
       urls.one.length === 0 &&

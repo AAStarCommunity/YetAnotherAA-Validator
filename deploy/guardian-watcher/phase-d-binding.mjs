@@ -289,13 +289,29 @@ export function allBranchRulesetProblems(rulesets) {
     Array.isArray(r?.conditions?.ref_name?.include) &&
     r.conditions.ref_name.include.includes("~ALL") &&
     (r.conditions.ref_name.exclude ?? []).length === 0 &&
-    (r.bypass_actors ?? []).length === 0 &&
+    // the bypass list must be READ and empty (#428 re-review B1'): a reader without admin rights
+    // gets no bypass_actors field at all, which is not "no bypass"
+    Array.isArray(r.bypass_actors) &&
+    r.bypass_actors.length === 0 &&
     need.every(t => (r.rules ?? []).some(x => x?.type === t));
-  return rulesets.some(covers)
+  const problems = rulesets.some(covers)
     ? []
     : [
-        "no active ruleset on all branches (~ALL, no exclusion, no bypass) restricting creation, deletion and force-pushes",
+        "no active ruleset on all branches (~ALL, no exclusion, no bypass read and empty) restricting creation, deletion and force-pushes",
       ];
+  // a rule that refuses the watcher's own appends (an update restriction, a pull-request or status
+  // or signature requirement...) would let Phase D pass while every publication fails (#428
+  // re-review): an active branch ruleset may hold only these rule types
+  const allowed = new Set([...need, "required_linear_history"]);
+  const extra = rulesets
+    .filter(r => r?.enforcement === "active" && r?.target === "branch")
+    .flatMap(r => (r.rules ?? []).map(x => x?.type))
+    .filter(t => !allowed.has(t));
+  if (extra.length)
+    problems.push(
+      `an active branch ruleset also has ${[...new Set(extra)].map(t => String(t).slice(0, 40)).join(", ")}, which would refuse the watcher's appends`
+    );
+  return problems;
 }
 
 /**

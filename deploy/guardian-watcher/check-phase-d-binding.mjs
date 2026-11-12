@@ -479,13 +479,39 @@ cell(
     evaluate: [rs({ enforcement: "evaluate" })],
     noCreation: [rs({ rules: [{ type: "deletion" }, { type: "non_fast_forward" }] })],
     tag: [rs({ target: "tag" })],
+    // #428 re-review B1': an unread (absent) or null bypass list is not an empty one
+    bypassAbsent: [(({ bypass_actors: _b, ...r }) => r)(rs({}))],
+    bypassNull: [rs({ bypass_actors: null })],
+    noForce: [rs({ rules: [{ type: "creation" }, { type: "deletion" }] })],
+    // a rule that would refuse the watcher's appends (fails safe, but must not print PASS)
+    update: [
+      rs({
+        rules: [
+          { type: "creation" },
+          { type: "deletion" },
+          { type: "non_fast_forward" },
+          { type: "update" },
+        ],
+      }),
+    ],
     none: [],
     unread: null,
   };
   results.push({
     name: "Codex Phase D R5 mirror-ruleset: an active ~ALL ruleset (no exclusion, no bypass) with creation, deletion and non_fast_forward passes; one-branch, excluded, bypass, evaluate-only, missing rule, tag target, none or unreadable fail",
     ok:
-      allBranchRulesetProblems([rs({}), rs({ target: "tag" })]).length === 0 &&
+      allBranchRulesetProblems([
+        rs({}),
+        rs({ target: "tag", rules: [{ type: "update" }] }),
+        rs({
+          rules: [
+            { type: "creation" },
+            { type: "deletion" },
+            { type: "non_fast_forward" },
+            { type: "required_linear_history" },
+          ],
+        }),
+      ]).length === 0 &&
       Object.values(rsCases).every(c => allBranchRulesetProblems(c).length === 1),
     got: {
       pass: allBranchRulesetProblems([rs({})]),
