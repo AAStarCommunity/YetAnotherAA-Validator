@@ -96,56 +96,73 @@ as a decimal string; its `keystore` must be the same file as `phase-d.json`
 `sender.keystore`), the Pinata gateway, the Telegram chat id. Keep
 `publish.enabled: true` (`watcher-publish`).
 
-**The git mirror's deploy key** is a key file, not the ssh-agent: a launchd job
-started after a reboot without a login has no agent. The file lies inside the
-same trust boundary as the Keychain (M0 §5.5a: the Mini's operator is not
-defended against). What a leaked key can do (Codex Phase D R1 #3):
+**The git mirror lives in its own repository** (DSR), never in this one: this
+repository runs GitHub Actions with secrets, and a deploy key with write access
+could push a branch carrying a modified workflow that runs with those secrets.
+The mirror repository has no code, no Actions and no secrets, and one branch.
 
-- it can write to **this repository only**, but to the whole of it: push new
-  branches with any content, and push to any branch no rule protects. `master`
-  stays protected by its branch protection (a reviewed pull request is
-  required), so nothing it pushes reaches `master` unreviewed;
-- on `disclosure-records` the ruleset below blocks force-push and deletion, so
-  the **history** is kept: every commit the watcher made stays reachable. A
-  fast-forward commit can still delete or change record files in the branch's
-  latest tree;
-- the mirror is a third copy next to the registry and IPFS: a record is judged
-  by its CID and the registry entry, never by the mirror's latest tree alone.
+Its **deploy key** is a key file, not the ssh-agent: a launchd job started after
+a reboot without a login has no agent. The file lies inside the same trust
+boundary as the Keychain (M0 §5.5a: the Mini's operator is not defended
+against). What a leaked key can do: write to the mirror repository only. The
+ruleset below keeps every branch's history (no force-push, no deletion) and
+allows no new branch; a new commit can still change or delete record files in
+the branch's latest tree, so a record is judged by the registry's `recordHash`
+and its IPFS CID, never by the mirror alone. This repository and its secrets are
+outside the key's reach.
 
-```sh
-ssh-keygen -t ed25519 -N "" -C "aoa-watcher mirror $(id -un)@$(hostname -s)" -f ~/.aoa-watcher/mirror_deploy_key
-chmod 600 ~/.aoa-watcher/mirror_deploy_key
-cat ~/.aoa-watcher/mirror_deploy_key.pub        # public: add it as the deploy key below
-ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
-ssh-keygen -lf ~/.ssh/known_hosts | grep github.com
-# compare the SHA256 fingerprint with GitHub's published one before going on:
-# https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
-```
+1. **The repository** (an organization admin; the name is yours, the commands
+   use `aoa-disclosure-records`):
 
-On GitHub (repository admin): Settings → Deploy keys → Add deploy key, paste the
-`.pub` line, **tick "Allow write access"**. Then the bare clone, with that key
-only, and the branch as an empty root commit (records only, no source tree; the
-watcher only ever appends to it):
+   ```sh
+   R=AAStarCommunity/aoa-disclosure-records
+   gh repo create $R --public --description "Guardian watcher disclosure records (mirror; no code)"
+   gh api -X PUT repos/$R/actions/permissions -F enabled=false     # Actions off
+   gh api repos/$R/actions/secrets --jq .total_count               # expect 0; never add one
+   ```
 
-```sh
-export GIT_SSH_COMMAND="ssh -F /dev/null -o IdentityFile=$HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
-git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git
-M=~/.aoa-watcher/mirror.git
-ROOT=$(git -C $M commit-tree $(git -C $M hash-object -t tree -w /dev/null) -m "disclosure records")
-git -C $M push origin "$ROOT:refs/heads/disclosure-records"
-git -C $M fetch origin disclosure-records
-unset GIT_SSH_COMMAND
-```
+2. **The key file and GitHub's host key:**
 
-Then the ruleset (once): Settings → Rules → Rulesets → New branch ruleset,
-target `disclosure-records`, enforcement **Active**, rules **Restrict
-deletions** and **Block force pushes**, no pull-request requirement, no bypass
-list.
+   ```sh
+   ssh-keygen -t ed25519 -N "" -C "aoa-watcher mirror $(id -un)@$(hostname -s)" -f ~/.aoa-watcher/mirror_deploy_key
+   chmod 600 ~/.aoa-watcher/mirror_deploy_key
+   cat ~/.aoa-watcher/mirror_deploy_key.pub        # public: the deploy key below
+   ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+   ssh-keygen -lf ~/.ssh/known_hosts | grep github.com
+   # compare the SHA256 fingerprint with GitHub's published one before going on:
+   # https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+   ```
 
-and in `config.json` `publish.mirror.sshKey` is the key file's absolute path
-(`/Users/<you>/.aoa-watcher/mirror_deploy_key`). Phase D checks the key file
-(`mirror-key`), a dry-run push with it (`mirror-push`) and the ruleset
-(`mirror-ruleset`).
+3. **The deploy key, on the mirror repository only:** its Settings → Deploy keys
+   → Add deploy key, paste the `.pub` line, **tick "Allow write access"**. Never
+   add it to any other repository.
+
+4. **The bare clone and the branch**, an empty root commit (records only; the
+   watcher only ever appends to it), with that key only:
+
+   ```sh
+   export GIT_SSH_COMMAND="ssh -F /dev/null -o IdentityFile=$HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
+   git clone --bare git@github.com:$R.git ~/.aoa-watcher/mirror.git     # an empty repository: a warning is expected
+   M=~/.aoa-watcher/mirror.git
+   ROOT=$(git -C $M commit-tree $(git -C $M hash-object -t tree -w /dev/null) -m "disclosure records")
+   git -C $M push origin "$ROOT:refs/heads/disclosure-records"
+   git -C $M fetch origin disclosure-records
+   unset GIT_SSH_COMMAND
+   ```
+
+5. **The ruleset**, after the branch exists (it forbids creating branches): the
+   mirror repository's Settings → Rules → Rulesets → New branch ruleset, target
+   **All branches**, enforcement **Active**, rules **Restrict creations**,
+   **Restrict deletions** and **Block force pushes**, no pull-request
+   requirement, no bypass list.
+
+In `config.json`: `publish.mirror.repoUrl` is
+`https://github.com/<the mirror repository>` and `publish.mirror.sshKey` the key
+file's absolute path (`/Users/<you>/.aoa-watcher/mirror_deploy_key`). Phase D
+checks the key file (`mirror-key`), a dry-run push with it (`mirror-push`), the
+ruleset (`mirror-ruleset`) and the repository's isolation
+(`mirror-repo-isolation`: Actions off, no secrets, one branch; listing secrets
+needs the repository admin's `gh`, so run Phase D as that admin).
 
 ## 5. The Phase D config
 
@@ -253,7 +270,8 @@ line:
 | `onchain:binding` and the on-chain facts                  | the contracts equal the watcher config; `aggregator.DVT_VALIDATOR == dvtValidator`, `categoryCount == 0`, `fraudProofVerifier == 0`, owner is the Safe                                                                                                                               |
 | `mirror-key`                                              | `publish.mirror.sshKey` is a regular file (not a symlink), mode 600, owned by this account, and loads without a passphrase                                                                                                                                                           |
 | `mirror-push`                                             | with that key only (no agent), `ls-remote` finds the branch and a dry-run push of its own tip is accepted (the key may write)                                                                                                                                                        |
-| `mirror-ruleset`                                          | the branch's active rules block force-pushes and deletion                                                                                                                                                                                                                            |
+| `mirror-ruleset`                                          | the branch's active rules block force-pushes, deletion and branch creation                                                                                                                                                                                                           |
+| `mirror-repo-isolation`                                   | the mirror repository has Actions disabled, no Actions secrets, and exactly one branch (needs the repository admin's `gh`)                                                                                                                                                           |
 | `release:spCommit`, `evidence:spParity`, `evidence:a3`    | the release commit is set and both evidence reports pass for it                                                                                                                                                                                                                      |
 
 A MISSING line names what is not set or not reachable; a FAIL line names what is
@@ -393,22 +411,21 @@ and disclosed again on the new registry as usual.
 1. generate a new key file next to the old one
    (`ssh-keygen -t ed25519 -N "" -f ~/.aoa-watcher/mirror_deploy_key.new`,
    `chmod 600`);
-2. add its `.pub` as a new deploy key **with write access**;
+2. add its `.pub` as a new deploy key **with write access**, on the mirror
+   repository only;
 3. stop the watcher, move the new file over `mirror_deploy_key`, start the
    watcher, and run Phase D (`mirror-key`, `mirror-push` must pass);
-4. delete the **old** deploy key on GitHub, and delete the old file.
+4. delete the **old** deploy key on the mirror repository, and delete the old
+   file.
 
 **A leak** (the file was copied, or the Mini's account is suspected):
 
-1. delete the deploy key on GitHub at once: the key can no longer push;
-2. check what it was used for, from the repository's activity
-   (`gh api repos/<owner>/<repo>/activity`, or Insights → Activity):
-   - branches it created: delete them (none can have reached `master` without a
-     reviewed pull request);
-   - commits on `disclosure-records` the watcher did not make: the history is
-     intact (force-push is blocked), so compare every record file with its
-     journal, its IPFS CID and its registry entry, and restore any changed or
-     deleted file with a new commit, never by a force-push;
+1. delete the deploy key on the mirror repository at once: it can no longer
+   push. It never had access to any other repository;
+2. compare the mirror with the records: the history is intact (no force-push, no
+   deletion, no new branch), so compare every record file in the latest tree
+   with its journal, its IPFS CID and the registry's `recordHash`, and restore
+   any changed or deleted file with a new commit, never by a force-push;
 3. rotate as above (a new key file and deploy key). If the Mini's account itself
    is suspected, the sender key and the Keychain items are suspect too: follow
    M0 §5.5a (a leaked sender key) as well.

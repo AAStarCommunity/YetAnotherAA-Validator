@@ -34,6 +34,7 @@ import {
   publishBindingProblems,
   mirrorKeyProblems,
   mirrorRulesetProblems,
+  mirrorIsolationProblems,
 } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -155,7 +156,7 @@ else {
   const m = wcfg?.publish?.mirror;
   const branch = m?.branch ?? "disclosure-records";
   if (!wcfg)
-    for (const id of ["mirror-key", "mirror-push", "mirror-ruleset"])
+    for (const id of ["mirror-key", "mirror-push", "mirror-ruleset", "mirror-repo-isolation"])
       add(id, "MISSING", "needs the watcher config");
   else if (placeholder(m?.sshKey)) {
     add("mirror-key", "MISSING", "publish.mirror.sshKey not set");
@@ -249,8 +250,10 @@ else {
     const repo = /^https:\/\/github\.com\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)$/.exec(
       String(m?.repoUrl ?? "")
     );
-    if (!repo) add("mirror-ruleset", "MISSING", "publish.mirror.repoUrl not set");
-    else {
+    if (!repo) {
+      add("mirror-ruleset", "MISSING", "publish.mirror.repoUrl not set");
+      add("mirror-repo-isolation", "MISSING", "publish.mirror.repoUrl not set");
+    } else {
       const r = spawnSync("gh", ["api", `repos/${repo[1]}/rules/branches/${branch}`], {
         encoding: "utf8",
         timeout: 30_000,
@@ -265,7 +268,33 @@ else {
       add(
         "mirror-ruleset",
         rp.length ? "FAIL" : "PASS",
-        rp.length ? rp.join("; ") : `${branch}: force-push and deletion blocked`
+        rp.length ? rp.join("; ") : `${branch}: force-push, deletion and branch creation blocked`
+      );
+      // the mirror's repository holds nothing a leaked key could reach beyond the records (DSR):
+      // Actions off, no secrets, one branch. Listing secrets needs the repository admin's gh.
+      const gh = path => {
+        const x = spawnSync("gh", ["api", "--paginate", path], {
+          encoding: "utf8",
+          timeout: 30_000,
+        });
+        if (x.status !== 0) return null;
+        try {
+          // --paginate concatenates JSON arrays page by page ("][" joins)
+          return JSON.parse(String(x.stdout).replace(/\]\s*\[/g, ","));
+        } catch {
+          return null;
+        }
+      };
+      const ip = mirrorIsolationProblems({
+        actions: gh(`repos/${repo[1]}/actions/permissions`),
+        secrets: gh(`repos/${repo[1]}/actions/secrets`),
+        branches: gh(`repos/${repo[1]}/branches`),
+        branch,
+      });
+      add(
+        "mirror-repo-isolation",
+        ip.length ? "FAIL" : "PASS",
+        ip.length ? ip.join("; ") : `Actions off, no secrets, only ${branch}`
       );
     }
   }

@@ -264,5 +264,27 @@ export function mirrorRulesetProblems(rules) {
   const problems = [];
   if (!types.has("non_fast_forward")) problems.push("force-pushes are not blocked");
   if (!types.has("deletion")) problems.push("deletion is not blocked");
+  // the dedicated mirror repository allows no new branch (DSR): a leaked key cannot add one
+  if (!types.has("creation")) problems.push("branch creation is not blocked");
+  return problems;
+}
+
+/**
+ * The mirror's dedicated repository is isolated (DSR): Actions disabled (a pushed workflow cannot
+ * run), no Actions secrets, and exactly one branch, the mirror's. `actions` is GitHub's
+ * actions/permissions answer, `secrets` actions/secrets, `branches` the branch list (null =
+ * unreadable). Returns the problems, in fixed wording.
+ */
+export function mirrorIsolationProblems({ actions, secrets, branches, branch }) {
+  const problems = [];
+  if (!actions || typeof actions.enabled !== "boolean")
+    problems.push("the repository's Actions settings could not be read");
+  else if (actions.enabled !== false) problems.push("GitHub Actions is enabled on the repository");
+  if (!secrets || !Number.isSafeInteger(secrets.total_count))
+    problems.push("the repository's secrets could not be listed (needs the repository admin's gh)");
+  else if (secrets.total_count !== 0) problems.push("the repository has Actions secrets");
+  if (!Array.isArray(branches)) problems.push("the repository's branches could not be listed");
+  else if (branches.length !== 1 || branches[0]?.name !== branch)
+    problems.push(`the repository must have exactly one branch, ${branch}`);
   return problems;
 }

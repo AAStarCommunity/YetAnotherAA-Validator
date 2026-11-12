@@ -17,6 +17,7 @@ import {
   publishBindingProblems,
   mirrorKeyProblems,
   mirrorRulesetProblems,
+  mirrorIsolationProblems,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -461,19 +462,45 @@ cell(
   const full = mirrorRulesetProblems([
     { type: "deletion" },
     { type: "non_fast_forward" },
+    { type: "creation" },
     { type: "x" },
   ]);
-  const noForce = mirrorRulesetProblems([{ type: "deletion" }]);
-  const noDel = mirrorRulesetProblems([{ type: "non_fast_forward" }]);
+  const noForce = mirrorRulesetProblems([{ type: "deletion" }, { type: "creation" }]);
+  const noDel = mirrorRulesetProblems([{ type: "non_fast_forward" }, { type: "creation" }]);
+  const noCreate = mirrorRulesetProblems([{ type: "non_fast_forward" }, { type: "deletion" }]);
   const unread = mirrorRulesetProblems(null);
   results.push({
-    name: "DSR mirror-ruleset: passes only when force-push AND deletion are blocked; unreadable rules fail",
+    name: "DSR mirror-ruleset: passes only when force-push, deletion AND branch creation are blocked; unreadable rules fail",
     ok:
       full.length === 0 &&
       /force-pushes/.test(noForce.join()) &&
       /deletion/.test(noDel.join()) &&
+      /creation/.test(noCreate.join()) &&
       unread.length === 1,
-    got: { full, noForce, noDel, unread },
+    got: { full, noForce, noDel, noCreate, unread },
+  });
+  const B = "disclosure-records";
+  const iso = o =>
+    mirrorIsolationProblems({
+      actions: { enabled: false },
+      secrets: { total_count: 0 },
+      branches: [{ name: B }],
+      branch: B,
+      ...o,
+    });
+  const isoCases = {
+    actionsOn: iso({ actions: { enabled: true } }),
+    actionsUnread: iso({ actions: null }),
+    secrets: iso({ secrets: { total_count: 2 } }),
+    secretsUnread: iso({ secrets: null }),
+    twoBranches: iso({ branches: [{ name: B }, { name: "x" }] }),
+    otherBranch: iso({ branches: [{ name: "master" }] }),
+    branchesUnread: iso({ branches: null }),
+  };
+  results.push({
+    name: "DSR mirror-repo-isolation: Actions off, no secrets, only the mirror branch passes; Actions on, any secret, another or a second branch, or anything unreadable fails",
+    ok: iso({}).length === 0 && Object.values(isoCases).every(p => p.length === 1),
+    got: { pass: iso({}), isoCases },
   });
 }
 
