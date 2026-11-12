@@ -424,6 +424,32 @@ cell(
         "/repo"
       ).includes("committee-keeper.mjs")
     );
+    const fs6 = {
+      "/repo/inner": "node /repo/deploy/committee-keeper.mjs",
+      "/repo/a.sh": "/bin/bash inner",
+      "/repo/b.sh": 'bash "inner"',
+    };
+    const rt6 = p => (fs6[p] !== undefined ? { kind: "text", text: fs6[p] } : { kind: "none" });
+    cell(
+      'runsSender: argv ["/bin/bash", "inner"], a wrapper with "/bin/bash inner", and bash "inner" are all followed (Codex R8 P2)',
+      runsSender(["/bin/bash", "inner"], rt6, "/repo").includes("committee-keeper.mjs") &&
+        runsSender(["/bin/bash", "/repo/a.sh"], rt6, "/repo").includes("committee-keeper.mjs") &&
+        runsSender(["/bin/bash", "/repo/b.sh"], rt6, "/repo").includes("committee-keeper.mjs")
+    );
+    {
+      const deep = {};
+      for (let i = 0; i < 5; i++) deep[`/e/w${i}.sh`] = `exec /e/w${i + 1}.sh`;
+      cell(
+        "runsSender: an UNREADABLE file past the depth limit is reported too (Codex R8 P2)",
+        runsSender(["/bin/bash", "/e/w0.sh"], p =>
+          deep[p] !== undefined
+            ? { kind: "text", text: deep[p] }
+            : p === "/e/w5.sh"
+              ? { kind: "unreadable" }
+              : { kind: "none" }
+        ).some(x => x.includes("not followed past depth"))
+      );
+    }
     const chain6 = {};
     for (let i = 0; i < 6; i++) chain6[`/d/w${i}.sh`] = `exec /d/w${i + 1}.sh`;
     chain6["/d/w6.sh"] = "node /repo/deploy/committee-keeper.mjs";

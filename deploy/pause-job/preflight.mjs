@@ -41,8 +41,14 @@ const JS_FILE = /\.(mjs|cjs|js|ts)$/;
 // a text file; binaries and non-files are skipped by readText
 const REL_TOKEN =
   /(?:^|[\s"'=(;|&`])((?:\.{1,2}\/|[A-Za-z0-9_-]+\/)[A-Za-z0-9_./-]*[A-Za-z0-9_-])(?=$|[\s"');|&`])/gm;
-const INTERP_TOKEN =
-  /(?:^|[\s;|&(`])(?:bash|sh|zsh|dash|ksh|node|python3?|exec|source|\.)\s+(?:-[A-Za-z]+\s+)*([A-Za-z0-9_][A-Za-z0-9_.-]*)(?=$|[\s"');|&`])/gm;
+// an interpreter (bare or by absolute path) or exec/source, then flags, then a script name,
+// possibly quoted (Codex R8 P2)
+const INTERPRETER = "(?:\\/[A-Za-z0-9_./-]*\\/)?(?:bash|sh|zsh|dash|ksh|node|python3?)";
+const INTERP_TOKEN = new RegExp(
+  `(?:^|[\\s;|&(\`])(?:${INTERPRETER}|exec|source|\\.)\\s+(?:-[A-Za-z]+\\s+)*["']?([A-Za-z0-9_][A-Za-z0-9_.-]*)["']?(?=$|[\\s"');|&\`])`,
+  "gm"
+);
+const INTERPRETER_ARG = new RegExp(`^${INTERPRETER}$`);
 const ABS_TOKEN = /(?:^|[\s"'=(;|&`])(\/[A-Za-z0-9_./-]+)(?=$|[\s"');|&`])/gm;
 
 /**
@@ -97,7 +103,8 @@ export function runsSender(args, readText = () => ({ kind: "none" }), cwd = null
     if (!path || seen.has(path)) return;
     // a wrapper chain deeper than we follow is not certified clean (Codex R7 P2)
     if (level > depth) {
-      if (readText(path).kind === "text") hits.add(`<not followed past depth ${depth}: ${path}>`);
+      // readable or not, a file there is not certified (Codex R8 P2)
+      if (readText(path).kind !== "none") hits.add(`<not followed past depth ${depth}: ${path}>`);
       return;
     }
     seen.add(path);
@@ -108,6 +115,12 @@ export function runsSender(args, readText = () => ({ kind: "none" }), cwd = null
     for (const s of SENDING_SCRIPTS) if (code.includes(s)) hits.add(s);
     follow(code, level + 1, posix.dirname(path));
   };
+  // argv itself: [interpreter, flags..., script, ...]: the script may be a bare, extensionless name
+  // resolved against the working directory (`["/bin/bash", "inner"]`, Codex R8 P2)
+  if (args.length > 1 && INTERPRETER_ARG.test(args[0])) {
+    const script = args.slice(1).find(a => !a.startsWith("-"));
+    if (script && !script.startsWith("/") && !/\s/.test(script)) visit(resolve(script, cwd), 0);
+  }
   for (const a of args) {
     for (const s of SENDING_SCRIPTS) if (a.includes(s)) hits.add(s);
     if (a.startsWith("/")) visit(a, 0);

@@ -825,6 +825,40 @@ await section(async () => {
   );
 });
 
+await section(async () => {
+  // a top-up that replaces an INCLUDED (not yet final) pause's cost is caught (Codex R8 P2)
+  const j = await fresh();
+  const [a, b] = [
+    "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  ].sort();
+  const bData = spIface.encodeFunctionData("pauseUnderstakedOperator", [b]).toLowerCase();
+  const noB = {
+    ...chain,
+    estimateGas: tx =>
+      tx.data.toLowerCase() === bData ? Promise.reject(new Error("x")) : chain.estimateGas(tx),
+  };
+  await j.round({ chain: noB });
+  const included =
+    j.st.ledger.txs.length === 1 &&
+    j.st.ledger.txs[0].status === "included" &&
+    j.st.ledger.spent === "0";
+  await p.send("anvil_setBalance", [j.w.address, ethers.toQuantity(10n ** 18n)]); // back to the cap
+  const r = await j.round();
+  cell(
+    "top-up over an included, unfinalized cost: no broadcast, topup alert (b stays unpaused)",
+    included &&
+      r.report.sent.length === 0 &&
+      !(await isPaused(b)) &&
+      r.alerts.some(x => x.key === "topup"),
+    { included, sent: r.report.sent, a: r.alerts }
+  );
+  void a;
+});
+
+await revert(u9b);
+const u9c = await snapshot();
+
 // ---- C8: another use of the key stops the round
 await section(async () => {
   const j = await fresh();
@@ -873,7 +907,7 @@ await section(async () => {
     msg
   );
 });
-await revert(u9b);
+await revert(u9c);
 const u10 = await snapshot();
 
 // ---- C9: a failed getLogs range is retried, never skipped

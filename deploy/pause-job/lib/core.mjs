@@ -287,6 +287,22 @@ async function isPaused(st, chain, B, op) {
   return spIface.decodeFunctionResult("operators", out).isPaused;
 }
 
+/**
+ * Mark `t` included by receipt `r`, recording its provisional cost from the receipt (execution,
+ * plus the receipt's own l1Fee on OP) for the funding check; the reservation stays held and the
+ * final cost is computed at finality (Codex R8 P2).
+ */
+function markIncluded(t, r, chainId) {
+  t.status = "included";
+  t.includedHash = r.transactionHash;
+  t.includedBlock = Number(r.blockNumber);
+  t.includedBlockHash = r.blockHash;
+  t.pendingRounds = 0;
+  t.includedCost = String(
+    costOf(r, chainId, OP_CHAINS.has(chainId) ? { l1Fee: 0n, operatorFee: 0n } : null)
+  );
+}
+
 /** The receipt of any hash ever signed for `t`'s nonce, or null. */
 async function receiptOf(chain, t) {
   const ours = new Set(t.hashes.map(lc));
@@ -313,13 +329,7 @@ async function reconcile(stLive, chain, persist, finalized) {
   const st = structuredClone(stLive);
   const alerts = [];
   const l = st.ledger;
-  const include = (t, r) => {
-    t.status = "included";
-    t.includedHash = r.transactionHash;
-    t.includedBlock = Number(r.blockNumber);
-    t.includedBlockHash = r.blockHash;
-    t.pendingRounds = 0;
-  };
+  const include = (t, r) => markIncluded(t, r, st.chainId);
   for (const t of l.txs) {
     if (!HELD.has(t.status)) continue;
     const r = await receiptOf(chain, t);
@@ -333,6 +343,7 @@ async function reconcile(stLive, chain, persist, finalized) {
       delete t.includedHash;
       delete t.includedBlock;
       delete t.includedBlockHash;
+      delete t.includedCost;
     }
     if (PENDING.has(t.status) && r) include(t, r);
     if (t.status !== "included" || t.includedBlock > finalized) continue;
@@ -624,7 +635,11 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     return { alerts, report };
   }
   report.balance = String(balance);
-  const budgetLeft = big(st.ledger.cap) - big(st.ledger.spent);
+  // spent covers final transactions only; an included one has already left the balance too
+  const includedCost = st.ledger.txs
+    .filter(t => t.status === "included")
+    .reduce((x, t) => x + big(t.includedCost ?? t.reserve), 0n);
+  const budgetLeft = big(st.ledger.cap) - big(st.ledger.spent) - includedCost;
   if (balance > budgetLeft) {
     alerts.push({
       key: "topup",
@@ -640,11 +655,7 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
       const t = st.ledger.txs.find(x => PENDING.has(x.status));
       const rc = await receiptOf(chain, t).catch(() => null);
       if (rc) {
-        t.status = "included";
-        t.includedHash = rc.transactionHash;
-        t.includedBlock = Number(rc.blockNumber);
-        t.includedBlockHash = rc.blockHash;
-        t.pendingRounds = 0;
+        markIncluded(t, rc, st.chainId);
         await persist(st);
       } else await new Promise(res => setTimeout(res, cfg.pollMs ?? 3000));
     }
