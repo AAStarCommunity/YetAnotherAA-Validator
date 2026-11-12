@@ -121,6 +121,10 @@ last check and inclusion. If one does, the ledger shows `spent + reserved > cap`
 and the job stops sending (fail closed) until a new funding. The overrun itself
 is recorded: the final cost is written to the journal, not discarded.
 
+**The absolute bound is the funding (DSR 65db9e38).** Fund the signer with
+exactly the cap, 0.1 ETH on Sepolia and 0.02 ETH on OP, and never top it up
+without a fresh go from DSR.
+
 A new cap is a new funding: start a new ledger (a new state) for it. Do not edit
 `cap`, which the job refuses.
 

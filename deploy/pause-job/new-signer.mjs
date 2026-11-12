@@ -43,7 +43,7 @@ let password;
 try {
   password = readSecretFile(SECRET_NAMES.keystorePassword, secrets);
 } catch (e) {
-  fail(e?.name === "SafeError" ? e.message : "the keystore password is unreadable");
+  fail(`the keystore unlock file: ${e?.name === "SafeError" ? e.message : "unreadable"}`);
 }
 if (password.length < 16) fail("the keystore password is shorter than 16 characters");
 

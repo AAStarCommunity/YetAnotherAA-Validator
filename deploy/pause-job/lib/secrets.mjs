@@ -67,11 +67,13 @@ const defaultFs = { lstatSync, openSync, fstatSync, readSync, closeSync };
 /**
  * Read one secret from `dir`: the directory checked, the file opened without following a symlink
  * and checked on its descriptor (so the checked file is the one read), then its value. `fs` and
- * `uid` are injectable for tests. Throws SafeError naming the item.
+ * `uid` are injectable for tests. Throws a SafeError with the reason only: the caller names the
+ * item with its own fixed label (no secret's file name or value reaches a log; CodeQL
+ * js/clear-text-logging on #432).
  */
 export function readSecretFile(name, dir, { fs = defaultFs, uid = process.getuid() } = {}) {
   const fail = why => {
-    throw new SafeError(`secret ${name}: ${why}`);
+    throw new SafeError(why);
   };
   if (!Object.values(SECRET_NAMES).includes(name)) fail("not a known secret name");
   if (!okDir(dir)) fail("the secrets directory is not an absolute plain path");

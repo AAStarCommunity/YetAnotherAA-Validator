@@ -209,25 +209,29 @@ async function main() {
   );
   if (dp.length)
     die(78, `state directory: ${dp.join("; ").replaceAll("secrets directory", "state directory")}`);
-  const secret = n => {
+  // `label` is fixed text for the operator; the reason comes from our own checks (SafeError)
+  const secret = (n, label) => {
     try {
       return readSecretFile(n, secrets);
     } catch (e) {
-      die(78, e?.name === "SafeError" ? e.message : `secret ${n}: unreadable`);
+      die(78, `${label}: ${e?.name === "SafeError" ? e.message : "unreadable"}`);
     }
   };
   let wallet;
   try {
     const ks = readFileSync(tilde(cfg.keystore), "utf8");
-    wallet = await ethers.Wallet.fromEncryptedJson(ks, secret(SECRET_NAMES.keystorePassword));
+    wallet = await ethers.Wallet.fromEncryptedJson(
+      ks,
+      secret(SECRET_NAMES.keystorePassword, "the keystore unlock file")
+    );
   } catch (e) {
     die(78, e?.name === "SafeError" ? e.message : "the keystore cannot be opened");
   }
   const providers = [
-    { name: cfg.rpc.primary, url: secret(SECRET_NAMES.rpcPrimary) },
-    { name: cfg.rpc.fallback, url: secret(SECRET_NAMES.rpcFallback) },
+    { name: cfg.rpc.primary, url: secret(SECRET_NAMES.rpcPrimary, "the primary RPC file") },
+    { name: cfg.rpc.fallback, url: secret(SECRET_NAMES.rpcFallback, "the fallback RPC file") },
   ];
-  const token = cfg.telegram ? secret(SECRET_NAMES.telegram) : null;
+  const token = cfg.telegram ? secret(SECRET_NAMES.telegram, "the alert bot token file") : null;
 
   // one instance: an OS-held lock (a listening socket on 127.0.0.1:lockPort). The kernel releases
   // it when the process dies, so there is no stale lock to take over and no takeover race.
