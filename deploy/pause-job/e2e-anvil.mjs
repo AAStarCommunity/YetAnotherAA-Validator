@@ -823,6 +823,38 @@ await section(async () => {
     msg
   );
 });
+await section(async () => {
+  // a foreign use of the key AT a nonce the journal still holds as pending (clestons B3): our
+  // journalled bytes never went out (crash after the durable write); the key is used elsewhere
+  const j = await fresh();
+  let crashed = false;
+  try {
+    await j.round({
+      persist: s => {
+        writeDurable(j.path, s);
+        if (!crashed && s.ledger.txs.some(t => t.status === "signed")) {
+          crashed = true;
+          throw new Error("crash");
+        }
+      },
+    });
+  } catch {
+    /* the crash */
+  }
+  const st = JSON.parse(readFileSync(j.path, "utf8"));
+  await (await j.w.connect(p).sendTransaction({ to: j.w.address, value: 0n, nonce: 0 })).wait();
+  let msg = "";
+  try {
+    await runRound(st, { chain, signer: j.signer, persist: () => {}, cfg: CFG });
+  } catch (e) {
+    msg = e.message;
+  }
+  cell(
+    "nonce history: a pending journalled nonce consumed by a foreign transaction stops the round",
+    crashed && /consumed by a transaction the job did not journal/.test(msg),
+    msg
+  );
+});
 await revert(u9b);
 const u10 = await snapshot();
 
@@ -935,6 +967,22 @@ await section(async () => {
     "CLI: a second run while the lock is held exits 75",
     locked.code === 75 && /holds the lock/.test(locked.out),
     locked
+  );
+  const lockStatus = JSON.parse(readFileSync(join(home, "state/status.json"), "utf8"));
+  cell(
+    "CLI: a startup failure (lock held) is not silent: status.json names it (clestons B2)",
+    /holds the lock/.test(lockStatus.startup ?? ""),
+    lockStatus
+  );
+  const good = readFileSync(join(home, "state/state.json"));
+  writeFileSync(join(home, "state/state.json"), "{", { mode: 0o600 });
+  const corrupt = cli([]);
+  const corruptStatus = JSON.parse(readFileSync(join(home, "state/status.json"), "utf8"));
+  writeFileSync(join(home, "state/state.json"), good, { mode: 0o600 });
+  cell(
+    "CLI: an unreadable state.json exits 1 with a startup status, not silently",
+    corrupt.code === 1 && /startup/.test(corruptStatus.startup ?? ""),
+    { corrupt, corruptStatus }
   );
   const leaked = [
     init.out,

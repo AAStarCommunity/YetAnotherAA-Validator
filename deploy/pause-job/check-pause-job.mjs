@@ -398,6 +398,16 @@ cell(
       "runsSender: shell globs `/tmp/*` ... `*/` are not taken for a comment (Codex R4 P2-2)",
       runsSender(["/bin/bash", "/g/globs.sh"], rt2).includes("committee-keeper.mjs")
     );
+    const fs3 = {
+      "/w/outer.sh": "exec /w/bin/run-keeper --watch",
+      "/w/bin/run-keeper": "#!/bin/sh\nnode /repo/deploy/register-node.mjs",
+    };
+    cell(
+      "runsSender: an extensionless absolute path inside a wrapper is followed (clestons L4)",
+      runsSender(["/bin/bash", "/w/outer.sh"], p =>
+        fs3[p] !== undefined ? { kind: "text", text: fs3[p] } : { kind: "none" }
+      ).includes("register-node.mjs")
+    );
   }
   {
     // the real `launchctl print` shape (tabs, blocks), values abbreviated
@@ -501,6 +511,15 @@ cell(
       run(plist, args, sha, undefined, LOADED_ENV, ["BASH_ENV"]).some(x =>
         x.includes("start-up variable")
       )
+    );
+    cell(
+      "reviewed: NODE_OPTIONS or DYLD_* in the loaded or inherited environment fails (clestons L4)",
+      run(plist, args, sha, undefined, [...LOADED_ENV, "NODE_OPTIONS"]).some(x =>
+        x.includes("start-up variable")
+      ) &&
+        run(plist, args, sha, undefined, LOADED_ENV, ["DYLD_INSERT_LIBRARIES"]).some(x =>
+          x.includes("start-up variable")
+        )
     );
     cell(
       "reviewed: an unreadable loaded environment fails closed",

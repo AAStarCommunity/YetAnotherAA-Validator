@@ -164,6 +164,17 @@ over.
 
 ## Preflight (DSR 502ccd64)
 
+**What preflight is, and what it is not (clestons #432 L4).** Preflight guards
+against operator mistakes, such as a forgotten keeper still loaded or an armed
+node container. It is not a security boundary. Anything running as this account
+could defeat it, for example with a wrapper that builds its path at run time, a
+binary that sends transactions, or a job installed after the check ran. The
+boundary is elsewhere:
+
+- a signer that holds no role;
+- the funding cap;
+- the on-chain identity check that runs every round.
+
 `preflight.mjs` covers the three Phase D items that live on DVT's own host.
 Until this PR merged, they were manual items on the launch checklist.
 

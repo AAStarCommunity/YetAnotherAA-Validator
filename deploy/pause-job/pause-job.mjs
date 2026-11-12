@@ -23,8 +23,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ethers } from "ethers";
 import { emptyState, runRound, stateProblems } from "./lib/core.mjs";
-import { readSecretFile, secretsDirProblems, okDir, SECRET_NAMES } from "./lib/secrets.mjs";
-import { SafeError, safeText } from "./lib/safe-error.mjs";
+import { readSecretFile, dirProblems, okDir, SECRET_NAMES } from "./lib/secrets.mjs";
+import { SafeError, safeText, isOurs } from "./lib/safe-error.mjs";
 
 /** The cumulative spend ceiling per chain (DSR 4019916a condition 5); config may only lower it. */
 export const CAP_CEILING = {
@@ -75,6 +75,13 @@ export function configProblems(c) {
     p.push("telegram must be null or { chatId }");
   if (!Number.isSafeInteger(c.lockPort) || c.lockPort < 1024 || c.lockPort > 65535)
     p.push("lockPort must be a port in 1024..65535");
+  for (const [k, lo, hi] of [
+    ["receiptWaitMs", 1000, 300_000],
+    ["pollMs", 100, 60_000],
+    ["bumpAfterRounds", 1, 100],
+  ])
+    if (c[k] !== undefined && (!Number.isSafeInteger(c[k]) || c[k] < lo || c[k] > hi))
+      p.push(`${k}, when set, must be an integer in ${lo}..${hi}`);
   if (!Number.isSafeInteger(c.realertMinutes) || c.realertMinutes < 1)
     p.push("realertMinutes must be a positive integer");
   // provider NAMES only (DSR bd595f0f: alchemy primary, infura fallback); the URLs are secret files
@@ -118,7 +125,10 @@ export function writeDurable(path, obj) {
 
 /** A JSON-RPC chain over one URL. Every error leaving here is a SafeError category (no URL). */
 export function rpcChain(url) {
-  const p = new ethers.JsonRpcProvider(url, undefined, {
+  // every request bounded (clestons L3: the ethers default is 300 s)
+  const req = new ethers.FetchRequest(url);
+  req.timeout = 30_000;
+  const p = new ethers.JsonRpcProvider(req, undefined, {
     staticNetwork: true,
     batchMaxCount: 1,
     cacheTimeout: -1,
@@ -203,21 +213,66 @@ async function main() {
   if (cp.length) die(78, `config: ${cp.join("; ")}`);
   const stateDir = tilde(cfg.stateDir);
   const secrets = tilde(cfg.secretsDir);
-  const dp = secretsDirProblems(
+  const dp = dirProblems(
     existsSync(stateDir) ? lstatSync(stateDir) : null,
-    process.getuid()
+    process.getuid(),
+    "state directory"
   );
-  if (dp.length)
-    die(78, `state directory: ${dp.join("; ").replaceAll("secrets directory", "state directory")}`);
+  if (dp.length) die(78, `state directory: ${dp.join("; ")}`);
+  const statusPath = join(stateDir, "status.json");
   // `label` is fixed text for the operator; the reason comes from our own checks (SafeError)
   const secret = (n, label) => {
     try {
       return readSecretFile(n, secrets);
     } catch (e) {
-      die(78, `${label}: ${e?.name === "SafeError" ? e.message : "unreadable"}`);
+      throw new SafeError(`${label}: ${isOurs(e) ? e.message : "unreadable"}`);
     }
   };
+  // failures from here on are not silent (clestons B2): a minimal status.json, and once the bot
+  // token is read, a "startup:" alert (re-alerted at most every realertMinutes) before exiting
+  let token = null;
+  const fatal = async (code, text) => {
+    try {
+      writeDurable(statusPath, {
+        schema: "aoa-pause-job-status/1",
+        at: new Date().toISOString(),
+        chainId: cfg.chainId,
+        startup: text,
+      });
+    } catch {
+      /* status is best effort; the exit code and the log still carry it */
+    }
+    if (token) {
+      const stampPath = join(stateDir, "startup-alerts.json");
+      let stamps = {};
+      try {
+        stamps = JSON.parse(readFileSync(stampPath, "utf8"));
+      } catch {
+        stamps = {};
+      }
+      const box = { chainId: cfg.chainId, alerts: stamps };
+      await deliver(
+        box,
+        [{ key: `startup:${text}`, text: `startup: ${text}` }],
+        cfg,
+        token,
+        Date.now()
+      );
+      try {
+        writeDurable(stampPath, box.alerts);
+      } catch {
+        /* best effort */
+      }
+    }
+    die(code, text);
+  };
+  try {
+    token = cfg.telegram ? secret(SECRET_NAMES.telegram, "the alert bot token file") : null;
+  } catch (e) {
+    await fatal(78, safeText("secrets", e));
+  }
   let wallet;
+  let providers;
   try {
     const ks = readFileSync(tilde(cfg.keystore), "utf8");
     wallet = await ethers.Wallet.fromEncryptedJson(
@@ -225,27 +280,35 @@ async function main() {
       secret(SECRET_NAMES.keystorePassword, "the keystore unlock file")
     );
   } catch (e) {
-    die(78, e?.name === "SafeError" ? e.message : "the keystore cannot be opened");
+    await fatal(78, isOurs(e) ? e.message : "the keystore cannot be opened");
   }
-  const providers = [
-    { name: cfg.rpc.primary, url: secret(SECRET_NAMES.rpcPrimary, "the primary RPC file") },
-    { name: cfg.rpc.fallback, url: secret(SECRET_NAMES.rpcFallback, "the fallback RPC file") },
-  ];
-  const token = cfg.telegram ? secret(SECRET_NAMES.telegram, "the alert bot token file") : null;
+  try {
+    providers = [
+      { name: cfg.rpc.primary, url: secret(SECRET_NAMES.rpcPrimary, "the primary RPC file") },
+      { name: cfg.rpc.fallback, url: secret(SECRET_NAMES.rpcFallback, "the fallback RPC file") },
+    ];
+  } catch (e) {
+    await fatal(78, safeText("secrets", e));
+  }
 
   // one instance: an OS-held lock (a listening socket on 127.0.0.1:lockPort). The kernel releases
   // it when the process dies, so there is no stale lock to take over and no takeover race.
   const lockServer = createServer();
-  await new Promise(resolve => {
-    lockServer.once("error", () =>
-      die(75, `another run holds the lock (127.0.0.1:${cfg.lockPort})`)
+  const locked = await new Promise(resolve => {
+    lockServer.once("error", () => resolve(false));
+    lockServer.listen({ host: "127.0.0.1", port: cfg.lockPort, exclusive: true }, () =>
+      resolve(true)
     );
-    lockServer.listen({ host: "127.0.0.1", port: cfg.lockPort, exclusive: true }, resolve);
   });
-  const release = () => lockServer.close();
+  if (!locked) await fatal(75, `another run holds the lock (127.0.0.1:${cfg.lockPort})`);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    lockServer.close();
+  };
 
   const statePath = join(stateDir, "state.json");
-  const statusPath = join(stateDir, "status.json");
   try {
     // ONE provider for the whole round (the same-block identity check never mixes two): the
     // primary unless it fails a probe; a provider failing mid-round fails the round, never switches
@@ -325,6 +388,11 @@ async function main() {
       delivery,
     });
     return result.alerts.length || !delivery.ok ? 1 : 0;
+  } catch (e) {
+    // anything before or around the round (no provider, unreadable or inconsistent state, cap or
+    // address mismatch) alerts instead of exiting silently
+    release();
+    await fatal(1, safeText("startup", e));
   } finally {
     release();
   }

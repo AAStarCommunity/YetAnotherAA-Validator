@@ -32,6 +32,17 @@ export const okDir = d =>
 
 const modeOf = st => (st.mode & 0o777).toString(8).padStart(3, "0");
 
+/** Problems of a private directory (lstat-like `st`): `what` names it in the fixed wording. Pure. */
+export function dirProblems(st, uid, what) {
+  if (!st) return [`the ${what} is not present`];
+  const p = [];
+  if (st.isSymbolicLink?.()) p.push(`the ${what} is a symlink`);
+  else if (!st.isDirectory?.()) p.push(`the ${what} is not a directory`);
+  if ((st.mode & 0o777) !== 0o700) p.push(`${what} mode ${modeOf(st)}, required 700`);
+  if (st.uid !== uid) p.push(`the ${what} is not owned by the job's account`);
+  return p;
+}
+
 /** Problems of the secrets directory itself (lstat-like `st`), fixed wording. Pure. */
 export function secretsDirProblems(st, uid) {
   if (!st) return ["the secrets directory is not present"];

@@ -138,12 +138,15 @@ export function costOf(receipt, chainId, opFees = null) {
 /** The OP fees of `raw` (signed bytes) for `gas` gas at `blockTag`; null on L1. */
 async function opFeesAt(st, chain, raw, gas, blockTag) {
   if (!OP_CHAINS.has(st.chainId)) return null;
+  // the oracle is given the UNSIGNED serialization (it adds the signature's size itself), so no
+  // signed bytes reach the RPC before they are journalled (clestons #432 L1)
+  const unsigned = ethers.Transaction.from(raw).unsignedSerialized;
   const c = async (fn, a) =>
     gpo.decodeFunctionResult(
       fn,
       await chain.call({ to: GAS_PRICE_ORACLE, data: gpo.encodeFunctionData(fn, a) }, blockTag)
     )[0];
-  return { l1Fee: await c("getL1Fee", [raw]), operatorFee: await c("getOperatorFee", [gas]) };
+  return { l1Fee: await c("getL1Fee", [unsigned]), operatorFee: await c("getOperatorFee", [gas]) };
 }
 
 /**
@@ -286,9 +289,16 @@ async function isPaused(st, chain, B, op) {
 
 /** The receipt of any hash ever signed for `t`'s nonce, or null. */
 async function receiptOf(chain, t) {
+  const ours = new Set(t.hashes.map(lc));
   for (const h of t.hashes) {
     const r = await chain.receipt(h);
-    if (r) return r;
+    if (!r) continue;
+    // a receipt is believed only for a hash we signed, with a plausible gas figure (clestons L2)
+    if (!ours.has(lc(r.transactionHash)))
+      throw new SafeError("a receipt for a transaction we did not sign");
+    if (!(big(r.gasUsed) > 0n) || big(r.gasUsed) > big(t.gasLimit))
+      throw new SafeError("a receipt with an implausible gasUsed");
+    return r;
   }
   return null;
 }
@@ -329,7 +339,7 @@ async function reconcile(stLive, chain, persist, finalized) {
     // final only at or below finalized AND on the canonical chain
     const blk = await chain.blockByNumber(t.includedBlock);
     if (!blk || lc(blk.hash) !== lc(t.includedBlockHash)) continue; // decided next round
-    const raw = t.raws[t.hashes.indexOf(t.includedHash)];
+    const raw = t.raws[t.hashes.map(lc).indexOf(lc(t.includedHash))];
     const fees = await opFeesAt(st, chain, raw, big(r.gasUsed), {
       blockHash: t.includedBlockHash,
       requireCanonical: true,
@@ -512,6 +522,15 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     throw new SafeError(
       `signer nonce ${latestNonce} does not match the journal (${landed} landed of ${st.ledger.txs.length}): another use of the key`
     );
+  // every nonce consumed beyond `landed` must be one of OUR journalled transactions: one with no
+  // receipt for any hash we signed was taken by a transaction we did not journal (clestons B3)
+  for (let n = landed; n < latestNonce; n++) {
+    const r = await receiptOf(chain, st.ledger.txs[n]);
+    if (!r)
+      throw new SafeError(
+        `signer nonce ${n} was consumed by a transaction the job did not journal: another use of the key`
+      );
+  }
 
   // 2. inventories, finalized only
   for (const which of ["operators", "roles"]) {

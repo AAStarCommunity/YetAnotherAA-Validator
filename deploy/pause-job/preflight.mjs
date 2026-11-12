@@ -27,6 +27,9 @@ export const SENDING_SCRIPTS = [
   "committee-keeper.mjs",
   "apply-verifier-rotation.mjs",
   "reregister-guardians.mjs",
+  "register-node.mjs",
+  "x402-register-operators.sh",
+  "x402-provision.sh",
 ];
 
 // paths a script may execute: tokens that look like a script file, absolute, relative with a
@@ -34,6 +37,9 @@ export const SENDING_SCRIPTS = [
 const SCRIPT_TOKEN =
   /(?:^|[\s"'=(;|&`])((?:\.{1,2}\/|\/)?[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:sh|bash|zsh|command|mjs|cjs|js|ts|py))(?=$|[\s"');|&`])/gm;
 const JS_FILE = /\.(mjs|cjs|js|ts)$/;
+// any absolute path in a script, with or without an extension (clestons L4): followed when it is
+// a text file; binaries and non-files are skipped by readText
+const ABS_TOKEN = /(?:^|[\s"'=(;|&`])(\/[A-Za-z0-9_./-]+)(?=$|[\s"');|&`])/gm;
 
 /**
  * The text of a script with only ITS language's whole-line comments removed (Codex R4 P2-2): a
@@ -70,6 +76,7 @@ export function runsSender(args, readText = () => ({ kind: "none" }), cwd = null
       visit(resolve(m[1], cwd), level);
       if (dir) visit(resolve(m[1], dir), level);
     }
+    for (const m of text.matchAll(ABS_TOKEN)) visit(m[1], level);
   };
   const visit = (path, level) => {
     if (!path || seen.has(path) || level > depth) return;
@@ -119,7 +126,9 @@ export function parseLaunchctlPrint(out) {
 // launchd adds these to every job's environment; they are not the job's configuration
 const LAUNCHD_ENV = new Set(["OSLogRateLimit", "XPC_SERVICE_NAME"]);
 // variables bash or sh read to run code before the script (fail closed if inherited)
-const STARTUP_ENV = /^(BASH_ENV|ENV|BASH_FUNC_.*|SHELLOPTS|BASHOPTS|PS4)$/;
+// and the runtime-injection variables of node and the dynamic loader (clestons L4)
+const STARTUP_ENV =
+  /^(BASH_ENV|ENV|BASH_FUNC_.*|SHELLOPTS|BASHOPTS|PS4|NODE_OPTIONS|NODE_PATH|DYLD_.*)$/;
 
 /**
  * Why a loaded job does NOT match its reviewed entry (preflight-reviewed.json, DSR bc3be95b); an
@@ -346,6 +355,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       } catch {
         d = null;
       }
+      // an emptied plist with no Label cannot be loaded by launchd: nothing to check (clestons L4)
+      if (d && d.Label === undefined && !d.ProgramArguments && !d.Program) continue;
       if (!d || typeof d.Label !== "string") extra.push(`${f}: cannot be read as a plist`);
       else if (plists[d.Label]) extra.push(`${d.Label}: more than one plist`);
       else plists[d.Label] = d;
