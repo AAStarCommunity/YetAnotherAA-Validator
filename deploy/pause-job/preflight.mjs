@@ -29,17 +29,35 @@ export const SENDING_SCRIPTS = [
   "reregister-guardians.mjs",
 ];
 
-// paths a script may execute: tokens that look like a script file, absolute or relative
+// paths a script may execute: tokens that look like a script file, absolute, relative with a
+// directory, or bare (`bash inner.sh`, Codex R4 P2-1)
 const SCRIPT_TOKEN =
-  /(?:^|[\s"'=(;|&`])((?:\.{1,2}\/|\/|[A-Za-z0-9_.-]+\/)[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:sh|bash|zsh|command|mjs|cjs|js|ts|py))(?=$|[\s"');|&`])/gm;
+  /(?:^|[\s"'=(;|&`])((?:\.{1,2}\/|\/)?[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:sh|bash|zsh|command|mjs|cjs|js|ts|py))(?=$|[\s"');|&`])/gm;
+const JS_FILE = /\.(mjs|cjs|js|ts)$/;
+
+/**
+ * The text of a script with only ITS language's whole-line comments removed (Codex R4 P2-2): a
+ * shell script keeps `/*` and `*\/` (globs such as `ls /tmp/*`), only `#` lines go; a JS file
+ * loses `//` lines and block comments. An extensionless file is JS only with a node shebang.
+ * Pure.
+ */
+export function codeOf(path, text) {
+  const js = JS_FILE.test(path) || /^#!.*\bnode\b/.test(text);
+  const t = js ? text.replace(/\/\*[\s\S]*?\*\//g, " ") : text;
+  const comment = js ? /^\s*\/\// : /^\s*#(?!!)/;
+  return t
+    .split("\n")
+    .filter(l => !comment.test(l))
+    .join("\n");
+}
 
 /**
  * Does a job run a DVT sending script? A sending script's name ANYWHERE in an argument counts
- * (`sh -c "node …/committee-keeper.mjs"`). Every argument that names a file, absolute or relative
- * to the job's working directory, is read when it is text (binaries by magic are skipped), and
- * the scripts it references are followed in turn, relative to the working directory and to the
- * referring file, up to `depth` levels (Codex R3 P2-3: outer.sh -> inner.sh -> keeper). A file that
- * exists but cannot be read is unknown (fail closed). Paths built at run time ($VAR) cannot be
+ * (`sh -c "node …/committee-keeper.mjs"`). Every script path in an argument, absolute, relative to
+ * the job's working directory, or inside a command string (`sh -c "exec /repo/inner.sh"`), is read
+ * when it is text (binaries by magic are skipped), and the scripts it references are followed in
+ * turn, relative to the working directory and to the referring file, up to `depth` levels. A file
+ * that exists but cannot be read is unknown (fail closed). Paths built at run time ($VAR) cannot be
  * followed: a residual stated in the README. Pure given readText.
  */
 export function runsSender(args, readText = () => ({ kind: "none" }), cwd = null, depth = 4) {
@@ -47,32 +65,55 @@ export function runsSender(args, readText = () => ({ kind: "none" }), cwd = null
   const seen = new Set();
   const resolve = (x, base) =>
     x.startsWith("/") ? x : base ? posix.normalize(`${base}/${x}`) : null;
+  const follow = (text, level, dir) => {
+    for (const m of text.matchAll(SCRIPT_TOKEN)) {
+      visit(resolve(m[1], cwd), level);
+      if (dir) visit(resolve(m[1], dir), level);
+    }
+  };
   const visit = (path, level) => {
-    if (!path || seen.has(path)) return;
+    if (!path || seen.has(path) || level > depth) return;
     seen.add(path);
     const t = readText(path);
     if (t.kind === "unreadable") hits.add(`<unreadable file ${path}>`);
     if (t.kind !== "text") return;
-    // whole-line comments are not executed: `# … committee-keeper.mjs …` in a shell script, or
-    // `//` and block comments in JS, do not count (inline text after code still does)
-    const code = t.text
-      .replace(/\/\*[\s\S]*?\*\//g, " ")
-      .split("\n")
-      .filter(l => !/^\s*(#|\/\/)/.test(l) || /^#!/.test(l))
-      .join("\n");
+    const code = codeOf(path, t.text);
     for (const s of SENDING_SCRIPTS) if (code.includes(s)) hits.add(s);
-    if (level >= depth) return;
-    for (const m of code.matchAll(SCRIPT_TOKEN)) {
-      visit(resolve(m[1], cwd), level + 1);
-      visit(resolve(m[1], posix.dirname(path)), level + 1);
-    }
+    follow(code, level + 1, posix.dirname(path));
   };
   for (const a of args) {
     for (const s of SENDING_SCRIPTS) if (a.includes(s)) hits.add(s);
     if (a.startsWith("/")) visit(a, 0);
-    else if (cwd && /[/.]/.test(a) && !a.startsWith("-")) visit(resolve(a, cwd), 0);
+    else if (cwd && /[/.]/.test(a) && !a.startsWith("-") && !/\s/.test(a))
+      visit(resolve(a, cwd), 0);
+    // a command string (`-c "…"`) or any argument naming scripts: follow what it names
+    follow(a, 0, null);
   }
   return [...hits];
+}
+
+/** { args, env, inherited, cwd } from `launchctl print` output; env is null when absent. Pure. */
+export function parseLaunchctlPrint(out) {
+  const m = out.match(/arguments = \{([^}]*)\}/);
+  const prog = out.match(/^\s*program = (.*)$/m);
+  const a = m
+    ? m[1]
+        .split("\n")
+        .map(x => x.trim())
+        .filter(Boolean)
+    : [];
+  if (prog && a[0] !== prog[1].trim()) a.unshift(prog[1].trim());
+  const block = name => {
+    const b = out.match(new RegExp(`^\\t${name} = \\{\\n([\\s\\S]*?)^\\t\\}`, "m"));
+    return b ? [...b[1].matchAll(/^\t\t([^\s=]+) =>/gm)].map(x => x[1]) : null;
+  };
+  const cwd = out.match(/^\s*working directory = (.*)$/m);
+  return {
+    args: a,
+    env: block("environment"),
+    inherited: block("inherited environment") ?? [],
+    cwd: cwd ? cwd[1].trim() : null,
+  };
 }
 
 // launchd adds these to every job's environment; they are not the job's configuration
@@ -274,27 +315,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const uid = process.getuid();
     const programOf = l => {
       const out = run("launchctl", ["print", `gui/${uid}/${l}`]);
-      if (out === null) return null;
-      const m = out.match(/arguments = \{([^}]*)\}/);
-      const prog = out.match(/^\s*program = (.*)$/m);
-      const a = m
-        ? m[1]
-            .split("\n")
-            .map(s => s.trim())
-            .filter(Boolean)
-        : [];
-      if (prog && a[0] !== prog[1].trim()) a.unshift(prog[1].trim());
-      const block = name => {
-        const b = out.match(new RegExp(`^\\t${name} = \\{\\n([\\s\\S]*?)^\\t\\}`, "m"));
-        return b ? [...b[1].matchAll(/^\t\t([^\s=]+) =>/gm)].map(x => x[1]) : null;
-      };
-      const cwd = out.match(/^\s*working directory = (.*)$/m);
-      return {
-        args: a,
-        env: block("environment"),
-        inherited: block("inherited environment") ?? [],
-        cwd: cwd ? cwd[1].trim() : null,
-      };
+      return out === null ? null : parseLaunchctlPrint(out);
     };
     const reviewed = JSON.parse(
       readFileSync(new URL("./preflight-reviewed.json", import.meta.url), "utf8")

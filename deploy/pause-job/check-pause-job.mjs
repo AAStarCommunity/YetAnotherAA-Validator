@@ -20,7 +20,13 @@ import {
 } from "./lib/core.mjs";
 import { configProblems, CAP_CEILING } from "./pause-job.mjs";
 import { parseRoles } from "./gen-sp-pin.mjs";
-import { launchdOff, nodeSlashOff, runsSender, PAUSE_LABEL } from "./preflight.mjs";
+import {
+  launchdOff,
+  nodeSlashOff,
+  runsSender,
+  parseLaunchctlPrint,
+  PAUSE_LABEL,
+} from "./preflight.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const results = [];
@@ -372,6 +378,75 @@ cell(
     cell(
       "runsSender: a whole-line comment naming a sending script does not count",
       runsSender(["/bin/bash", "/c/quiet.sh"], rt).length === 0
+    );
+    const fs2 = {
+      "/w/outer.sh": "bash inner.sh",
+      "/w/inner.sh": "node /repo/deploy/committee-keeper.mjs",
+      "/repo/inner.sh": "node /repo/deploy/committee-keeper.mjs",
+      "/g/globs.sh": "ls /tmp/cache/*\nnode /repo/deploy/committee-keeper.mjs\nls /tmp/*/status",
+    };
+    const rt2 = p => (fs2[p] !== undefined ? { kind: "text", text: fs2[p] } : { kind: "none" });
+    cell(
+      "runsSender: a bare `bash inner.sh` reference is followed (Codex R4 P2-1)",
+      runsSender(["/bin/bash", "/w/outer.sh"], rt2, "/w").includes("committee-keeper.mjs")
+    );
+    cell(
+      'runsSender: a script inside `sh -c "exec /repo/inner.sh"` is followed (Codex R4 P2-1)',
+      runsSender(["/bin/sh", "-c", "exec /repo/inner.sh"], rt2).includes("committee-keeper.mjs")
+    );
+    cell(
+      "runsSender: shell globs `/tmp/*` ... `*/` are not taken for a comment (Codex R4 P2-2)",
+      runsSender(["/bin/bash", "/g/globs.sh"], rt2).includes("committee-keeper.mjs")
+    );
+  }
+  {
+    // the real `launchctl print` shape (tabs, blocks), values abbreviated
+    const out = [
+      "gui/501/io.aastar.dvt-committee-health = {",
+      "\tactive count = 0",
+      "\tpath = /Users/u/Library/LaunchAgents/io.aastar.dvt-committee-health.plist",
+      "\tstate = not running",
+      "",
+      "\tprogram = /bin/bash",
+      "\targuments = {",
+      "\t\t/bin/bash",
+      "\t\t/Users/u/repo/deploy/local-heartbeat.sh",
+      "\t\thealth",
+      "\t}",
+      "",
+      "\tworking directory = /Users/u/repo",
+      "",
+      "\tinherited environment = {",
+      "\t\tSSH_AUTH_SOCK => /private/tmp/x/Listeners",
+      "\t}",
+      "",
+      "\tdefault environment = {",
+      "\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin",
+      "\t}",
+      "",
+      "\tenvironment = {",
+      "\t\tOSLogRateLimit => 64",
+      "\t\tPATH => /opt/homebrew/bin:/usr/bin:/bin",
+      "\t\tHOME => /Users/u",
+      "\t\tXPC_SERVICE_NAME => io.aastar.dvt-committee-health",
+      "\t}",
+      "}",
+    ].join("\n");
+    const L = parseLaunchctlPrint(out);
+    cell(
+      "parseLaunchctlPrint: args, environment names, inherited names and working directory",
+      L.args.join() === "/bin/bash,/Users/u/repo/deploy/local-heartbeat.sh,health" &&
+        L.env.join() === "OSLogRateLimit,PATH,HOME,XPC_SERVICE_NAME" &&
+        L.inherited.join() === "SSH_AUTH_SOCK" &&
+        L.cwd === "/Users/u/repo",
+      L
+    );
+    const stale = parseLaunchctlPrint(
+      out.replace("\t\tHOME => /Users/u", "\t\tHOME => /Users/u\n\t\tBASH_ENV => /tmp/x")
+    );
+    cell(
+      "parseLaunchctlPrint: a stale loaded BASH_ENV is visible to the reviewed check",
+      stale.env.includes("BASH_ENV")
     );
   }
   {
