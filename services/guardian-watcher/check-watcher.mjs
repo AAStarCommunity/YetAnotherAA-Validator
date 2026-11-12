@@ -388,46 +388,60 @@ try {
     );
   }
 
-  // #413 review Low 2: the interim status also carries the last completed iteration's slowness,
-  // so it is exactly as healthy as that iteration; the slowness is a reason, never a status field,
-  // and publicationStep replaces it with this iteration's own
+  // #413 review Low 2 + Codex info R1: the interim status carries whether the last completed
+  // iteration (scan, publication, slowness) was healthy: degraded unless it was known healthy (a
+  // restart without a saved status included); never a status field; the completed status drops
+  // the carried reason
   {
-    const { interimCarry, publicationStep } = await import("./watcher.mjs");
+    const { interimCarry, publicationStep, LAST_ITERATION_DEGRADED, restoredCarry } =
+      await import("./watcher.mjs");
+    // a restart restores the saved status's health: a slow (degraded) last iteration stays degraded
+    const rSlow = restoredCarry({ healthy: false, publication: { at: "t0", ok: true } });
+    const rNone = restoredCarry(null);
+    const rGood = restoredCarry({ healthy: true, publication: { at: "t0", ok: true } });
     const keep = store.getCursor();
-    const slow = "iteration slower than 30000 ms (maxTickFraction of the interval)";
     const done = { at: "t0", ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } };
-    const carry = interimCarry(done, slow, "t1");
-    const interim = await runOnce(c.chain, cfg, store, rs, ident, { carry });
-    store.setCursor(keep);
-    const fast = await runOnce(c.chain, cfg, store, rs, ident, {
-      carry: interimCarry(done, null, "t1"),
-    });
-    store.setCursor(keep);
-    // the completed status replaces the carried slowness with this iteration's (fast: none)
+    const run = async lastHealthy => {
+      const r = await runOnce(c.chain, cfg, store, rs, ident, {
+        carry: interimCarry(done, lastHealthy, "t1"),
+      });
+      store.setCursor(keep);
+      return r;
+    };
+    const afterBad = await run(false);
+    const afterUnknown = await run(undefined);
+    const afterGood = await run(true);
     let t = 0;
-    const finalSt = { ...interim.status };
+    const finalSt = { ...afterBad.status };
     await publicationStep({
       status: finalSt,
       run: async () => ({ ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } }),
-      slowNote: slow,
+      slowNote: null,
       iterStart: 0,
       cfg: { intervalMs: 60_000, maxTickFraction: 0.5 },
-      carried: interim.carried,
+      carried: afterBad.carried,
       now: () => (t += 1),
     });
     cell(
-      "#413 Low 2: the interim status carries the last iteration's slowness (healthy false, no slowNote field); without it the same interim is healthy; the completed status drops the carried slowness",
-      carry.publication.inProgress === true &&
-        carry.publication.at === "t0" &&
-        interim.status.healthy === false &&
-        (interim.status.degraded ?? []).includes(slow) &&
-        !("slowNote" in interim.status) &&
-        fast.status.healthy === true &&
-        !(finalSt.degraded ?? []).includes(slow) &&
-        finalSt.healthy === true,
+      "#413 Low 2 / Codex info R1: an interim status after a degraded (or unknown) completed iteration is degraded with a fixed reason; after a healthy one it is healthy; no carry field leaks; the completed status drops the carried reason",
+      afterBad.status.healthy === false &&
+        (afterBad.status.degraded ?? []).includes(LAST_ITERATION_DEGRADED) &&
+        afterUnknown.status.healthy === false &&
+        afterGood.status.healthy === true &&
+        !("lastCompletedHealthy" in afterBad.status) &&
+        afterBad.status.publication?.inProgress === true &&
+        !(finalSt.degraded ?? []).includes(LAST_ITERATION_DEGRADED) &&
+        finalSt.healthy === true &&
+        rSlow.lastHealthy === false &&
+        rSlow.lastPub?.at === "t0" &&
+        rNone.lastHealthy === false &&
+        rNone.lastPub === null &&
+        rGood.lastHealthy === true,
       {
-        interim: [interim.status.healthy, interim.status.degraded],
-        fast: [fast.status.healthy, fast.status.degraded],
+        restored: [rSlow, rNone, rGood],
+        bad: [afterBad.status.healthy, afterBad.status.degraded],
+        unknown: afterUnknown.status.healthy,
+        good: [afterGood.status.healthy, afterGood.status.degraded],
         final: [finalSt.healthy, finalSt.degraded],
       }
     );

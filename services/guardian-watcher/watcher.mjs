@@ -197,16 +197,27 @@ export async function publicationStep({
   return nextSlow;
 }
 
+/** The reason an interim status carries while the last completed iteration was not healthy. */
+export const LAST_ITERATION_DEGRADED =
+  "the last completed iteration was degraded (its status listed why); until this one completes";
 /**
  * What the status written before this iteration's publication keeps from the last completed one
- * (#413 review Low 2): its publication result, marked in progress, and its slowness. The interim
- * status is then as healthy as the last completed iteration, so the heartbeat can judge recovery
- * from it and an interim write never resets its unhealthy count.
+ * (#413 review Low 2): its publication result, marked in progress, and whether that WHOLE iteration
+ * (scan, publication, slowness) was healthy. The interim status is then healthy only if the last
+ * completed iteration was and this scan is, so the heartbeat can judge recovery from it and an
+ * interim write never resets its unhealthy count (Codex info R1: the scan's and the slowness's
+ * degradation are carried, not only the publication's). `lastHealthy` is anything but true when
+ * unknown (after a restart without a saved status): not healthy.
  */
-export function interimCarry(lastPub, slowNote, since) {
+/** What a restart restores from the last saved status (Codex info R1 #2): its publication
+ * result, and its health (anything but a saved healthy: not healthy). */
+export function restoredCarry(saved) {
+  return { lastPub: saved?.publication ?? null, lastHealthy: saved?.healthy === true };
+}
+export function interimCarry(lastPub, lastHealthy, since) {
   return {
     publication: { ...(lastPub ?? {}), inProgress: true, since },
-    ...(slowNote ? { slowNote } : {}),
+    lastCompletedHealthy: lastHealthy === true,
   };
 }
 
@@ -303,10 +314,9 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
   // `carry`: fields kept from the previous status while this run has not replaced them yet (the
-  // last publication result, marked in progress: Codex W2c R1 M8), and the last completed
-  // iteration's slowness (`slowNote`), so this interim status is exactly as healthy as that
-  // iteration was (#413 review Low 2): it is a reason, never a status field
-  const { slowNote: carriedSlow, ...carryFields } = carry ?? {};
+  // last publication result, marked in progress: Codex W2c R1 M8), and whether the last completed
+  // iteration was healthy (`lastCompletedHealthy`, #413 review Low 2): a reason, never a field
+  const { lastCompletedHealthy, ...carryFields } = carry ?? {};
   const status = { at: started, ruleset: ident, lastError: null, ...carryFields };
   let carried = []; // the reasons taken from the carried publication (replaced by publicationStep)
   // wall time of this tick and the archive it ran over, reported with every status
@@ -347,7 +357,8 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
     // degradation (Codex W2c R18): a scan-only "healthy" must not read as recovered
     if (carry?.publication) {
       carried = publicationReasons(carry.publication);
-      if (typeof carriedSlow === "string") carried.push(carriedSlow);
+      // anything but a known-healthy last iteration (absent too) keeps this interim status degraded
+      if (lastCompletedHealthy !== true) carried.push(LAST_ITERATION_DEGRADED);
       extra.push(...carried);
     }
     status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
@@ -501,12 +512,14 @@ async function main() {
   const pub = p ? { p, built: await buildSinks(p, chain, { chainId: cfg.chainId }) } : null;
   const store = new Store(cfg.dataDir);
   const once = process.argv.includes("--once");
-  let lastPub = store.readStatus()?.publication ?? null;
+  // the last saved status: its publication result and its health survive a restart (Codex info R1
+  // #2: a slow or degraded iteration before the restart is not forgotten)
+  let { lastPub, lastHealthy } = restoredCarry(store.readStatus());
   let first = true;
   let slowNote = null; // the last iteration was slower than maxTickFraction of the interval
   for (;;) {
     // The last publication result stays visible, marked in progress, until this pass replaces it.
-    const carry = pub ? interimCarry(lastPub, slowNote, new Date().toISOString()) : undefined;
+    const carry = pub ? interimCarry(lastPub, lastHealthy, new Date().toISOString()) : undefined;
     const iterStart = Date.now();
     const { status, carried } = await runOnce(chain, cfg, store, rs, ident, { second, carry });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
@@ -521,6 +534,7 @@ async function main() {
         run: degraded => publishPhase(store, chain, cfg, pub.p, pub.built, { degraded }),
       });
       lastPub = status.publication;
+      lastHealthy = status.healthy === true;
       store.writeStatus(status);
     }
     console.log(JSON.stringify(status));
