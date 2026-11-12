@@ -417,7 +417,8 @@ export async function compare(rb, reader, facts) {
       ]);
       const allNa =
         [...need].every(k => own(c, k) && c[k] === NOT_DEPLOYED) &&
-        Object.keys(c).every(k => need.has(k) || k === "rolesSource");
+        // rolesSource may be left out; when written it is the marker too (Codex retire R2)
+        Object.keys(c).every(k => need.has(k) || (k === "rolesSource" && c[k] === NOT_DEPLOYED));
       check(`${P}.address`, c.address, "(not in the address book)", allNa);
       if (allNa) absent.push(key);
       continue;

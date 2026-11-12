@@ -1292,6 +1292,14 @@ await mut(
     const rb = clone();
     rb.contracts[KEY] = retired();
     const r = await run(rb, undefined, { addressBook: noEntry });
+    const rb2 = clone();
+    rb2.contracts[KEY] = { ...retired(), rolesSource: NA };
+    const r2 = await run(rb2, undefined, { addressBook: noEntry });
+    cell(
+      "retired registry with rolesSource written as the marker: verified absent",
+      r2.absent.includes(KEY) && !failed(r2).some(p => p.startsWith(`contracts.${KEY}`)),
+      { absent: r2.absent, f: failed(r2) }
+    );
     cell(
       "retired registry: all 'n/a:not deployed', no address-book entry -> verified absent, no ABI gap",
       r.absent.includes(KEY) &&
@@ -1320,6 +1328,9 @@ await mut(
     ],
     ["another n/a spelling on one field", c => (c.version = "n/a:not-deployed"), noEntry],
     ["a field left out", c => delete c.WRITER, noEntry],
+    ["rolesSource another spelling", c => (c.rolesSource = "n/a:retired"), noEntry],
+    ["rolesSource a number", c => (c.rolesSource = 42), noEntry],
+    ["rolesSource a block range", c => (c.rolesSource = { fromBlock: 1, toBlock: 2 }), noEntry],
     [
       "an address-book entry for it",
       () => {},
