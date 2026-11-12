@@ -133,15 +133,19 @@ DSR. That is a process rule. What bounds the job's spending in code is the
 - after any overrun, the job stops sending;
 - an included OP cost that cannot yet be read blocks sending until it is read.
 
-`--init` refuses a signer holding more than the cap.
+`--init` refuses a signer that does not hold **exactly** the cap: more would be
+an unapproved top-up, and less would raise a `deficit` alert every round.
 
 A balance above what the ledger explains (`cap - spent - included costs`) raises
 an **`inflow`** alert, and **sending continues**. It is never a halt. A halt
 would let anyone switch the keeper off with 1 wei of dust, and the first to want
 that is the operator about to be paused (clestons #432 N1). Extra balance never
-raises the ledger's bound. A balance **below** what the ledger explains raises a
-**`deficit`** alert (the ledger may undercount a cost, e.g. a receipt `l1Fee` of
-0). It is also an alert only.
+raises the ledger's bound. A balance **below** what the ledger explains, even
+allowing for every held reservation (`cap - committed`), raises a **`deficit`**
+alert (the ledger may undercount a cost, e.g. a receipt `l1Fee` of 0). It is
+also an alert only. Because it allows for every hold, an undercount shows only
+once its reservation is released; that looseness is the price of never alerting
+on a pending or re-included transaction.
 
 A new cap is a new funding: start a new ledger (a new state) for it. Do not edit
 `cap`, which the job refuses.

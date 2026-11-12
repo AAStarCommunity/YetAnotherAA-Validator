@@ -471,6 +471,10 @@ async function roundOn({ cap, balance, prior = null }) {
       "fundingGate: below cap - committed it is a deficit",
       fundingGate(st2, 10000000n - 300001n).deficit?.key === "deficit"
     );
+    cell(
+      "fundingGate: a balance of EXACTLY cap - committed is no deficit (the boundary, clestons #433 L1)",
+      fundingGate(st2, 10000000n - 300000n).deficit === null
+    );
   }
   // an included tx with reservation 10 but a KNOWN cost far above it: a new send must not fit
   const H0 = `0x${"0c".repeat(32)}`;
@@ -491,7 +495,14 @@ async function roundOn({ cap, balance, prior = null }) {
   });
   cell(
     "scripted round: an included cost above the cap trips overCap (committed), nothing sent (L2)",
-    over.sent.length === 0 && over.r.alerts.some(x => x.key === "cap" && /committed/.test(x.text)),
+    over.sent.length === 0 &&
+      over.r.alerts.some(
+        x =>
+          x.key === "cap" &&
+          /^remaining cap insufficient: committed 10000001 \(spent 0, held reservations or known included costs\) exceeds the cap 10000000;/.test(
+            x.text
+          )
+      ),
     { sent: over.sent.length, a: over.r.alerts.map(x => x.text) }
   );
 }

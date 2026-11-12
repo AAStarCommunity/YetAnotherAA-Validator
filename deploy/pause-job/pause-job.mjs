@@ -365,9 +365,11 @@ async function main() {
         throw new SafeError("a state already exists; refusing to start a new ledger over it");
       // the funding is the hard bound: at most the cap may be on the new signer
       const bal = BigInt(await chain.balance(wallet.address, "latest"));
-      if (bal > BigInt(cfg.capWei))
+      // exactly the cap (DSR 65db9e38): more is an unapproved top-up, less would raise a deficit
+      // alert every round (clestons #433 L3)
+      if (bal !== BigInt(cfg.capWei))
         throw new SafeError(
-          `the signer holds ${bal} wei, more than the cap ${cfg.capWei}; fund exactly the cap`
+          `the signer holds ${bal} wei, ${bal > BigInt(cfg.capWei) ? "more" : "less"} than the cap ${cfg.capWei}; fund exactly the cap`
         );
       const n = Number(await chain.nonce(wallet.address, "latest"));
       if (n !== 0)

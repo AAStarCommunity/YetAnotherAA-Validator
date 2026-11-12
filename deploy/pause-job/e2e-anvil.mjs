@@ -1025,6 +1025,13 @@ await section(async () => {
     overfunded.code !== 0 && /more than the cap/.test(overfunded.out),
     overfunded
   );
+  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 17n - 1n)]);
+  const underfunded = cli(["--init"]);
+  cell(
+    "CLI: --init refuses a signer funded below the cap too (clestons #433 L3: it would alert every round)",
+    underfunded.code !== 0 && /less than the cap/.test(underfunded.out),
+    underfunded
+  );
   await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 17n)]);
   const init = cli(["--init"]);
   const run = cli([]);
