@@ -124,8 +124,9 @@ export function gitMirror({
   // every git call of this sink, fetches and pushes alike, uses only the key file (when given;
   // production always gives one: lib/sinks-config.mjs requires it)
   const sshEnv = sshKey ? { GIT_SSH_COMMAND: mirrorSshCommand(sshKey) } : {};
-  // with a key, only the ssh transport (Codex Phase D R1 #2): a local, file://, https or ext remote
-  // could otherwise take the push without the key
+  // with a key, only the ssh transport (Codex Phase D R1 #2): defence in depth behind remoteBound
+  // (which already requires the GitHub SSH remote, after any insteadOf rewrite); not load-bearing
+  // on its own
   const sshOnly = sshKey ? ["-c", "protocol.allow=never", "-c", "protocol.ssh.allow=always"] : [];
   // the key file must be there before any keyed call (a clear refusal instead of an ssh failure)
   const keyThere = () => {
@@ -143,10 +144,26 @@ export function gitMirror({
     return gitRaw(cwd, [...sshOnly, ...args], { ...o, env: { ...sshEnv, ...(o.env ?? {}) } });
   };
   const text = async (...a) => (await git(...a)).toString().trim();
+  // with a key, the remote is checked at the start of every publication (each commit() fetches
+  // first), not only by Phase D (Codex Phase D R3): exactly one fetch and one push URL for
+  // `remote`, both the GitHub SSH remote of repoUrl
+  const remoteBound = async () => {
+    if (!sshKey) return;
+    const all = async extra =>
+      (await text(clone, ["remote", "get-url", "--all", ...extra, remote]))
+        .split("\n")
+        .filter(Boolean);
+    const ok = [await all([]), await all(["--push"])].every(
+      u => u.length === 1 && isExpectedMirrorRemote(u[0], repoUrl)
+    );
+    if (!ok)
+      throw new SinkError("mirror: the clone's remote is not the GitHub SSH remote of repoUrl");
+  };
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
     throw new SinkError("mirror: bad branch name");
   const tracking = `refs/watcher/${branch}`; // our own ref: nothing else updates it
   const fetchTip = async () => {
+    await remoteBound();
     await git(clone, [
       "fetch",
       "--quiet",

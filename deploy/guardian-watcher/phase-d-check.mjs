@@ -199,19 +199,22 @@ else {
           encoding: "utf8",
           timeout: 60_000,
         });
-      const url = r => (r.status === 0 ? String(r.stdout).trim() : "");
-      const fetchUrl = url(run(["remote", "get-url", "origin"]));
-      const pushUrl = url(run(["remote", "get-url", "--push", "origin"]));
-      const ls =
-        isExpectedMirrorRemote(fetchUrl, m.repoUrl) && isExpectedMirrorRemote(pushUrl, m.repoUrl)
-          ? run(["ls-remote", "--heads", "origin", `refs/heads/${branch}`])
-          : null;
+      // EVERY effective URL (Codex Phase D R3: a push goes to all push URLs, get-url names only the
+      // first): exactly one fetch and one push URL, both the expected remote
+      const urls = a => {
+        const r = run(["remote", "get-url", "--all", ...a, "origin"]);
+        return r.status === 0 ? String(r.stdout).split("\n").filter(Boolean) : [];
+      };
+      const bound = [urls([]), urls(["--push"])].every(
+        u => u.length === 1 && isExpectedMirrorRemote(u[0], m.repoUrl)
+      );
+      const ls = bound ? run(["ls-remote", "--heads", "origin", `refs/heads/${branch}`]) : null;
       const tip = ls?.status === 0 ? String(ls.stdout).split(/\s/)[0] : "";
       if (!ls)
         add(
           "mirror-push",
           "FAIL",
-          "the clone's origin (fetch or push URL) is not the GitHub SSH remote of publish.mirror.repoUrl"
+          "the clone's origin must have exactly one fetch and one push URL, both the GitHub SSH remote of publish.mirror.repoUrl"
         );
       else if (ls.status !== 0)
         add("mirror-push", "FAIL", "remote unreachable or the key not authorized (ls-remote)");

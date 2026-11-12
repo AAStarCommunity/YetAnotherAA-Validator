@@ -1510,7 +1510,7 @@ try {
   writeFileSync(join(bin, "ssh"), `#!/bin/sh\necho "$@" >> ${log}\nexit 255\n`, { mode: 0o755 });
   const clone = join(d, "m.git");
   execFileSync("git", ["init", "-q", "--bare", clone]);
-  execFileSync("git", ["-C", clone, "remote", "add", "origin", "git@example.invalid:o/r.git"]);
+  execFileSync("git", ["-C", clone, "remote", "add", "origin", "git@github.com:o/r.git"]);
   const oldPath = process.env.PATH;
   process.env.PATH = `${bin}:${oldPath}`;
   const key = join(d, "deploy_key");
@@ -1639,6 +1639,35 @@ try {
   } catch (e) {
     localErr = e.message;
   }
+  // Codex Phase D R3: a second push URL (pushes go to all of them) is refused at run time too
+  const extra = mk();
+  execFileSync("git", ["-C", extra, "remote", "set-url", "origin", "git@github.com:o/r.git"]);
+  execFileSync("git", [
+    "-C",
+    extra,
+    "config",
+    "--add",
+    "remote.origin.pushurl",
+    "git@github.com:o/r.git",
+  ]);
+  execFileSync("git", [
+    "-C",
+    extra,
+    "config",
+    "--add",
+    "remote.origin.pushurl",
+    "git@other.example:o/r.git",
+  ]);
+  let extraErr = null;
+  try {
+    await gitMirror({ clone: extra, repoUrl: "https://github.com/o/r", sshKey: key }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    extraErr = e.message;
+  }
   const R = "https://github.com/AAStar/Repo";
   const match = {
     scp: isExpectedMirrorRemote("git@github.com:aastar/repo.git", R),
@@ -1653,13 +1682,14 @@ try {
     control === "ok" &&
       typeof localErr === "string" &&
       !/deploy key file is missing/.test(localErr) &&
+      /remote is not the GitHub SSH remote/.test(extraErr ?? "") &&
       match.scp &&
       match.sshUrl &&
       !match.https &&
       !match.path &&
       !match.other &&
       match.noRepo === null,
-    { control, localErr, match }
+    { control, localErr, extraErr, match }
   );
   rmSync(d, { recursive: true, force: true });
 }
