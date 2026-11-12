@@ -108,11 +108,6 @@ export function stateProblems(st, { allowOverCap = false } = {}) {
   return p;
 }
 
-/**
- * The funding gate before any broadcast, or null when it passes. Spent covers final transactions
- * only; an included one has already left the balance too, at its provisional cost. Any included
- * cost still unknown refuses; a balance above cap - spent - included costs is a top-up. Pure.
- */
 /** An alert when any included transaction's cost is still unknown, else null. Pure. */
 export function unknownCostAlert(st) {
   const unknown = st.ledger.txs.filter(t => t.status === "included" && t.includedCost == null);
@@ -124,18 +119,30 @@ export function unknownCostAlert(st) {
     : null;
 }
 
+/**
+ * The funding check before any broadcast: { block, inflow }. `block` (refuse every broadcast) only
+ * when an included cost is still unknown; `inflow` (an alert, sending continues) when the balance
+ * exceeds cap - spent - included costs. Spent covers final transactions only; an included one has
+ * already left the balance too, at its provisional cost. Pure.
+ */
 export function fundingGate(st, balance) {
-  const inc = st.ledger.txs.filter(t => t.status === "included");
-  const u = unknownCostAlert(st);
-  if (u) return u;
-  const included = inc.reduce((x, t) => x + big(t.includedCost), 0n);
-  const budgetLeft = big(st.ledger.cap) - big(st.ledger.spent) - included;
-  if (balance > budgetLeft)
-    return {
-      key: "topup",
-      text: `the signer holds ${balance} wei, more than the budget left (${budgetLeft} of cap ${st.ledger.cap}): a top-up without a DSR go; nothing broadcast`,
-    };
-  return null;
+  const block = unknownCostAlert(st);
+  if (block) return { block, inflow: null };
+  const included = st.ledger.txs
+    .filter(t => t.status === "included")
+    .reduce((x, t) => x + big(t.includedCost), 0n);
+  const explained = big(st.ledger.cap) - big(st.ledger.spent) - included;
+  // more on the signer than the ledger explains: SOMEONE sent it value. Reported, never a halt
+  // (DSR N1 ruling (c), clestons #432 N1: a halt would hand the operator about to be paused a
+  // 1-wei kill switch). The ledger, not the balance, bounds what the job spends.
+  const inflow =
+    balance > explained
+      ? {
+          key: "inflow",
+          text: `inflow: the signer holds ${balance - explained} wei more than the ledger explains (balance ${balance}, cap ${st.ledger.cap}, spent ${st.ledger.spent}); sending continues within the ledger cap; any top-up needs a DSR go`,
+        }
+      : null;
+  return { block: null, inflow };
 }
 
 /** spent + reserved > cap: the job records it and broadcasts nothing more. */
@@ -160,14 +167,19 @@ export function costOf(receipt, chainId, opFees = null) {
   const exec = big(receipt.gasUsed) * big(receipt.effectiveGasPrice);
   if (!OP_CHAINS.has(chainId)) return exec;
   if (!opFees) throw new SafeError("an OP receipt needs the GasPriceOracle fees");
-  const rl1 = receipt.l1Fee != null ? big(receipt.l1Fee) : 0n;
-  const l1 = opFees.l1Fee > rl1 ? opFees.l1Fee : rl1;
+  // the receipt's l1Fee is what the chain charged: it wins when present; the oracle's reading only
+  // stands in when the receipt has none (clestons #432 N2: max() could overcount and trip the
+  // exact-to-the-wei funding gate)
+  const l1 = receipt.l1Fee != null ? big(receipt.l1Fee) : opFees.l1Fee;
   return exec + l1 + opFees.operatorFee;
 }
 
 /** The OP fees of `raw` (signed bytes) for `gas` gas at `blockTag`; null on L1. */
 async function opFeesAt(st, chain, raw, gas, blockTag) {
   if (!OP_CHAINS.has(st.chainId)) return null;
+  // ethers turns `undefined` into an EMPTY transaction, whose L1 fee is smaller: never price that
+  if (typeof raw !== "string" || !/^0x[0-9a-fA-F]+$/.test(raw))
+    throw new SafeError("no signed bytes for this transaction");
   // the oracle is given the UNSIGNED serialization (it adds the signature's size itself), so no
   // signed bytes reach the RPC before they are journalled (clestons #432 L1)
   const unsigned = ethers.Transaction.from(raw).unsignedSerialized;
@@ -587,10 +599,16 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
   // every nonce consumed beyond `landed` must be one of OUR journalled transactions: one with no
   // receipt for any hash we signed was taken by a transaction we did not journal (clestons B3)
   for (let n = landed; n < latestNonce; n++) {
-    const r = await receiptOf(chain, st.ledger.txs[n]);
+    let r = await receiptOf(chain, st.ledger.txs[n]);
+    if (!r) {
+      // one re-read after a pause: a load-balanced RPC can answer the nonce and the receipt from
+      // different nodes (clestons #432 N4)
+      await new Promise(res => setTimeout(res, cfg.pollMs ?? 3000));
+      r = await receiptOf(chain, st.ledger.txs[n]);
+    }
     if (!r)
       throw new SafeError(
-        `signer nonce ${n} was consumed by a transaction the job did not journal: another use of the key`
+        `signer nonce ${n} was consumed but no receipt names a transaction the job journalled: another use of the key, or an RPC answering inconsistently (check before rotating the key)`
       );
   }
 
@@ -687,8 +705,9 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
   }
   report.balance = String(balance);
   const gate = fundingGate(st, balance);
-  if (gate) {
-    alerts.push(gate);
+  if (gate.inflow) alerts.push(gate.inflow);
+  if (gate.block) {
+    alerts.push(gate.block);
     return { alerts, report };
   }
   const pending = () => st.ledger.txs.some(t => PENDING.has(t.status));

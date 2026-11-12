@@ -19,6 +19,7 @@ import {
   fundingGate,
   unknownCostAlert,
   receiptOf,
+  runRound,
   PIN,
   spIface,
 } from "./lib/core.mjs";
@@ -87,13 +88,15 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
 {
   const r = { gasUsed: "100", effectiveGasPrice: "7", l1Fee: "50" };
   cell("costOf on Sepolia: gasUsed x effectiveGasPrice", costOf(r, 11155111) === 700n);
+  const noL1 = { gasUsed: "100", effectiveGasPrice: "7" };
   cell(
-    "costOf on OP: execution + GasPriceOracle L1 fee + operator fee",
-    costOf(r, 10, { l1Fee: 80n, operatorFee: 9n }) === 789n
+    "costOf on OP, receipt without l1Fee: execution + the oracle's L1 fee + operator fee",
+    costOf(noL1, 10, { l1Fee: 80n, operatorFee: 9n }) === 789n
   );
   cell(
-    "costOf on OP takes the receipt's l1Fee when it is larger (never undercount)",
-    costOf(r, 10, { l1Fee: 10n, operatorFee: 0n }) === 750n
+    "costOf on OP: the receipt's l1Fee (what the chain charged) wins over the oracle, either way (clestons N2)",
+    costOf(r, 10, { l1Fee: 80n, operatorFee: 9n }) === 759n &&
+      costOf(r, 10, { l1Fee: 10n, operatorFee: 0n }) === 750n
   );
   let threw = false;
   try {
@@ -129,6 +132,85 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     (await receiptOf(mk({ transactionHash: "0xaa", gasUsed: "10" }), t))?.gasUsed === "10"
   );
 }
+// ---- B3 in CI (clestons #432 test gap): a journalled pending nonce consumed with no receipt for
+// any hash we signed stops the round; the same with our receipt present does not
+{
+  const signer = ethers.Wallet.createRandom();
+  const mkState = () => {
+    const st = emptyState({
+      chainId: 31337,
+      signer: signer.address,
+      spProxy: A,
+      registry: B,
+      startBlock: 10,
+      cap: "1000000",
+    });
+    st.ledger.txs.push({
+      nonce: 0,
+      operator: A,
+      hash: "0xaa",
+      hashes: ["0xaa"],
+      raws: ["0x"],
+      reserve: "100",
+      gasLimit: "1000",
+      status: "sent",
+      pendingRounds: 0,
+    });
+    st.ledger.reserved = "100";
+    return st;
+  };
+  const fake = receipt => ({
+    chainId: async () => "0x7a69",
+    blockNumber: async () => 5,
+    blockByNumber: async () => ({ number: 5, hash: `0x${"ab".repeat(32)}` }),
+    receipt: async () => receipt,
+    nonce: async () => 1,
+    getLogs: async () => [],
+    call: async () => {
+      throw new Error("not reached");
+    },
+  });
+  const cfg = { logChunk: 10, pollMs: 1 };
+  let msg = "";
+  try {
+    await runRound(mkState(), {
+      chain: fake(null),
+      signer: { address: signer.address },
+      persist: () => {},
+      cfg,
+    });
+  } catch (e) {
+    msg = e.message;
+  }
+  cell(
+    "B3 (unit): a pending journalled nonce consumed with no receipt of ours stops the round",
+    /no receipt names a transaction the job journalled/.test(msg),
+    msg
+  );
+  let msg2 = "";
+  try {
+    await runRound(mkState(), {
+      chain: fake({
+        transactionHash: "0xAA",
+        gasUsed: "10",
+        blockNumber: "0x4",
+        blockHash: `0x${"cd".repeat(32)}`,
+        effectiveGasPrice: "1",
+        status: "0x1",
+      }),
+      signer: { address: signer.address },
+      persist: () => {},
+      cfg,
+    });
+  } catch (e) {
+    msg2 = e.message;
+  }
+  cell(
+    "B3 (unit, control): the same nonce with our receipt present does not raise it",
+    !/no receipt names/.test(msg2),
+    msg2
+  );
+}
 // ---- the provisional (included, not final) cost on OP includes the oracle's fees (Codex R9 P2)
 {
   const w = ethers.Wallet.createRandom();
@@ -157,10 +239,14 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     "function getOperatorFee(uint256) view returns (uint256)",
   ]);
   const seen = [];
+  const unsignedOk = ethers.Transaction.from(raw).unsignedSerialized;
   const op = {
     call: async ({ data }, tag) => {
       seen.push({ data, tag });
       const f = gpo.parseTransaction({ data });
+      // the oracle answers only for THIS transaction's unsigned bytes (a lookup that lost them
+      // and priced something else must fail here)
+      if (f.name === "getL1Fee" && f.args[0] !== unsignedOk) throw new Error("revert: other bytes");
       return ethers.AbiCoder.defaultAbiCoder().encode(
         ["uint256"],
         [f.name === "getL1Fee" ? 80n : 9n]
@@ -181,6 +267,18 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     { c: String(c), seen: seen.length }
   );
   cell("provisionalCost sends the oracle the UNSIGNED serialization (clestons L1)", unsignedSent);
+  {
+    // the receipt's hash in another case still finds the signed bytes (the lowercase lookup)
+    const seen2 = [];
+    const op2 = { call: async ({ data }, tag) => (seen2.push(tag), op.call({ data }, tag)) };
+    const up = { ...r, transactionHash: r.transactionHash.toUpperCase().replace(/^0X/, "0x") };
+    const c2 = await provisionalCost(st, op2, t, up);
+    cell(
+      "provisionalCost finds the signed bytes for a receipt hash in another case",
+      c2 === 789n,
+      String(c2)
+    );
+  }
   const down = {
     call: async () => {
       throw new Error("rpc down");
@@ -197,19 +295,21 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
       "fundingGate: an included cost still unknown refuses every broadcast",
       (() => {
         try {
-          return fundingGate(led([inc(null)]), 0n)?.key === "cost-unknown";
+          return fundingGate(led([inc(null)]), 0n).block?.key === "cost-unknown";
         } catch {
           return false;
         }
       })()
     );
     cell(
-      "fundingGate: cap 100, included cost 15 (above its reservation 10), top-up 3: balance 88 > 85 refuses (Codex R10 example)",
-      fundingGate(led([inc("15")]), 88n)?.key === "topup"
+      "fundingGate: cap 100, included cost 15, an unexplained +3 (balance 88 > 85): an inflow ALERT, not a block (DSR N1 (c))",
+      fundingGate(led([inc("15")]), 88n).inflow?.key === "inflow" &&
+        fundingGate(led([inc("15")]), 88n).block === null
     );
     cell(
-      "fundingGate: a balance of exactly cap - spent - included passes",
-      fundingGate(led([inc("15")]), 85n) === null
+      "fundingGate: a balance of exactly cap - spent - included: neither block nor inflow",
+      fundingGate(led([inc("15")]), 85n).block === null &&
+        fundingGate(led([inc("15")]), 85n).inflow === null
     );
     cell(
       "unknownCostAlert: any included transaction with an unknown cost raises it; none, no alert",

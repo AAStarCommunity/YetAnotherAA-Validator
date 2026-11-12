@@ -810,50 +810,82 @@ await section(async () => {
 await revert(u9);
 const u9b = await snapshot();
 
-// ---- C7d: the funding is the hard bound (DSR 65db9e38, Codex R7 P1): a balance above the budget
-// left (cap - spent) is a top-up, and nothing is broadcast
+// ---- C7d: an inflow is reported, never a halt (DSR N1 ruling (c), clestons #432 N1): the ledger,
+// not the balance, bounds what the job spends; 1 wei of dust must not switch the keeper off
+for (const [label, extra] of [
+  ["1 wei", 1n],
+  ["a large inflow (5 ETH)", 5n * 10n ** 18n],
+]) {
+  await section(async () => {
+    const snap = await snapshot();
+    try {
+      const j = await fresh();
+      await p.send("anvil_setBalance", [j.w.address, ethers.toQuantity(10n ** 18n + extra)]);
+      const r = await j.round();
+      cell(
+        `inflow of ${label}: the next round still pauses the understaked operators, and the inflow alert fires`,
+        r.report.sent.length === 2 && r.alerts.some(x => x.key === "inflow"),
+        { sent: r.report.sent, a: r.alerts.map(x => x.key) }
+      );
+    } finally {
+      await revert(snap);
+    }
+  });
+}
 await section(async () => {
-  const j = await fresh();
-  await p.send("anvil_setBalance", [j.w.address, ethers.toQuantity(10n ** 18n + 1n)]);
-  const r = await j.round();
-  cell(
-    "top-up: a signer balance above cap - spent broadcasts nothing and alerts",
-    r.report.sent.length === 0 &&
-      j.st.ledger.txs.length === 0 &&
-      r.alerts.some(x => x.key === "topup"),
-    { sent: r.report.sent, a: r.alerts }
-  );
-});
-
-await section(async () => {
-  // a top-up that replaces an INCLUDED (not yet final) pause's cost is caught (Codex R8 P2)
-  const j = await fresh();
-  const [a, b] = [
-    "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-    "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-  ].sort();
-  const bData = spIface.encodeFunctionData("pauseUnderstakedOperator", [b]).toLowerCase();
-  const noB = {
-    ...chain,
-    estimateGas: tx =>
-      tx.data.toLowerCase() === bData ? Promise.reject(new Error("x")) : chain.estimateGas(tx),
-  };
-  await j.round({ chain: noB });
-  const included =
-    j.st.ledger.txs.length === 1 &&
-    j.st.ledger.txs[0].status === "included" &&
-    j.st.ledger.spent === "0";
-  await p.send("anvil_setBalance", [j.w.address, ethers.toQuantity(10n ** 18n)]); // back to the cap
-  const r = await j.round();
-  cell(
-    "top-up over an included, unfinalized cost: no broadcast, topup alert (b stays unpaused)",
-    included &&
+  // the ledger at its cap with a large balance: nothing is sent; the cap alert says why
+  const snap = await snapshot();
+  try {
+    const j = await fresh("1000");
+    await p.send("anvil_setBalance", [j.w.address, ethers.toQuantity(5n * 10n ** 18n)]);
+    const r = await j.round();
+    cell(
+      "ledger at the cap, large balance: no send (cap alert), the inflow is reported too",
       r.report.sent.length === 0 &&
-      !(await isPaused(b)) &&
-      r.alerts.some(x => x.key === "topup"),
-    { included, sent: r.report.sent, a: r.alerts }
-  );
-  void a;
+        j.st.ledger.txs.length === 0 &&
+        r.alerts.some(x => x.key === "cap") &&
+        r.alerts.some(x => x.key === "inflow"),
+      { sent: r.report.sent, a: r.alerts.map(x => x.key) }
+    );
+  } finally {
+    await revert(snap);
+  }
+});
+await section(async () => {
+  // an inflow that replaces an INCLUDED (not yet final) pause's cost is reported, and the next
+  // operator is still paused
+  const snap = await snapshot();
+  try {
+    const j = await fresh();
+    const [a, b] = [
+      "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    ].sort();
+    const bData = spIface.encodeFunctionData("pauseUnderstakedOperator", [b]).toLowerCase();
+    const noB = {
+      ...chain,
+      estimateGas: tx =>
+        tx.data.toLowerCase() === bData ? Promise.reject(new Error("x")) : chain.estimateGas(tx),
+    };
+    await j.round({ chain: noB });
+    const included =
+      j.st.ledger.txs.length === 1 &&
+      j.st.ledger.txs[0].status === "included" &&
+      j.st.ledger.spent === "0";
+    await p.send("anvil_setBalance", [j.w.address, ethers.toQuantity(10n ** 18n)]); // back to the cap
+    const r = await j.round();
+    cell(
+      "inflow over an included, unfinalized cost: reported, and b is still paused",
+      included &&
+        r.report.sent.join() === b &&
+        (await isPaused(b)) &&
+        r.alerts.some(x => x.key === "inflow"),
+      { included, sent: r.report.sent, a: r.alerts.map(x => x.key) }
+    );
+    void a;
+  } finally {
+    await revert(snap);
+  }
 });
 
 await revert(u9b);
@@ -903,7 +935,7 @@ await section(async () => {
   }
   cell(
     "nonce history: a pending journalled nonce consumed by a foreign transaction stops the round",
-    crashed && /consumed by a transaction the job did not journal/.test(msg),
+    crashed && /was consumed but no receipt names a transaction the job journalled/.test(msg),
     msg
   );
 });

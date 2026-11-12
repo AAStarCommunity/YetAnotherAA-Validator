@@ -121,17 +121,22 @@ last check and inclusion. If one does, the ledger shows `spent + reserved > cap`
 and the job stops sending (fail closed) until a new funding. The overrun itself
 is recorded: the final cost is written to the journal, not discarded.
 
-**The absolute bound is the funding (DSR 65db9e38).** Fund the signer with
-exactly the cap, 0.1 ETH on Sepolia and 0.02 ETH on OP, and never top it up
-without a fresh go from DSR. The job enforces this:
+**Funding (DSR 65db9e38, N1 ruling).** Fund the signer with exactly the cap, 0.1
+ETH on Sepolia and 0.02 ETH on OP, and never top it up without a fresh go from
+DSR. That is a process rule. What bounds the job's spending in code is the
+**ledger**:
 
-- `--init` refuses a signer holding more than the cap.
-- Every round, before any broadcast, it refuses to broadcast if the signer holds
-  more than `cap - spent` (a top-up) and raises a `topup` alert.
+- `spent + reserved ≤ cap`, under `CAP_CEILING`;
+- after any overrun, the job stops sending;
+- an included OP cost that cannot yet be read blocks sending until it is read.
 
-The money on the signer is therefore never more than the budget left, so total
-spend cannot exceed the cap, even when an OP inclusion-time fee overruns a
-reservation.
+`--init` refuses a signer holding more than the cap.
+
+A balance above what the ledger explains (`cap - spent - included costs`) raises
+an **`inflow`** alert, and **sending continues**. It is never a halt. A halt
+would let anyone switch the keeper off with 1 wei of dust, and the first to want
+that is the operator about to be paused (clestons #432 N1). Extra balance never
+raises the ledger's bound.
 
 A new cap is a new funding: start a new ledger (a new state) for it. Do not edit
 `cap`, which the job refuses.
