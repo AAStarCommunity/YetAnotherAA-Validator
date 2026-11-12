@@ -18,7 +18,8 @@ launchd starts `pause-job.mjs` every 600 s. Each start runs one round
      canonical. Only then does its full cost move from reserved to spent.
    - The full cost is execution gas plus, on OP, the L1 data fee and operator
      fee. Both fees are read from the chain's own GasPriceOracle at the
-     inclusion block, and the receipt's `l1Fee` is used instead if it is larger.
+     inclusion block; the receipt's own `l1Fee`, when present, is what the chain
+     charged and is used instead.
    - A transaction whose block is reorged out goes back to `sent`. Its
      reservation is still held, and the transaction is resent.
 
@@ -93,10 +94,11 @@ re-derive it. **Before deploy, regenerate it at the rc.8 tag commit and rerun
 
 ## Cap and funding
 
-The cap is **cumulative per chain from funding**: `spent + reserved ≤ cap`. The
-job refuses to send and alerts as soon as the remainder is below
-`gasLimit × maxFeePerGas`. The code sets a ceiling per chain, and the config can
-only lower it:
+The cap is **cumulative per chain from funding**: `committed ≤ cap`, where
+`committed` is final costs plus every held reservation, an included transaction
+counting at the larger of its reservation and its known cost. The job refuses to
+send and alerts as soon as the remainder is below `gasLimit × maxFeePerGas`. The
+code sets a ceiling per chain, and the config can only lower it:
 
 | chain              | ceiling  |
 | ------------------ | -------- |
@@ -117,16 +119,17 @@ The job reserves twice the GasPriceOracle's current fees. Before every broadcast
 it re-prices that reservation, which only grows, and it does not rebroadcast
 when the cap cannot cover it. A copy already in a mempool can still land. An
 overrun can therefore happen only if L1 fees rise past the margin between the
-last check and inclusion. If one does, the ledger shows `spent + reserved > cap`
-and the job stops sending (fail closed) until a new funding. The overrun itself
-is recorded: the final cost is written to the journal, not discarded.
+last check and inclusion. If one does, the ledger shows `committed > cap` and
+the job stops sending (fail closed) until a new funding. The overrun itself is
+recorded: the final cost is written to the journal, not discarded.
 
 **Funding (DSR 65db9e38, N1 ruling).** Fund the signer with exactly the cap, 0.1
 ETH on Sepolia and 0.02 ETH on OP, and never top it up without a fresh go from
 DSR. That is a process rule. What bounds the job's spending in code is the
 **ledger**:
 
-- `spent + reserved ≤ cap`, under `CAP_CEILING`;
+- `committed ≤ cap` (final costs plus held reservations, an included transaction
+  at max(reservation, known cost)), under `CAP_CEILING`;
 - after any overrun, the job stops sending;
 - an included OP cost that cannot yet be read blocks sending until it is read.
 
@@ -136,7 +139,9 @@ A balance above what the ledger explains (`cap - spent - included costs`) raises
 an **`inflow`** alert, and **sending continues**. It is never a halt. A halt
 would let anyone switch the keeper off with 1 wei of dust, and the first to want
 that is the operator about to be paused (clestons #432 N1). Extra balance never
-raises the ledger's bound.
+raises the ledger's bound. A balance **below** what the ledger explains raises a
+**`deficit`** alert (the ledger may undercount a cost, e.g. a receipt `l1Fee` of
+0). It is also an alert only.
 
 A new cap is a new funding: start a new ledger (a new state) for it. Do not edit
 `cap`, which the job refuses.

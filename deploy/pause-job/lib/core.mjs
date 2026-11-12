@@ -127,7 +127,7 @@ export function unknownCostAlert(st) {
  */
 export function fundingGate(st, balance) {
   const block = unknownCostAlert(st);
-  if (block) return { block, inflow: null };
+  if (block) return { block, inflow: null, deficit: null };
   const included = st.ledger.txs
     .filter(t => t.status === "included")
     .reduce((x, t) => x + big(t.includedCost), 0n);
@@ -135,6 +135,16 @@ export function fundingGate(st, balance) {
   // more on the signer than the ledger explains: SOMEONE sent it value. Reported, never a halt
   // (DSR N1 ruling (c), clestons #432 N1: a halt would hand the operator about to be paused a
   // 1-wei kill switch). The ledger, not the balance, bounds what the job spends.
+  // less on the signer than the ledger explains: a cost the ledger undercounts (e.g. a receipt
+  // l1Fee of 0) or a debit we did not make. An ALERT only, never a halt (clestons #432 L3, DSR):
+  // a low balance must not become an external stop either
+  const deficit =
+    balance < explained
+      ? {
+          key: "deficit",
+          text: `deficit: the signer holds ${explained - balance} wei less than the ledger explains (balance ${balance}, cap ${st.ledger.cap}, spent ${st.ledger.spent}); the ledger may undercount a cost — check the last receipts`,
+        }
+      : null;
   const inflow =
     balance > explained
       ? {
@@ -142,10 +152,10 @@ export function fundingGate(st, balance) {
           text: `inflow: the signer holds ${balance - explained} wei more than the ledger explains (balance ${balance}, cap ${st.ledger.cap}, spent ${st.ledger.spent}); sending continues within the ledger cap; any top-up needs a DSR go`,
         }
       : null;
-  return { block: null, inflow };
+  return { block: null, inflow, deficit };
 }
 
-/** spent + reserved > cap: the job records it and broadcasts nothing more. */
+/** committed() > cap: the job records it and broadcasts nothing more. */
 export function overCap(st) {
   return committed(st) > big(st.ledger.cap);
 }
@@ -176,7 +186,7 @@ export function ranges(from, to, size) {
 /**
  * The full cost of a final transaction. `opFees` is { l1Fee, operatorFee } read from the
  * GasPriceOracle at the inclusion block (OP chains only). The receipt's own l1Fee, when present, is
- * taken if larger (never undercount). Pure.
+ * what the chain charged and is used; the oracle's reading stands in only when it is absent. Pure.
  */
 export function costOf(receipt, chainId, opFees = null) {
   const exec = big(receipt.gasUsed) * big(receipt.effectiveGasPrice);
@@ -699,11 +709,11 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
   // 5. broadcast ONLY after the identity check passed at a canonical B
   report.sent = [];
   if (!id.ok) return { alerts, report };
-  // a recorded overrun (spent + reserved > cap) stops every broadcast until a new funding
+  // a recorded overrun (committed() > cap) stops every broadcast until a new funding
   if (overCap(st)) {
     alerts.push({
       key: "cap",
-      text: `remaining cap insufficient: spent ${st.ledger.spent} + reserved ${st.ledger.reserved} exceeds the cap ${st.ledger.cap}; nothing broadcast until a new funding`,
+      text: `remaining cap insufficient: committed ${committed(st)} (spent ${st.ledger.spent}, held reservations or known included costs) exceeds the cap ${st.ledger.cap}; nothing broadcast until a new funding`,
     });
     return { alerts, report };
   }
@@ -721,6 +731,7 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
   report.balance = String(balance);
   const gate = fundingGate(st, balance);
   if (gate.inflow) alerts.push(gate.inflow);
+  if (gate.deficit) alerts.push(gate.deficit);
   if (gate.block) {
     alerts.push(gate.block);
     return { alerts, report };
