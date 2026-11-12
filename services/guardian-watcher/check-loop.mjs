@@ -1488,7 +1488,7 @@ const good = {
   enabled: true,
   pinners: [{ type: "pinata", gateway: "https://x.mypinata.cloud" }, { type: "filebase" }],
   telegram: { chatId: "-100" },
-  mirror: { clone: "/tmp/none.git" },
+  mirror: { clone: "/tmp/none.git", sshKey: "/tmp/none.key" },
   registry: {
     address: ethers.getAddress("0x" + "ab".repeat(20)),
     fromBlock: 1,
@@ -1513,6 +1513,11 @@ const good = {
     ],
     ["no telegram", { ...good, telegram: undefined }],
     ["no mirror", { ...good, mirror: {} }],
+    // the deploy key file is required, as an absolute plain path (DSR: a file, not the agent)
+    ["no mirror key", { ...good, mirror: { clone: "/tmp/none.git" } }],
+    ["relative mirror key", { ...good, mirror: { ...good.mirror, sshKey: "keys/k" } }],
+    ["mirror key with a space", { ...good, mirror: { ...good.mirror, sshKey: "/tmp/a b" } }],
+    ["mirror key with ..", { ...good, mirror: { ...good.mirror, sshKey: "/tmp/../etc/k" } }],
     ["bad registry", { ...good, registry: { ...good.registry, address: "0x12" } }],
     ["no deployer", { ...good, registry: { ...good.registry, deployer: undefined } }],
     ["no keystore", { ...good, registry: { ...good.registry, keystore: "" } }],

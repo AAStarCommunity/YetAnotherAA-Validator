@@ -11,7 +11,15 @@
 // fixed category, never an exception's text. See phase-d.example.json; a "<...>" value is MISSING.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, existsSync, statSync, accessSync, constants } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  existsSync,
+  statSync,
+  lstatSync,
+  accessSync,
+  constants,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +32,8 @@ import {
   staleProblems,
   importClosure,
   publishBindingProblems,
+  mirrorKeyProblems,
+  mirrorRulesetProblems,
 } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -134,6 +144,105 @@ else {
         "watcher-config",
         "FAIL",
         "does not load with the watcher's validation, or dataDir not writable"
+      );
+    }
+  }
+}
+
+// ---- 2b. The git mirror (DSR): the deploy key FILE, a push it authorizes, the branch's ruleset.
+// Read-only: ls-remote and a dry-run push of the remote's own tip (nothing is written anywhere).
+{
+  const m = wcfg?.publish?.mirror;
+  const branch = m?.branch ?? "disclosure-records";
+  if (!wcfg)
+    for (const id of ["mirror-key", "mirror-push", "mirror-ruleset"])
+      add(id, "MISSING", "needs the watcher config");
+  else if (placeholder(m?.sshKey)) {
+    add("mirror-key", "MISSING", "publish.mirror.sshKey not set");
+    add("mirror-push", "MISSING", "needs the deploy key");
+  } else {
+    let st = null;
+    try {
+      st = lstatSync(m.sshKey);
+    } catch {
+      st = null;
+    }
+    const noPassphrase =
+      !!st &&
+      spawnSync("ssh-keygen", ["-y", "-P", "", "-f", m.sshKey], {
+        stdio: "ignore",
+        timeout: 10_000,
+      }).status === 0;
+    const kp = mirrorKeyProblems({ st, uid: process.getuid(), noPassphrase });
+    add(
+      "mirror-key",
+      kp.length ? "FAIL" : "PASS",
+      kp.length ? kp.join("; ") : "regular file, mode 600, this account's, loads unattended"
+    );
+    if (kp.length) add("mirror-push", "MISSING", "needs a valid deploy key file");
+    else if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
+      add("mirror-push", "FAIL", "publish.mirror.branch is not a plain branch name");
+    else {
+      const { mirrorSshCommand } = await import(join(W, "sinks/git-mirror.mjs"));
+      const env = {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_SSH_COMMAND: mirrorSshCommand(m.sshKey),
+      };
+      const run = a =>
+        spawnSync("git", ["-C", m.clone, ...a], { env, encoding: "utf8", timeout: 60_000 });
+      const ls = run(["ls-remote", "--heads", "origin", `refs/heads/${branch}`]);
+      const tip = ls.status === 0 ? String(ls.stdout).split(/\s/)[0] : "";
+      if (ls.status !== 0)
+        add("mirror-push", "FAIL", "remote unreachable or the key not authorized (ls-remote)");
+      else if (!/^[0-9a-f]{40}$/.test(tip))
+        add("mirror-push", "MISSING", `branch ${branch} is not on the remote yet`);
+      else if (run(["cat-file", "-e", `${tip}^{commit}`]).status !== 0)
+        add(
+          "mirror-push",
+          "MISSING",
+          `the remote tip is not in the clone: git -C <clone> fetch origin ${branch}`
+        );
+      else {
+        // the remote's own tip onto itself: a no-op that still needs the push (write) permission
+        const pr = run([
+          "push",
+          "--dry-run",
+          "--porcelain",
+          "origin",
+          `${tip}:refs/heads/${branch}`,
+        ]);
+        add(
+          "mirror-push",
+          pr.status === 0 ? "PASS" : "FAIL",
+          pr.status === 0
+            ? "the key may push to the branch (dry run)"
+            : "a dry-run push was refused (a read-only key, or not authorized)"
+        );
+      }
+    }
+  }
+  if (wcfg) {
+    const repo = /^https:\/\/github\.com\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)$/.exec(
+      String(m?.repoUrl ?? "")
+    );
+    if (!repo) add("mirror-ruleset", "MISSING", "publish.mirror.repoUrl not set");
+    else {
+      const r = spawnSync("gh", ["api", `repos/${repo[1]}/rules/branches/${branch}`], {
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      let rules = null;
+      try {
+        rules = r.status === 0 ? JSON.parse(r.stdout) : null;
+      } catch {
+        rules = null;
+      }
+      const rp = mirrorRulesetProblems(rules);
+      add(
+        "mirror-ruleset",
+        rp.length ? "FAIL" : "PASS",
+        rp.length ? rp.join("; ") : `${branch}: force-push and deletion blocked`
       );
     }
   }

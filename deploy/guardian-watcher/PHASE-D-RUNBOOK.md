@@ -14,9 +14,16 @@ disclosure, not the Mini's operator (M0 §5.5).
 - The Mac Mini, logged in as the user that will run the watcher (`id -un`).
 - `node` at `/opt/homebrew/bin/node` (the wrapper's PATH), `gh` logged in,
   `git`, `docker`.
-- The step-13 manifest is published: you have the DVTValidator, BLSAggregator,
-  SuperPaymaster, DisclosureRegistry, owner Safe and deployer addresses, every
-  guardian address, and the SP rc.8 release tag's full commit.
+- **The sender comes first.** DisclosureRegistry's `WRITER` is fixed when the
+  registry is deployed (an immutable constructor argument), so the watcher
+  sender is generated before it: do steps 1–3 first, then send the sender
+  **address** (public) to DSR, who passes it to SP for the step-13 manifest's
+  `disclosureRegistry.WRITER`. The registry is deployed with it.
+- After that the step-13 manifest is published: you have the DVTValidator,
+  BLSAggregator, SuperPaymaster, DisclosureRegistry (with its deployment block),
+  owner Safe and deployer addresses, every guardian address, and the SP rc.8
+  release tag's full commit. Steps 4 onwards use it; the registry fields are
+  filled only once the registry is deployed.
 - Do **not** send any transaction from
   `0xb5600060e6de5E11D3636731964218E53caadf0E` (D). Use senders A or E only
   after SP confirms.
@@ -63,8 +70,9 @@ cd $REPO && node deploy/guardian-watcher/new-sender-keystore.mjs
 
 It prints the new **sender address** only and writes
 `~/.aoa-watcher/sender.keystore.json` (mode 600). It refuses to overwrite an
-existing keystore. The sender must not be a guardian, the owner Safe or the
-deployer (`sender-keystore`). Fund it with at least 0.05 Sepolia ETH
+existing keystore. Send the address to DSR now (step 0): the registry is
+deployed with it as `WRITER`. The sender must not be a guardian, the owner Safe
+or the deployer (`sender-keystore`). Fund it with at least 0.05 Sepolia ETH
 (`sender-balance`, `sender.minBalanceWei`), from a sender SP has confirmed
 (never D).
 
@@ -86,9 +94,49 @@ manifest (public data only): `aggregator`, `roles.superPaymaster`,
 `fromBlock`, the deployer, and `maxFeePerGas`: the absolute fee ceiling in wei
 as a decimal string; its `keystore` must be the same file as `phase-d.json`
 `sender.keystore`), the Pinata gateway, the Telegram chat id. Keep
-`publish.enabled: true` (`watcher-publish`). The git mirror needs a bare clone
-whose push key is in the ssh-agent:
-`git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git`.
+`publish.enabled: true` (`watcher-publish`).
+
+**The git mirror's deploy key** is a key file, not the ssh-agent: a launchd job
+started after a reboot without a login has no agent. The file lies inside the
+same trust boundary as the Keychain (M0 §5.5a: the Mini's operator is not
+defended against). It can write only this repository, and the branch ruleset
+below blocks force-push and deletion, so a leaked key can at worst append
+commits to the mirror, a third copy next to the registry and IPFS.
+
+```sh
+ssh-keygen -t ed25519 -N "" -C "aoa-watcher mirror $(id -un)@$(hostname -s)" -f ~/.aoa-watcher/mirror_deploy_key
+chmod 600 ~/.aoa-watcher/mirror_deploy_key
+cat ~/.aoa-watcher/mirror_deploy_key.pub        # public: add it as the deploy key below
+ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+ssh-keygen -lf ~/.ssh/known_hosts | grep github.com
+# compare the SHA256 fingerprint with GitHub's published one before going on:
+# https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+```
+
+On GitHub (repository admin): Settings → Deploy keys → Add deploy key, paste the
+`.pub` line, **tick "Allow write access"**. Then the bare clone, with that key
+only, and the branch as an empty root commit (records only, no source tree; the
+watcher only ever appends to it):
+
+```sh
+export GIT_SSH_COMMAND="ssh -i $HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
+git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git
+M=~/.aoa-watcher/mirror.git
+ROOT=$(git -C $M commit-tree $(git -C $M hash-object -t tree -w /dev/null) -m "disclosure records")
+git -C $M push origin "$ROOT:refs/heads/disclosure-records"
+git -C $M fetch origin disclosure-records
+unset GIT_SSH_COMMAND
+```
+
+Then the ruleset (once): Settings → Rules → Rulesets → New branch ruleset,
+target `disclosure-records`, enforcement **Active**, rules **Restrict
+deletions** and **Block force pushes**, no pull-request requirement, no bypass
+list.
+
+and in `config.json` `publish.mirror.sshKey` is the key file's absolute path
+(`/Users/<you>/.aoa-watcher/mirror_deploy_key`). Phase D checks the key file
+(`mirror-key`), a dry-run push with it (`mirror-push`) and the ruleset
+(`mirror-ruleset`).
 
 ## 5. The Phase D config
 
@@ -194,6 +242,9 @@ line:
 | `release-mode`                                            | no `PHASE_D_RPC_*` override (a dry run is never a release acceptance)                                                                                                                                                                                                                |
 | `chain-id`                                                | `chainId` is set                                                                                                                                                                                                                                                                     |
 | `onchain:binding` and the on-chain facts                  | the contracts equal the watcher config; `aggregator.DVT_VALIDATOR == dvtValidator`, `categoryCount == 0`, `fraudProofVerifier == 0`, owner is the Safe                                                                                                                               |
+| `mirror-key`                                              | `publish.mirror.sshKey` is a regular file (not a symlink), mode 600, owned by this account, and loads without a passphrase                                                                                                                                                           |
+| `mirror-push`                                             | with that key only (no agent), `ls-remote` finds the branch and a dry-run push of its own tip is accepted (the key may write)                                                                                                                                                        |
+| `mirror-ruleset`                                          | the branch's active rules block force-pushes and deletion                                                                                                                                                                                                                            |
 | `release:spCommit`, `evidence:spParity`, `evidence:a3`    | the release commit is set and both evidence reports pass for it                                                                                                                                                                                                                      |
 
 A MISSING line names what is not set or not reachable; a FAIL line names what is
@@ -325,3 +376,27 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.aastar.aoa-watcher.pl
 
 Once the fill is consumed at the finalized block, the waiting record is archived
 and disclosed again on the new registry as usual.
+
+## The mirror deploy key: rotation and a leak
+
+**Rotation** (the author decides when):
+
+1. generate a new key file next to the old one
+   (`ssh-keygen -t ed25519 -N "" -f ~/.aoa-watcher/mirror_deploy_key.new`,
+   `chmod 600`);
+2. add its `.pub` as a new deploy key **with write access**;
+3. stop the watcher, move the new file over `mirror_deploy_key`, start the
+   watcher, and run Phase D (`mirror-key`, `mirror-push` must pass);
+4. delete the **old** deploy key on GitHub, and delete the old file.
+
+**A leak** (the file was copied, or the Mini's account is suspected):
+
+1. delete the deploy key on GitHub at once: the key can no longer push;
+2. compare the branch with the journals: every commit on `disclosure-records`
+   must be one the watcher made (a record file whose bytes match the record
+   pinned on IPFS and disclosed in the registry). The ruleset kept anything from
+   being rewritten or deleted, so an attacker could only append; such commits
+   are reported in the chat, never reverted by force;
+3. rotate as above (a new key file and deploy key). If the Mini's account itself
+   is suspected, the sender key and the Keychain items are suspect too: follow
+   M0 §5.5a (a leaked sender key) as well.

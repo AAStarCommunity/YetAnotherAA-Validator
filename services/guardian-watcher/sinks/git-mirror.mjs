@@ -1,5 +1,10 @@
 // GitHub mirror sink: append record files to the `disclosure-records` branch, pushed with a
-// repo-scoped deploy key held in the ssh-agent (loaded from the Keychain, never a key file).
+// repo-scoped deploy key. The key is a FILE (`sshKey`: absolute path, mode 0600, owned by the
+// watcher's account, no passphrase), used with IdentitiesOnly and no ssh-agent (DSR): a launchd job
+// after a reboot without a login has no agent, and the file sits inside the same trust boundary as
+// the Keychain (M0 §5.5a: the Mini's operator is not defended against). The key can write only this
+// repository, and the branch ruleset forbids force-push and deletion, so a leaked key can at worst
+// append commits to the mirror, which the registry and IPFS copies expose.
 //
 // Plumbing only, no working tree (Codex W2b R1 H5/H6): every read is of the FETCHED remote tree
 // and every write goes through hash-object / a private temporary index / commit-tree, so nothing
@@ -20,7 +25,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { SinkError, guarded } from "./errors.mjs";
 import { join, posix } from "node:path";
 
-function git(cwd, args, { input, env } = {}) {
+function gitRaw(cwd, args, { input, env } = {}) {
   return new Promise((res, rej) => {
     const p = spawn("git", ["-C", cwd, ...args], {
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
@@ -63,7 +68,22 @@ function git(cwd, args, { input, env } = {}) {
     p.stdin.end(input ?? undefined);
   });
 }
-const text = async (...a) => (await git(...a)).toString().trim();
+/**
+ * The ssh command git uses for the mirror (DSR): only this key file, no agent, no prompt, and a
+ * known host key. The path must be absolute and plain (it is parsed by a shell inside git).
+ */
+export function mirrorSshCommand(sshKey) {
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(String(sshKey ?? "")) || String(sshKey).includes("/../"))
+    throw new SinkError("mirror: sshKey must be an absolute plain path");
+  return [
+    "ssh",
+    `-i ${sshKey}`,
+    "-o IdentitiesOnly=yes",
+    "-o IdentityAgent=none",
+    "-o BatchMode=yes",
+    "-o StrictHostKeyChecking=yes",
+  ].join(" ");
+}
 
 /** A record path: under records/, forward slashes, no empty/dot/.git/-leading segments, safe charset. */
 export function checkMirrorPath(path) {
@@ -92,8 +112,15 @@ export function gitMirror({
   remote = "origin",
   repoUrl,
   beforePush,
+  sshKey,
 }) {
   if (!clone) throw new SinkError("mirror: clone directory required");
+  // every git call of this sink, fetches and pushes alike, uses only the key file (when given;
+  // production always gives one: lib/sinks-config.mjs requires it)
+  const sshEnv = sshKey ? { GIT_SSH_COMMAND: mirrorSshCommand(sshKey) } : {};
+  const git = (cwd, args, o = {}) =>
+    gitRaw(cwd, args, { ...o, env: { ...sshEnv, ...(o.env ?? {}) } });
+  const text = async (...a) => (await git(...a)).toString().trim();
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
     throw new SinkError("mirror: bad branch name");
   const tracking = `refs/watcher/${branch}`; // our own ref: nothing else updates it

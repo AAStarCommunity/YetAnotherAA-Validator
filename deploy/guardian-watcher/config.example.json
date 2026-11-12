@@ -26,6 +26,7 @@
     "telegram": { "chatId": "<the alert chat id>" },
     "mirror": {
       "clone": "/Users/REPLACE_USER/.aoa-watcher/mirror.git",
+      "sshKey": "/Users/REPLACE_USER/.aoa-watcher/mirror_deploy_key",
       "branch": "disclosure-records",
       "repoUrl": "https://github.com/AAStarCommunity/YetAnotherAA-Validator"
     },

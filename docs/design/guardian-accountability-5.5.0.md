@@ -753,9 +753,14 @@ or as the author's attestation: nothing in the repository proves them.
      `aoa-dvt-watcher-keystore-pw`, `aoa-dvt-alert-bot-token`,
      `aoa-dvt-rpc-primary`, `aoa-dvt-rpc-secondary`. The other credentials: the
      sender's encrypted keystore `~/.aoa-watcher/sender.keystore.json` (mode
-     600; its password is the third item) and the git mirror's push key, held in
-     the ssh-agent (`sinks/git-mirror.mjs`). None is in `.env`, a config file or
-     a command line.
+     600; its password is the third item) and the git mirror's deploy key, a key
+     file `~/.aoa-watcher/mirror_deploy_key` (mode 600, no passphrase, used with
+     `IdentitiesOnly` and no ssh-agent: `sinks/git-mirror.mjs`; DSR). The key
+     file lies inside the same trust boundary as the Keychain (item 1); it can
+     write only this repository, and the `disclosure-records` ruleset blocks
+     force-push and deletion, so a leak can at worst append commits to the
+     mirror (runbook: rotation and a leak). None of these is in `.env`, a config
+     file or a command line.
    - Rotation is triggered by the author only (a provider notice, a suspected
      leak, or a scheduled change). A Keychain item is replaced interactively
      with `security add-generic-password -U -a aoa-watcher -s <item> -w` (the

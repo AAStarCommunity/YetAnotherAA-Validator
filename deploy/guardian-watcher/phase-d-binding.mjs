@@ -234,3 +234,35 @@ export function publishBindingProblems({ wcfg, pc, cfg, samePath }) {
     problems.push("the watcher's chainId is not phase-d.json chainId");
   return problems;
 }
+
+/**
+ * The mirror deploy key file (DSR: a file, not the ssh-agent): a regular file, mode exactly 0600,
+ * owned by the account running the check (the watcher's), and usable without a passphrase
+ * (`noPassphrase`: `ssh-keygen -y -P "" -f <key>` succeeded). `st` is lstat-like (a symlink is
+ * refused, as it could point anywhere). Returns the problems, in fixed wording.
+ */
+export function mirrorKeyProblems({ st, uid, noPassphrase }) {
+  const problems = [];
+  if (!st) return ["the deploy key file is not present"];
+  if (st.isSymbolicLink?.()) problems.push("the deploy key path is a symlink");
+  else if (!st.isFile?.()) problems.push("the deploy key path is not a regular file");
+  const mode = st.mode & 0o777;
+  if (mode !== 0o600) problems.push(`mode ${mode.toString(8).padStart(3, "0")}, required 600`);
+  if (st.uid !== uid) problems.push("not owned by the watcher's account");
+  if (noPassphrase !== true)
+    problems.push("not an unencrypted private key ssh can load unattended");
+  return problems;
+}
+
+/**
+ * The mirror branch's active rules (GitHub `rules/branches/<branch>`): the ruleset git-mirror relies
+ * on forbids force-pushes and deletion. `rules` is the API's array; anything else is unknown.
+ */
+export function mirrorRulesetProblems(rules) {
+  if (!Array.isArray(rules)) return ["the branch rules could not be read"];
+  const types = new Set(rules.map(r => r?.type));
+  const problems = [];
+  if (!types.has("non_fast_forward")) problems.push("force-pushes are not blocked");
+  if (!types.has("deletion")) problems.push("deletion is not blocked");
+  return problems;
+}

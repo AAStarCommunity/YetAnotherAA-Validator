@@ -3,7 +3,7 @@
 // registry signer. No network, no real credentials. Live provider cells are separate (pre-go-live).
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1496,6 +1496,63 @@ try {
       range.pending === 7,
     { to: t.to, value: t.value, nonce: t.nonce, chain, capped, role, range }
   );
+}
+
+// ---- DSR (Phase D mirror key): every git call of the mirror uses only the deploy key file, never
+// the ssh-agent; a non-plain key path is refused
+{
+  const { mirrorSshCommand } = await import("./sinks/git-mirror.mjs");
+  const d = mkdtempSync(join(tmpdir(), "mirror-ssh-"));
+  const bin = join(d, "bin");
+  mkdirSync(bin);
+  const log = join(d, "ssh.log");
+  // a fake ssh on PATH: records its argv, then fails as an unreachable remote would
+  writeFileSync(join(bin, "ssh"), `#!/bin/sh\necho "$@" >> ${log}\nexit 255\n`, { mode: 0o755 });
+  const clone = join(d, "m.git");
+  execFileSync("git", ["init", "-q", "--bare", clone]);
+  execFileSync("git", ["-C", clone, "remote", "add", "origin", "git@example.invalid:o/r.git"]);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  const key = join(d, "deploy_key");
+  let err = null;
+  try {
+    await gitMirror({ clone, repoUrl: "https://github.com/o/r", sshKey: key }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    err = e.message;
+  } finally {
+    process.env.PATH = oldPath;
+  }
+  let argv = "";
+  try {
+    argv = readFileSync(log, "utf8");
+  } catch {
+    argv = "";
+  }
+  const refused = [];
+  for (const k of ["relative/key", "/tmp/a b", "/tmp/../k", "/tmp/k;rm"]) {
+    try {
+      mirrorSshCommand(k);
+      refused.push(false);
+    } catch {
+      refused.push(true);
+    }
+  }
+  cell(
+    "DSR mirror key: the mirror's git calls run ssh with only the key file (-i, IdentitiesOnly, no agent, batch, strict host key); non-plain key paths are refused",
+    argv.includes(`-i ${key}`) &&
+      argv.includes("IdentitiesOnly=yes") &&
+      argv.includes("IdentityAgent=none") &&
+      argv.includes("BatchMode=yes") &&
+      argv.includes("StrictHostKeyChecking=yes") &&
+      /remote unreachable or not authorized/.test(err ?? "") &&
+      refused.every(Boolean),
+    { argv, err, refused }
+  );
+  rmSync(d, { recursive: true, force: true });
 }
 
 let failed = 0;

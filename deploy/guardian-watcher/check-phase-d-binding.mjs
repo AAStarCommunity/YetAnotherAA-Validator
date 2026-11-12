@@ -15,6 +15,8 @@ import {
   staleProblems,
   importClosure,
   publishBindingProblems,
+  mirrorKeyProblems,
+  mirrorRulesetProblems,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -428,6 +430,50 @@ cell(
     name: "config.example.json has a chainId and it is phase-d.example.json's (a copied config starts publishing)",
     ok: Number.isSafeInteger(ex.chainId) && ex.chainId === pd.chainId,
     got: { ex: ex.chainId, pd: pd.chainId },
+  });
+}
+
+// ---- DSR: the mirror deploy key file and the branch ruleset
+{
+  const st = (o = {}) => ({
+    isFile: () => o.file ?? true,
+    isSymbolicLink: () => o.link ?? false,
+    mode: o.mode ?? 0o100600,
+    uid: o.uid ?? 501,
+  });
+  const good = mirrorKeyProblems({ st: st(), uid: 501, noPassphrase: true });
+  const cases = {
+    absent: mirrorKeyProblems({ st: null, uid: 501, noPassphrase: false }),
+    link: mirrorKeyProblems({ st: st({ link: true }), uid: 501, noPassphrase: true }),
+    dir: mirrorKeyProblems({ st: st({ file: false }), uid: 501, noPassphrase: true }),
+    mode644: mirrorKeyProblems({ st: st({ mode: 0o100644 }), uid: 501, noPassphrase: true }),
+    otherUser: mirrorKeyProblems({ st: st({ uid: 502 }), uid: 501, noPassphrase: true }),
+    passphrase: mirrorKeyProblems({ st: st(), uid: 501, noPassphrase: false }),
+  };
+  results.push({
+    name: "DSR mirror-key: a regular 0600 file of this account that loads without a passphrase passes; absent, symlink, non-file, other mode, other owner, passphrase each fail",
+    ok:
+      good.length === 0 &&
+      Object.values(cases).every(p => p.length >= 1) &&
+      /644/.test(cases.mode644.join()),
+    got: { good, cases },
+  });
+  const full = mirrorRulesetProblems([
+    { type: "deletion" },
+    { type: "non_fast_forward" },
+    { type: "x" },
+  ]);
+  const noForce = mirrorRulesetProblems([{ type: "deletion" }]);
+  const noDel = mirrorRulesetProblems([{ type: "non_fast_forward" }]);
+  const unread = mirrorRulesetProblems(null);
+  results.push({
+    name: "DSR mirror-ruleset: passes only when force-push AND deletion are blocked; unreadable rules fail",
+    ok:
+      full.length === 0 &&
+      /force-pushes/.test(noForce.join()) &&
+      /deletion/.test(noDel.join()) &&
+      unread.length === 1,
+    got: { full, noForce, noDel, unread },
   });
 }
 

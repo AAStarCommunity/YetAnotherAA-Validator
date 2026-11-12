@@ -66,6 +66,13 @@ export function publishConfig(c) {
   p.telegram = { ...p.telegram, service: p.telegram.service ?? SERVICE_DEFAULTS.telegram };
   need(okService(p.telegram.service), "telegram.service must be a Keychain service name");
   need(p.mirror?.clone, "mirror.clone required");
+  // the deploy key FILE the mirror pushes with (DSR: a file, not the ssh-agent): an absolute plain
+  // path; its mode and owner are checked by Phase D (mirror-key)
+  need(
+    /^\/[A-Za-z0-9._/-]+$/.test(String(p.mirror.sshKey ?? "")) &&
+      !String(p.mirror.sshKey).includes("/../"),
+    "mirror.sshKey (absolute path of the deploy key file) required"
+  );
   if (p.mirror.repoUrl !== undefined && !PUBLIC_REPO_URL.test(String(p.mirror.repoUrl)))
     throw new SafeError("config.publish: mirror.repoUrl must be https://github.com/<owner>/<repo>");
   const r = p.registry ?? {};
@@ -118,6 +125,7 @@ export async function buildSinks(p, provider, { readSecret = keychainRead, chain
     clone: p.mirror.clone,
     branch: p.mirror.branch,
     repoUrl: p.mirror.repoUrl,
+    sshKey: p.mirror.sshKey,
   });
   let json;
   try {
