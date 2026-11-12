@@ -42,7 +42,7 @@ const opt = k => {
   const i = args.indexOf(`--${k}`);
   return i >= 0 ? args[i + 1] : undefined;
 };
-const tilde = p => p?.replace(/^~\//, `${homedir()}/`);
+const tilde = p => (typeof p === "string" ? p.replace(/^~\//, `${homedir()}/`) : undefined);
 
 /** Problems with a config object, fixed wording. Pure. */
 export function configProblems(c) {
@@ -161,6 +161,7 @@ export function rpcChain(url) {
     getLogs: f => send("eth_getLogs", [f]),
     call: (tx, tag) => send("eth_call", [tx, tag]),
     nonce: (a, tag) => send("eth_getTransactionCount", [a, tag]),
+    balance: (a, tag) => send("eth_getBalance", [a, tag]),
     estimateGas: tx => send("eth_estimateGas", [tx]),
     fees: async () => {
       const b = await send("eth_getBlockByNumber", ["latest", false]);
@@ -313,7 +314,12 @@ async function main() {
     await fatal(78, safeText("secrets", e));
   }
   // the rest of the config, now that a failure can be reported
-  const cp = configProblems(cfg);
+  let cp;
+  try {
+    cp = configProblems(cfg);
+  } catch {
+    cp = ["config has a field of the wrong type"];
+  }
   if (cp.length) await fatal(78, `config: ${cp.join("; ")}`);
   let wallet;
   let providers;
@@ -357,6 +363,12 @@ async function main() {
     if (args.includes("--init")) {
       if (existsSync(statePath))
         throw new SafeError("a state already exists; refusing to start a new ledger over it");
+      // the funding is the hard bound: at most the cap may be on the new signer
+      const bal = BigInt(await chain.balance(wallet.address, "latest"));
+      if (bal > BigInt(cfg.capWei))
+        throw new SafeError(
+          `the signer holds ${bal} wei, more than the cap ${cfg.capWei}; fund exactly the cap`
+        );
       const n = Number(await chain.nonce(wallet.address, "latest"));
       if (n !== 0)
         throw new SafeError(

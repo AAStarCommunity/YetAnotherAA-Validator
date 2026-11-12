@@ -201,7 +201,10 @@ const work = mkdtempSync(join(tmpdir(), "pause-e2e-"));
 let n = 0;
 const fresh = async (cap = String(10n ** 18n)) => {
   const w = ethers.Wallet.createRandom();
-  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 18n)]);
+  await p.send("anvil_setBalance", [
+    w.address,
+    ethers.toQuantity(BigInt(cap) < 10n ** 18n ? BigInt(cap) : 10n ** 18n),
+  ]);
   const st = emptyState({
     chainId: 31337,
     signer: w.address,
@@ -807,6 +810,21 @@ await section(async () => {
 await revert(u9);
 const u9b = await snapshot();
 
+// ---- C7d: the funding is the hard bound (DSR 65db9e38, Codex R7 P1): a balance above the budget
+// left (cap - spent) is a top-up, and nothing is broadcast
+await section(async () => {
+  const j = await fresh();
+  await p.send("anvil_setBalance", [j.w.address, ethers.toQuantity(10n ** 18n + 1n)]);
+  const r = await j.round();
+  cell(
+    "top-up: a signer balance above cap - spent broadcasts nothing and alerts",
+    r.report.sent.length === 0 &&
+      j.st.ledger.txs.length === 0 &&
+      r.alerts.some(x => x.key === "topup"),
+    { sent: r.report.sent, a: r.alerts }
+  );
+});
+
 // ---- C8: another use of the key stops the round
 await section(async () => {
   const j = await fresh();
@@ -899,7 +917,7 @@ await section(async () => {
     mode: 0o600,
   }); // down: the round must use the fallback
   writeFileSync(join(home, "secrets/aoa-dvt-pause-rpc-fallback"), URL, { mode: 0o600 });
-  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 18n)]);
+  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 17n)]);
   const cfg = {
     chainId: 31337,
     spProxy: SP,
@@ -934,6 +952,14 @@ await section(async () => {
       return { code: e.status, out: String(e.stderr) };
     }
   };
+  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 17n + 1n)]);
+  const overfunded = cli(["--init"]);
+  cell(
+    "CLI: --init refuses a signer funded above the cap (fund exactly the cap)",
+    overfunded.code !== 0 && /more than the cap/.test(overfunded.out),
+    overfunded
+  );
+  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 17n)]);
   const init = cli(["--init"]);
   const run = cli([]);
   const status = JSON.parse(readFileSync(join(home, "state/status.json"), "utf8"));

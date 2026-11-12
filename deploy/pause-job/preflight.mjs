@@ -41,6 +41,8 @@ const JS_FILE = /\.(mjs|cjs|js|ts)$/;
 // a text file; binaries and non-files are skipped by readText
 const REL_TOKEN =
   /(?:^|[\s"'=(;|&`])((?:\.{1,2}\/|[A-Za-z0-9_-]+\/)[A-Za-z0-9_./-]*[A-Za-z0-9_-])(?=$|[\s"');|&`])/gm;
+const INTERP_TOKEN =
+  /(?:^|[\s;|&(`])(?:bash|sh|zsh|dash|ksh|node|python3?|exec|source|\.)\s+(?:-[A-Za-z]+\s+)*([A-Za-z0-9_][A-Za-z0-9_.-]*)(?=$|[\s"');|&`])/gm;
 const ABS_TOKEN = /(?:^|[\s"'=(;|&`])(\/[A-Za-z0-9_./-]+)(?=$|[\s"');|&`])/gm;
 
 /**
@@ -81,13 +83,23 @@ export function runsSender(args, readText = () => ({ kind: "none" }), cwd = null
     for (const m of text.matchAll(ABS_TOKEN)) visit(m[1], level);
     // relative paths without an extension (`exec ./bin/run-keeper`), against the working
     // directory and the referring file (Codex R6 P2)
+    // a bare script after an interpreter or `exec`/`source` (`bash inner`, Codex R7 P2)
+    for (const m of text.matchAll(INTERP_TOKEN)) {
+      visit(resolve(m[1], cwd), level);
+      if (dir) visit(resolve(m[1], dir), level);
+    }
     for (const m of text.matchAll(REL_TOKEN)) {
       visit(resolve(m[1], cwd), level);
       if (dir) visit(resolve(m[1], dir), level);
     }
   };
   const visit = (path, level) => {
-    if (!path || seen.has(path) || level > depth) return;
+    if (!path || seen.has(path)) return;
+    // a wrapper chain deeper than we follow is not certified clean (Codex R7 P2)
+    if (level > depth) {
+      if (readText(path).kind === "text") hits.add(`<not followed past depth ${depth}: ${path}>`);
+      return;
+    }
     seen.add(path);
     const t = readText(path);
     if (t.kind === "unreadable") hits.add(`<unreadable file ${path}>`);

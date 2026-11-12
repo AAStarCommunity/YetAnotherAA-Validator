@@ -612,6 +612,26 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     });
     return { alerts, report };
   }
+  // the funding IS the hard bound (DSR 65db9e38: fund exactly the cap, never top up without a go),
+  // enforced here (Codex R7 P1): the signer may hold no more than the budget left, cap - spent. A
+  // balance above it means a top-up; nothing is broadcast. Total spend can then never exceed the
+  // cap, even when an OP inclusion-time fee overruns a reservation.
+  let balance;
+  try {
+    balance = big(await chain.balance(st.signer, at(B)));
+  } catch (e) {
+    alerts.push({ key: "balance", text: safeText("signer balance", e) });
+    return { alerts, report };
+  }
+  report.balance = String(balance);
+  const budgetLeft = big(st.ledger.cap) - big(st.ledger.spent);
+  if (balance > budgetLeft) {
+    alerts.push({
+      key: "topup",
+      text: `the signer holds ${balance} wei, more than the budget left (${budgetLeft} of cap ${st.ledger.cap}): a top-up without a DSR go; nothing broadcast`,
+    });
+    return { alerts, report };
+  }
   const pending = () => st.ledger.txs.some(t => PENDING.has(t.status));
   // wait for inclusion (not finality) of whatever is pending, before signing a new nonce
   const waitIncluded = async () => {

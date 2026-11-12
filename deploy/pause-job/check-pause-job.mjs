@@ -412,6 +412,27 @@ cell(
       "/w/outer.sh": "exec ./bin/run-keeper --watch",
       "/w/bin/run-keeper": "#!/bin/sh\nnode /repo/deploy/register-node.mjs",
     };
+    const fs5 = {
+      "/repo/outer.sh": "bash inner",
+      "/repo/inner": "node /repo/deploy/committee-keeper.mjs",
+    };
+    cell(
+      "runsSender: a bare script after an interpreter (`bash inner`) is followed (Codex R7 P2)",
+      runsSender(
+        ["/bin/bash", "/repo/outer.sh"],
+        p => (fs5[p] !== undefined ? { kind: "text", text: fs5[p] } : { kind: "none" }),
+        "/repo"
+      ).includes("committee-keeper.mjs")
+    );
+    const chain6 = {};
+    for (let i = 0; i < 6; i++) chain6[`/d/w${i}.sh`] = `exec /d/w${i + 1}.sh`;
+    chain6["/d/w6.sh"] = "node /repo/deploy/committee-keeper.mjs";
+    cell(
+      "runsSender: a wrapper chain deeper than followed is reported, not certified (Codex R7 P2)",
+      runsSender(["/bin/bash", "/d/w0.sh"], p =>
+        chain6[p] !== undefined ? { kind: "text", text: chain6[p] } : { kind: "none" }
+      ).some(x => x.includes("not followed past depth"))
+    );
     cell(
       "runsSender: a relative extensionless path inside a wrapper is followed (Codex R6 P2)",
       runsSender(
