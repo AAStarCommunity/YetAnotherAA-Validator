@@ -728,6 +728,9 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     report.sent.push(op);
     await waitIncluded();
   }
+  // the last inclusion's cost may be unknown too: say so now, not a round later (Codex R12 P3)
+  const tail = unknownCostAlert(st);
+  if (tail && !alerts.some(x => x.key === tail.key)) alerts.push(tail);
   return { alerts, report };
 }
 
