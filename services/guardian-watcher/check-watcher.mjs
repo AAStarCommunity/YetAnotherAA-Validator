@@ -447,6 +447,61 @@ try {
     );
   }
 
+  // #427 review Low: the loop step carries the health of the iteration it just completed, so after
+  // a degraded iteration the next interim status is degraded, and after a healthy one it is healthy
+  {
+    const { watchStep, LAST_ITERATION_DEGRADED } = await import("./watcher.mjs");
+    const keep = store.getCursor();
+    const interims = [];
+    const written = [];
+    const scanned = [];
+    let loop = {
+      carryState: {
+        lastPub: { at: "t0", ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } },
+        lastHealthy: true,
+      },
+      slowNote: null,
+    };
+    const step = async publishOk => {
+      const r = await watchStep(loop, {
+        publishing: true,
+        scan: async carry => {
+          const x = await runOnce(c.chain, cfg, store, rs, ident, { carry });
+          store.setCursor(keep);
+          interims.push({ healthy: x.status.healthy, degraded: [...(x.status.degraded ?? [])] });
+          return x;
+        },
+        publish: async () =>
+          publishOk
+            ? { at: "t", ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } }
+            : { at: "t", ok: false, stalls: { feeCapped: 0, insufficientFunds: 0 } },
+        writeStatus: st => written.push(st.healthy),
+        // the scan's own status, before publication changes it (the first-iteration warning)
+        onScan: st => scanned.push(st.healthy),
+        cfg: { intervalMs: 60_000, maxTickFraction: 0.5 },
+      });
+      loop = r.next;
+      return r.status;
+    };
+    const s1 = await step(false); // healthy interim, degraded completed
+    const s2 = await step(true); // degraded interim (carried), healthy completed
+    const s3 = await step(true); // healthy interim
+    cell(
+      "#427 Low: each loop step carries the iteration it just completed: after a degraded one the next interim is degraded (fixed reason), after a healthy one healthy; every completed status is written",
+      interims[0].healthy === true &&
+        s1.healthy === false &&
+        interims[1].healthy === false &&
+        interims[1].degraded.includes(LAST_ITERATION_DEGRADED) &&
+        s2.healthy === true &&
+        interims[2].healthy === true &&
+        s3.healthy === true &&
+        JSON.stringify(written) === "[false,true,true]" &&
+        // onScan sees the interim status (before publication): true, false (carried), true
+        JSON.stringify(scanned) === "[true,false,true]",
+      { interims, completed: [s1.healthy, s2.healthy, s3.healthy], written }
+    );
+  }
+
   // A cursor whose block no longer has the stored hash: stop, do not advance.
   {
     const keep = store.getCursor();
