@@ -15,6 +15,7 @@ import {
   ranges,
   revertData,
   costOf,
+  provisionalCost,
   PIN,
   spIface,
 } from "./lib/core.mjs";
@@ -98,6 +99,72 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     threw = true;
   }
   cell("costOf on OP without the oracle fees refuses (fail closed)", threw);
+}
+// ---- the provisional (included, not final) cost on OP includes the oracle's fees (Codex R9 P2)
+{
+  const w = ethers.Wallet.createRandom();
+  const tx = {
+    type: 2,
+    chainId: 10,
+    nonce: 0,
+    to: A,
+    data: "0x",
+    value: 0n,
+    gasLimit: 100000n,
+    maxFeePerGas: 10n,
+    maxPriorityFeePerGas: 1n,
+  };
+  const raw = await w.signTransaction(tx);
+  const hash = ethers.keccak256(raw);
+  const t = { hashes: [hash], raws: [raw], reserve: "999999" };
+  const r = {
+    transactionHash: hash,
+    blockHash: `0x${"11".repeat(32)}`,
+    gasUsed: "100",
+    effectiveGasPrice: "7",
+  };
+  const gpo = new ethers.Interface([
+    "function getL1Fee(bytes) view returns (uint256)",
+    "function getOperatorFee(uint256) view returns (uint256)",
+  ]);
+  const seen = [];
+  const op = {
+    call: async ({ data }, tag) => {
+      seen.push({ data, tag });
+      const f = gpo.parseTransaction({ data });
+      return ethers.AbiCoder.defaultAbiCoder().encode(
+        ["uint256"],
+        [f.name === "getL1Fee" ? 80n : 9n]
+      );
+    },
+  };
+  const st = { chainId: 10 };
+  const c = await provisionalCost(st, op, t, r);
+  const unsignedSent = seen.some(
+    x =>
+      gpo.parseTransaction({ data: x.data }).name === "getL1Fee" &&
+      gpo.parseTransaction({ data: x.data }).args[0] ===
+        ethers.Transaction.from(raw).unsignedSerialized
+  );
+  cell(
+    "provisionalCost on OP = execution + oracle L1 + operator fee, read at the inclusion block",
+    c === 789n && seen.every(x => x.tag?.blockHash === r.blockHash),
+    { c: String(c), seen: seen.length }
+  );
+  cell("provisionalCost sends the oracle the UNSIGNED serialization (clestons L1)", unsignedSent);
+  const down = {
+    call: async () => {
+      throw new Error("rpc down");
+    },
+  };
+  cell(
+    "provisionalCost on OP with the oracle unreadable falls back to the reservation (fail closed)",
+    (await provisionalCost(st, down, t, r)) === 999999n
+  );
+  cell(
+    "provisionalCost on L1 is the execution cost",
+    (await provisionalCost({ chainId: 11155111 }, down, t, r)) === 700n
+  );
 }
 {
   const st = base();

@@ -288,19 +288,32 @@ async function isPaused(st, chain, B, op) {
 }
 
 /**
- * Mark `t` included by receipt `r`, recording its provisional cost from the receipt (execution,
- * plus the receipt's own l1Fee on OP) for the funding check; the reservation stays held and the
- * final cost is computed at finality (Codex R8 P2).
+ * The cost an INCLUDED transaction has already taken from the balance, for the funding check. On
+ * OP the oracle's L1 and operator fees are read at the inclusion block (Codex R9 P2); if they
+ * cannot be read, the reservation is used instead (more, never less: fail closed). Async.
  */
-function markIncluded(t, r, chainId) {
+export async function provisionalCost(st, chain, t, r) {
+  if (!OP_CHAINS.has(st.chainId)) return costOf(r, st.chainId);
+  try {
+    const raw = t.raws[t.hashes.map(lc).indexOf(lc(r.transactionHash))];
+    const fees = await opFeesAt(st, chain, raw, big(r.gasUsed), {
+      blockHash: r.blockHash,
+      requireCanonical: true,
+    });
+    return costOf(r, st.chainId, fees);
+  } catch {
+    return big(t.reserve);
+  }
+}
+
+/** Mark `t` included by receipt `r`; the reservation stays held until finality. */
+async function markIncluded(st, chain, t, r) {
   t.status = "included";
   t.includedHash = r.transactionHash;
   t.includedBlock = Number(r.blockNumber);
   t.includedBlockHash = r.blockHash;
   t.pendingRounds = 0;
-  t.includedCost = String(
-    costOf(r, chainId, OP_CHAINS.has(chainId) ? { l1Fee: 0n, operatorFee: 0n } : null)
-  );
+  t.includedCost = String(await provisionalCost(st, chain, t, r));
 }
 
 /** The receipt of any hash ever signed for `t`'s nonce, or null. */
@@ -329,7 +342,7 @@ async function reconcile(stLive, chain, persist, finalized) {
   const st = structuredClone(stLive);
   const alerts = [];
   const l = st.ledger;
-  const include = (t, r) => markIncluded(t, r, st.chainId);
+  const include = (t, r) => markIncluded(st, chain, t, r);
   for (const t of l.txs) {
     if (!HELD.has(t.status)) continue;
     const r = await receiptOf(chain, t);
@@ -345,7 +358,7 @@ async function reconcile(stLive, chain, persist, finalized) {
       delete t.includedBlockHash;
       delete t.includedCost;
     }
-    if (PENDING.has(t.status) && r) include(t, r);
+    if (PENDING.has(t.status) && r) await include(t, r);
     if (t.status !== "included" || t.includedBlock > finalized) continue;
     // final only at or below finalized AND on the canonical chain
     const blk = await chain.blockByNumber(t.includedBlock);
@@ -655,7 +668,7 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
       const t = st.ledger.txs.find(x => PENDING.has(x.status));
       const rc = await receiptOf(chain, t).catch(() => null);
       if (rc) {
-        markIncluded(t, rc, st.chainId);
+        await markIncluded(st, chain, t, rc);
         await persist(st);
       } else await new Promise(res => setTimeout(res, cfg.pollMs ?? 3000));
     }
