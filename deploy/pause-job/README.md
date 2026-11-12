@@ -118,7 +118,8 @@ it re-prices that reservation, which only grows, and it does not rebroadcast
 when the cap cannot cover it. A copy already in a mempool can still land. An
 overrun can therefore happen only if L1 fees rise past the margin between the
 last check and inclusion. If one does, the ledger shows `spent + reserved > cap`
-and the job stops sending (fail closed) until a new funding.
+and the job stops sending (fail closed) until a new funding. The overrun itself
+is recorded: the final cost is written to the journal, not discarded.
 
 A new cap is a new funding: start a new ledger (a new state) for it. Do not edit
 `cap`, which the job refuses.
@@ -170,6 +171,10 @@ Until this PR merged, they were manual items on the launch checklist.
     the job's ProgramArguments, not its label: a script name anywhere in an
     argument counts, and shell wrapper scripts are read. A wrapper that cannot
     be read fails. The plists in `~/Library/LaunchAgents` are read as well.
+  - Wrapper scripts are followed transitively, up to 4 levels, from absolute
+    paths and from paths relative to the job's working directory or to the
+    referring script. Whole-line comments are ignored. Paths built at run time
+    (`$VAR`) cannot be followed; that is a stated residual.
   - The only exceptions are in `preflight-reviewed.json` (DSR bc3be95b). An
     entry passes only when all of the following hold:
     - the label matches exactly;
@@ -177,6 +182,9 @@ Until this PR merged, they were manual items on the launch checklist.
     - the plist's **full** ProgramArguments are exactly
       `[interpreter, <repo>/<wrapper>, ...args]`;
     - the arguments launchd actually loaded equal the plist's;
+    - the environment launchd actually loaded has the same variable names (apart
+      from the two that launchd adds), and no shell start-up variable
+      (`BASH_ENV`, `ENV`, `BASH_FUNC_*`) is present, whether set or inherited;
     - the plist's environment variable names are exactly the listed ones;
     - every file the mode runs hashes to its pinned sha256, hashed at the paths
       the plist resolves.

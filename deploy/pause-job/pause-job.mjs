@@ -274,7 +274,7 @@ async function main() {
       return 0;
     }
     const st = JSON.parse(readFileSync(statePath, "utf8"));
-    const sp = stateProblems(st);
+    const sp = stateProblems(st, { allowOverCap: true });
     if (sp.length) throw new SafeError(`state: ${sp.join("; ")}`);
     // the config may lower the cap; it never raises a ledger's cap beyond the ceiling
     if (BigInt(cfg.capWei) !== BigInt(st.ledger.cap))

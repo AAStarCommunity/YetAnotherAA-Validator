@@ -18,7 +18,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 
 export const PAUSE_LABEL = "io.aastar.dvt-pause-job";
 export const FORBIDDEN_LABELS = ["io.aastar.dvt-committee-keeper", "io.aastar.dvt-apply-rotation"];
@@ -29,40 +29,70 @@ export const SENDING_SCRIPTS = [
   "reregister-guardians.mjs",
 ];
 
+// paths a script may execute: tokens that look like a script file, absolute or relative
+const SCRIPT_TOKEN =
+  /(?:^|[\s"'=(;|&`])((?:\.{1,2}\/|\/|[A-Za-z0-9_.-]+\/)[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:sh|bash|zsh|command|mjs|cjs|js|ts|py))(?=$|[\s"');|&`])/gm;
+
 /**
- * Does a job's argument list run a DVT sending script? A name ANYWHERE in an argument counts
- * (`sh -c "node …/committee-keeper.mjs"`), and an argument that is a readable text file (a wrapper
- * script) is searched too; `readText(path)` returns its text, or null when it is not a file. A
- * wrapper that cannot be read is reported as unknown (fail closed). Pure given readText.
+ * Does a job run a DVT sending script? A sending script's name ANYWHERE in an argument counts
+ * (`sh -c "node …/committee-keeper.mjs"`). Every argument that names a file, absolute or relative
+ * to the job's working directory, is read when it is text (binaries by magic are skipped), and
+ * the scripts it references are followed in turn, relative to the working directory and to the
+ * referring file, up to `depth` levels (Codex R3 P2-3: outer.sh -> inner.sh -> keeper). A file that
+ * exists but cannot be read is unknown (fail closed). Paths built at run time ($VAR) cannot be
+ * followed: a residual stated in the README. Pure given readText.
  */
-export function runsSender(args, readText = () => ({ kind: "none" })) {
+export function runsSender(args, readText = () => ({ kind: "none" }), cwd = null, depth = 4) {
   const hits = new Set();
+  const seen = new Set();
+  const resolve = (x, base) =>
+    x.startsWith("/") ? x : base ? posix.normalize(`${base}/${x}`) : null;
+  const visit = (path, level) => {
+    if (!path || seen.has(path)) return;
+    seen.add(path);
+    const t = readText(path);
+    if (t.kind === "unreadable") hits.add(`<unreadable file ${path}>`);
+    if (t.kind !== "text") return;
+    // whole-line comments are not executed: `# … committee-keeper.mjs …` in a shell script, or
+    // `//` and block comments in JS, do not count (inline text after code still does)
+    const code = t.text
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .split("\n")
+      .filter(l => !/^\s*(#|\/\/)/.test(l) || /^#!/.test(l))
+      .join("\n");
+    for (const s of SENDING_SCRIPTS) if (code.includes(s)) hits.add(s);
+    if (level >= depth) return;
+    for (const m of code.matchAll(SCRIPT_TOKEN)) {
+      visit(resolve(m[1], cwd), level + 1);
+      visit(resolve(m[1], posix.dirname(path)), level + 1);
+    }
+  };
   for (const a of args) {
     for (const s of SENDING_SCRIPTS) if (a.includes(s)) hits.add(s);
-    // ANY absolute path that is a text file is read as a possible wrapper, with or without an
-    // extension (Codex R2 P2-5); binaries (Mach-O, ELF) and paths that are not files are skipped;
-    // a file that exists but cannot be read is unknown (fail closed)
-    if (a.startsWith("/")) {
-      const t = readText(a);
-      if (t.kind === "unreadable") hits.add(`<unreadable file ${a}>`);
-      else if (t.kind === "text")
-        for (const s of SENDING_SCRIPTS) if (t.text.includes(s)) hits.add(s);
-    }
+    if (a.startsWith("/")) visit(a, 0);
+    else if (cwd && /[/.]/.test(a) && !a.startsWith("-")) visit(resolve(a, cwd), 0);
   }
   return [...hits];
 }
 
+// launchd adds these to every job's environment; they are not the job's configuration
+const LAUNCHD_ENV = new Set(["OSLogRateLimit", "XPC_SERVICE_NAME"]);
+// variables bash or sh read to run code before the script (fail closed if inherited)
+const STARTUP_ENV = /^(BASH_ENV|ENV|BASH_FUNC_.*|SHELLOPTS|BASHOPTS|PS4)$/;
+
 /**
  * Why a loaded job does NOT match its reviewed entry (preflight-reviewed.json, DSR bc3be95b); an
  * empty list means it is the reviewed, non-sending job. Everything must match exactly:
- *   - the label, and a plist in ~/Library/LaunchAgents for it (the source of args and env);
+ *   - the label, and a plist in ~/Library/LaunchAgents for it;
  *   - the plist's FULL ProgramArguments: [interpreter, <repo>/<wrapper>, ...args] (no Program key);
- *   - the arguments launchd actually loaded equal the plist's;
- *   - the plist's environment variable NAMES exactly (bash runs $BASH_ENV, so nothing extra);
+ *   - what launchd LOADED: the same arguments, and the same environment variable names (minus the
+ *     two launchd adds), with no shell start-up variable inherited (Codex R3 P2-2: a stale loaded
+ *     BASH_ENV is caught even when the plist on disk no longer has it);
+ *   - the plist's environment variable NAMES exactly;
  *   - the sha256 of every file the mode runs, hashed at the paths the plist resolves (<repo>/<rel>).
- * Pure given shaOf.
+ * `loaded` is { args, env, inherited } from launchctl print. Pure given shaOf.
  */
-export function reviewProblems(r, plist, loadedArgs, shaOf) {
+export function reviewProblems(r, plist, loaded, shaOf) {
   const p = [];
   if (!plist) return [`${r.label}: no plist for the reviewed job in ~/Library/LaunchAgents`];
   if (plist.Label !== r.label) p.push(`${r.label}: plist label differs`);
@@ -83,10 +113,29 @@ export function reviewProblems(r, plist, loadedArgs, shaOf) {
     p.push(
       `${r.label}: ProgramArguments are not exactly [${r.interpreter}, <repo>/${r.wrapper}, ${r.args.join(", ")}]`
     );
-  if (!loadedArgs || loadedArgs.length !== pa.length || loadedArgs.some((a, i) => a !== pa[i]))
+  const want = [...r.envKeys].sort().join();
+  const la = loaded?.args;
+  if (!la || la.length !== pa.length || la.some((a, i) => a !== pa[i]))
     p.push(`${r.label}: the arguments launchd loaded differ from the plist's`);
+  if (!loaded?.env || !loaded?.inherited)
+    p.push(`${r.label}: the loaded environment cannot be read`);
+  else {
+    const le = loaded.env
+      .filter(n => !LAUNCHD_ENV.has(n))
+      .sort()
+      .join();
+    if (le !== want)
+      p.push(
+        `${r.label}: the LOADED environment variable names are not exactly ${r.envKeys.join(", ")}`
+      );
+    const bad = [...loaded.env, ...loaded.inherited].filter(n => STARTUP_ENV.test(n));
+    if (bad.length)
+      p.push(
+        `${r.label}: a shell start-up variable is in the loaded environment (${bad.join(", ")})`
+      );
+  }
   const env = Object.keys(plist.EnvironmentVariables ?? {}).sort();
-  if (env.join() !== [...r.envKeys].sort().join())
+  if (env.join() !== want)
     p.push(`${r.label}: environment variable names are not exactly ${r.envKeys.join(", ")}`);
   if (repo)
     for (const [rel, sha] of Object.entries(r.files))
@@ -94,6 +143,9 @@ export function reviewProblems(r, plist, loadedArgs, shaOf) {
         p.push(`${r.label}: ${rel} does not hash to the reviewed sha256`);
   return p;
 }
+
+// programOf may return an argument array (tests) or { args, env, inherited, cwd } (launchctl)
+const asLoaded = x => (x === null || x === undefined ? null : Array.isArray(x) ? { args: x } : x);
 
 /**
  * launchd-off. `plists` maps a label to its LaunchAgents plist (parsed) or is missing it. Pure
@@ -117,22 +169,24 @@ export function launchdOff(
       continue;
     }
     if (!labels.includes(r.label)) continue;
-    const why = reviewProblems(r, plists[r.label], programOf(r.label), shaOf);
+    const why = reviewProblems(r, plists[r.label], asLoaded(programOf(r.label)), shaOf);
     if (why.length) p.push(...why);
     else cleared.add(r.label);
   }
   for (const l of labels) {
     if (l === PAUSE_LABEL || cleared.has(l)) continue;
-    const args = programOf(l);
+    const loaded = asLoaded(programOf(l));
+    const args = loaded?.args ?? null;
     if (args === null) {
       // Apple's XPC services are listed but not printable in the gui domain; anything else that
       // cannot be read fails closed (an installed agent is still read from its plist)
       if (!l.startsWith("com.apple.")) p.push(`${l}: its ProgramArguments cannot be read`);
-    } else for (const s of runsSender(args, readText)) p.push(`${l} runs ${s}`);
+    } else for (const s of runsSender(args, readText, loaded.cwd ?? null)) p.push(`${l} runs ${s}`);
     const d = plists[l];
     if (d) {
       const a = [...(d.ProgramArguments ?? []), ...(d.Program ? [d.Program] : [])].map(String);
-      for (const s of runsSender(a, readText)) p.push(`${l} (plist) runs ${s}`);
+      for (const s of runsSender(a, readText, d.WorkingDirectory ?? null))
+        p.push(`${l} (plist) runs ${s}`);
     }
   }
   return [...new Set(p)];
@@ -230,7 +284,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
             .filter(Boolean)
         : [];
       if (prog && a[0] !== prog[1].trim()) a.unshift(prog[1].trim());
-      return a;
+      const block = name => {
+        const b = out.match(new RegExp(`^\\t${name} = \\{\\n([\\s\\S]*?)^\\t\\}`, "m"));
+        return b ? [...b[1].matchAll(/^\t\t([^\s=]+) =>/gm)].map(x => x[1]) : null;
+      };
+      const cwd = out.match(/^\s*working directory = (.*)$/m);
+      return {
+        args: a,
+        env: block("environment"),
+        inherited: block("inherited environment") ?? [],
+        cwd: cwd ? cwd[1].trim() : null,
+      };
     };
     const reviewed = JSON.parse(
       readFileSync(new URL("./preflight-reviewed.json", import.meta.url), "utf8")

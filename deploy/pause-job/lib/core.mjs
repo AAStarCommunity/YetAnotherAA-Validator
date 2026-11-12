@@ -81,7 +81,12 @@ export function emptyState({
 }
 
 /** Problems with the state itself (shape and bookkeeping invariants). Pure. */
-export function stateProblems(st) {
+/**
+ * Problems with the state itself. A budget breach (spent + reserved > cap) is NOT an
+ * inconsistency once an inclusion-time OP fee overran a reservation: with { allowOverCap } it is
+ * left to overCap(), and the job records the real cost and stops broadcasting (Codex R3 P1).
+ */
+export function stateProblems(st, { allowOverCap = false } = {}) {
   const p = [];
   if (st?.schema !== "aoa-pause-job-state/2") return ["unknown state schema"];
   const l = st.ledger;
@@ -99,8 +104,14 @@ export function stateProblems(st) {
   });
   if (reserved !== big(l.reserved)) p.push("reserved does not equal the held reservations");
   if (spent !== big(l.spent)) p.push("spent does not equal the final costs");
-  if (spent + reserved > big(l.cap)) p.push("spent + reserved exceeds the cap");
+  if (!allowOverCap && spent + reserved > big(l.cap)) p.push("spent + reserved exceeds the cap");
   return p;
+}
+
+/** spent + reserved > cap: the job records it and broadcasts nothing more. */
+export function overCap(st) {
+  const l = st.ledger;
+  return big(l.spent) + big(l.reserved) > big(l.cap);
 }
 
 /** Split [from, to] into chunks of at most `size` blocks. Pure. */
@@ -340,7 +351,7 @@ async function reconcile(stLive, chain, persist, finalized) {
         text: `pause of ${t.operator} reverted on chain (tx ${t.includedHash})`,
       });
   }
-  const bad = stateProblems(st);
+  const bad = stateProblems(st, { allowOverCap: true });
   if (bad.length) {
     alerts.push({
       key: "reconcile",
@@ -480,7 +491,7 @@ async function replace(st, t, { chain, signer, persist, cfg }) {
  */
 export async function runRound(st, { chain, signer, persist, cfg }) {
   const alerts = [];
-  const sp = stateProblems(st);
+  const sp = stateProblems(st, { allowOverCap: true });
   if (sp.length) throw new SafeError(`state: ${sp.join("; ")}`);
   if (lc(signer.address) !== st.signer)
     throw new SafeError("the keystore is not the state's signer");
@@ -492,7 +503,7 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
   alerts.push(...(await reconcile(st, chain, persist, finalized)));
   for (const t of st.ledger.txs)
     if (PENDING.has(t.status)) t.pendingRounds = (t.pendingRounds ?? 0) + 1;
-  const sp2 = stateProblems(st);
+  const sp2 = stateProblems(st, { allowOverCap: true });
   if (sp2.length) throw new SafeError(`state after reconcile: ${sp2.join("; ")}`);
   const latestNonce = Number(await chain.nonce(st.signer, "latest"));
   const firstPending = st.ledger.txs.findIndex(t => PENDING.has(t.status));
@@ -574,6 +585,14 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
   // 5. broadcast ONLY after the identity check passed at a canonical B
   report.sent = [];
   if (!id.ok) return { alerts, report };
+  // a recorded overrun (spent + reserved > cap) stops every broadcast until a new funding
+  if (overCap(st)) {
+    alerts.push({
+      key: "cap",
+      text: `remaining cap insufficient: spent ${st.ledger.spent} + reserved ${st.ledger.reserved} exceeds the cap ${st.ledger.cap}; nothing broadcast until a new funding`,
+    });
+    return { alerts, report };
+  }
   const pending = () => st.ledger.txs.some(t => PENDING.has(t.status));
   // wait for inclusion (not finality) of whatever is pending, before signing a new nonce
   const waitIncluded = async () => {

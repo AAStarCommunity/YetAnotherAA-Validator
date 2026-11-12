@@ -727,10 +727,7 @@ await section(async () => {
     "stuck: once final, the landed hash is one of those signed; cost counted once",
     t.status === "final" &&
       t.hashes.includes(t.includedHash) &&
-      BigInt(j.st.ledger.spent) ===
-        j.st.ledger.txs
-          .filter(x => x.status === "final")
-          .reduce((x, y) => x + BigInt(y.cost), 0n) &&
+      BigInt(j.st.ledger.spent) === (await receiptSum(j.st)) &&
       stateProblems(j.st).length === 0,
     copy(j.st.ledger)
   );
@@ -764,6 +761,52 @@ await section(async () => {
 await revert(u8);
 const u9 = await snapshot();
 
+// ---- C7c: an overrun (a cost above its reservation, as an OP inclusion-time fee can produce) is
+// RECORDED, not discarded, and stops every broadcast (Codex R3 P1). Round 1 pauses only the first
+// operator (the second's estimate fails); its reservation is shrunk in the journal so the real
+// receipt cost overruns it on this L1 test chain; round 2 finds the second operator still a
+// candidate and must broadcast nothing.
+await section(async () => {
+  const j = await fresh();
+  const [a, b] = [
+    "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  ].sort();
+  const bData = spIface.encodeFunctionData("pauseUnderstakedOperator", [b]).toLowerCase();
+  const noB = {
+    ...chain,
+    estimateGas: tx =>
+      tx.data.toLowerCase() === bData ? Promise.reject(new Error("x")) : chain.estimateGas(tx),
+  };
+  await j.round({ chain: noB });
+  const one = j.st.ledger.txs.length === 1 && j.st.ledger.txs[0].operator === a;
+  j.st.ledger.txs[0].reserve = "1";
+  j.st.ledger.reserved = "1";
+  j.st.ledger.cap = "1"; // a valid ledger: spent 0 + reserved 1 = cap 1
+  await finalize();
+  const nonce = Number(await p.getTransactionCount(j.w.address, "latest"));
+  const r = await j.round();
+  cell(
+    "overrun: the real cost is recorded (final, spent = receipts) even though it exceeds the cap",
+    one &&
+      j.st.ledger.txs[0].status === "final" &&
+      BigInt(j.st.ledger.spent) === (await receiptSum(j.st)) &&
+      BigInt(j.st.ledger.spent) > BigInt(j.st.ledger.cap) &&
+      r.alerts.some(x => x.key.startsWith("overrun:")),
+    { one, l: copy(j.st.ledger), a: r.alerts }
+  );
+  cell(
+    "overrun: with spent > cap the remaining candidate is NOT paused and nothing is broadcast",
+    r.report.sent.length === 0 &&
+      !(await isPaused(b)) &&
+      Number(await p.getTransactionCount(j.w.address, "pending")) === nonce &&
+      r.alerts.some(x => x.key === "cap" && x.text.includes("exceeds the cap")),
+    { sent: r.report.sent, a: r.alerts }
+  );
+});
+await revert(u9);
+const u9b = await snapshot();
+
 // ---- C8: another use of the key stops the round
 await section(async () => {
   const j = await fresh();
@@ -780,7 +823,7 @@ await section(async () => {
     msg
   );
 });
-await revert(u9);
+await revert(u9b);
 const u10 = await snapshot();
 
 // ---- C9: a failed getLogs range is retried, never skipped

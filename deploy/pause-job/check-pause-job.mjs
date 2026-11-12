@@ -353,6 +353,28 @@ cell(
     ).length === 0
   );
   {
+    const fs = {
+      "/repo/outer.sh": "#!/bin/bash\nexec /repo/inner.sh",
+      "/repo/inner.sh": "node deploy/committee-keeper.mjs --watch",
+      "/w/deploy/outer.sh": "bash ./deploy/inner2.sh",
+      "/w/deploy/inner2.sh": "node deploy/apply-verifier-rotation.mjs --broadcast",
+      "/c/quiet.sh": "# this script never runs committee-keeper.mjs\necho ok",
+    };
+    const rt = p => (fs[p] !== undefined ? { kind: "text", text: fs[p] } : { kind: "none" });
+    cell(
+      "runsSender: a nested wrapper chain outer.sh -> inner.sh -> keeper is followed (Codex R3 P2-3)",
+      runsSender(["/bin/bash", "/repo/outer.sh"], rt).includes("committee-keeper.mjs")
+    );
+    cell(
+      "runsSender: a relative wrapper is resolved against the working directory",
+      runsSender(["/bin/bash", "deploy/outer.sh"], rt, "/w").includes("apply-verifier-rotation.mjs")
+    );
+    cell(
+      "runsSender: a whole-line comment naming a sending script does not count",
+      runsSender(["/bin/bash", "/c/quiet.sh"], rt).length === 0
+    );
+  }
+  {
     // the reviewed exception (DSR bc3be95b): label, FULL args, loaded == plist, env names, file hashes
     const r = {
       label: "io.aastar.dvt-committee-health",
@@ -380,8 +402,37 @@ cell(
       kind: "text",
       text: "apply) node deploy/apply-verifier-rotation.mjs --broadcast",
     });
-    const run = (pl, loaded = args, s = sha, labels = [PAUSE_LABEL, r.label]) =>
-      launchdOff(labels, () => loaded, txt, [r], s, { [r.label]: pl });
+    const LOADED_ENV = ["OSLogRateLimit", "PATH", "HOME", "XPC_SERVICE_NAME"];
+    const run = (
+      pl,
+      loaded = args,
+      s = sha,
+      labels = [PAUSE_LABEL, r.label],
+      env = LOADED_ENV,
+      inherited = ["SSH_AUTH_SOCK"]
+    ) =>
+      launchdOff(labels, () => ({ args: loaded, env, inherited }), txt, [r], s, { [r.label]: pl });
+    cell(
+      "reviewed: a stale LOADED BASH_ENV fails even when the plist on disk lacks it (Codex R3 P2-2)",
+      run(plist, args, sha, undefined, [...LOADED_ENV, "BASH_ENV"]).some(x =>
+        x.includes("LOADED environment")
+      ) &&
+        run(plist, args, sha, undefined, [...LOADED_ENV, "BASH_ENV"]).some(x =>
+          x.includes("start-up variable")
+        )
+    );
+    cell(
+      "reviewed: an inherited BASH_ENV (launchctl setenv) fails",
+      run(plist, args, sha, undefined, LOADED_ENV, ["BASH_ENV"]).some(x =>
+        x.includes("start-up variable")
+      )
+    );
+    cell(
+      "reviewed: an unreadable loaded environment fails closed",
+      launchdOff([PAUSE_LABEL, r.label], () => args, txt, [r], sha, { [r.label]: plist }).some(x =>
+        x.includes("loaded environment cannot be read")
+      )
+    );
     cell(
       "reviewed: the exact plist, loaded args, env names and both file hashes pass",
       run(plist).length === 0,
