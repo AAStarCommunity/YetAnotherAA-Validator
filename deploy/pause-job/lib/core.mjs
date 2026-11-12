@@ -108,6 +108,29 @@ export function stateProblems(st, { allowOverCap = false } = {}) {
   return p;
 }
 
+/**
+ * The funding gate before any broadcast, or null when it passes. Spent covers final transactions
+ * only; an included one has already left the balance too, at its provisional cost. Any included
+ * cost still unknown refuses; a balance above cap - spent - included costs is a top-up. Pure.
+ */
+export function fundingGate(st, balance) {
+  const inc = st.ledger.txs.filter(t => t.status === "included");
+  const unknown = inc.filter(t => t.includedCost == null);
+  if (unknown.length)
+    return {
+      key: "cost-unknown",
+      text: `the cost of included pause(s) ${unknown.map(t => t.nonce).join(", ")} cannot be read yet; nothing broadcast until it is`,
+    };
+  const included = inc.reduce((x, t) => x + big(t.includedCost), 0n);
+  const budgetLeft = big(st.ledger.cap) - big(st.ledger.spent) - included;
+  if (balance > budgetLeft)
+    return {
+      key: "topup",
+      text: `the signer holds ${balance} wei, more than the budget left (${budgetLeft} of cap ${st.ledger.cap}): a top-up without a DSR go; nothing broadcast`,
+    };
+  return null;
+}
+
 /** spent + reserved > cap: the job records it and broadcasts nothing more. */
 export function overCap(st) {
   const l = st.ledger;
@@ -290,7 +313,8 @@ async function isPaused(st, chain, B, op) {
 /**
  * The cost an INCLUDED transaction has already taken from the balance, for the funding check. On
  * OP the oracle's L1 and operator fees are read at the inclusion block (Codex R9 P2); if they
- * cannot be read, the reservation is used instead (more, never less: fail closed). Async.
+ * cannot be read the cost is null (unknown), and fundingGate refuses every broadcast until a
+ * later reconcile reads it. Async.
  */
 export async function provisionalCost(st, chain, t, r) {
   if (!OP_CHAINS.has(st.chainId)) return costOf(r, st.chainId);
@@ -302,7 +326,9 @@ export async function provisionalCost(st, chain, t, r) {
     });
     return costOf(r, st.chainId, fees);
   } catch {
-    return big(t.reserve);
+    // unknown, not guessed: a reservation can be exceeded on OP (Codex R10 P2); broadcasts stop
+    // until it is read
+    return null;
   }
 }
 
@@ -313,7 +339,8 @@ async function markIncluded(st, chain, t, r) {
   t.includedBlock = Number(r.blockNumber);
   t.includedBlockHash = r.blockHash;
   t.pendingRounds = 0;
-  t.includedCost = String(await provisionalCost(st, chain, t, r));
+  const c = await provisionalCost(st, chain, t, r);
+  t.includedCost = c === null ? null : String(c);
 }
 
 /** The receipt of any hash ever signed for `t`'s nonce, or null. */
@@ -359,6 +386,10 @@ async function reconcile(stLive, chain, persist, finalized) {
       delete t.includedCost;
     }
     if (PENDING.has(t.status) && r) await include(t, r);
+    else if (t.status === "included" && t.includedCost == null && r) {
+      const c = await provisionalCost(st, chain, t, r); // retry an unknown inclusion cost
+      t.includedCost = c === null ? null : String(c);
+    }
     if (t.status !== "included" || t.includedBlock > finalized) continue;
     // final only at or below finalized AND on the canonical chain
     const blk = await chain.blockByNumber(t.includedBlock);
@@ -648,16 +679,9 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     return { alerts, report };
   }
   report.balance = String(balance);
-  // spent covers final transactions only; an included one has already left the balance too
-  const includedCost = st.ledger.txs
-    .filter(t => t.status === "included")
-    .reduce((x, t) => x + big(t.includedCost ?? t.reserve), 0n);
-  const budgetLeft = big(st.ledger.cap) - big(st.ledger.spent) - includedCost;
-  if (balance > budgetLeft) {
-    alerts.push({
-      key: "topup",
-      text: `the signer holds ${balance} wei, more than the budget left (${budgetLeft} of cap ${st.ledger.cap}): a top-up without a DSR go; nothing broadcast`,
-    });
+  const gate = fundingGate(st, balance);
+  if (gate) {
+    alerts.push(gate);
     return { alerts, report };
   }
   const pending = () => st.ledger.txs.some(t => PENDING.has(t.status));
@@ -689,6 +713,12 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     }
     report.sent.push(op);
     await waitIncluded();
+    // an inclusion whose cost could not be read stops the round (Codex R10 P2)
+    const g = st.ledger.txs.some(t => t.status === "included" && t.includedCost == null);
+    if (g) {
+      alerts.push(fundingGate(st, 0n));
+      break;
+    }
   }
   return { alerts, report };
 }

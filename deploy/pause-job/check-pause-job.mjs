@@ -16,6 +16,7 @@ import {
   revertData,
   costOf,
   provisionalCost,
+  fundingGate,
   PIN,
   spIface,
 } from "./lib/core.mjs";
@@ -158,9 +159,25 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     },
   };
   cell(
-    "provisionalCost on OP with the oracle unreadable falls back to the reservation (fail closed)",
-    (await provisionalCost(st, down, t, r)) === 999999n
+    "provisionalCost on OP with the oracle unreadable is UNKNOWN (null), never a guess (Codex R10 P2)",
+    (await provisionalCost(st, down, t, r)) === null
   );
+  {
+    const led = txs => ({ ledger: { cap: "100", spent: "0", reserved: "10", txs } });
+    const inc = cost => ({ nonce: 0, status: "included", reserve: "10", includedCost: cost });
+    cell(
+      "fundingGate: an included cost still unknown refuses every broadcast",
+      fundingGate(led([inc(null)]), 0n)?.key === "cost-unknown"
+    );
+    cell(
+      "fundingGate: cap 100, included cost 15 (above its reservation 10), top-up 3: balance 88 > 85 refuses (Codex R10 example)",
+      fundingGate(led([inc("15")]), 88n)?.key === "topup"
+    );
+    cell(
+      "fundingGate: a balance of exactly cap - spent - included passes",
+      fundingGate(led([inc("15")]), 85n) === null
+    );
+  }
   cell(
     "provisionalCost on L1 is the execution cost",
     (await provisionalCost({ chainId: 11155111 }, down, t, r)) === 700n
