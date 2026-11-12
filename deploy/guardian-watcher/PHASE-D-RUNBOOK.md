@@ -99,9 +99,18 @@ as a decimal string; its `keystore` must be the same file as `phase-d.json`
 **The git mirror's deploy key** is a key file, not the ssh-agent: a launchd job
 started after a reboot without a login has no agent. The file lies inside the
 same trust boundary as the Keychain (M0 §5.5a: the Mini's operator is not
-defended against). It can write only this repository, and the branch ruleset
-below blocks force-push and deletion, so a leaked key can at worst append
-commits to the mirror, a third copy next to the registry and IPFS.
+defended against). What a leaked key can do (Codex Phase D R1 #3):
+
+- it can write to **this repository only**, but to the whole of it: push new
+  branches with any content, and push to any branch no rule protects. `master`
+  stays protected by its branch protection (a reviewed pull request is
+  required), so nothing it pushes reaches `master` unreviewed;
+- on `disclosure-records` the ruleset below blocks force-push and deletion, so
+  the **history** is kept: every commit the watcher made stays reachable. A
+  fast-forward commit can still delete or change record files in the branch's
+  latest tree;
+- the mirror is a third copy next to the registry and IPFS: a record is judged
+  by its CID and the registry entry, never by the mirror's latest tree alone.
 
 ```sh
 ssh-keygen -t ed25519 -N "" -C "aoa-watcher mirror $(id -un)@$(hostname -s)" -f ~/.aoa-watcher/mirror_deploy_key
@@ -119,7 +128,7 @@ only, and the branch as an empty root commit (records only, no source tree; the
 watcher only ever appends to it):
 
 ```sh
-export GIT_SSH_COMMAND="ssh -i $HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
+export GIT_SSH_COMMAND="ssh -F /dev/null -i $HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
 git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git
 M=~/.aoa-watcher/mirror.git
 ROOT=$(git -C $M commit-tree $(git -C $M hash-object -t tree -w /dev/null) -m "disclosure records")
@@ -392,11 +401,14 @@ and disclosed again on the new registry as usual.
 **A leak** (the file was copied, or the Mini's account is suspected):
 
 1. delete the deploy key on GitHub at once: the key can no longer push;
-2. compare the branch with the journals: every commit on `disclosure-records`
-   must be one the watcher made (a record file whose bytes match the record
-   pinned on IPFS and disclosed in the registry). The ruleset kept anything from
-   being rewritten or deleted, so an attacker could only append; such commits
-   are reported in the chat, never reverted by force;
+2. check what it was used for, from the repository's activity
+   (`gh api repos/<owner>/<repo>/activity`, or Insights → Activity):
+   - branches it created: delete them (none can have reached `master` without a
+     reviewed pull request);
+   - commits on `disclosure-records` the watcher did not make: the history is
+     intact (force-push is blocked), so compare every record file with its
+     journal, its IPFS CID and its registry entry, and restore any changed or
+     deleted file with a new commit, never by a force-push;
 3. rotate as above (a new key file and deploy key). If the Mini's account itself
    is suspected, the sender key and the Keychain items are suspect too: follow
    M0 §5.5a (a leaked sender key) as well.

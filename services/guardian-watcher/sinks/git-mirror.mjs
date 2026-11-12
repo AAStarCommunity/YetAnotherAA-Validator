@@ -69,14 +69,18 @@ function gitRaw(cwd, args, { input, env } = {}) {
   });
 }
 /**
- * The ssh command git uses for the mirror (DSR): only this key file, no agent, no prompt, and a
- * known host key. The path must be absolute and plain (it is parsed by a shell inside git).
+ * The ssh command git uses for the mirror (DSR): only this key file, no ssh config, no agent, no
+ * prompt, and a known host key (the default ~/.ssh/known_hosts). The path must be absolute and
+ * plain (it is parsed by a shell inside git).
  */
 export function mirrorSshCommand(sshKey) {
   if (!/^\/[A-Za-z0-9._/-]+$/.test(String(sshKey ?? "")) || String(sshKey).includes("/../"))
     throw new SinkError("mirror: sshKey must be an absolute plain path");
   return [
     "ssh",
+    // no ssh config at all (Codex Phase D R1 #1): IdentitiesOnly still admits a configured
+    // IdentityFile, so ~/.ssh/config could otherwise supply another key
+    "-F /dev/null",
     `-i ${sshKey}`,
     "-o IdentitiesOnly=yes",
     "-o IdentityAgent=none",
@@ -118,8 +122,11 @@ export function gitMirror({
   // every git call of this sink, fetches and pushes alike, uses only the key file (when given;
   // production always gives one: lib/sinks-config.mjs requires it)
   const sshEnv = sshKey ? { GIT_SSH_COMMAND: mirrorSshCommand(sshKey) } : {};
+  // with a key, only the ssh transport (Codex Phase D R1 #2): a local, file://, https or ext remote
+  // could otherwise take the push without the key
+  const sshOnly = sshKey ? ["-c", "protocol.allow=never", "-c", "protocol.ssh.allow=always"] : [];
   const git = (cwd, args, o = {}) =>
-    gitRaw(cwd, args, { ...o, env: { ...sshEnv, ...(o.env ?? {}) } });
+    gitRaw(cwd, [...sshOnly, ...args], { ...o, env: { ...sshEnv, ...(o.env ?? {}) } });
   const text = async (...a) => (await git(...a)).toString().trim();
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
     throw new SinkError("mirror: bad branch name");
@@ -229,3 +236,23 @@ export const PUBLIC_REPO_URL = /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Z
 /** A blob URL in such a repository, as gitMirror builds it. */
 export const MIRROR_BLOB_URL =
   /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/blob\/[0-9a-f]{4,40}\/[A-Za-z0-9._\/-]{1,300}$/;
+
+/**
+ * The SSH remote the mirror must push to for its public `repoUrl` (Codex Phase D R1 #2): the
+ * clone's effective fetch AND push URLs (after any insteadOf rewrite) must be one of these, so a
+ * local path, an HTTPS remote or a separate pushurl cannot stand in for the deploy key's write.
+ */
+export function expectedMirrorRemotes(repoUrl) {
+  const m = /^https:\/\/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?$/.exec(
+    String(repoUrl ?? "")
+  );
+  if (!m) return null;
+  const path = `${m[1]}/${m[2]}`.toLowerCase();
+  return [`git@github.com:${path}.git`, `ssh://git@github.com/${path}.git`];
+}
+export const isExpectedMirrorRemote = (url, repoUrl) =>
+  !!expectedMirrorRemotes(repoUrl)?.includes(
+    String(url ?? "")
+      .trim()
+      .toLowerCase()
+  );

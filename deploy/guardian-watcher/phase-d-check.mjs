@@ -183,17 +183,37 @@ else {
     else if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
       add("mirror-push", "FAIL", "publish.mirror.branch is not a plain branch name");
     else {
-      const { mirrorSshCommand } = await import(join(W, "sinks/git-mirror.mjs"));
+      const { mirrorSshCommand, isExpectedMirrorRemote } = await import(
+        join(W, "sinks/git-mirror.mjs")
+      );
       const env = {
         ...process.env,
         GIT_TERMINAL_PROMPT: "0",
         GIT_SSH_COMMAND: mirrorSshCommand(m.sshKey),
       };
+      // ssh transport only (Codex Phase D R1 #2): no local path, file://, https or ext remote
+      const SSH_ONLY = ["-c", "protocol.allow=never", "-c", "protocol.ssh.allow=always"];
       const run = a =>
-        spawnSync("git", ["-C", m.clone, ...a], { env, encoding: "utf8", timeout: 60_000 });
-      const ls = run(["ls-remote", "--heads", "origin", `refs/heads/${branch}`]);
-      const tip = ls.status === 0 ? String(ls.stdout).split(/\s/)[0] : "";
-      if (ls.status !== 0)
+        spawnSync("git", [...SSH_ONLY, "-C", m.clone, ...a], {
+          env,
+          encoding: "utf8",
+          timeout: 60_000,
+        });
+      const url = r => (r.status === 0 ? String(r.stdout).trim() : "");
+      const fetchUrl = url(run(["remote", "get-url", "origin"]));
+      const pushUrl = url(run(["remote", "get-url", "--push", "origin"]));
+      const ls =
+        isExpectedMirrorRemote(fetchUrl, m.repoUrl) && isExpectedMirrorRemote(pushUrl, m.repoUrl)
+          ? run(["ls-remote", "--heads", "origin", `refs/heads/${branch}`])
+          : null;
+      const tip = ls?.status === 0 ? String(ls.stdout).split(/\s/)[0] : "";
+      if (!ls)
+        add(
+          "mirror-push",
+          "FAIL",
+          "the clone's origin (fetch or push URL) is not the GitHub SSH remote of publish.mirror.repoUrl"
+        );
+      else if (ls.status !== 0)
         add("mirror-push", "FAIL", "remote unreachable or the key not authorized (ls-remote)");
       else if (!/^[0-9a-f]{40}$/.test(tip))
         add("mirror-push", "MISSING", `branch ${branch} is not on the remote yet`);

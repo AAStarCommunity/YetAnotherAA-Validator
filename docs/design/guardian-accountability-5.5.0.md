@@ -755,12 +755,15 @@ or as the author's attestation: nothing in the repository proves them.
      sender's encrypted keystore `~/.aoa-watcher/sender.keystore.json` (mode
      600; its password is the third item) and the git mirror's deploy key, a key
      file `~/.aoa-watcher/mirror_deploy_key` (mode 600, no passphrase, used with
-     `IdentitiesOnly` and no ssh-agent: `sinks/git-mirror.mjs`; DSR). The key
-     file lies inside the same trust boundary as the Keychain (item 1); it can
-     write only this repository, and the `disclosure-records` ruleset blocks
-     force-push and deletion, so a leak can at worst append commits to the
-     mirror (runbook: rotation and a leak). None of these is in `.env`, a config
-     file or a command line.
+     `IdentitiesOnly`, no ssh config and no ssh-agent: `sinks/git-mirror.mjs`;
+     DSR). The key file lies inside the same trust boundary as the Keychain
+     (item 1). A leaked key can write to the whole of this repository (new
+     branches, any unprotected branch; `master` still needs a reviewed pull
+     request). On `disclosure-records` the ruleset blocks force-push and
+     deletion, so the history is kept, but a new commit can delete or change
+     record files in the latest tree: records are judged by their CID and
+     registry entry, never by the mirror's tree alone (runbook: rotation and a
+     leak). None of these is in `.env`, a config file or a command line.
    - Rotation is triggered by the author only (a provider notice, a suspected
      leak, or a scheduled change). A Keychain item is replaced interactively
      with `security add-generic-password -U -a aoa-watcher -s <item> -w` (the

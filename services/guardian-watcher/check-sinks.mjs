@@ -1543,7 +1543,8 @@ try {
   }
   cell(
     "DSR mirror key: the mirror's git calls run ssh with only the key file (-i, IdentitiesOnly, no agent, batch, strict host key); non-plain key paths are refused",
-    argv.includes(`-i ${key}`) &&
+    argv.includes("-F /dev/null") &&
+      argv.includes(`-i ${key}`) &&
       argv.includes("IdentitiesOnly=yes") &&
       argv.includes("IdentityAgent=none") &&
       argv.includes("BatchMode=yes") &&
@@ -1551,6 +1552,89 @@ try {
       /remote unreachable or not authorized/.test(err ?? "") &&
       refused.every(Boolean),
     { argv, err, refused }
+  );
+  // Codex Phase D R1 #2: with a key the sink pushes over ssh only (a local or file:// remote is
+  // refused, never taken without the key); the Phase D remote match accepts only the GitHub SSH
+  // remote of repoUrl
+  const { expectedMirrorRemotes, isExpectedMirrorRemote } = await import("./sinks/git-mirror.mjs");
+  const upstream = join(d, "up.git");
+  execFileSync("git", ["init", "-q", "--bare", upstream]);
+  {
+    // the branch exists upstream, so only the transport rule can make the keyed push fail
+    const empty = execFileSync("git", [
+      "-C",
+      upstream,
+      "hash-object",
+      "-t",
+      "tree",
+      "-w",
+      "/dev/null",
+    ])
+      .toString()
+      .trim();
+    const root = execFileSync("git", [
+      "-C",
+      upstream,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit-tree",
+      empty,
+      "-m",
+      "r",
+    ])
+      .toString()
+      .trim();
+    execFileSync("git", ["-C", upstream, "update-ref", "refs/heads/disclosure-records", root]);
+  }
+  const mk = () => {
+    const c = mkdtempSync(join(d, "l-"));
+    execFileSync("git", ["init", "-q", "--bare", c]);
+    execFileSync("git", ["-C", c, "remote", "add", "origin", upstream]);
+    return c;
+  };
+  const local = mk();
+  let control = "ok";
+  try {
+    await gitMirror({ clone: mk(), repoUrl: "https://github.com/o/r" }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    control = e.message;
+  }
+  let localErr = null;
+  try {
+    await gitMirror({ clone: local, repoUrl: "https://github.com/o/r", sshKey: key }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    localErr = e.message;
+  }
+  const R = "https://github.com/AAStar/Repo";
+  const match = {
+    scp: isExpectedMirrorRemote("git@github.com:aastar/repo.git", R),
+    sshUrl: isExpectedMirrorRemote("ssh://git@github.com/AAStar/Repo.git", R),
+    https: isExpectedMirrorRemote("https://github.com/AAStar/Repo.git", R),
+    path: isExpectedMirrorRemote("/tmp/up.git", R),
+    other: isExpectedMirrorRemote("git@github.com:evil/repo.git", R),
+    noRepo: expectedMirrorRemotes("not a url"),
+  };
+  cell(
+    "Codex Phase D R1 #2: a key-bound mirror refuses a non-ssh remote (local path); only the GitHub SSH remote of repoUrl matches",
+    control === "ok" &&
+      typeof localErr === "string" &&
+      match.scp &&
+      match.sshUrl &&
+      !match.https &&
+      !match.path &&
+      !match.other &&
+      match.noRepo === null,
+    { control, localErr, match }
   );
   rmSync(d, { recursive: true, force: true });
 }
