@@ -453,7 +453,12 @@ try {
   die(3, `a read failed (${e instanceof Infra ? e.message : "RPC error"}): no verdict`);
 }
 const { cmp, unverified } = result;
-for (const k of missingAbi) unverified.push(`abis/ has no file for ${k} (ask SP)`);
+for (const k of missingAbi)
+  unverified.push(
+    k === "disclosureRegistry"
+      ? "disclosureRegistry is retired (DSR 009967e4): SP's read-back must drop it"
+      : `abis/ has no file for ${k} (ask SP)`
+  );
 // ABIs or the address book not fetched from SP at the pinned commits are not authenticated
 // (Codex A7 R2 #4): usable for a dry run, never for SAME STATE
 if (opt("abi-dir")) unverified.push("ABIs from --abi-dir (not SP's abis/ at spCommit)");
