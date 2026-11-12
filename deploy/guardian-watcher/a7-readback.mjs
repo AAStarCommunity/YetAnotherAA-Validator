@@ -132,7 +132,9 @@ export const ABI_FILES = {
   blsAggregator: "BLSAggregator.json",
   dvtValidator: "DVTValidator.json",
   reputationSystem: "ReputationSystem.json",
-  disclosureRegistry: null, // DVT's own contract: ABI from the DVT repo at the manifest's DVT commit
+  // retired (DSR 009967e4): no ABI, so its fields are unverified and stop the rehearsal; it stays
+  // in the lists above only because SP's frozen schema v10 still requires it
+  disclosureRegistry: null,
   xPNTsFactoryV2: "xPNTsFactoryV2.json",
   xPNTsTokenV2Impl: "xPNTsTokenV2.full.json",
   xPNTsTokenV2Ext: "xPNTsTokenV2Ext.json",

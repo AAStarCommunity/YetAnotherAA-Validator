@@ -4,6 +4,35 @@ All notable changes to YetAnotherAA-Validator (the DVT BLS signer node) are
 documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [Unreleased]
+
+### Removed — guardian watcher W2\* publication and DisclosureRegistry (DSR 009967e4, 502ccd64)
+
+The author retired the 5.5.0 guardian watcher's on-chain publication. Nothing
+removed here was ever deployed or running. The last state is the tag
+`archive/guardian-watcher-w2-2026-11-12` (master `8a7cda74`), from which the SDK
+ports the detection logic.
+
+- `services/guardian-watcher/` (scanner, classifier, publication journal, sinks,
+  CLI), and in `deploy/guardian-watcher/` the launchd plists, the wrapper, the
+  heartbeat, `fill-nonce`, `new-sender-keystore`, `rearm-hold` and the whole
+  Phase D check and runbook.
+- `contracts/src/disclosure/DisclosureRegistry.sol`, its deploy script, its
+  three test suites and `disclosure-vectors.json`; the release-profile artifact
+  step in CI.
+- `scripts/disclosure/` (entry recheck, its stub chain, the A3 emission diff,
+  the disclosure vectors).
+- A7 rehearsal: DisclosureRegistry's ABI is no longer fetched from this
+  repository.
+
+### Kept
+
+- The M0 §3.1 evidence encoding, moved to `scripts/evidence/`. It has a new CI
+  step, `check:evidence`, and its vectors are byte-identical. SP's own
+  DVTValidator parity check is `check:sp-parity`.
+- `src/modules/audit` (guardian-slash-watcher, the fraud-proof consumers) and
+  the A7 fork and read-back tools.
+
 ## [1.15.0] — 2026-08-29 — CC-115 B1 domain-bound fraud-proof verifier + CC-97 committee floor
 
 Two security changes landed on master today (PRs #240, #241). Both are

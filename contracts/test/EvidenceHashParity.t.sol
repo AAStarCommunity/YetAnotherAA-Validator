@@ -4,10 +4,10 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 
 /// @dev M0 §3.1 evidence encoding, which SP's DVTValidator (0.8.0) checks at execute
-///      (EvidenceHashMismatch). The off-chain side (scripts/disclosure/recheck-lib.mjs) writes
+///      (EvidenceHashMismatch). The off-chain side (scripts/evidence/evidence-lib.mjs) writes
 ///      test/fixtures/evidence-vectors.json; this test recomputes every vector with Solidity's own
 ///      abi.encode and keccak256, so a drift in either implementation fails one of the two
-///      (`npm run check:disclosure` diffs the JS side). SP's contract is checked against the same file
+///      (`npm run check:evidence` diffs the JS side). SP's contract is checked against the same file
 ///      when its branch is available.
 contract EvidenceHashParityTest is Test {
     bytes32 internal constant TAG_EVIDENCE = keccak256("SuperPaymaster.DVT.Evidence.v2");

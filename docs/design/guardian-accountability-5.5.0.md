@@ -1,5 +1,25 @@
 # Guardian accountability for SuperPaymaster 5.5.0 — M0 design
 
+> **RETIRED 2026-11-12 (author decision, DSR 009967e4, 502ccd64).** The guardian
+> watcher's on-chain publication (W2\*), the `DisclosureRegistry` contract, the
+> watcher's Phase D and the registry-reading parts of the A7 rehearsal are
+> removed from master. Their last state is the tag
+> `archive/guardian-watcher-w2-2026-11-12` (master `8a7cda74`). This document is
+> kept as the design record; sections 4–5 (registry, watcher, publication) and
+> the Phase D parts of §5.5/§9 no longer describe anything in this repository.
+> Still in force: the §3.1 evidence encoding (`scripts/evidence/`,
+> `EvidenceHashParity.t.sol`), which the fraud-proof consumers use.
+>
+> The replacement: detection is a read-only `@aastar/sdk` API with a single
+> implementation, which DVT imports. DVT adds a pause job and a daily report
+> after that API exists. One finding from the retirement: the watcher detected
+> BLS actions through `SignersCommitted`, which SP's BLSAggregator never emits.
+> §5.2 and §9 had recorded it as "SP-reported, re-check before freezing"; that
+> re-check never happened, and the watcher's own stub chain emitted the event,
+> so every self-test passed. Rule from it: a test fixture must not supply a
+> premise that has not been verified. Negative controls run against SP's real
+> artifacts.
+
 > **Status: DESIGN (M0), for DSR review before any build.** No contract or
 > service in this document exists yet. Nothing here sends a transaction. Owner
 > rulings are quoted with their date; everything else is a proposal and says so.
