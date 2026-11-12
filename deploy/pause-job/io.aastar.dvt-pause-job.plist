@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The DVT pause job (README.md). Render __HOME__ and __REPO__ (absolute paths), then
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.aastar.dvt-pause-job.plist and check
+     `launchctl print gui/$(id -u)/io.aastar.dvt-pause-job | grep "run interval"` shows 600.
+     StartInterval is a top-level key: nested inside EnvironmentVariables it passes plutil -lint
+     and launchd ignores it. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.aastar.dvt-pause-job</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>__REPO__/deploy/pause-job/pause-job.mjs</string>
+    <string>--config</string>
+    <string>__HOME__/.aoa-pause-job/config.json</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/aoa-pause-job.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/aoa-pause-job.log</string>
+</dict>
+</plist>

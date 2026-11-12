@@ -179,6 +179,15 @@ jobs:
       - name: Check the evidence vectors
         run: npm run check:evidence
 
+      - name: Check the pause job (pure cells)
+        run: npm run check:pause-job
+
+      # sp-pin.json must be exactly what SP's abis/ and IRegistry.sol say at its pinned commit
+      - name: Check the pause job's SP pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npm run check:pause-job-pin
+
       # A7 rehearsal (M0 §9): SP's frozen aoa-a7-readback/1 schema and both examples (sha256-pinned)
       # validate; every comparison rule fails on its mutation; a live read-back is never a fork's.
       - name: Check the A7 read-back comparison

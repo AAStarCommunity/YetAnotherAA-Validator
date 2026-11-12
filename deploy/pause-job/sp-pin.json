@@ -1,0 +1,447 @@
+{
+  "schema": "aoa-pause-job-sp-pin/1",
+  "spRepo": "AAStarCommunity/SuperPaymaster",
+  "spCommit": "23e9633df1d15365f6d33dd882efb77d4c28febd",
+  "sources": {
+    "abis/SuperPaymaster.full.json": "944d4dc3c0cb6896398cd592e9f063d1af099312",
+    "abis/Registry.json": "3563bbb24c3bbc62751fa67bb4b4584e8ca763fc",
+    "contracts/src/interfaces/v3/IRegistry.sol": "cd7088db04e7b2486e6fb33475d355a8691edf3d"
+  },
+  "abi": {
+    "superPaymaster": [
+      {
+        "type": "function",
+        "name": "pauseUnderstakedOperator",
+        "inputs": [
+          {
+            "name": "operator",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      },
+      {
+        "type": "function",
+        "name": "operators",
+        "inputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "aPNTsBalance",
+            "type": "uint128",
+            "internalType": "uint128"
+          },
+          {
+            "name": "isConfigured",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "isPaused",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "xPNTsToken",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "reputation",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "minTxInterval",
+            "type": "uint48",
+            "internalType": "uint48"
+          },
+          {
+            "name": "treasury",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "totalSpent",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "totalTxSponsored",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "owner",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "pendingOwner",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "p",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "guardian",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "BLS_AGGREGATOR",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "REGISTRY",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "contract IRegistry"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "event",
+        "name": "OperatorConfigured",
+        "inputs": [
+          {
+            "name": "operator",
+            "type": "address",
+            "indexed": true,
+            "internalType": "address"
+          },
+          {
+            "name": "xPNTsToken",
+            "type": "address",
+            "indexed": false,
+            "internalType": "address"
+          },
+          {
+            "name": "treasury",
+            "type": "address",
+            "indexed": false,
+            "internalType": "address"
+          }
+        ],
+        "anonymous": false
+      },
+      {
+        "type": "error",
+        "name": "OperatorNotConfigured",
+        "inputs": []
+      },
+      {
+        "type": "error",
+        "name": "OperatorMeetsMinimumStake",
+        "inputs": []
+      }
+    ],
+    "registry": [
+      {
+        "type": "function",
+        "name": "owner",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "pendingOwner",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "p",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "blsAggregator",
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "hasRole",
+        "inputs": [
+          {
+            "name": "",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "bool",
+            "internalType": "bool"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "isReputationSource",
+        "inputs": [
+          {
+            "name": "",
+            "type": "address",
+            "internalType": "address"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "bool",
+            "internalType": "bool"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "function",
+        "name": "getRoleConfig",
+        "inputs": [
+          {
+            "name": "roleId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "tuple",
+            "internalType": "struct IRegistry.RoleConfig",
+            "components": [
+              {
+                "name": "minStake",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "ticketPrice",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "slashThreshold",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "slashBase",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "slashInc",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "slashMax",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "exitFeePercent",
+                "type": "uint16",
+                "internalType": "uint16"
+              },
+              {
+                "name": "isActive",
+                "type": "bool",
+                "internalType": "bool"
+              },
+              {
+                "name": "minExitFee",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "description",
+                "type": "string",
+                "internalType": "string"
+              },
+              {
+                "name": "owner",
+                "type": "address",
+                "internalType": "address"
+              },
+              {
+                "name": "roleLockDuration",
+                "type": "uint256",
+                "internalType": "uint256"
+              }
+            ]
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
+        "type": "event",
+        "name": "RoleConfigured",
+        "inputs": [
+          {
+            "name": "roleId",
+            "type": "bytes32",
+            "indexed": true,
+            "internalType": "bytes32"
+          },
+          {
+            "name": "config",
+            "type": "tuple",
+            "indexed": false,
+            "internalType": "struct IRegistry.RoleConfig",
+            "components": [
+              {
+                "name": "minStake",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "ticketPrice",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "slashThreshold",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "slashBase",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "slashInc",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "slashMax",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "exitFeePercent",
+                "type": "uint16",
+                "internalType": "uint16"
+              },
+              {
+                "name": "isActive",
+                "type": "bool",
+                "internalType": "bool"
+              },
+              {
+                "name": "minExitFee",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "description",
+                "type": "string",
+                "internalType": "string"
+              },
+              {
+                "name": "owner",
+                "type": "address",
+                "internalType": "address"
+              },
+              {
+                "name": "roleLockDuration",
+                "type": "uint256",
+                "internalType": "uint256"
+              }
+            ]
+          },
+          {
+            "name": "timestamp",
+            "type": "uint256",
+            "indexed": false,
+            "internalType": "uint256"
+          }
+        ],
+        "anonymous": false
+      }
+    ]
+  },
+  "roles": {
+    "ROLE_COMMUNITY": "0xe94d78b6d8fb99b2c21131eb4552924a60f564d8515a3cc90ef300fc9735c074",
+    "ROLE_ENDUSER": "0x0c34ecc75d3bf122e0609d2576e167f53fb42429262ce8c9b33cab91ff670e3a",
+    "ROLE_PAYMASTER_AOA": "0xf86d13979a91272f2c54c4147e588ecbeaad32dd1e0a5332a77356847049a70e",
+    "ROLE_PAYMASTER_SUPER": "0x2024516755f401845808190bb830b0e4523d0df0845503cab52130a794699a0f",
+    "ROLE_DVT": "0x3b5016dc6721b132ddcb7027030b137a739df81e419695dae0899a866c1c514d",
+    "ROLE_ANODE": "0x3aa2e9509f29532b71f822e18bcde843a8070a508d564188ec8a6adf59eff28a",
+    "ROLE_KMS": "0x6fb2b25080d21c908f32ff8ff99eb1d552c210854f7de48a40406764c09c68f8"
+  }
+}
