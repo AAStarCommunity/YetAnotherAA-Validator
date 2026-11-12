@@ -266,6 +266,14 @@ explorer or another RPC, for the fields listed in the hold.
        it carries a `cid` (a journal committed to the old bytes would stop the
        new record as a bytes-change incident); a journal without `cid`, e.g. one
        that only holds `holdRearms`, can stay;
+     - for a BLS record, `amendments/bls-<key>.json` and every file whose name
+       starts with it (`.conflict.*`, `.invalid.*`; `<key>` is the 64 hex digits
+       at the end of the record id) to `manual-quarantine/amendments/`. Nothing
+       publishes or alerts from these files: they hold SP effects proven for the
+       action after its record was written, and are only counted in
+       `status.json`. They came from the same wrong primary, though, and a later
+       correct proof for the action would be stored as a conflict against them;
+       set aside, the corrected proof is written as the only one;
   3. fix or replace the primary (Keychain item `aoa-dvt-rpc-primary`);
   4. rewind `cursor.json` to the block before the record's block, B:
      `{"block": <B-1>, "hash": "<hash of block B-1 from a trusted source>"}`.

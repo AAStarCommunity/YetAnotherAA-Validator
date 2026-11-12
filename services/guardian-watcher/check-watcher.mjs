@@ -388,6 +388,65 @@ try {
     );
   }
 
+  // #413 review Low 2 + Codex info R1: the interim status carries whether the last completed
+  // iteration (scan, publication, slowness) was healthy: degraded unless it was known healthy (a
+  // restart without a saved status included); never a status field; the completed status drops
+  // the carried reason
+  {
+    const { interimCarry, publicationStep, LAST_ITERATION_DEGRADED, restoredCarry } =
+      await import("./watcher.mjs");
+    // a restart restores the saved status's health: a slow (degraded) last iteration stays degraded
+    const rSlow = restoredCarry({ healthy: false, publication: { at: "t0", ok: true } });
+    const rNone = restoredCarry(null);
+    const rGood = restoredCarry({ healthy: true, publication: { at: "t0", ok: true } });
+    const keep = store.getCursor();
+    const done = { at: "t0", ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } };
+    const run = async lastHealthy => {
+      const r = await runOnce(c.chain, cfg, store, rs, ident, {
+        carry: interimCarry(done, lastHealthy, "t1"),
+      });
+      store.setCursor(keep);
+      return r;
+    };
+    const afterBad = await run(false);
+    const afterUnknown = await run(undefined);
+    const afterGood = await run(true);
+    let t = 0;
+    const finalSt = { ...afterBad.status };
+    await publicationStep({
+      status: finalSt,
+      run: async () => ({ ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } }),
+      slowNote: null,
+      iterStart: 0,
+      cfg: { intervalMs: 60_000, maxTickFraction: 0.5 },
+      carried: afterBad.carried,
+      now: () => (t += 1),
+    });
+    cell(
+      "#413 Low 2 / Codex info R1: an interim status after a degraded (or unknown) completed iteration is degraded with a fixed reason; after a healthy one it is healthy; no carry field leaks; the completed status drops the carried reason",
+      afterBad.status.healthy === false &&
+        (afterBad.status.degraded ?? []).includes(LAST_ITERATION_DEGRADED) &&
+        afterUnknown.status.healthy === false &&
+        afterGood.status.healthy === true &&
+        !("lastCompletedHealthy" in afterBad.status) &&
+        afterBad.status.publication?.inProgress === true &&
+        !(finalSt.degraded ?? []).includes(LAST_ITERATION_DEGRADED) &&
+        finalSt.healthy === true &&
+        rSlow.lastHealthy === false &&
+        rSlow.lastPub?.at === "t0" &&
+        rNone.lastHealthy === false &&
+        rNone.lastPub === null &&
+        rGood.lastHealthy === true,
+      {
+        restored: [rSlow, rNone, rGood],
+        bad: [afterBad.status.healthy, afterBad.status.degraded],
+        unknown: afterUnknown.status.healthy,
+        good: [afterGood.status.healthy, afterGood.status.degraded],
+        final: [finalSt.healthy, finalSt.degraded],
+      }
+    );
+  }
+
   // A cursor whose block no longer has the stored hash: stop, do not advance.
   {
     const keep = store.getCursor();
