@@ -290,6 +290,38 @@ jobs:
       - name: Run coverage
         run: forge coverage
 
+  # SP's own DVTValidator._checkEvidence against this repo's M0 §3.1 evidence vectors, byte for byte
+  # (DSR 502ccd64: evidence:spParity stays in DVT's CI). The SP commit is pinned in
+  # scripts/evidence/sp-parity-commit; at the rc.8 freeze (step 17) it becomes the tag commit, and
+  # the tag check asserts this pin equals it. SP is public: the default token reads it.
+  sp-parity:
+    name: SP evidence parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # the same pinned toolchain as the Smart Contracts job
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: "1.7.1"
+
+      - name: Check SP's evidence decoding against the vectors
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npm run -s check:sp-parity -- "$(tr -d '[:space:]' < scripts/evidence/sp-parity-commit)"
+
   # Job 6: Type checking
   typecheck:
     name: Type Check
@@ -341,7 +373,7 @@ jobs:
     name: CI Success
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [security, quality, build, test, contracts, typecheck, codeql]
+    needs: [security, quality, build, test, contracts, sp-parity, typecheck, codeql]
     if: always()
     steps:
       - name: Check all jobs status
@@ -351,6 +383,7 @@ jobs:
                 "${{ needs.build.result }}" == "success" &&
                 "${{ needs.test.result }}" == "success" &&
                 "${{ needs.contracts.result }}" == "success" &&
+                "${{ needs.sp-parity.result }}" == "success" &&
                 "${{ needs.typecheck.result }}" == "success" &&
                 "${{ needs.codeql.result }}" == "success" ]]; then
             echo "All CI checks passed!"
