@@ -1,0 +1,629 @@
+#!/usr/bin/env node
+// The pause path end to end against SuperPaymaster's REAL compiled contracts (DSR 4019916a
+// condition 3: no mocks on the pause path; the SignersCommitted lesson). SP's own
+// contracts/script/v3/DeployAnvil.s.sol deploys the full stack (Registry, GTokenStaking, SP proxy,
+// xPNTs v2, ...) from an SP checkout AT sp-pin.json's commit, built with `forge build`; this
+// script refuses any other commit. The understaked state is produced on chain the real way: the
+// Registry owner raises ROLE_PAYMASTER_SUPER's minStake with configureRole.
+//
+//   node deploy/pause-job/e2e-anvil.mjs --sp /path/to/SuperPaymaster   (checkout at the pin, built)
+//
+// anvil test-only conveniences (anvil_setBalance, evm_snapshot/revert, impersonation) set up and
+// isolate cells; none of them is on the pause path. Exit 0 only if every cell passes.
+import { execFileSync, spawn } from "node:child_process";
+import {
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  chmodSync,
+  existsSync,
+} from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { ethers } from "ethers";
+import { PIN, emptyState, runRound, stateProblems, spIface, regIface } from "./lib/core.mjs";
+import { rpcChain, writeDurable } from "./pause-job.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const args = process.argv.slice(2);
+const opt = k => {
+  const i = args.indexOf(`--${k}`);
+  return i >= 0 ? args[i + 1] : undefined;
+};
+const die = (c, m) => {
+  console.error(`e2e-anvil: ${m}`);
+  process.exit(c);
+};
+const spDir = opt("sp");
+if (!spDir) die(2, "usage: e2e-anvil.mjs --sp <SuperPaymaster checkout at sp-pin.json's commit>");
+const head = execFileSync("git", ["-C", spDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+if (head !== PIN.spCommit)
+  die(2, `the SP checkout is at ${head}, sp-pin.json pins ${PIN.spCommit}`);
+const dirty = execFileSync("git", ["-C", spDir, "status", "--porcelain", "--", "contracts/src"], {
+  encoding: "utf8",
+});
+if (dirty.trim()) die(2, "the SP checkout has local changes under contracts/src");
+
+const bin = n =>
+  existsSync(join(homedir(), ".foundry/bin", n)) ? join(homedir(), ".foundry/bin", n) : n;
+const PORT = 20000 + Math.floor(Math.random() * 20000);
+const URL = `http://127.0.0.1:${PORT}`;
+// anvil's well-known public test accounts (not secrets): #0 deploys SP and owns it
+const DEPLOYER_PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+const anvil = spawn(bin("anvil"), ["--port", String(PORT), "--silent"], { stdio: "ignore" });
+const stop = () => {
+  try {
+    anvil.kill("SIGKILL");
+  } catch {
+    /* gone */
+  }
+};
+process.on("exit", stop);
+const p = new ethers.JsonRpcProvider(URL, undefined, { staticNetwork: true, cacheTimeout: -1 });
+for (let i = 0; ; i++) {
+  try {
+    await p.send("eth_chainId", []);
+    break;
+  } catch {
+    if (i > 100) die(3, "anvil did not start");
+    await new Promise(r => setTimeout(r, 100));
+  }
+}
+
+// ---- deploy SP with SP's own anvil script
+const cfgFile = join(spDir, "deployments/config.anvil.json");
+const before = existsSync(cfgFile) ? readFileSync(cfgFile) : null;
+try {
+  execFileSync(
+    bin("forge"),
+    [
+      "script",
+      "contracts/script/v3/DeployAnvil.s.sol:DeployAnvil",
+      "--rpc-url",
+      URL,
+      "--broadcast",
+      "--disable-code-size-limit",
+      "--private-key",
+      DEPLOYER_PK,
+    ],
+    {
+      cwd: spDir,
+      env: { ...process.env, ENV: "anvil", LOCAL_DEV_GOVERNANCE_ACK: "true" },
+      stdio: ["ignore", "ignore", "pipe"],
+      maxBuffer: 64 << 20,
+    }
+  );
+} catch (e) {
+  die(
+    3,
+    `DeployAnvil failed: ${String(e.stderr ?? "")
+      .split("\n")
+      .filter(l => /Error/.test(l))
+      .slice(0, 3)
+      .join(" | ")}`
+  );
+}
+const deployed = JSON.parse(readFileSync(cfgFile, "utf8"));
+if (before) writeFileSync(cfgFile, before); // leave the SP checkout as it was
+// anvil's "finalized" is latest - 64: mine past it so the deployed operators are final, as on a
+// real chain some minutes after deploy (the inventory reads finalized blocks only)
+await p.send("anvil_mine", ["0x80"]);
+const SP = deployed.superPaymaster;
+const REG = deployed.registry;
+const startBlock = 1;
+
+const results = [];
+const cell = (name, ok, got) =>
+  results.push({
+    name,
+    ok: !!ok,
+    got: JSON.stringify(got ?? null, (k, v) => (typeof v === "bigint" ? String(v) : v)),
+  });
+// a section that throws records ONE failing cell and the run goes on: a mutant must turn a named
+// assertion red, not crash the script
+let sectionNo = 0;
+const section = async fn => {
+  const k = ++sectionNo;
+  try {
+    await fn();
+  } catch (e) {
+    cell(`section ${k} ran to the end`, false, String(e?.message ?? e).slice(0, 300));
+  }
+};
+
+const deployer = new ethers.Wallet(DEPLOYER_PK, p);
+const send = async (to, iface, fn, a, from = deployer) => {
+  const tx = await from.sendTransaction({ to, data: iface.encodeFunctionData(fn, a) });
+  const r = await tx.wait();
+  if (r.status !== 1) throw new Error(`${fn} reverted`);
+};
+const read = async (to, iface, fn, a = []) =>
+  iface.decodeFunctionResult(fn, await p.call({ to, data: iface.encodeFunctionData(fn, a) }));
+const ROLE_SUPER = PIN.roles.ROLE_PAYMASTER_SUPER;
+const adminIface = new ethers.Interface([
+  "function setGuardian(address)",
+  "function setOperatorPaused(address operator, bool paused)",
+]);
+const roleCfgType = PIN.abi.registry.find(f => f.name === "getRoleConfig").outputs[0];
+const cfgIface = new ethers.Interface([
+  {
+    type: "function",
+    name: "configureRole",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "roleId", type: "bytes32" },
+      { ...roleCfgType, name: "config" },
+    ],
+    outputs: [],
+  },
+]);
+const raiseMinStake = async () => {
+  const c = (await read(REG, regIface, "getRoleConfig", [ROLE_SUPER]))[0];
+  const next = c.toObject();
+  next.minStake = c.minStake * 1000n + 10n ** 24n;
+  await send(REG, cfgIface, "configureRole", [ROLE_SUPER, next]);
+};
+const snapshot = () => p.send("evm_snapshot", []);
+const revert = id => p.send("evm_revert", [id]);
+const isPaused = async op => (await read(SP, spIface, "operators", [op])).isPaused;
+
+const chain = rpcChain(URL);
+const CFG = {
+  logChunk: 50,
+  gasLimitMax: "300000",
+  maxFeePerGasCap: "200000000000",
+  maxPriorityFeePerGas: "1000000000",
+  receiptWaitMs: 10_000,
+  pollMs: 200,
+};
+const work = mkdtempSync(join(tmpdir(), "pause-e2e-"));
+let n = 0;
+const fresh = async (cap = String(10n ** 18n)) => {
+  const w = ethers.Wallet.createRandom();
+  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 18n)]);
+  const st = emptyState({
+    chainId: 31337,
+    signer: w.address,
+    spProxy: SP,
+    registry: REG,
+    startBlock,
+    cap,
+  });
+  const path = join(work, `state-${n++}.json`);
+  const signer = { address: w.address, sign: tx => w.signTransaction(tx) };
+  const persist = s => writeDurable(path, s);
+  return {
+    w,
+    st,
+    path,
+    signer,
+    persist,
+    round: (o = {}) =>
+      runRound(st, {
+        chain: o.chain ?? chain,
+        signer,
+        persist: o.persist ?? persist,
+        cfg: { ...CFG, ...(o.cfg ?? {}) },
+      }),
+  };
+};
+const ops = st => Object.keys(st.operators).sort();
+
+// ---- C1: nothing understaked: inventory from the SP proxy, nothing sent
+const base = await snapshot();
+await section(async () => {
+  const j = await fresh();
+  const r = await j.round();
+  cell(
+    "inventory: both DeployAnvil operators found from the SP proxy's OperatorConfigured logs",
+    ops(j.st).length === 2 && ops(j.st).every(o => ethers.isAddress(o)),
+    ops(j.st)
+  );
+  cell(
+    "meets minimum stake: decision 'meets', nothing sent, no alert",
+    r.report.operators.every(o => o.decision === "meets") &&
+      j.st.ledger.txs.length === 0 &&
+      r.alerts.length === 0,
+    r
+  );
+  cell(
+    "identity: a fresh signer passes the same-block identity check",
+    r.report.identity.ok,
+    r.report.identity
+  );
+});
+
+// ---- C2..C4: understaked -> paused, one transaction per round, then all paused, nothing sent
+await raiseMinStake();
+const understaked = await snapshot();
+await section(async () => {
+  const j = await fresh();
+  const r1 = await j.round();
+  const [a, b] = ops(j.st);
+  cell(
+    "understaked: round 1 pauses both, in turn (nonce 0 mined before nonce 1 is signed)",
+    j.st.ledger.txs.length === 2 &&
+      r1.report.sent.join() === [a, b].join() &&
+      j.st.ledger.txs.every((t, i) => t.nonce === i && t.status === "mined" && t.ok),
+    { r: r1.report, a: r1.alerts }
+  );
+  cell(
+    "ledger: spent = sum of gasUsed x price, nothing reserved after both mined",
+    BigInt(j.st.ledger.spent) > 0n &&
+      j.st.ledger.reserved === "0" &&
+      stateProblems(j.st).length === 0,
+    j.st.ledger
+  );
+  cell(
+    "both operators paused on chain after round 1",
+    (await isPaused(a)) && (await isPaused(b)),
+    null
+  );
+  const r2 = await j.round();
+  const r3 = await j.round();
+  cell(
+    "rounds 2-3: nothing sent, the ledger unchanged",
+    r2.report.sent.length === 0 && r3.report.sent.length === 0 && j.st.ledger.txs.length === 2,
+    [r2.report.sent, r3.report.sent]
+  );
+  cell(
+    "an already paused operator is understaked + paused, not a candidate, counter 0",
+    r3.report.operators.every(
+      o => o.decision === "understaked" && o.paused === true && o.understakedRounds === 0
+    ),
+    r3.report.operators
+  );
+  cell(
+    "no pause-timeout alert when every pause landed within a round",
+    ![...r1.alerts, ...r2.alerts, ...r3.alerts].some(x => x.key.startsWith("timeout")),
+    [r1.alerts, r2.alerts, r3.alerts]
+  );
+  cell(
+    "ledger invariants hold after three rounds; spent + reserved <= cap",
+    stateProblems(j.st).length === 0 && BigInt(j.st.ledger.reserved) === 0n,
+    j.st.ledger
+  );
+});
+
+// ---- C5: the signer becomes SP's guardian: fail closed, nothing sent
+await revert(understaked);
+const u2 = await snapshot();
+await section(async () => {
+  const j = await fresh();
+  await send(SP, adminIface, "setGuardian", [j.w.address]);
+  const r = await j.round();
+  cell(
+    "identity: the signer is SP.guardian -> check fails, nothing sent, alert",
+    !r.report.identity.ok &&
+      r.report.identity.problems.some(x => x.includes("SuperPaymaster.guardian")) &&
+      j.st.ledger.txs.length === 0 &&
+      r.alerts.some(a => a.key === "identity"),
+    r.report.identity
+  );
+});
+await revert(u2);
+const u3 = await snapshot();
+await section(async () => {
+  // a role configured on chain that is not in the pinned ROLE_* set fails closed
+  const j = await fresh();
+  const c = (await read(REG, regIface, "getRoleConfig", [ROLE_SUPER]))[0].toObject();
+  await send(REG, cfgIface, "configureRole", [
+    ethers.id("NOT_IN_THE_PIN"),
+    { ...c, owner: deployer.address },
+  ]);
+  const r = await j.round();
+  cell(
+    "identity: a role configured in the not-yet-finalized tail, outside the pinned set, fails closed, nothing sent",
+    !r.report.identity.ok &&
+      r.report.identity.problems.some(x => x.includes("not in the pinned")) &&
+      j.st.ledger.txs.length === 0,
+    r.report.identity
+  );
+  await p.send("anvil_mine", ["0x80"]);
+  const r2 = await j.round();
+  cell(
+    "identity: the same role once finalized is in the inventory and still fails closed",
+    Object.keys(j.st.roles).includes(ethers.id("NOT_IN_THE_PIN")) &&
+      !r2.report.identity.ok &&
+      j.st.ledger.txs.length === 0,
+    { roles: Object.keys(j.st.roles), id: r2.report.identity }
+  );
+});
+await revert(u3);
+const u4 = await snapshot();
+await section(async () => {
+  // the signer holds a role: granted the way DeployAnvil grants anni ROLE_COMMUNITY (the deployer,
+  // a community, sponsors the stake through Registry.safeMintForRole)
+  const j = await fresh();
+  const mint = new ethers.Interface([
+    "function safeMintForRole(bytes32 roleId, address user, bytes data) returns (uint256)",
+  ]);
+  const data = ethers.AbiCoder.defaultAbiCoder().encode(
+    ["tuple(string,string,uint256)"],
+    [["PauseE2E", "pause-e2e.eth", 30n * 10n ** 18n]]
+  );
+  await send(REG, mint, "safeMintForRole", [PIN.roles.ROLE_COMMUNITY, j.w.address, data]);
+  const has = (await read(REG, regIface, "hasRole", [PIN.roles.ROLE_COMMUNITY, j.w.address]))[0];
+  const r = await j.round();
+  cell(
+    "identity: the signer holds ROLE_COMMUNITY -> fails closed, nothing sent",
+    has &&
+      !r.report.identity.ok &&
+      r.report.identity.problems.some(x => x.includes("holds role")) &&
+      j.st.ledger.txs.length === 0,
+    { has, id: r.report.identity }
+  );
+});
+await section(async () => {
+  const j = await fresh();
+  const src = new ethers.Interface(["function setReputationSource(address source, bool active)"]);
+  await send(REG, src, "setReputationSource", [j.w.address, true]);
+  const r = await j.round();
+  cell(
+    "identity: the signer is a reputation source -> fails closed, nothing sent",
+    !r.report.identity.ok &&
+      r.report.identity.problems.some(x => x.includes("reputation source")) &&
+      j.st.ledger.txs.length === 0,
+    r.report.identity
+  );
+});
+await revert(u4);
+const u5 = await snapshot();
+
+// ---- C6: the cap: refuse + alert; 2 rounds unpaused -> pause timeout
+await section(async () => {
+  const j = await fresh("1000");
+  const r1 = await j.round();
+  cell(
+    "cap: remainder below gasLimit x maxFee -> not sent, 'remaining cap insufficient' alert",
+    j.st.ledger.txs.length === 0 &&
+      r1.alerts.some(a => a.key === "cap" && a.text.startsWith("remaining cap insufficient")),
+    r1.alerts
+  );
+  const r2 = await j.round();
+  cell(
+    "pause timeout: understaked and unpaused for 2 rounds -> 'pause timeout' alert",
+    r2.alerts.some(a => a.key.startsWith("timeout:") && a.text.startsWith("pause timeout")) &&
+      !r1.alerts.some(a => a.key.startsWith("timeout:")),
+    r2.alerts
+  );
+});
+await revert(u5);
+const u6 = await snapshot();
+
+// ---- C7: crash between journalling and broadcast: the same bytes go out next round
+await section(async () => {
+  const j = await fresh();
+  let crashed = false;
+  const crashy = s => {
+    writeDurable(j.path, s);
+    if (!crashed && s.ledger.txs.some(t => t.status === "signed")) {
+      crashed = true;
+      throw new Error("simulated crash after the durable write, before broadcast");
+    }
+  };
+  let threw = false;
+  try {
+    await j.round({ persist: crashy });
+  } catch {
+    threw = true;
+  }
+  const saved = JSON.parse(readFileSync(j.path, "utf8"));
+  const nonceAfterCrash = Number(await p.getTransactionCount(j.w.address, "latest"));
+  cell(
+    "crash: the signed transaction is on disk and was NOT broadcast",
+    threw &&
+      saved.ledger.txs.length === 1 &&
+      saved.ledger.txs[0]?.status === "signed" &&
+      nonceAfterCrash === 0,
+    { saved: saved.ledger, nonceAfterCrash }
+  );
+  // restart from what is on disk
+  const st2 = saved;
+  const persist2 = s => writeDurable(j.path, s);
+  await runRound(st2, { chain, signer: j.signer, persist: persist2, cfg: CFG });
+  await runRound(st2, { chain, signer: j.signer, persist: persist2, cfg: CFG });
+  cell(
+    "restart: the SAME bytes were sent (hash unchanged), mined, ledger consistent",
+    st2.ledger.txs[0]?.hash === saved.ledger.txs[0]?.hash &&
+      st2.ledger.txs[0]?.status === "mined" &&
+      stateProblems(st2).length === 0,
+    st2.ledger
+  );
+});
+await revert(u6);
+const u7 = await snapshot();
+
+// ---- C7b: a pause that never mines is replaced at the same nonce with higher fees; the cost
+// is counted once, from whichever hash mined
+await section(async () => {
+  const j = await fresh();
+  await p.send("evm_setAutomine", [false]);
+  const quick = { cfg: { receiptWaitMs: 300, pollMs: 100, bumpAfterRounds: 2 } };
+  try {
+    const r1 = await j.round(quick);
+    const first = j.st.ledger.txs[0]?.hash;
+    await j.round(quick);
+    await j.round(quick);
+    const kept = j.st.ledger.txs[0]?.hashes?.length === 1;
+    await j.round(quick); // the third pending round start: replaced
+    const t = j.st.ledger.txs[0];
+    cell(
+      "stuck: pending past bumpAfterRounds -> replaced at the same nonce, higher fee, both hashes kept",
+      r1.report.sent.length === 1 &&
+        kept &&
+        t.hashes.length === 2 &&
+        t.hashes[0] === first &&
+        t.nonce === 0 &&
+        BigInt(t.maxFeePerGas) > 0n &&
+        stateProblems(j.st).length === 0,
+      t
+    );
+    cell(
+      "stuck: the extra reservation is held against the cap",
+      BigInt(j.st.ledger.reserved) === BigInt(t.reserve),
+      j.st.ledger
+    );
+  } finally {
+    await p.send("evm_setAutomine", [true]);
+  }
+  await p.send("evm_mine", []);
+  await j.round();
+  const t = j.st.ledger.txs[0];
+  cell(
+    "stuck: once mined, exactly one of the hashes is the mined one, cost counted once, nothing reserved",
+    t.status === "mined" &&
+      t.hashes.includes(t.minedHash) &&
+      BigInt(j.st.ledger.spent) === j.st.ledger.txs.reduce((x, y) => x + BigInt(y.cost ?? 0), 0n) &&
+      j.st.ledger.reserved === "0" &&
+      stateProblems(j.st).length === 0,
+    j.st.ledger
+  );
+});
+await revert(u7);
+const u7b = await snapshot();
+
+// ---- C8: another use of the key stops the round
+await section(async () => {
+  const j = await fresh();
+  await (await j.w.connect(p).sendTransaction({ to: j.w.address, value: 0n })).wait();
+  let msg = "";
+  try {
+    await j.round();
+  } catch (e) {
+    msg = e.message;
+  }
+  cell(
+    "nonce history: a transaction the job did not journal stops the round",
+    /does not match the journal/.test(msg) && j.st.ledger.txs.length === 0,
+    msg
+  );
+});
+await revert(u7b);
+const u8 = await snapshot();
+
+// ---- C9: a failed getLogs range is retried, never skipped
+await section(async () => {
+  const j = await fresh();
+  let failOnce = true;
+  const flaky = {
+    ...chain,
+    getLogs: f =>
+      failOnce ? ((failOnce = false), Promise.reject(new Error("down"))) : chain.getLogs(f),
+  };
+  const r1 = await j.round({ chain: flaky });
+  const c1 = j.st.cursor.operators;
+  const r2 = await j.round();
+  cell(
+    "getLogs failure: cursor stays, alert raised, no operator invented",
+    c1 === startBlock - 1 &&
+      r1.alerts.some(a => a.key === "inventory:operators") &&
+      ops(j.st).length === 2,
+    { c1, a: r1.alerts, ops: ops(j.st) }
+  );
+  cell(
+    "next round: the same range is read and the cursor reaches finalized",
+    j.st.cursor.operators === r2.report.finalized,
+    { cursor: j.st.cursor, f: r2.report.finalized }
+  );
+});
+await revert(u8);
+
+// ---- C10: the CLI: --init refuses a used key; a round writes status.json
+await section(async () => {
+  const home = join(work, "cli");
+  mkdirSync(join(home, "secrets"), { recursive: true, mode: 0o700 });
+  mkdirSync(join(home, "state"), { recursive: true, mode: 0o700 });
+  chmodSync(join(home, "secrets"), 0o700);
+  chmodSync(join(home, "state"), 0o700);
+  const w = ethers.Wallet.createRandom();
+  const pw = "e2e-only-password-not-a-secret";
+  writeFileSync(join(home, "keystore"), await w.encrypt(pw), { mode: 0o600 });
+  writeFileSync(join(home, "secrets/aoa-dvt-pause-keystore-pw"), pw, { mode: 0o600 });
+  writeFileSync(join(home, "secrets/aoa-dvt-pause-rpc-primary"), "http://127.0.0.1:1", {
+    mode: 0o600,
+  }); // down: the round must use the fallback
+  writeFileSync(join(home, "secrets/aoa-dvt-pause-rpc-fallback"), URL, { mode: 0o600 });
+  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 18n)]);
+  const cfg = {
+    chainId: 31337,
+    spProxy: SP,
+    registry: REG,
+    startBlock,
+    capWei: String(10n ** 17n),
+    gasLimitMax: "300000",
+    maxFeePerGasCap: "200000000000",
+    maxPriorityFeePerGas: "1000000000",
+    logChunk: 50,
+    stateDir: join(home, "state"),
+    secretsDir: join(home, "secrets"),
+    keystore: join(home, "keystore"),
+    telegram: null,
+    realertMinutes: 60,
+    rpc: { primary: "alchemy", fallback: "infura" },
+  };
+  writeFileSync(join(home, "config.json"), JSON.stringify(cfg));
+  const cli = a => {
+    try {
+      return {
+        code: 0,
+        out: execFileSync(
+          "node",
+          [join(HERE, "pause-job.mjs"), "--config", join(home, "config.json"), ...a],
+          { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+        ),
+      };
+    } catch (e) {
+      return { code: e.status, out: String(e.stderr) };
+    }
+  };
+  const init = cli(["--init"]);
+  const run = cli([]);
+  const status = JSON.parse(readFileSync(join(home, "state/status.json"), "utf8"));
+  cell(
+    "CLI: --init on a nonce-0 key creates the state",
+    init.code === 0 && /state created/.test(init.out),
+    init
+  );
+  cell(
+    "CLI: a round pauses, writes status.json, exits 1 (alerts undelivered without Telegram)",
+    status.report?.sent?.length === 2 && run.code === 1 && status.delivery.ok === false,
+    { run, status: status.report }
+  );
+  cell(
+    "CLI: the primary is down -> the whole round ran on the fallback, named in status, alerted",
+    status.provider === "infura" && status.alerts.some(a => a.includes("primary RPC (alchemy)")),
+    { provider: status.provider, alerts: status.alerts }
+  );
+  const again = cli(["--init"]);
+  cell(
+    "CLI: --init refuses when a state exists",
+    again.code !== 0 && /already exists/.test(again.out),
+    again
+  );
+  const leaked = [
+    init.out,
+    run.out,
+    again.out,
+    readFileSync(join(home, "state/status.json"), "utf8"),
+    readFileSync(join(home, "state/state.json"), "utf8"),
+  ].some(t => t.includes(pw) || t.includes(`127.0.0.1:${PORT}`));
+  cell(
+    "CLI: neither the keystore password nor the RPC URL appears in output, status or state",
+    !leaked
+  );
+});
+
+stop();
+let nf = 0;
+for (const r of results) {
+  console.log(
+    `${r.ok ? "ok  " : "FAIL"} ${r.name}${r.ok ? "" : `\n     got ${r.got.slice(0, 1200)}`}`
+  );
+  if (!r.ok) nf++;
+}
+console.log(`\n${results.length - nf}/${results.length} cells (SP ${PIN.spCommit}, DeployAnvil)`);
+process.exit(nf ? 1 : 0);

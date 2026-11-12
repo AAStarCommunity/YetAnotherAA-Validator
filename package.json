@@ -40,6 +40,8 @@
     "check:sp-parity": "node scripts/evidence/sp-evidence-parity.mjs",
     "check:a7-readback": "node deploy/guardian-watcher/check-a7-readback.mjs",
     "check:a7-fork": "node deploy/guardian-watcher/check-a7-fork.mjs",
+    "check:pause-job": "node deploy/pause-job/check-pause-job.mjs",
+    "check:pause-job-pin": "node deploy/pause-job/gen-sp-pin.mjs --check",
     "e2e:committee": "node scripts/e2e/committee-e2e.mjs",
     "e2e:selftest": "node scripts/e2e/selftest.mjs",
     "check:pin-rate": "node scripts/check-pin-rate.mjs"

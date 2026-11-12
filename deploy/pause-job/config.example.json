@@ -1,0 +1,17 @@
+{
+  "chainId": 11155111,
+  "spProxy": "0x0000000000000000000000000000000000000001",
+  "registry": "0x0000000000000000000000000000000000000002",
+  "startBlock": 1,
+  "capWei": "100000000000000000",
+  "gasLimitMax": "150000",
+  "maxFeePerGasCap": "100000000000",
+  "maxPriorityFeePerGas": "1000000000",
+  "logChunk": 5000,
+  "stateDir": "/Users/REPLACE/.aoa-pause-job/state",
+  "secretsDir": "/Users/REPLACE/.aoa-pause-job/secrets",
+  "keystore": "/Users/REPLACE/.aoa-pause-job/keystore/pause-signer",
+  "telegram": { "chatId": "-1000000000000" },
+  "realertMinutes": 60,
+  "rpc": { "primary": "alchemy", "fallback": "infura" }
+}
