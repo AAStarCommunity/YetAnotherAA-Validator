@@ -320,3 +320,17 @@ export function deployKeyProblems(pub, keys) {
   if (!match.some(k => k?.read_only === false)) return ["the deploy key has no write access"];
   return [];
 }
+
+/**
+ * `gh api --paginate --slurp` output (an array of pages, each a JSON array) as one list, or null
+ * when it is anything else (Codex Phase D R8: every page counts; never a textual join, as a value can
+ * contain "][").
+ */
+export function flattenPages(stdout) {
+  try {
+    const pages = JSON.parse(String(stdout));
+    return Array.isArray(pages) && pages.every(Array.isArray) ? pages.flat() : null;
+  } catch {
+    return null;
+  }
+}

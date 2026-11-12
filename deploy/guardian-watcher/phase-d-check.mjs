@@ -36,6 +36,7 @@ import {
   allBranchRulesetProblems,
   mirrorIsolationProblems,
   deployKeyProblems,
+  flattenPages,
 } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -149,6 +150,16 @@ else {
       );
     }
   }
+}
+
+/** GET a GitHub list endpoint, every page, on github.com; null when unreadable. */
+function ghPages(path) {
+  // --slurp: one JSON array of the pages, never a textual join (a value can contain "][")
+  const x = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", "--slurp", path], {
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  return x.status === 0 ? flattenPages(x.stdout) : null;
 }
 
 // ---- 2b. The git mirror (DSR): the deploy key FILE, a push it authorizes, the branch's ruleset.
@@ -267,16 +278,8 @@ else {
           encoding: "utf8",
           timeout: 10_000,
         });
-        const k = spawnSync("gh", ["api", "--hostname", "github.com", `repos/${repo[1]}/keys`], {
-          encoding: "utf8",
-          timeout: 30_000,
-        });
-        let keys = null;
-        try {
-          keys = k.status === 0 ? JSON.parse(k.stdout) : null;
-        } catch {
-          keys = null;
-        }
+        // every page (Codex Phase D R8): the matching key may come after the first 30
+        const keys = ghPages(`repos/${repo[1]}/keys`);
         const dp = deployKeyProblems(y.status === 0 ? y.stdout : "", keys);
         add(
           "mirror-deploy-key",
@@ -298,7 +301,7 @@ else {
           return null;
         }
       };
-      const list = ghJson(`repos/${repo[1]}/rulesets?includes_parents=false&per_page=100`);
+      const list = ghPages(`repos/${repo[1]}/rulesets?includes_parents=false`);
       const full = Array.isArray(list)
         ? list.map(r =>
             Number.isSafeInteger(r?.id) ? ghJson(`repos/${repo[1]}/rulesets/${r.id}`) : null
@@ -314,23 +317,11 @@ else {
       );
       // the mirror's repository holds nothing a leaked key could reach beyond the records (DSR):
       // Actions off, no secrets, one branch. Listing secrets needs the repository admin's gh.
-      const gh = path => {
-        const x = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", path], {
-          encoding: "utf8",
-          timeout: 30_000,
-        });
-        if (x.status !== 0) return null;
-        try {
-          // --paginate concatenates JSON arrays page by page ("][" joins)
-          return JSON.parse(String(x.stdout).replace(/\]\s*\[/g, ","));
-        } catch {
-          return null;
-        }
-      };
       const ip = mirrorIsolationProblems({
-        actions: gh(`repos/${repo[1]}/actions/permissions`),
-        secrets: gh(`repos/${repo[1]}/actions/secrets`),
-        branches: gh(`repos/${repo[1]}/branches`),
+        actions: ghJson(`repos/${repo[1]}/actions/permissions`),
+        // total_count counts every secret whatever the page
+        secrets: ghJson(`repos/${repo[1]}/actions/secrets`),
+        branches: ghPages(`repos/${repo[1]}/branches`),
         branch,
       });
       add(

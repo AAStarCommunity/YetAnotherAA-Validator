@@ -19,6 +19,7 @@ import {
   mirrorIsolationProblems,
   allBranchRulesetProblems,
   deployKeyProblems,
+  flattenPages,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -523,6 +524,26 @@ cell(
       dk.noPub.length === 1 &&
       dk.unread.length === 1,
     got: dk,
+  });
+  // Codex Phase D R8: every page of a list; a value containing "][" is not a page boundary
+  const page1 = Array.from({ length: 30 }, (_, i) => ({
+    key: `ssh-ed25519 AAAA${i}`,
+    read_only: false,
+  }));
+  const pages = flattenPages(
+    JSON.stringify([page1, [{ key: PUB, read_only: false, title: "a ][ b" }]])
+  );
+  results.push({
+    name: "Codex Phase D R8: a key on the second page is found; a title containing '][' survives; non-page output is unreadable",
+    ok:
+      Array.isArray(pages) &&
+      pages.length === 31 &&
+      deployKeyProblems(PUB, pages).length === 0 &&
+      pages[30].title === "a ][ b" &&
+      flattenPages('{"a":1}') === null &&
+      flattenPages("not json") === null &&
+      deployKeyProblems(PUB, page1).length === 1,
+    got: { n: pages?.length, last: pages?.[30] },
   });
   const B = "disclosure-records";
   const iso = o =>
