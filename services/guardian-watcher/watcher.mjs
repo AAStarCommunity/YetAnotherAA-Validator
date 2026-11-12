@@ -234,7 +234,7 @@ export function interimCarry(lastPub, lastHealthy, since) {
  */
 export async function watchStep(
   { carryState, slowNote },
-  { publishing, scan, publish, writeStatus, cfg, now = Date.now }
+  { publishing, scan, publish, writeStatus, cfg, now = Date.now, onScan = () => {} }
 ) {
   // The last publication result stays visible, marked in progress, until this pass replaces it.
   const carry = publishing
@@ -242,6 +242,8 @@ export async function watchStep(
     : undefined;
   const iterStart = now();
   const { status, carried } = await scan(carry);
+  // what main() reports right after the scan, before publication changes the status (as master did)
+  onScan(status);
   if (!publishing) return { status, next: { carryState, slowNote } };
   const nextSlow = await publicationStep({
     status,
@@ -558,10 +560,12 @@ async function main() {
       publish: degraded => publishPhase(store, chain, cfg, pub.p, pub.built, { degraded }),
       writeStatus: st => store.writeStatus(st),
       cfg,
+      onScan: st => {
+        if (first && st.degraded) console.error(`WARNING: DEGRADED: ${st.degraded.join("; ")}`);
+        first = false;
+      },
     });
     loop = next;
-    if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
-    first = false;
     console.log(JSON.stringify(status));
     if (once) process.exit(onceExitCode(status));
     await new Promise(r => setTimeout(r, cfg.intervalMs));

@@ -454,6 +454,7 @@ try {
     const keep = store.getCursor();
     const interims = [];
     const written = [];
+    const scanned = [];
     let loop = {
       carryState: {
         lastPub: { at: "t0", ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } },
@@ -475,6 +476,8 @@ try {
             ? { at: "t", ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } }
             : { at: "t", ok: false, stalls: { feeCapped: 0, insufficientFunds: 0 } },
         writeStatus: st => written.push(st.healthy),
+        // the scan's own status, before publication changes it (the first-iteration warning)
+        onScan: st => scanned.push(st.healthy),
         cfg: { intervalMs: 60_000, maxTickFraction: 0.5 },
       });
       loop = r.next;
@@ -492,7 +495,9 @@ try {
         s2.healthy === true &&
         interims[2].healthy === true &&
         s3.healthy === true &&
-        JSON.stringify(written) === "[false,true,true]",
+        JSON.stringify(written) === "[false,true,true]" &&
+        // onScan sees the interim status (before publication): true, false (carried), true
+        JSON.stringify(scanned) === "[true,false,true]",
       { interims, completed: [s1.healthy, s2.healthy, s3.healthy], written }
     );
   }
