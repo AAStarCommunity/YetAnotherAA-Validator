@@ -4,6 +4,7 @@
 // cap, crash recovery, nonce history, the identity check) runs against SP's REAL contracts on
 // anvil in e2e-anvil.mjs (DSR 4019916a condition 3: no mocks on the pause path).
 //   node deploy/pause-job/check-pause-job.mjs
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -319,45 +320,115 @@ cell(
     runsSender(["/bin/bash", "/x/run.sh"], () => null).some(x => x.includes("unreadable"))
   );
   {
-    const rev = [
-      {
-        label: "io.aastar.dvt-committee-health",
-        argsEnd: ["deploy/local-heartbeat.sh", "health"],
-        sha256: "ab".repeat(32),
-        why: "t",
+    // the reviewed exception (DSR bc3be95b): label, FULL args, loaded == plist, env names, file hashes
+    const r = {
+      label: "io.aastar.dvt-committee-health",
+      interpreter: "/bin/bash",
+      wrapper: "deploy/local-heartbeat.sh",
+      args: ["health"],
+      envKeys: ["HOME", "PATH"],
+      files: {
+        "deploy/local-heartbeat.sh": "a".repeat(64),
+        "deploy/committee-health.mjs": "b".repeat(64),
       },
-    ];
+    };
     const args = ["/bin/bash", "/r/deploy/local-heartbeat.sh", "health"];
-    const txt = () => "case apply) node deploy/apply-verifier-rotation.mjs --broadcast";
+    const plist = {
+      Label: r.label,
+      ProgramArguments: args,
+      EnvironmentVariables: { HOME: "/h", PATH: "/p" },
+    };
+    const sha = path =>
+      ({
+        "/r/deploy/local-heartbeat.sh": "a".repeat(64),
+        "/r/deploy/committee-health.mjs": "b".repeat(64),
+      })[path] ?? null;
+    const txt = () => "apply) node deploy/apply-verifier-rotation.mjs --broadcast";
+    const run = (pl, loaded = args, s = sha, labels = [PAUSE_LABEL, r.label]) =>
+      launchdOff(labels, () => loaded, txt, [r], s, { [r.label]: pl });
     cell(
-      "reviewed: a listed job with its exact mode and pinned wrapper hash passes",
-      launchdOff(
-        [PAUSE_LABEL, rev[0].label],
-        () => args,
-        txt,
-        rev,
-        () => "ab".repeat(32)
-      ).length === 0
+      "reviewed: the exact plist, loaded args, env names and both file hashes pass",
+      run(plist).length === 0,
+      run(plist)
     );
     cell(
-      "reviewed: the same job in another mode fails",
-      launchdOff(
-        [PAUSE_LABEL, rev[0].label],
-        () => ["/bin/bash", "/r/deploy/local-heartbeat.sh", "apply"],
-        txt,
-        rev,
-        () => "ab".repeat(32)
-      ).length > 0
+      "reviewed: another mode fails",
+      run({ ...plist, ProgramArguments: ["/bin/bash", "/r/deploy/local-heartbeat.sh", "apply"] }, [
+        "/bin/bash",
+        "/r/deploy/local-heartbeat.sh",
+        "apply",
+      ]).length > 0
     );
     cell(
-      "reviewed: a changed wrapper (hash differs) fails",
+      "reviewed: an extra argument fails",
+      run({ ...plist, ProgramArguments: [...args, "--x"] }, [...args, "--x"]).length > 0
+    );
+    cell(
+      "reviewed: another interpreter fails",
+      run({ ...plist, ProgramArguments: ["/bin/zsh", ...args.slice(1)] }, [
+        "/bin/zsh",
+        ...args.slice(1),
+      ]).length > 0
+    );
+    cell(
+      "reviewed: loaded args that differ from the plist fail",
+      run(plist, ["/bin/bash", "/other/deploy/local-heartbeat.sh", "health"]).length > 0
+    );
+    cell(
+      "reviewed: an extra environment variable (e.g. BASH_ENV) fails",
+      run({ ...plist, EnvironmentVariables: { ...plist.EnvironmentVariables, BASH_ENV: "/tmp/x" } })
+        .length > 0
+    );
+    cell(
+      "reviewed: a changed wrapper hash fails",
+      run(plist, args, p => (p.endsWith("local-heartbeat.sh") ? "c".repeat(64) : sha(p))).length > 0
+    );
+    cell(
+      "reviewed: a changed committee-health.mjs hash fails",
+      run(plist, args, p => (p.endsWith("committee-health.mjs") ? "c".repeat(64) : sha(p))).length >
+        0
+    );
+    cell(
+      "reviewed: no plist for the job fails",
+      launchdOff([PAUSE_LABEL, r.label], () => args, txt, [r], sha, {}).length > 0
+    );
+    cell(
+      "reviewed: apply-rotation loaded still fails (the exception covers health only)",
+      run(plist, args, sha, [PAUSE_LABEL, r.label, "io.aastar.dvt-apply-rotation"]).some(x =>
+        x.includes("apply-rotation is loaded")
+      )
+    );
+    cell(
+      "reviewed: a forbidden label cannot be made an exception",
       launchdOff(
-        [PAUSE_LABEL, rev[0].label],
-        () => args,
+        [PAUSE_LABEL],
+        () => [],
         txt,
-        rev,
-        () => "cd".repeat(32)
-      ).length > 0
+        [{ ...r, label: "io.aastar.dvt-committee-keeper" }],
+        sha,
+        {}
+      ).some(x => x.includes("cannot be a reviewed"))
+    );
+  }
+  {
+    // preflight-reviewed.json must hash what the repository holds (DSR bc3be95b: changes only by a
+    // PR that states the new hashes; this cell turns CI red when a reviewed file changes alone)
+    const rv = JSON.parse(readFileSync(join(here, "preflight-reviewed.json"), "utf8"));
+    const repo = join(here, "../..");
+    const bad = rv.jobs.flatMap(j =>
+      Object.entries(j.files)
+        .filter(
+          ([rel, h]) =>
+            createHash("sha256")
+              .update(readFileSync(join(repo, rel)))
+              .digest("hex") !== h
+        )
+        .map(([rel]) => rel)
+    );
+    cell(
+      "preflight-reviewed.json hashes equal the repository's reviewed files",
+      bad.length === 0,
+      bad
     );
   }
   cell(

@@ -156,11 +156,24 @@ Until this PR merged, they were manual items on the launch checklist.
     the job's ProgramArguments, not its label: a script name anywhere in an
     argument counts, and shell wrapper scripts are read. A wrapper that cannot
     be read fails. The plists in `~/Library/LaunchAgents` are read as well.
-  - The only exceptions are in `preflight-reviewed.json`. An entry names a
-    label, the exact end of the job's arguments (its mode) and the sha256 of its
-    wrapper. Today the one entry is `io.aastar.dvt-committee-health`, which runs
-    `local-heartbeat.sh health` and sends nothing. The same wrapper's `apply`
-    mode broadcasts, so any change to the file or the mode fails the check.
+  - The only exceptions are in `preflight-reviewed.json` (DSR bc3be95b). An
+    entry passes only when all of the following hold:
+    - the label matches exactly;
+    - a plist for it exists in `~/Library/LaunchAgents`;
+    - the plist's **full** ProgramArguments are exactly
+      `[interpreter, <repo>/<wrapper>, ...args]`;
+    - the arguments launchd actually loaded equal the plist's;
+    - the plist's environment variable names are exactly the listed ones;
+    - every file the mode runs hashes to its pinned sha256, hashed at the paths
+      the plist resolves.
+
+    Today the one entry is `io.aastar.dvt-committee-health`, which runs
+    `local-heartbeat.sh health` and, through it, `committee-health.mjs`; it
+    sends nothing. The same wrapper's `apply` mode broadcasts, and that mode is
+    not covered. A forbidden label can never be an exception.
+
+    The file changes only through a PR whose body states the new hashes. CI
+    checks the hashes against the repository's files.
 - **node-slash-off**: the node inventory must not be empty, and every running
   `dvt-node-*` container must be in it. On every DVT node container,
   `AUDIT_ENABLED` and `AUDIT_EXECUTE_SLASH` are absent or exactly `"false"`.

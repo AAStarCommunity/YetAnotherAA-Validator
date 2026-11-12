@@ -49,48 +49,89 @@ export function runsSender(args, readText = () => null) {
 }
 
 /**
- * A job reviewed as not sending (preflight-reviewed.json): its label, the exact END of its
- * arguments (the mode it runs in), and the sha256 of its wrapper file all match. A wrapper that
- * changes, or the same wrapper in another mode, is not reviewed. Pure given shaOf.
+ * Why a loaded job does NOT match its reviewed entry (preflight-reviewed.json, DSR bc3be95b); an
+ * empty list means it is the reviewed, non-sending job. Everything must match exactly:
+ *   - the label, and a plist in ~/Library/LaunchAgents for it (the source of args and env);
+ *   - the plist's FULL ProgramArguments: [interpreter, <repo>/<wrapper>, ...args] (no Program key);
+ *   - the arguments launchd actually loaded equal the plist's;
+ *   - the plist's environment variable NAMES exactly (bash runs $BASH_ENV, so nothing extra);
+ *   - the sha256 of every file the mode runs, hashed at the paths the plist resolves (<repo>/<rel>).
+ * Pure given shaOf.
  */
-export function isReviewed(label, args, reviewed, shaOf) {
-  return reviewed.some(r => {
-    if (r.label !== label || args.length < r.argsEnd.length) return false;
-    const tail = args.slice(args.length - r.argsEnd.length);
-    if (
-      !tail.every((a, i) =>
-        i === 0 ? a.endsWith(`/${r.argsEnd[0]}`) || a === r.argsEnd[0] : a === r.argsEnd[i]
-      )
-    )
-      return false;
-    return shaOf(tail[0]) === r.sha256;
-  });
+export function reviewProblems(r, plist, loadedArgs, shaOf) {
+  const p = [];
+  if (!plist) return [`${r.label}: no plist for the reviewed job in ~/Library/LaunchAgents`];
+  if (plist.Label !== r.label) p.push(`${r.label}: plist label differs`);
+  if (plist.Program !== undefined) p.push(`${r.label}: plist has a Program key`);
+  const pa = (plist.ProgramArguments ?? []).map(String);
+  const repoPath = pa[1] ?? "";
+  const repo = repoPath.endsWith(`/${r.wrapper}`)
+    ? repoPath.slice(0, -(r.wrapper.length + 1))
+    : null;
+  if (
+    pa.length !== r.args.length + 2 ||
+    pa[0] !== r.interpreter ||
+    !repo ||
+    !repo.startsWith("/") ||
+    repo.includes("/../") ||
+    pa.slice(2).some((a, i) => a !== r.args[i])
+  )
+    p.push(
+      `${r.label}: ProgramArguments are not exactly [${r.interpreter}, <repo>/${r.wrapper}, ${r.args.join(", ")}]`
+    );
+  if (!loadedArgs || loadedArgs.length !== pa.length || loadedArgs.some((a, i) => a !== pa[i]))
+    p.push(`${r.label}: the arguments launchd loaded differ from the plist's`);
+  const env = Object.keys(plist.EnvironmentVariables ?? {}).sort();
+  if (env.join() !== [...r.envKeys].sort().join())
+    p.push(`${r.label}: environment variable names are not exactly ${r.envKeys.join(", ")}`);
+  if (repo)
+    for (const [rel, sha] of Object.entries(r.files))
+      if (shaOf(`${repo}/${rel}`) !== sha)
+        p.push(`${r.label}: ${rel} does not hash to the reviewed sha256`);
+  return p;
 }
 
-/** launchd-off from `launchctl list` labels and each loaded job's ProgramArguments. Pure. */
+/**
+ * launchd-off. `plists` maps a label to its LaunchAgents plist (parsed) or is missing it. Pure
+ * given the injected readers.
+ */
 export function launchdOff(
   labels,
   programOf,
   readText = () => null,
   reviewed = [],
-  shaOf = () => null
+  shaOf = () => null,
+  plists = {}
 ) {
   const p = [];
   for (const f of FORBIDDEN_LABELS) if (labels.includes(f)) p.push(`${f} is loaded`);
   if (!labels.includes(PAUSE_LABEL)) p.push(`${PAUSE_LABEL} is not loaded`);
+  const cleared = new Set();
+  for (const r of reviewed) {
+    if (FORBIDDEN_LABELS.includes(r.label) || r.label === PAUSE_LABEL) {
+      p.push(`${r.label} cannot be a reviewed exception`);
+      continue;
+    }
+    if (!labels.includes(r.label)) continue;
+    const why = reviewProblems(r, plists[r.label], programOf(r.label), shaOf);
+    if (why.length) p.push(...why);
+    else cleared.add(r.label);
+  }
   for (const l of labels) {
-    if (l === PAUSE_LABEL) continue;
+    if (l === PAUSE_LABEL || cleared.has(l)) continue;
     const args = programOf(l);
     if (args === null) {
       // Apple's XPC services are listed but not printable in the gui domain; anything else that
-      // cannot be read fails closed (an installed agent is still read from its plist, below)
+      // cannot be read fails closed (an installed agent is still read from its plist)
       if (!l.startsWith("com.apple.")) p.push(`${l}: its ProgramArguments cannot be read`);
-      continue;
+    } else for (const s of runsSender(args, readText)) p.push(`${l} runs ${s}`);
+    const d = plists[l];
+    if (d) {
+      const a = [...(d.ProgramArguments ?? []), ...(d.Program ? [d.Program] : [])].map(String);
+      for (const s of runsSender(a, readText)) p.push(`${l} (plist) runs ${s}`);
     }
-    if (isReviewed(l, args, reviewed, shaOf)) continue;
-    for (const s of runsSender(args, readText)) p.push(`${l} runs ${s}`);
   }
-  return p;
+  return [...new Set(p)];
 }
 
 /** node-slash-off from each container's environment (array of "K=V"). Pure. */
@@ -172,15 +213,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         return null;
       }
     };
-    const p = launchdOff(labels, programOf, readText, reviewed, shaOf);
-    // the installed agents, read from their plists: a job named com.apple.* (skipped above when
-    // unprintable) is still caught here by what it runs
+    // the installed agents, read from their plists: a job named com.apple.* (unprintable above)
+    // is still caught by what its plist runs
     const dir = join(homedir(), "Library/LaunchAgents");
+    const plists = {};
+    const extra = [];
     let files = [];
     try {
       files = readdirSync(dir).filter(f => f.endsWith(".plist"));
     } catch {
-      p.push("~/Library/LaunchAgents cannot be listed");
+      extra.push("~/Library/LaunchAgents cannot be listed");
     }
     for (const f of files) {
       const j = run("plutil", ["-convert", "json", "-o", "-", join(dir, f)]);
@@ -190,16 +232,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       } catch {
         d = null;
       }
-      if (!d) {
-        p.push(`${f}: cannot be read as a plist`);
-        continue;
-      }
-      if (d.Label === PAUSE_LABEL || !labels.includes(d.Label)) continue;
-      const a = [...(d.ProgramArguments ?? []), ...(d.Program ? [d.Program] : [])].map(String);
-      if (isReviewed(d.Label, a, reviewed, shaOf)) continue;
-      for (const s of runsSender(a, readText)) p.push(`${d.Label} (${f}) runs ${s}`);
+      if (!d || typeof d.Label !== "string") extra.push(`${f}: cannot be read as a plist`);
+      else if (plists[d.Label]) extra.push(`${d.Label}: more than one plist`);
+      else plists[d.Label] = d;
     }
-    results.push(["launchd-off", p.length ? "FAIL" : "PASS", [...new Set(p)]]);
+    const p = [...extra, ...launchdOff(labels, programOf, readText, reviewed, shaOf, plists)];
+    results.push(["launchd-off", p.length ? "FAIL" : "PASS", p]);
   }
   const envOf = n => {
     const out = run("docker", ["inspect", n, "--format", "{{json .Config.Env}}"]);

@@ -1,11 +1,19 @@
 {
-  "schema": "aoa-pause-job-preflight-reviewed/1",
+  "schema": "aoa-pause-job-preflight-reviewed/2",
+  "rule": "Changed only by a PR whose body states the new sha256 values (DSR bc3be95b); CI checks them against the repository files.",
   "jobs": [
     {
       "label": "io.aastar.dvt-committee-health",
-      "argsEnd": ["deploy/local-heartbeat.sh", "health"],
-      "sha256": "370ab96e3fcaa25720e552f2afa8e712ecab052a85e657c26471390ab7819b6d",
-      "why": "Runs local-heartbeat.sh in mode 'health': committee-health.mjs plus alerts, no transaction. The same wrapper's 'apply' mode broadcasts apply-verifier-rotation.mjs, so ONLY mode 'health' with exactly this wrapper (sha256 of master's deploy/local-heartbeat.sh) is reviewed; any change to the file or the mode fails launchd-off."
+      "interpreter": "/bin/bash",
+      "wrapper": "deploy/local-heartbeat.sh",
+      "args": ["health"],
+      "envKeys": ["HOME", "PATH"],
+      "files": {
+        "deploy/local-heartbeat.sh": "370ab96e3fcaa25720e552f2afa8e712ecab052a85e657c26471390ab7819b6d",
+        "deploy/committee-health.mjs": "ba03ba750d5fcdf39f27c5408a7f42506b1928fb89719a689cc6cbaee7e65561"
+      },
+      "reviewedAt": "bc5db53718394251d299534b43914cbb033bb612",
+      "why": "Mode 'health' (local-heartbeat.sh 494-535) only runs committee-health.mjs --expect-armed ... --json, which holds no wallet or signer; --broadcast appears only under 'apply' (536-557), which is NOT covered. Reviewed by DSR bc3be95b."
     }
   ]
 }
