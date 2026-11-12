@@ -13,5 +13,6 @@
   "keystore": "/Users/REPLACE/.aoa-pause-job/keystore/pause-signer",
   "telegram": { "chatId": "-1000000000000" },
   "realertMinutes": 60,
+  "lockPort": 47219,
   "rpc": { "primary": "alchemy", "fallback": "infura" }
 }

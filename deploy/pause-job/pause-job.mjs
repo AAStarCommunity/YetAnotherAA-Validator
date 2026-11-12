@@ -16,9 +16,9 @@ import {
   openSync,
   readFileSync,
   renameSync,
-  unlinkSync,
   writeSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ethers } from "ethers";
@@ -67,6 +67,8 @@ export function configProblems(c) {
     if (!okDir(tilde(c[k]))) p.push(`${k} must be an absolute plain path`);
   if (c.telegram !== null && !/^-?[0-9]+$/.test(String(c.telegram?.chatId ?? "")))
     p.push("telegram must be null or { chatId }");
+  if (!Number.isSafeInteger(c.lockPort) || c.lockPort < 1024 || c.lockPort > 65535)
+    p.push("lockPort must be a port in 1024..65535");
   if (!Number.isSafeInteger(c.realertMinutes) || c.realertMinutes < 1)
     p.push("realertMinutes must be a positive integer");
   // provider NAMES only (DSR bd595f0f: alchemy primary, infura fallback); the URLs are secret files
@@ -80,7 +82,7 @@ export function configProblems(c) {
 
 /** Write `obj` to `path` durably: 0600 temp file, fsync, rename, fsync the directory. */
 export function writeDurable(path, obj) {
-  const tmp = `${path}.tmp`;
+  const tmp = `${path}.${process.pid}.tmp`;
   const fd = openSync(
     tmp,
     constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
@@ -125,6 +127,13 @@ export function rpcChain(url) {
       const b = await send("eth_getBlockByNumber", [tag, false]);
       if (!b) throw new SafeError(`no ${tag} block`);
       return Number(b.number);
+    },
+    blockByNumber: async n => {
+      const b = await send("eth_getBlockByNumber", [
+        typeof n === "number" ? ethers.toQuantity(n) : n,
+        false,
+      ]);
+      return b ? { number: Number(b.number), hash: b.hash } : null;
     },
     getLogs: f => send("eth_getLogs", [f]),
     call: (tx, tag) => send("eth_call", [tx, tag]),
@@ -207,33 +216,16 @@ async function main() {
   ];
   const token = cfg.telegram ? secret(SECRET_NAMES.telegram) : null;
 
-  // one instance: an exclusive lock file holding our pid; a dead holder's lock is taken over
-  const lock = join(stateDir, "lock");
-  try {
-    const fd = openSync(lock, "wx", 0o600);
-    writeSync(fd, String(process.pid));
-    closeSync(fd);
-  } catch {
-    let pid = NaN;
-    try {
-      pid = Number(readFileSync(lock, "utf8"));
-      process.kill(pid, 0);
-      die(75, `another run (pid ${pid}) holds the lock`);
-    } catch (e) {
-      if (e?.code !== "ESRCH") die(75, "the lock is held");
-      unlinkSync(lock);
-      const fd = openSync(lock, "wx", 0o600);
-      writeSync(fd, String(process.pid));
-      closeSync(fd);
-    }
-  }
-  const release = () => {
-    try {
-      unlinkSync(lock);
-    } catch {
-      /* gone */
-    }
-  };
+  // one instance: an OS-held lock (a listening socket on 127.0.0.1:lockPort). The kernel releases
+  // it when the process dies, so there is no stale lock to take over and no takeover race.
+  const lockServer = createServer();
+  await new Promise(resolve => {
+    lockServer.once("error", () =>
+      die(75, `another run holds the lock (127.0.0.1:${cfg.lockPort})`)
+    );
+    lockServer.listen({ host: "127.0.0.1", port: cfg.lockPort, exclusive: true }, resolve);
+  });
+  const release = () => lockServer.close();
 
   const statePath = join(stateDir, "state.json");
   const statusPath = join(stateDir, "status.json");

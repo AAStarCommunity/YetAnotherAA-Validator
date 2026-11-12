@@ -11,11 +11,21 @@ use the SDK attribution API, and the committee keeper is unchanged.
 launchd starts `pause-job.mjs` every 600 s. Each start runs one round
 (`lib/core.mjs`):
 
-1. **Settle.** At most one transaction is in flight. If its receipt is missing,
-   the job resends the same signed bytes. The signer's on-chain nonce must be
-   between the journal's mined count and that count plus the in-flight
-   transaction. Anything else means someone else used the key, and the round
-   stops.
+1. **Reconcile (reads only, nothing is broadcast).** Each journalled transaction
+   moves through `signed` → `sent` → `included` → `final`:
+   - A receipt makes it `included`, and its reservation stays held.
+   - It becomes `final` only once its block is at or below `finalized` and is
+     canonical. Only then does its full cost move from reserved to spent.
+   - The full cost is execution gas plus, on OP, the L1 data fee and operator
+     fee. Both fees are read from the chain's own GasPriceOracle at the
+     inclusion block, and the receipt's `l1Fee` is used instead if it is larger.
+   - A transaction whose block is reorged out goes back to `sent`. Its
+     reservation is still held, and the transaction is resent.
+
+   The signer's on-chain nonce must lie between the number of transactions that
+   have landed and the journal length. Anything else means someone else used the
+   key, and the round stops.
+
 2. **Operator inventory.** The inventory is built from `OperatorConfigured` logs
    emitted by the **SuperPaymaster proxy**, not by the Registry. A second
    inventory is built from the Registry's `RoleConfigured` logs. Both are read
@@ -129,6 +139,10 @@ A new cap is a new funding: start a new ledger (a new state) for it. Do not edit
    `run interval = 600`.
 7. Run `node deploy/pause-job/preflight.mjs`. It must print no FAIL.
 
+**One instance.** The lock is a listening socket on `127.0.0.1:lockPort`. The
+kernel releases it when the process dies, so there is no stale lock file to take
+over.
+
 ## Preflight (DSR 502ccd64)
 
 `preflight.mjs` covers the three Phase D items that live on DVT's own host.
@@ -139,9 +153,17 @@ Until this PR merged, they were manual items on the launch checklist.
   - apply-rotation is not loaded;
   - the pause job **is** loaded;
   - no other loaded job runs a DVT transaction-sending script. This is judged by
-    the job's ProgramArguments, not its label.
-- **node-slash-off**: on every DVT node container, `AUDIT_ENABLED` and
-  `AUDIT_EXECUTE_SLASH` are absent or exactly `"false"`.
+    the job's ProgramArguments, not its label: a script name anywhere in an
+    argument counts, and shell wrapper scripts are read. A wrapper that cannot
+    be read fails. The plists in `~/Library/LaunchAgents` are read as well.
+  - The only exceptions are in `preflight-reviewed.json`. An entry names a
+    label, the exact end of the job's arguments (its mode) and the sha256 of its
+    wrapper. Today the one entry is `io.aastar.dvt-committee-health`, which runs
+    `local-heartbeat.sh health` and sends nothing. The same wrapper's `apply`
+    mode broadcasts, so any change to the file or the mode fails the check.
+- **node-slash-off**: the node inventory must not be empty, and every running
+  `dvt-node-*` container must be in it. On every DVT node container,
+  `AUDIT_ENABLED` and `AUDIT_EXECUTE_SLASH` are absent or exactly `"false"`.
 - **spParity**: always **MANUAL** until SP's DVTValidator-0.8.0 is on SP main
   (DSR 48be82a3).
 

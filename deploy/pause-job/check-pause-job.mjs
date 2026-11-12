@@ -8,10 +8,18 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { emptyState, stateProblems, ranges, revertData, PIN, spIface } from "./lib/core.mjs";
+import {
+  emptyState,
+  stateProblems,
+  ranges,
+  revertData,
+  costOf,
+  PIN,
+  spIface,
+} from "./lib/core.mjs";
 import { configProblems, CAP_CEILING } from "./pause-job.mjs";
 import { parseRoles } from "./gen-sp-pin.mjs";
-import { launchdOff, nodeSlashOff, PAUSE_LABEL } from "./preflight.mjs";
+import { launchdOff, nodeSlashOff, runsSender, PAUSE_LABEL } from "./preflight.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const results = [];
@@ -41,14 +49,52 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
   st.ledger.reserved = "1100";
   const p = stateProblems(st);
   cell(
-    "two in flight and spent + reserved > cap are both problems",
-    p.some(x => x.includes("more than one")) && p.some(x => x.includes("exceeds the cap")),
+    "spent + reserved > cap is a problem",
+    p.some(x => x.includes("exceeds the cap")),
     p
   );
 }
 {
   const st = base();
-  st.ledger.txs.push({ nonce: 1, cost: "5", status: "mined" });
+  st.ledger.txs.push({ nonce: 0, reserve: "100", status: "sent" });
+  st.ledger.txs.push({ nonce: 1, reserve: "100", status: "included" });
+  st.ledger.reserved = "200";
+  cell(
+    "an included transaction after a pending one is a problem",
+    stateProblems(st).some(x => x.includes("after a pending")),
+    stateProblems(st)
+  );
+  st.ledger.txs[0].status = "included";
+  st.ledger.txs[1].status = "sent";
+  cell(
+    "included then pending holds both reservations and is fine",
+    stateProblems(st).length === 0,
+    stateProblems(st)
+  );
+}
+// ---- costs: L1 is execution only; OP adds the GasPriceOracle's L1 + operator fees, never less
+{
+  const r = { gasUsed: "100", effectiveGasPrice: "7", l1Fee: "50" };
+  cell("costOf on Sepolia: gasUsed x effectiveGasPrice", costOf(r, 11155111) === 700n);
+  cell(
+    "costOf on OP: execution + GasPriceOracle L1 fee + operator fee",
+    costOf(r, 10, { l1Fee: 80n, operatorFee: 9n }) === 789n
+  );
+  cell(
+    "costOf on OP takes the receipt's l1Fee when it is larger (never undercount)",
+    costOf(r, 10, { l1Fee: 10n, operatorFee: 0n }) === 750n
+  );
+  let threw = false;
+  try {
+    costOf(r, 10, null);
+  } catch {
+    threw = true;
+  }
+  cell("costOf on OP without the oracle fees refuses (fail closed)", threw);
+}
+{
+  const st = base();
+  st.ledger.txs.push({ nonce: 1, cost: "5", status: "final" });
   st.ledger.spent = "5";
   cell(
     "a ledger whose nonces do not start at 0 is a problem",
@@ -58,7 +104,7 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
 }
 {
   const st = base();
-  st.ledger.txs.push({ nonce: 0, cost: "5", status: "mined" });
+  st.ledger.txs.push({ nonce: 0, cost: "5", status: "final" });
   cell(
     "spent that does not equal the mined costs is a problem",
     stateProblems(st).some(p => p.startsWith("spent does not")),
@@ -112,6 +158,7 @@ const good = {
   keystore: "/Users/x/.aoa-pause-job/keystore/pause-signer",
   telegram: { chatId: "-100123" },
   realertMinutes: 60,
+  lockPort: 47219,
   rpc: { primary: "alchemy", fallback: "infura" },
 };
 cell("the example-shaped config passes", configProblems(good).length === 0, configProblems(good));
@@ -190,8 +237,10 @@ cell(
 
 // ---- preflight rules
 {
-  const ok = launchdOff([PAUSE_LABEL, "io.aastar.price-keeper", "com.apple.x"], l =>
-    l === "com.apple.x" ? null : ["/bin/bash", `/x/${l}.sh`]
+  const ok = launchdOff(
+    [PAUSE_LABEL, "io.aastar.price-keeper", "com.apple.x"],
+    l => (l === "com.apple.x" ? null : ["/bin/bash", `/x/${l}.sh`]),
+    () => "echo unrelated"
   );
   cell("launchd-off passes with only the pause job and unrelated jobs", ok.length === 0, ok);
   const k = launchdOff([PAUSE_LABEL, "io.aastar.dvt-committee-keeper"], () => []);
@@ -245,6 +294,72 @@ cell(
       nodeSlashOff(() => e, ["n"]).length > 0,
       nodeSlashOff(() => e, ["n"])
     );
+  cell("node-slash-off fails on an empty inventory", nodeSlashOff(() => [], []).length > 0);
+  cell(
+    "node-slash-off fails when a running dvt-node-* is not in the inventory",
+    nodeSlashOff(() => [], ["dvt-node-1"], ["dvt-node-1", "dvt-node-4"]).some(x =>
+      x.includes("dvt-node-4")
+    )
+  );
+  cell(
+    "runsSender: a sending script inside sh -c is found",
+    runsSender(["/bin/sh", "-c", "node /repo/deploy/committee-keeper.mjs --watch"]).includes(
+      "committee-keeper.mjs"
+    )
+  );
+  cell(
+    "runsSender: a wrapper script that runs one is found by reading it",
+    runsSender(
+      ["/bin/bash", "/x/run.sh"],
+      () => "exec node deploy/apply-verifier-rotation.mjs"
+    ).includes("apply-verifier-rotation.mjs")
+  );
+  cell(
+    "runsSender: an unreadable wrapper is reported (fail closed)",
+    runsSender(["/bin/bash", "/x/run.sh"], () => null).some(x => x.includes("unreadable"))
+  );
+  {
+    const rev = [
+      {
+        label: "io.aastar.dvt-committee-health",
+        argsEnd: ["deploy/local-heartbeat.sh", "health"],
+        sha256: "ab".repeat(32),
+        why: "t",
+      },
+    ];
+    const args = ["/bin/bash", "/r/deploy/local-heartbeat.sh", "health"];
+    const txt = () => "case apply) node deploy/apply-verifier-rotation.mjs --broadcast";
+    cell(
+      "reviewed: a listed job with its exact mode and pinned wrapper hash passes",
+      launchdOff(
+        [PAUSE_LABEL, rev[0].label],
+        () => args,
+        txt,
+        rev,
+        () => "ab".repeat(32)
+      ).length === 0
+    );
+    cell(
+      "reviewed: the same job in another mode fails",
+      launchdOff(
+        [PAUSE_LABEL, rev[0].label],
+        () => ["/bin/bash", "/r/deploy/local-heartbeat.sh", "apply"],
+        txt,
+        rev,
+        () => "ab".repeat(32)
+      ).length > 0
+    );
+    cell(
+      "reviewed: a changed wrapper (hash differs) fails",
+      launchdOff(
+        [PAUSE_LABEL, rev[0].label],
+        () => args,
+        txt,
+        rev,
+        () => "cd".repeat(32)
+      ).length > 0
+    );
+  }
   cell(
     "node-slash-off fails on a missing container",
     nodeSlashOff(() => null, ["gone"]).length === 1

@@ -19,6 +19,7 @@ import {
   chmodSync,
   existsSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir, homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,10 +42,19 @@ if (!spDir) die(2, "usage: e2e-anvil.mjs --sp <SuperPaymaster checkout at sp-pin
 const head = execFileSync("git", ["-C", spDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 if (head !== PIN.spCommit)
   die(2, `the SP checkout is at ${head}, sp-pin.json pins ${PIN.spCommit}`);
-const dirty = execFileSync("git", ["-C", spDir, "status", "--porcelain", "--", "contracts/src"], {
+// every tracked build input at the pin, the deploy script and the submodules included (Codex R1 P2-9)
+const dirty = execFileSync("git", ["-C", spDir, "status", "--porcelain", "--untracked-files=no"], {
   encoding: "utf8",
 });
-if (dirty.trim()) die(2, "the SP checkout has local changes under contracts/src");
+if (dirty.trim()) die(2, "the SP checkout has local changes to tracked files");
+const subs = execFileSync("git", ["-C", spDir, "submodule", "status", "--recursive"], {
+  encoding: "utf8",
+});
+for (const line of subs
+  .split("\n")
+  .filter(l => /^(singleton-paymaster|contracts\/lib)/.test(l.slice(1).trim().split(" ")[1] ?? "")))
+  if (!line.startsWith(" "))
+    die(2, `an SP build submodule is not at its pinned commit: ${line.trim().split(" ")[1]}`);
 
 const bin = n =>
   existsSync(join(homedir(), ".foundry/bin", n)) ? join(homedir(), ".foundry/bin", n) : n;
@@ -212,8 +222,10 @@ const fresh = async (cap = String(10n ** 18n)) => {
 };
 const ops = st => Object.keys(st.operators).sort();
 
+const finalize = () => p.send("anvil_mine", ["0x80"]);
+const copy = o => structuredClone(o);
+
 // ---- C1: nothing understaked: inventory from the SP proxy, nothing sent
-const base = await snapshot();
 await section(async () => {
   const j = await fresh();
   const r = await j.round();
@@ -230,13 +242,13 @@ await section(async () => {
     r
   );
   cell(
-    "identity: a fresh signer passes the same-block identity check",
-    r.report.identity.ok,
-    r.report.identity
+    "identity: a fresh signer passes the same-block identity check (B pinned by hash)",
+    r.report.identity.ok && /^0x[0-9a-f]{64}$/.test(r.report.block.hash),
+    r.report
   );
 });
 
-// ---- C2..C4: understaked -> paused, one transaction per round, then all paused, nothing sent
+// ---- C2: understaked -> both paused in one round, in turn; reservation held until FINAL
 await raiseMinStake();
 const understaked = await snapshot();
 await section(async () => {
@@ -244,30 +256,37 @@ await section(async () => {
   const r1 = await j.round();
   const [a, b] = ops(j.st);
   cell(
-    "understaked: round 1 pauses both, in turn (nonce 0 mined before nonce 1 is signed)",
+    "understaked: round 1 pauses both in turn (nonce 0 included before nonce 1 is signed)",
     j.st.ledger.txs.length === 2 &&
       r1.report.sent.join() === [a, b].join() &&
-      j.st.ledger.txs.every((t, i) => t.nonce === i && t.status === "mined" && t.ok),
+      j.st.ledger.txs.every((t, i) => t.nonce === i && t.status === "included"),
     { r: r1.report, a: r1.alerts }
   );
+  cell("both operators paused on chain after round 1", (await isPaused(a)) && (await isPaused(b)));
   cell(
-    "ledger: spent = sum of gasUsed x price, nothing reserved after both mined",
-    BigInt(j.st.ledger.spent) > 0n &&
-      j.st.ledger.reserved === "0" &&
-      stateProblems(j.st).length === 0,
-    j.st.ledger
-  );
-  cell(
-    "both operators paused on chain after round 1",
-    (await isPaused(a)) && (await isPaused(b)),
-    null
+    "included, not final: both reservations still held, nothing spent",
+    j.st.ledger.spent === "0" &&
+      BigInt(j.st.ledger.reserved) === j.st.ledger.txs.reduce((x, t) => x + BigInt(t.reserve), 0n),
+    copy(j.st.ledger)
   );
   const r2 = await j.round();
+  cell(
+    "round 2 before finality: still included, nothing sent, still reserved",
+    r2.report.sent.length === 0 &&
+      j.st.ledger.txs.every(t => t.status === "included") &&
+      j.st.ledger.spent === "0",
+    copy(j.st.ledger)
+  );
+  await finalize();
   const r3 = await j.round();
   cell(
-    "rounds 2-3: nothing sent, the ledger unchanged",
-    r2.report.sent.length === 0 && r3.report.sent.length === 0 && j.st.ledger.txs.length === 2,
-    [r2.report.sent, r3.report.sent]
+    "after finality: final, spent = sum of receipt costs, nothing reserved",
+    j.st.ledger.txs.every(t => t.status === "final" && t.ok) &&
+      BigInt(j.st.ledger.spent) > 0n &&
+      j.st.ledger.reserved === "0" &&
+      stateProblems(j.st).length === 0 &&
+      r3.report.sent.length === 0,
+    copy(j.st.ledger)
   );
   cell(
     "an already paused operator is understaked + paused, not a candidate, counter 0",
@@ -281,15 +300,58 @@ await section(async () => {
     ![...r1.alerts, ...r2.alerts, ...r3.alerts].some(x => x.key.startsWith("timeout")),
     [r1.alerts, r2.alerts, r3.alerts]
   );
-  cell(
-    "ledger invariants hold after three rounds; spent + reserved <= cap",
-    stateProblems(j.st).length === 0 && BigInt(j.st.ledger.reserved) === 0n,
-    j.st.ledger
-  );
 });
 
-// ---- C5: the signer becomes SP's guardian: fail closed, nothing sent
+// ---- C3: a reorg removes an included pause: back to sent, resent, reservation kept throughout
 await revert(understaked);
+const u1 = await snapshot();
+await section(async () => {
+  const j = await fresh();
+  const pre = await snapshot();
+  const r1 = await j.round({ cfg: { receiptWaitMs: 2000 } });
+  const included = copy(j.st.ledger.txs);
+  await revert(pre); // the blocks holding both pauses are gone
+  let r2 = { alerts: [] };
+  let threw = null;
+  try {
+    r2 = await j.round();
+  } catch (e) {
+    threw = e.message;
+  }
+  cell(
+    "reorg: the round after a reorg runs (the vanished inclusions are detected, not a nonce mismatch)",
+    threw === null,
+    threw
+  );
+  const t0 = j.st.ledger.txs[0];
+  cell(
+    "reorg: an included pause whose receipt vanished goes back to pending and is resent (same hash)",
+    included[0].status === "included" &&
+      r2.alerts.some(a => a.key.startsWith("reorg:")) &&
+      t0.hashes[0] === included[0].hashes[0],
+    { included: included.map(t => t.status), now: j.st.ledger.txs.map(t => t.status), a: r2.alerts }
+  );
+  cell(
+    "reorg: the reservation was never released",
+    BigInt(j.st.ledger.reserved) === j.st.ledger.txs.reduce((x, t) => x + BigInt(t.reserve), 0n) &&
+      j.st.ledger.spent === "0" &&
+      stateProblems(j.st).length === 0,
+    copy(j.st.ledger)
+  );
+  await finalize();
+  await j.round();
+  cell(
+    "reorg: after re-inclusion and finality both are final and paused, counted once",
+    j.st.ledger.txs.every(t => t.status === "final") &&
+      (await isPaused(ops(j.st)[0])) &&
+      stateProblems(j.st).length === 0,
+    copy(j.st.ledger)
+  );
+  void r1;
+});
+
+// ---- C4: identity failures: nothing broadcast, not even a journalled transaction
+await revert(u1);
 const u2 = await snapshot();
 await section(async () => {
   const j = await fresh();
@@ -305,9 +367,43 @@ await section(async () => {
   );
 });
 await revert(u2);
+const u2b = await snapshot();
+await section(async () => {
+  // journal a transaction, crash before broadcast, then the signer becomes guardian: the restart
+  // must NOT broadcast the journalled bytes (Codex R1 P1-4)
+  const j = await fresh();
+  let crashed = false;
+  try {
+    await j.round({
+      persist: s => {
+        writeDurable(j.path, s);
+        if (!crashed && s.ledger.txs.some(t => t.status === "signed")) {
+          crashed = true;
+          throw new Error("crash");
+        }
+      },
+    });
+  } catch {
+    /* the crash */
+  }
+  await send(SP, adminIface, "setGuardian", [j.w.address]);
+  const st = JSON.parse(readFileSync(j.path, "utf8"));
+  const r = await runRound(st, { chain, signer: j.signer, persist: j.persist, cfg: CFG });
+  const nonce = Number(await p.getTransactionCount(j.w.address, "latest"));
+  const pend = Number(await p.getTransactionCount(j.w.address, "pending"));
+  cell(
+    "recovery is gated: a journalled pause is not broadcast while the identity check fails",
+    crashed &&
+      !r.report.identity.ok &&
+      nonce === 0 &&
+      pend === 0 &&
+      st.ledger.txs[0].status === "signed",
+    { nonce, pend, status: st.ledger.txs[0]?.status }
+  );
+});
+await revert(u2b);
 const u3 = await snapshot();
 await section(async () => {
-  // a role configured on chain that is not in the pinned ROLE_* set fails closed
   const j = await fresh();
   const c = (await read(REG, regIface, "getRoleConfig", [ROLE_SUPER]))[0].toObject();
   await send(REG, cfgIface, "configureRole", [
@@ -316,13 +412,13 @@ await section(async () => {
   ]);
   const r = await j.round();
   cell(
-    "identity: a role configured in the not-yet-finalized tail, outside the pinned set, fails closed, nothing sent",
+    "identity: a role configured in the not-yet-finalized tail, outside the pinned set, fails closed",
     !r.report.identity.ok &&
       r.report.identity.problems.some(x => x.includes("not in the pinned")) &&
       j.st.ledger.txs.length === 0,
     r.report.identity
   );
-  await p.send("anvil_mine", ["0x80"]);
+  await finalize();
   const r2 = await j.round();
   cell(
     "identity: the same role once finalized is in the inventory and still fails closed",
@@ -335,8 +431,6 @@ await section(async () => {
 await revert(u3);
 const u4 = await snapshot();
 await section(async () => {
-  // the signer holds a role: granted the way DeployAnvil grants anni ROLE_COMMUNITY (the deployer,
-  // a community, sponsors the stake through Registry.safeMintForRole)
   const j = await fresh();
   const mint = new ethers.Interface([
     "function safeMintForRole(bytes32 roleId, address user, bytes data) returns (uint256)",
@@ -370,15 +464,37 @@ await section(async () => {
     r.report.identity
   );
 });
+await section(async () => {
+  // B leaves the canonical chain while the round reads (provider-level injection: the first
+  // by-number lookup, the re-check of B, returns another hash): nothing of the round is acted on
+  const j = await fresh();
+  let n = 0;
+  const shifty = {
+    ...chain,
+    blockByNumber: async x => {
+      const b = await chain.blockByNumber(x);
+      if (typeof x === "number" && b && ++n === 1) return { ...b, hash: `0x${"ee".repeat(32)}` };
+      return b;
+    },
+  };
+  const r = await j.round({ chain: shifty });
+  cell(
+    "reorg under B during the round: identity voided, nothing sent, alert",
+    !r.report.identity.ok &&
+      r.report.identity.problems.some(x => x.includes("left the canonical chain")) &&
+      j.st.ledger.txs.length === 0,
+    r.report.identity
+  );
+});
 await revert(u4);
 const u5 = await snapshot();
 
-// ---- C6: the cap: refuse + alert; 2 rounds unpaused -> pause timeout
+// ---- C5: the cap: refuse + alert; 2 rounds unpaused -> pause timeout
 await section(async () => {
   const j = await fresh("1000");
   const r1 = await j.round();
   cell(
-    "cap: remainder below gasLimit x maxFee -> not sent, 'remaining cap insufficient' alert",
+    "cap: remainder below the reservation -> not sent, 'remaining cap insufficient' alert",
     j.st.ledger.txs.length === 0 &&
       r1.alerts.some(a => a.key === "cap" && a.text.startsWith("remaining cap insufficient")),
     r1.alerts
@@ -388,13 +504,13 @@ await section(async () => {
     "pause timeout: understaked and unpaused for 2 rounds -> 'pause timeout' alert",
     r2.alerts.some(a => a.key.startsWith("timeout:") && a.text.startsWith("pause timeout")) &&
       !r1.alerts.some(a => a.key.startsWith("timeout:")),
-    r2.alerts
+    [r1.alerts, r2.alerts]
   );
 });
 await revert(u5);
 const u6 = await snapshot();
 
-// ---- C7: crash between journalling and broadcast: the same bytes go out next round
+// ---- C6: crash between journalling and broadcast: the same bytes go out next round
 await section(async () => {
   const j = await fresh();
   let crashed = false;
@@ -412,79 +528,114 @@ await section(async () => {
     threw = true;
   }
   const saved = JSON.parse(readFileSync(j.path, "utf8"));
-  const nonceAfterCrash = Number(await p.getTransactionCount(j.w.address, "latest"));
+  const savedHash = saved.ledger.txs[0]?.hash;
+  const nonceAfterCrash = Number(await p.getTransactionCount(j.w.address, "pending"));
   cell(
     "crash: the signed transaction is on disk and was NOT broadcast",
     threw &&
       saved.ledger.txs.length === 1 &&
-      saved.ledger.txs[0]?.status === "signed" &&
+      saved.ledger.txs[0].status === "signed" &&
       nonceAfterCrash === 0,
-    { saved: saved.ledger, nonceAfterCrash }
+    { l: saved.ledger, nonceAfterCrash }
   );
-  // restart from what is on disk
-  const st2 = saved;
-  const persist2 = s => writeDurable(j.path, s);
-  await runRound(st2, { chain, signer: j.signer, persist: persist2, cfg: CFG });
-  await runRound(st2, { chain, signer: j.signer, persist: persist2, cfg: CFG });
+  const st2 = structuredClone(saved);
+  await runRound(st2, { chain, signer: j.signer, persist: j.persist, cfg: CFG });
+  const minedTx = await p.getTransaction(savedHash);
   cell(
-    "restart: the SAME bytes were sent (hash unchanged), mined, ledger consistent",
-    st2.ledger.txs[0]?.hash === saved.ledger.txs[0]?.hash &&
-      st2.ledger.txs[0]?.status === "mined" &&
-      stateProblems(st2).length === 0,
-    st2.ledger
+    "restart: the journalled bytes themselves were broadcast and included (hash from disk found on chain)",
+    minedTx?.blockNumber != null && st2.ledger.txs[0].includedHash === savedHash,
+    { savedHash, st: st2.ledger.txs.map(t => [t.status, t.includedHash]) }
+  );
+  await finalize();
+  await runRound(st2, { chain, signer: j.signer, persist: j.persist, cfg: CFG });
+  cell(
+    "restart: final once, ledger consistent",
+    st2.ledger.txs[0].status === "final" && stateProblems(st2).length === 0,
+    copy(st2.ledger)
   );
 });
 await revert(u6);
 const u7 = await snapshot();
 
-// ---- C7b: a pause that never mines is replaced at the same nonce with higher fees; the cost
-// is counted once, from whichever hash mined
+// ---- C7: a pause that never lands is replaced at the same nonce with a HIGHER fee
 await section(async () => {
   const j = await fresh();
   await p.send("evm_setAutomine", [false]);
   const quick = { cfg: { receiptWaitMs: 300, pollMs: 100, bumpAfterRounds: 2 } };
+  let before;
   try {
     const r1 = await j.round(quick);
-    const first = j.st.ledger.txs[0]?.hash;
+    before = copy(j.st.ledger.txs[0]);
     await j.round(quick);
     await j.round(quick);
-    const kept = j.st.ledger.txs[0]?.hashes?.length === 1;
-    await j.round(quick); // the third pending round start: replaced
+    const kept = j.st.ledger.txs[0].hashes.length === 1;
+    await j.round(quick);
     const t = j.st.ledger.txs[0];
     cell(
-      "stuck: pending past bumpAfterRounds -> replaced at the same nonce, higher fee, both hashes kept",
+      "stuck: replaced at the same nonce with a strictly higher maxFee and tip; both hashes kept",
       r1.report.sent.length === 1 &&
         kept &&
         t.hashes.length === 2 &&
-        t.hashes[0] === first &&
+        t.hashes[0] === before.hash &&
         t.nonce === 0 &&
-        BigInt(t.maxFeePerGas) > 0n &&
-        stateProblems(j.st).length === 0,
-      t
+        BigInt(t.maxFeePerGas) > BigInt(before.maxFeePerGas) &&
+        BigInt(t.maxPriorityFeePerGas) > BigInt(before.maxPriorityFeePerGas),
+      { before, t }
     );
     cell(
-      "stuck: the extra reservation is held against the cap",
-      BigInt(j.st.ledger.reserved) === BigInt(t.reserve),
-      j.st.ledger
+      "stuck: the reservation never shrinks and is held against the cap",
+      BigInt(t.reserve) >= BigInt(before.reserve) &&
+        BigInt(j.st.ledger.reserved) === BigInt(t.reserve) &&
+        stateProblems(j.st).length === 0,
+      copy(j.st.ledger)
     );
   } finally {
     await p.send("evm_setAutomine", [true]);
   }
   await p.send("evm_mine", []);
+  await finalize();
   await j.round();
   const t = j.st.ledger.txs[0];
   cell(
-    "stuck: once mined, exactly one of the hashes is the mined one, cost counted once, nothing reserved",
-    t.status === "mined" &&
-      t.hashes.includes(t.minedHash) &&
-      BigInt(j.st.ledger.spent) === j.st.ledger.txs.reduce((x, y) => x + BigInt(y.cost ?? 0), 0n) &&
-      j.st.ledger.reserved === "0" &&
+    "stuck: once final, the landed hash is one of those signed; cost counted once",
+    t.status === "final" &&
+      t.hashes.includes(t.includedHash) &&
+      BigInt(j.st.ledger.spent) ===
+        j.st.ledger.txs
+          .filter(x => x.status === "final")
+          .reduce((x, y) => x + BigInt(y.cost), 0n) &&
       stateProblems(j.st).length === 0,
-    j.st.ledger
+    copy(j.st.ledger)
   );
 });
 await revert(u7);
-const u7b = await snapshot();
+const u8 = await snapshot();
+await section(async () => {
+  // replacement impossible (fee ceiling): the current bytes are still rebroadcast (Codex R1 P2-5)
+  const j = await fresh();
+  await p.send("evm_setAutomine", [false]);
+  try {
+    const quick = { cfg: { receiptWaitMs: 200, pollMs: 100, bumpAfterRounds: 0 } };
+    await j.round(quick);
+    const h = j.st.ledger.txs[0].hash;
+    await p.send("anvil_dropTransaction", [h]); // the mempool lost it
+    const r = await j.round({
+      cfg: { ...quick.cfg, maxFeePerGasCap: j.st.ledger.txs[0].maxFeePerGas },
+    });
+    const inPool = await p.getTransaction(h);
+    cell(
+      "stuck, replacement above the ceiling: alerted, and the current bytes are rebroadcast",
+      r.alerts.some(a => a.key.startsWith("stuck:")) &&
+        inPool != null &&
+        j.st.ledger.txs[0].hashes.length === 1,
+      { a: r.alerts, inPool: !!inPool }
+    );
+  } finally {
+    await p.send("evm_setAutomine", [true]);
+  }
+});
+await revert(u8);
+const u9 = await snapshot();
 
 // ---- C8: another use of the key stops the round
 await section(async () => {
@@ -502,8 +653,8 @@ await section(async () => {
     msg
   );
 });
-await revert(u7b);
-const u8 = await snapshot();
+await revert(u9);
+const u10 = await snapshot();
 
 // ---- C9: a failed getLogs range is retried, never skipped
 await section(async () => {
@@ -516,23 +667,22 @@ await section(async () => {
   };
   const r1 = await j.round({ chain: flaky });
   const c1 = j.st.cursor.operators;
+  const ops1 = ops(j.st).length;
+  cell(
+    "getLogs failure: cursor stays, alert raised, no operator in the inventory yet",
+    c1 === startBlock - 1 && ops1 === 0 && r1.alerts.some(a => a.key === "inventory:operators"),
+    { c1, ops1, a: r1.alerts }
+  );
   const r2 = await j.round();
   cell(
-    "getLogs failure: cursor stays, alert raised, no operator invented",
-    c1 === startBlock - 1 &&
-      r1.alerts.some(a => a.key === "inventory:operators") &&
-      ops(j.st).length === 2,
-    { c1, a: r1.alerts, ops: ops(j.st) }
-  );
-  cell(
-    "next round: the same range is read and the cursor reaches finalized",
-    j.st.cursor.operators === r2.report.finalized,
+    "next round: the same range is read, both operators found, the cursor reaches finalized",
+    ops(j.st).length === 2 && j.st.cursor.operators === r2.report.finalized,
     { cursor: j.st.cursor, f: r2.report.finalized }
   );
 });
-await revert(u8);
+await revert(u10);
 
-// ---- C10: the CLI: --init refuses a used key; a round writes status.json
+// ---- C10: the CLI end to end
 await section(async () => {
   const home = join(work, "cli");
   mkdirSync(join(home, "secrets"), { recursive: true, mode: 0o700 });
@@ -563,6 +713,7 @@ await section(async () => {
     keystore: join(home, "keystore"),
     telegram: null,
     realertMinutes: 60,
+    lockPort: 30000 + Math.floor(Math.random() * 20000),
     rpc: { primary: "alchemy", fallback: "infura" },
   };
   writeFileSync(join(home, "config.json"), JSON.stringify(cfg));
@@ -589,7 +740,7 @@ await section(async () => {
     init
   );
   cell(
-    "CLI: a round pauses, writes status.json, exits 1 (alerts undelivered without Telegram)",
+    "CLI: a round pauses both, writes status.json, exits 1 (alerts undelivered without Telegram)",
     status.report?.sent?.length === 2 && run.code === 1 && status.delivery.ok === false,
     { run, status: status.report }
   );
@@ -604,10 +755,21 @@ await section(async () => {
     again.code !== 0 && /already exists/.test(again.out),
     again
   );
+  // the lock: a second process while the port is held exits 75 without touching the state
+  const holder = createServer().listen({ host: "127.0.0.1", port: cfg.lockPort, exclusive: true });
+  await new Promise(r => holder.once("listening", r));
+  const locked = cli([]);
+  holder.close();
+  cell(
+    "CLI: a second run while the lock is held exits 75",
+    locked.code === 75 && /holds the lock/.test(locked.out),
+    locked
+  );
   const leaked = [
     init.out,
     run.out,
     again.out,
+    locked.out,
     readFileSync(join(home, "state/status.json"), "utf8"),
     readFileSync(join(home, "state/state.json"), "utf8"),
   ].some(t => t.includes(pw) || t.includes(`127.0.0.1:${PORT}`));

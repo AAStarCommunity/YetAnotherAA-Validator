@@ -15,7 +15,8 @@
 //               run by hand against the pinned SP commit and recorded on the launch checklist
 // Exit 0 only when no item FAILs. MANUAL items never count as PASS.
 import { execFileSync } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -28,8 +29,52 @@ export const SENDING_SCRIPTS = [
   "reregister-guardians.mjs",
 ];
 
+/**
+ * Does a job's argument list run a DVT sending script? A name ANYWHERE in an argument counts
+ * (`sh -c "node …/committee-keeper.mjs"`), and an argument that is a readable text file (a wrapper
+ * script) is searched too; `readText(path)` returns its text, or null when it is not a file. A
+ * wrapper that cannot be read is reported as unknown (fail closed). Pure given readText.
+ */
+export function runsSender(args, readText = () => null) {
+  const hits = new Set();
+  for (const a of args) {
+    for (const s of SENDING_SCRIPTS) if (a.includes(s)) hits.add(s);
+    if (/^\/.+\.(sh|bash|zsh|command)$/.test(a)) {
+      const t = readText(a);
+      if (t === null) hits.add(`<unreadable wrapper ${a}>`);
+      else for (const s of SENDING_SCRIPTS) if (t.includes(s)) hits.add(s);
+    }
+  }
+  return [...hits];
+}
+
+/**
+ * A job reviewed as not sending (preflight-reviewed.json): its label, the exact END of its
+ * arguments (the mode it runs in), and the sha256 of its wrapper file all match. A wrapper that
+ * changes, or the same wrapper in another mode, is not reviewed. Pure given shaOf.
+ */
+export function isReviewed(label, args, reviewed, shaOf) {
+  return reviewed.some(r => {
+    if (r.label !== label || args.length < r.argsEnd.length) return false;
+    const tail = args.slice(args.length - r.argsEnd.length);
+    if (
+      !tail.every((a, i) =>
+        i === 0 ? a.endsWith(`/${r.argsEnd[0]}`) || a === r.argsEnd[0] : a === r.argsEnd[i]
+      )
+    )
+      return false;
+    return shaOf(tail[0]) === r.sha256;
+  });
+}
+
 /** launchd-off from `launchctl list` labels and each loaded job's ProgramArguments. Pure. */
-export function launchdOff(labels, programOf) {
+export function launchdOff(
+  labels,
+  programOf,
+  readText = () => null,
+  reviewed = [],
+  shaOf = () => null
+) {
   const p = [];
   for (const f of FORBIDDEN_LABELS) if (labels.includes(f)) p.push(`${f} is loaded`);
   if (!labels.includes(PAUSE_LABEL)) p.push(`${PAUSE_LABEL} is not loaded`);
@@ -38,19 +83,24 @@ export function launchdOff(labels, programOf) {
     const args = programOf(l);
     if (args === null) {
       // Apple's XPC services are listed but not printable in the gui domain; anything else that
-      // cannot be read fails closed
+      // cannot be read fails closed (an installed agent is still read from its plist, below)
       if (!l.startsWith("com.apple.")) p.push(`${l}: its ProgramArguments cannot be read`);
       continue;
     }
-    for (const s of SENDING_SCRIPTS)
-      if (args.some(a => a.endsWith(`/${s}`) || a === s)) p.push(`${l} runs ${s}`);
+    if (isReviewed(l, args, reviewed, shaOf)) continue;
+    for (const s of runsSender(args, readText)) p.push(`${l} runs ${s}`);
   }
   return p;
 }
 
 /** node-slash-off from each container's environment (array of "K=V"). Pure. */
-export function nodeSlashOff(envOf, nodes) {
+export function nodeSlashOff(envOf, nodes, running = null) {
   const p = [];
+  if (!nodes.length) p.push("no DVT node containers given");
+  // every running DVT node container must be in the inventory checked here
+  if (running)
+    for (const r of running)
+      if (/^dvt-node-/.test(r) && !nodes.includes(r)) p.push(`${r} is running but not checked`);
   for (const n of nodes) {
     const env = envOf(n);
     if (env === null) {
@@ -67,6 +117,13 @@ export function nodeSlashOff(envOf, nodes) {
   return p;
 }
 
+const readText = path => {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+};
 const run = (cmd, a) => {
   try {
     return execFileSync(cmd, a, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
@@ -102,10 +159,20 @@ if (import.meta.url === `file://${process.argv[1]}`) {
             .map(s => s.trim())
             .filter(Boolean)
         : [];
-      if (prog) a.push(prog[1].trim());
+      if (prog && a[0] !== prog[1].trim()) a.unshift(prog[1].trim());
       return a;
     };
-    const p = launchdOff(labels, programOf);
+    const reviewed = JSON.parse(
+      readFileSync(new URL("./preflight-reviewed.json", import.meta.url), "utf8")
+    ).jobs;
+    const shaOf = path => {
+      try {
+        return createHash("sha256").update(readFileSync(path)).digest("hex");
+      } catch {
+        return null;
+      }
+    };
+    const p = launchdOff(labels, programOf, readText, reviewed, shaOf);
     // the installed agents, read from their plists: a job named com.apple.* (skipped above when
     // unprintable) is still caught here by what it runs
     const dir = join(homedir(), "Library/LaunchAgents");
@@ -129,8 +196,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       }
       if (d.Label === PAUSE_LABEL || !labels.includes(d.Label)) continue;
       const a = [...(d.ProgramArguments ?? []), ...(d.Program ? [d.Program] : [])].map(String);
-      for (const s of SENDING_SCRIPTS)
-        if (a.some(x => x.endsWith(`/${s}`) || x === s)) p.push(`${d.Label} (${f}) runs ${s}`);
+      if (isReviewed(d.Label, a, reviewed, shaOf)) continue;
+      for (const s of runsSender(a, readText)) p.push(`${d.Label} (${f}) runs ${s}`);
     }
     results.push(["launchd-off", p.length ? "FAIL" : "PASS", [...new Set(p)]]);
   }
@@ -142,7 +209,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       return null;
     }
   };
-  const ns = nodeSlashOff(envOf, nodes);
+  const ps = run("docker", ["ps", "--format", "{{.Names}}"]);
+  const ns =
+    ps === null ? ["docker ps failed"] : nodeSlashOff(envOf, nodes, ps.split("\n").filter(Boolean));
   results.push(["node-slash-off", ns.length ? "FAIL" : "PASS", ns]);
   results.push([
     "spParity",

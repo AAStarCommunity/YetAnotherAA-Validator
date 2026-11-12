@@ -1,0 +1,11 @@
+{
+  "schema": "aoa-pause-job-preflight-reviewed/1",
+  "jobs": [
+    {
+      "label": "io.aastar.dvt-committee-health",
+      "argsEnd": ["deploy/local-heartbeat.sh", "health"],
+      "sha256": "370ab96e3fcaa25720e552f2afa8e712ecab052a85e657c26471390ab7819b6d",
+      "why": "Runs local-heartbeat.sh in mode 'health': committee-health.mjs plus alerts, no transaction. The same wrapper's 'apply' mode broadcasts apply-verifier-rotation.mjs, so ONLY mode 'health' with exactly this wrapper (sha256 of master's deploy/local-heartbeat.sh) is reviewed; any change to the file or the mode fails launchd-off."
+    }
+  ]
+}
