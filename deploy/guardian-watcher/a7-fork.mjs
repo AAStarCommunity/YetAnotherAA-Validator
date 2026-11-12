@@ -48,6 +48,7 @@ import {
   EXAMPLE_SHA256,
   fieldInventory,
   checkInventory,
+  abiGapUnverified,
 } from "./a7-readback.mjs";
 
 const args = process.argv.slice(2);
@@ -453,12 +454,8 @@ try {
   die(3, `a read failed (${e instanceof Infra ? e.message : "RPC error"}): no verdict`);
 }
 const { cmp, unverified } = result;
-for (const k of missingAbi)
-  unverified.push(
-    k === "disclosureRegistry"
-      ? "disclosureRegistry is retired (DSR 009967e4): SP's read-back must drop it"
-      : `abis/ has no file for ${k} (ask SP)`
-  );
+// a contract with no ABI file is unverified unless compare() verified it as not deployed
+unverified.push(...abiGapUnverified(missingAbi, result.absent ?? []));
 // ABIs or the address book not fetched from SP at the pinned commits are not authenticated
 // (Codex A7 R2 #4): usable for a dry run, never for SAME STATE
 if (opt("abi-dir")) unverified.push("ABIs from --abi-dir (not SP's abis/ at spCommit)");

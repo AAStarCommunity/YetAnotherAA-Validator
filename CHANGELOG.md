@@ -23,7 +23,12 @@ ports the detection logic.
 - `scripts/disclosure/` (entry recheck, its stub chain, the A3 emission diff,
   the disclosure vectors).
 - A7 rehearsal: DisclosureRegistry's ABI is no longer fetched from this
-  repository.
+  repository. SP's schema v10 is unchanged and still requires the key, so the
+  read-back carries it with every field `"n/a:not deployed"` and no address-book
+  entry. A7 accepts exactly that form as verified absent, needing no ABI. Any
+  other form, such as a real address, codehash, WRITER or AGGREGATOR, another
+  spelling, a missing field, an address-book entry or an omitted entry, stops
+  the rehearsal.
 
 ### Kept
 

@@ -132,8 +132,10 @@ export const ABI_FILES = {
   blsAggregator: "BLSAggregator.json",
   dvtValidator: "DVTValidator.json",
   reputationSystem: "ReputationSystem.json",
-  // retired (DSR 009967e4): no ABI, so its fields are unverified and stop the rehearsal; it stays
-  // in the lists above only because SP's frozen schema v10 still requires it
+  // retired (DSR 009967e4): no ABI. SP's frozen schema v10 still requires the key, so the read-back
+  // carries it with every field "n/a:not deployed" and the address book has no entry (SP 2026-11-12):
+  // compare() verifies that exact form and lists it in `absent`, which needs no ABI; any other entry
+  // (a real address, codehash, WRITER, another spelling) stays unverified via abiGapUnverified
   disclosureRegistry: null,
   xPNTsFactoryV2: "xPNTsFactoryV2.json",
   xPNTsTokenV2Impl: "xPNTsTokenV2.full.json",
@@ -177,6 +179,21 @@ const lc = v => String(v).toLowerCase();
 
 export const URL_LIKE = /[a-z][a-z0-9+.-]*:\/\/|\b(?:https?|wss?|ftp|file):/i;
 /** Any string value or object key, at any depth, that looks like a URL. */
+/**
+ * What a contract with no SP ABI file leaves unverified. A contract compare() verified as not
+ * deployed (`absent`) needs no ABI; every other one stops the rehearsal. Pure.
+ */
+export function abiGapUnverified(missingAbi, absent) {
+  return missingAbi
+    .filter(k => !absent.includes(k))
+    .map(k =>
+      k === "disclosureRegistry"
+        ? "disclosureRegistry is retired (DSR 009967e4): the read-back must write every field " +
+          "'n/a:not deployed' and the address book must have no entry"
+        : `abis/ has no file for ${k} (ask SP)`
+    );
+}
+
 export function hasUrlLike(v) {
   if (typeof v === "string") return URL_LIKE.test(v);
   if (Array.isArray(v)) return v.some(hasUrlLike);
@@ -254,6 +271,8 @@ const wordAddr = w => (BigInt(w) === 0n ? ZERO : `0x${w.slice(-40)}`.toLowerCase
 export async function compare(rb, reader, facts) {
   const cmp = [];
   const unverified = [];
+  // contracts verified as "not deployed": every field exactly the marker, no address-book entry
+  const absent = [];
   const check = (path, sp, ours, ok) =>
     cmp.push({ path, sp: show(sp) ?? null, fork: show(ours) ?? null, ok: !!ok });
   const eq = (path, sp, ours) =>
@@ -398,8 +417,10 @@ export async function compare(rb, reader, facts) {
       ]);
       const allNa =
         [...need].every(k => own(c, k) && c[k] === NOT_DEPLOYED) &&
-        Object.keys(c).every(k => need.has(k) || k === "rolesSource");
+        // rolesSource may be left out; when written it is the marker too (Codex retire R2)
+        Object.keys(c).every(k => need.has(k) || (k === "rolesSource" && c[k] === NOT_DEPLOYED));
       check(`${P}.address`, c.address, "(not in the address book)", allNa);
+      if (allNa) absent.push(key);
       continue;
     } else if (book === undefined) unverified.push(`${P}.address (not in the address book)`);
     else if (isState(c.address)) check(`${P}.address`, c.address, book, false);
@@ -954,7 +975,7 @@ export async function compare(rb, reader, facts) {
     else eq("amsterdamProbe.upstream:simulateV1", pr.expected.gasUsed, ours?.simulate);
     eq("amsterdamProbe.upstream:callAtGasUsed", true, ours?.callAtGasUsed);
   }
-  return { cmp, unverified };
+  return { cmp, unverified, absent };
 }
 
 /** Any string that looks like a URL is redacted before printing or recording (Codex A7 R1 #5). */
