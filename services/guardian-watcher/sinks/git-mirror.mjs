@@ -21,7 +21,7 @@
 // All git calls are argv-only (no shell).
 import { spawn } from "node:child_process";
 import { ethers } from "ethers";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, lstatSync } from "node:fs";
 import { SinkError, guarded } from "./errors.mjs";
 import { join, posix } from "node:path";
 
@@ -81,7 +81,9 @@ export function mirrorSshCommand(sshKey) {
     // no ssh config at all (Codex Phase D R1 #1): IdentitiesOnly still admits a configured
     // IdentityFile, so ~/.ssh/config could otherwise supply another key
     "-F /dev/null",
-    `-i ${sshKey}`,
+    // IdentityFile, not -i (Codex Phase D R2): ssh drops a missing -i file and falls back to the
+    // default ~/.ssh/id_* keys; a configured IdentityFile replaces the defaults, missing or not
+    `-o IdentityFile=${sshKey}`,
     "-o IdentitiesOnly=yes",
     "-o IdentityAgent=none",
     "-o BatchMode=yes",
@@ -125,8 +127,21 @@ export function gitMirror({
   // with a key, only the ssh transport (Codex Phase D R1 #2): a local, file://, https or ext remote
   // could otherwise take the push without the key
   const sshOnly = sshKey ? ["-c", "protocol.allow=never", "-c", "protocol.ssh.allow=always"] : [];
-  const git = (cwd, args, o = {}) =>
-    gitRaw(cwd, [...sshOnly, ...args], { ...o, env: { ...sshEnv, ...(o.env ?? {}) } });
+  // the key file must be there before any keyed call (a clear refusal instead of an ssh failure)
+  const keyThere = () => {
+    if (!sshKey) return;
+    let st = null;
+    try {
+      st = lstatSync(sshKey);
+    } catch {
+      st = null;
+    }
+    if (!st?.isFile()) throw new SinkError("mirror: the deploy key file is missing");
+  };
+  const git = (cwd, args, o = {}) => {
+    keyThere();
+    return gitRaw(cwd, [...sshOnly, ...args], { ...o, env: { ...sshEnv, ...(o.env ?? {}) } });
+  };
   const text = async (...a) => (await git(...a)).toString().trim();
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
     throw new SinkError("mirror: bad branch name");

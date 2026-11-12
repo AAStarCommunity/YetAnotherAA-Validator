@@ -1514,6 +1514,27 @@ try {
   const oldPath = process.env.PATH;
   process.env.PATH = `${bin}:${oldPath}`;
   const key = join(d, "deploy_key");
+  writeFileSync(key, "not a real key\n", { mode: 0o600 }); // the fake ssh never reads it
+  // Codex Phase D R2: a missing key file is refused before ssh runs (no fallback to default keys)
+  let missingErr = null;
+  process.env.PATH = `${bin}:${process.env.PATH}`;
+  try {
+    await gitMirror({ clone, repoUrl: "https://github.com/o/r", sshKey: join(d, "gone") }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    missingErr = e.message;
+  } finally {
+    process.env.PATH = process.env.PATH.slice(bin.length + 1);
+  }
+  let sshRanForMissing = true;
+  try {
+    readFileSync(log, "utf8");
+  } catch {
+    sshRanForMissing = false;
+  }
   let err = null;
   try {
     await gitMirror({ clone, repoUrl: "https://github.com/o/r", sshKey: key }).commit(
@@ -1544,14 +1565,17 @@ try {
   cell(
     "DSR mirror key: the mirror's git calls run ssh with only the key file (-i, IdentitiesOnly, no agent, batch, strict host key); non-plain key paths are refused",
     argv.includes("-F /dev/null") &&
-      argv.includes(`-i ${key}`) &&
+      argv.includes(`-o IdentityFile=${key}`) &&
+      !/(^| )-i /.test(argv) &&
       argv.includes("IdentitiesOnly=yes") &&
       argv.includes("IdentityAgent=none") &&
       argv.includes("BatchMode=yes") &&
       argv.includes("StrictHostKeyChecking=yes") &&
       /remote unreachable or not authorized/.test(err ?? "") &&
+      /deploy key file is missing/.test(missingErr ?? "") &&
+      sshRanForMissing === false &&
       refused.every(Boolean),
-    { argv, err, refused }
+    { argv, err, refused, missingErr, sshRanForMissing }
   );
   // Codex Phase D R1 #2: with a key the sink pushes over ssh only (a local or file:// remote is
   // refused, never taken without the key); the Phase D remote match accepts only the GitHub SSH
@@ -1628,6 +1652,7 @@ try {
     "Codex Phase D R1 #2: a key-bound mirror refuses a non-ssh remote (local path); only the GitHub SSH remote of repoUrl matches",
     control === "ok" &&
       typeof localErr === "string" &&
+      !/deploy key file is missing/.test(localErr) &&
       match.scp &&
       match.sshUrl &&
       !match.https &&

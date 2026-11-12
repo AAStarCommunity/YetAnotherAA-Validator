@@ -128,7 +128,7 @@ only, and the branch as an empty root commit (records only, no source tree; the
 watcher only ever appends to it):
 
 ```sh
-export GIT_SSH_COMMAND="ssh -F /dev/null -i $HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
+export GIT_SSH_COMMAND="ssh -F /dev/null -o IdentityFile=$HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
 git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git
 M=~/.aoa-watcher/mirror.git
 ROOT=$(git -C $M commit-tree $(git -C $M hash-object -t tree -w /dev/null) -m "disclosure records")
