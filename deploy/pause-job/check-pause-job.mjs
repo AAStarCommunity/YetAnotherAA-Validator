@@ -447,6 +447,30 @@ async function roundOn({ cap, balance, prior = null }) {
       "fundingGate: a balance below even the pending allowance is a deficit",
       fundingGate(st, 10000000n - 300001n).deficit?.key === "deficit"
     );
+    // an included tx recorded at 120000 whose block was reorged and re-included at 150000 before B
+    const st2 = emptyState({
+      chainId: 31337,
+      signer: w.address,
+      spProxy: A,
+      registry: B,
+      startBlock: 1,
+      cap: "10000000",
+    });
+    st2.ledger.txs.push({
+      nonce: 0,
+      status: "included",
+      reserve: "300000",
+      includedCost: "120000",
+    });
+    st2.ledger.reserved = "300000";
+    cell(
+      "fundingGate: an included tx re-included at a higher cost (within its reservation) is no deficit (Codex follow-up R2)",
+      fundingGate(st2, 10000000n - 150000n).deficit === null
+    );
+    cell(
+      "fundingGate: below cap - committed it is a deficit",
+      fundingGate(st2, 10000000n - 300001n).deficit?.key === "deficit"
+    );
   }
   // an included tx with reservation 10 but a KNOWN cost far above it: a new send must not fit
   const H0 = `0x${"0c".repeat(32)}`;

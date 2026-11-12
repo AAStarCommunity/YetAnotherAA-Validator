@@ -138,18 +138,16 @@ export function fundingGate(st, balance) {
   // less on the signer than the ledger explains: a cost the ledger undercounts (e.g. a receipt
   // l1Fee of 0) or a debit we did not make. An ALERT only, never a halt (clestons #432 L3, DSR):
   // a low balance must not become an external stop either
-  // a PENDING transaction may have been mined since the reconcile (before B was pinned), so its
-  // fee can already be gone from the balance without being in the ledger: the low side allows
-  // for every pending reservation (Codex follow-up P2); the high side does not need to
-  const pendingHeld = st.ledger.txs
-    .filter(t => PENDING.has(t.status))
-    .reduce((x, t) => x + big(t.reserve), 0n);
-  const explainedLow = explained - pendingHeld;
+  // the low side allows for everything the ledger still HOLDS: a pending transaction may have been
+  // mined since the reconcile, and an included one may have been reorged and re-included at a
+  // different cost, both before B was pinned (Codex follow-up P2 x2). cap - committed() is the
+  // least the balance can be when every held transaction spent its full hold.
+  const explainedLow = big(st.ledger.cap) - committed(st);
   const deficit =
     balance < explainedLow
       ? {
           key: "deficit",
-          text: `deficit: the signer holds ${explainedLow - balance} wei less than the ledger explains even allowing for pending reservations (balance ${balance}, cap ${st.ledger.cap}, spent ${st.ledger.spent}); the ledger may undercount a cost — check the last receipts`,
+          text: `deficit: the signer holds ${explainedLow - balance} wei less than the ledger explains even allowing for every held reservation (balance ${balance}, cap ${st.ledger.cap}, spent ${st.ledger.spent}); the ledger may undercount a cost — check the last receipts`,
         }
       : null;
   const inflow =
