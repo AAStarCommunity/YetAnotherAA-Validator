@@ -2364,11 +2364,40 @@ const good = {
       });
       void inProgress;
       const afterInProgress = sent.some(t => /RECOVERED/.test(t));
+      // #413 Low 2: an interim status that carries a completed healthy pass is a recovery, so
+      // checks phase-locked to the in-progress window still recover (here, every check is interim)
+      let st2 = {
+        alerting: "unhealthy",
+        unhealthyRuns: 3,
+        lastAt: "y",
+        lastAtSeenSince: 0,
+        lastSentAt: 0,
+      };
+      const sent2 = [];
+      const interimTick = (at, pub) =>
+        heartbeat({
+          cfg: { dataDir: d, intervalMs: 60_000, heartbeat: { label: "t" } },
+          now: Date.parse(at),
+          readStatus: () =>
+            JSON.stringify({ at, healthy: true, degraded: null, lagBlocks: 0, publication: pub }),
+          statMtime: () => Date.parse(at),
+          send: async t => (sent2.push(t), true),
+          readState: () => st2,
+          writeState: x => ((st2 = x), true),
+        });
+      await interimTick("2026-11-11T01:00:00.000Z", { inProgress: true, at: "t0", error: "x" });
+      const afterErrored = sent2.some(t => /RECOVERED/.test(t));
+      await interimTick("2026-11-11T01:05:00.000Z", { inProgress: true, at: "t0", ok: true });
+      const lockedRecovered = sent2.some(t => /RECOVERED/.test(t));
       await tick("2026-11-11T00:01:00.000Z", true);
       cell(
-        "N1/R18: no RECOVERED while the status is unhealthy or publication is in progress; RECOVERED once a completed iteration is healthy",
-        !afterUnhealthy && !afterInProgress && sent.some(t => /RECOVERED/.test(t)),
-        sent
+        "N1/R18/#413 Low 2: no RECOVERED while unhealthy or while an interim status carries no completed pass (or an errored one); RECOVERED from a completed healthy iteration, and from an interim status carrying one (phase-locked checks)",
+        !afterUnhealthy &&
+          !afterInProgress &&
+          sent.some(t => /RECOVERED/.test(t)) &&
+          !afterErrored &&
+          lockedRecovered,
+        { sent, sent2 }
       );
     } finally {
       rmSync(d, { recursive: true, force: true });

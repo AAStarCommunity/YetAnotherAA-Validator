@@ -26,6 +26,13 @@ const args = process.argv.slice(2);
 const ci = args.indexOf("--config");
 
 /** One check. Everything external is injectable for the self-test. */
+/** The status reflects a completed publication pass: finished, or interim carrying one. */
+export function fromCompleted(status) {
+  const p = status?.publication;
+  if (!p || p.inProgress !== true) return true;
+  return typeof p.at === "string" && !p.error;
+}
+
 export async function check({
   cfg,
   now = Date.now(),
@@ -132,14 +139,14 @@ export async function check({
         sent = problem.key;
       }
     }
-  } else if (
-    state.alerting &&
-    status?.healthy === true &&
-    status.publication?.inProgress !== true
-  ) {
+  } else if (state.alerting && status?.healthy === true && fromCompleted(status)) {
     // recovery needs a positive healthy from a completed iteration: a fresh but unhealthy status
-    // below the unhealthy threshold (#413 review N1), or one written while publication is still
-    // in progress (Codex W2c R18), is not "recovered"; the alert stays open until it is
+    // below the unhealthy threshold (#413 review N1) is not "recovered". A status written while
+    // publication is in progress counts only when it carries a completed pass's result (`at`):
+    // the watcher then judges it by that pass and that iteration's slowness, so it is as healthy
+    // as the completed iteration (#413 review Low 2: with checks phase-locked to the in-progress
+    // window, RECOVERED was otherwise held back). Without a carried result it is not a recovery
+    // (Codex W2c R18).
     const ok = await send(
       `[aoa-watcher] ${host}: RECOVERED (status fresh, lag within ${maxLag}, healthy)`
     );
