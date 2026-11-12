@@ -707,10 +707,10 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     });
     return { alerts, report };
   }
-  // the funding IS the hard bound (DSR 65db9e38: fund exactly the cap, never top up without a go),
-  // enforced here (Codex R7 P1): the signer may hold no more than the budget left, cap - spent. A
-  // balance above it means a top-up; nothing is broadcast. Total spend can then never exceed the
-  // cap, even when an OP inclusion-time fee overruns a reservation.
+  // the balance at B feeds fundingGate: an unknown included cost blocks every broadcast; a balance
+  // above what the ledger explains (cap - spent - included costs) is reported as an `inflow` and
+  // sending continues (DSR N1 ruling (c)). The LEDGER bounds spending (committed() <= cap); "fund
+  // exactly the cap, no top-up without a go" is a process rule (DSR 65db9e38).
   let balance;
   try {
     balance = big(await chain.balance(st.signer, at(B)));
