@@ -862,13 +862,18 @@ async function scenario(build) {
         runs += c.checked;
         if (getHold(store, Store.recordId(bls))?.state === "unconfirmed-final") finalAt = t;
       }
+      // #424 review Info: a final hold names no next attempt (it is never retried until re-armed)
+      const finalHold = getHold(store, Store.recordId(bls));
       cell(
-        "L1: with a pass every minute, 10 mismatches make the hold final no earlier than ~4 h after the first (not within 10 minutes)",
+        "L1: with a pass every minute, 10 mismatches make the hold final no earlier than ~4 h after the first (not within 10 minutes); the final hold names no next attempt",
         finalAt !== null &&
           finalAt - t0 >= finalAfterMismatchesMs() &&
           finalAfterMismatchesMs() >= 3 * 3_600_000 &&
-          runs === CONFIRM_MAX_ATTEMPTS,
+          runs === CONFIRM_MAX_ATTEMPTS &&
+          finalHold?.state === "unconfirmed-final" &&
+          finalHold.nextAttemptAt === undefined,
         {
+          next: finalHold?.nextAttemptAt,
           finalAfterMin: finalAt && (finalAt - t0) / 60_000,
           bound: finalAfterMismatchesMs() / 60_000,
           runs,

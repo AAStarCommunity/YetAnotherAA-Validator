@@ -197,6 +197,19 @@ export async function publicationStep({
   return nextSlow;
 }
 
+/**
+ * What the status written before this iteration's publication keeps from the last completed one
+ * (#413 review Low 2): its publication result, marked in progress, and its slowness. The interim
+ * status is then as healthy as the last completed iteration, so the heartbeat can judge recovery
+ * from it and an interim write never resets its unhealthy count.
+ */
+export function interimCarry(lastPub, slowNote, since) {
+  return {
+    publication: { ...(lastPub ?? {}), inProgress: true, since },
+    ...(slowNote ? { slowNote } : {}),
+  };
+}
+
 /** The lock port the watcher takes for this config (one process per host), shared with every tool
  * that must not run beside it (deploy/guardian-watcher/rearm-hold.mjs; Codex D-RPC2 R8 #3). */
 export function watcherLockPort(cfg, p = cfg.publish?.enabled ? publishConfig(cfg.publish) : null) {
@@ -290,8 +303,11 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
   const nowMs = now ?? Date.now();
   const started = new Date(nowMs).toISOString();
   // `carry`: fields kept from the previous status while this run has not replaced them yet (the
-  // last publication result, marked in progress: Codex W2c R1 M8).
-  const status = { at: started, ruleset: ident, lastError: null, ...(carry ?? {}) };
+  // last publication result, marked in progress: Codex W2c R1 M8), and the last completed
+  // iteration's slowness (`slowNote`), so this interim status is exactly as healthy as that
+  // iteration was (#413 review Low 2): it is a reason, never a status field
+  const { slowNote: carriedSlow, ...carryFields } = carry ?? {};
+  const status = { at: started, ruleset: ident, lastError: null, ...carryFields };
   let carried = []; // the reasons taken from the carried publication (replaced by publicationStep)
   // wall time of this tick and the archive it ran over, reported with every status
   const tickStart = Date.now();
@@ -331,6 +347,7 @@ export async function runOnce(chain, cfg, store, rs, ident, { now, second, carry
     // degradation (Codex W2c R18): a scan-only "healthy" must not read as recovered
     if (carry?.publication) {
       carried = publicationReasons(carry.publication);
+      if (typeof carriedSlow === "string") carried.push(carriedSlow);
       extra.push(...carried);
     }
     status.degraded = h.degraded || extra.length ? [...(h.degraded ?? []), ...extra] : null;
@@ -489,9 +506,7 @@ async function main() {
   let slowNote = null; // the last iteration was slower than maxTickFraction of the interval
   for (;;) {
     // The last publication result stays visible, marked in progress, until this pass replaces it.
-    const carry = pub
-      ? { publication: { ...(lastPub ?? {}), inProgress: true, since: new Date().toISOString() } }
-      : undefined;
+    const carry = pub ? interimCarry(lastPub, slowNote, new Date().toISOString()) : undefined;
     const iterStart = Date.now();
     const { status, carried } = await runOnce(chain, cfg, store, rs, ident, { second, carry });
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);

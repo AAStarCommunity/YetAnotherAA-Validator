@@ -388,6 +388,51 @@ try {
     );
   }
 
+  // #413 review Low 2: the interim status also carries the last completed iteration's slowness,
+  // so it is exactly as healthy as that iteration; the slowness is a reason, never a status field,
+  // and publicationStep replaces it with this iteration's own
+  {
+    const { interimCarry, publicationStep } = await import("./watcher.mjs");
+    const keep = store.getCursor();
+    const slow = "iteration slower than 30000 ms (maxTickFraction of the interval)";
+    const done = { at: "t0", ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } };
+    const carry = interimCarry(done, slow, "t1");
+    const interim = await runOnce(c.chain, cfg, store, rs, ident, { carry });
+    store.setCursor(keep);
+    const fast = await runOnce(c.chain, cfg, store, rs, ident, {
+      carry: interimCarry(done, null, "t1"),
+    });
+    store.setCursor(keep);
+    // the completed status replaces the carried slowness with this iteration's (fast: none)
+    let t = 0;
+    const finalSt = { ...interim.status };
+    await publicationStep({
+      status: finalSt,
+      run: async () => ({ ok: true, stalls: { feeCapped: 0, insufficientFunds: 0 } }),
+      slowNote: slow,
+      iterStart: 0,
+      cfg: { intervalMs: 60_000, maxTickFraction: 0.5 },
+      carried: interim.carried,
+      now: () => (t += 1),
+    });
+    cell(
+      "#413 Low 2: the interim status carries the last iteration's slowness (healthy false, no slowNote field); without it the same interim is healthy; the completed status drops the carried slowness",
+      carry.publication.inProgress === true &&
+        carry.publication.at === "t0" &&
+        interim.status.healthy === false &&
+        (interim.status.degraded ?? []).includes(slow) &&
+        !("slowNote" in interim.status) &&
+        fast.status.healthy === true &&
+        !(finalSt.degraded ?? []).includes(slow) &&
+        finalSt.healthy === true,
+      {
+        interim: [interim.status.healthy, interim.status.degraded],
+        fast: [fast.status.healthy, fast.status.degraded],
+        final: [finalSt.healthy, finalSt.degraded],
+      }
+    );
+  }
+
   // A cursor whose block no longer has the stored hash: stop, do not advance.
   {
     const keep = store.getCursor();
