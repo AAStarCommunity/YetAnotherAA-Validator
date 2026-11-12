@@ -214,11 +214,46 @@ export const LAST_ITERATION_DEGRADED =
 export function restoredCarry(saved) {
   return { lastPub: saved?.publication ?? null, lastHealthy: saved?.healthy === true };
 }
+/** What the next iteration carries from a COMPLETED one (#427 review Low): its publication result
+ * and whether the whole iteration was healthy; main() takes it after every completed iteration. */
+export function completedCarry(status) {
+  return { lastPub: status?.publication ?? null, lastHealthy: status?.healthy === true };
+}
 export function interimCarry(lastPub, lastHealthy, since) {
   return {
     publication: { ...(lastPub ?? {}), inProgress: true, since },
     lastCompletedHealthy: lastHealthy === true,
   };
+}
+
+/**
+ * One iteration of the resident loop (#427 review Low: main() only threads its result): the scan
+ * with the interim carry, then, when publishing, the publication step and the status write. Returns
+ * the completed status and the state the NEXT iteration carries (its health follows this iteration,
+ * never a value restored at start).
+ */
+export async function watchStep(
+  { carryState, slowNote },
+  { publishing, scan, publish, writeStatus, cfg, now = Date.now }
+) {
+  // The last publication result stays visible, marked in progress, until this pass replaces it.
+  const carry = publishing
+    ? interimCarry(carryState.lastPub, carryState.lastHealthy, new Date(now()).toISOString())
+    : undefined;
+  const iterStart = now();
+  const { status, carried } = await scan(carry);
+  if (!publishing) return { status, next: { carryState, slowNote } };
+  const nextSlow = await publicationStep({
+    status,
+    slowNote,
+    iterStart,
+    cfg,
+    carried,
+    run: publish,
+    now,
+  });
+  writeStatus(status);
+  return { status, next: { carryState: completedCarry(status), slowNote: nextSlow } };
 }
 
 /** The lock port the watcher takes for this config (one process per host), shared with every tool
@@ -514,29 +549,19 @@ async function main() {
   const once = process.argv.includes("--once");
   // the last saved status: its publication result and its health survive a restart (Codex info R1
   // #2: a slow or degraded iteration before the restart is not forgotten)
-  let { lastPub, lastHealthy } = restoredCarry(store.readStatus());
+  let loop = { carryState: restoredCarry(store.readStatus()), slowNote: null };
   let first = true;
-  let slowNote = null; // the last iteration was slower than maxTickFraction of the interval
   for (;;) {
-    // The last publication result stays visible, marked in progress, until this pass replaces it.
-    const carry = pub ? interimCarry(lastPub, lastHealthy, new Date().toISOString()) : undefined;
-    const iterStart = Date.now();
-    const { status, carried } = await runOnce(chain, cfg, store, rs, ident, { second, carry });
+    const { status, next } = await watchStep(loop, {
+      publishing: !!pub,
+      scan: carry => runOnce(chain, cfg, store, rs, ident, { second, carry }),
+      publish: degraded => publishPhase(store, chain, cfg, pub.p, pub.built, { degraded }),
+      writeStatus: st => store.writeStatus(st),
+      cfg,
+    });
+    loop = next;
     if (first && status.degraded) console.error(`WARNING: DEGRADED: ${status.degraded.join("; ")}`);
     first = false;
-    if (pub) {
-      slowNote = await publicationStep({
-        status,
-        slowNote,
-        iterStart,
-        cfg,
-        carried,
-        run: degraded => publishPhase(store, chain, cfg, pub.p, pub.built, { degraded }),
-      });
-      lastPub = status.publication;
-      lastHealthy = status.healthy === true;
-      store.writeStatus(status);
-    }
     console.log(JSON.stringify(status));
     if (once) process.exit(onceExitCode(status));
     await new Promise(r => setTimeout(r, cfg.intervalMs));
