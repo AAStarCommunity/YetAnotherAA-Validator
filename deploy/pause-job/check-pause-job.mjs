@@ -423,6 +423,31 @@ async function roundOn({ cap, balance, prior = null }) {
     deficit.sent.length === 1 && deficit.r.alerts.some(x => x.key === "deficit"),
     { sent: deficit.sent.length, a: deficit.r.alerts.map(x => x.key) }
   );
+  {
+    // a journalled PENDING tx mined between the reconcile and B: its fee is gone from the balance
+    // but not in the ledger yet; that is no deficit (Codex follow-up P2)
+    const w = ethers.Wallet.createRandom();
+    const st = emptyState({
+      chainId: 31337,
+      signer: w.address,
+      spProxy: A,
+      registry: B,
+      startBlock: 1,
+      cap: "10000000",
+    });
+    st.ledger.txs.push({ nonce: 0, status: "sent", reserve: "300000" });
+    st.ledger.reserved = "300000";
+    const g = fundingGate(st, 10000000n - 120000n); // the fee it actually paid
+    cell(
+      "fundingGate: a pending tx already mined (fee gone from the balance, not yet in the ledger) is no deficit",
+      g.deficit === null && g.inflow === null,
+      g
+    );
+    cell(
+      "fundingGate: a balance below even the pending allowance is a deficit",
+      fundingGate(st, 10000000n - 300001n).deficit?.key === "deficit"
+    );
+  }
   // an included tx with reservation 10 but a KNOWN cost far above it: a new send must not fit
   const H0 = `0x${"0c".repeat(32)}`;
   const big1 = await roundOn({
