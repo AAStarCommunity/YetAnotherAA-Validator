@@ -294,24 +294,11 @@ export function allBranchRulesetProblems(rulesets) {
     Array.isArray(r.bypass_actors) &&
     r.bypass_actors.length === 0 &&
     need.every(t => (r.rules ?? []).some(x => x?.type === t));
-  const problems = rulesets.some(covers)
+  return rulesets.some(covers)
     ? []
     : [
         "no active ruleset on all branches (~ALL, no exclusion, no bypass read and empty) restricting creation, deletion and force-pushes",
       ];
-  // a rule that refuses the watcher's own appends (an update restriction, a pull-request or status
-  // or signature requirement...) would let Phase D pass while every publication fails (#428
-  // re-review): an active branch ruleset may hold only these rule types
-  const allowed = new Set([...need, "required_linear_history"]);
-  const extra = rulesets
-    .filter(r => r?.enforcement === "active" && r?.target === "branch")
-    .flatMap(r => (r.rules ?? []).map(x => x?.type))
-    .filter(t => !allowed.has(t));
-  if (extra.length)
-    problems.push(
-      `an active branch ruleset also has ${[...new Set(extra)].map(t => String(t).slice(0, 40)).join(", ")}, which would refuse the watcher's appends`
-    );
-  return problems;
 }
 
 /**
@@ -349,4 +336,23 @@ export function flattenPages(stdout) {
   } catch {
     return null;
   }
+}
+
+/**
+ * The rules in force on the mirror branch from EVERY source (GitHub `rules/branches/<branch>`,
+ * organization rulesets included) allow the watcher's appends (#428 re-review; Codex Phase D R10):
+ * only creation, deletion, non_fast_forward and required_linear_history may apply. An update,
+ * pull-request, status-check or signature rule would refuse every real append while the no-op dry
+ * run passes. Rules scoped to other branches are not in this list, so they never count.
+ */
+export function appendBlockingProblems(branchRules) {
+  if (!Array.isArray(branchRules))
+    return ["the rules in force on the mirror branch could not be read"];
+  const allowed = new Set(["creation", "deletion", "non_fast_forward", "required_linear_history"]);
+  const extra = [...new Set(branchRules.map(x => x?.type).filter(t => !allowed.has(t)))];
+  return extra.length
+    ? [
+        `the mirror branch is also subject to ${extra.map(t => String(t).slice(0, 40)).join(", ")}, which would refuse the watcher's appends`,
+      ]
+    : [];
 }

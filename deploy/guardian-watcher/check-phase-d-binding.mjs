@@ -18,6 +18,7 @@ import {
   mirrorKeyProblems,
   mirrorIsolationProblems,
   allBranchRulesetProblems,
+  appendBlockingProblems,
   deployKeyProblems,
   flattenPages,
 } from "./phase-d-binding.mjs";
@@ -483,35 +484,14 @@ cell(
     bypassAbsent: [(({ bypass_actors: _b, ...r }) => r)(rs({}))],
     bypassNull: [rs({ bypass_actors: null })],
     noForce: [rs({ rules: [{ type: "creation" }, { type: "deletion" }] })],
-    // a rule that would refuse the watcher's appends (fails safe, but must not print PASS)
-    update: [
-      rs({
-        rules: [
-          { type: "creation" },
-          { type: "deletion" },
-          { type: "non_fast_forward" },
-          { type: "update" },
-        ],
-      }),
-    ],
     none: [],
     unread: null,
   };
   results.push({
     name: "Codex Phase D R5 mirror-ruleset: an active ~ALL ruleset (no exclusion, no bypass) with creation, deletion and non_fast_forward passes; one-branch, excluded, bypass, evaluate-only, missing rule, tag target, none or unreadable fail",
     ok:
-      allBranchRulesetProblems([
-        rs({}),
-        rs({ target: "tag", rules: [{ type: "update" }] }),
-        rs({
-          rules: [
-            { type: "creation" },
-            { type: "deletion" },
-            { type: "non_fast_forward" },
-            { type: "required_linear_history" },
-          ],
-        }),
-      ]).length === 0 &&
+      allBranchRulesetProblems([rs({}), rs({ target: "tag", rules: [{ type: "update" }] })])
+        .length === 0 &&
       Object.values(rsCases).every(c => allBranchRulesetProblems(c).length === 1),
     got: {
       pass: allBranchRulesetProblems([rs({})]),
@@ -570,6 +550,25 @@ cell(
       flattenPages("not json") === null &&
       deployKeyProblems(PUB, page1).length === 1,
     got: { n: pages?.length, last: pages?.[30] },
+  });
+  // #428 re-review / Codex Phase D R10: the rules in force on the mirror branch (any source)
+  const ok3 = [{ type: "creation" }, { type: "deletion" }, { type: "non_fast_forward" }];
+  const ab = {
+    pass: appendBlockingProblems([...ok3, { type: "required_linear_history" }]),
+    orgSigned: appendBlockingProblems([...ok3, { type: "required_signatures" }]),
+    update: appendBlockingProblems([...ok3, { type: "update" }]),
+    pr: appendBlockingProblems([...ok3, { type: "pull_request" }]),
+    unread: appendBlockingProblems(null),
+  };
+  results.push({
+    name: "Codex Phase D R10: the mirror branch's rules from every source may only restrict creation, deletion, force-push (and linear history); a signature, update or pull-request rule in force, or unreadable rules, fail",
+    ok:
+      ab.pass.length === 0 &&
+      /required_signatures/.test(ab.orgSigned.join()) &&
+      /update/.test(ab.update.join()) &&
+      /pull_request/.test(ab.pr.join()) &&
+      ab.unread.length === 1,
+    got: ab,
   });
   const B = "disclosure-records";
   const iso = o =>

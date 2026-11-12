@@ -34,6 +34,7 @@ import {
   publishBindingProblems,
   mirrorKeyProblems,
   allBranchRulesetProblems,
+  appendBlockingProblems,
   mirrorIsolationProblems,
   deployKeyProblems,
   flattenPages,
@@ -307,7 +308,12 @@ function ghPages(path) {
             Number.isSafeInteger(r?.id) ? ghJson(`repos/${repo[1]}/rulesets/${r.id}`) : null
           )
         : null;
-      const rp = allBranchRulesetProblems(full && full.every(Boolean) ? full : null);
+      // and nothing in force on the mirror branch, from any source (organization rulesets
+      // included), refuses the watcher's appends (#428 re-review; Codex Phase D R10)
+      const rp = [
+        ...allBranchRulesetProblems(full && full.every(Boolean) ? full : null),
+        ...appendBlockingProblems(ghPages(`repos/${repo[1]}/rules/branches/${branch}`)),
+      ];
       add(
         "mirror-ruleset",
         rp.length ? "FAIL" : "PASS",
