@@ -138,7 +138,8 @@ DSR. That is a process rule. What bounds the job's spending in code is the
 anyone can send the public address 1 wei before `--init`, and refusing would be
 the N1 kill switch at setup time. Our own overfunding is caught earlier: DSR
 reads the funding transaction (value equal to the cap, from the approved funder)
-before `--init`.
+before `--init`. The `--init` note goes to stderr only; the first round's
+funding check raises the same `inflow` through the normal alert path.
 
 A balance above what the ledger explains (`cap - spent - included costs`) raises
 an **`inflow`** alert, and **sending continues**. It is never a halt. A halt

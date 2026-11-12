@@ -1020,17 +1020,48 @@ await section(async () => {
     underfunded.code !== 0 && /less than the cap/.test(underfunded.out),
     underfunded
   );
-  // cap + 1 wei: anyone can dust the public address before --init; init must still succeed (DSR
-  // ruling on 9d14dfc4: refusing would be the N1 kill switch at setup time), with an inflow note
-  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 17n + 1n)]);
+  // the normal case: EXACTLY the cap (clestons #433 Low 1: `<` -> `<=` must turn a cell red)
+  await p.send("anvil_setBalance", [w.address, ethers.toQuantity(10n ** 17n)]);
   const init = cli(["--init"]);
   cell(
-    "CLI: --init with cap + 1 wei succeeds and reports the inflow",
-    init.code === 0 &&
-      /state created/.test(init.out) &&
-      /ALERT inflow: the signer holds 1 wei more than the cap/.test(init.out),
+    "CLI: --init with exactly the cap succeeds, with no inflow note",
+    init.code === 0 && /state created/.test(init.out) && !/ALERT inflow/.test(init.out),
     init
   );
+  {
+    // cap + 1 wei, in a separate state directory with its own signer: anyone can dust the public
+    // address before --init; init must still succeed (DSR ruling on 9d14dfc4: refusing would be
+    // the N1 kill switch at setup time), with an inflow note
+    const home2 = join(work, "cli-dusted");
+    mkdirSync(join(home2, "state"), { recursive: true, mode: 0o700 });
+    chmodSync(join(home2, "state"), 0o700);
+    const w2 = ethers.Wallet.createRandom();
+    writeFileSync(join(home2, "keystore"), await w2.encrypt(pw), { mode: 0o600 });
+    const cfg2 = {
+      ...cfg,
+      stateDir: join(home2, "state"),
+      keystore: join(home2, "keystore"),
+      lockPort: cfg.lockPort + 1,
+    };
+    writeFileSync(join(home2, "config.json"), JSON.stringify(cfg2));
+    await p.send("anvil_setBalance", [w2.address, ethers.toQuantity(10n ** 17n + 1n)]);
+    const r2 = spawnSync(
+      "node",
+      [join(HERE, "pause-job.mjs"), "--config", join(home2, "config.json"), "--init"],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+    const out2 = `${r2.stdout ?? ""}${r2.stderr ?? ""}`;
+    cell(
+      "CLI: --init with cap + 1 wei succeeds and reports the inflow",
+      r2.status === 0 &&
+        /state created/.test(out2) &&
+        /ALERT inflow: the signer holds 1 wei more than the cap/.test(out2),
+      { code: r2.status, out2 }
+    );
+  }
   const run = cli([]);
   const status = JSON.parse(readFileSync(join(home, "state/status.json"), "utf8"));
   cell(
