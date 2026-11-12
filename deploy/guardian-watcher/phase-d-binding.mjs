@@ -312,7 +312,7 @@ export function deployKeyProblems(pub, keys) {
       .slice(0, 2)
       .join(" ");
   const mine = body(pub);
-  if (!/^ssh-[a-z0-9-]+ [A-Za-z0-9+/=]+$/.test(mine))
+  if (!/^[a-z0-9][a-z0-9@.-]* [A-Za-z0-9+/=]+$/.test(mine))
     return ["the key file's public key could not be read"];
   if (!Array.isArray(keys)) return ["the repository's deploy keys could not be listed"];
   const match = keys.filter(k => body(k?.key) === mine);

@@ -504,11 +504,20 @@ cell(
     notListed: deployKeyProblems(PUB, [{ key: "ssh-ed25519 AAAAOTHER", read_only: false }]),
     noPub: deployKeyProblems("", [{ key: PUB, read_only: false }]),
     unread: deployKeyProblems(PUB, null),
+    // Codex Phase D R7: every OpenSSH key type, not only ssh-* (ECDSA, security keys)
+    ecdsa: deployKeyProblems("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=", [
+      { key: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=", read_only: false },
+    ]),
+    sk: deployKeyProblems("sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaA==", [
+      { key: "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaA==", read_only: false },
+    ]),
   };
   results.push({
     name: "#428 M2 mirror-deploy-key: passes only when the key file's public key is a write deploy key of the mirror repository; read-only, not listed, unreadable key or list fail",
     ok:
       dk.pass.length === 0 &&
+      dk.ecdsa.length === 0 &&
+      dk.sk.length === 0 &&
       /no write access/.test(dk.readOnly.join()) &&
       /not a deploy key/.test(dk.notListed.join()) &&
       dk.noPub.length === 1 &&
