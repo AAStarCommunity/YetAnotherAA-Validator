@@ -133,8 +133,12 @@ DSR. That is a process rule. What bounds the job's spending in code is the
 - after any overrun, the job stops sending;
 - an included OP cost that cannot yet be read blocks sending until it is read.
 
-`--init` refuses a signer that does not hold **exactly** the cap: more would be
-an unapproved top-up, and less would raise a `deficit` alert every round.
+`--init` refuses a signer holding **less** than the cap (it would raise a
+`deficit` alert every round). It accepts more, with an `inflow` note, because
+anyone can send the public address 1 wei before `--init`, and refusing would be
+the N1 kill switch at setup time. Our own overfunding is caught earlier: DSR
+reads the funding transaction (value equal to the cap, from the approved funder)
+before `--init`.
 
 A balance above what the ledger explains (`cap - spent - included costs`) raises
 an **`inflow`** alert, and **sending continues**. It is never a halt. A halt
