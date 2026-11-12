@@ -26,6 +26,8 @@ import { SinkError, guarded } from "./errors.mjs";
 import { join, posix } from "node:path";
 
 function gitRaw(cwd, args, { input, env } = {}) {
+  // the subcommand names the error, not a leading "-c k=v" (#428 review Low)
+  const sub = args.find((a, i) => a !== "-c" && args[i - 1] !== "-c") ?? "git";
   return new Promise((res, rej) => {
     const p = spawn("git", ["-C", cwd, ...args], {
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
@@ -42,7 +44,7 @@ function gitRaw(cwd, args, { input, env } = {}) {
     p.stderr.on("data", d => err.length < 64 && err.push(d));
     p.on("error", e => {
       clearTimeout(t);
-      rej(new SinkError(`git ${args[0]}: spawn failed`));
+      rej(new SinkError(`git ${sub}: spawn failed`));
     });
     p.on("close", code => {
       clearTimeout(t);
@@ -63,7 +65,7 @@ function gitRaw(cwd, args, { input, env } = {}) {
             : /\[remote rejected\]|\[rejected\]|failed to push|pre-receive hook declined/i.test(se)
               ? "push rejected by the remote"
               : `exit ${Number.isInteger(code) ? code : "signal"}`;
-      rej(new SinkError(`git ${args[0]}: ${cat}`));
+      rej(new SinkError(`git ${sub}: ${cat}`));
     });
     p.stdin.end(input ?? undefined);
   });
@@ -124,9 +126,8 @@ export function gitMirror({
   // every git call of this sink, fetches and pushes alike, uses only the key file (when given;
   // production always gives one: lib/sinks-config.mjs requires it)
   const sshEnv = sshKey ? { GIT_SSH_COMMAND: mirrorSshCommand(sshKey) } : {};
-  // with a key, only the ssh transport (Codex Phase D R1 #2): defence in depth behind remoteBound
-  // (which already requires the GitHub SSH remote, after any insteadOf rewrite); not load-bearing
-  // on its own
+  // with a key, only the ssh transport (Codex Phase D R1 #2). Load-bearing (#428 review Low): a
+  // `remote.<name>.vcs` helper is used whatever get-url prints, and only this rule stops it
   const sshOnly = sshKey ? ["-c", "protocol.allow=never", "-c", "protocol.ssh.allow=always"] : [];
   // the key file must be there before any keyed call (a clear refusal instead of an ssh failure)
   const keyThere = () => {
@@ -153,10 +154,7 @@ export function gitMirror({
       (await text(clone, ["remote", "get-url", "--all", ...extra, remote]))
         .split("\n")
         .filter(Boolean);
-    const ok = [await all([]), await all(["--push"])].every(
-      u => u.length === 1 && isExpectedMirrorRemote(u[0], repoUrl)
-    );
-    if (!ok)
+    if (remoteUrlProblems(await all([]), await all(["--push"]), repoUrl).length)
       throw new SinkError("mirror: the clone's remote is not the GitHub SSH remote of repoUrl");
   };
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
@@ -240,6 +238,10 @@ export function gitMirror({
       rmSync(tmp, { recursive: true, force: true });
     }
     if (beforePush) await beforePush();
+    // again right before the push (#428 review Low): the destination is resolved anew by git, so a
+    // config change while the commit was built is refused, not followed. A change in the instant
+    // between this check and git's own read needs local control of the account (M0 §5.5a item 1)
+    await remoteBound();
     // Fast-forward only, and only from the tip we built on (lease), never forced.
     await git(clone, [
       "push",
@@ -281,6 +283,23 @@ export function expectedMirrorRemotes(repoUrl) {
   if (!m) return null;
   const path = `${m[1]}/${m[2]}`.toLowerCase();
   return [`git@github.com:${path}.git`, `ssh://git@github.com/${path}.git`];
+}
+/**
+ * The mirror clone's remote, as `get-url --all` (fetch) and `get-url --all --push` print it: exactly
+ * one URL each, both the GitHub SSH remote of repoUrl (Codex Phase D R2/R3; shared by the sink and
+ * Phase D). Returns the problems, in fixed wording.
+ */
+export function remoteUrlProblems(fetchUrls, pushUrls, repoUrl) {
+  const problems = [];
+  for (const [n, u] of [
+    ["fetch", fetchUrls],
+    ["push", pushUrls],
+  ]) {
+    if (!Array.isArray(u) || u.length !== 1) problems.push(`not exactly one ${n} URL`);
+    else if (!isExpectedMirrorRemote(u[0], repoUrl))
+      problems.push(`the ${n} URL is not the GitHub SSH remote of repoUrl`);
+  }
+  return problems;
 }
 export const isExpectedMirrorRemote = (url, repoUrl) =>
   !!expectedMirrorRemotes(repoUrl)?.includes(

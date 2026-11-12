@@ -18,6 +18,7 @@ import {
   mirrorKeyProblems,
   mirrorIsolationProblems,
   allBranchRulesetProblems,
+  deployKeyProblems,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -491,6 +492,28 @@ cell(
         Object.entries(rsCases).map(([k, v]) => [k, allBranchRulesetProblems(v)])
       ),
     },
+  });
+  // #428 review M2: the key must be the mirror repository's write deploy key
+  const PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0wmN/Cr3JXqmLW7u+g9pTh+wyqDHpSQEIQczXkVx9q";
+  const dk = {
+    pass: deployKeyProblems(`${PUB} aoa-watcher mirror\n`, [
+      { key: "ssh-ed25519 AAAAOTHER", read_only: false },
+      { key: PUB, read_only: false },
+    ]),
+    readOnly: deployKeyProblems(PUB, [{ key: PUB, read_only: true }]),
+    notListed: deployKeyProblems(PUB, [{ key: "ssh-ed25519 AAAAOTHER", read_only: false }]),
+    noPub: deployKeyProblems("", [{ key: PUB, read_only: false }]),
+    unread: deployKeyProblems(PUB, null),
+  };
+  results.push({
+    name: "#428 M2 mirror-deploy-key: passes only when the key file's public key is a write deploy key of the mirror repository; read-only, not listed, unreadable key or list fail",
+    ok:
+      dk.pass.length === 0 &&
+      /no write access/.test(dk.readOnly.join()) &&
+      /not a deploy key/.test(dk.notListed.join()) &&
+      dk.noPub.length === 1 &&
+      dk.unread.length === 1,
+    got: dk,
   });
   const B = "disclosure-records";
   const iso = o =>

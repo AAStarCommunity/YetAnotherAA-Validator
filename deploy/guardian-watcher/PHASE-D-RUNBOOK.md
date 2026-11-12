@@ -105,11 +105,11 @@ Its **deploy key** is a key file, not the ssh-agent: a launchd job started after
 a reboot without a login has no agent. The file lies inside the same trust
 boundary as the Keychain (M0 §5.5a: the Mini's operator is not defended
 against). What a leaked key can do: write to the mirror repository only. The
-ruleset below keeps every branch's history (no force-push, no deletion) and
-allows no new branch; a new commit can still change or delete record files in
-the branch's latest tree, so a record is judged by the registry's `recordHash`
-and its IPFS CID, never by the mirror alone. This repository and its secrets are
-outside the key's reach.
+rulesets below keep every branch's history (no force-push, no deletion) and
+allow no new branch or tag; a new commit can still change or delete record files
+in the branch's latest tree, so a record is judged by the registry's
+`recordHash` and its IPFS CID, never by the mirror alone. This repository and
+its secrets are outside the key's reach.
 
 1. **The repository** (an organization admin; the name is yours, the commands
    use `aoa-disclosure-records`):
@@ -127,10 +127,12 @@ outside the key's reach.
    ssh-keygen -t ed25519 -N "" -C "aoa-watcher mirror $(id -un)@$(hostname -s)" -f ~/.aoa-watcher/mirror_deploy_key
    chmod 600 ~/.aoa-watcher/mirror_deploy_key
    cat ~/.aoa-watcher/mirror_deploy_key.pub        # public: the deploy key below
-   ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
-   ssh-keygen -lf ~/.ssh/known_hosts | grep github.com
-   # compare the SHA256 fingerprint with GitHub's published one before going on:
+   ssh-keyscan -t ed25519 github.com > ~/.aoa-watcher/github-host-key
+   ssh-keygen -lf ~/.aoa-watcher/github-host-key
+   # compare that SHA256 fingerprint with GitHub's published one:
    # https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+   # only if it matches (otherwise delete the file and stop):
+   cat ~/.aoa-watcher/github-host-key >> ~/.ssh/known_hosts && rm ~/.aoa-watcher/github-host-key
    ```
 
 3. **The deploy key, on the mirror repository only:** its Settings → Deploy keys
@@ -144,7 +146,8 @@ outside the key's reach.
    export GIT_SSH_COMMAND="ssh -F /dev/null -o IdentityFile=$HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
    git clone --bare git@github.com:$R.git ~/.aoa-watcher/mirror.git     # an empty repository: a warning is expected
    M=~/.aoa-watcher/mirror.git
-   ROOT=$(git -C $M commit-tree $(git -C $M hash-object -t tree -w /dev/null) -m "disclosure records")
+   ROOT=$(git -C $M -c user.name=aoa-watcher -c user.email=aoa-watcher@localhost \
+     commit-tree $(git -C $M hash-object -t tree -w /dev/null) -m "disclosure records")
    git -C $M push origin "$ROOT:refs/heads/disclosure-records"
    git -C $M fetch origin disclosure-records
    unset GIT_SSH_COMMAND
@@ -154,12 +157,15 @@ outside the key's reach.
    mirror repository's Settings → Rules → Rulesets → New branch ruleset, target
    **All branches**, enforcement **Active**, rules **Restrict creations**,
    **Restrict deletions** and **Block force pushes**, no pull-request
-   requirement, no bypass list.
+   requirement, no bypass list. And a tag ruleset: target **All tags**, Active,
+   **Restrict creations**, **Restrict updates**, **Restrict deletions**, no
+   bypass list (the mirror uses no tags; Phase D does not check this one).
 
 In `config.json`: `publish.mirror.repoUrl` is
 `https://github.com/<the mirror repository>` and `publish.mirror.sshKey` the key
 file's absolute path (`/Users/<you>/.aoa-watcher/mirror_deploy_key`). Phase D
-checks the key file (`mirror-key`), a dry-run push with it (`mirror-push`), the
+checks the key file (`mirror-key`), a dry-run push with it (`mirror-push`), that
+it is the mirror repository's write deploy key (`mirror-deploy-key`), the
 ruleset (`mirror-ruleset`) and the repository's isolation
 (`mirror-repo-isolation`: Actions off, no secrets, one branch; listing secrets
 needs the repository admin's `gh`, so run Phase D as that admin).
@@ -270,6 +276,7 @@ line:
 | `onchain:binding` and the on-chain facts                  | the contracts equal the watcher config; `aggregator.DVT_VALIDATOR == dvtValidator`, `categoryCount == 0`, `fraudProofVerifier == 0`, owner is the Safe                                                                                                                               |
 | `mirror-key`                                              | `publish.mirror.sshKey` is a regular file (not a symlink), mode 600, owned by this account, and loads without a passphrase                                                                                                                                                           |
 | `mirror-push`                                             | with that key only (no agent), `ls-remote` finds the branch and a dry-run push of its own tip is accepted (the key may write)                                                                                                                                                        |
+| `mirror-deploy-key`                                       | the key file's public key is a deploy key of the mirror repository with write access (`gh api repos/<r>/keys`), not some other key that can write                                                                                                                                    |
 | `mirror-ruleset`                                          | an active repository ruleset on **all** branches (`~ALL`, no exclusion, no bypass actor) restricts creation, deletion and force-pushes                                                                                                                                               |
 | `mirror-repo-isolation`                                   | the mirror repository has Actions disabled, no Actions secrets, and exactly one branch (needs the repository admin's `gh`)                                                                                                                                                           |
 | `release:spCommit`, `evidence:spParity`, `evidence:a3`    | the release commit is set and both evidence reports pass for it                                                                                                                                                                                                                      |

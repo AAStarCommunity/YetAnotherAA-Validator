@@ -1563,7 +1563,7 @@ try {
     }
   }
   cell(
-    "DSR mirror key: the mirror's git calls run ssh with only the key file (-i, IdentitiesOnly, no agent, batch, strict host key); non-plain key paths are refused",
+    "DSR mirror key: the mirror's git calls run ssh with only the key file (IdentityFile, no ssh config, IdentitiesOnly, no agent, batch, strict host key); non-plain key paths are refused",
     argv.includes("-F /dev/null") &&
       argv.includes(`-o IdentityFile=${key}`) &&
       !/(^| )-i /.test(argv) &&
@@ -1690,6 +1690,143 @@ try {
       !match.other &&
       match.noRepo === null,
     { control, localErr, extraErr, match }
+  );
+  rmSync(d, { recursive: true, force: true });
+}
+
+// ---- #428 review Lows: an end-to-end keyed publication through a local "GitHub" (a fake ssh that
+// runs git's own upload/receive-pack in a directory); a pushurl changed while the commit is built is
+// refused before the push; a remote.<name>.vcs helper never runs; a key path that is a directory is
+// refused; remoteUrlProblems requires exactly one URL each way
+{
+  const { remoteUrlProblems } = await import("./sinks/git-mirror.mjs");
+  const d = mkdtempSync(join(tmpdir(), "mirror-e2e-"));
+  const bin = join(d, "bin");
+  mkdirSync(bin);
+  const gh = join(d, "gh");
+  mkdirSync(join(gh, "o"), { recursive: true });
+  const up = join(gh, "o", "r.git");
+  execFileSync("git", ["init", "-q", "--bare", up]);
+  const empty = execFileSync("git", ["-C", up, "hash-object", "-t", "tree", "-w", "/dev/null"])
+    .toString()
+    .trim();
+  const root = execFileSync("git", [
+    "-C",
+    up,
+    "-c",
+    "user.name=t",
+    "-c",
+    "user.email=t@t",
+    "commit-tree",
+    empty,
+    "-m",
+    "r",
+  ])
+    .toString()
+    .trim();
+  execFileSync("git", ["-C", up, "update-ref", "refs/heads/disclosure-records", root]);
+  const hosts = join(d, "hosts.log");
+  // the last argument is the remote command (git-upload-pack 'o/r.git'); the host is logged
+  writeFileSync(
+    join(bin, "ssh"),
+    `#!/bin/sh\nfor a; do last="$a"; done\nfor a; do case "$a" in *@*) echo "$a" >> ${hosts};; esac; done\ncd ${gh} && eval "$last"\n`,
+    { mode: 0o755 }
+  );
+  const vcsLog = join(d, "vcs.log");
+  writeFileSync(join(bin, "git-remote-foo"), `#!/bin/sh\necho ran >> ${vcsLog}\nexit 1\n`, {
+    mode: 0o755,
+  });
+  const key = join(d, "deploy_key");
+  writeFileSync(key, "x\n", { mode: 0o600 });
+  const mk = (extra = []) => {
+    const c = mkdtempSync(join(d, "c-"));
+    execFileSync("git", ["init", "-q", "--bare", c]);
+    execFileSync("git", ["-C", c, "remote", "add", "origin", "git@github.com:o/r.git"]);
+    for (const [k, v] of extra) execFileSync("git", ["-C", c, "config", "--add", k, v]);
+    return c;
+  };
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  let n = 0;
+  const run = async (clone, o = {}) => {
+    try {
+      const r = await gitMirror({
+        clone,
+        repoUrl: "https://github.com/o/r",
+        sshKey: key,
+        ...o,
+      }).commit(`records/bls/e2e-${(n += 1)}.json`, Buffer.from("{}"), "e2e");
+      return r?.commit ? "ok" : "no commit";
+    } catch (e) {
+      return e.message;
+    }
+  };
+  let ok, redirected, vcs, dirKey;
+  try {
+    ok = await run(mk());
+    const c2 = mk();
+    redirected = await run(c2, {
+      beforePush: async () => {
+        execFileSync("git", [
+          "-C",
+          c2,
+          "config",
+          "remote.origin.pushurl",
+          "git@other.example:o/r.git",
+        ]);
+      },
+    });
+    vcs = await run(mk([["remote.origin.vcs", "foo"]]));
+    const dk = join(d, "keydir");
+    mkdirSync(dk);
+    dirKey = await run(mk(), { sshKey: dk });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+  let hostsSeen = "";
+  try {
+    hostsSeen = readFileSync(hosts, "utf8");
+  } catch {
+    hostsSeen = "";
+  }
+  let vcsRan = true;
+  try {
+    readFileSync(vcsLog, "utf8");
+  } catch {
+    vcsRan = false;
+  }
+  const urls = {
+    one: remoteUrlProblems(
+      ["git@github.com:o/r.git"],
+      ["git@github.com:o/r.git"],
+      "https://github.com/o/r"
+    ),
+    twoPush: remoteUrlProblems(
+      ["git@github.com:o/r.git"],
+      ["git@github.com:o/r.git", "git@github.com:o/r.git"],
+      "https://github.com/o/r"
+    ),
+    noFetch: remoteUrlProblems([], ["git@github.com:o/r.git"], "https://github.com/o/r"),
+    other: remoteUrlProblems(
+      ["git@github.com:o/r.git"],
+      ["git@x.example:o/r.git"],
+      "https://github.com/o/r"
+    ),
+  };
+  cell(
+    "#428 Lows: a keyed publication reaches a local GitHub end to end; a pushurl changed while building is refused before the push (never reaches the other host); a remote vcs helper never runs; a key path that is a directory is refused; exactly one fetch and one push URL",
+    ok === "ok" &&
+      /remote is not the GitHub SSH remote/.test(redirected ?? "") &&
+      !hostsSeen.includes("other.example") &&
+      typeof vcs === "string" &&
+      vcs !== "ok" &&
+      vcsRan === false &&
+      /deploy key file is missing/.test(dirKey ?? "") &&
+      urls.one.length === 0 &&
+      urls.twoPush.length === 1 &&
+      urls.noFetch.length === 1 &&
+      urls.other.length === 1,
+    { ok, redirected, hostsSeen, vcs, vcsRan, dirKey, urls }
   );
   rmSync(d, { recursive: true, force: true });
 }

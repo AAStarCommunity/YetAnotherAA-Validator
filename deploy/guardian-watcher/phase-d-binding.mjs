@@ -297,3 +297,26 @@ export function allBranchRulesetProblems(rulesets) {
         "no active ruleset on all branches (~ALL, no exclusion, no bypass) restricting creation, deletion and force-pushes",
       ];
 }
+
+/**
+ * The key file is a WRITE deploy key of the mirror repository (#428 review M2): its public key
+ * (`ssh-keygen -y -f <key>`) equals one of the repository's deploy keys (`repos/<r>/keys`) with
+ * read_only false. A personal key with write access would pass mirror-push but is not confined to
+ * the mirror repository. Keys compare on type and base64 body (comments ignored).
+ */
+export function deployKeyProblems(pub, keys) {
+  const body = k =>
+    String(k ?? "")
+      .trim()
+      .split(/\s+/)
+      .slice(0, 2)
+      .join(" ");
+  const mine = body(pub);
+  if (!/^ssh-[a-z0-9-]+ [A-Za-z0-9+/=]+$/.test(mine))
+    return ["the key file's public key could not be read"];
+  if (!Array.isArray(keys)) return ["the repository's deploy keys could not be listed"];
+  const match = keys.filter(k => body(k?.key) === mine);
+  if (!match.length) return ["the key file is not a deploy key of the mirror repository"];
+  if (!match.some(k => k?.read_only === false)) return ["the deploy key has no write access"];
+  return [];
+}

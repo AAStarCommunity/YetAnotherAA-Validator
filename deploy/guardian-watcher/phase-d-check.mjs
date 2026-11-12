@@ -35,6 +35,7 @@ import {
   mirrorKeyProblems,
   allBranchRulesetProblems,
   mirrorIsolationProblems,
+  deployKeyProblems,
 } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -156,7 +157,13 @@ else {
   const m = wcfg?.publish?.mirror;
   const branch = m?.branch ?? "disclosure-records";
   if (!wcfg)
-    for (const id of ["mirror-key", "mirror-push", "mirror-ruleset", "mirror-repo-isolation"])
+    for (const id of [
+      "mirror-key",
+      "mirror-push",
+      "mirror-deploy-key",
+      "mirror-ruleset",
+      "mirror-repo-isolation",
+    ])
       add(id, "MISSING", "needs the watcher config");
   else if (placeholder(m?.sshKey)) {
     add("mirror-key", "MISSING", "publish.mirror.sshKey not set");
@@ -184,9 +191,7 @@ else {
     else if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
       add("mirror-push", "FAIL", "publish.mirror.branch is not a plain branch name");
     else {
-      const { mirrorSshCommand, isExpectedMirrorRemote } = await import(
-        join(W, "sinks/git-mirror.mjs")
-      );
+      const { mirrorSshCommand, remoteUrlProblems } = await import(join(W, "sinks/git-mirror.mjs"));
       const env = {
         ...process.env,
         GIT_TERMINAL_PROMPT: "0",
@@ -206,9 +211,7 @@ else {
         const r = run(["remote", "get-url", "--all", ...a, "origin"]);
         return r.status === 0 ? String(r.stdout).split("\n").filter(Boolean) : [];
       };
-      const bound = [urls([]), urls(["--push"])].every(
-        u => u.length === 1 && isExpectedMirrorRemote(u[0], m.repoUrl)
-      );
+      const bound = remoteUrlProblems(urls([]), urls(["--push"]), m.repoUrl).length === 0;
       const ls = bound ? run(["ls-remote", "--heads", "origin", `refs/heads/${branch}`]) : null;
       const tip = ls?.status === 0 ? String(ls.stdout).split(/\s/)[0] : "";
       if (!ls)
@@ -253,11 +256,41 @@ else {
     if (!repo) {
       add("mirror-ruleset", "MISSING", "publish.mirror.repoUrl not set");
       add("mirror-repo-isolation", "MISSING", "publish.mirror.repoUrl not set");
+      add("mirror-deploy-key", "MISSING", "publish.mirror.repoUrl not set");
     } else {
+      // the key is this repository's write deploy key, not some other key with write access
+      // (#428 review M2); only its PUBLIC half is read, and nothing is printed
+      if (placeholder(m?.sshKey))
+        add("mirror-deploy-key", "MISSING", "publish.mirror.sshKey not set");
+      else {
+        const y = spawnSync("ssh-keygen", ["-y", "-P", "", "-f", m.sshKey], {
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        const k = spawnSync("gh", ["api", "--hostname", "github.com", `repos/${repo[1]}/keys`], {
+          encoding: "utf8",
+          timeout: 30_000,
+        });
+        let keys = null;
+        try {
+          keys = k.status === 0 ? JSON.parse(k.stdout) : null;
+        } catch {
+          keys = null;
+        }
+        const dp = deployKeyProblems(y.status === 0 ? y.stdout : "", keys);
+        add(
+          "mirror-deploy-key",
+          dp.length ? "FAIL" : "PASS",
+          dp.length ? dp.join("; ") : "the key file is the mirror repository's write deploy key"
+        );
+      }
       // every branch protected, not only the mirror's (Codex Phase D R5): each repository ruleset
       // is read in full (conditions, bypass actors, rules)
       const ghJson = path => {
-        const x = spawnSync("gh", ["api", path], { encoding: "utf8", timeout: 30_000 });
+        const x = spawnSync("gh", ["api", "--hostname", "github.com", path], {
+          encoding: "utf8",
+          timeout: 30_000,
+        });
         if (x.status !== 0) return null;
         try {
           return JSON.parse(x.stdout);
@@ -282,7 +315,7 @@ else {
       // the mirror's repository holds nothing a leaked key could reach beyond the records (DSR):
       // Actions off, no secrets, one branch. Listing secrets needs the repository admin's gh.
       const gh = path => {
-        const x = spawnSync("gh", ["api", "--paginate", path], {
+        const x = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", path], {
           encoding: "utf8",
           timeout: 30_000,
         });
