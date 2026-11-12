@@ -351,7 +351,7 @@ async function markIncluded(st, chain, t, r) {
 }
 
 /** The receipt of any hash ever signed for `t`'s nonce, or null. */
-async function receiptOf(chain, t) {
+export async function receiptOf(chain, t) {
   const ours = new Set(t.hashes.map(lc));
   for (const h of t.hashes) {
     const r = await chain.receipt(h);

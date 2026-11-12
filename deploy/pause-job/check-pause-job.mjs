@@ -18,6 +18,7 @@ import {
   provisionalCost,
   fundingGate,
   unknownCostAlert,
+  receiptOf,
   PIN,
   spIface,
 } from "./lib/core.mjs";
@@ -102,6 +103,32 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
   }
   cell("costOf on OP without the oracle fees refuses (fail closed)", threw);
 }
+// ---- receipts are believed only for our own hashes with a plausible gasUsed (clestons L2)
+{
+  const t = { hashes: ["0xAA"], gasLimit: "1000" };
+  const mk = r => ({ receipt: async () => r });
+  const throws = async c => {
+    try {
+      await receiptOf(c, t);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  cell(
+    "receiptOf: a receipt naming another transaction is refused",
+    await throws(mk({ transactionHash: "0xbb", gasUsed: "10" }))
+  );
+  cell(
+    "receiptOf: gasUsed 0 or above gasLimit is refused",
+    (await throws(mk({ transactionHash: "0xaa", gasUsed: "0" }))) &&
+      (await throws(mk({ transactionHash: "0xaa", gasUsed: "1001" })))
+  );
+  cell(
+    "receiptOf: our hash (any case) with a plausible gasUsed is accepted",
+    (await receiptOf(mk({ transactionHash: "0xaa", gasUsed: "10" }), t))?.gasUsed === "10"
+  );
+}
 // ---- the provisional (included, not final) cost on OP includes the oracle's fees (Codex R9 P2)
 {
   const w = ethers.Wallet.createRandom();
@@ -168,7 +195,13 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     const inc = cost => ({ nonce: 0, status: "included", reserve: "10", includedCost: cost });
     cell(
       "fundingGate: an included cost still unknown refuses every broadcast",
-      fundingGate(led([inc(null)]), 0n)?.key === "cost-unknown"
+      (() => {
+        try {
+          return fundingGate(led([inc(null)]), 0n)?.key === "cost-unknown";
+        } catch {
+          return false;
+        }
+      })()
     );
     cell(
       "fundingGate: cap 100, included cost 15 (above its reservation 10), top-up 3: balance 88 > 85 refuses (Codex R10 example)",
