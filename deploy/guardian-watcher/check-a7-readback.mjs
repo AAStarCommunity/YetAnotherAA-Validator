@@ -23,6 +23,7 @@ import {
   fieldInventory,
   checkInventory,
   EXAMPLE_SHA256,
+  abiGapUnverified,
 } from "./a7-readback.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1260,6 +1261,109 @@ await mut(
     "R17: a response string 'https:host/x' never reaches the record",
     failed(r).includes("contracts.superPaymaster.version") && !/SYNTHETIC_R17_SECRET/.test(out),
     out.slice(0, 300)
+  );
+}
+
+// ---- retired DisclosureRegistry (DSR 009967e4; SP and DSR 2026-11-12): schema v10 still requires
+// the key; the only accepted form is every field "n/a:not deployed" with no address-book entry. That
+// form is VERIFIED-ABSENT (in `absent`, needs no ABI); every other form fails or stays unverified,
+// and a7-fork's ABI-gap message (abiGapUnverified) then stops the rehearsal.
+{
+  const KEY = "disclosureRegistry";
+  const NA = "n/a:not deployed";
+  const retired = () =>
+    Object.fromEntries(
+      Object.keys(base.contracts[KEY])
+        .filter(k => k !== "rolesSource")
+        .map(k => [k, NA])
+    );
+  const noEntry = (() => {
+    const b = { ...addressBook };
+    delete b[KEY];
+    return b;
+  })();
+  const gap = r => abiGapUnverified([KEY], r.absent ?? []);
+  const stops = r =>
+    failed(r).some(p => p.startsWith(`contracts.${KEY}`)) ||
+    r.unverified.some(u => u.startsWith(`contracts.${KEY}`)) ||
+    gap(r).length > 0;
+  // positive
+  {
+    const rb = clone();
+    rb.contracts[KEY] = retired();
+    const r = await run(rb, undefined, { addressBook: noEntry });
+    const rb2 = clone();
+    rb2.contracts[KEY] = { ...retired(), rolesSource: NA };
+    const r2 = await run(rb2, undefined, { addressBook: noEntry });
+    cell(
+      "retired registry with rolesSource written as the marker: verified absent",
+      r2.absent.includes(KEY) && !failed(r2).some(p => p.startsWith(`contracts.${KEY}`)),
+      { absent: r2.absent, f: failed(r2) }
+    );
+    cell(
+      "retired registry: all 'n/a:not deployed', no address-book entry -> verified absent, no ABI gap",
+      r.absent.includes(KEY) &&
+        !failed(r).some(p => p.startsWith(`contracts.${KEY}`)) &&
+        !r.unverified.some(u => u.startsWith(`contracts.${KEY}`)) &&
+        gap(r).length === 0,
+      { absent: r.absent, f: failed(r), u: r.unverified, gap: gap(r) }
+    );
+  }
+  // negatives: each one must stop the rehearsal and must not be listed as absent
+  const neg = [
+    ["a real address", c => (c.address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), noEntry],
+    ["a real codehash", c => (c.codehash = `0x${"aa".repeat(32)}`), noEntry],
+    ["a real WRITER", c => (c.WRITER = "0xcccccccccccccccccccccccccccccccccccccccc"), noEntry],
+    [
+      "a real AGGREGATOR",
+      c => (c.AGGREGATOR = "0x8888888888888888888888888888888888888888"),
+      noEntry,
+    ],
+    [
+      "another n/a spelling on every field",
+      c => {
+        for (const k of Object.keys(c)) c[k] = "n/a:retired";
+      },
+      noEntry,
+    ],
+    ["another n/a spelling on one field", c => (c.version = "n/a:not-deployed"), noEntry],
+    ["a field left out", c => delete c.WRITER, noEntry],
+    ["rolesSource another spelling", c => (c.rolesSource = "n/a:retired"), noEntry],
+    ["rolesSource a number", c => (c.rolesSource = 42), noEntry],
+    ["rolesSource a block range", c => (c.rolesSource = { fromBlock: 1, toBlock: 2 }), noEntry],
+    [
+      "an address-book entry for it",
+      () => {},
+      { ...noEntry, [KEY]: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    ],
+  ];
+  for (const [name, f, book] of neg) {
+    const rb = clone();
+    rb.contracts[KEY] = retired();
+    f(rb.contracts[KEY]);
+    const r = await run(rb, undefined, { addressBook: book });
+    cell(
+      `retired registry with ${name}: not absent, the rehearsal stops`,
+      !r.absent.includes(KEY) && stops(r),
+      { absent: r.absent, f: failed(r).filter(p => p.includes(KEY)), gap: gap(r) }
+    );
+  }
+  {
+    const rb = clone();
+    delete rb.contracts[KEY];
+    const r = await run(rb, undefined, { addressBook: noEntry });
+    cell(
+      "retired registry entry omitted: unverified (schema v10 requires it), not absent",
+      !r.absent.includes(KEY) && r.unverified.some(u => u.startsWith(`contracts.${KEY}`)),
+      { absent: r.absent, u: r.unverified }
+    );
+  }
+  cell(
+    "abiGapUnverified: an ABI-less contract not verified absent stays unverified; absent clears it",
+    abiGapUnverified([KEY, "ownerSafe"], []).length === 2 &&
+      abiGapUnverified([KEY, "ownerSafe"], [KEY]).length === 1 &&
+      /retired/.test(abiGapUnverified([KEY], [])[0]),
+    abiGapUnverified([KEY, "ownerSafe"], [KEY])
   );
 }
 

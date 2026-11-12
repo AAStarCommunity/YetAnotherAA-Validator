@@ -708,6 +708,19 @@ if (process.env.FAKE_ANVIL_SERVE) {
     exits
   );
 }
+// the ABI gap: every contract without an SP ABI file goes through abiGapUnverified, which clears
+// only the ones compare() verified as not deployed (the retired disclosureRegistry); its cases are
+// in check-a7-readback.mjs
+{
+  const src = readFileSync(join(here, "a7-fork.mjs"), "utf8");
+  cell(
+    "wiring (structural): the ABI gap is unverified via abiGapUnverified(missingAbi, result.absent)",
+    /unverified\.push\(\.\.\.abiGapUnverified\(missingAbi, result\.absent \?\? \[\]\)\)/.test(
+      src
+    ) && (src.match(/missingAbi/g) ?? []).length === 3,
+    (src.match(/.*missingAbi.*/g) ?? []).join(" | ")
+  );
+}
 
 let failed = 0;
 for (const r of results) {
