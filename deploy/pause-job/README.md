@@ -123,7 +123,15 @@ is recorded: the final cost is written to the journal, not discarded.
 
 **The absolute bound is the funding (DSR 65db9e38).** Fund the signer with
 exactly the cap, 0.1 ETH on Sepolia and 0.02 ETH on OP, and never top it up
-without a fresh go from DSR.
+without a fresh go from DSR. The job enforces this:
+
+- `--init` refuses a signer holding more than the cap.
+- Every round, before any broadcast, it refuses to broadcast if the signer holds
+  more than `cap - spent` (a top-up) and raises a `topup` alert.
+
+The money on the signer is therefore never more than the budget left, so total
+spend cannot exceed the cap, even when an OP inclusion-time fee overruns a
+reservation.
 
 A new cap is a new funding: start a new ledger (a new state) for it. Do not edit
 `cap`, which the job refuses.
@@ -188,8 +196,9 @@ Until this PR merged, they were manual items on the launch checklist.
     be read fails. The plists in `~/Library/LaunchAgents` are read as well.
   - Wrapper scripts are followed transitively, up to 4 levels, from absolute
     paths and from paths relative to the job's working directory or to the
-    referring script. Whole-line comments are ignored. Paths built at run time
-    (`$VAR`) cannot be followed; that is a stated residual.
+    referring script. Whole-line comments are ignored. A chain deeper than that
+    is reported as not followed (FAIL), never certified clean. Paths built at
+    run time (`$VAR`) cannot be followed; that is a stated residual.
   - The only exceptions are in `preflight-reviewed.json` (DSR bc3be95b). An
     entry passes only when all of the following hold:
     - the label matches exactly;
