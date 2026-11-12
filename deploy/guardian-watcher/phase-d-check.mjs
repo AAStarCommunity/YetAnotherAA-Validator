@@ -33,7 +33,7 @@ import {
   importClosure,
   publishBindingProblems,
   mirrorKeyProblems,
-  mirrorRulesetProblems,
+  allBranchRulesetProblems,
   mirrorIsolationProblems,
 } from "./phase-d-binding.mjs";
 
@@ -254,21 +254,30 @@ else {
       add("mirror-ruleset", "MISSING", "publish.mirror.repoUrl not set");
       add("mirror-repo-isolation", "MISSING", "publish.mirror.repoUrl not set");
     } else {
-      const r = spawnSync("gh", ["api", `repos/${repo[1]}/rules/branches/${branch}`], {
-        encoding: "utf8",
-        timeout: 30_000,
-      });
-      let rules = null;
-      try {
-        rules = r.status === 0 ? JSON.parse(r.stdout) : null;
-      } catch {
-        rules = null;
-      }
-      const rp = mirrorRulesetProblems(rules);
+      // every branch protected, not only the mirror's (Codex Phase D R5): each repository ruleset
+      // is read in full (conditions, bypass actors, rules)
+      const ghJson = path => {
+        const x = spawnSync("gh", ["api", path], { encoding: "utf8", timeout: 30_000 });
+        if (x.status !== 0) return null;
+        try {
+          return JSON.parse(x.stdout);
+        } catch {
+          return null;
+        }
+      };
+      const list = ghJson(`repos/${repo[1]}/rulesets?includes_parents=false&per_page=100`);
+      const full = Array.isArray(list)
+        ? list.map(r =>
+            Number.isSafeInteger(r?.id) ? ghJson(`repos/${repo[1]}/rulesets/${r.id}`) : null
+          )
+        : null;
+      const rp = allBranchRulesetProblems(full && full.every(Boolean) ? full : null);
       add(
         "mirror-ruleset",
         rp.length ? "FAIL" : "PASS",
-        rp.length ? rp.join("; ") : `${branch}: force-push, deletion and branch creation blocked`
+        rp.length
+          ? rp.join("; ")
+          : "all branches: creation, deletion and force-push restricted, no bypass"
       );
       // the mirror's repository holds nothing a leaked key could reach beyond the records (DSR):
       // Actions off, no secrets, one branch. Listing secrets needs the repository admin's gh.

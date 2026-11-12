@@ -255,21 +255,6 @@ export function mirrorKeyProblems({ st, uid, noPassphrase }) {
 }
 
 /**
- * The mirror branch's active rules (GitHub `rules/branches/<branch>`): the ruleset git-mirror relies
- * on forbids force-pushes and deletion. `rules` is the API's array; anything else is unknown.
- */
-export function mirrorRulesetProblems(rules) {
-  if (!Array.isArray(rules)) return ["the branch rules could not be read"];
-  const types = new Set(rules.map(r => r?.type));
-  const problems = [];
-  if (!types.has("non_fast_forward")) problems.push("force-pushes are not blocked");
-  if (!types.has("deletion")) problems.push("deletion is not blocked");
-  // the dedicated mirror repository allows no new branch (DSR): a leaked key cannot add one
-  if (!types.has("creation")) problems.push("branch creation is not blocked");
-  return problems;
-}
-
-/**
  * The mirror's dedicated repository is isolated (DSR): Actions disabled (a pushed workflow cannot
  * run), no Actions secrets, and exactly one branch, the mirror's. `actions` is GitHub's
  * actions/permissions answer, `secrets` actions/secrets, `branches` the branch list (null =
@@ -287,4 +272,28 @@ export function mirrorIsolationProblems({ actions, secrets, branches, branch }) 
   else if (branches.length !== 1 || branches[0]?.name !== branch)
     problems.push(`the repository must have exactly one branch, ${branch}`);
   return problems;
+}
+
+/**
+ * The dedicated mirror repository's rulesets protect EVERY branch (Codex Phase D R5): at least one
+ * repository ruleset (full details, as GET rulesets/<id> returns them) that is active, targets
+ * branches, includes ~ALL with no exclusion, has no bypass actor, and has the creation, deletion
+ * and non_fast_forward rules. A ruleset scoped to one branch would leave branch creation open.
+ */
+export function allBranchRulesetProblems(rulesets) {
+  if (!Array.isArray(rulesets)) return ["the repository's rulesets could not be read"];
+  const need = ["creation", "deletion", "non_fast_forward"];
+  const covers = r =>
+    r?.enforcement === "active" &&
+    r?.target === "branch" &&
+    Array.isArray(r?.conditions?.ref_name?.include) &&
+    r.conditions.ref_name.include.includes("~ALL") &&
+    (r.conditions.ref_name.exclude ?? []).length === 0 &&
+    (r.bypass_actors ?? []).length === 0 &&
+    need.every(t => (r.rules ?? []).some(x => x?.type === t));
+  return rulesets.some(covers)
+    ? []
+    : [
+        "no active ruleset on all branches (~ALL, no exclusion, no bypass) restricting creation, deletion and force-pushes",
+      ];
 }

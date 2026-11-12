@@ -16,8 +16,8 @@ import {
   importClosure,
   publishBindingProblems,
   mirrorKeyProblems,
-  mirrorRulesetProblems,
   mirrorIsolationProblems,
+  allBranchRulesetProblems,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -459,25 +459,38 @@ cell(
       /644/.test(cases.mode644.join()),
     got: { good, cases },
   });
-  const full = mirrorRulesetProblems([
-    { type: "deletion" },
-    { type: "non_fast_forward" },
-    { type: "creation" },
-    { type: "x" },
-  ]);
-  const noForce = mirrorRulesetProblems([{ type: "deletion" }, { type: "creation" }]);
-  const noDel = mirrorRulesetProblems([{ type: "non_fast_forward" }, { type: "creation" }]);
-  const noCreate = mirrorRulesetProblems([{ type: "non_fast_forward" }, { type: "deletion" }]);
-  const unread = mirrorRulesetProblems(null);
+  // Codex Phase D R5: the ruleset must cover EVERY branch, without exclusion or bypass
+  const rs = o => ({
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: ["~ALL"], exclude: [] } },
+    bypass_actors: [],
+    rules: [{ type: "creation" }, { type: "deletion" }, { type: "non_fast_forward" }],
+    ...o,
+  });
+  const rsCases = {
+    oneBranch: [
+      rs({ conditions: { ref_name: { include: ["refs/heads/disclosure-records"], exclude: [] } } }),
+    ],
+    excluded: [rs({ conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/x"] } } })],
+    bypass: [rs({ bypass_actors: [{ actor_type: "DeployKey" }] })],
+    evaluate: [rs({ enforcement: "evaluate" })],
+    noCreation: [rs({ rules: [{ type: "deletion" }, { type: "non_fast_forward" }] })],
+    tag: [rs({ target: "tag" })],
+    none: [],
+    unread: null,
+  };
   results.push({
-    name: "DSR mirror-ruleset: passes only when force-push, deletion AND branch creation are blocked; unreadable rules fail",
+    name: "Codex Phase D R5 mirror-ruleset: an active ~ALL ruleset (no exclusion, no bypass) with creation, deletion and non_fast_forward passes; one-branch, excluded, bypass, evaluate-only, missing rule, tag target, none or unreadable fail",
     ok:
-      full.length === 0 &&
-      /force-pushes/.test(noForce.join()) &&
-      /deletion/.test(noDel.join()) &&
-      /creation/.test(noCreate.join()) &&
-      unread.length === 1,
-    got: { full, noForce, noDel, noCreate, unread },
+      allBranchRulesetProblems([rs({}), rs({ target: "tag" })]).length === 0 &&
+      Object.values(rsCases).every(c => allBranchRulesetProblems(c).length === 1),
+    got: {
+      pass: allBranchRulesetProblems([rs({})]),
+      rsCases: Object.fromEntries(
+        Object.entries(rsCases).map(([k, v]) => [k, allBranchRulesetProblems(v)])
+      ),
+    },
   });
   const B = "disclosure-records";
   const iso = o =>

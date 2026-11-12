@@ -14,7 +14,8 @@
 //                  { "type": "filebase" } ],
 //     "telegram": { "chatId": "-100…" },
 //     "mirror": { "clone": "/path/to/bare/clone.git", "branch": "disclosure-records",
-//                 "repoUrl": "https://github.com/AAStarCommunity/aoa-disclosure-records" },
+//                 "repoUrl": "https://github.com/AAStarCommunity/aoa-disclosure-records",
+//                 "sshKey": "/Users/<you>/.aoa-watcher/mirror_deploy_key" },
 //     "registry": { "address": "0x…", "fromBlock": N, "deployer": "0x…", "maxFeePerGas": "<wei>",
 //                   "keystore": "/Users/<you>/.aoa-watcher/sender.keystore.json" },
 //     (an absolute path: "~" is not expanded, #413 review N3)
