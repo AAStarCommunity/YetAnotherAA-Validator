@@ -312,6 +312,16 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
       c2 === 789n,
       String(c2)
     );
+    // a REAL oracle prices any bytes it is given: with the signed bytes missing, the cost must be
+    // unknown, not the price of an empty transaction (ethers' Transaction.from(undefined))
+    const permissive = {
+      call: async () => ethers.AbiCoder.defaultAbiCoder().encode(["uint256"], [1n]),
+    };
+    const lost = { ...t, raws: [] };
+    cell(
+      "provisionalCost with the signed bytes missing is unknown, even from an oracle that prices anything",
+      (await provisionalCost(st, permissive, lost, r)) === null
+    );
   }
   const down = {
     call: async () => {
