@@ -47,6 +47,14 @@ const dirty = execFileSync("git", ["-C", spDir, "status", "--porcelain", "--untr
   encoding: "utf8",
 });
 if (dirty.trim()) die(2, "the SP checkout has local changes to tracked files");
+// untracked files may only be build outputs (Codex R2 P2-9): anything else could be an input
+const untracked = execFileSync("git", ["-C", spDir, "ls-files", "--others", "--exclude-standard"], {
+  encoding: "utf8",
+})
+  .split("\n")
+  .filter(f => f && !/^(out|cache|broadcast|node_modules)\//.test(f));
+if (untracked.length)
+  die(2, `the SP checkout has untracked files: ${untracked.slice(0, 3).join(", ")}`);
 const subs = execFileSync("git", ["-C", spDir, "submodule", "status", "--recursive"], {
   encoding: "utf8",
 });
@@ -200,6 +208,7 @@ const fresh = async (cap = String(10n ** 18n)) => {
     spProxy: SP,
     registry: REG,
     startBlock,
+    registryStartBlock: startBlock,
     cap,
   });
   const path = join(work, `state-${n++}.json`);
@@ -224,6 +233,16 @@ const ops = st => Object.keys(st.operators).sort();
 
 const finalize = () => p.send("anvil_mine", ["0x80"]);
 const copy = o => structuredClone(o);
+const lcHex = h => h.toLowerCase();
+// the cost of the final transactions, summed independently from the chain's receipts
+const receiptSum = async st => {
+  let sum = 0n;
+  for (const t of st.ledger.txs.filter(x => x.status === "final")) {
+    const r = await p.getTransactionReceipt(t.includedHash);
+    sum += r.gasUsed * r.gasPrice;
+  }
+  return sum;
+};
 
 // ---- C1: nothing understaked: inventory from the SP proxy, nothing sent
 await section(async () => {
@@ -280,9 +299,9 @@ await section(async () => {
   await finalize();
   const r3 = await j.round();
   cell(
-    "after finality: final, spent = sum of receipt costs, nothing reserved",
+    "after finality: final, spent = sum of receipt costs (summed here from the receipts), nothing reserved",
     j.st.ledger.txs.every(t => t.status === "final" && t.ok) &&
-      BigInt(j.st.ledger.spent) > 0n &&
+      BigInt(j.st.ledger.spent) === (await receiptSum(j.st)) &&
       j.st.ledger.reserved === "0" &&
       stateProblems(j.st).length === 0 &&
       r3.report.sent.length === 0,
@@ -301,6 +320,112 @@ await section(async () => {
     [r1.alerts, r2.alerts, r3.alerts]
   );
 });
+
+// ---- C2b: an operator-specific failure does not starve the next operator (Codex R2 P2-6)
+await revert(understaked);
+const u0 = await snapshot();
+await section(async () => {
+  const j = await fresh();
+  const [a, b] = [
+    "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  ].sort();
+  const aData = spIface.encodeFunctionData("pauseUnderstakedOperator", [a]).toLowerCase();
+  const failFirst = {
+    ...chain,
+    estimateGas: tx =>
+      tx.data.toLowerCase() === aData ? Promise.reject(new Error("x")) : chain.estimateGas(tx),
+  };
+  const r = await j.round({ chain: failFirst });
+  cell(
+    "operator-specific estimate failure: the next operator is still paused in the same round",
+    r.report.sent.join() === b &&
+      (await isPaused(b)) &&
+      !(await isPaused(a)) &&
+      r.alerts.some(x => x.key === `estimate:${a}`),
+    { sent: r.report.sent, a: r.alerts }
+  );
+});
+await revert(u0);
+const u0b = await snapshot();
+// ---- C2c: incoherent receipts (nonce 1 seen, nonce 0 not) never persist (Codex R2 P1-4)
+await section(async () => {
+  const j = await fresh();
+  await j.round();
+  const before = copy(j.st.ledger);
+  const h0 = j.st.ledger.txs[0].hashes;
+  const half = {
+    ...chain,
+    receipt: h => (h0.includes(h) ? Promise.resolve(null) : chain.receipt(h)),
+  };
+  const r = await j.round({ chain: half });
+  cell(
+    "incoherent receipts: the reconciled copy is discarded, the journal unchanged, alert",
+    JSON.stringify(j.st.ledger) === JSON.stringify(before) &&
+      r.alerts.some(x => x.key === "reconcile") &&
+      stateProblems(j.st).length === 0,
+    { a: r.alerts, now: j.st.ledger.txs.map(t => t.status) }
+  );
+  await finalize();
+  await j.round();
+  cell(
+    "incoherent receipts: the next coherent round proceeds to final",
+    j.st.ledger.txs.every(t => t.status === "final") && stateProblems(j.st).length === 0,
+    j.st.ledger.txs.map(t => t.status)
+  );
+});
+await revert(u0b);
+const u0c = await snapshot();
+// ---- C2d: the role inventory starts at the Registry's own deploy block (Codex R2 P1-3): a role
+// configured BEFORE SP's start block is found from registryStartBlock, and missed from startBlock
+await section(async () => {
+  const c = (await read(REG, regIface, "getRoleConfig", [ROLE_SUPER]))[0].toObject();
+  const NEW = ethers.id("CONFIGURED_BEFORE_SP_START");
+  await send(REG, cfgIface, "configureRole", [NEW, { ...c, owner: deployer.address }]);
+  const late = Number(await p.getBlockNumber()) + 1;
+  await finalize();
+  const mk = reg => {
+    const w = ethers.Wallet.createRandom();
+    return {
+      w,
+      st: emptyState({
+        chainId: 31337,
+        signer: w.address,
+        spProxy: SP,
+        registry: REG,
+        startBlock: late,
+        registryStartBlock: reg,
+        cap: String(10n ** 18n),
+      }),
+    };
+  };
+  const a = mk(1);
+  const b = mk(late);
+  const ids = [];
+  for (const x of [a, b]) {
+    await p.send("anvil_setBalance", [x.w.address, ethers.toQuantity(10n ** 18n)]);
+    const r = await runRound(x.st, {
+      chain,
+      signer: { address: x.w.address, sign: t => x.w.signTransaction(t) },
+      persist: () => {},
+      cfg: CFG,
+    });
+    ids.push(r.report.identity);
+  }
+  cell(
+    "roles: scanned from the Registry's deploy block, a role configured before SP's start is found and fails closed",
+    Object.keys(a.st.roles).includes(lcHex(NEW)) &&
+      !ids[0].ok &&
+      ids[0].problems.some(x => x.includes("not in the pinned")),
+    { roles: Object.keys(a.st.roles), id: ids[0] }
+  );
+  cell(
+    "roles: (control) scanned only from SP's start block, the same role is not seen",
+    !Object.keys(b.st.roles).includes(lcHex(NEW)) && ids[1].ok,
+    { roles: Object.keys(b.st.roles), id: ids[1] }
+  );
+});
+await revert(u0c);
 
 // ---- C3: a reorg removes an included pause: back to sent, resent, reservation kept throughout
 await revert(understaked);
@@ -344,6 +469,8 @@ await section(async () => {
     "reorg: after re-inclusion and finality both are final and paused, counted once",
     j.st.ledger.txs.every(t => t.status === "final") &&
       (await isPaused(ops(j.st)[0])) &&
+      (await isPaused(ops(j.st)[1])) &&
+      BigInt(j.st.ledger.spent) === (await receiptSum(j.st)) &&
       stateProblems(j.st).length === 0,
     copy(j.st.ledger)
   );
@@ -703,6 +830,7 @@ await section(async () => {
     spProxy: SP,
     registry: REG,
     startBlock,
+    registryStartBlock: startBlock,
     capWei: String(10n ** 17n),
     gasLimitMax: "300000",
     maxFeePerGasCap: "200000000000",

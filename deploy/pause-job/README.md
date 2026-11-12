@@ -26,12 +26,14 @@ launchd starts `pause-job.mjs` every 600 s. Each start runs one round
    have landed and the journal length. Anything else means someone else used the
    key, and the round stops.
 
-2. **Operator inventory.** The inventory is built from `OperatorConfigured` logs
-   emitted by the **SuperPaymaster proxy**, not by the Registry. A second
-   inventory is built from the Registry's `RoleConfigured` logs. Both are read
-   only up to the `finalized` block. A cursor moves past a range only after that
-   range's `getLogs` succeeds and its logs check out. A failed range raises an
-   alert, is retried next round and is never skipped.
+2. **Operator inventory** (`startBlock`, SP's deploy block) **and role
+   inventory** (`registryStartBlock`, the Registry's own deploy block, which may
+   be earlier). The inventory is built from `OperatorConfigured` logs emitted by
+   the **SuperPaymaster proxy**, not by the Registry. A second inventory is
+   built from the Registry's `RoleConfigured` logs. Both are read only up to the
+   `finalized` block. A cursor moves past a range only after that range's
+   `getLogs` succeeds and its logs check out. A failed range raises an alert, is
+   retried next round and is never skipped.
 3. **One block.** The round pins `B = latest`. Every read and call in the round
    is made at `B`.
 4. **Identity check (fail closed).** At `B`, the signer must not be any of the
@@ -61,15 +63,17 @@ launchd starts `pause-job.mjs` every 600 s. Each start runs one round
 
 6. **Send.** `reserve = gasLimit × maxFeePerGas` is held against the cap. The
    signed transaction is written to the state file (fsync) **before** it is
-   broadcast. Candidates are sent in turn, with at most one transaction in
-   flight. Each must be mined within `receiptWaitMs` (default 90 s) before the
-   next is signed. One that is not stays in flight, and the next round resends
-   the same bytes. A transaction still pending at the start of more than
-   `bumpAfterRounds` rounds (default 3) is **replaced at the same nonce** with
-   fees ×1.25, never below the current `2 × baseFee + tip`. The extra
-   reservation is checked against the cap first, and the new bytes are
-   journalled before broadcast. Every hash signed for that nonce is still looked
-   up, and the cost is counted once, from the one that mined.
+   broadcast. An operator-specific refusal (estimate, gas) moves on to the next
+   operator; a chain-wide one (cap, fee ceiling) stops the round. Candidates are
+   sent in turn, with at most one transaction in flight. Each must be mined
+   within `receiptWaitMs` (default 90 s) before the next is signed. One that is
+   not stays in flight, and the next round resends the same bytes. A transaction
+   still pending at the start of more than `bumpAfterRounds` rounds (default 3)
+   is **replaced at the same nonce** with fees ×1.25, never below the current
+   `2 × baseFee + tip`. The extra reservation is checked against the cap first,
+   and the new bytes are journalled before broadcast. Every hash signed for that
+   nonce is still looked up, and the cost is counted once, from the one that
+   mined.
 
 **One provider per round.** The config names two providers, alchemy as primary
 and infura as fallback (DSR bd595f0f); their URLs are secret files. A round
@@ -105,6 +109,16 @@ gives the go. These sources are never used:
 - D `0xb5600060…`;
 - the A3a approver and executor;
 - any A3a nonce-pinned EOA.
+
+**OP residual (stated, not hidden).** On OP, the sequencer charges the L1 data
+fee and the operator fee when a transaction is included. They are not bounded by
+the transaction's `maxFeePerGas`, so the cap cannot be an absolute bound there.
+The job reserves twice the GasPriceOracle's current fees. Before every broadcast
+it re-prices that reservation, which only grows, and it does not rebroadcast
+when the cap cannot cover it. A copy already in a mempool can still land. An
+overrun can therefore happen only if L1 fees rise past the margin between the
+last check and inclusion. If one does, the ledger shows `spent + reserved > cap`
+and the job stops sending (fail closed) until a new funding.
 
 A new cap is a new funding: start a new ledger (a new state) for it. Do not edit
 `cap`, which the job refuses.

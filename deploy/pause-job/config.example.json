@@ -3,6 +3,7 @@
   "spProxy": "0x0000000000000000000000000000000000000001",
   "registry": "0x0000000000000000000000000000000000000002",
   "startBlock": 1,
+  "registryStartBlock": 1,
   "capWei": "100000000000000000",
   "gasLimitMax": "150000",
   "maxFeePerGasCap": "100000000000",

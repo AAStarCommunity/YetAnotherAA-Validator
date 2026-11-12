@@ -149,6 +149,7 @@ const good = {
   spProxy: A,
   registry: B,
   startBlock: 100,
+  registryStartBlock: 90,
   capWei: String(10n ** 17n),
   gasLimitMax: "200000",
   maxFeePerGasCap: "200000000000",
@@ -227,6 +228,22 @@ cell(
     t1 = true;
   }
   cell("parseRoles refuses a constant that hashes another name", t1);
+  cell(
+    "parseRoles reads a declaration with a block comment inside it (Codex R2 P2-7)",
+    Object.keys(
+      parseRoles(
+        'bytes32 constant ROLE_A = keccak256("A");\nbytes32 /* doc */ constant ROLE_X = keccak256("X");'
+      )
+    ).join() === "ROLE_A,ROLE_X"
+  );
+  cell(
+    "parseRoles ignores a commented-out declaration",
+    Object.keys(
+      parseRoles(
+        'bytes32 constant ROLE_A = keccak256("A");\n// bytes32 constant ROLE_Z = keccak256("Z");'
+      )
+    ).join() === "ROLE_A"
+  );
   let t2 = false;
   try {
     parseRoles('bytes32 constant ROLE_A = keccak256("A");\nbytes32 constant ROLE_X = 0x01;');
@@ -241,7 +258,7 @@ cell(
   const ok = launchdOff(
     [PAUSE_LABEL, "io.aastar.price-keeper", "com.apple.x"],
     l => (l === "com.apple.x" ? null : ["/bin/bash", `/x/${l}.sh`]),
-    () => "echo unrelated"
+    () => ({ kind: "text", text: "echo unrelated" })
   );
   cell("launchd-off passes with only the pause job and unrelated jobs", ok.length === 0, ok);
   const k = launchdOff([PAUSE_LABEL, "io.aastar.dvt-committee-keeper"], () => []);
@@ -310,14 +327,30 @@ cell(
   );
   cell(
     "runsSender: a wrapper script that runs one is found by reading it",
-    runsSender(
-      ["/bin/bash", "/x/run.sh"],
-      () => "exec node deploy/apply-verifier-rotation.mjs"
-    ).includes("apply-verifier-rotation.mjs")
+    runsSender(["/bin/bash", "/x/run.sh"], () => ({
+      kind: "text",
+      text: "exec node deploy/apply-verifier-rotation.mjs",
+    })).includes("apply-verifier-rotation.mjs")
   );
   cell(
     "runsSender: an unreadable wrapper is reported (fail closed)",
-    runsSender(["/bin/bash", "/x/run.sh"], () => null).some(x => x.includes("unreadable"))
+    runsSender(["/bin/bash", "/x/run.sh"], () => ({ kind: "unreadable" })).some(x =>
+      x.includes("unreadable")
+    )
+  );
+  cell(
+    "runsSender: an extensionless wrapper is read too (Codex R2 P2-5)",
+    runsSender(["/bin/bash", "/repo/run-keeper"], p =>
+      p === "/repo/run-keeper"
+        ? { kind: "text", text: "node deploy/committee-keeper.mjs" }
+        : { kind: "binary" }
+    ).includes("committee-keeper.mjs")
+  );
+  cell(
+    "runsSender: a binary interpreter is not searched",
+    runsSender(["/opt/homebrew/bin/node", "/x/y.mjs"], p =>
+      p.endsWith("node") ? { kind: "binary" } : { kind: "text", text: "console.log(1)" }
+    ).length === 0
   );
   {
     // the reviewed exception (DSR bc3be95b): label, FULL args, loaded == plist, env names, file hashes
@@ -343,7 +376,10 @@ cell(
         "/r/deploy/local-heartbeat.sh": "a".repeat(64),
         "/r/deploy/committee-health.mjs": "b".repeat(64),
       })[path] ?? null;
-    const txt = () => "apply) node deploy/apply-verifier-rotation.mjs --broadcast";
+    const txt = () => ({
+      kind: "text",
+      text: "apply) node deploy/apply-verifier-rotation.mjs --broadcast",
+    });
     const run = (pl, loaded = args, s = sha, labels = [PAUSE_LABEL, r.label]) =>
       launchdOff(labels, () => loaded, txt, [r], s, { [r.label]: pl });
     cell(
@@ -359,6 +395,19 @@ cell(
         "apply",
       ]).length > 0
     );
+    {
+      const bashC = [
+        "/bin/bash",
+        "-c",
+        "node deploy/apply-verifier-rotation.mjs --broadcast",
+        "/r/deploy/local-heartbeat.sh",
+        "health",
+      ];
+      cell(
+        "reviewed: bash -c with the wrapper as mere argument data fails (Codex R2 P2-5)",
+        run({ ...plist, ProgramArguments: bashC }, bashC).length > 0
+      );
+    }
     cell(
       "reviewed: an extra argument fails",
       run({ ...plist, ProgramArguments: [...args, "--x"] }, [...args, "--x"]).length > 0

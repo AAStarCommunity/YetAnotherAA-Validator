@@ -55,6 +55,12 @@ export function configProblems(c) {
     p.push(`chainId must be one of ${Object.keys(CAP_CEILING).join(", ")}`);
   addr("spProxy");
   addr("registry");
+  if (
+    !Number.isSafeInteger(c.registryStartBlock) ||
+    c.registryStartBlock < 1 ||
+    c.registryStartBlock > c.startBlock
+  )
+    p.push("registryStartBlock must be the Registry's deploy block, at or before startBlock");
   if (!Number.isSafeInteger(c.startBlock) || c.startBlock < 1)
     p.push("startBlock must be a positive block (SP's deploy block)");
   for (const k of ["capWei", "gasLimitMax", "maxFeePerGasCap", "maxPriorityFeePerGas"])
@@ -89,7 +95,14 @@ export function writeDurable(path, obj) {
     0o600
   );
   try {
-    writeSync(fd, `${JSON.stringify(obj, null, 2)}\n`);
+    // every byte, or throw (Codex R2 P1-2): a short write never reaches the rename
+    const buf = Buffer.from(`${JSON.stringify(obj, null, 2)}\n`);
+    let off = 0;
+    while (off < buf.length) {
+      const n = writeSync(fd, buf, off, buf.length - off);
+      if (!(n > 0)) throw new SafeError("state write made no progress");
+      off += n;
+    }
     fsyncSync(fd);
   } finally {
     closeSync(fd);

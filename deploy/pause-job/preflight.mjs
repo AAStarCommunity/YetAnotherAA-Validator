@@ -16,7 +16,7 @@
 // Exit 0 only when no item FAILs. MANUAL items never count as PASS.
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -35,14 +35,18 @@ export const SENDING_SCRIPTS = [
  * script) is searched too; `readText(path)` returns its text, or null when it is not a file. A
  * wrapper that cannot be read is reported as unknown (fail closed). Pure given readText.
  */
-export function runsSender(args, readText = () => null) {
+export function runsSender(args, readText = () => ({ kind: "none" })) {
   const hits = new Set();
   for (const a of args) {
     for (const s of SENDING_SCRIPTS) if (a.includes(s)) hits.add(s);
-    if (/^\/.+\.(sh|bash|zsh|command)$/.test(a)) {
+    // ANY absolute path that is a text file is read as a possible wrapper, with or without an
+    // extension (Codex R2 P2-5); binaries (Mach-O, ELF) and paths that are not files are skipped;
+    // a file that exists but cannot be read is unknown (fail closed)
+    if (a.startsWith("/")) {
       const t = readText(a);
-      if (t === null) hits.add(`<unreadable wrapper ${a}>`);
-      else for (const s of SENDING_SCRIPTS) if (t.includes(s)) hits.add(s);
+      if (t.kind === "unreadable") hits.add(`<unreadable file ${a}>`);
+      else if (t.kind === "text")
+        for (const s of SENDING_SCRIPTS) if (t.text.includes(s)) hits.add(s);
     }
   }
   return [...hits];
@@ -98,7 +102,7 @@ export function reviewProblems(r, plist, loadedArgs, shaOf) {
 export function launchdOff(
   labels,
   programOf,
-  readText = () => null,
+  readText = () => ({ kind: "none" }),
   reviewed = [],
   shaOf = () => null,
   plists = {}
@@ -158,11 +162,36 @@ export function nodeSlashOff(envOf, nodes, running = null) {
   return p;
 }
 
+const BINARY_MAGIC = [
+  "cffaedfe",
+  "cefaedfe",
+  "feedfacf",
+  "feedface",
+  "cafebabe",
+  "bebafeca",
+  "7f454c46",
+];
 const readText = path => {
+  let st;
   try {
-    return readFileSync(path, "utf8");
+    st = statSync(path);
+  } catch (e) {
+    return { kind: e?.code === "ENOENT" || e?.code === "ENOTDIR" ? "none" : "unreadable" };
+  }
+  if (!st.isFile()) return { kind: "none" };
+  // the magic first: a binary of any size is a binary; only a large TEXT file is unknown
+  let fd;
+  try {
+    fd = openSync(path, "r");
+    const head = Buffer.alloc(4);
+    readSync(fd, head, 0, 4, 0);
+    if (BINARY_MAGIC.includes(head.toString("hex"))) return { kind: "binary" };
+    if (st.size > 4 << 20) return { kind: "unreadable" };
+    return { kind: "text", text: readFileSync(path, "utf8") };
   } catch {
-    return null;
+    return { kind: "unreadable" };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 };
 const run = (cmd, a) => {

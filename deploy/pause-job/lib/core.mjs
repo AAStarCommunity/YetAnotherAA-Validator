@@ -55,7 +55,15 @@ const PENDING = new Set(["signed", "sent"]);
 const HELD = new Set(["signed", "sent", "included"]); // reservation held
 
 /** A fresh state. `cap` is the cumulative spend cap in wei for this chain (decimal string). */
-export function emptyState({ chainId, signer, spProxy, registry, startBlock, cap }) {
+export function emptyState({
+  chainId,
+  signer,
+  spProxy,
+  registry,
+  startBlock,
+  registryStartBlock,
+  cap,
+}) {
   return {
     schema: "aoa-pause-job-state/2",
     chainId,
@@ -63,7 +71,8 @@ export function emptyState({ chainId, signer, spProxy, registry, startBlock, cap
     spProxy: lc(spProxy),
     registry: lc(registry),
     // last block whose logs are fully in the inventory; startBlock - 1 = nothing scanned yet
-    cursor: { operators: startBlock - 1, roles: startBlock - 1 },
+    // roles from the Registry's OWN deployment block (it may predate SP; Codex R2 P1-3)
+    cursor: { operators: startBlock - 1, roles: (registryStartBlock ?? startBlock) - 1 },
     operators: {}, // addr -> { since, understakedRounds }
     roles: {}, // roleId -> first block seen in RoleConfigured
     ledger: { cap: String(cap), spent: "0", reserved: "0", txs: [] },
@@ -277,7 +286,10 @@ async function receiptOf(chain, t) {
  * Reconcile the journal with the chain. READS ONLY: nothing is signed or broadcast here.
  * Returns alerts; mutates st and persists.
  */
-async function reconcile(st, chain, persist, finalized) {
+async function reconcile(stLive, chain, persist, finalized) {
+  // work on a copy; it replaces the live state only if the result is coherent, so a receipt seen
+  // mid-reorg or an RPC failure halfway never persists a state that blocks the next round
+  const st = structuredClone(stLive);
   const alerts = [];
   const l = st.ledger;
   const include = (t, r) => {
@@ -328,7 +340,16 @@ async function reconcile(st, chain, persist, finalized) {
         text: `pause of ${t.operator} reverted on chain (tx ${t.includedHash})`,
       });
   }
-  await persist(st);
+  const bad = stateProblems(st);
+  if (bad.length) {
+    alerts.push({
+      key: "reconcile",
+      text: `receipts were inconsistent this round (${bad.join("; ")}); kept the previous journal, retried next round`,
+    });
+    return alerts;
+  }
+  stLive.ledger = st.ledger;
+  await persist(stLive);
   return alerts;
 }
 
@@ -358,6 +379,33 @@ async function pushPending(st, { chain, signer, persist, cfg }) {
     if ((t.pendingRounds ?? 0) > (cfg.bumpAfterRounds ?? 3)) {
       const a = await replace(st, t, { chain, signer, persist, cfg });
       if (a) alerts.push(a);
+    }
+    // OP: the L1/operator fees are charged at inclusion and are not bounded by the transaction, so
+    // the reservation is re-priced from the oracle before every broadcast and only grows; when the
+    // cap cannot cover it the bytes are NOT rebroadcast (a copy already in a mempool may still land:
+    // README, residual)
+    if (OP_CHAINS.has(st.chainId)) {
+      let need;
+      try {
+        need = await reservationFor(st, chain, t.raw, big(t.gasLimit), big(t.maxFeePerGas));
+      } catch (e) {
+        alerts.push({ key: `reprice:${t.nonce}`, text: safeText("re-price", e) });
+        continue;
+      }
+      if (need > big(t.reserve)) {
+        const extra = need - big(t.reserve);
+        const remaining = big(l.cap) - big(l.spent) - big(l.reserved);
+        if (extra > remaining) {
+          alerts.push({
+            key: "cap",
+            text: `remaining cap insufficient: re-pricing the pause of ${t.operator} needs ${extra} more wei, ${remaining} left of ${l.cap}; not rebroadcast`,
+          });
+          continue;
+        }
+        l.reserved = String(big(l.reserved) + extra);
+        t.reserve = String(need);
+        await persist(st);
+      }
     }
     try {
       await chain.sendRaw(t.raw);
@@ -552,7 +600,11 @@ export async function runRound(st, { chain, signer, persist, cfg }) {
     if (st.ledger.txs.some(t => HELD.has(t.status) && t.operator === op)) continue; // on its way
     const r = await send(st, { chain, signer, persist, cfg }, op);
     if (r) alerts.push(r);
-    if (!st.ledger.txs.some(t => PENDING.has(t.status) && t.operator === op)) break; // not signed
+    if (!st.ledger.txs.some(t => PENDING.has(t.status) && t.operator === op)) {
+      // an operator-specific refusal (estimate, gas) moves on; a chain-wide one (cap, fee) stops
+      if (r && (r.key === "cap" || r.key.startsWith("fee:"))) break;
+      continue;
+    }
     report.sent.push(op);
     await waitIncluded();
   }

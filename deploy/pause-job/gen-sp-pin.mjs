@@ -98,8 +98,11 @@ function pick(abiFile, names, label) {
 }
 
 /** The ROLE_* constants of IRegistry.sol: name -> id, each literal checked. Pure. */
-export function parseRoles(src) {
-  const re = /^bytes32\s+constant\s+(ROLE_[A-Z0-9_]+)\s*=\s*keccak256\("([A-Z0-9_]+)"\)\s*;/gm;
+export function parseRoles(raw) {
+  // comments removed first (Codex R2 P2-7): `bytes32 /* x */ constant ROLE_X = ...` is a declaration
+  const src = raw.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, "");
+  const re =
+    /^\s*bytes32\s+constant\s+(ROLE_[A-Z0-9_]+)\s*=\s*keccak256\(\s*"([A-Z0-9_]+)"\s*\)\s*;/gm;
   const roles = {};
   for (const m of src.matchAll(re)) {
     if (m[1] !== `ROLE_${m[2]}`) throw new Error(`${m[1]} hashes "${m[2]}", not its own name`);
@@ -107,9 +110,8 @@ export function parseRoles(src) {
     roles[m[1]] = ethers.id(m[2]);
   }
   // any other mention of a bytes32 ROLE_ constant we did not parse is a shape we do not know
-  const all = [...src.matchAll(/\bbytes32\s+(?:public\s+)?constant\s+(ROLE_[A-Z0-9_]+)/g)].map(
-    m => m[1]
-  );
+  // every identifier ROLE_* that is declared or assigned anywhere must be one we parsed
+  const all = [...src.matchAll(/\b(ROLE_[A-Z0-9_]+)\s*=(?!=)/g)].map(m => m[1]);
   for (const n of all) if (!roles[n]) throw new Error(`${n} has a form this parser does not read`);
   if (!Object.keys(roles).length) throw new Error("no ROLE_* constants found");
   return roles;
