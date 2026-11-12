@@ -15,6 +15,12 @@ import {
   staleProblems,
   importClosure,
   publishBindingProblems,
+  mirrorKeyProblems,
+  mirrorIsolationProblems,
+  allBranchRulesetProblems,
+  appendBlockingProblems,
+  deployKeyProblems,
+  flattenPages,
 } from "./phase-d-binding.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -428,6 +434,164 @@ cell(
     name: "config.example.json has a chainId and it is phase-d.example.json's (a copied config starts publishing)",
     ok: Number.isSafeInteger(ex.chainId) && ex.chainId === pd.chainId,
     got: { ex: ex.chainId, pd: pd.chainId },
+  });
+}
+
+// ---- DSR: the mirror deploy key file and the branch ruleset
+{
+  const st = (o = {}) => ({
+    isFile: () => o.file ?? true,
+    isSymbolicLink: () => o.link ?? false,
+    mode: o.mode ?? 0o100600,
+    uid: o.uid ?? 501,
+  });
+  const good = mirrorKeyProblems({ st: st(), uid: 501, noPassphrase: true });
+  const cases = {
+    absent: mirrorKeyProblems({ st: null, uid: 501, noPassphrase: false }),
+    link: mirrorKeyProblems({ st: st({ link: true }), uid: 501, noPassphrase: true }),
+    dir: mirrorKeyProblems({ st: st({ file: false }), uid: 501, noPassphrase: true }),
+    mode644: mirrorKeyProblems({ st: st({ mode: 0o100644 }), uid: 501, noPassphrase: true }),
+    otherUser: mirrorKeyProblems({ st: st({ uid: 502 }), uid: 501, noPassphrase: true }),
+    passphrase: mirrorKeyProblems({ st: st(), uid: 501, noPassphrase: false }),
+  };
+  results.push({
+    name: "DSR mirror-key: a regular 0600 file of this account that loads without a passphrase passes; absent, symlink, non-file, other mode, other owner, passphrase each fail",
+    ok:
+      good.length === 0 &&
+      Object.values(cases).every(p => p.length >= 1) &&
+      /644/.test(cases.mode644.join()),
+    got: { good, cases },
+  });
+  // Codex Phase D R5: the ruleset must cover EVERY branch, without exclusion or bypass
+  const rs = o => ({
+    enforcement: "active",
+    target: "branch",
+    conditions: { ref_name: { include: ["~ALL"], exclude: [] } },
+    bypass_actors: [],
+    rules: [{ type: "creation" }, { type: "deletion" }, { type: "non_fast_forward" }],
+    ...o,
+  });
+  const rsCases = {
+    oneBranch: [
+      rs({ conditions: { ref_name: { include: ["refs/heads/disclosure-records"], exclude: [] } } }),
+    ],
+    excluded: [rs({ conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/x"] } } })],
+    bypass: [rs({ bypass_actors: [{ actor_type: "DeployKey" }] })],
+    evaluate: [rs({ enforcement: "evaluate" })],
+    noCreation: [rs({ rules: [{ type: "deletion" }, { type: "non_fast_forward" }] })],
+    tag: [rs({ target: "tag" })],
+    // #428 re-review B1': an unread (absent) or null bypass list is not an empty one
+    bypassAbsent: [(({ bypass_actors: _b, ...r }) => r)(rs({}))],
+    bypassNull: [rs({ bypass_actors: null })],
+    noForce: [rs({ rules: [{ type: "creation" }, { type: "deletion" }] })],
+    none: [],
+    unread: null,
+  };
+  results.push({
+    name: "Codex Phase D R5 mirror-ruleset: an active ~ALL ruleset (no exclusion, no bypass) with creation, deletion and non_fast_forward passes; one-branch, excluded, bypass, evaluate-only, missing rule, tag target, none or unreadable fail",
+    ok:
+      allBranchRulesetProblems([rs({}), rs({ target: "tag", rules: [{ type: "update" }] })])
+        .length === 0 &&
+      Object.values(rsCases).every(c => allBranchRulesetProblems(c).length === 1),
+    got: {
+      pass: allBranchRulesetProblems([rs({})]),
+      rsCases: Object.fromEntries(
+        Object.entries(rsCases).map(([k, v]) => [k, allBranchRulesetProblems(v)])
+      ),
+    },
+  });
+  // #428 review M2: the key must be the mirror repository's write deploy key
+  const PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0wmN/Cr3JXqmLW7u+g9pTh+wyqDHpSQEIQczXkVx9q";
+  const dk = {
+    pass: deployKeyProblems(`${PUB} aoa-watcher mirror\n`, [
+      { key: "ssh-ed25519 AAAAOTHER", read_only: false },
+      { key: PUB, read_only: false },
+    ]),
+    readOnly: deployKeyProblems(PUB, [{ key: PUB, read_only: true }]),
+    notListed: deployKeyProblems(PUB, [{ key: "ssh-ed25519 AAAAOTHER", read_only: false }]),
+    noPub: deployKeyProblems("", [{ key: PUB, read_only: false }]),
+    unread: deployKeyProblems(PUB, null),
+    // Codex Phase D R7: every OpenSSH key type, not only ssh-* (ECDSA, security keys)
+    ecdsa: deployKeyProblems("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=", [
+      { key: "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=", read_only: false },
+    ]),
+    sk: deployKeyProblems("sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaA==", [
+      { key: "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaA==", read_only: false },
+    ]),
+  };
+  results.push({
+    name: "#428 M2 mirror-deploy-key: passes only when the key file's public key is a write deploy key of the mirror repository; read-only, not listed, unreadable key or list fail",
+    ok:
+      dk.pass.length === 0 &&
+      dk.ecdsa.length === 0 &&
+      dk.sk.length === 0 &&
+      /no write access/.test(dk.readOnly.join()) &&
+      /not a deploy key/.test(dk.notListed.join()) &&
+      dk.noPub.length === 1 &&
+      dk.unread.length === 1,
+    got: dk,
+  });
+  // Codex Phase D R8: every page of a list; a value containing "][" is not a page boundary
+  const page1 = Array.from({ length: 30 }, (_, i) => ({
+    key: `ssh-ed25519 AAAA${i}`,
+    read_only: false,
+  }));
+  const pages = flattenPages(
+    JSON.stringify([page1, [{ key: PUB, read_only: false, title: "a ][ b" }]])
+  );
+  results.push({
+    name: "Codex Phase D R8: a key on the second page is found; a title containing '][' survives; non-page output is unreadable",
+    ok:
+      Array.isArray(pages) &&
+      pages.length === 31 &&
+      deployKeyProblems(PUB, pages).length === 0 &&
+      pages[30].title === "a ][ b" &&
+      flattenPages('{"a":1}') === null &&
+      flattenPages("not json") === null &&
+      deployKeyProblems(PUB, page1).length === 1,
+    got: { n: pages?.length, last: pages?.[30] },
+  });
+  // #428 re-review / Codex Phase D R10: the rules in force on the mirror branch (any source)
+  const ok3 = [{ type: "creation" }, { type: "deletion" }, { type: "non_fast_forward" }];
+  const ab = {
+    pass: appendBlockingProblems([...ok3, { type: "required_linear_history" }]),
+    orgSigned: appendBlockingProblems([...ok3, { type: "required_signatures" }]),
+    update: appendBlockingProblems([...ok3, { type: "update" }]),
+    pr: appendBlockingProblems([...ok3, { type: "pull_request" }]),
+    unread: appendBlockingProblems(null),
+  };
+  results.push({
+    name: "Codex Phase D R10: the mirror branch's rules from every source may only restrict creation, deletion, force-push (and linear history); a signature, update or pull-request rule in force, or unreadable rules, fail",
+    ok:
+      ab.pass.length === 0 &&
+      /required_signatures/.test(ab.orgSigned.join()) &&
+      /update/.test(ab.update.join()) &&
+      /pull_request/.test(ab.pr.join()) &&
+      ab.unread.length === 1,
+    got: ab,
+  });
+  const B = "disclosure-records";
+  const iso = o =>
+    mirrorIsolationProblems({
+      actions: { enabled: false },
+      secrets: { total_count: 0 },
+      branches: [{ name: B }],
+      branch: B,
+      ...o,
+    });
+  const isoCases = {
+    actionsOn: iso({ actions: { enabled: true } }),
+    actionsUnread: iso({ actions: null }),
+    secrets: iso({ secrets: { total_count: 2 } }),
+    secretsUnread: iso({ secrets: null }),
+    twoBranches: iso({ branches: [{ name: B }, { name: "x" }] }),
+    otherBranch: iso({ branches: [{ name: "master" }] }),
+    branchesUnread: iso({ branches: null }),
+  };
+  results.push({
+    name: "DSR mirror-repo-isolation: Actions off, no secrets, only the mirror branch passes; Actions on, any secret, another or a second branch, or anything unreadable fails",
+    ok: iso({}).length === 0 && Object.values(isoCases).every(p => p.length === 1),
+    got: { pass: iso({}), isoCases },
   });
 }
 

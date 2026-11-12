@@ -234,3 +234,125 @@ export function publishBindingProblems({ wcfg, pc, cfg, samePath }) {
     problems.push("the watcher's chainId is not phase-d.json chainId");
   return problems;
 }
+
+/**
+ * The mirror deploy key file (DSR: a file, not the ssh-agent): a regular file, mode exactly 0600,
+ * owned by the account running the check (the watcher's), and usable without a passphrase
+ * (`noPassphrase`: `ssh-keygen -y -P "" -f <key>` succeeded). `st` is lstat-like (a symlink is
+ * refused, as it could point anywhere). Returns the problems, in fixed wording.
+ */
+export function mirrorKeyProblems({ st, uid, noPassphrase }) {
+  const problems = [];
+  if (!st) return ["the deploy key file is not present"];
+  if (st.isSymbolicLink?.()) problems.push("the deploy key path is a symlink");
+  else if (!st.isFile?.()) problems.push("the deploy key path is not a regular file");
+  const mode = st.mode & 0o777;
+  if (mode !== 0o600) problems.push(`mode ${mode.toString(8).padStart(3, "0")}, required 600`);
+  if (st.uid !== uid) problems.push("not owned by the watcher's account");
+  if (noPassphrase !== true)
+    problems.push("not an unencrypted private key ssh can load unattended");
+  return problems;
+}
+
+/**
+ * The mirror's dedicated repository is isolated (DSR): Actions disabled (a pushed workflow cannot
+ * run), no Actions secrets, and exactly one branch, the mirror's. `actions` is GitHub's
+ * actions/permissions answer, `secrets` actions/secrets, `branches` the branch list (null =
+ * unreadable). Returns the problems, in fixed wording.
+ */
+export function mirrorIsolationProblems({ actions, secrets, branches, branch }) {
+  const problems = [];
+  if (!actions || typeof actions.enabled !== "boolean")
+    problems.push("the repository's Actions settings could not be read");
+  else if (actions.enabled !== false) problems.push("GitHub Actions is enabled on the repository");
+  if (!secrets || !Number.isSafeInteger(secrets.total_count))
+    problems.push("the repository's secrets could not be listed (needs the repository admin's gh)");
+  else if (secrets.total_count !== 0) problems.push("the repository has Actions secrets");
+  if (!Array.isArray(branches)) problems.push("the repository's branches could not be listed");
+  else if (branches.length !== 1 || branches[0]?.name !== branch)
+    problems.push(`the repository must have exactly one branch, ${branch}`);
+  return problems;
+}
+
+/**
+ * The dedicated mirror repository's rulesets protect EVERY branch (Codex Phase D R5): at least one
+ * repository ruleset (full details, as GET rulesets/<id> returns them) that is active, targets
+ * branches, includes ~ALL with no exclusion, has no bypass actor, and has the creation, deletion
+ * and non_fast_forward rules. A ruleset scoped to one branch would leave branch creation open.
+ */
+export function allBranchRulesetProblems(rulesets) {
+  if (!Array.isArray(rulesets)) return ["the repository's rulesets could not be read"];
+  const need = ["creation", "deletion", "non_fast_forward"];
+  const covers = r =>
+    r?.enforcement === "active" &&
+    r?.target === "branch" &&
+    Array.isArray(r?.conditions?.ref_name?.include) &&
+    r.conditions.ref_name.include.includes("~ALL") &&
+    (r.conditions.ref_name.exclude ?? []).length === 0 &&
+    // the bypass list must be READ and empty (#428 re-review B1'): a reader without admin rights
+    // gets no bypass_actors field at all, which is not "no bypass"
+    Array.isArray(r.bypass_actors) &&
+    r.bypass_actors.length === 0 &&
+    need.every(t => (r.rules ?? []).some(x => x?.type === t));
+  return rulesets.some(covers)
+    ? []
+    : [
+        "no active ruleset on all branches (~ALL, no exclusion, no bypass read and empty) restricting creation, deletion and force-pushes",
+      ];
+}
+
+/**
+ * The key file is a WRITE deploy key of the mirror repository (#428 review M2): its public key
+ * (`ssh-keygen -y -f <key>`) equals one of the repository's deploy keys (`repos/<r>/keys`) with
+ * read_only false. A personal key with write access would pass mirror-push but is not confined to
+ * the mirror repository. Keys compare on type and base64 body (comments ignored).
+ */
+export function deployKeyProblems(pub, keys) {
+  const body = k =>
+    String(k ?? "")
+      .trim()
+      .split(/\s+/)
+      .slice(0, 2)
+      .join(" ");
+  const mine = body(pub);
+  if (!/^[a-z0-9][a-z0-9@.-]* [A-Za-z0-9+/=]+$/.test(mine))
+    return ["the key file's public key could not be read"];
+  if (!Array.isArray(keys)) return ["the repository's deploy keys could not be listed"];
+  const match = keys.filter(k => body(k?.key) === mine);
+  if (!match.length) return ["the key file is not a deploy key of the mirror repository"];
+  if (!match.some(k => k?.read_only === false)) return ["the deploy key has no write access"];
+  return [];
+}
+
+/**
+ * `gh api --paginate --slurp` output (an array of pages, each a JSON array) as one list, or null
+ * when it is anything else (Codex Phase D R8: every page counts; never a textual join, as a value can
+ * contain "][").
+ */
+export function flattenPages(stdout) {
+  try {
+    const pages = JSON.parse(String(stdout));
+    return Array.isArray(pages) && pages.every(Array.isArray) ? pages.flat() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The rules in force on the mirror branch from EVERY source (GitHub `rules/branches/<branch>`,
+ * organization rulesets included) allow the watcher's appends (#428 re-review; Codex Phase D R10):
+ * only creation, deletion, non_fast_forward and required_linear_history may apply. An update,
+ * pull-request, status-check or signature rule would refuse every real append while the no-op dry
+ * run passes. Rules scoped to other branches are not in this list, so they never count.
+ */
+export function appendBlockingProblems(branchRules) {
+  if (!Array.isArray(branchRules))
+    return ["the rules in force on the mirror branch could not be read"];
+  const allowed = new Set(["creation", "deletion", "non_fast_forward", "required_linear_history"]);
+  const extra = [...new Set(branchRules.map(x => x?.type).filter(t => !allowed.has(t)))];
+  return extra.length
+    ? [
+        `the mirror branch is also subject to ${extra.map(t => String(t).slice(0, 40)).join(", ")}, which would refuse the watcher's appends`,
+      ]
+    : [];
+}

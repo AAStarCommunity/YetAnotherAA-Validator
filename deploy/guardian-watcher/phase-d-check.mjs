@@ -11,7 +11,15 @@
 // fixed category, never an exception's text. See phase-d.example.json; a "<...>" value is MISSING.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, existsSync, statSync, accessSync, constants } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  existsSync,
+  statSync,
+  lstatSync,
+  accessSync,
+  constants,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +32,12 @@ import {
   staleProblems,
   importClosure,
   publishBindingProblems,
+  mirrorKeyProblems,
+  allBranchRulesetProblems,
+  appendBlockingProblems,
+  mirrorIsolationProblems,
+  deployKeyProblems,
+  flattenPages,
 } from "./phase-d-binding.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -134,6 +148,192 @@ else {
         "watcher-config",
         "FAIL",
         "does not load with the watcher's validation, or dataDir not writable"
+      );
+    }
+  }
+}
+
+/** GET a GitHub list endpoint, every page, on github.com; null when unreadable. */
+function ghPages(path) {
+  // --slurp: one JSON array of the pages, never a textual join (a value can contain "][")
+  const x = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", "--slurp", path], {
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  return x.status === 0 ? flattenPages(x.stdout) : null;
+}
+
+// ---- 2b. The git mirror (DSR): the deploy key FILE, a push it authorizes, the branch's ruleset.
+// Read-only: ls-remote and a dry-run push of the remote's own tip (nothing is written anywhere).
+{
+  const m = wcfg?.publish?.mirror;
+  const branch = m?.branch ?? "disclosure-records";
+  if (!wcfg)
+    for (const id of [
+      "mirror-key",
+      "mirror-push",
+      "mirror-deploy-key",
+      "mirror-ruleset",
+      "mirror-repo-isolation",
+    ])
+      add(id, "MISSING", "needs the watcher config");
+  else if (placeholder(m?.sshKey)) {
+    add("mirror-key", "MISSING", "publish.mirror.sshKey not set");
+    add("mirror-push", "MISSING", "needs the deploy key");
+  } else {
+    let st = null;
+    try {
+      st = lstatSync(m.sshKey);
+    } catch {
+      st = null;
+    }
+    const noPassphrase =
+      !!st &&
+      spawnSync("ssh-keygen", ["-y", "-P", "", "-f", m.sshKey], {
+        stdio: "ignore",
+        timeout: 10_000,
+      }).status === 0;
+    const kp = mirrorKeyProblems({ st, uid: process.getuid(), noPassphrase });
+    add(
+      "mirror-key",
+      kp.length ? "FAIL" : "PASS",
+      kp.length ? kp.join("; ") : "regular file, mode 600, this account's, loads unattended"
+    );
+    if (kp.length) add("mirror-push", "MISSING", "needs a valid deploy key file");
+    else if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
+      add("mirror-push", "FAIL", "publish.mirror.branch is not a plain branch name");
+    else {
+      const { mirrorSshCommand, remoteUrlProblems } = await import(join(W, "sinks/git-mirror.mjs"));
+      const env = {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_SSH_COMMAND: mirrorSshCommand(m.sshKey),
+      };
+      // ssh transport only (Codex Phase D R1 #2): no local path, file://, https or ext remote
+      const SSH_ONLY = ["-c", "protocol.allow=never", "-c", "protocol.ssh.allow=always"];
+      const run = a =>
+        spawnSync("git", [...SSH_ONLY, "-C", m.clone, ...a], {
+          env,
+          encoding: "utf8",
+          timeout: 60_000,
+        });
+      // EVERY effective URL (Codex Phase D R3: a push goes to all push URLs, get-url names only the
+      // first): exactly one fetch and one push URL, both the expected remote
+      const urls = a => {
+        const r = run(["remote", "get-url", "--all", ...a, "origin"]);
+        return r.status === 0 ? String(r.stdout).split("\n").filter(Boolean) : [];
+      };
+      const bound = remoteUrlProblems(urls([]), urls(["--push"]), m.repoUrl).length === 0;
+      const ls = bound ? run(["ls-remote", "--heads", "origin", `refs/heads/${branch}`]) : null;
+      const tip = ls?.status === 0 ? String(ls.stdout).split(/\s/)[0] : "";
+      if (!ls)
+        add(
+          "mirror-push",
+          "FAIL",
+          "the clone's origin must have exactly one fetch and one push URL, both the GitHub SSH remote of publish.mirror.repoUrl"
+        );
+      else if (ls.status !== 0)
+        add("mirror-push", "FAIL", "remote unreachable or the key not authorized (ls-remote)");
+      else if (!/^[0-9a-f]{40}$/.test(tip))
+        add("mirror-push", "MISSING", `branch ${branch} is not on the remote yet`);
+      else if (run(["cat-file", "-e", `${tip}^{commit}`]).status !== 0)
+        add(
+          "mirror-push",
+          "MISSING",
+          `the remote tip is not in the clone: git -C <clone> fetch origin ${branch}`
+        );
+      else {
+        // the remote's own tip onto itself: a no-op that still needs the push (write) permission
+        const pr = run([
+          "push",
+          "--dry-run",
+          "--porcelain",
+          "origin",
+          `${tip}:refs/heads/${branch}`,
+        ]);
+        add(
+          "mirror-push",
+          pr.status === 0 ? "PASS" : "FAIL",
+          pr.status === 0
+            ? "the key may push to the branch (dry run)"
+            : "a dry-run push was refused (a read-only key, or not authorized)"
+        );
+      }
+    }
+  }
+  if (wcfg) {
+    const repo = /^https:\/\/github\.com\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)$/.exec(
+      String(m?.repoUrl ?? "")
+    );
+    if (!repo) {
+      add("mirror-ruleset", "MISSING", "publish.mirror.repoUrl not set");
+      add("mirror-repo-isolation", "MISSING", "publish.mirror.repoUrl not set");
+      add("mirror-deploy-key", "MISSING", "publish.mirror.repoUrl not set");
+    } else {
+      // the key is this repository's write deploy key, not some other key with write access
+      // (#428 review M2); only its PUBLIC half is read, and nothing is printed
+      if (placeholder(m?.sshKey))
+        add("mirror-deploy-key", "MISSING", "publish.mirror.sshKey not set");
+      else {
+        const y = spawnSync("ssh-keygen", ["-y", "-P", "", "-f", m.sshKey], {
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        // every page (Codex Phase D R8): the matching key may come after the first 30
+        const keys = ghPages(`repos/${repo[1]}/keys`);
+        const dp = deployKeyProblems(y.status === 0 ? y.stdout : "", keys);
+        add(
+          "mirror-deploy-key",
+          dp.length ? "FAIL" : "PASS",
+          dp.length ? dp.join("; ") : "the key file is the mirror repository's write deploy key"
+        );
+      }
+      // every branch protected, not only the mirror's (Codex Phase D R5): each repository ruleset
+      // is read in full (conditions, bypass actors, rules)
+      const ghJson = path => {
+        const x = spawnSync("gh", ["api", "--hostname", "github.com", path], {
+          encoding: "utf8",
+          timeout: 30_000,
+        });
+        if (x.status !== 0) return null;
+        try {
+          return JSON.parse(x.stdout);
+        } catch {
+          return null;
+        }
+      };
+      const list = ghPages(`repos/${repo[1]}/rulesets?includes_parents=false`);
+      const full = Array.isArray(list)
+        ? list.map(r =>
+            Number.isSafeInteger(r?.id) ? ghJson(`repos/${repo[1]}/rulesets/${r.id}`) : null
+          )
+        : null;
+      // and nothing in force on the mirror branch, from any source (organization rulesets
+      // included), refuses the watcher's appends (#428 re-review; Codex Phase D R10)
+      const rp = [
+        ...allBranchRulesetProblems(full && full.every(Boolean) ? full : null),
+        ...appendBlockingProblems(ghPages(`repos/${repo[1]}/rules/branches/${branch}`)),
+      ];
+      add(
+        "mirror-ruleset",
+        rp.length ? "FAIL" : "PASS",
+        rp.length
+          ? rp.join("; ")
+          : "all branches: creation, deletion and force-push restricted, no bypass"
+      );
+      // the mirror's repository holds nothing a leaked key could reach beyond the records (DSR):
+      // Actions off, no secrets, one branch. Listing secrets needs the repository admin's gh.
+      const ip = mirrorIsolationProblems({
+        actions: ghJson(`repos/${repo[1]}/actions/permissions`),
+        // total_count counts every secret whatever the page
+        secrets: ghJson(`repos/${repo[1]}/actions/secrets`),
+        branches: ghPages(`repos/${repo[1]}/branches`),
+        branch,
+      });
+      add(
+        "mirror-repo-isolation",
+        ip.length ? "FAIL" : "PASS",
+        ip.length ? ip.join("; ") : `Actions off, no secrets, only ${branch}`
       );
     }
   }

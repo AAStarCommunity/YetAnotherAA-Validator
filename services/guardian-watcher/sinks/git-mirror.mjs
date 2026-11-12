@@ -1,5 +1,10 @@
 // GitHub mirror sink: append record files to the `disclosure-records` branch, pushed with a
-// repo-scoped deploy key held in the ssh-agent (loaded from the Keychain, never a key file).
+// repo-scoped deploy key. The key is a FILE (`sshKey`: absolute path, mode 0600, owned by the
+// watcher's account, no passphrase), used with IdentitiesOnly and no ssh-agent (DSR): a launchd job
+// after a reboot without a login has no agent, and the file sits inside the same trust boundary as
+// the Keychain (M0 §5.5a: the Mini's operator is not defended against). The key can write only this
+// repository, and the branch ruleset forbids force-push and deletion, so a leaked key can at worst
+// append commits to the mirror, which the registry and IPFS copies expose.
 //
 // Plumbing only, no working tree (Codex W2b R1 H5/H6): every read is of the FETCHED remote tree
 // and every write goes through hash-object / a private temporary index / commit-tree, so nothing
@@ -16,11 +21,13 @@
 // All git calls are argv-only (no shell).
 import { spawn } from "node:child_process";
 import { ethers } from "ethers";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, lstatSync } from "node:fs";
 import { SinkError, guarded } from "./errors.mjs";
 import { join, posix } from "node:path";
 
-function git(cwd, args, { input, env } = {}) {
+function gitRaw(cwd, args, { input, env } = {}) {
+  // the subcommand names the error, not a leading "-c k=v" (#428 review Low)
+  const sub = args.find((a, i) => a !== "-c" && args[i - 1] !== "-c") ?? "git";
   return new Promise((res, rej) => {
     const p = spawn("git", ["-C", cwd, ...args], {
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
@@ -37,7 +44,7 @@ function git(cwd, args, { input, env } = {}) {
     p.stderr.on("data", d => err.length < 64 && err.push(d));
     p.on("error", e => {
       clearTimeout(t);
-      rej(new SinkError(`git ${args[0]}: spawn failed`));
+      rej(new SinkError(`git ${sub}: spawn failed`));
     });
     p.on("close", code => {
       clearTimeout(t);
@@ -58,12 +65,33 @@ function git(cwd, args, { input, env } = {}) {
             : /\[remote rejected\]|\[rejected\]|failed to push|pre-receive hook declined/i.test(se)
               ? "push rejected by the remote"
               : `exit ${Number.isInteger(code) ? code : "signal"}`;
-      rej(new SinkError(`git ${args[0]}: ${cat}`));
+      rej(new SinkError(`git ${sub}: ${cat}`));
     });
     p.stdin.end(input ?? undefined);
   });
 }
-const text = async (...a) => (await git(...a)).toString().trim();
+/**
+ * The ssh command git uses for the mirror (DSR): only this key file, no ssh config, no agent, no
+ * prompt, and a known host key (the default ~/.ssh/known_hosts). The path must be absolute and
+ * plain (it is parsed by a shell inside git).
+ */
+export function mirrorSshCommand(sshKey) {
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(String(sshKey ?? "")) || String(sshKey).includes("/../"))
+    throw new SinkError("mirror: sshKey must be an absolute plain path");
+  return [
+    "ssh",
+    // no ssh config at all (Codex Phase D R1 #1): IdentitiesOnly still admits a configured
+    // IdentityFile, so ~/.ssh/config could otherwise supply another key
+    "-F /dev/null",
+    // IdentityFile, not -i (Codex Phase D R2): ssh drops a missing -i file and falls back to the
+    // default ~/.ssh/id_* keys; a configured IdentityFile replaces the defaults, missing or not
+    `-o IdentityFile=${sshKey}`,
+    "-o IdentitiesOnly=yes",
+    "-o IdentityAgent=none",
+    "-o BatchMode=yes",
+    "-o StrictHostKeyChecking=yes",
+  ].join(" ");
+}
 
 /** A record path: under records/, forward slashes, no empty/dot/.git/-leading segments, safe charset. */
 export function checkMirrorPath(path) {
@@ -92,12 +120,48 @@ export function gitMirror({
   remote = "origin",
   repoUrl,
   beforePush,
+  sshKey,
 }) {
   if (!clone) throw new SinkError("mirror: clone directory required");
+  // every git call of this sink, fetches and pushes alike, uses only the key file (when given;
+  // production always gives one: lib/sinks-config.mjs requires it)
+  const sshEnv = sshKey ? { GIT_SSH_COMMAND: mirrorSshCommand(sshKey) } : {};
+  // with a key, only the ssh transport (Codex Phase D R1 #2). Load-bearing (#428 review Low): a
+  // `remote.<name>.vcs` helper is used whatever get-url prints, and only this rule stops it
+  const sshOnly = sshKey ? ["-c", "protocol.allow=never", "-c", "protocol.ssh.allow=always"] : [];
+  // the key file must be there before any keyed call (a clear refusal instead of an ssh failure)
+  const keyThere = () => {
+    if (!sshKey) return;
+    let st = null;
+    try {
+      st = lstatSync(sshKey);
+    } catch {
+      st = null;
+    }
+    if (!st?.isFile()) throw new SinkError("mirror: the deploy key file is missing");
+  };
+  const git = (cwd, args, o = {}) => {
+    keyThere();
+    return gitRaw(cwd, [...sshOnly, ...args], { ...o, env: { ...sshEnv, ...(o.env ?? {}) } });
+  };
+  const text = async (...a) => (await git(...a)).toString().trim();
+  // with a key, the remote is checked at the start of every publication (each commit() fetches
+  // first), not only by Phase D (Codex Phase D R3): exactly one fetch and one push URL for
+  // `remote`, both the GitHub SSH remote of repoUrl
+  const remoteBound = async () => {
+    if (!sshKey) return;
+    const all = async extra =>
+      (await text(clone, ["remote", "get-url", "--all", ...extra, remote]))
+        .split("\n")
+        .filter(Boolean);
+    if (remoteUrlProblems(await all([]), await all(["--push"]), repoUrl).length)
+      throw new SinkError("mirror: the clone's remote is not the GitHub SSH remote of repoUrl");
+  };
   if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-"))
     throw new SinkError("mirror: bad branch name");
   const tracking = `refs/watcher/${branch}`; // our own ref: nothing else updates it
   const fetchTip = async () => {
+    await remoteBound();
     await git(clone, [
       "fetch",
       "--quiet",
@@ -174,6 +238,10 @@ export function gitMirror({
       rmSync(tmp, { recursive: true, force: true });
     }
     if (beforePush) await beforePush();
+    // again right before the push (#428 review Low): the destination is resolved anew by git, so a
+    // config change while the commit was built is refused, not followed. A change in the instant
+    // between this check and git's own read needs local control of the account (M0 §5.5a item 1)
+    await remoteBound();
     // Fast-forward only, and only from the tip we built on (lease), never forced.
     await git(clone, [
       "push",
@@ -202,3 +270,40 @@ export const PUBLIC_REPO_URL = /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Z
 /** A blob URL in such a repository, as gitMirror builds it. */
 export const MIRROR_BLOB_URL =
   /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/blob\/[0-9a-f]{4,40}\/[A-Za-z0-9._\/-]{1,300}$/;
+
+/**
+ * The SSH remote the mirror must push to for its public `repoUrl` (Codex Phase D R1 #2): the
+ * clone's effective fetch AND push URLs (after any insteadOf rewrite) must be one of these, so a
+ * local path, an HTTPS remote or a separate pushurl cannot stand in for the deploy key's write.
+ */
+export function expectedMirrorRemotes(repoUrl) {
+  const m = /^https:\/\/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?$/.exec(
+    String(repoUrl ?? "")
+  );
+  if (!m) return null;
+  const path = `${m[1]}/${m[2]}`.toLowerCase();
+  return [`git@github.com:${path}.git`, `ssh://git@github.com/${path}.git`];
+}
+/**
+ * The mirror clone's remote, as `get-url --all` (fetch) and `get-url --all --push` print it: exactly
+ * one URL each, both the GitHub SSH remote of repoUrl (Codex Phase D R2/R3; shared by the sink and
+ * Phase D). Returns the problems, in fixed wording.
+ */
+export function remoteUrlProblems(fetchUrls, pushUrls, repoUrl) {
+  const problems = [];
+  for (const [n, u] of [
+    ["fetch", fetchUrls],
+    ["push", pushUrls],
+  ]) {
+    if (!Array.isArray(u) || u.length !== 1) problems.push(`not exactly one ${n} URL`);
+    else if (!isExpectedMirrorRemote(u[0], repoUrl))
+      problems.push(`the ${n} URL is not the GitHub SSH remote of repoUrl`);
+  }
+  return problems;
+}
+export const isExpectedMirrorRemote = (url, repoUrl) =>
+  !!expectedMirrorRemotes(repoUrl)?.includes(
+    String(url ?? "")
+      .trim()
+      .toLowerCase()
+  );

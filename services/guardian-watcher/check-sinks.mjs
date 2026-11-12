@@ -3,7 +3,7 @@
 // registry signer. No network, no real credentials. Live provider cells are separate (pre-go-live).
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1496,6 +1496,341 @@ try {
       range.pending === 7,
     { to: t.to, value: t.value, nonce: t.nonce, chain, capped, role, range }
   );
+}
+
+// ---- DSR (Phase D mirror key): every git call of the mirror uses only the deploy key file, never
+// the ssh-agent; a non-plain key path is refused
+{
+  const { mirrorSshCommand } = await import("./sinks/git-mirror.mjs");
+  const d = mkdtempSync(join(tmpdir(), "mirror-ssh-"));
+  const bin = join(d, "bin");
+  mkdirSync(bin);
+  const log = join(d, "ssh.log");
+  // a fake ssh on PATH: records its argv, then fails as an unreachable remote would
+  writeFileSync(join(bin, "ssh"), `#!/bin/sh\necho "$@" >> ${log}\nexit 255\n`, { mode: 0o755 });
+  const clone = join(d, "m.git");
+  execFileSync("git", ["init", "-q", "--bare", clone]);
+  execFileSync("git", ["-C", clone, "remote", "add", "origin", "git@github.com:o/r.git"]);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  const key = join(d, "deploy_key");
+  writeFileSync(key, "not a real key\n", { mode: 0o600 }); // the fake ssh never reads it
+  // Codex Phase D R2: a missing key file is refused before ssh runs (no fallback to default keys)
+  let missingErr = null;
+  process.env.PATH = `${bin}:${process.env.PATH}`;
+  try {
+    await gitMirror({ clone, repoUrl: "https://github.com/o/r", sshKey: join(d, "gone") }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    missingErr = e.message;
+  } finally {
+    process.env.PATH = process.env.PATH.slice(bin.length + 1);
+  }
+  let sshRanForMissing = true;
+  try {
+    readFileSync(log, "utf8");
+  } catch {
+    sshRanForMissing = false;
+  }
+  let err = null;
+  try {
+    await gitMirror({ clone, repoUrl: "https://github.com/o/r", sshKey: key }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    err = e.message;
+  } finally {
+    process.env.PATH = oldPath;
+  }
+  let argv = "";
+  try {
+    argv = readFileSync(log, "utf8");
+  } catch {
+    argv = "";
+  }
+  const refused = [];
+  for (const k of ["relative/key", "/tmp/a b", "/tmp/../k", "/tmp/k;rm"]) {
+    try {
+      mirrorSshCommand(k);
+      refused.push(false);
+    } catch {
+      refused.push(true);
+    }
+  }
+  cell(
+    "DSR mirror key: the mirror's git calls run ssh with only the key file (IdentityFile, no ssh config, IdentitiesOnly, no agent, batch, strict host key); non-plain key paths are refused",
+    argv.includes("-F /dev/null") &&
+      argv.includes(`-o IdentityFile=${key}`) &&
+      !/(^| )-i /.test(argv) &&
+      argv.includes("IdentitiesOnly=yes") &&
+      argv.includes("IdentityAgent=none") &&
+      argv.includes("BatchMode=yes") &&
+      argv.includes("StrictHostKeyChecking=yes") &&
+      /remote unreachable or not authorized/.test(err ?? "") &&
+      /deploy key file is missing/.test(missingErr ?? "") &&
+      sshRanForMissing === false &&
+      refused.every(Boolean),
+    { argv, err, refused, missingErr, sshRanForMissing }
+  );
+  // Codex Phase D R1 #2: with a key the sink pushes over ssh only (a local or file:// remote is
+  // refused, never taken without the key); the Phase D remote match accepts only the GitHub SSH
+  // remote of repoUrl
+  const { expectedMirrorRemotes, isExpectedMirrorRemote } = await import("./sinks/git-mirror.mjs");
+  const upstream = join(d, "up.git");
+  execFileSync("git", ["init", "-q", "--bare", upstream]);
+  {
+    // the branch exists upstream, so only the transport rule can make the keyed push fail
+    const empty = execFileSync("git", [
+      "-C",
+      upstream,
+      "hash-object",
+      "-t",
+      "tree",
+      "-w",
+      "/dev/null",
+    ])
+      .toString()
+      .trim();
+    const root = execFileSync("git", [
+      "-C",
+      upstream,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit-tree",
+      empty,
+      "-m",
+      "r",
+    ])
+      .toString()
+      .trim();
+    execFileSync("git", ["-C", upstream, "update-ref", "refs/heads/disclosure-records", root]);
+  }
+  const mk = () => {
+    const c = mkdtempSync(join(d, "l-"));
+    execFileSync("git", ["init", "-q", "--bare", c]);
+    execFileSync("git", ["-C", c, "remote", "add", "origin", upstream]);
+    return c;
+  };
+  const local = mk();
+  let control = "ok";
+  try {
+    await gitMirror({ clone: mk(), repoUrl: "https://github.com/o/r" }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    control = e.message;
+  }
+  let localErr = null;
+  try {
+    await gitMirror({ clone: local, repoUrl: "https://github.com/o/r", sshKey: key }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    localErr = e.message;
+  }
+  // Codex Phase D R3: a second push URL (pushes go to all of them) is refused at run time too
+  const extra = mk();
+  execFileSync("git", ["-C", extra, "remote", "set-url", "origin", "git@github.com:o/r.git"]);
+  execFileSync("git", [
+    "-C",
+    extra,
+    "config",
+    "--add",
+    "remote.origin.pushurl",
+    "git@github.com:o/r.git",
+  ]);
+  execFileSync("git", [
+    "-C",
+    extra,
+    "config",
+    "--add",
+    "remote.origin.pushurl",
+    "git@other.example:o/r.git",
+  ]);
+  let extraErr = null;
+  try {
+    await gitMirror({ clone: extra, repoUrl: "https://github.com/o/r", sshKey: key }).commit(
+      "records/bls/k.json",
+      Buffer.from("{}"),
+      "k"
+    );
+  } catch (e) {
+    extraErr = e.message;
+  }
+  const R = "https://github.com/AAStar/Repo";
+  const match = {
+    scp: isExpectedMirrorRemote("git@github.com:aastar/repo.git", R),
+    sshUrl: isExpectedMirrorRemote("ssh://git@github.com/AAStar/Repo.git", R),
+    https: isExpectedMirrorRemote("https://github.com/AAStar/Repo.git", R),
+    path: isExpectedMirrorRemote("/tmp/up.git", R),
+    other: isExpectedMirrorRemote("git@github.com:evil/repo.git", R),
+    noRepo: expectedMirrorRemotes("not a url"),
+  };
+  cell(
+    "Codex Phase D R1 #2: a key-bound mirror refuses a non-ssh remote (local path); only the GitHub SSH remote of repoUrl matches",
+    control === "ok" &&
+      typeof localErr === "string" &&
+      !/deploy key file is missing/.test(localErr) &&
+      /remote is not the GitHub SSH remote/.test(extraErr ?? "") &&
+      match.scp &&
+      match.sshUrl &&
+      !match.https &&
+      !match.path &&
+      !match.other &&
+      match.noRepo === null,
+    { control, localErr, extraErr, match }
+  );
+  rmSync(d, { recursive: true, force: true });
+}
+
+// ---- #428 review Lows: an end-to-end keyed publication through a local "GitHub" (a fake ssh that
+// runs git's own upload/receive-pack in a directory); a pushurl changed while the commit is built is
+// refused before the push; a remote.<name>.vcs helper never runs; a key path that is a directory is
+// refused; remoteUrlProblems requires exactly one URL each way
+{
+  const { remoteUrlProblems } = await import("./sinks/git-mirror.mjs");
+  const d = mkdtempSync(join(tmpdir(), "mirror-e2e-"));
+  const bin = join(d, "bin");
+  mkdirSync(bin);
+  const gh = join(d, "gh");
+  mkdirSync(join(gh, "o"), { recursive: true });
+  const up = join(gh, "o", "r.git");
+  execFileSync("git", ["init", "-q", "--bare", up]);
+  const empty = execFileSync("git", ["-C", up, "hash-object", "-t", "tree", "-w", "/dev/null"])
+    .toString()
+    .trim();
+  const root = execFileSync("git", [
+    "-C",
+    up,
+    "-c",
+    "user.name=t",
+    "-c",
+    "user.email=t@t",
+    "commit-tree",
+    empty,
+    "-m",
+    "r",
+  ])
+    .toString()
+    .trim();
+  execFileSync("git", ["-C", up, "update-ref", "refs/heads/disclosure-records", root]);
+  const hosts = join(d, "hosts.log");
+  // the last argument is the remote command (git-upload-pack 'o/r.git'); the host is logged
+  writeFileSync(
+    join(bin, "ssh"),
+    `#!/bin/sh\nfor a; do last="$a"; done\nfor a; do case "$a" in *@*) echo "$a" >> ${hosts};; esac; done\ncd ${gh} && eval "$last"\n`,
+    { mode: 0o755 }
+  );
+  const vcsLog = join(d, "vcs.log");
+  writeFileSync(join(bin, "git-remote-foo"), `#!/bin/sh\necho ran >> ${vcsLog}\nexit 1\n`, {
+    mode: 0o755,
+  });
+  const key = join(d, "deploy_key");
+  writeFileSync(key, "x\n", { mode: 0o600 });
+  const mk = (extra = []) => {
+    const c = mkdtempSync(join(d, "c-"));
+    execFileSync("git", ["init", "-q", "--bare", c]);
+    execFileSync("git", ["-C", c, "remote", "add", "origin", "git@github.com:o/r.git"]);
+    for (const [k, v] of extra) execFileSync("git", ["-C", c, "config", "--add", k, v]);
+    return c;
+  };
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  let n = 0;
+  const run = async (clone, o = {}) => {
+    try {
+      const r = await gitMirror({
+        clone,
+        repoUrl: "https://github.com/o/r",
+        sshKey: key,
+        ...o,
+      }).commit(`records/bls/e2e-${(n += 1)}.json`, Buffer.from("{}"), "e2e");
+      return r?.commit ? "ok" : "no commit";
+    } catch (e) {
+      return e.message;
+    }
+  };
+  let ok, redirected, vcs, dirKey;
+  try {
+    ok = await run(mk());
+    const c2 = mk();
+    redirected = await run(c2, {
+      beforePush: async () => {
+        execFileSync("git", [
+          "-C",
+          c2,
+          "config",
+          "remote.origin.pushurl",
+          "git@other.example:o/r.git",
+        ]);
+      },
+    });
+    vcs = await run(mk([["remote.origin.vcs", "foo"]]));
+    const dk = join(d, "keydir");
+    mkdirSync(dk);
+    dirKey = await run(mk(), { sshKey: dk });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+  let hostsSeen = "";
+  try {
+    hostsSeen = readFileSync(hosts, "utf8");
+  } catch {
+    hostsSeen = "";
+  }
+  let vcsRan = true;
+  try {
+    readFileSync(vcsLog, "utf8");
+  } catch {
+    vcsRan = false;
+  }
+  const urls = {
+    one: remoteUrlProblems(
+      ["git@github.com:o/r.git"],
+      ["git@github.com:o/r.git"],
+      "https://github.com/o/r"
+    ),
+    twoPush: remoteUrlProblems(
+      ["git@github.com:o/r.git"],
+      ["git@github.com:o/r.git", "git@github.com:o/r.git"],
+      "https://github.com/o/r"
+    ),
+    noFetch: remoteUrlProblems([], ["git@github.com:o/r.git"], "https://github.com/o/r"),
+    other: remoteUrlProblems(
+      ["git@github.com:o/r.git"],
+      ["git@x.example:o/r.git"],
+      "https://github.com/o/r"
+    ),
+  };
+  cell(
+    "#428 Lows: a keyed publication reaches a local GitHub end to end; a pushurl changed while building is refused before the push (never reaches the other host); a remote vcs helper never runs; a key path that is a directory is refused; exactly one fetch and one push URL",
+    ok === "ok" &&
+      /remote is not the GitHub SSH remote/.test(redirected ?? "") &&
+      !hostsSeen.includes("other.example") &&
+      typeof vcs === "string" &&
+      vcs !== "ok" &&
+      // the error names the subcommand, not a leading "-c" (#428 review Low)
+      /^git fetch: /.test(vcs) &&
+      vcsRan === false &&
+      /deploy key file is missing/.test(dirKey ?? "") &&
+      urls.one.length === 0 &&
+      urls.twoPush.length === 1 &&
+      urls.noFetch.length === 1 &&
+      urls.other.length === 1,
+    { ok, redirected, hostsSeen, vcs, vcsRan, dirKey, urls }
+  );
+  rmSync(d, { recursive: true, force: true });
 }
 
 let failed = 0;

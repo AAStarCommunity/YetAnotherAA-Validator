@@ -14,9 +14,16 @@ disclosure, not the Mini's operator (M0 §5.5).
 - The Mac Mini, logged in as the user that will run the watcher (`id -un`).
 - `node` at `/opt/homebrew/bin/node` (the wrapper's PATH), `gh` logged in,
   `git`, `docker`.
-- The step-13 manifest is published: you have the DVTValidator, BLSAggregator,
-  SuperPaymaster, DisclosureRegistry, owner Safe and deployer addresses, every
-  guardian address, and the SP rc.8 release tag's full commit.
+- **The sender comes first.** DisclosureRegistry's `WRITER` is fixed when the
+  registry is deployed (an immutable constructor argument), so the watcher
+  sender is generated before it: do steps 1–3 first, then send the sender
+  **address** (public) to DSR, who passes it to SP for the step-13 manifest's
+  `disclosureRegistry.WRITER`. The registry is deployed with it.
+- After that the step-13 manifest is published: you have the DVTValidator,
+  BLSAggregator, SuperPaymaster, DisclosureRegistry (with its deployment block),
+  owner Safe and deployer addresses, every guardian address, and the SP rc.8
+  release tag's full commit. Steps 4 onwards use it; the registry fields are
+  filled only once the registry is deployed.
 - Do **not** send any transaction from
   `0xb5600060e6de5E11D3636731964218E53caadf0E` (D). Use senders A or E only
   after SP confirms.
@@ -63,8 +70,9 @@ cd $REPO && node deploy/guardian-watcher/new-sender-keystore.mjs
 
 It prints the new **sender address** only and writes
 `~/.aoa-watcher/sender.keystore.json` (mode 600). It refuses to overwrite an
-existing keystore. The sender must not be a guardian, the owner Safe or the
-deployer (`sender-keystore`). Fund it with at least 0.05 Sepolia ETH
+existing keystore. Send the address to DSR now (step 0): the registry is
+deployed with it as `WRITER`. The sender must not be a guardian, the owner Safe
+or the deployer (`sender-keystore`). Fund it with at least 0.05 Sepolia ETH
 (`sender-balance`, `sender.minBalanceWei`), from a sender SP has confirmed
 (never D).
 
@@ -86,9 +94,82 @@ manifest (public data only): `aggregator`, `roles.superPaymaster`,
 `fromBlock`, the deployer, and `maxFeePerGas`: the absolute fee ceiling in wei
 as a decimal string; its `keystore` must be the same file as `phase-d.json`
 `sender.keystore`), the Pinata gateway, the Telegram chat id. Keep
-`publish.enabled: true` (`watcher-publish`). The git mirror needs a bare clone
-whose push key is in the ssh-agent:
-`git clone --bare git@github.com:AAStarCommunity/YetAnotherAA-Validator.git ~/.aoa-watcher/mirror.git`.
+`publish.enabled: true` (`watcher-publish`).
+
+**The git mirror lives in its own repository** (DSR), never in this one: this
+repository runs GitHub Actions with secrets, and a deploy key with write access
+could push a branch carrying a modified workflow that runs with those secrets.
+The mirror repository has no code, no Actions and no secrets, and one branch.
+
+Its **deploy key** is a key file, not the ssh-agent: a launchd job started after
+a reboot without a login has no agent. The file lies inside the same trust
+boundary as the Keychain (M0 §5.5a: the Mini's operator is not defended
+against). What a leaked key can do: write to the mirror repository only. The
+rulesets below keep every branch's history (no force-push, no deletion) and
+allow no new branch or tag; a new commit can still change or delete record files
+in the branch's latest tree, so a record is judged by the registry's
+`recordHash` and its IPFS CID, never by the mirror alone. This repository and
+its secrets are outside the key's reach.
+
+1. **The repository** (an organization admin; the name is yours, the commands
+   use `aoa-disclosure-records`):
+
+   ```sh
+   R=AAStarCommunity/aoa-disclosure-records
+   gh repo create $R --public --description "Guardian watcher disclosure records (mirror; no code)"
+   gh api -X PUT repos/$R/actions/permissions -F enabled=false     # Actions off
+   gh api repos/$R/actions/secrets --jq .total_count               # expect 0; never add one
+   ```
+
+2. **The key file and GitHub's host key:**
+
+   ```sh
+   ssh-keygen -t ed25519 -N "" -C "aoa-watcher mirror $(id -un)@$(hostname -s)" -f ~/.aoa-watcher/mirror_deploy_key
+   chmod 600 ~/.aoa-watcher/mirror_deploy_key
+   cat ~/.aoa-watcher/mirror_deploy_key.pub        # public: the deploy key below
+   ssh-keyscan -t ed25519 github.com > ~/.aoa-watcher/github-host-key
+   ssh-keygen -lf ~/.aoa-watcher/github-host-key
+   # compare that SHA256 fingerprint with GitHub's published one:
+   # https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+   # only if it matches (otherwise delete the file and stop):
+   cat ~/.aoa-watcher/github-host-key >> ~/.ssh/known_hosts && rm ~/.aoa-watcher/github-host-key
+   ```
+
+3. **The deploy key, on the mirror repository only:** its Settings → Deploy keys
+   → Add deploy key, paste the `.pub` line, **tick "Allow write access"**. Never
+   add it to any other repository.
+
+4. **The bare clone and the branch**, an empty root commit (records only; the
+   watcher only ever appends to it), with that key only:
+
+   ```sh
+   export GIT_SSH_COMMAND="ssh -F /dev/null -o IdentityFile=$HOME/.aoa-watcher/mirror_deploy_key -o IdentitiesOnly=yes -o IdentityAgent=none"
+   git clone --bare git@github.com:$R.git ~/.aoa-watcher/mirror.git     # an empty repository: a warning is expected
+   M=~/.aoa-watcher/mirror.git
+   ROOT=$(git -C $M -c user.name=aoa-watcher -c user.email=aoa-watcher@localhost \
+     commit-tree $(git -C $M hash-object -t tree -w /dev/null) -m "disclosure records")
+   git -C $M push origin "$ROOT:refs/heads/disclosure-records"
+   git -C $M fetch origin disclosure-records
+   unset GIT_SSH_COMMAND
+   ```
+
+5. **The ruleset**, after the branch exists (it forbids creating branches): the
+   mirror repository's Settings → Rules → Rulesets → New branch ruleset, target
+   **All branches**, enforcement **Active**, rules **Restrict creations**,
+   **Restrict deletions** and **Block force pushes**, no pull-request
+   requirement, no bypass list. And a tag ruleset: target **All tags**, Active,
+   **Restrict creations**, **Restrict updates**, **Restrict deletions**, no
+   bypass list (the mirror uses no tags; Phase D does not check this one).
+
+In `config.json`: `publish.mirror.repoUrl` is
+`https://github.com/<the mirror repository>` and `publish.mirror.sshKey` the key
+file's absolute path (`/Users/<you>/.aoa-watcher/mirror_deploy_key`). Phase D
+checks the key file (`mirror-key`), a dry-run push with it (`mirror-push`), that
+it is the mirror repository's write deploy key (`mirror-deploy-key`), the
+ruleset (`mirror-ruleset`) and the repository's isolation
+(`mirror-repo-isolation`: Actions off, no secrets, one branch). Listing the
+secrets and a ruleset's bypass list both need the mirror repository's admin, so
+run Phase D with that admin's `gh`: without it, both checks fail, never pass.
 
 ## 5. The Phase D config
 
@@ -177,24 +258,29 @@ cd $REPO && npm run -s check:phase-d -- --config ~/.aoa-watcher/phase-d.json
 It exits **0 only when every line is PASS** (`N PASS, 0 FAIL, 0 MISSING`). Each
 line:
 
-| id                                                        | PASS means                                                                                                                                                                                                                                                                           |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `keychain:account`, `keychain:<item>`                     | the six Keychain items of step 2 exist under `aoa-watcher`                                                                                                                                                                                                                           |
-| `watcher-config`                                          | `~/.aoa-watcher/config.json` loads with the watcher's own validation and its data dir is writable                                                                                                                                                                                    |
-| `watcher-publish`                                         | publication is enabled, the watcher's publish config validates, and it uses `sender.keystore` and the Keychain items of step 2                                                                                                                                                       |
-| `sender-keystore`                                         | encrypted, mode 600, decrypts with the Keychain password, address not a guardian / owner Safe / deployer, not SP's guardian                                                                                                                                                          |
-| `sender-balance`                                          | the sender holds at least `sender.minBalanceWei`                                                                                                                                                                                                                                     |
-| `launchd-off:<job>`                                       | the committee keeper and apply-rotation jobs are not loaded                                                                                                                                                                                                                          |
-| `launchd-on:<job>`                                        | the watcher and the heartbeat are loaded and running with a pid                                                                                                                                                                                                                      |
-| `watcher-job-binding`                                     | the job runs exactly `~/.aoa-watcher/run-watcher.sh`, which is byte-for-byte the template with the two values; the live pid is `node <$REPO watcher.mjs> --config <config>` with the Keychain RPCs in its environment; the process started after every checked file was last changed |
-| `node-compose`, `node-discovery:*`, `node-unclassified:*` | the compose file is the deployment's, every running container is a DVT node or listed in `notDvt`                                                                                                                                                                                    |
-| `node-slash-off:<container>`                              | `AUDIT_ENABLED=false` and `AUDIT_EXECUTE_SLASH=false` explicitly in the container's environment                                                                                                                                                                                      |
-| `rpc-primary`, `rpc-second`                               | right chain id, trace capability positively verified                                                                                                                                                                                                                                 |
-| `rpc-independent`                                         | two declared operators on two different hosts                                                                                                                                                                                                                                        |
-| `release-mode`                                            | no `PHASE_D_RPC_*` override (a dry run is never a release acceptance)                                                                                                                                                                                                                |
-| `chain-id`                                                | `chainId` is set                                                                                                                                                                                                                                                                     |
-| `onchain:binding` and the on-chain facts                  | the contracts equal the watcher config; `aggregator.DVT_VALIDATOR == dvtValidator`, `categoryCount == 0`, `fraudProofVerifier == 0`, owner is the Safe                                                                                                                               |
-| `release:spCommit`, `evidence:spParity`, `evidence:a3`    | the release commit is set and both evidence reports pass for it                                                                                                                                                                                                                      |
+| id                                                        | PASS means                                                                                                                                                                                                                                                                                                                                             |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `keychain:account`, `keychain:<item>`                     | the six Keychain items of step 2 exist under `aoa-watcher`                                                                                                                                                                                                                                                                                             |
+| `watcher-config`                                          | `~/.aoa-watcher/config.json` loads with the watcher's own validation and its data dir is writable                                                                                                                                                                                                                                                      |
+| `watcher-publish`                                         | publication is enabled, the watcher's publish config validates, and it uses `sender.keystore` and the Keychain items of step 2                                                                                                                                                                                                                         |
+| `sender-keystore`                                         | encrypted, mode 600, decrypts with the Keychain password, address not a guardian / owner Safe / deployer, not SP's guardian                                                                                                                                                                                                                            |
+| `sender-balance`                                          | the sender holds at least `sender.minBalanceWei`                                                                                                                                                                                                                                                                                                       |
+| `launchd-off:<job>`                                       | the committee keeper and apply-rotation jobs are not loaded                                                                                                                                                                                                                                                                                            |
+| `launchd-on:<job>`                                        | the watcher and the heartbeat are loaded and running with a pid                                                                                                                                                                                                                                                                                        |
+| `watcher-job-binding`                                     | the job runs exactly `~/.aoa-watcher/run-watcher.sh`, which is byte-for-byte the template with the two values; the live pid is `node <$REPO watcher.mjs> --config <config>` with the Keychain RPCs in its environment; the process started after every checked file was last changed                                                                   |
+| `node-compose`, `node-discovery:*`, `node-unclassified:*` | the compose file is the deployment's, every running container is a DVT node or listed in `notDvt`                                                                                                                                                                                                                                                      |
+| `node-slash-off:<container>`                              | `AUDIT_ENABLED=false` and `AUDIT_EXECUTE_SLASH=false` explicitly in the container's environment                                                                                                                                                                                                                                                        |
+| `rpc-primary`, `rpc-second`                               | right chain id, trace capability positively verified                                                                                                                                                                                                                                                                                                   |
+| `rpc-independent`                                         | two declared operators on two different hosts                                                                                                                                                                                                                                                                                                          |
+| `release-mode`                                            | no `PHASE_D_RPC_*` override (a dry run is never a release acceptance)                                                                                                                                                                                                                                                                                  |
+| `chain-id`                                                | `chainId` is set                                                                                                                                                                                                                                                                                                                                       |
+| `onchain:binding` and the on-chain facts                  | the contracts equal the watcher config; `aggregator.DVT_VALIDATOR == dvtValidator`, `categoryCount == 0`, `fraudProofVerifier == 0`, owner is the Safe                                                                                                                                                                                                 |
+| `mirror-key`                                              | `publish.mirror.sshKey` is a regular file (not a symlink), mode 600, owned by this account, and loads without a passphrase                                                                                                                                                                                                                             |
+| `mirror-push`                                             | with that key only (no agent), `ls-remote` finds the branch and a dry-run push of its own tip is accepted (the key may write)                                                                                                                                                                                                                          |
+| `mirror-deploy-key`                                       | the key file's public key is a deploy key of the mirror repository with write access (`gh api repos/<r>/keys`), not some other key that can write                                                                                                                                                                                                      |
+| `mirror-ruleset`                                          | an active repository ruleset on **all** branches (`~ALL`, no exclusion, bypass list read and empty) restricts creation, deletion and force-pushes; and nothing in force on the mirror branch from any source (organization rulesets included) adds a rule that would refuse the watcher's appends (update, pull request, status checks, signatures...) |
+| `mirror-repo-isolation`                                   | the mirror repository has Actions disabled, no Actions secrets, and exactly one branch (needs the repository admin's `gh`)                                                                                                                                                                                                                             |
+| `release:spCommit`, `evidence:spParity`, `evidence:a3`    | the release commit is set and both evidence reports pass for it                                                                                                                                                                                                                                                                                        |
 
 A MISSING line names what is not set or not reachable; a FAIL line names what is
 wrong. Fix it, restart the watcher if a watched file changed (step 7), and run
@@ -333,3 +419,29 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.aastar.aoa-watcher.pl
 
 Once the fill is consumed at the finalized block, the waiting record is archived
 and disclosed again on the new registry as usual.
+
+## The mirror deploy key: rotation and a leak
+
+**Rotation** (the author decides when):
+
+1. generate a new key file next to the old one
+   (`ssh-keygen -t ed25519 -N "" -f ~/.aoa-watcher/mirror_deploy_key.new`,
+   `chmod 600`);
+2. add its `.pub` as a new deploy key **with write access**, on the mirror
+   repository only;
+3. stop the watcher, move the new file over `mirror_deploy_key`, start the
+   watcher, and run Phase D (`mirror-key`, `mirror-push` must pass);
+4. delete the **old** deploy key on the mirror repository, and delete the old
+   file.
+
+**A leak** (the file was copied, or the Mini's account is suspected):
+
+1. delete the deploy key on the mirror repository at once: it can no longer
+   push. It never had access to any other repository;
+2. compare the mirror with the records: the history is intact (no force-push, no
+   deletion, no new branch), so compare every record file in the latest tree
+   with its journal, its IPFS CID and the registry's `recordHash`, and restore
+   any changed or deleted file with a new commit, never by a force-push;
+3. rotate as above (a new key file and deploy key). If the Mini's account itself
+   is suspected, the sender key and the Keychain items are suspect too: follow
+   M0 §5.5a (a leaked sender key) as well.
