@@ -209,16 +209,52 @@ async function main() {
   } catch {
     die(78, "config is missing or not JSON");
   }
-  const cp = configProblems(cfg);
-  if (cp.length) die(78, `config: ${cp.join("; ")}`);
-  const stateDir = tilde(cfg.stateDir);
-  const secrets = tilde(cfg.secretsDir);
+  // Reporting needs only four config fields, checked on their own: a state directory and a
+  // secrets directory (absolute plain paths, the state directory 0700 and ours), a lock port, and
+  // telegram (null or a chat id). If any of those is broken the job cannot report safely and
+  // exits with stderr only; every OTHER failure from here on is reported (clestons B2, Codex R6).
+  const stateDir = tilde(cfg?.stateDir);
+  const secrets = tilde(cfg?.secretsDir);
+  const lockOk =
+    Number.isSafeInteger(cfg?.lockPort) && cfg.lockPort >= 1024 && cfg.lockPort <= 65535;
+  const tgOk = cfg?.telegram === null || /^-?[0-9]+$/.test(String(cfg?.telegram?.chatId ?? ""));
+  if (!okDir(stateDir) || !okDir(secrets) || !lockOk || !tgOk)
+    die(78, `config: ${configProblems(cfg).join("; ") || "unusable for reporting"}`);
   const dp = dirProblems(
     existsSync(stateDir) ? lstatSync(stateDir) : null,
     process.getuid(),
     "state directory"
   );
   if (dp.length) die(78, `state directory: ${dp.join("; ")}`);
+
+  // one instance: an OS-held lock (a listening socket on 127.0.0.1:lockPort), taken FIRST. The
+  // kernel releases it when the process dies. A process that does not get it touches nothing
+  // shared: it exits 75 and writes only its own lock-loser note (Codex R6 P2).
+  const lockServer = createServer();
+  const locked = await new Promise(resolve => {
+    lockServer.once("error", () => resolve(false));
+    lockServer.listen({ host: "127.0.0.1", port: cfg.lockPort, exclusive: true }, () =>
+      resolve(true)
+    );
+  });
+  if (!locked) {
+    try {
+      writeDurable(join(stateDir, "lock-loser.json"), {
+        at: new Date().toISOString(),
+        note: `another run holds the lock (127.0.0.1:${cfg.lockPort})`,
+      });
+    } catch {
+      /* best effort */
+    }
+    die(75, `another run holds the lock (127.0.0.1:${cfg.lockPort})`);
+  }
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    lockServer.close();
+  };
+
   const statusPath = join(stateDir, "status.json");
   // `label` is fixed text for the operator; the reason comes from our own checks (SafeError)
   const secret = (n, label) => {
@@ -228,9 +264,11 @@ async function main() {
       throw new SafeError(`${label}: ${isOurs(e) ? e.message : "unreadable"}`);
     }
   };
-  // failures from here on are not silent (clestons B2): a minimal status.json, and once the bot
-  // token is read, a "startup:" alert (re-alerted at most every realertMinutes) before exiting
+  // failures from here on are not silent: a minimal status.json, and once the bot token is read,
+  // a "startup:" alert (re-alerted at most every realertMinutes), all while the lock is held
   let token = null;
+  const realert =
+    Number.isSafeInteger(cfg.realertMinutes) && cfg.realertMinutes > 0 ? cfg.realertMinutes : 60;
   const fatal = async (code, text) => {
     try {
       writeDurable(statusPath, {
@@ -246,22 +284,25 @@ async function main() {
       const stampPath = join(stateDir, "startup-alerts.json");
       let stamps = {};
       try {
-        stamps = JSON.parse(readFileSync(stampPath, "utf8"));
+        const j = JSON.parse(readFileSync(stampPath, "utf8"));
+        // a plain map of key -> timestamp, or nothing (Codex R6 P3)
+        if (j && typeof j === "object" && !Array.isArray(j))
+          for (const [k, v] of Object.entries(j)) if (Number.isFinite(v)) stamps[k] = v;
       } catch {
         stamps = {};
       }
       const box = { chainId: cfg.chainId, alerts: stamps };
-      await deliver(
-        box,
-        [{ key: `startup:${text}`, text: `startup: ${text}` }],
-        cfg,
-        token,
-        Date.now()
-      );
       try {
+        await deliver(
+          box,
+          [{ key: `startup:${text}`, text: `startup: ${text}` }],
+          { ...cfg, realertMinutes: realert },
+          token,
+          Date.now()
+        );
         writeDurable(stampPath, box.alerts);
       } catch {
-        /* best effort */
+        /* best effort: the exit code and status still carry it */
       }
     }
     die(code, text);
@@ -271,6 +312,9 @@ async function main() {
   } catch (e) {
     await fatal(78, safeText("secrets", e));
   }
+  // the rest of the config, now that a failure can be reported
+  const cp = configProblems(cfg);
+  if (cp.length) await fatal(78, `config: ${cp.join("; ")}`);
   let wallet;
   let providers;
   try {
@@ -290,23 +334,6 @@ async function main() {
   } catch (e) {
     await fatal(78, safeText("secrets", e));
   }
-
-  // one instance: an OS-held lock (a listening socket on 127.0.0.1:lockPort). The kernel releases
-  // it when the process dies, so there is no stale lock to take over and no takeover race.
-  const lockServer = createServer();
-  const locked = await new Promise(resolve => {
-    lockServer.once("error", () => resolve(false));
-    lockServer.listen({ host: "127.0.0.1", port: cfg.lockPort, exclusive: true }, () =>
-      resolve(true)
-    );
-  });
-  if (!locked) await fatal(75, `another run holds the lock (127.0.0.1:${cfg.lockPort})`);
-  let released = false;
-  const release = () => {
-    if (released) return;
-    released = true;
-    lockServer.close();
-  };
 
   const statePath = join(stateDir, "state.json");
   try {
@@ -390,8 +417,7 @@ async function main() {
     return result.alerts.length || !delivery.ok ? 1 : 0;
   } catch (e) {
     // anything before or around the round (no provider, unreadable or inconsistent state, cap or
-    // address mismatch) alerts instead of exiting silently
-    release();
+    // address mismatch) alerts instead of exiting silently; the lock is still held while it does
     await fatal(1, safeText("startup", e));
   } finally {
     release();

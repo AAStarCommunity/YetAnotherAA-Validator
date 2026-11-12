@@ -959,6 +959,7 @@ await section(async () => {
     again
   );
   // the lock: a second process while the port is held exits 75 without touching the state
+  const statusBefore = readFileSync(join(home, "state/status.json"), "utf8");
   const holder = createServer().listen({ host: "127.0.0.1", port: cfg.lockPort, exclusive: true });
   await new Promise(r => holder.once("listening", r));
   const locked = cli([]);
@@ -968,11 +969,22 @@ await section(async () => {
     locked.code === 75 && /holds the lock/.test(locked.out),
     locked
   );
-  const lockStatus = JSON.parse(readFileSync(join(home, "state/status.json"), "utf8"));
+  const loser = JSON.parse(readFileSync(join(home, "state/lock-loser.json"), "utf8"));
   cell(
-    "CLI: a startup failure (lock held) is not silent: status.json names it (clestons B2)",
-    /holds the lock/.test(lockStatus.startup ?? ""),
-    lockStatus
+    "CLI: the lock loser leaves the owner's status.json untouched and notes itself apart (Codex R6 P2)",
+    readFileSync(join(home, "state/status.json"), "utf8") === statusBefore &&
+      /holds the lock/.test(loser.note ?? ""),
+    loser
+  );
+  // a config failure that is not about reporting itself is reported (Codex R6 P2): status.json
+  writeFileSync(join(home, "config.json"), JSON.stringify({ ...cfg, receiptWaitMs: 5 }));
+  const badCfg = cli([]);
+  writeFileSync(join(home, "config.json"), JSON.stringify(cfg));
+  const cfgStatus = JSON.parse(readFileSync(join(home, "state/status.json"), "utf8"));
+  cell(
+    "CLI: an out-of-range config value exits 78 with a startup status (not stderr only)",
+    badCfg.code === 78 && /receiptWaitMs/.test(cfgStatus.startup ?? ""),
+    { badCfg, cfgStatus }
   );
   const good = readFileSync(join(home, "state/state.json"));
   writeFileSync(join(home, "state/state.json"), "{", { mode: 0o600 });

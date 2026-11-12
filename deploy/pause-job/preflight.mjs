@@ -39,6 +39,8 @@ const SCRIPT_TOKEN =
 const JS_FILE = /\.(mjs|cjs|js|ts)$/;
 // any absolute path in a script, with or without an extension (clestons L4): followed when it is
 // a text file; binaries and non-files are skipped by readText
+const REL_TOKEN =
+  /(?:^|[\s"'=(;|&`])((?:\.{1,2}\/|[A-Za-z0-9_-]+\/)[A-Za-z0-9_./-]*[A-Za-z0-9_-])(?=$|[\s"');|&`])/gm;
 const ABS_TOKEN = /(?:^|[\s"'=(;|&`])(\/[A-Za-z0-9_./-]+)(?=$|[\s"');|&`])/gm;
 
 /**
@@ -77,6 +79,12 @@ export function runsSender(args, readText = () => ({ kind: "none" }), cwd = null
       if (dir) visit(resolve(m[1], dir), level);
     }
     for (const m of text.matchAll(ABS_TOKEN)) visit(m[1], level);
+    // relative paths without an extension (`exec ./bin/run-keeper`), against the working
+    // directory and the referring file (Codex R6 P2)
+    for (const m of text.matchAll(REL_TOKEN)) {
+      visit(resolve(m[1], cwd), level);
+      if (dir) visit(resolve(m[1], dir), level);
+    }
   };
   const visit = (path, level) => {
     if (!path || seen.has(path) || level > depth) return;

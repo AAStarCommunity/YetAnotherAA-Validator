@@ -408,6 +408,18 @@ cell(
         fs3[p] !== undefined ? { kind: "text", text: fs3[p] } : { kind: "none" }
       ).includes("register-node.mjs")
     );
+    const fs4 = {
+      "/w/outer.sh": "exec ./bin/run-keeper --watch",
+      "/w/bin/run-keeper": "#!/bin/sh\nnode /repo/deploy/register-node.mjs",
+    };
+    cell(
+      "runsSender: a relative extensionless path inside a wrapper is followed (Codex R6 P2)",
+      runsSender(
+        ["/bin/bash", "/w/outer.sh"],
+        p => (fs4[p] !== undefined ? { kind: "text", text: fs4[p] } : { kind: "none" }),
+        "/w"
+      ).includes("register-node.mjs")
+    );
   }
   {
     // the real `launchctl print` shape (tabs, blocks), values abbreviated
