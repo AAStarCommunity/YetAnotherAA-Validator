@@ -20,6 +20,7 @@ import {
   unknownCostAlert,
   receiptOf,
   runRound,
+  committed,
   PIN,
   spIface,
 } from "./lib/core.mjs";
@@ -187,17 +188,28 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     /no receipt names a transaction the job journalled/.test(msg),
     msg
   );
+  // control (Codex R14 P3): no receipt during reconcile, so tx0 stays pending and the B3 loop RUNS;
+  // its re-read then finds our receipt, and the round goes on to the inventory (a getLogs call)
+  const ours = {
+    transactionHash: "0xAA",
+    gasUsed: "10",
+    blockNumber: "0x4",
+    blockHash: `0x${"cd".repeat(32)}`,
+    effectiveGasPrice: "1",
+    status: "0x1",
+  };
+  let receiptCalls = 0;
+  let reachedInventory = false;
+  const late = {
+    ...fake(null),
+    blockNumber: async () => 50, // above the inventory cursor, so the inventory is read
+    receipt: async () => (++receiptCalls >= 3 ? ours : null),
+    getLogs: async () => ((reachedInventory = true), []),
+  };
   let msg2 = "";
   try {
     await runRound(mkState(), {
-      chain: fake({
-        transactionHash: "0xAA",
-        gasUsed: "10",
-        blockNumber: "0x4",
-        blockHash: `0x${"cd".repeat(32)}`,
-        effectiveGasPrice: "1",
-        status: "0x1",
-      }),
+      chain: late,
       signer: { address: signer.address },
       persist: () => {},
       cfg,
@@ -206,10 +218,32 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     msg2 = e.message;
   }
   cell(
-    "B3 (unit, control): the same nonce with our receipt present does not raise it",
-    !/no receipt names/.test(msg2),
-    msg2
+    "B3 (unit, control): the loop runs, its re-read finds our receipt, and the round reaches the inventory",
+    receiptCalls >= 3 && reachedInventory && !/no receipt names/.test(msg2),
+    { receiptCalls, reachedInventory, msg2 }
   );
+  {
+    // committed(): a known OP overrun of an included transaction counts before finality (R14 P1)
+    const st = emptyState({
+      chainId: 10,
+      signer: A,
+      spProxy: A,
+      registry: B,
+      startBlock: 1,
+      cap: "100",
+    });
+    st.ledger.txs.push({ nonce: 0, status: "included", reserve: "10", includedCost: "60" });
+    st.ledger.reserved = "10";
+    cell(
+      "committed: cap 100, an included reservation 10 with a known cost 60 commits 60 (a new 90 cannot fit)",
+      committed(st) === 60n && 100n - committed(st) < 90n
+    );
+    st.ledger.txs[0].includedCost = "5";
+    cell(
+      "committed: a known cost below its reservation still holds the reservation",
+      committed(st) === 10n
+    );
+  }
 }
 // ---- the provisional (included, not final) cost on OP includes the oracle's fees (Codex R9 P2)
 {

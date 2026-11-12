@@ -147,8 +147,23 @@ export function fundingGate(st, balance) {
 
 /** spent + reserved > cap: the job records it and broadcasts nothing more. */
 export function overCap(st) {
-  const l = st.ledger;
-  return big(l.spent) + big(l.reserved) > big(l.cap);
+  return committed(st) > big(st.ledger.cap);
+}
+
+/**
+ * What the ledger has committed: final costs, plus every held reservation, where an INCLUDED
+ * transaction counts at the larger of its reservation and its known provisional cost (Codex R14
+ * P1: a known OP overrun constrains every later send before finality, not only at it). Pure.
+ */
+export function committed(st) {
+  let c = big(st.ledger.spent);
+  for (const t of st.ledger.txs) {
+    if (!HELD.has(t.status)) continue;
+    const r = big(t.reserve);
+    const k = t.status === "included" && t.includedCost != null ? big(t.includedCost) : 0n;
+    c += k > r ? k : r;
+  }
+  return c;
 }
 
 /** Split [from, to] into chunks of at most `size` blocks. Pure. */
@@ -489,7 +504,7 @@ async function pushPending(st, { chain, signer, persist, cfg }) {
       }
       if (need > big(t.reserve)) {
         const extra = need - big(t.reserve);
-        const remaining = big(l.cap) - big(l.spent) - big(l.reserved);
+        const remaining = big(l.cap) - committed(st);
         if (extra > remaining) {
           alerts.push({
             key: "cap",
@@ -548,7 +563,7 @@ async function replace(st, t, { chain, signer, persist, cfg }) {
   const l = st.ledger;
   // the reservation never shrinks: either hash may be the one that lands
   const extra = reserve > big(t.reserve) ? reserve - big(t.reserve) : 0n;
-  const remaining = big(l.cap) - big(l.spent) - big(l.reserved);
+  const remaining = big(l.cap) - committed(st);
   if (extra > remaining)
     return {
       key: "cap",
@@ -796,7 +811,7 @@ async function send(st, { chain, signer, persist, cfg }, op) {
   } catch (e) {
     return { key: `estimate:${op}`, text: safeText(`reservation ${op}`, e) };
   }
-  const remaining = big(l.cap) - big(l.spent) - big(l.reserved);
+  const remaining = big(l.cap) - committed(st);
   if (reserve > remaining)
     return {
       key: "cap",
