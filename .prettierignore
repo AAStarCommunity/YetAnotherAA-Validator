@@ -9,8 +9,6 @@ contracts/cache/
 conformance/x402/fixtures.json
 contracts/broadcast/
 
-# Generated JS<->Solidity disclosure vectors (byte-exact generator output; see scripts/disclosure/gen-vectors.mjs)
-contracts/test/fixtures/disclosure-vectors.json
 
 # SP-owned A7 read-back schema and examples, pinned byte-for-byte by sha256 (never reformat)
 deploy/guardian-watcher/fixtures/a7/

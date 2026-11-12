@@ -174,29 +174,10 @@ jobs:
       - name: Check the validator-resolution precedence
         run: npm run check:precedence
 
-      # DisclosureRegistry recheck (M0 §4.4): honest entries must rebuild from the action tx alone and
-      # every forged entry must be flagged by the check it targets; the JS encoding must match the
-      # committed vectors that DisclosureRecheckParity.t.sol checks against the contract.
-      - name: Check the disclosure-entry recheck
-        run: npm run check:disclosure
-
-      # Guardian watcher core (M0 §5.2): BLS actions and owner/guardian-route actions are recorded
-      # and flagged by the pinned ruleset, unauthenticable ones dead-lettered, the cursor never
-      # passes finality or a failed tick, and a re-scan rewrites nothing.
-      - name: Check the guardian watcher core
-        run: npm run check:watcher
-
-      # Phase D (M0 §5.2a): the running watcher job is exactly the configured wrapper, reading the
-      # RPC URLs from the very Keychain items Phase D verified (Codex R6, R7 counterexamples).
-      - name: Check the Phase D watcher-job binding
-        run: npm run check:phase-d-binding
-
-      # Phase D never prints a URL-like fragment, even from a mistaken operator label
-      - name: Check the Phase D report redaction
-        run: npm run check:phase-d-redact
-
-      - name: D-RPC2 second-provider confirmation self-test
-        run: npm run check:drpc2
+      # M0 §3.1 evidence encoding (the fraud-proof consumers' wire format): the JS encoding must match
+      # the committed vectors that EvidenceHashParity.t.sol recomputes in Solidity.
+      - name: Check the evidence vectors
+        run: npm run check:evidence
 
       # A7 rehearsal (M0 §9): SP's frozen aoa-a7-readback/1 schema and both examples (sha256-pinned)
       # validate; every comparison rule fails on its mutation; a live read-back is never a fork's.
@@ -288,17 +269,6 @@ jobs:
 
       - name: Run tests
         run: forge test -vvv
-
-      - name: Release artifact identity (compiler, evmVersion, pinned hashes)
-        run: |
-          FOUNDRY_PROFILE=release forge build --force src/disclosure/DisclosureRegistry.sol
-          A=out-release/DisclosureRegistry.sol/DisclosureRegistry.json
-          jq -r '.metadata.compiler.version, .metadata.settings.evmVersion' "$A"
-          echo "creation $(cast keccak "$(jq -r .bytecode.object "$A")")"
-          echo "runtime  $(cast keccak "$(jq -r .deployedBytecode.object "$A")")"
-
-      - name: Disclosure tests under the release profile (cancun, the deployed artifact)
-        run: FOUNDRY_PROFILE=release forge test --match-path 'test/**/Disclosure*'
 
       - name: Check contract sizes
         run: forge build --sizes

@@ -2,7 +2,7 @@
 // Standing check (DSR 8c5f68e5): run SuperPaymaster's own DVTValidator._checkEvidence against this
 // repo's M0 §3.1 vectors (contracts/test/fixtures/evidence-vectors.json), byte for byte.
 //
-//   node scripts/disclosure/sp-evidence-parity.mjs <SP commit SHA> [--repo owner/name] [--out empty-dir]
+//   node scripts/evidence/sp-evidence-parity.mjs <SP commit SHA> [--repo owner/name] [--out empty-dir]
 //
 // Everything is read through the GitHub API (gh), at that exact commit, never from a local checkout
 // of SP. DVTValidator.sol and its whole import closure are resolved with SP's own foundry.toml
