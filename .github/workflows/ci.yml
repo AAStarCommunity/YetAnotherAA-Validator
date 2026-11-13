@@ -324,16 +324,22 @@ jobs:
       - name: Check SP's evidence decoding against the vectors
         env:
           GH_TOKEN: ${{ github.token }}
-        # the pin file is exactly one lowercase 40-hex SHA (a trailing newline allowed); anything
-        # else, fragments joined across lines included, fails here instead of being repaired
+        # the pin file's raw bytes are exactly one lowercase 40-hex SHA plus at most one newline;
+        # anything else (fragments across lines, NUL bytes, extra newlines) fails here instead of
+        # being repaired. The bytes are checked before any shell substitution, which drops NULs
+        # and trailing newlines.
         run: |
           node --version
           forge --version
-          pin="$(cat scripts/evidence/sp-parity-commit)"
-          if [[ ! "$pin" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::scripts/evidence/sp-parity-commit must be one 40-hex SHA"
-            exit 1
-          fi
+          pin="$(node -e '
+            const b = require("fs").readFileSync("scripts/evidence/sp-parity-commit");
+            const s = b.toString("latin1");
+            if (!/^[0-9a-f]{40}\n?$/.test(s) || b.length > 41) {
+              console.error("::error::scripts/evidence/sp-parity-commit must be one 40-hex SHA");
+              process.exit(1);
+            }
+            process.stdout.write(s.slice(0, 40));
+          ')"
           npm run -s check:sp-parity -- "$pin"
 
   # Job 6: Type checking
