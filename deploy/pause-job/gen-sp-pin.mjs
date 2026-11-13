@@ -45,6 +45,8 @@ const REG_NAMES = [
   ["function", "hasRole"],
   ["function", "isReputationSource"],
   ["function", "getRoleConfig"],
+  // the pause detector's stake read, the same as SuperPaymasterStorage._hasEffectiveSuperStake
+  ["function", "getEffectiveStake"],
   ["event", "RoleConfigured"],
 ];
 

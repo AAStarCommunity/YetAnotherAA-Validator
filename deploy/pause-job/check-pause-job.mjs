@@ -33,7 +33,9 @@ import {
   nodeSlashOff,
   runsSender,
   parseLaunchctlPrint,
-  PAUSE_LABEL,
+  DETECTOR_LABEL,
+  KEEPER_LABEL,
+  detectorFresh,
 } from "./preflight.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -800,41 +802,98 @@ cell(
 // ---- preflight rules
 {
   const ok = launchdOff(
-    [PAUSE_LABEL, "io.aastar.price-keeper", "com.apple.x"],
+    [DETECTOR_LABEL, KEEPER_LABEL, "com.apple.x"],
     l => (l === "com.apple.x" ? null : ["/bin/bash", `/x/${l}.sh`]),
     () => ({ kind: "text", text: "echo unrelated" })
   );
-  cell("launchd-off passes with only the pause job and unrelated jobs", ok.length === 0, ok);
-  const k = launchdOff([PAUSE_LABEL, "io.aastar.dvt-committee-keeper"], () => []);
+  cell("launchd-on passes with the detector, the keeper and unrelated jobs", ok.length === 0, ok);
+  const d2 = launchdOff([DETECTOR_LABEL, KEEPER_LABEL, "io.aastar.dvt-pause-job"], () => []);
   cell(
-    "launchd-off fails when the committee keeper is loaded",
+    "launchd-on fails when the retired D2 pause job is loaded",
+    d2.some(p => p.includes("io.aastar.dvt-pause-job is loaded")),
+    d2
+  );
+  const nk = launchdOff([DETECTOR_LABEL], () => []);
+  cell(
+    "launchd-on fails when the price keeper is not loaded",
+    nk.some(p => p.includes(`${KEEPER_LABEL} is not loaded`)),
+    nk
+  );
+  const nd = launchdOff([KEEPER_LABEL], () => []);
+  cell(
+    "launchd-on fails when the pause detector is not loaded",
+    nd.some(p => p.includes(`${DETECTOR_LABEL} is not loaded`)),
+    nd
+  );
+  const ds = launchdOff([DETECTOR_LABEL, KEEPER_LABEL], l =>
+    l === DETECTOR_LABEL ? ["/usr/bin/node", "/repo/deploy/pause-job/pause-job.mjs"] : null
+  );
+  cell(
+    "launchd-on fails when the detector's label runs the D2 sender (the detector is scanned)",
+    ds.some(p => p.includes("runs pause-job.mjs")),
+    ds
+  );
+  const now = Date.parse("2026-11-14T12:00:00Z");
+  const st = (at, clear = true) =>
+    JSON.stringify({
+      schema: "aoa-pause-detector-status/1",
+      at,
+      clear,
+      alerts: clear ? [] : ["x"],
+    });
+  cell(
+    "pause-detector passes on a fresh clear status",
+    detectorFresh(st("2026-11-14T11:30:00Z"), now).problems.length === 0
+  );
+  cell(
+    "pause-detector fails on a status older than two intervals",
+    detectorFresh(st("2026-11-14T09:40:00Z"), now).problems.length === 1
+  );
+  cell(
+    "pause-detector fails when there is no status",
+    detectorFresh(null, now).problems.length === 1
+  );
+  cell(
+    "pause-detector fails on another job's status file",
+    detectorFresh(
+      JSON.stringify({ schema: "aoa-pause-job-status/1", at: "2026-11-14T11:59:00Z" }),
+      now
+    ).problems.length === 1
+  );
+  cell(
+    "pause-detector reports NOT clear without failing (freshness is the trigger check)",
+    detectorFresh(st("2026-11-14T11:30:00Z", false), now).note.includes("NOT clear")
+  );
+  const k = launchdOff([DETECTOR_LABEL, "io.aastar.dvt-committee-keeper"], () => []);
+  cell(
+    "launchd-on fails when the committee keeper is loaded",
     k.some(p => p.includes("committee-keeper")),
     k
   );
-  const r = launchdOff([PAUSE_LABEL, "io.aastar.dvt-apply-rotation"], () => []);
+  const r = launchdOff([DETECTOR_LABEL, "io.aastar.dvt-apply-rotation"], () => []);
   cell(
-    "launchd-off fails when apply-rotation is loaded",
+    "launchd-on fails when apply-rotation is loaded",
     r.some(p => p.includes("apply-rotation")),
     r
   );
   const n = launchdOff([], () => []);
   cell(
-    "launchd-off fails when the pause job itself is not loaded",
+    "launchd-on fails when the required jobs are not loaded",
     n.some(p => p.includes("not loaded")),
     n
   );
-  const m = launchdOff([PAUSE_LABEL, "io.aastar.harmless"], () => [
+  const m = launchdOff([DETECTOR_LABEL, "io.aastar.harmless"], () => [
     "/usr/bin/node",
     "/repo/deploy/committee-keeper.mjs",
   ]);
   cell(
-    "launchd-off fails when a job under another name runs the committee keeper",
+    "launchd-on fails when a job under another name runs the committee keeper",
     m.some(p => p.includes("runs committee-keeper.mjs")),
     m
   );
-  const u = launchdOff([PAUSE_LABEL, "io.aastar.unreadable"], () => null);
+  const u = launchdOff([DETECTOR_LABEL, "io.aastar.unreadable"], () => null);
   cell(
-    "launchd-off fails closed on a non-Apple job it cannot read",
+    "launchd-on fails closed on a non-Apple job it cannot read",
     u.some(p => p.includes("cannot be read")),
     u
   );
@@ -1080,20 +1139,34 @@ cell(
         "/r/deploy/local-heartbeat.sh": "a".repeat(64),
         "/r/deploy/committee-health.mjs": "b".repeat(64),
       })[path] ?? null;
-    const txt = () => ({
-      kind: "text",
-      text: "apply) node deploy/apply-verifier-rotation.mjs --broadcast",
-    });
+    // the detector's own (harmless) files live under /d/; everything else reads as a wrapper that
+    // could run apply-rotation
+    const txt = path =>
+      String(path).startsWith("/usr/")
+        ? { kind: "binary" }
+        : String(path).startsWith("/d/")
+          ? { kind: "text", text: "read only" }
+          : { kind: "text", text: "apply) node deploy/apply-verifier-rotation.mjs --broadcast" };
     const LOADED_ENV = ["OSLogRateLimit", "PATH", "HOME", "XPC_SERVICE_NAME"];
     const run = (
       pl,
       loaded = args,
       s = sha,
-      labels = [PAUSE_LABEL, r.label],
+      labels = [KEEPER_LABEL, DETECTOR_LABEL, r.label],
       env = LOADED_ENV,
       inherited = ["SSH_AUTH_SOCK"]
     ) =>
-      launchdOff(labels, () => ({ args: loaded, env, inherited }), txt, [r], s, { [r.label]: pl });
+      launchdOff(
+        labels,
+        l =>
+          l === DETECTOR_LABEL
+            ? { args: ["/usr/bin/node", "/d/detector.mjs"], env: [], inherited: [] }
+            : { args: loaded, env, inherited },
+        txt,
+        [r],
+        s,
+        { [r.label]: pl }
+      );
     cell(
       "reviewed: a stale LOADED BASH_ENV fails even when the plist on disk lacks it (Codex R3 P2-2)",
       run(plist, args, sha, undefined, [...LOADED_ENV, "BASH_ENV"]).some(x =>
@@ -1120,8 +1193,8 @@ cell(
     );
     cell(
       "reviewed: an unreadable loaded environment fails closed",
-      launchdOff([PAUSE_LABEL, r.label], () => args, txt, [r], sha, { [r.label]: plist }).some(x =>
-        x.includes("loaded environment cannot be read")
+      launchdOff([DETECTOR_LABEL, r.label], () => args, txt, [r], sha, { [r.label]: plist }).some(
+        x => x.includes("loaded environment cannot be read")
       )
     );
     cell(
@@ -1181,18 +1254,21 @@ cell(
     );
     cell(
       "reviewed: no plist for the job fails",
-      launchdOff([PAUSE_LABEL, r.label], () => args, txt, [r], sha, {}).length > 0
+      launchdOff([DETECTOR_LABEL, r.label], () => args, txt, [r], sha, {}).length > 0
     );
     cell(
       "reviewed: apply-rotation loaded still fails (the exception covers health only)",
-      run(plist, args, sha, [PAUSE_LABEL, r.label, "io.aastar.dvt-apply-rotation"]).some(x =>
-        x.includes("apply-rotation is loaded")
-      )
+      run(plist, args, sha, [
+        KEEPER_LABEL,
+        DETECTOR_LABEL,
+        r.label,
+        "io.aastar.dvt-apply-rotation",
+      ]).some(x => x.includes("apply-rotation is loaded"))
     );
     cell(
       "reviewed: a forbidden label cannot be made an exception",
       launchdOff(
-        [PAUSE_LABEL],
+        [DETECTOR_LABEL],
         () => [],
         txt,
         [{ ...r, label: "io.aastar.dvt-committee-keeper" }],

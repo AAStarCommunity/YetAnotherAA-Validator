@@ -182,6 +182,11 @@ jobs:
       - name: Check the pause job (pure cells)
         run: npm run check:pause-job
 
+      # the rc.8 pause detector: read-only rounds on a scripted chain, and the proof that it holds
+      # no key, keystore, signing or broadcast code
+      - name: Check the pause detector
+        run: npm run check:pause-detector
+
       # sp-pin.json must be exactly what SP's abis/ and IRegistry.sol say at its pinned commit
       - name: Check the pause job's SP pin
         env:

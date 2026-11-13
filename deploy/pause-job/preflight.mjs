@@ -4,10 +4,15 @@
 // gate cannot see. Until this PR merges they are manual launch-checklist items.
 //
 //   node deploy/pause-job/preflight.mjs [--nodes dvt-node-1,dvt-node-2,dvt-node-3]
+//                                       [--detector-status <path to the detector's status.json>]
 //
-// launchd-off   the committee keeper and apply-rotation are not loaded, the pause job IS loaded, and
-//               no other loaded job of this user runs a DVT transaction-sending script (by its
-//               ProgramArguments, not its label: a job's name is not what it runs)
+// launchd-on    (rc.8, DSR: "detect, then act by hand") the read-only pause detector and the price
+//               keeper ARE loaded; the committee keeper, apply-rotation and the retired D2 pause job
+//               are NOT; and no other loaded job of this user runs a DVT transaction-sending script
+//               (by its ProgramArguments, not its label: a job's name is not what it runs). The
+//               price keeper is the one approved sender and is not scanned; the detector is.
+// pause-detector its last round's status.json is fresh (at most two intervals old): the trigger
+//               fired, not just the job loaded
 // node-slash-off every DVT node container has AUDIT_ENABLED and AUDIT_EXECUTE_SLASH absent or exactly
 //               "false" (the node arms only on exactly "true", src/config/configuration.ts:206/265;
 //               anything else is refused here, fail closed)
@@ -20,11 +25,19 @@ import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } fr
 import { homedir } from "node:os";
 import { join, posix } from "node:path";
 
-export const PAUSE_LABEL = "io.aastar.dvt-pause-job";
-export const FORBIDDEN_LABELS = ["io.aastar.dvt-committee-keeper", "io.aastar.dvt-apply-rotation"];
+export const DETECTOR_LABEL = "io.aastar.dvt-pause-detector";
+export const KEEPER_LABEL = "io.aastar.price-keeper";
+export const REQUIRED_LABELS = [DETECTOR_LABEL, KEEPER_LABEL];
+export const FORBIDDEN_LABELS = [
+  "io.aastar.dvt-committee-keeper",
+  "io.aastar.dvt-apply-rotation",
+  // the D2 pause job is retired (DSR fae09c1e): its signer was refunded and deleted
+  "io.aastar.dvt-pause-job",
+];
 // DVT scripts that send transactions; a loaded job running any of them (other than ours) fails
 export const SENDING_SCRIPTS = [
   "committee-keeper.mjs",
+  "pause-job.mjs",
   "apply-verifier-rotation.mjs",
   "reregister-guardians.mjs",
   "register-node.mjs",
@@ -231,7 +244,7 @@ export function reviewProblems(r, plist, loaded, shaOf) {
 const asLoaded = x => (x === null || x === undefined ? null : Array.isArray(x) ? { args: x } : x);
 
 /**
- * launchd-off. `plists` maps a label to its LaunchAgents plist (parsed) or is missing it. Pure
+ * launchd-on. `plists` maps a label to its LaunchAgents plist (parsed) or is missing it. Pure
  * given the injected readers.
  */
 export function launchdOff(
@@ -244,10 +257,10 @@ export function launchdOff(
 ) {
   const p = [];
   for (const f of FORBIDDEN_LABELS) if (labels.includes(f)) p.push(`${f} is loaded`);
-  if (!labels.includes(PAUSE_LABEL)) p.push(`${PAUSE_LABEL} is not loaded`);
+  for (const q of REQUIRED_LABELS) if (!labels.includes(q)) p.push(`${q} is not loaded`);
   const cleared = new Set();
   for (const r of reviewed) {
-    if (FORBIDDEN_LABELS.includes(r.label) || r.label === PAUSE_LABEL) {
+    if (FORBIDDEN_LABELS.includes(r.label) || REQUIRED_LABELS.includes(r.label)) {
       p.push(`${r.label} cannot be a reviewed exception`);
       continue;
     }
@@ -257,7 +270,7 @@ export function launchdOff(
     else cleared.add(r.label);
   }
   for (const l of labels) {
-    if (l === PAUSE_LABEL || cleared.has(l)) continue;
+    if (l === KEEPER_LABEL || cleared.has(l)) continue;
     const loaded = asLoaded(programOf(l));
     const args = loaded?.args ?? null;
     if (args === null) {
@@ -273,6 +286,35 @@ export function launchdOff(
     }
   }
   return [...new Set(p)];
+}
+
+/**
+ * pause-detector: the detector's last status.json (`text`, or null when missing) is fresh: written
+ * at most `maxAgeMs` before `now`, by the detector. Returns { problems, note }. Pure.
+ */
+export function detectorFresh(text, now, maxAgeMs = 2 * 3600_000 + 600_000) {
+  if (text === null) return { problems: ["the detector has written no status.json"], note: "" };
+  let j;
+  try {
+    j = JSON.parse(text);
+  } catch {
+    return { problems: ["the detector's status.json is not JSON"], note: "" };
+  }
+  if (j?.schema !== "aoa-pause-detector-status/1")
+    return { problems: ["status.json is not the detector's"], note: "" };
+  const at = Date.parse(j.at);
+  if (!Number.isFinite(at)) return { problems: ["status.json has no time"], note: "" };
+  if (now - at > maxAgeMs)
+    return {
+      problems: [`the detector's last round is ${Math.round((now - at) / 60_000)} min old`],
+      note: "",
+    };
+  if (at - now > 600_000) return { problems: ["status.json is dated in the future"], note: "" };
+  const n = Array.isArray(j.alerts) ? j.alerts.length : 0;
+  return {
+    problems: [],
+    note: j.clear === true ? "last round clear" : `last round NOT clear (${n} alert(s))`,
+  };
 }
 
 /** node-slash-off from each container's environment (array of "K=V"). Pure. */
@@ -347,7 +389,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     .filter(Boolean);
   const results = [];
   const list = run("launchctl", ["list"]);
-  if (list === null) results.push(["launchd-off", "FAIL", ["launchctl list failed"]]);
+  if (list === null) results.push(["launchd-on", "FAIL", ["launchctl list failed"]]);
   else {
     const labels = list
       .split("\n")
@@ -395,8 +437,23 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       else plists[d.Label] = d;
     }
     const p = [...extra, ...launchdOff(labels, programOf, readText, reviewed, shaOf, plists)];
-    results.push(["launchd-off", p.length ? "FAIL" : "PASS", p]);
+    results.push(["launchd-on", p.length ? "FAIL" : "PASS", p]);
   }
+  const di = argv.indexOf("--detector-status");
+  const statusPath =
+    di >= 0 ? argv[di + 1] : join(homedir(), ".aoa-pause-detector/state/status.json");
+  let statusText = null;
+  try {
+    statusText = readFileSync(statusPath, "utf8");
+  } catch {
+    statusText = null;
+  }
+  const fr = detectorFresh(statusText, Date.now());
+  results.push([
+    "pause-detector",
+    fr.problems.length ? "FAIL" : "PASS",
+    fr.problems.length ? fr.problems : [fr.note],
+  ]);
   const envOf = n => {
     const out = run("docker", ["inspect", n, "--format", "{{json .Config.Env}}"]);
     try {

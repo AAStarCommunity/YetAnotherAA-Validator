@@ -347,6 +347,30 @@
         "stateMutability": "view"
       },
       {
+        "type": "function",
+        "name": "getEffectiveStake",
+        "inputs": [
+          {
+            "name": "user",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "roleId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          }
+        ],
+        "outputs": [
+          {
+            "name": "",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ],
+        "stateMutability": "view"
+      },
+      {
         "type": "event",
         "name": "RoleConfigured",
         "inputs": [
