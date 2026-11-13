@@ -6,11 +6,24 @@ retired. This detector watches, and a person pauses with the exact command it
 sends.
 
 It is D2's read path with every send path removed. It holds **no key**. There is
-no keystore, no signer, and no signing or broadcast code. Its JSON-RPC client
-refuses every method outside six read-only ones before the request leaves the
-process. `check-pause-detector.mjs` fails CI if any signing, broadcast, key or
-subprocess call appears in the detector or in anything it imports. Its own
-control cells show the scan catching such calls.
+no keystore, no signer, and no signing or broadcast code:
+
+- **Runtime.** Only seven read-only JSON-RPC methods are allowed. The check runs
+  twice: in the client, and again in the transport itself, which is a plain
+  `fetch` POST with no ethers provider. A write method is refused before any
+  request is made.
+- **Static.** `no-signing-scan.mjs` parses (acorn) the detector and every module
+  it reaches by static import or re-export. CI fails on any of these:
+  - a name or string that holds a key, signs, broadcasts or runs a program;
+  - dynamic import, `require`, `eval`, `globalThis`, `.constructor`;
+  - a computed member built from strings;
+  - `process` or `console` used other than as a few named members;
+  - ethers used other than as nine pure utilities;
+  - any `fetch` other than to the Telegram Bot API or from the one JSON-RPC
+    transport.
+
+  Control cells show the scan catching each form, including every bypass Codex
+  found in rounds 1 and 2.
 
 ## What one round does (hourly, launchd)
 
@@ -18,6 +31,14 @@ control cells show the scan catching such calls.
    `OperatorConfigured` logs, over finalized ranges only. The cursor moves past
    a range only after that range's `getLogs` succeeded; a failed range is
    retried next round, never skipped.
+   - Every log must carry an ABI address topic (12 zero bytes, then the address)
+     and a `blockHash` equal to the canonical hash of its block. Anything else
+     makes the round unknown.
+   - Each round re-reads the last `rescanBlocks` behind the cursor. Once a day
+     it re-reads everything from `startBlock`. So a lagging backend that
+     answered `[]` cannot hide an operator for good.
+   - A cursor ahead of the finalized block stops the round. State times after
+     now (a clock that was ahead) are reset and reported.
 2. **One block.** It pins B, the latest block, by hash. Every read below is at B
    (EIP-1898, `requireCanonical`).
 3. **Identity at B.**
@@ -30,6 +51,14 @@ control cells show the scan catching such calls.
      identifies nothing.
 4. **Recent operators.** Operators configured after the cursor, up to B, are
    read this round too. They are not persisted until finalized.
+   - **Ancestry.** It walks B's ancestry by hash (`eth_getBlockByHash`) down to
+     the finalized block, and the walk must join the finalized block read by
+     number. Every log above finalized must come from that chain, so a
+     load-balanced endpoint answering from another fork is caught. More than
+     2048 blocks above finalized is unknown.
+   - **B's own logs.** The backend must answer `getLogs` for B by hash
+     (EIP-234). Those operators count too. If that answer differs from the range
+     answer for block B, the round is unknown.
 5. **Each operator at B.**
    - It reads `operators(op).{isConfigured, isPaused}` and the three Registry
      reads of `SuperPaymasterStorage._hasEffectiveSuperStake`:
@@ -59,6 +88,10 @@ control cells show the scan catching such calls.
   is actionable or unknown.
 - **When the identity is not confirmed, no PAUSE NEEDED is sent.** The identity
   alert is sent instead, because the detector may be reading the wrong contract.
+- **Delivery.** Alerts go out in messages of whole lines, under Telegram's
+  limit. A message counts as delivered only on HTTP 2xx with a JSON body
+  `ok: true`. Only the alerts in delivered messages are marked sent; the rest
+  are retried next round.
 - **Repeats.** An alert repeats every `realertMinutes` while it holds.
 - **Resolution.** A `resolved:` line is sent once a later round sees the
   condition gone. For an operator, that requires the operator to be read at a
@@ -72,6 +105,8 @@ control cells show the scan catching such calls.
   `status.json`.
 - `lib/detect.mjs`: the round. It does no I/O; the chain is injected.
 - `check-pause-detector.mjs`: the CI cells (`npm run check:pause-detector`).
+- `no-signing-scan.mjs`: the AST scan those cells run (test code, not loaded by
+  the detector).
 - `e2e-anvil.mjs`: end to end against SP's real contracts, deployed by SP's
   `DeployAnvil.s.sol` at `sp-pin.json`'s commit:
   - it raises minStake on chain;
@@ -97,6 +132,9 @@ secret-file reader, called with the detector's own name table) and
 2. Write `~/.aoa-pause-detector/config.json`. The addresses, implementations,
    code hashes and deploy block come from the tag read-back, never from this
    repo.
+   - `rescanBlocks` (blocks re-read behind the cursor each round; 20000 in the
+     example) bounds how long a lagging backend's `[]` can hide an operator
+     before the daily full rescan.
    - `logChunk` must fit the providers' `getLogs` range limits. A range that is
      too wide makes every round `unknown` until it is fixed; it never makes a
      round clear.

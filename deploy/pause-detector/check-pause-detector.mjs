@@ -31,6 +31,7 @@ import {
   deliver,
   telegram,
   MESSAGE_CHARS,
+  rpcTransport,
 } from "./detector.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
@@ -101,6 +102,13 @@ const CAUGHT = {
   "a second JSON-RPC fetch": "function rpcTransport(url) { fetch(url); fetch(url); }",
   "an object key naming a signer": "const o = { signTransaction: 1 };",
   "a private key field": "const k = cfg.privateKey;",
+  // Codex R2's bypasses
+  "a process alias": "const p = process; p.getuid();",
+  "a computed name built from strings": 'const f = x["exec" + "Sync"];',
+  "a computed string member": 'const f = x["execSync"];',
+  "Function via .constructor": '(() => 1).constructor("return 1")();',
+  getBuiltinModule: "process.getBuiltinModule('node:child_process');",
+  "console beyond log and error": "console.table(x);",
 };
 await cell(
   "no-signing CONTROL: every forbidden form is caught (incl. Codex R1's four bypasses)",
@@ -109,6 +117,30 @@ await cell(
       ([, src]) => scanSource("/y.mjs", src).length === 0
     );
     assert(missed.length === 0, `not caught: ${missed.map(([k]) => k).join(", ")}`);
+  }
+);
+await cell(
+  "no-signing: the JSON-RPC transport itself refuses a write method (no fetch made)",
+  async () => {
+    const real = globalThis.fetch;
+    let fetched = 0;
+    globalThis.fetch = async () => {
+      fetched++;
+      return { ok: true, json: async () => ({ result: "0x" }) };
+    };
+    try {
+      let refused = false;
+      try {
+        await rpcTransport("http://x")("eth_" + "sendRaw" + "Transaction", ["0x00"]);
+      } catch (e) {
+        refused = /refused/.test(e.message);
+      }
+      assert(refused && fetched === 0, `refused=${refused} fetched=${fetched}`);
+      await rpcTransport("http://x")("eth_chainId", []);
+      assert(fetched === 1, "a read method did not pass (control)");
+    } finally {
+      globalThis.fetch = real;
+    }
   }
 );
 await cell("no-signing CONTROL: a re-export (export * from) is followed", () => {
@@ -178,12 +210,13 @@ await cell(
     assert(seen.length === 1 && seen[0] === "eth_chainId", "read method did not pass");
   }
 );
-await cell("no-signing: the read-only allowlist is exactly the six read methods", () => {
+await cell("no-signing: the read-only allowlist is exactly the seven read methods", () => {
   assert(
     [...READ_METHODS].sort().join() ===
       [
         "eth_call",
         "eth_chainId",
+        "eth_getBlockByHash",
         "eth_getBlockByNumber",
         "eth_getCode",
         "eth_getLogs",
@@ -253,6 +286,16 @@ function fakeChain(w) {
       if (tag === "finalized") return w.finalized;
       return w.latest;
     },
+    blockByHash: async h => {
+      failIf("blockByHash");
+      const n = Number(BigInt(h));
+      if (!(n >= 0 && n <= w.latest) || h !== hashOf(n)) return null;
+      return {
+        number: n,
+        hash: h,
+        parentHash: w.forkParentAt === n ? hashOf(n + 7777) : hashOf(n - 1),
+      };
+    },
     blockByNumber: async n => {
       if (n === "latest") return { number: w.latest, hash: hashOf(w.latest) };
       afterB = true;
@@ -276,7 +319,13 @@ function fakeChain(w) {
       }
       w.scanned = [...(w.scanned ?? []), [a, b]];
       return Object.entries(w.ops)
-        .filter(([, o]) => o.logBlock >= a && o.logBlock <= b && !w.hidden?.has(o.logBlock))
+        .filter(
+          ([, o]) =>
+            o.logBlock >= a &&
+            o.logBlock <= b &&
+            !w.hidden?.has(o.logBlock) &&
+            !(w.rangeSkipsB && !f.blockHash && o.logBlock === w.latest)
+        )
         .map(([op, o]) => ({
           address: SP,
           topics: [OPERATOR_CONFIGURED, w.topicOf?.(op) ?? ethers.zeroPadValue(op, 32)],
@@ -647,6 +696,71 @@ await cell("state: an operators array (or bad entries) is refused, not silently 
   const good = { ...emptyState(c), cursor: 250, operators: { [ethers.getAddress(OP1)]: 120 } };
   assert(stateProblems(good, c).length === 0, stateProblems(good, c).join("; "));
 });
+
+await cell(
+  "round: an operator only in the by-hash answer for B still counts, and the disagreement is unknown",
+  async () => {
+    const w = world({ rangeSkipsB: true });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 1n,
+      logBlock: 300,
+    };
+    const { alerts, report } = await round(w);
+    assert(
+      report.operators.some(o => o.operator === ethers.getAddress(OP2)),
+      "the by-hash operator was dropped"
+    );
+    assert(
+      alerts.some(a => a.key === "inventory-recent" && /differ/.test(a.text)) && !report.clear,
+      "disagreement not unknown"
+    );
+  }
+);
+await cell(
+  "round: a block above finalized that is not B's ancestor makes the recent scan unknown",
+  async () => {
+    const { alerts, report } = await round(world({ forkParentAt: 280 }));
+    assert(
+      alerts.some(a => a.key === "inventory-recent") && !report.clear,
+      "a forked ancestry was accepted"
+    );
+  }
+);
+await cell("round: B's ancestry must reach the finalized block the backend reports", async () => {
+  const { alerts, report } = await round(world({ forkParentAt: 251 }));
+  assert(
+    alerts.some(a => /descend|ancestry/.test(a.text)) && !report.clear,
+    alerts.map(a => a.text).join("; ")
+  );
+});
+await cell(
+  "round: a state cursor ahead of the finalized block stops the round (no silent skip)",
+  async () => {
+    const st = { ...emptyState(cfgOf()), cursor: 10_000, lastFullScan: 1e12 };
+    let stopped = false;
+    try {
+      await runRound(st, { chain: fakeChain(world()), cfg: cfgOf(), now: 1e12 + 1000 });
+    } catch (e) {
+      stopped = /ahead of the finalized/.test(e.message);
+    }
+    assert(stopped, "not stopped");
+  }
+);
+await cell(
+  "round: state times after now are reset and reported; the full rescan runs",
+  async () => {
+    const st = { ...emptyState(cfgOf()), lastFullScan: 5e12, alerts: { "actionable:x": 5e12 } };
+    const { alerts } = await round(world(), cfgOf(), st, 1e12);
+    assert(
+      alerts.some(a => a.key === "clock"),
+      "no clock alert"
+    );
+    assert(st.lastFullScan === 1e12 && st.alerts["actionable:x"] === 0, JSON.stringify(st.alerts));
+  }
+);
 
 // ---------------------------------------------------------------- delivery
 

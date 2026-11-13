@@ -64,6 +64,19 @@ export const FORBIDDEN_NAMES = new Set([
   "binding",
   "_linkedBinding",
   "dlopen",
+  // reaching Function or a module loader through an object (Codex R2 P1-1)
+  "constructor",
+  "prototype",
+  "__proto__",
+  "__defineGetter__",
+  "__lookupGetter__",
+  "getBuiltinModule",
+  "mainModule",
+]);
+// globals the detector may use, and only these members of them, never computed or aliased
+export const GLOBALS_OK = new Map([
+  ["process", new Set(["argv", "exit", "getuid", "pid"])],
+  ["console", new Set(["log", "error"])],
 ]);
 // text in string literals and template parts
 export const FORBIDDEN_TEXT =
@@ -155,6 +168,14 @@ export function scanSource(path, text, onImport = () => {}) {
             parent?.type === "ImportSpecifier";
           if (!okUse) p.push(`${at(node)}: ethers used other than as ethers.<allowed utility>`);
         }
+        if (GLOBALS_OK.has(node.name)) {
+          const okUse =
+            parent?.type === "MemberExpression" &&
+            parent.object === node &&
+            !parent.computed &&
+            GLOBALS_OK.get(node.name).has(parent.property.name);
+          if (!okUse) p.push(`${at(node)}: ${node.name} used other than as an allowed member`);
+        }
         if (node.name === "fetch") {
           if (!(parent?.type === "CallExpression" && parent.callee === node))
             p.push(`${at(node)}: fetch referenced other than as a direct call`);
@@ -187,6 +208,17 @@ export function scanSource(path, text, onImport = () => {}) {
           GUARDED_OBJECTS.has(node.object.name)
         )
           p.push(`${at(node)}: computed member of ${node.object.name}`);
+        // a computed member is a variable or a number, never a name built from strings (which
+        // could spell constructor, execSync, ... past every name check; Codex R2 P1-1)
+        if (
+          node.computed &&
+          !(
+            node.property.type === "Identifier" ||
+            node.property.type === "MemberExpression" ||
+            (node.property.type === "Literal" && typeof node.property.value === "number")
+          )
+        )
+          p.push(`${at(node)}: a computed member that is not a variable or a number`);
         break;
       case "Property":
         if (!node.computed && node.key.type === "Identifier" && FORBIDDEN_NAMES.has(node.key.name))

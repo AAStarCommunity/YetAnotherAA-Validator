@@ -34,6 +34,7 @@ import { SafeError, safeText, isOurs } from "../pause-job/lib/safe-error.mjs";
 export const READ_METHODS = Object.freeze([
   "eth_chainId",
   "eth_getBlockByNumber",
+  "eth_getBlockByHash",
   "eth_getLogs",
   "eth_call",
   "eth_getCode",
@@ -127,6 +128,9 @@ export function writeDurable(path, obj) {
 export function rpcTransport(url) {
   let id = 0;
   return async (method, params) => {
+    // the allowlist again, here: the transport cannot be used to send anything (Codex R2 P1-1)
+    if (!READ_METHODS.includes(method))
+      throw new SafeError(`refused: ${method} is not a read-only method`);
     const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -184,6 +188,10 @@ export function readOnlyChain(url, send = null) {
         false,
       ]);
       return b ? { number: Number(b.number), hash: b.hash } : null;
+    },
+    blockByHash: async h => {
+      const b = await rpc("eth_getBlockByHash", [h, false]);
+      return b ? { number: Number(b.number), hash: b.hash, parentHash: b.parentHash } : null;
     },
     getLogs: f => rpc("eth_getLogs", [f]),
     call: (tx, tag) => rpc("eth_call", [tx, tag]),
@@ -302,7 +310,8 @@ export async function deliver(st, due, resolved, header, now, send) {
 async function main() {
   const args = process.argv.slice(2);
   const i = args.indexOf("--config");
-  const cfgPath = tilde(i >= 0 ? args[i + 1] : undefined);
+  const next = i + 1;
+  const cfgPath = tilde(i >= 0 ? args[next] : undefined);
   if (!cfgPath) die(2, "usage: detector.mjs --config <file>");
   let cfg;
   try {
