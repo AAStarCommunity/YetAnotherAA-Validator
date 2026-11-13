@@ -48,10 +48,17 @@ export function emptyState({ chainId, spProxy, startBlock }) {
     spProxy: lc(spProxy),
     startBlock,
     cursor: startBlock - 1, // last block whose OperatorConfigured logs are in the inventory
-    operators: {}, // addr -> first block seen
+    lastFullScan: 0, // ms of the last successful rescan from startBlock (daily)
+    operators: {}, // checksummed addr -> first block seen
     alerts: {}, // key -> last alert time (ms)
   };
 }
+
+const plainObject = o =>
+  o !== null &&
+  typeof o === "object" &&
+  !Array.isArray(o) &&
+  Object.getPrototypeOf(o) === Object.prototype;
 
 /** Problems of a loaded state against the config it must belong to. Pure. */
 export function stateProblems(st, cfg) {
@@ -62,8 +69,26 @@ export function stateProblems(st, cfg) {
   if (st.startBlock !== cfg.startBlock) p.push("the state has another startBlock");
   if (!Number.isSafeInteger(st.cursor) || st.cursor < st.startBlock - 1)
     p.push("the state cursor is not a block at or after startBlock - 1");
-  if (!st.operators || typeof st.operators !== "object") p.push("the state has no operator map");
-  if (!st.alerts || typeof st.alerts !== "object") p.push("the state has no alert map");
+  if (!Number.isFinite(st.lastFullScan) || st.lastFullScan < 0)
+    p.push("the state has no lastFullScan time");
+  // a JSON array here would silently drop every operator on the next write (Codex R1 P1-4)
+  if (!plainObject(st.operators)) p.push("the state's operators is not a plain map");
+  else
+    for (const [k, v] of Object.entries(st.operators)) {
+      let ok = false;
+      try {
+        ok = ethers.getAddress(k) === k;
+      } catch {
+        ok = false;
+      }
+      if (!ok || !Number.isSafeInteger(v) || v < st.startBlock || v > st.cursor) {
+        p.push("the state's operators has an entry that is not <checksummed address>: <block>");
+        break;
+      }
+    }
+  if (!plainObject(st.alerts)) p.push("the state's alerts is not a plain map");
+  else if (Object.values(st.alerts).some(v => !Number.isFinite(v)))
+    p.push("the state's alerts has a time that is not a number");
   return p;
 }
 
@@ -74,8 +99,36 @@ export function ranges(from, to, size) {
   return out;
 }
 
+// an ABI-encoded address topic: 12 zero bytes, then the address (Codex R1 P1-3)
+const ADDRESS_TOPIC = /^0x0{24}[0-9a-fA-F]{40}$/;
+const HASH32 = /^0x[0-9a-fA-F]{64}$/;
+
+/**
+ * Check every log of a getLogs answer: our address and topic, not removed, in the range, an
+ * address topic, and its blockHash the CANONICAL hash of its block number (Codex R1 P1-2: a stale
+ * or forked backend's logs are not accepted). `canon(n)` answers the canonical hash of block n.
+ */
+async function checkLogs(logs, spProxy, a, b, canon) {
+  if (!Array.isArray(logs)) throw new SafeError(`getLogs: not a list (blocks ${a}-${b})`);
+  for (const lg of logs) {
+    if (lc(lg?.address) !== spProxy || lg.topics?.[0] !== OPERATOR_CONFIGURED || lg.removed)
+      throw new SafeError(`getLogs: a log outside the filter (blocks ${a}-${b})`);
+    const n = Number(lg.blockNumber);
+    if (!(Number.isSafeInteger(n) && n >= a && n <= b))
+      throw new SafeError(`getLogs: a log outside the range (blocks ${a}-${b})`);
+    if (typeof lg.topics[1] !== "string" || !ADDRESS_TOPIC.test(lg.topics[1]))
+      throw new SafeError(
+        `getLogs: a log whose operator topic is not an address (blocks ${a}-${b})`
+      );
+    if (typeof lg.blockHash !== "string" || !HASH32.test(lg.blockHash))
+      throw new SafeError(`getLogs: a log without a block hash (blocks ${a}-${b})`);
+    if (lc(await canon(n)) !== lc(lg.blockHash))
+      throw new SafeError(`getLogs: a log from block ${n} that is not on the canonical chain`);
+  }
+}
+
 /** The operators of OperatorConfigured logs over [from, to]; every log checked. Throws a SafeError. */
-async function operatorLogs(chain, spProxy, from, to, size, each) {
+async function operatorLogs(chain, spProxy, from, to, size, each, canon) {
   for (const [a, b] of ranges(from, to, size)) {
     let logs;
     try {
@@ -88,16 +141,7 @@ async function operatorLogs(chain, spProxy, from, to, size, each) {
     } catch (e) {
       throw new SafeError(`${safeText("getLogs", e)} (blocks ${a}-${b})`);
     }
-    if (!Array.isArray(logs)) throw new SafeError(`getLogs: not a list (blocks ${a}-${b})`);
-    for (const lg of logs) {
-      if (lc(lg.address) !== spProxy || lg.topics?.[0] !== OPERATOR_CONFIGURED || lg.removed)
-        throw new SafeError(`getLogs: a log outside the filter (blocks ${a}-${b})`);
-      const n = Number(lg.blockNumber);
-      if (!(n >= a && n <= b))
-        throw new SafeError(`getLogs: a log outside the range (blocks ${a}-${b})`);
-      if (typeof lg.topics[1] !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(lg.topics[1]))
-        throw new SafeError(`getLogs: a log without an operator topic (blocks ${a}-${b})`);
-    }
+    await checkLogs(logs, spProxy, a, b, canon);
     each(logs, b);
   }
 }
@@ -242,21 +286,49 @@ export const pauseCommand = (spProxy, op) =>
  * the caller delivers them. `clear` in the report is true ONLY when every read succeeded at a
  * canonical B with the identity confirmed and no operator is actionable or unknown.
  */
-export async function runRound(st, { chain, cfg }) {
+export async function runRound(st, { chain, cfg, now = Date.now() }) {
   const alerts = [];
   const sp = stateProblems(st, cfg);
   if (sp.length) throw new SafeError(`state: ${sp.join("; ")}`);
+  if (!Number.isSafeInteger(cfg.rescanBlocks) || cfg.rescanBlocks < 0)
+    throw new SafeError("rescanBlocks is not a block count");
+  if (!Number.isSafeInteger(cfg.logChunk) || cfg.logChunk < 1)
+    throw new SafeError("logChunk is not a block count");
   const chainId = Number(await chain.chainId());
   if (chainId !== st.chainId) throw new SafeError(`chain id ${chainId}, expected ${st.chainId}`);
 
-  // 1. inventory, finalized ranges only
+  // the canonical hash of block n, read once per round (every log is checked against it)
+  const hashes = new Map();
+  const canon = async n => {
+    if (!hashes.has(n)) {
+      const b = await chain.blockByNumber(n);
+      if (!b?.hash) throw new SafeError(`no block ${n}`);
+      hashes.set(n, b.hash);
+    }
+    return hashes.get(n);
+  };
+
+  // 1. inventory, finalized ranges only. Each round also re-reads the last `rescanBlocks` before
+  //    the cursor, and once a day everything from startBlock: a lagging backend that answered []
+  //    for a range it had not indexed yet cannot hide an operator for good (Codex R1 P1-2)
   const finalized = Number(await chain.blockNumber("finalized"));
+  const full = now - st.lastFullScan >= 24 * 3600_000;
+  const from = full ? st.startBlock : Math.max(st.startBlock, st.cursor + 1 - cfg.rescanBlocks);
   let inventoryOk = true;
   try {
-    await operatorLogs(chain, st.spProxy, st.cursor + 1, finalized, cfg.logChunk, (logs, b) => {
-      for (const lg of logs) st.operators[opOf(lg.topics[1])] ??= Number(lg.blockNumber);
-      st.cursor = b;
-    });
+    await operatorLogs(
+      chain,
+      st.spProxy,
+      from,
+      finalized,
+      cfg.logChunk,
+      (logs, b) => {
+        for (const lg of logs) st.operators[opOf(lg.topics[1])] ??= Number(lg.blockNumber);
+        if (b > st.cursor) st.cursor = b;
+      },
+      canon
+    );
+    if (full) st.lastFullScan = now;
   } catch (e) {
     inventoryOk = false;
     alerts.push({
@@ -276,9 +348,30 @@ export async function runRound(st, { chain, cfg }) {
   let recentOk = true;
   if (B.number > st.cursor)
     try {
-      await operatorLogs(chain, st.spProxy, st.cursor + 1, B.number, cfg.logChunk, logs => {
-        for (const lg of logs) recent.add(opOf(lg.topics[1]));
-      });
+      // the backend must know B's logs (EIP-234 blockHash filter): a node that has not indexed B
+      // fails here instead of answering [] for the recent range
+      await checkLogs(
+        await chain.getLogs({
+          address: st.spProxy,
+          topics: [OPERATOR_CONFIGURED],
+          blockHash: B.hash,
+        }),
+        st.spProxy,
+        B.number,
+        B.number,
+        async n => (n === B.number ? B.hash : canon(n))
+      );
+      await operatorLogs(
+        chain,
+        st.spProxy,
+        st.cursor + 1,
+        B.number,
+        cfg.logChunk,
+        logs => {
+          for (const lg of logs) recent.add(opOf(lg.topics[1]));
+        },
+        canon
+      );
     } catch (e) {
       recentOk = false;
       alerts.push({
@@ -292,7 +385,7 @@ export async function runRound(st, { chain, cfg }) {
   const results = [];
   for (const op of ops) results.push({ operator: op, ...(await operatorAt(chain, B, cfg, op)) });
 
-  // 6. B must still be canonical after every read
+  // 6. B must still be canonical after every read; a failed re-read is NOT canonical (fail closed)
   const again = await chain.blockByNumber(B.number).catch(() => null);
   const canonical = Boolean(again) && lc(again.hash) === lc(B.hash);
 

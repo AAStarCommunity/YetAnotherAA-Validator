@@ -72,6 +72,8 @@ export function configProblems(c) {
     p.push("startBlock must be a positive block (SP's deploy block)");
   if (!Number.isSafeInteger(c.logChunk) || c.logChunk < 1 || c.logChunk > 50000)
     p.push("logChunk must be 1..50000");
+  if (!Number.isSafeInteger(c.rescanBlocks) || c.rescanBlocks < 0 || c.rescanBlocks > 1_000_000)
+    p.push("rescanBlocks must be 0..1000000 (blocks re-read behind the cursor each round)");
   for (const k of ["stateDir", "secretsDir"])
     if (!okDir(tilde(c[k]))) p.push(`${k} must be an absolute plain path`);
   if (c.telegram !== null && !/^-?[0-9]+$/.test(String(c.telegram?.chatId ?? "")))
@@ -118,22 +120,45 @@ export function writeDurable(path, obj) {
 }
 
 /**
- * A read-only JSON-RPC chain. `send` is injectable (tests); by default one bounded ethers provider
- * over `url`. Any method outside READ_METHODS is refused BEFORE it reaches the transport. Every
- * error leaving here is a SafeError category (no URL), keeping a revert selector for the probe.
+ * The JSON-RPC transport: one POST per request over `url`, bounded to 30 s. It is called only by
+ * readOnlyChain's `rpc`, after the method allowlist. A JSON-RPC error keeps its `data` (a revert
+ * selector for the probe) and nothing else; the URL never reaches an error.
+ */
+export function rpcTransport(url) {
+  let id = 0;
+  return async (method, params) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) throw new SafeError(`${method}: HTTP ${res.status}`);
+    let j;
+    try {
+      j = await res.json();
+    } catch {
+      throw new SafeError(`${method}: not JSON`);
+    }
+    if (j?.error) {
+      const e = new SafeError(
+        `${method}: ${j.error.code === 3 || /revert/i.test(String(j.error.message)) ? "CALL_EXCEPTION" : "SERVER_ERROR"}`
+      );
+      if (typeof j.error.data === "string") e.data = j.error.data;
+      throw e;
+    }
+    if (!j || !("result" in j)) throw new SafeError(`${method}: no result`);
+    return j.result;
+  };
+}
+
+/**
+ * A read-only JSON-RPC chain. `send` is injectable (tests); by default rpcTransport(url). Any
+ * method outside READ_METHODS is refused BEFORE it reaches the transport. Every error leaving here
+ * is a SafeError (fixed text, no URL), keeping a revert selector for the probe.
  */
 export function readOnlyChain(url, send = null) {
-  let transport = send;
-  if (!transport) {
-    const req = new ethers.FetchRequest(url);
-    req.timeout = 30_000;
-    const p = new ethers.JsonRpcProvider(req, undefined, {
-      staticNetwork: true,
-      batchMaxCount: 1,
-      cacheTimeout: -1,
-    });
-    transport = (m, params) => p.send(m, params);
-  }
+  const transport = send ?? rpcTransport(url);
   const rpc = async (m, params) => {
     if (!READ_METHODS.includes(m)) throw new SafeError(`refused: ${m} is not a read-only method`);
     try {
@@ -193,22 +218,85 @@ export function resolvedKeys(st, alerts, report) {
   });
 }
 
-async function telegram(cfg, token, text) {
+/** Telegram's message limit, with room for the header line. */
+export const MESSAGE_CHARS = 3800;
+
+/**
+ * Split alert lines into messages of at most MESSAGE_CHARS, each line whole. A line longer than
+ * the limit (not produced by this detector) is cut, and says so. Returns [{ text, items }], where
+ * items are the caller's entries carried in that message. Pure.
+ */
+export function batches(header, entries) {
+  const out = [];
+  let cur = null;
+  for (const e of entries) {
+    let line = e.line;
+    if (header.length + 1 + line.length > MESSAGE_CHARS)
+      line = `${line.slice(0, MESSAGE_CHARS - header.length - 20)} …(cut)`;
+    if (!cur || cur.text.length + 1 + line.length > MESSAGE_CHARS) {
+      cur = { text: header, items: [] };
+      out.push(cur);
+    }
+    cur.text += `\n${line}`;
+    cur.items.push(e);
+  }
+  return out;
+}
+
+/**
+ * Send one message. Delivered only when Telegram answers HTTP 2xx with a JSON body `ok: true`.
+ * `post` is injectable (tests).
+ */
+export async function telegram(cfg, token, text, post = null) {
   if (!cfg.telegram) {
     console.error(`ALERT ${text}`);
     return { ok: false, why: "no Telegram configured" };
   }
   try {
-    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: cfg.telegram.chatId, text: text.slice(0, 4000) }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    return r.ok ? { ok: true } : { ok: false, why: `telegram HTTP ${r.status}` };
+    const r = post
+      ? await post(text)
+      : await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chat_id: cfg.telegram.chatId, text }),
+          signal: AbortSignal.timeout(15_000),
+        });
+    if (!r.ok) return { ok: false, why: `telegram HTTP ${r.status}` };
+    let j;
+    try {
+      j = await r.json();
+    } catch {
+      return { ok: false, why: "telegram: not JSON" };
+    }
+    return j?.ok === true ? { ok: true } : { ok: false, why: "telegram: ok is not true" };
   } catch (e) {
     return { ok: false, why: safeText("telegram", e) };
   }
+}
+
+/**
+ * Deliver due alerts and resolutions in messages of whole lines; mark sent (or delete) only the
+ * entries of messages Telegram accepted. Mutates st.alerts. Returns { ok, sent, failed }.
+ */
+export async function deliver(st, due, resolved, header, now, send) {
+  const entries = [
+    ...due.map(a => ({ line: `- ${a.text}`, ack: () => (st.alerts[a.key] = now) })),
+    ...resolved.map(k => ({ line: `- resolved: ${k}`, ack: () => delete st.alerts[k] })),
+  ];
+  let sent = 0;
+  let failed = 0;
+  let why;
+  for (const b of batches(header, entries)) {
+    const r = await send(b.text);
+    if (r.ok) {
+      for (const e of b.items) e.ack();
+      sent += b.items.length;
+    } else {
+      failed += b.items.length;
+      why = r.why;
+    }
+  }
+  return { ok: failed === 0, sent, failed, ...(why ? { why } : {}) };
 }
 
 async function main() {
@@ -335,20 +423,14 @@ async function main() {
       });
     const due = dueAlerts(st, result.alerts, cfg.realertMinutes, now);
     const resolved = resolvedKeys(st, result.alerts, result.report);
-    const lines = [...due.map(a => `- ${a.text}`), ...resolved.map(k => `- resolved: ${k}`)];
-    let delivery = { ok: true, sent: 0 };
-    if (lines.length) {
-      const r = await telegram(
-        cfg,
-        token,
-        `DVT pause detector (chain ${st.chainId}, block ${result.report?.block?.number ?? "?"}):\n${lines.join("\n")}`
-      );
-      delivery = { ...r, sent: r.ok ? lines.length : 0 };
-      if (r.ok) {
-        for (const a of due) st.alerts[a.key] = now;
-        for (const k of resolved) delete st.alerts[k];
-      }
-    }
+    const delivery = await deliver(
+      st,
+      due,
+      resolved,
+      `DVT pause detector (chain ${st.chainId}, block ${result.report?.block?.number ?? "?"}):`,
+      now,
+      text => telegram(cfg, token, text)
+    );
     writeDurable(statePath, st);
     writeDurable(statusPath, {
       schema: "aoa-pause-detector-status/1",

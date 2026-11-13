@@ -854,6 +854,11 @@ cell(
     detectorFresh(null, now).problems.length === 1
   );
   cell(
+    "pause-detector fails on a status dated even a minute in the future (Codex R1 P1-6)",
+    detectorFresh(st("2026-11-14T12:01:00Z"), now).problems.some(x => x.includes("future")) &&
+      detectorFresh(st("2026-11-14T12:00:00Z"), now).problems.length === 0
+  );
+  cell(
     "pause-detector fails on another job's status file",
     detectorFresh(
       JSON.stringify({ schema: "aoa-pause-job-status/1", at: "2026-11-14T11:59:00Z" }),

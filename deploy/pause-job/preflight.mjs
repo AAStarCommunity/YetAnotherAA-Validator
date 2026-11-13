@@ -309,7 +309,9 @@ export function detectorFresh(text, now, maxAgeMs = 2 * 3600_000 + 600_000) {
       problems: [`the detector's last round is ${Math.round((now - at) / 60_000)} min old`],
       note: "",
     };
-  if (at - now > 600_000) return { problems: ["status.json is dated in the future"], note: "" };
+  // written on this host by this host's clock: any time after now is a rolled-back clock or a
+  // forged file, never fresh (Codex R1 P1-6)
+  if (at > now) return { problems: ["status.json is dated in the future"], note: "" };
   const n = Array.isArray(j.alerts) ? j.alerts.length : 0;
   return {
     problems: [],

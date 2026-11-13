@@ -27,8 +27,13 @@ import {
   dueAlerts,
   resolvedKeys,
   DETECTOR_SECRETS,
+  batches,
+  deliver,
+  telegram,
+  MESSAGE_CHARS,
 } from "./detector.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
+import { scanSource, scanTree } from "./no-signing-scan.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let pass = 0;
@@ -48,46 +53,6 @@ const assert = (c, m) => {
 };
 
 // ---------------------------------------------------------------- no key, no signing, no broadcast
-
-/** Code with comments removed (a comment saying "no signing" is not code). Pure. */
-export function codeOnly(text) {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n")
-    .map(l => l.replace(/(^|[^:"'`])\/\/.*$/, "$1"))
-    .join("\n");
-}
-// anything that can hold a key, sign, or broadcast, or run another program that could
-export const FORBIDDEN =
-  /\b(Wallet|HDNodeWallet|BaseWallet|SigningKey|Signer|JsonRpcSigner|NonceManager|signTransaction|signMessage|signTypedData|sendTransaction|sendRawTransaction|broadcastTransaction|eth_sendRawTransaction|eth_sendTransaction|eth_signTransaction|eth_sign|personal_sign|privateKey|fromEncryptedJson|fromEncryptedJsonSync|encryptKeystoreJson|decryptKeystoreJson|Mnemonic|fromPhrase|child_process|spawn|execFile|execSync|fork|keystore|mktx)\b/;
-export const ALLOWED_IMPORTS = new Set([
-  "node:fs",
-  "node:net",
-  "node:os",
-  "node:path",
-  "node:url",
-  "ethers",
-]);
-const IMPORT = /^\s*import\s+(?:[^"';]*?\sfrom\s+)?["']([^"']+)["']/gm;
-const DYNAMIC = /\bimport\s*\(|\brequire\s*\(/;
-
-/** Problems of the file at `path` and every local module it imports, transitively. */
-export function scanTree(path, read = p => readFileSync(p, "utf8"), seen = new Set()) {
-  const p = [];
-  if (seen.has(path)) return p;
-  seen.add(path);
-  const code = codeOnly(read(path));
-  const m = code.match(FORBIDDEN);
-  if (m) p.push(`${path}: forbidden "${m[1]}"`);
-  if (DYNAMIC.test(code)) p.push(`${path}: a dynamic import or require`);
-  for (const [, spec] of code.matchAll(IMPORT)) {
-    if (spec.startsWith(".")) {
-      if (spec.endsWith(".json")) continue;
-      p.push(...scanTree(resolve(dirname(path), spec), read, seen));
-    } else if (!ALLOWED_IMPORTS.has(spec)) p.push(`${path}: imports ${spec}`);
-  }
-  return p;
-}
 
 await cell(
   "no-signing: the detector and everything it imports hold no signing or broadcast code",
@@ -109,38 +74,78 @@ await cell(
       assert(seen.has(resolve(HERE, f)), `${f} not scanned`);
   }
 );
-await cell("no-signing CONTROL: a signTransaction call is caught", () => {
+// every one of these must be caught: Codex R1's bypasses first, then the plain forms
+const CAUGHT = {
+  "computed ethers member": 'import { ethers } from "ethers";\nconst W = ethers["Wal" + "let"];',
+  "code between strings holding comment markers":
+    'const a = "/*";\nconst w = x.signTransaction(t);\nconst b = "*/";',
+  "an import after another statement on one line":
+    'const a = 1; import { execFile } from "node:child_process";',
+  "an ethers alias": 'import { ethers } from "ethers";\nconst e = ethers;',
+  "an ethers signer": 'import { ethers } from "ethers";\nconst w = new ethers.Wallet(k);',
+  "a JsonRpcProvider": 'import { ethers } from "ethers";\nconst p = new ethers.JsonRpcProvider(u);',
+  "a broadcast method name": 'await rpc("eth_sendRawTransaction", [raw]);',
+  "a broadcast method in a template": "await rpc(`eth_send${x}`, [raw]); const t = `x keystore`;",
+  child_process: 'import { execFile } from "node:child_process";',
+  "net beyond the lock": 'import { connect } from "node:net";',
+  "a keystore file": "const k = readFileSync(cfg.keystore);",
+  "a dynamic import": 'const m = await import("./x.mjs");',
+  require: 'const m = require("x");',
+  eval: 'eval("x")',
+  "new Function": 'new Function("return 1")',
+  globalThis: "globalThis.fetch(u)",
+  "a computed process member": 'process["bind" + "ing"]("x")',
+  "a fetch alias": "const f = fetch; f(u);",
+  "a fetch to an arbitrary URL": "await fetch(u, {});",
+  "a fetch outside rpcTransport": "function other(url) { return fetch(url); }",
+  "a second JSON-RPC fetch": "function rpcTransport(url) { fetch(url); fetch(url); }",
+  "an object key naming a signer": "const o = { signTransaction: 1 };",
+  "a private key field": "const k = cfg.privateKey;",
+};
+await cell(
+  "no-signing CONTROL: every forbidden form is caught (incl. Codex R1's four bypasses)",
+  () => {
+    const missed = Object.entries(CAUGHT).filter(
+      ([, src]) => scanSource("/y.mjs", src).length === 0
+    );
+    assert(missed.length === 0, `not caught: ${missed.map(([k]) => k).join(", ")}`);
+  }
+);
+await cell("no-signing CONTROL: a re-export (export * from) is followed", () => {
+  const files = {
+    "/r/a.mjs": 'export * from "./evil.mjs";',
+    "/r/evil.mjs": "x.sendTransaction(t);",
+  };
+  const p = scanTree("/r/a.mjs", f => files[f]);
+  assert(
+    p.some(x => x.includes("/r/evil.mjs")),
+    p.join("; ")
+  );
+});
+await cell("no-signing CONTROL: a signing module two imports deep is caught", () => {
   const files = {
     "/x/a.mjs": 'import { b } from "./b.mjs";\n',
-    "/x/b.mjs": "const r = await w.signTransaction(tx);\n",
+    "/x/b.mjs": 'export { c } from "./c.mjs";\n',
+    "/x/c.mjs": "export const c = w => w.signTransaction({});\n",
   };
   const p = scanTree("/x/a.mjs", f => files[f]);
   assert(
-    p.some(x => x.includes("signTransaction")),
-    "not caught"
+    p.some(x => x.includes("/x/c.mjs") && x.includes("signTransaction")),
+    p.join("; ")
   );
 });
-await cell(
-  "no-signing CONTROL: an ethers Wallet, an eth_sendRawTransaction and child_process are caught",
-  () => {
-    for (const src of [
-      "const w = new ethers.Wallet(k);",
-      'await rpc("eth_sendRawTransaction", [raw]);',
-      'import { execFile } from "node:child_process";',
-      "const k = readFileSync(cfg.keystore);",
-      'const m = await import("./x.mjs");',
-    ]) {
-      const p = scanTree("/y.mjs", () => src);
-      assert(p.length > 0, `not caught: ${src}`);
-    }
+await cell("no-signing CONTROL: comments are not code; the two allowed fetches pass", () => {
+  const ok = [
+    "// no Wallet, no signTransaction here\n/* keystore */\nconst a = 1;\n",
+    "async function t(token) { return fetch(`https://api.telegram.org/bot${token}/sendMessage`, {}); }",
+    "function rpcTransport(url) { return () => fetch(url, {}); }",
+    'import { createServer } from "node:net";',
+    'import { ethers } from "ethers";\nconst i = new ethers.Interface([]);',
+  ];
+  for (const src of ok) {
+    const p = scanSource("/z.mjs", src);
+    assert(p.length === 0, `${src}: ${p.join("; ")}`);
   }
-);
-await cell("no-signing CONTROL: a comment that says 'no signing' is not code", () => {
-  const p = scanTree(
-    "/z.mjs",
-    () => "// no Wallet, no signTransaction here\n/* keystore */\nconst a = 1;\n"
-  );
-  assert(p.length === 0, p.join("; "));
 });
 await cell(
   "no-signing: the RPC client refuses every write method before the transport sees it",
@@ -212,6 +217,7 @@ const cfgOf = over => ({
   registryImplementationCodeHash: ethers.keccak256(REG_IMPL_CODE),
   startBlock: 100,
   logChunk: 50,
+  rescanBlocks: 60,
   ...over,
 });
 
@@ -253,18 +259,29 @@ function fakeChain(w) {
       return { number: n, hash: w.reorg ? hashOf(n + 9999) : hashOf(n) };
     },
     getLogs: async f => {
-      if (w.failOnce?.delete(`logs:${Number(f.fromBlock)}`)) throw new Error("once");
-      failIf(`logs:${Number(f.fromBlock)}`);
-      failIf("logs");
-      const a = Number(f.fromBlock);
-      const b = Number(f.toBlock);
       assert(f.address === SP && f.topics[0] === OPERATOR_CONFIGURED, "log filter");
+      let a;
+      let b;
+      if (f.blockHash) {
+        // EIP-234: one block by hash; a backend that has not indexed it fails
+        failIf("logs-at-B");
+        assert(f.blockHash === hashOf(w.latest), "blockHash filter not B");
+        a = b = w.latest;
+      } else {
+        if (w.failOnce?.delete(`logs:${Number(f.fromBlock)}`)) throw new Error("once");
+        failIf(`logs:${Number(f.fromBlock)}`);
+        failIf("logs");
+        a = Number(f.fromBlock);
+        b = Number(f.toBlock);
+      }
+      w.scanned = [...(w.scanned ?? []), [a, b]];
       return Object.entries(w.ops)
-        .filter(([, o]) => o.logBlock >= a && o.logBlock <= b)
+        .filter(([, o]) => o.logBlock >= a && o.logBlock <= b && !w.hidden?.has(o.logBlock))
         .map(([op, o]) => ({
           address: SP,
-          topics: [OPERATOR_CONFIGURED, ethers.zeroPadValue(op, 32)],
+          topics: [OPERATOR_CONFIGURED, w.topicOf?.(op) ?? ethers.zeroPadValue(op, 32)],
           blockNumber: ethers.toQuantity(o.logBlock),
+          blockHash: w.forkedLog === o.logBlock ? hashOf(o.logBlock + 5555) : hashOf(o.logBlock),
           removed: false,
         }));
     },
@@ -348,9 +365,9 @@ const world = over => ({
   },
   ...over,
 });
-const round = async (w, cfg = cfgOf(), st = emptyState(cfg)) => ({
+const round = async (w, cfg = cfgOf(), st = emptyState(cfg), now = 1e12) => ({
   st,
-  ...(await runRound(st, { chain: fakeChain(w), cfg })),
+  ...(await runRound(st, { chain: fakeChain(w), cfg, now })),
 });
 
 await cell(
@@ -548,6 +565,142 @@ await cell("round: a state of another SuperPaymaster is refused", async () => {
     refused = /another SuperPaymaster/.test(e.message);
   }
   assert(refused, "not refused");
+});
+
+await cell(
+  "round: an operator topic with non-zero padding is refused (unknown), not decoded",
+  async () => {
+    const w = world({ topicOf: op => `0x${"ab".repeat(12)}${op.slice(2)}` });
+    const { alerts, report, st } = await round(w);
+    assert(Object.keys(st.operators).length === 0 && st.cursor === 99, "decoded or cursor moved");
+    assert(
+      alerts.some(a => a.key === "inventory" && /not an address/.test(a.text)) && !report.clear,
+      "not refused"
+    );
+  }
+);
+await cell("round: a log whose blockHash is not canonical is refused (unknown)", async () => {
+  const { alerts, report, st } = await round(world({ forkedLog: 120 }));
+  assert(st.cursor === 99 && !report.clear, "accepted a forked log");
+  assert(
+    alerts.some(a => /not on the canonical chain/.test(a.text)),
+    alerts.map(a => a.text).join("; ")
+  );
+});
+await cell(
+  "round: a backend that cannot give B's logs by hash makes the recent scan unknown",
+  async () => {
+    const { alerts, report } = await round(world({ fail: new Set(["logs-at-B"]) }));
+    assert(alerts.some(a => a.key === "inventory-recent") && !report.clear, "not unknown");
+  }
+);
+await cell(
+  "round: a lagging backend's [] is caught by the next round's rescan window",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    const w = world({ hidden: new Set([120]), latest: 300, finalized: 250 });
+    await round(w, cfg, st, 1e12); // first (full) round: block 120 answered [] by the backend
+    assert(Object.keys(st.operators).length === 0, "seen despite hidden");
+    // the backend catches up; the cursor is at 250, the window re-reads 191..250: 120 is outside
+    w.hidden = new Set();
+    w.ops[OP1.toLowerCase()].logBlock = 200; // an operator inside the window
+    await round(w, cfg, st, 1e12 + 3600_000);
+    assert(st.operators[ethers.getAddress(OP1)] === 200, "the rescan window did not find it");
+  }
+);
+await cell(
+  "round: a missed operator outside the window is found by the daily full rescan",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    const w = world({ hidden: new Set([120]) });
+    await round(w, cfg, st, 1e12);
+    w.hidden = new Set();
+    await round(w, cfg, st, 1e12 + 3600_000); // window only: 120 is outside
+    assert(Object.keys(st.operators).length === 0, "found without the full rescan");
+    await round(w, cfg, st, 1e12 + 24 * 3600_000); // a day later: full rescan from startBlock
+    assert(st.operators[ethers.getAddress(OP1)] === 120, "the daily rescan did not find it");
+    assert(st.lastFullScan === 1e12 + 24 * 3600_000, "lastFullScan not recorded");
+  }
+);
+await cell("round: a failed full rescan does not record lastFullScan", async () => {
+  const st = emptyState(cfgOf());
+  await round(world({ fail: new Set(["logs:100"]) }), cfgOf(), st, 1e12);
+  assert(st.lastFullScan === 0, "recorded a failed full scan");
+});
+await cell("state: an operators array (or bad entries) is refused, not silently emptied", () => {
+  const c = cfgOf();
+  const lowerCase = `0x${"ab".repeat(20)}`; // not its own checksum form
+  assert(ethers.getAddress(lowerCase) !== lowerCase, "fixture");
+  for (const bad of [[], { [lowerCase]: 120 }, { [ethers.getAddress(OP1)]: "120" }, { x: 1 }]) {
+    const st = { ...emptyState(c), cursor: 250, operators: bad };
+    assert(
+      stateProblems(st, c).some(x => /operators/.test(x)),
+      `accepted ${JSON.stringify(bad)}`
+    );
+  }
+  assert(
+    stateProblems({ ...emptyState(c), alerts: [] }, c).some(x => /alerts/.test(x)),
+    "alerts array"
+  );
+  const good = { ...emptyState(c), cursor: 250, operators: { [ethers.getAddress(OP1)]: 120 } };
+  assert(stateProblems(good, c).length === 0, stateProblems(good, c).join("; "));
+});
+
+// ---------------------------------------------------------------- delivery
+
+await cell("delivery: many alerts are split into whole-line messages under the limit", () => {
+  const entries = Array.from({ length: 40 }, (_, k) => ({ line: `- ${"x".repeat(180)} ${k}` }));
+  const b = batches("H:", entries);
+  assert(b.length > 1 && b.every(m => m.text.length <= MESSAGE_CHARS), "over the limit");
+  assert(b.flatMap(m => m.items).length === 40, "a line lost");
+  assert(
+    b.every(m => m.items.every(e => m.text.includes(e.line))),
+    "a line cut"
+  );
+});
+await cell("delivery: only alerts in messages Telegram accepted are marked sent", async () => {
+  const st = { alerts: { old: 1 } };
+  const due = Array.from({ length: 40 }, (_, k) => ({
+    key: `k${k}`,
+    text: `${"y".repeat(180)} ${k}`,
+  }));
+  let n = 0;
+  const r = await deliver(st, due, ["old"], "H:", 5, async () =>
+    n++ === 0 ? { ok: true } : { ok: false, why: "x" }
+  );
+  const marked = Object.keys(st.alerts).filter(k => st.alerts[k] === 5);
+  assert(
+    !r.ok && r.failed > 0 && marked.length === r.sent && marked.length < 40,
+    JSON.stringify(r)
+  );
+  // the resolution rides in the last message, which failed: it must still be pending
+  assert("old" in st.alerts, "a resolution in a failed message was acknowledged");
+});
+await cell("delivery: HTTP 200 with ok:false or a non-JSON body is NOT delivered", async () => {
+  const cfg = { telegram: { chatId: "1" } };
+  const res = (status, body) => ({
+    ok: status < 300,
+    status,
+    json: async () => (body === "bad" ? JSON.parse("{") : body),
+  });
+  assert(
+    (await telegram(cfg, "t", "x", async () => res(200, { ok: true }))).ok === true,
+    "ok:true not ok"
+  );
+  assert(
+    (await telegram(cfg, "t", "x", async () => res(200, { ok: false }))).ok === false,
+    "ok:false accepted"
+  );
+  assert(
+    (await telegram(cfg, "t", "x", async () => res(200, "bad"))).ok === false,
+    "non-JSON accepted"
+  );
+  assert(
+    (await telegram(cfg, "t", "x", async () => res(429, { ok: false }))).ok === false,
+    "429 accepted"
+  );
 });
 
 // ---------------------------------------------------------------- alert bookkeeping

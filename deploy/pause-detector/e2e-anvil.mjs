@@ -129,6 +129,7 @@ const CFG = {
   registryImplementationCodeHash: await hashOf(await implOf(REG)),
   startBlock: 1,
   logChunk: 50,
+  rescanBlocks: 20000,
 };
 const chain = readOnlyChain(URL);
 const deployer = new ethers.Wallet(DEPLOYER_PK, p);
