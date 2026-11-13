@@ -298,10 +298,14 @@ jobs:
     name: SP evidence parity
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # the token only reads public SP sources: no inherited security-events/actions scopes
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Use Node.js 20
         uses: actions/setup-node@v7
@@ -320,7 +324,17 @@ jobs:
       - name: Check SP's evidence decoding against the vectors
         env:
           GH_TOKEN: ${{ github.token }}
-        run: npm run -s check:sp-parity -- "$(tr -d '[:space:]' < scripts/evidence/sp-parity-commit)"
+        # the pin file is exactly one lowercase 40-hex SHA (a trailing newline allowed); anything
+        # else, fragments joined across lines included, fails here instead of being repaired
+        run: |
+          node --version
+          forge --version
+          pin="$(cat scripts/evidence/sp-parity-commit)"
+          if [[ ! "$pin" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::scripts/evidence/sp-parity-commit must be one 40-hex SHA"
+            exit 1
+          fi
+          npm run -s check:sp-parity -- "$pin"
 
   # Job 6: Type checking
   typecheck:
