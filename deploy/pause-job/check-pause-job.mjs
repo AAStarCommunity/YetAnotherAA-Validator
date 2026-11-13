@@ -23,6 +23,8 @@ import {
   committed,
   PIN,
   spIface,
+  regIface,
+  OPERATOR_CONFIGURED,
 } from "./lib/core.mjs";
 import { configProblems, CAP_CEILING } from "./pause-job.mjs";
 import { parseRoles } from "./gen-sp-pin.mjs";
@@ -245,6 +247,266 @@ cell("a fresh state has no problems", stateProblems(base()).length === 0, stateP
     );
   }
 }
+// ---- a whole round on a scripted chain, so CI pins the send-path decisions (clestons #432 L2):
+// the chain answers the job's own reads; SP's pause logic itself is covered by e2e-anvil.mjs
+const OPR = "0x3333333333333333333333333333333333333333";
+const OTHER = "0x4444444444444444444444444444444444444444";
+const BH = `0x${"ab".repeat(32)}`;
+function scripted({ signer, balance, finalized = 100, prior = null }) {
+  const sent = [];
+  const out = (iface, fn, v) => iface.encodeFunctionResult(fn, v);
+  const roleCfg = {
+    minStake: 0n,
+    ticketPrice: 0n,
+    slashThreshold: 0,
+    slashBase: 0,
+    slashInc: 0,
+    slashMax: 0,
+    exitFeePercent: 0,
+    isActive: true,
+    minExitFee: 0n,
+    description: "",
+    owner: OTHER,
+    roleLockDuration: 0n,
+  };
+  const opsOut = {
+    aPNTsBalance: 0n,
+    isConfigured: true,
+    isPaused: false,
+    xPNTsToken: OTHER,
+    reputation: 0,
+    minTxInterval: 0,
+    treasury: OTHER,
+    totalSpent: 0n,
+    totalTxSponsored: 0n,
+  };
+  const chain = {
+    chainId: async () => "0x7a69",
+    blockNumber: async () => finalized,
+    blockByNumber: async () => ({ number: 101, hash: BH }),
+    getLogs: async f =>
+      f.topics[0] === OPERATOR_CONFIGURED && f.address.toLowerCase() === A.toLowerCase()
+        ? [
+            {
+              address: A,
+              topics: [OPERATOR_CONFIGURED, ethers.zeroPadValue(OPR, 32)],
+              blockNumber: "0x1",
+              removed: false,
+            },
+          ]
+        : [],
+    call: async ({ to, data }) => {
+      const sp = to.toLowerCase() === A.toLowerCase();
+      const iface = sp ? spIface : regIface;
+      const f = iface.parseTransaction({ data });
+      switch (f.name) {
+        case "REGISTRY":
+          return out(spIface, f.name, [B]);
+        case "owner":
+        case "pendingOwner":
+        case "guardian":
+        case "BLS_AGGREGATOR":
+        case "blsAggregator":
+          return out(iface, f.name, [OTHER]);
+        case "hasRole":
+        case "isReputationSource":
+          return out(regIface, f.name, [false]);
+        case "getRoleConfig":
+          return out(regIface, f.name, [roleCfg]);
+        case "pauseUnderstakedOperator":
+          return "0x"; // understaked
+        case "operators":
+          return out(spIface, f.name, Object.values(opsOut));
+        default:
+          throw new Error(`unscripted ${f.name}`);
+      }
+    },
+    nonce: async () => (prior ? 1 : 0) + sent.length,
+    estimateGas: async () => 50000n,
+    fees: async () => ({ baseFee: 1n }),
+    balance: async () => balance,
+    sendRaw: async raw => {
+      sent.push(raw);
+      return ethers.keccak256(raw);
+    },
+    receipt: async h => {
+      if (prior && h === prior.hash)
+        return {
+          transactionHash: h,
+          blockNumber: "0x63",
+          blockHash: prior.blockHash,
+          gasUsed: "10",
+          effectiveGasPrice: "1",
+          status: "0x1",
+        };
+      const i = sent.findIndex(r => ethers.keccak256(r) === h);
+      return i < 0
+        ? null
+        : {
+            transactionHash: h,
+            blockNumber: "0x65",
+            blockHash: BH,
+            gasUsed: "40000",
+            effectiveGasPrice: "3",
+            status: "0x1",
+          };
+    },
+  };
+  return { chain, sent };
+}
+async function roundOn({ cap, balance, prior = null }) {
+  const w = ethers.Wallet.createRandom();
+  const st = emptyState({
+    chainId: 31337,
+    signer: w.address,
+    spProxy: A,
+    registry: B,
+    startBlock: 1,
+    cap,
+  });
+  if (prior) {
+    st.ledger.txs.push({
+      nonce: 0,
+      operator: OTHER,
+      hash: prior.hash,
+      hashes: [prior.hash],
+      raws: ["0x01"],
+      reserve: prior.reserve,
+      gasLimit: "100000",
+      status: "included",
+      includedHash: prior.hash,
+      includedBlock: 99,
+      includedBlockHash: prior.blockHash,
+      includedCost: prior.includedCost,
+      pendingRounds: 0,
+    });
+    st.ledger.reserved = prior.reserve;
+  }
+  const { chain, sent } = scripted({
+    signer: w.address,
+    balance,
+    finalized: prior ? 50 : 100,
+    prior,
+  });
+  const cfg = {
+    logChunk: 1000,
+    gasLimitMax: "1000000",
+    maxFeePerGasCap: "1000",
+    maxPriorityFeePerGas: "1",
+    receiptWaitMs: 1000,
+    pollMs: 1,
+  };
+  const r = await runRound(st, {
+    chain,
+    signer: { address: w.address, sign: tx => w.signTransaction(tx) },
+    persist: () => {},
+    cfg,
+  });
+  return { r, sent, st };
+}
+{
+  const ok = await roundOn({ cap: "10000000", balance: 10000000n });
+  cell(
+    "scripted round (control): an understaked operator is paused, no inflow",
+    ok.sent.length === 1 && !ok.r.alerts.some(x => x.key === "inflow"),
+    { sent: ok.sent.length, a: ok.r.alerts.map(x => x.key) }
+  );
+  const inflow = await roundOn({ cap: "10000000", balance: 10000001n });
+  cell(
+    "scripted round: after an inflow of 1 wei the send STILL happens, and the inflow alert fires (L2)",
+    inflow.sent.length === 1 && inflow.r.alerts.some(x => x.key === "inflow"),
+    { sent: inflow.sent.length, a: inflow.r.alerts.map(x => x.key) }
+  );
+  const deficit = await roundOn({ cap: "10000000", balance: 9999999n });
+  cell(
+    "scripted round: a balance below what the ledger explains raises a deficit alert and still sends (L3)",
+    deficit.sent.length === 1 && deficit.r.alerts.some(x => x.key === "deficit"),
+    { sent: deficit.sent.length, a: deficit.r.alerts.map(x => x.key) }
+  );
+  {
+    // a journalled PENDING tx mined between the reconcile and B: its fee is gone from the balance
+    // but not in the ledger yet; that is no deficit (Codex follow-up P2)
+    const w = ethers.Wallet.createRandom();
+    const st = emptyState({
+      chainId: 31337,
+      signer: w.address,
+      spProxy: A,
+      registry: B,
+      startBlock: 1,
+      cap: "10000000",
+    });
+    st.ledger.txs.push({ nonce: 0, status: "sent", reserve: "300000" });
+    st.ledger.reserved = "300000";
+    const g = fundingGate(st, 10000000n - 120000n); // the fee it actually paid
+    cell(
+      "fundingGate: a pending tx already mined (fee gone from the balance, not yet in the ledger) is no deficit",
+      g.deficit === null && g.inflow === null,
+      g
+    );
+    cell(
+      "fundingGate: a balance below even the pending allowance is a deficit",
+      fundingGate(st, 10000000n - 300001n).deficit?.key === "deficit"
+    );
+    // an included tx recorded at 120000 whose block was reorged and re-included at 150000 before B
+    const st2 = emptyState({
+      chainId: 31337,
+      signer: w.address,
+      spProxy: A,
+      registry: B,
+      startBlock: 1,
+      cap: "10000000",
+    });
+    st2.ledger.txs.push({
+      nonce: 0,
+      status: "included",
+      reserve: "300000",
+      includedCost: "120000",
+    });
+    st2.ledger.reserved = "300000";
+    cell(
+      "fundingGate: an included tx re-included at a higher cost (within its reservation) is no deficit (Codex follow-up R2)",
+      fundingGate(st2, 10000000n - 150000n).deficit === null
+    );
+    cell(
+      "fundingGate: below cap - committed it is a deficit",
+      fundingGate(st2, 10000000n - 300001n).deficit?.key === "deficit"
+    );
+    cell(
+      "fundingGate: a balance of EXACTLY cap - committed is no deficit (the boundary, clestons #433 L1)",
+      fundingGate(st2, 10000000n - 300000n).deficit === null
+    );
+  }
+  // an included tx with reservation 10 but a KNOWN cost far above it: a new send must not fit
+  const H0 = `0x${"0c".repeat(32)}`;
+  const big1 = await roundOn({
+    cap: "10000000",
+    balance: 0n,
+    prior: { hash: H0, blockHash: `0x${"0d".repeat(32)}`, reserve: "10", includedCost: "9900000" },
+  });
+  cell(
+    "scripted round: an included cost above its reservation is committed; the new send is refused (L2)",
+    big1.sent.length === 0 && big1.r.alerts.some(x => x.key === "cap"),
+    { sent: big1.sent.length, a: big1.r.alerts.map(x => x.key) }
+  );
+  const over = await roundOn({
+    cap: "10000000",
+    balance: 0n,
+    prior: { hash: H0, blockHash: `0x${"0d".repeat(32)}`, reserve: "10", includedCost: "10000001" },
+  });
+  cell(
+    "scripted round: an included cost above the cap trips overCap (committed), nothing sent (L2)",
+    over.sent.length === 0 &&
+      over.r.alerts.some(
+        x =>
+          x.key === "cap" &&
+          /^remaining cap insufficient: committed 10000001 \(spent 0, held reservations or known included costs\) exceeds the cap 10000000;/.test(
+            x.text
+          )
+      ),
+    { sent: over.sent.length, a: over.r.alerts.map(x => x.text) }
+  );
+}
+
 // ---- the provisional (included, not final) cost on OP includes the oracle's fees (Codex R9 P2)
 {
   const w = ethers.Wallet.createRandom();

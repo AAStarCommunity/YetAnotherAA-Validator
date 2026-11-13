@@ -365,9 +365,17 @@ async function main() {
         throw new SafeError("a state already exists; refusing to start a new ledger over it");
       // the funding is the hard bound: at most the cap may be on the new signer
       const bal = BigInt(await chain.balance(wallet.address, "latest"));
-      if (bal > BigInt(cfg.capWei))
+      // less than the cap is refused (it would raise a deficit alert every round, clestons #433 L3);
+      // MORE is accepted with an inflow note: anyone can send the public address 1 wei before
+      // --init, and refusing would be the N1 kill switch at setup time (DSR ruling on 9d14dfc4).
+      // Our own overfunding is caught earlier: DSR reads the funding tx (value == cap) first.
+      if (bal < BigInt(cfg.capWei))
         throw new SafeError(
-          `the signer holds ${bal} wei, more than the cap ${cfg.capWei}; fund exactly the cap`
+          `the signer holds ${bal} wei, less than the cap ${cfg.capWei}; fund exactly the cap`
+        );
+      if (bal > BigInt(cfg.capWei))
+        console.error(
+          `ALERT inflow: the signer holds ${bal - BigInt(cfg.capWei)} wei more than the cap ${cfg.capWei}; the ledger cap stays ${cfg.capWei}; any top-up needs a DSR go`
         );
       const n = Number(await chain.nonce(wallet.address, "latest"));
       if (n !== 0)
