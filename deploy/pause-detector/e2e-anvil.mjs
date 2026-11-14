@@ -141,6 +141,7 @@ const CFG = {
   startBlock: 1,
   logChunk: 50,
   rescanBlocks: 20000,
+  maxHeadAgeSec: 1800,
 };
 const chain = readOnlyChain(URL);
 const deployer = new ethers.Wallet(DEPLOYER_PK, p);

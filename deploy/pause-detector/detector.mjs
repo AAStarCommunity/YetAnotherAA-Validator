@@ -16,11 +16,14 @@ import {
   bundleProblems,
   launchProblems,
   permissionProblems,
+  recordStop,
   symlinkProblems,
 } from "./lib/guard.mjs";
 
 const refuse = problems => {
-  console.error(`pause-detector: refusing to run: ${problems.slice(0, 5).join("; ")}`);
+  const text = `refusing to run: ${problems.slice(0, 5).join("; ")}`;
+  console.error(`pause-detector: ${text}`);
+  recordStop(homedir(), text);
   process.exit(78);
 };
 const home = homedir();
@@ -30,6 +33,7 @@ const first = [
   ...launchProblems({
     execArgv: process.execArgv,
     script: process.argv[1],
+    args: process.argv.slice(2),
     envNames: Object.keys(process.env),
     home,
   }),

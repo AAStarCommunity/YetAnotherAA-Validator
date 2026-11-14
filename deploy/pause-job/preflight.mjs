@@ -339,6 +339,12 @@ export function detectorArgsProblems(args, home, env = [], inherited = []) {
   return [];
 }
 
+/** detector-bundle: no symlink under ~/.aoa-pause-detector, and the bundle exactly its manifest. */
+export function detectorBundleItem(home) {
+  const dd = join(home, DETECTOR_DIR);
+  return [...detectorSymlinks(dd), ...detectorBundle(join(dd, "app"))];
+}
+
 /**
  * pause-detector: the detector's last status.json (`text`, or null when missing) is fresh: written
  * at most `maxAgeMs` before `now`, by the detector. Returns { problems, note }. Pure.
@@ -363,7 +369,21 @@ export function detectorFresh(text, now, maxAgeMs = 2 * 3600_000 + 600_000) {
   // written on this host by this host's clock: any time after now is a rolled-back clock or a
   // forged file, never fresh (Codex R1 P1-6)
   if (at > now) return { problems: ["status.json is dated in the future"], note: "" };
+  // a fresh file is not a healthy detector (clestons #434 F2, B1): a run that failed at startup,
+  // alerts that never reached Telegram, and a "clear" read on an old head all FAIL
+  if (typeof j.startup === "string")
+    return { problems: [`the detector's last run failed at startup: ${j.startup}`], note: "" };
   const n = Array.isArray(j.alerts) ? j.alerts.length : 0;
+  if (n > 0 && j.delivery?.ok !== true)
+    return { problems: [`the last round's ${n} alert(s) were not delivered`], note: "" };
+  if (j.clear === true) {
+    const ts = Number(j.report?.block?.timestamp);
+    if (!Number.isSafeInteger(ts) || now - ts * 1000 > maxAgeMs)
+      return {
+        problems: ["the last round reads clear on a head that is old or undated"],
+        note: "",
+      };
+  }
   return {
     problems: [],
     note: j.clear === true ? "last round clear" : `last round NOT clear (${n} alert(s))`,
@@ -501,8 +521,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     results.push(["detector-args", da.length ? "FAIL" : "PASS", da]);
     // the bundle is exactly its manifest and nothing under ~/.aoa-pause-detector is a symlink:
     // checked here from outside the permission model too, so the entry file itself is covered
-    const dd = join(homedir(), DETECTOR_DIR);
-    const db = [...detectorSymlinks(dd), ...detectorBundle(join(dd, "app"))];
+    const db = detectorBundleItem(homedir());
     results.push(["detector-bundle", db.length ? "FAIL" : "PASS", db.slice(0, 5)]);
   }
   const di = argv.indexOf("--detector-status");

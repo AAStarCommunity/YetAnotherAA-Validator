@@ -81,6 +81,15 @@ function resetVerification(st, alerts, why) {
   });
 }
 
+/**
+ * A head block older than `maxAgeSec` (or without a usable timestamp) at `nowMs` is stale. Pure.
+ */
+export function headStale(block, nowMs, maxAgeSec) {
+  const t = Number(block?.timestamp);
+  if (!Number.isSafeInteger(t) || t <= 0 || !Number.isSafeInteger(maxAgeSec)) return true;
+  return nowMs / 1000 - t > maxAgeSec;
+}
+
 /** A fresh state, bound to { chainId, spProxy, startBlock }. */
 export function emptyState({ chainId, spProxy, startBlock }) {
   return {
@@ -452,7 +461,17 @@ async function roundOnce(st, { chain, cfg, now }) {
   // 2. one block, by hash, for every read of this round
   const head = await chain.blockByNumber("latest");
   if (!head?.hash) throw new SafeError("no latest block");
-  const B = { number: height(Number(head.number), "the latest block"), hash: head.hash };
+  const B = {
+    number: height(Number(head.number), "the latest block"),
+    hash: head.hash,
+    timestamp: head.timestamp,
+  };
+  // a head that stopped moving is the commonest honest failure, and self-consistent: every other
+  // check passes against a frozen node (clestons #434 B1). An old head stops the round.
+  if (headStale(head, now, cfg.maxHeadAgeSec))
+    throw new SafeError(
+      `the latest block ${B.number} is ${Number.isSafeInteger(head.timestamp) ? Math.round(now / 1000 - head.timestamp) : "?"} s old (max ${cfg.maxHeadAgeSec}): a frozen or lagging node`
+    );
   // a backend whose latest is below what it calls finalized (or below our cursor) is lagging or
   // inconsistent: nothing it says this round is used (Codex R3 P1-3)
   if (B.number < finalized || B.number < st.cursor)

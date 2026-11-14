@@ -14,6 +14,8 @@ import {
   openSync,
   readSync,
   readdirSync,
+  renameSync,
+  writeSync,
 } from "node:fs";
 import { join, relative, sep } from "node:path";
 
@@ -22,6 +24,35 @@ export class GuardError extends Error {
   constructor(message) {
     super(message);
     this.name = "GuardError";
+  }
+}
+
+/**
+ * Best effort: record a run that stopped before its round, so silence never reads as healthy
+ * (clestons #434 F1). A minimal status.json in ~/.aoa-pause-detector/state, `clear: false`, the
+ * reason in `startup` (fixed text from our own checks); preflight FAILs on it. Written as a temp
+ * file (O_EXCL, O_NOFOLLOW) and renamed; any error is swallowed: the exit code and log still say it.
+ */
+export function recordStop(home, text) {
+  const dir = join(home, DIR, "state");
+  const tmp = join(dir, `status.json.${process.pid}.stop`);
+  try {
+    const fd = openSync(
+      tmp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600
+    );
+    try {
+      const body = Buffer.from(
+        `${JSON.stringify({ schema: "aoa-pause-detector-status/1", at: new Date().toISOString(), clear: false, startup: text })}\n`
+      );
+      writeSync(fd, body);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, join(dir, "status.json"));
+  } catch {
+    /* best effort */
   }
 }
 
@@ -92,7 +123,7 @@ export const ENV_OK = new Set([
  * variable is set. Reads reach ONLY the detector's own directory: never a repository checkout,
  * which may hold node_state.json, .env.sepolia or .keys/ (Codex R7 P1-1). Pure.
  */
-export function launchProblems({ execArgv, script, envNames, home }) {
+export function launchProblems({ execArgv, script, args, envNames, home }) {
   const p = [];
   const d = `${home}/${DIR}`;
   const flag = execArgv?.[0];
@@ -107,6 +138,11 @@ export function launchProblems({ execArgv, script, envNames, home }) {
     );
   if (script !== `${d}/app/deploy/pause-detector/detector.mjs`)
     p.push("the detector is not run from its bundle, ~/.aoa-pause-detector/app");
+  // and nothing after the script but the plist's own arguments (clestons #434 F3)
+  if (!Array.isArray(args) || args.join("\n") !== ["--config", `${d}/config.json`].join("\n"))
+    p.push(
+      "the arguments after the script are not exactly --config ~/.aoa-pause-detector/config.json"
+    );
   const bad = (envNames ?? []).filter(n => INJECTION_ENV.test(n));
   if (bad.length) p.push(`option-injecting variables are set: ${bad.join(", ")}`);
   // an allowlist, not a denylist: a stale KEEPER_PRIVATE_KEY (or any other variable) inherited

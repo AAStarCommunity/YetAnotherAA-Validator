@@ -44,8 +44,9 @@ Three layers carry it, and they are not equally strong:
    - **Startup guards.** `detector.mjs` is the entry and uses Node builtins only
      (`lib/guard.mjs`). It refuses to start unless all of these hold:
      - `process.permission` exists and grants nothing more;
-     - node's own flags (`process.execArgv`) are exactly the plist's, and the
-       script is the bundle's entry;
+     - node's own flags (`process.execArgv`) are exactly the plist's, the script
+       is the bundle's entry, and the only arguments after it are
+       `--config ~/.aoa-pause-detector/config.json` (clestons #434 F3);
      - no option-injecting variable is set (`NODE_OPTIONS`, `NODE_*`, `DYLD_*`,
        `BASH_ENV`). A `NODE_OPTIONS=--allow-fs-read=<key>` would widen the
        grants with the arguments unchanged (Codex R4);
@@ -125,6 +126,14 @@ a missed one.
      reported.
 2. **One block.** It pins B, the latest block, by hash. Every read below is at B
    (EIP-1898, `requireCanonical`).
+   - **A fresh head.** A head older than `maxHeadAgeSec` (1800 in the example;
+     Sepolia's block time is 12 s) stops the round as `unknown` (clestons #434
+     B1). A node frozen at a height is self-consistent, so every other check
+     passes against it; only the head's age shows it.
+   - The provider probe treats a stale head as a failed probe, so the fallback
+     takes over from a frozen primary.
+   - `status.json` records B's timestamp, and preflight FAILs a `clear` on an
+     old or undated head.
 3. **Identity at B.**
    - `SuperPaymaster.REGISTRY()` is the configured Registry.
    - The EIP-1967 implementation slot of **both** proxies holds the configured
@@ -203,9 +212,12 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
 
 - **What holds without that trust.** Every read failure and every inconsistency
   the detector can see yields `unknown`, never clear. Honest providers with
-  ordinary lag, load balancing or reorgs cannot produce a false clear. That is
-  the hash-bound, chain-linked cross-check watermark above, and the
-  commit-on-canonical rounds.
+  ordinary lag, load balancing, reorgs or a frozen head cannot produce a false
+  clear. That rests on the head-age check, the hash-bound chain-linked
+  cross-check watermark above, and the commit-on-canonical rounds.
+- **One provider per round.** Each round reads from one provider, the primary
+  unless it fails its probe. So the trust in "two providers" holds for each one
+  on its own, not as a cross-check between them (see the follow-up below).
 - **The known residual.** A provider that **deliberately** answers one finalized
   block two different ways, consistently, could still hide an operator. For
   example, it might serve another fork's block by number and by hash alike, with
@@ -239,6 +251,16 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   canonical B with the identity confirmed.
 - **No all-clear messages.** The trigger evidence is `status.json`, which
   preflight checks.
+- **A stop is never silent** (clestons #434 F1). Every early stop writes a
+  `status.json` with `clear: false` and the reason in `startup`, and preflight
+  FAILs on it. That covers a guard refusal, a bad config or state directory, and
+  a failed startup. The only exception is a second instance that loses the lock;
+  the run holding the lock writes its own status. The same goes for a round
+  whose alerts were not delivered.
+  - **Follow-up.** Nothing yet runs preflight on a schedule. Until a dead-man
+    check exists, a detector that no longer starts at all (an unloaded plist, a
+    missing node) shows only as a stale `status.json` the next time someone runs
+    preflight.
 
 ## Files
 
@@ -284,6 +306,11 @@ secret-file reader, called with the detector's own name table) and
    - `logChunk` must fit the providers' `getLogs` range limits. A range that is
      too wide makes every round `unknown` until it is fixed; it never makes a
      round clear.
+   - `maxHeadAgeSec` (60..86400) is the oldest head a round accepts.
+   - `startBlock` is the rc.8 SP deploy block. The first rounds cross-check
+     every block from there, at most 4096 per round, so a start far in the past
+     reads `cross-check is behind` (unknown, fail-closed) for a while (clestons
+     #434 F5).
 3. Create the secrets as 0600 files in a 0700 directory, without argv or
    history:
    - `aoa-dvt-detector-rpc-primary` and `aoa-dvt-detector-rpc-fallback` (RPC
@@ -304,6 +331,13 @@ secret-file reader, called with the detector's own name table) and
      them in the step-13 manifest as the detector's identity (DSR).
    - The checkout is not needed after this, and the detector cannot read it.
    - To upgrade, build a new bundle into a new directory and swap it in.
+   - It copies ethers from the checkout's `node_modules`. So install that with
+     `npm ci`, which installs exactly the lockfile, not `npm install`.
+     `--allow-dirty` is for tests only.
+   - The bundle is tested on the pinned Node 24.21.0 (CI also runs the cells on
+     Node 20). clestons reports that under Node 26's permission model the lock
+     socket fails to open (#434 F6, not reproduced here), so do not run it on
+     another major version without re-testing.
 6. Render and load the plist, then check
    `launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector | grep "run interval"`
    shows 3600. The plist needs the pinned node at
@@ -318,7 +352,9 @@ secret-file reader, called with the detector's own name table) and
      injecting variable;
    - **detector-bundle**: the bundle matches its manifest, with no symlink under
      `~/.aoa-pause-detector`;
-   - **pause-detector**: `status.json` is at most two intervals old.
+   - **pause-detector**: `status.json` is at most two intervals old, is not a
+     startup failure, has no undelivered alerts, and a `clear` in it is on a
+     head no older than two intervals.
 
 ## Before rc.8
 

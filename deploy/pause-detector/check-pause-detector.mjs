@@ -15,7 +15,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +32,7 @@ import {
   ROLE_PAYMASTER_SUPER,
   pauseCommand,
   ranges,
+  headStale,
 } from "./lib/detect.mjs";
 import {
   configProblems,
@@ -292,6 +294,7 @@ const cfgOf = over => ({
   startBlock: 100,
   logChunk: 50,
   rescanBlocks: 60,
+  maxHeadAgeSec: 1800,
   ...over,
 });
 
@@ -342,7 +345,12 @@ function fakeChain(w) {
       };
     },
     blockByNumber: async n => {
-      if (n === "latest") return w.noLatest ? null : { number: w.latest, hash: hashOf(w.latest) };
+      // the head is `headAgeSec` old at the round's `now` (12 s by default): w.frozenAt freezes it
+      const ts = Math.floor((w.nowMs ?? Date.now()) / 1000) - (w.headAgeSec ?? 12);
+      if (n === "latest")
+        return w.noLatest
+          ? null
+          : { number: w.latest, hash: hashOf(w.latest), timestamp: w.frozenAt ?? ts };
       if (w.oldFork?.[n]) return { number: n, hash: w.oldFork[n] };
       afterB = true;
       return { number: n, hash: w.reorg ? hashOf(n + 9999) : hashOf(n) };
@@ -391,7 +399,8 @@ function fakeChain(w) {
       return (
         {
           [SP]: PROXY_CODE,
-          [w.impl ?? IMPL]: IMPL_CODE,
+          [IMPL]: IMPL_CODE,
+          [w.impl ?? IMPL]: w.implCode ?? IMPL_CODE,
           [REG]: REG_CODE,
           [w.regImpl ?? REG_IMPL]: REG_IMPL_CODE,
         }[a.toLowerCase()] ?? "0x"
@@ -466,10 +475,10 @@ const world = over => ({
   },
   ...over,
 });
-const round = async (w, cfg = cfgOf(), st = emptyState(cfg), now = 1e12) => ({
-  st,
-  ...(await runRound(st, { chain: fakeChain(w), cfg, now })),
-});
+const round = async (w, cfg = cfgOf(), st = emptyState(cfg), now = 1e12) => {
+  w.nowMs = now;
+  return { st, ...(await runRound(st, { chain: fakeChain(w), cfg, now })) };
+};
 
 await cell(
   "round CONTROL: a staked operator is ok, the round is clear, nothing alerts",
@@ -1256,6 +1265,59 @@ await cell(
   }
 );
 
+await cell(
+  "round: a node frozen at a height is unknown, never clear (clestons #434 B1)",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    const w = world();
+    // control: a fresh head (12 s old) reads clear
+    const r0 = await round(w, cfg, st, 1e12);
+    assert(r0.report.clear, "control: a fresh head is not clear");
+    // the node freezes: the head stays at block 300 with its old timestamp; one hour later is still
+    // within maxHeadAgeSec, a day and a week later are not
+    w.frozenAt = Math.floor(1e12 / 1000) - 12;
+    const r1 = await round(w, cfg, st, 1e12 + 1000 * 1000);
+    assert(r1.report.clear, "control: a head 1000 s old (under 1800) is still clear");
+    for (const later of [86_400_000, 7 * 86_400_000]) {
+      let why = "";
+      try {
+        await round(w, cfg, st, 1e12 + later);
+      } catch (e) {
+        why = e.message;
+      }
+      assert(
+        /frozen or lagging node/.test(why),
+        `${later / 3600000} h later: ${why || "no error"}`
+      );
+    }
+  }
+);
+await cell("round: a head without a timestamp is stale (fail closed)", async () => {
+  assert(
+    headStale({ number: 1 }, 1e12, 1800) && headStale({ timestamp: "x" }, 1e12, 1800),
+    "accepted"
+  );
+  assert(!headStale({ timestamp: 1e9 - 10 }, 1e12, 1800), "control");
+  assert(headStale({ timestamp: 1e9 - 1801 }, 1e12, 1800), "boundary");
+});
+
+await cell(
+  "round: the SP proxy pointing at ANOTHER implementation fails identity, even with the configured one still deployed (clestons #434 F4)",
+  async () => {
+    // the configured implementation's code is still on chain (hash matches), but the proxy's slot
+    // points at a different contract: only the slot check can see that
+    const { alerts, report } = await round(
+      world({ impl: "0x00000000000000000000000000000000000000d7", implCode: "0x60ff" })
+    );
+    assert(
+      !report.identity.ok &&
+        alerts.some(a => a.key === "identity" && /SuperPaymaster proxy/.test(a.text)),
+      alerts.map(a => a.text).join("; ")
+    );
+  }
+);
+
 // ---------------------------------------------------------------- delivery
 
 await cell("delivery: many alerts are split into whole-line messages under the limit", () => {
@@ -1429,6 +1491,30 @@ const runDetector = ({ home, d }, env = {}) =>
     ],
     { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, ...env } }
   );
+const withHomeAsync = async fn => {
+  const h = makeHome();
+  try {
+    await fn(h);
+  } finally {
+    rmSync(h.home, { recursive: true, force: true });
+  }
+};
+const runDetectorAsync = ({ home, d }, env = {}) =>
+  new Promise(res => {
+    const c = spawn(
+      process.execPath,
+      [
+        ...plistFlags(d),
+        join(d, "app/deploy/pause-detector/detector.mjs"),
+        "--config",
+        join(d, "config.json"),
+      ],
+      { env: { PATH: process.env.PATH, HOME: home, ...env } }
+    );
+    let stderr = "";
+    c.stderr.on("data", x => (stderr += x));
+    c.on("close", status => res({ status, stderr }));
+  });
 const withHome = fn => {
   const h = makeHome();
   try {
@@ -1473,7 +1559,8 @@ await cell("permission: launchProblems accepts exactly the plist's launch and no
   const d = `${H}/.aoa-pause-detector`;
   const good = ["--permission", `--allow-fs-read=${d}`, `--allow-fs-write=${d}/state`];
   const script = `${d}/app/deploy/pause-detector/detector.mjs`;
-  const ok = x => launchProblems({ home: H, script, envNames: ["PATH", "HOME"], ...x });
+  const args = ["--config", `${d}/config.json`];
+  const ok = x => launchProblems({ home: H, script, args, envNames: ["PATH", "HOME"], ...x });
   assert(ok({ execArgv: good }).length === 0, ok({ execArgv: good }).join("; "));
   assert(
     ok({ execArgv: ["--experimental-permission", ...good.slice(1)] }).length === 0,
@@ -1487,6 +1574,11 @@ await cell("permission: launchProblems accepts exactly the plist's launch and no
     ],
     ["child processes", { execArgv: [...good, "--allow-child-process"] }],
     ["no --permission", { execArgv: good.slice(1) }],
+    [
+      "an extra argument after the script (F3)",
+      { execArgv: good, args: [...args, "--private-key", "0x1"] },
+    ],
+    ["another config", { execArgv: good, args: ["--config", "/tmp/x.json"] }],
     [
       "run from a checkout, not the bundle",
       { execArgv: good, script: "/Users/u/Dev/repo/deploy/pause-detector/detector.mjs" },
@@ -1535,6 +1627,9 @@ await cell("permission: a NODE_OPTIONS grant makes detector.mjs refuse (Codex R4
       r.status === 78 && /option-injecting variables are set: NODE_OPTIONS/.test(r.stderr),
       `${r.status} ${r.stderr}`
     );
+    // the refusal is not silent: status.json records it, and preflight FAILs on that (F1)
+    const stop = JSON.parse(readFileSync(join(h.d, "state", "status.json"), "utf8"));
+    assert(stop.clear === false && /option-injecting/.test(stop.startup), JSON.stringify(stop));
   })
 );
 await cell(
@@ -1657,6 +1752,85 @@ await cell(
       );
     })
 );
+// a minimal JSON-RPC server: Sepolia's chain id, and a head `age` seconds old
+const rpcServer = age =>
+  new Promise(res => {
+    const srv = createHttpServer((req, out) => {
+      let body = "";
+      req.on("data", c => (body += c));
+      req.on("end", () => {
+        const { id, method } = JSON.parse(body);
+        const result =
+          method === "eth_chainId"
+            ? "0xaa36a7"
+            : method === "eth_getBlockByNumber"
+              ? {
+                  number: "0x12c",
+                  hash: `0x${"ab".repeat(32)}`,
+                  timestamp: ethers.toQuantity(Math.floor(Date.now() / 1000) - age),
+                }
+              : null;
+        out.setHeader("content-type", "application/json");
+        out.end(
+          JSON.stringify(
+            result === null
+              ? { jsonrpc: "2.0", id, error: { code: -32000, message: "no" } }
+              : { jsonrpc: "2.0", id, result }
+          )
+        );
+      });
+    });
+    srv.listen(0, "127.0.0.1", () => res(srv));
+  });
+const runBundleAgainst = async (age, fn) => {
+  const srv = await rpcServer(age);
+  try {
+    await withHomeAsync(async h => {
+      const url = `http://127.0.0.1:${srv.address().port}`;
+      mkdirSync(join(h.d, "secrets"), { mode: 0o700 });
+      for (const n of ["aoa-dvt-detector-rpc-primary", "aoa-dvt-detector-rpc-fallback"])
+        writeFileSync(join(h.d, "secrets", n), url, { mode: 0o600 });
+      const ex = JSON.parse(readFileSync(join(HERE, "config.example.json"), "utf8"));
+      writeFileSync(
+        join(h.d, "config.json"),
+        JSON.stringify({
+          ...ex,
+          stateDir: join(h.d, "state"),
+          secretsDir: join(h.d, "secrets"),
+          telegram: null,
+          lockPort: 40000 + Math.floor(Math.random() * 20000),
+        }),
+        { mode: 0o600 }
+      );
+      const r = await runDetectorAsync(h);
+      const status = JSON.parse(readFileSync(join(h.d, "state", "status.json"), "utf8"));
+      fn(r, status);
+    });
+  } finally {
+    srv.close();
+  }
+};
+await cell(
+  "provider: a frozen head (a week old) on both providers ends the run unknown, never clear (clestons #434 B1, end to end)",
+  async () =>
+    runBundleAgainst(7 * 86400, (r, status) => {
+      assert(r.status !== 0 && status.clear === false, `exit ${r.status}, clear ${status.clear}`);
+      assert(
+        /no RPC provider has a fresh head \(stale: alchemy, infura/.test(status.startup ?? ""),
+        JSON.stringify(status)
+      );
+    })
+);
+await cell(
+  "provider: CONTROL a fresh head gets past the probe (and fails later, unknown, on the missing reads)",
+  async () =>
+    runBundleAgainst(5, (r, status) => {
+      assert(
+        status.clear === false && !/fresh head/.test(JSON.stringify(status)),
+        JSON.stringify(status).slice(0, 300)
+      );
+    })
+);
 await cell("permission: detector.mjs refuses to start outside the permission model", () =>
   withHome(({ home, d }) => {
     const r = spawnSync(
@@ -1697,8 +1871,10 @@ await cell("config: the plist runs only detector.mjs, hourly, and passes no secr
   assert(/<key>StartInterval<\/key>\s*<integer>3600<\/integer>/.test(x), "not hourly");
   assert(x.includes("deploy/pause-detector/detector.mjs"), "does not run detector.mjs");
   assert(!/EnvironmentVariables/.test(x), "has EnvironmentVariables");
+  // the plist's <string> values (its arguments and keys), never its comment text
+  const values = [...x.matchAll(/<string>([^<]*)<\/string>/g)].map(m => m[1]);
   assert(
-    !/pause-job\.mjs|keystore/i.test(x.replace(/<!--[\s\S]*?-->/g, "")),
+    values.length > 0 && !values.some(v => /pause-job\.mjs|keystore/i.test(v)),
     "references the sender or a keystore"
   );
 });

@@ -5,7 +5,17 @@
 // anvil in e2e-anvil.mjs (DSR 4019916a condition 3: no mocks on the pause path).
 //   node deploy/pause-job/check-pause-job.mjs
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
@@ -37,6 +47,7 @@ import {
   KEEPER_LABEL,
   detectorFresh,
   detectorArgsProblems,
+  detectorBundleItem,
 } from "./preflight.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -879,13 +890,48 @@ cell(
     for (const [what, args] of bad)
       cell(`detector-args fails: ${what}`, detectorArgsProblems(args, H).length === 1);
   }
+  {
+    // detector-bundle on a real bundle (bundle.mjs) and on a broken one (clestons #434 F4)
+    const home = realpathSync(mkdtempSync(join(homedir(), ".pd-pf-")));
+    try {
+      const d = join(home, ".aoa-pause-detector");
+      mkdirSync(join(d, "state"), { recursive: true });
+      cell("detector-bundle fails when there is no bundle", detectorBundleItem(home).length > 0);
+      const b = spawnSync(
+        process.execPath,
+        [join(here, "../pause-detector/bundle.mjs"), "--out", join(d, "app"), "--allow-dirty"],
+        { encoding: "utf8" }
+      );
+      cell(
+        "detector-bundle passes a fresh bundle",
+        b.status === 0 && detectorBundleItem(home).length === 0,
+        detectorBundleItem(home)
+      );
+      writeFileSync(join(d, "app", "node_state.json"), "{}");
+      cell(
+        "detector-bundle fails on a file outside the manifest",
+        detectorBundleItem(home).some(x => /not in its manifest/.test(x))
+      );
+      rmSync(join(d, "app", "node_state.json"));
+      symlinkSync("/etc/hosts", join(d, "x"));
+      cell(
+        "detector-bundle fails on a symlink under ~/.aoa-pause-detector",
+        detectorBundleItem(home).some(x => /symlink/.test(x))
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
   const now = Date.parse("2026-11-14T12:00:00Z");
-  const st = (at, clear = true) =>
+  const st = (at, clear = true, extra = {}) =>
     JSON.stringify({
       schema: "aoa-pause-detector-status/1",
       at,
       clear,
       alerts: clear ? [] : ["x"],
+      delivery: { ok: true },
+      report: { block: { timestamp: Math.floor(Date.parse(at) / 1000) - 12 } },
+      ...extra,
     });
   cell(
     "pause-detector passes on a fresh clear status",
@@ -898,6 +944,25 @@ cell(
   cell(
     "pause-detector fails when there is no status",
     detectorFresh(null, now).problems.length === 1
+  );
+  cell(
+    "pause-detector fails on a startup failure, undelivered alerts, or clear on an old head (clestons #434 F2, B1)",
+    detectorFresh(
+      st("2026-11-14T11:30:00Z", false, { startup: "no RPC provider has a fresh head" }),
+      now
+    ).problems.length === 1 &&
+      detectorFresh(
+        st("2026-11-14T11:30:00Z", false, { delivery: { ok: false, why: "telegram HTTP 401" } }),
+        now
+      ).problems.length === 1 &&
+      detectorFresh(
+        st("2026-11-14T11:30:00Z", true, {
+          report: { block: { timestamp: Math.floor(now / 1000) - 7 * 86400 } },
+        }),
+        now
+      ).problems.length === 1 &&
+      detectorFresh(st("2026-11-14T11:30:00Z", true, { report: {} }), now).problems.length === 1 &&
+      detectorFresh(st("2026-11-14T11:30:00Z"), now).problems.length === 0
   );
   cell(
     "pause-detector fails on a status dated even a minute in the future (Codex R1 P1-6)",

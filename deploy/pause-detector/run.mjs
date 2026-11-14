@@ -20,8 +20,8 @@ import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ethers } from "ethers";
-import { emptyState, runRound, stateProblems } from "./lib/detect.mjs";
-import { GuardError, readOwnJson } from "./lib/guard.mjs";
+import { emptyState, headStale, runRound, stateProblems } from "./lib/detect.mjs";
+import { GuardError, readOwnJson, recordStop } from "./lib/guard.mjs";
 import { readSecretFile, dirProblems, okDir } from "../pause-job/lib/secret-file.mjs";
 import { SafeError, safeText, isOurs } from "../pause-job/lib/safe-error.mjs";
 
@@ -43,8 +43,11 @@ export const DETECTOR_SECRETS = Object.freeze({
   telegram: "aoa-dvt-alert-bot-token",
 });
 
+// every early stop also leaves a status.json saying so (clestons #434 F1)
 const die = (code, m) => {
   console.error(`pause-detector: ${m}`);
+  // (not the lock loser: the run holding the lock writes its own status)
+  if (code !== 75) recordStop(homedir(), m);
   process.exit(code);
 };
 const tilde = p => (typeof p === "string" ? p.replace(/^~\//, `${homedir()}/`) : undefined);
@@ -68,6 +71,8 @@ export function configProblems(c) {
     p.push("startBlock must be a positive block (SP's deploy block)");
   if (!Number.isSafeInteger(c.logChunk) || c.logChunk < 1 || c.logChunk > 50000)
     p.push("logChunk must be 1..50000");
+  if (!Number.isSafeInteger(c.maxHeadAgeSec) || c.maxHeadAgeSec < 60 || c.maxHeadAgeSec > 86_400)
+    p.push("maxHeadAgeSec must be 60..86400 (an older head is a stale provider: unknown)");
   if (!Number.isSafeInteger(c.rescanBlocks) || c.rescanBlocks < 0 || c.rescanBlocks > 1_000_000)
     p.push("rescanBlocks must be 0..1000000 (blocks re-read behind the cursor each round)");
   for (const k of ["stateDir", "secretsDir"])
@@ -195,7 +200,7 @@ export function readOnlyChain(url, send = null) {
         typeof n === "number" ? ethers.toQuantity(n) : n,
         false,
       ]);
-      return b ? { number: Number(b.number), hash: b.hash } : null;
+      return b ? { number: Number(b.number), hash: b.hash, timestamp: Number(b.timestamp) } : null;
     },
     blockByHash: async h => {
       const b = await rpc("eth_getBlockByHash", [h, false]);
@@ -401,22 +406,35 @@ export async function main() {
         url: secret(DETECTOR_SECRETS.rpcFallback, "the fallback RPC file"),
       },
     ];
-    // ONE provider for the whole round: the primary unless it fails a probe
+    // ONE provider for the whole round: the primary unless it fails a probe. A provider whose head
+    // is older than maxHeadAgeSec is a failed probe (clestons #434 B1: a node frozen at a height is
+    // self-consistent and would otherwise read clear forever), so the fallback takes over
     let chain = null;
     let provider = null;
+    const stale = [];
     for (const pr of providers) {
       const c = readOnlyChain(pr.url);
       try {
-        if (Number(await c.chainId()) === cfg.chainId && (await c.blockNumber("latest")) > 0) {
-          chain = c;
-          provider = pr.name;
-          break;
+        if (Number(await c.chainId()) !== cfg.chainId) continue;
+        const h = await c.blockByNumber("latest");
+        if (!(h?.number > 0)) continue;
+        if (headStale(h, Date.now(), cfg.maxHeadAgeSec)) {
+          stale.push(pr.name);
+          continue;
         }
+        chain = c;
+        provider = pr.name;
+        break;
       } catch {
         /* try the next */
       }
     }
-    if (!chain) throw new SafeError("neither RPC provider answers for this chain");
+    if (!chain)
+      throw new SafeError(
+        stale.length
+          ? `no RPC provider has a fresh head (stale: ${stale.join(", ")}; max age ${cfg.maxHeadAgeSec} s)`
+          : "neither RPC provider answers for this chain"
+      );
     // the state is created on the first run and bound to { chainId, spProxy, startBlock }
     const st = existsSync(statePath) ? readOwnJson(statePath, "state") : emptyState(cfg);
     const sp = stateProblems(st, cfg);

@@ -11,6 +11,7 @@
   "startBlock": 1,
   "logChunk": 5000,
   "rescanBlocks": 20000,
+  "maxHeadAgeSec": 1800,
   "stateDir": "/Users/REPLACE/.aoa-pause-detector/state",
   "secretsDir": "/Users/REPLACE/.aoa-pause-detector/secrets",
   "telegram": { "chatId": "-1000000000000" },
