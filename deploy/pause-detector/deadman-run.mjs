@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { GuardError, DIR, MAX_SILENCE_MS, readOwnJson, recordStop } from "./lib/guard.mjs";
 import { DETECTOR_SECRETS, batches, telegram, writeDurable } from "./run.mjs";
-import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
+import { dirProblems, readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { safeText } from "../pause-job/lib/safe-error.mjs";
 
 /** No completed detector round for this long is an alert (DSR: 2 h). */
@@ -108,6 +108,16 @@ export async function main({ send = null } = {}) {
     recordStop(home, text, "deadman");
     return code;
   };
+  // its own directory is held to the detector's rule for its state directory: a real directory,
+  // owned by this account, mode exactly 700 (Codex dm-R7 P1)
+  let ownSt = null;
+  try {
+    ownSt = lstatSync(own);
+  } catch {
+    ownSt = null;
+  }
+  const dp = dirProblems(ownSt, process.getuid(), "dead-man directory");
+  if (dp.length) return stop(78, `dead-man directory: ${dp.join("; ")}`);
   let cfg;
   try {
     cfg = readOwnJson(join(d, "config.json"), "config");

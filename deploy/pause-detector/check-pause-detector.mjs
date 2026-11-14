@@ -2073,6 +2073,29 @@ const deadmanHome = async fn => {
   }
 };
 await cell(
+  "dead-man: its directory must be its own and mode 700, like the detector's state (Codex dm-R7 P1)",
+  async () =>
+    deadmanHome(async ({ d }) => {
+      const own = join(d, "deadman");
+      for (const mode of [0o770, 0o777, 0o750]) {
+        chmodSync(own, mode);
+        let sent = false;
+        const code = await deadmanMain({
+          send: async () => {
+            sent = true;
+            return { ok: true };
+          },
+        });
+        assert(code === 78 && !sent, `mode ${mode.toString(8)}: exit ${code}, sent ${sent}`);
+        assert(!existsSync(join(own, "state.json")), `mode ${mode.toString(8)}: state written`);
+      }
+      // control: 700 runs
+      chmodSync(own, 0o700);
+      const code = await deadmanMain({ send: async () => ({ ok: true }) });
+      assert(code === 0, `control exit ${code}`);
+    })
+);
+await cell(
   "dead-man: a gap is acknowledged only after its message was delivered (Codex dm-R6 P1)",
   async () =>
     deadmanHome(async ({ state }) => {
