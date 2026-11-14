@@ -78,7 +78,7 @@ export function compactQueue(q) {
 const FOLD = /^\((\d+) more undelivered dead-man messages folded here\)$/;
 
 /** One run. Returns the exit code: 0 alive, 1 silent (alerted or not), 78 unusable config. */
-export async function main() {
+export async function main({ send = null } = {}) {
   const home = homedir();
   const d = join(home, DIR);
   const own = join(d, "deadman");
@@ -140,20 +140,26 @@ export async function main() {
     ...(Array.isArray(st.queue) ? st.queue.filter(q => typeof q === "string") : []),
     ...(dec.message ? [`${new Date(now).toISOString()} ${dec.message}`] : []),
   ]);
+  // WRITE-AHEAD (Codex dm-R3 P1): the transition and the queue are persisted BEFORE delivery, so a
+  // run killed mid-request leaves the outage queued for the next one; the queue is emptied only
+  // after Telegram accepted it
+  try {
+    writeDurable(join(own, "state.json"), { ...dec.next, queue });
+  } catch (e) {
+    return stop(1, safeText("dead-man state", e));
+  }
   let delivery = { ok: true, sent: 0 };
   let undelivered = [];
   if (queue.length) {
-    const r = await telegram(
-      cfg,
-      token,
-      `DVT pause detector (chain ${cfg.chainId}):\n${queue.join("\n")}`
-    );
+    const text = `DVT pause detector (chain ${cfg.chainId}):\n${queue.join("\n")}`;
+    // `send` is injectable for the cells; the entry passes none
+    const r = await (send ? send(text) : telegram(cfg, token, text));
     delivery = { ...r, sent: r.ok ? queue.length : 0 };
     if (!r.ok) undelivered = queue;
   }
-  const keep = { ...dec.next, queue: undelivered };
   try {
-    writeDurable(join(own, "state.json"), keep);
+    if (!undelivered.length && queue.length)
+      writeDurable(join(own, "state.json"), { ...dec.next, queue: [] });
     writeDurable(join(own, "status.json"), {
       schema: "aoa-pause-detector-deadman/1",
       at: new Date(now).toISOString(),

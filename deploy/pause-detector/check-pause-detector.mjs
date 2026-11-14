@@ -61,6 +61,7 @@ import { scanSource, scanTree } from "./no-signing-scan.mjs";
 import {
   compactQueue,
   deadmanDecision,
+  main as deadmanMain,
   MAX_SILENCE_MS,
   QUEUE_MAX,
   REALERT_MS,
@@ -1951,6 +1952,49 @@ await cell(
       `messages represented: ${1 + folded + (q.length - 2)}`
     );
     assert(compactQueue(["a", "b"]).join() === "a,b", "control: a short queue is untouched");
+  }
+);
+
+await cell(
+  "dead-man: the outage is on disk BEFORE delivery is attempted (write-ahead, Codex dm-R3 P1)",
+  async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "pd-wa-")));
+    const realHome = process.env.HOME;
+    try {
+      const d = join(home, ".aoa-pause-detector");
+      mkdirSync(join(d, "deadman"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(d, "state"), { mode: 0o700 });
+      writeFileSync(join(d, "config.json"), JSON.stringify({ chainId: 11155111, telegram: null }), {
+        mode: 0o600,
+      });
+      process.env.HOME = home;
+      let onDisk = null;
+      // the delivery "dies": it never returns ok, and before it does we look at what is persisted
+      const code = await deadmanMain({
+        send: async () => {
+          onDisk = JSON.parse(readFileSync(join(d, "deadman", "state.json"), "utf8"));
+          return { ok: false, why: "killed" };
+        },
+      });
+      assert(
+        onDisk &&
+          onDisk.alerting === true &&
+          onDisk.queue.length === 1 &&
+          /DEAD-MAN/.test(onDisk.queue[0]),
+        `not written ahead: ${JSON.stringify(onDisk)}`
+      );
+      assert(code === 1, `exit ${code}`);
+      // a later run that delivers empties the queue
+      const code2 = await deadmanMain({ send: async () => ({ ok: true }) });
+      const after = JSON.parse(readFileSync(join(d, "deadman", "state.json"), "utf8"));
+      assert(
+        after.queue.length === 0 && code2 === 1,
+        `after delivery: ${JSON.stringify(after)} exit ${code2}`
+      );
+    } finally {
+      process.env.HOME = realHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   }
 );
 
