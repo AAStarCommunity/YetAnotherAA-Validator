@@ -32,6 +32,15 @@ Three layers carry it, and they are not equally strong:
      not a foundry keystore, not `~/.ssh`, not any checkout.
    - It holds no key and has no signing code, so there is no signing path by
      design.
+   - **ethers' `Wallet` is in the bundle** (DSR), because the bundle carries the
+     ethers package whole. The detector never uses it; the scan pins ethers to
+     nine pure utilities. And it has nothing to work with: no key is readable,
+     and the RPC allowlist refuses every send and sign method.
+   - **Environment.** The process runs only with an allowlist of variables: what
+     macOS and launchd give an agent, plus `SSH_AUTH_SOCK`. That is an agent
+     socket, and an agent never hands out key material. Anything else refuses
+     the start, so a stale `KEEPER_PRIVATE_KEY` inherited from launchd never
+     sits in the process (Codex R8).
    - **Startup guards.** `detector.mjs` is the entry and uses Node builtins only
      (`lib/guard.mjs`). It refuses to start unless all of these hold:
      - `process.permission` exists and grants nothing more;
@@ -236,7 +245,9 @@ secret-file reader, called with the detector's own name table) and
    `node deploy/pause-detector/bundle.mjs --out ~/.aoa-pause-detector/app`.
    - It refuses if the output directory exists, and if the detector's files
      differ from HEAD.
-   - It records the commit in `MANIFEST.json`.
+   - It records the commit in `MANIFEST.json`, and prints the source commit and
+     the sha256 of `MANIFEST.json`. **Record both in the deploy log.** SP puts
+     them in the step-13 manifest as the detector's identity (DSR).
    - The checkout is not needed after this, and the detector cannot read it.
    - To upgrade, build a new bundle into a new directory and swap it in.
 6. Render and load the plist, then check

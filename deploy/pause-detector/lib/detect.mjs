@@ -104,7 +104,8 @@ export function stateProblems(st, cfg) {
       } catch {
         ok = false;
       }
-      if (!ok || !Number.isSafeInteger(v) || v < st.startBlock || v > st.cursor) {
+      // (not bounded by the cursor: a disagreement moves the cursor back below known operators)
+      if (!ok || !Number.isSafeInteger(v) || v < st.startBlock) {
         p.push("the state's operators has an entry that is not <checksummed address>: <block>");
         break;
       }
@@ -467,8 +468,13 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
       // answer covered is already unknown through the failed scan
       if (covered.some(([a, b]) => n >= a && n <= b)) {
         const theirs = rangeOps.get(n) ?? new Set();
-        if ([...mine].sort().join() !== [...theirs].sort().join())
+        if ([...mine].sort().join() !== [...theirs].sort().join()) {
+          // the range answer for n is not trusted: move the cursor back so the next round reads
+          // n again by range (and by hash, if still above finalized), instead of passing it by
+          // (Codex R8 P1-1)
+          if (st.cursor >= n) st.cursor = n - 1;
           throw new SafeError(`the backend's logs for block ${n} differ by hash and by range`);
+        }
       }
     }
   } catch (e) {

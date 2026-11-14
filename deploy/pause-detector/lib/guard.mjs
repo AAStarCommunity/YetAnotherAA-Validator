@@ -62,6 +62,26 @@ export function permissionProblems(perm, home) {
 // variables through which node or the loader take options or code before the script runs: a
 // NODE_OPTIONS=--allow-fs-read=<key> widens the grants without touching argv (Codex R4 P1-1)
 export const INJECTION_ENV = /^(NODE_.*|DYLD_.*|BASH_ENV|ENV|BASH_FUNC_.*|SHELLOPTS|PS4)$/;
+/**
+ * The only environment variables the detector runs with: what macOS and launchd give an agent,
+ * and SSH_AUTH_SOCK (inherited on the Mini; an agent socket, which never hands out key material).
+ * Anything else, a *_KEY among them, refuses the start.
+ */
+export const ENV_OK = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "LANG",
+  "__CF_USER_TEXT_ENCODING",
+  "__CFBundleIdentifier",
+  "XPC_FLAGS",
+  "XPC_SERVICE_NAME",
+  "OSLogRateLimit",
+  "SSH_AUTH_SOCK",
+]);
 
 /**
  * The launch, exactly as the plist has it: node's own flags are
@@ -89,6 +109,10 @@ export function launchProblems({ execArgv, script, envNames, home }) {
     p.push("the detector is not run from its bundle, ~/.aoa-pause-detector/app");
   const bad = (envNames ?? []).filter(n => INJECTION_ENV.test(n));
   if (bad.length) p.push(`option-injecting variables are set: ${bad.join(", ")}`);
+  // an allowlist, not a denylist: a stale KEEPER_PRIVATE_KEY (or any other variable) inherited
+  // from launchd would be key material inside the process (Codex R8 P1-2)
+  const extra = (envNames ?? []).filter(n => !ENV_OK.has(n) && !INJECTION_ENV.test(n));
+  if (extra.length) p.push(`variables outside the allowlist are set: ${extra.join(", ")}`);
   return p;
 }
 

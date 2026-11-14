@@ -28,6 +28,7 @@ import { homedir } from "node:os";
 import { join, posix } from "node:path";
 import {
   DIR as DETECTOR_DIR,
+  ENV_OK as DETECTOR_ENV_OK,
   bundleProblems as detectorBundle,
   symlinkProblems as detectorSymlinks,
 } from "../pause-detector/lib/guard.mjs";
@@ -315,6 +316,10 @@ export function detectorArgsProblems(args, home, env = [], inherited = []) {
   );
   if (inj.length)
     return [`the detector's environment has option-injecting variables: ${inj.join(", ")}`];
+  // the same allowlist the detector enforces at startup (Codex R8 P1-2)
+  const extra = [...(env ?? []), ...(inherited ?? [])].filter(n => !DETECTOR_ENV_OK.has(n));
+  if (extra.length)
+    return [`the detector's environment has variables outside the allowlist: ${extra.join(", ")}`];
   if (env === null) return ["the detector's loaded environment cannot be read"];
   const d = `${home}/.aoa-pause-detector`;
   // the bundle, never a repository checkout (which may hold keys; Codex R7 P1-1)

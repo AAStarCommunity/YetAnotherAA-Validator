@@ -904,6 +904,41 @@ await cell(
   }
 );
 
+await cell(
+  "round: a by-hash/range disagreement moves the cursor back, so the next round reads that block again (Codex R8 P1-1)",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0 });
+    const st = { ...emptyState(cfg), lastFullScan: 1e12 };
+    const w = world({ latest: 300, finalized: 300, rangeHides: new Set([300]) });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 1n,
+      logBlock: 300,
+    };
+    st.cursor = 299;
+    const r1 = await round(w, cfg, st, 1e12 + 1000);
+    assert(
+      !r1.report.clear && st.cursor === 299,
+      `round 1: clear=${r1.report.clear} cursor=${st.cursor}`
+    );
+    // the backend recovers; B moves on: block 300 must still be read, and the operator found
+    w.rangeHides = new Set();
+    w.latest = 301;
+    w.finalized = 301;
+    const r2 = await round(w, cfg, st, 1e12 + 2000);
+    assert(
+      st.operators[ethers.getAddress(OP2)] === 300,
+      "the operator at the skipped block was never found"
+    );
+    assert(
+      r2.alerts.some(a => a.key === `actionable:${ethers.getAddress(OP2)}`) && !r2.report.clear,
+      "no PAUSE NEEDED after recovery"
+    );
+  }
+);
+
 // ---------------------------------------------------------------- delivery
 
 await cell("delivery: many alerts are split into whole-line messages under the limit", () => {
@@ -1143,6 +1178,29 @@ await cell("permission: launchProblems accepts exactly the plist's launch and no
     assert(ok(x).length > 0, `accepted ${what}`);
   for (const n of ["NODE_OPTIONS", "NODE_PATH", "DYLD_INSERT_LIBRARIES", "BASH_ENV"])
     assert(ok({ execArgv: good, envNames: ["PATH", n] }).length > 0, `accepted ${n}`);
+  // an allowlist: a key in the environment, or anything unknown, refuses (Codex R8 P1-2)
+  for (const n of ["KEEPER_PRIVATE_KEY", "PRIVATE_KEY", "RPC_URL", "anything"])
+    assert(
+      ok({ execArgv: good, envNames: ["PATH", n] }).some(x => /allowlist/.test(x)),
+      `accepted ${n}`
+    );
+  const launchdEnv = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "XPC_FLAGS",
+    "XPC_SERVICE_NAME",
+    "OSLogRateLimit",
+    "__CF_USER_TEXT_ENCODING",
+    "SSH_AUTH_SOCK",
+  ];
+  assert(
+    ok({ execArgv: good, envNames: launchdEnv }).length === 0,
+    "control: launchd's own variables refused"
+  );
 });
 await cell(
   "permission: the real bundle, launched as the plist does, passes every guard (control)",

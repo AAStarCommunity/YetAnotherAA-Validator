@@ -872,7 +872,9 @@ cell(
       "detector-args fails on NODE_OPTIONS set or inherited (Codex R4 P1-1)",
       detectorArgsProblems(good, H, ["NODE_OPTIONS"], []).length === 1 &&
         detectorArgsProblems(good, H, [], ["NODE_OPTIONS"]).length === 1 &&
-        detectorArgsProblems(good, H, ["PATH"], ["SSH_AUTH_SOCK"]).length === 0
+        detectorArgsProblems(good, H, ["PATH"], ["SSH_AUTH_SOCK"]).length === 0 &&
+        detectorArgsProblems(good, H, ["PATH"], ["KEEPER_PRIVATE_KEY"]).length === 1 &&
+        detectorArgsProblems(good, H, ["PATH", "RPC_URL"], []).length === 1
     );
     for (const [what, args] of bad)
       cell(`detector-args fails: ${what}`, detectorArgsProblems(args, H).length === 1);

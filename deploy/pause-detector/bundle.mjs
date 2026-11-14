@@ -106,7 +106,13 @@ for (const f of [...files].sort()) {
   const key = f.split(sep).join("/");
   manifest.files[key] = createHash("sha256").update(readFileSync(to)).digest("hex");
 }
-writeFileSync(join(out, MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
+const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+writeFileSync(join(out, MANIFEST), manifestText, { mode: 0o644 });
+// the detector's identity, for the deploy log and SP's step-13 manifest (DSR): the manifest's
+// sha256 and the source commit
+const manifestSha = createHash("sha256").update(manifestText).digest("hex");
 console.log(
-  `bundle: ${Object.keys(manifest.files).length} files (${own.length} detector, ${pkgs.size} packages) at ${commit} -> ${out}`
+  `bundle: ${Object.keys(manifest.files).length} files (${own.length} detector, ${pkgs.size} packages) -> ${out}`
 );
+console.log(`bundle: source commit ${commit}`);
+console.log(`bundle: MANIFEST.json sha256 ${manifestSha}`);
