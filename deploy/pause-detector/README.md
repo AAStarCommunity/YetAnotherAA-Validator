@@ -263,10 +263,35 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
 
 ## Dead-man (DSR: required before this is rc.8's pause path)
 
-A detector that stops silently gives no signal at all. That covers an unloaded
-plist, a missing node, a hang, a crash before the guards, and a lock held by an
-unrelated process. So a **separate** launchd job watches it:
-`io.aastar.dvt-pause-detector-deadman`, every 15 minutes (`deadman.mjs`).
+A detector that stops silently gives no signal at all. So a **separate** launchd
+job watches it: `io.aastar.dvt-pause-detector-deadman`, every 15 minutes
+(`deadman.mjs`).
+
+**What it covers, and what it does not** (clestons #435 B1). The two jobs share
+the pinned node, the bundle, `config.json` and the startup guards, so a failure
+of a shared part stops **both**, and neither sends anything.
+
+| The detector stops because                                                                | Dead-man alerts? |
+| ----------------------------------------------------------------------------------------- | ---------------- |
+| its plist is unloaded, or its launch arguments are wrong                                  | yes              |
+| it hangs, crashes, or a round throws on every run                                         | yes              |
+| an unrelated process holds its lock port                                                  | yes              |
+| its state directory, or an RPC secret, is unusable                                        | yes              |
+| the pinned node is missing or moved                                                       | **no**           |
+| a bundle file does not match `MANIFEST.json`                                              | **no**           |
+| any symlink under `~/.aoa-pause-detector` (including a stray one in `state/`)             | **no**           |
+| `config.json` is missing, unreadable or invalid                                           | **no**           |
+| the alert bot token file is unusable (both jobs read the same file)                       | **no**           |
+| the dead-man itself is down (plist unloaded; its directory missing; its state unreadable) | **no**           |
+
+In every **no** row the failure shows **only** when someone runs preflight
+(stale or stopped `status.json`, a missing label, bundle or symlink items).
+**Nothing runs preflight on a schedule yet**, so these are visible only on a
+manual preflight. In particular a broken redeploy (a node, bundle or config
+problem) is the most likely way to stop the detector, and it stops the dead-man
+with it: **run preflight after every deploy.** Narrowing the dead-man's guards
+to the files it actually uses, and having each job check the other's
+`status.json`, is a follow-up.
 
 - **Heartbeat.** Every **completed** round writes
   `state/heartbeat.json { at, gaps, block, clear }`. A completed round means no
@@ -287,8 +312,9 @@ unrelated process. So a **separate** launchd job watches it:
     message already queued is not queued again.
   - A long queue is compacted, never truncated: it keeps the first outage, a
     count of what was folded, and the latest messages.
-  - An existing state that cannot be read stops the run visibly, and the file is
-    left as it is.
+  - An existing state that cannot be read stops the run, and the file is left as
+    it is. That stop sends nothing; it is visible only on preflight (see the
+    table above).
   - Its directory `~/.aoa-pause-detector/deadman` must be a real directory owned
     by the job's account, mode `700`, the same rule as the detector's state
     directory; otherwise the run stops (exit 78) (Codex dm-R7).
