@@ -8,6 +8,7 @@
 //   - a fresh heartbeat after an alert: one "rounds resumed" notice.
 // It writes only ~/.aoa-pause-detector/deadman (its own state and status). It holds no key and
 // reads no chain: it watches the detector, not SuperPaymaster.
+import { lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GuardError, DIR, readOwnJson, recordStop } from "./lib/guard.mjs";
@@ -55,6 +56,27 @@ export function deadmanDecision(hb, now, st) {
   };
 }
 
+/** The most queued messages kept as they are; past it the queue is compacted, never truncated. */
+export const QUEUE_MAX = 10;
+
+/**
+ * A queue of undelivered messages, at most QUEUE_MAX lines, losing nothing silently (Codex dm-R2
+ * P1-1): past the limit it keeps the FIRST message (the original outage), one line counting what
+ * is folded, and the latest messages. Pure.
+ */
+export function compactQueue(q) {
+  if (q.length <= QUEUE_MAX) return q;
+  const keepTail = QUEUE_MAX - 2;
+  const dropped = q.slice(1, q.length - keepTail);
+  // a fold line already in the queue counts for the messages it stands for
+  const count = dropped.reduce((n, x) => {
+    const m = x.match(FOLD);
+    return n + (m ? Number(m[1]) : 1);
+  }, 0);
+  return [q[0], `(${count} more undelivered dead-man messages folded here)`, ...q.slice(-keepTail)];
+}
+const FOLD = /^\((\d+) more undelivered dead-man messages folded here\)$/;
+
 /** One run. Returns the exit code: 0 alive, 1 silent (alerted or not), 78 unusable config. */
 export async function main() {
   const home = homedir();
@@ -88,22 +110,36 @@ export async function main() {
   } catch {
     hb = null; // missing or unreadable: no proof of life
   }
-  let st = { alerting: false, lastSent: 0 };
+  // a MISSING state is a first run; an existing one that cannot be read is a visible stop, and it is
+  // left as it is (it may hold queued alerts), never overwritten as healthy (Codex dm-R2 P1-2)
+  let st = { alerting: false, lastSent: 0, queue: [] };
+  let exists = true;
   try {
-    const j = readOwnJson(join(own, "state.json"), "dead-man state");
-    if (j && typeof j === "object" && !Array.isArray(j)) st = j;
-  } catch {
-    /* first run, or unreadable: start fresh (an alert is then sent, never suppressed) */
+    lstatSync(join(own, "state.json"));
+  } catch (e) {
+    if (e?.code !== "ENOENT") return stop(1, "the dead-man state cannot be checked");
+    exists = false;
   }
+  if (exists)
+    try {
+      const j = readOwnJson(join(own, "state.json"), "dead-man state");
+      if (!j || typeof j !== "object" || Array.isArray(j)) throw new GuardError("not an object");
+      st = j;
+    } catch (e) {
+      return stop(
+        1,
+        `the dead-man state is unreadable (${e instanceof GuardError ? e.message : "error"}); left as it is`
+      );
+    }
   const now = Date.now();
   const dec = deadmanDecision(hb, now, st);
   // messages not yet delivered are queued in the state and sent first next run, whatever the
   // heartbeat says by then: an outage alert that failed is never dropped because a round completed
   // before the retry (Codex dm-R1 P1-1). The state machine (alerting) advances regardless.
-  const queue = (Array.isArray(st.queue) ? st.queue.filter(q => typeof q === "string") : []).slice(
-    -10
-  );
-  if (dec.message) queue.push(`${new Date(now).toISOString()} ${dec.message}`);
+  const queue = compactQueue([
+    ...(Array.isArray(st.queue) ? st.queue.filter(q => typeof q === "string") : []),
+    ...(dec.message ? [`${new Date(now).toISOString()} ${dec.message}`] : []),
+  ]);
   let delivery = { ok: true, sent: 0 };
   let undelivered = [];
   if (queue.length) {
@@ -113,7 +149,7 @@ export async function main() {
       `DVT pause detector (chain ${cfg.chainId}):\n${queue.join("\n")}`
     );
     delivery = { ...r, sent: r.ok ? queue.length : 0 };
-    if (!r.ok) undelivered = queue.slice(-10);
+    if (!r.ok) undelivered = queue;
   }
   const keep = { ...dec.next, queue: undelivered };
   try {

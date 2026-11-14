@@ -58,7 +58,13 @@ import {
 } from "./lib/guard.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
-import { deadmanDecision, MAX_SILENCE_MS, REALERT_MS } from "./deadman-run.mjs";
+import {
+  compactQueue,
+  deadmanDecision,
+  MAX_SILENCE_MS,
+  QUEUE_MAX,
+  REALERT_MS,
+} from "./deadman-run.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let pass = 0;
@@ -1539,7 +1545,10 @@ const makeHome = () => {
       encoding: "utf8",
     }
   );
-  if (b.status !== 0) throw new Error(`bundle failed: ${b.stderr}`);
+  if (b.status !== 0) {
+    rmSync(home, { recursive: true, force: true }); // no home left behind on a failed build
+    throw new Error(`bundle failed: ${b.stderr}`);
+  }
   return { home, d, app: join(d, "app") };
 };
 const plistFlags = d => [PERM_FLAG, `--allow-fs-read=${d}`, `--allow-fs-write=${join(d, "state")}`];
@@ -1930,6 +1939,21 @@ await cell(
   }
 );
 
+await cell(
+  "dead-man: a long undelivered queue keeps the first outage and the full count (Codex dm-R2 P1-1)",
+  () => {
+    let q = [];
+    for (let k = 0; k < 30; k++) q = compactQueue([...q, `m${k}`]);
+    assert(q.length <= QUEUE_MAX && q[0] === "m0" && q[q.length - 1] === "m29", q.join(" | "));
+    const folded = Number(/^\((\d+) more/.exec(q[1])?.[1]);
+    assert(
+      1 + folded + (q.length - 2) === 30,
+      `messages represented: ${1 + folded + (q.length - 2)}`
+    );
+    assert(compactQueue(["a", "b"]).join() === "a,b", "control: a short queue is untouched");
+  }
+);
+
 // ---------------------------------------------------------------- dead-man (DSR)
 
 await cell("dead-man: the decision (alive, silent, re-alert, resume, missing, future)", () => {
@@ -2079,6 +2103,18 @@ await cell(
       assert(
         r2.status === 1 && status().silent === false && status().undelivered === 2,
         `fresh heartbeat: ${r2.status} ${JSON.stringify(status())}`
+      );
+      // an existing state that cannot be read is a visible stop, and it is left as it is
+      // (Codex dm-R2 P1-2): never overwritten as healthy
+      writeFileSync(join(d, "deadman", "state.json"), "{ not json", { mode: 0o600 });
+      const r3 = run();
+      assert(
+        r3.status === 1 && /unreadable/.test(status().startup ?? ""),
+        `unreadable state: ${r3.status} ${JSON.stringify(status())}`
+      );
+      assert(
+        readFileSync(join(d, "deadman", "state.json"), "utf8") === "{ not json",
+        "the unreadable state was overwritten"
       );
       // and it may not write the detector's state (the grant is deadman/ only)
       assert(
