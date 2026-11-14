@@ -300,8 +300,16 @@ export const DETECTOR_NODE = ".local/keeper-node/node-v24.21.0/bin/node";
  * so it is under the permission model with nothing more allowed (no --allow-child-process, no
  * wider read or write). `args` is what launchd loaded (null when unreadable). Pure.
  */
-export function detectorArgsProblems(args, home) {
+export function detectorArgsProblems(args, home, env = [], inherited = []) {
   if (!Array.isArray(args)) return ["the detector's loaded arguments cannot be read"];
+  // NODE_OPTIONS=--allow-fs-read=<key> would widen the grants with the arguments unchanged
+  // (Codex R4 P1-1): no option-injecting variable, set or inherited
+  const inj = [...(env ?? []), ...(inherited ?? [])].filter(
+    n => STARTUP_ENV.test(n) || /^NODE_/.test(n)
+  );
+  if (inj.length)
+    return [`the detector's environment has option-injecting variables: ${inj.join(", ")}`];
+  if (env === null) return ["the detector's loaded environment cannot be read"];
   const script = args[5] ?? "";
   const suffix = "/deploy/pause-detector/detector.mjs";
   const repo = script.endsWith(suffix) ? script.slice(0, -suffix.length) : null;
@@ -480,7 +488,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     }
     const p = [...extra, ...launchdOff(labels, programOf, readText, reviewed, shaOf, plists)];
     results.push(["launchd-on", p.length ? "FAIL" : "PASS", p]);
-    const da = detectorArgsProblems(programOf(DETECTOR_LABEL)?.args ?? null, homedir());
+    const dl = programOf(DETECTOR_LABEL);
+    const da = detectorArgsProblems(
+      dl?.args ?? null,
+      homedir(),
+      dl?.env ?? null,
+      dl?.inherited ?? []
+    );
     results.push(["detector-args", da.length ? "FAIL" : "PASS", da]);
   }
   const di = argv.indexOf("--detector-status");

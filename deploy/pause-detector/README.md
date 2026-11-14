@@ -5,28 +5,49 @@ keeper α is parked, and the standalone D2 pause job (`deploy/pause-job`) is
 retired. This detector watches, and a person pauses with the exact command it
 sends.
 
-It is D2's read path with every send path removed. It holds **no key**. There is
-no keystore, no signer, and no signing or broadcast code. Three layers back
-this, and they are not equally strong:
+It is D2's read path with every send path removed.
 
-1. **The boundary: Node's permission model.** The plist runs the pinned node
+**The guarantee (DSR's wording):** no key held, no signing path by design,
+spawn/worker disabled and key material unreadable. This guards against an
+**accidental** signing path. It does **not** guard against a malicious
+dependency. The trust boundary is the same uid as the price keeper: anything
+running as that account, or a compromised dependency, is out of scope. Node's
+own documentation says the permission model is not a security boundary against
+malicious code, and nothing here claims it is.
+
+Three layers carry it, and they are not equally strong:
+
+1. **Node's permission model.** The plist runs the pinned node
    (`~/.local/keeper-node/node-v24.21.0`, not Homebrew's, whose directories
    admin can write) with `--permission`, reads of the repo and
    `~/.aoa-pause-detector` only, and writes of its state directory only.
    - So the process cannot start a child process (no `cast`), a worker, a native
      addon or WASI.
-   - It cannot read any key on the host: not the price keeper's `key.env`, not a
-     foundry keystore, not `~/.ssh`.
-   - It holds no key, so it cannot sign.
-   - `detector.mjs` checks `process.permission` first and refuses to start
-     without the model or with anything more allowed.
-   - Preflight checks that launchd LOADED exactly these arguments.
-   - A CI cell runs node with the plist's flags and proves spawn, worker and an
-     outside read all fail. The anvil e2e runs `detector.mjs` itself that way.
+   - It cannot read key material on the host: not the price keeper's `key.env`,
+     not a foundry keystore, not `~/.ssh`.
+   - It holds no key and has no signing code, so there is no signing path by
+     design.
+   - **Startup check.** `detector.mjs` refuses to start unless all of these
+     hold:
+     - `process.permission` exists and grants nothing more;
+     - node's own flags (`process.execArgv`) are exactly the plist's;
+     - no option-injecting variable is set (`NODE_OPTIONS`, `NODE_*`, `DYLD_*`,
+       `BASH_ENV`). A `NODE_OPTIONS=--allow-fs-read=<key>` would widen the
+       grants with the arguments unchanged (Codex R4).
+   - **Preflight.** It checks that launchd LOADED exactly these arguments, and
+     that the loaded or inherited environment holds no such variable.
+   - **Tests.** A CI cell runs node with the plist's flags and proves that
+     spawn, a worker and an outside read all fail, and that a `NODE_OPTIONS`
+     grant makes the detector refuse. The anvil e2e runs `detector.mjs` itself
+     under the flags.
+   - **Not covered.** Code inside the process can still use the network. A
+     malicious module could POST a transaction someone else signed. That is the
+     malicious-dependency case the guarantee excludes.
 2. **Runtime allowlist.** Only seven read-only JSON-RPC methods are allowed. The
    check runs twice: in the client, and again in the transport, which is a plain
-   `fetch` POST with no ethers provider. A write method is refused before any
-   request is made.
+   `fetch` POST with no ethers provider. `eth_sendRawTransaction`,
+   `eth_sendTransaction`, every `eth_sign*` and every `personal_*` method is
+   refused before any request is made. A cell tries each one.
 3. **Static scan, a review aid.** `no-signing-scan.mjs` parses (acorn) the
    detector and every module it reaches by static import or re-export. CI fails
    on any of these:
@@ -42,8 +63,8 @@ this, and they are not equally strong:
    Control cells show the scan catching each form Codex found in rounds 1–3.
    **It is not complete and cannot be.** JavaScript can build a name at run time
    (`const k = "constr" + "uctor"; f[k]`) in ways no static scan of this kind
-   rules out. It catches direct and accidental code. Layers 1 and 2 hold against
-   deliberate code.
+   rules out. It catches direct and accidental code, which is the case the
+   guarantee is about.
 
 **Durability under the model.** Node 24 disables `fsync` under the permission
 model. State writes stay atomic (temp file + rename) but are not fsynced. A

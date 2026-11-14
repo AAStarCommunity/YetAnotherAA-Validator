@@ -24,7 +24,8 @@ import {
 } from "node:fs";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { emptyState, runRound, stateProblems } from "./lib/detect.mjs";
 import { readSecretFile, dirProblems, okDir } from "../pause-job/lib/secret-file.mjs";
@@ -56,7 +57,9 @@ const tilde = p => (typeof p === "string" ? p.replace(/^~\//, `${homedir()}/`) :
 const HASH = /^0x[0-9a-fA-F]{64}$/;
 
 /**
- * The process-level boundary (Codex R3: a static scan of JavaScript cannot be complete): the
+ * The process confinement (Codex R3: a static scan of JavaScript cannot be complete). It guards
+ * against an ACCIDENTAL signing path, not a malicious dependency (Node's docs: the permission model
+ * is not a security boundary against malicious code; the trust boundary is the keeper's uid). The
  * detector runs ONLY under Node's permission model, with no child processes, no workers, no native
  * addons, no WASI, and file reads limited so that no key anywhere on the host (the price keeper's
  * key.env, a foundry keystore, ...) is readable. `perm` is process.permission; `home` the home
@@ -76,6 +79,38 @@ export function permissionProblems(perm, home) {
   for (const path of ["/", home, `${home}/.config`, `${home}/.foundry`, `${home}/.ssh`])
     if (perm.has("fs.read", path)) p.push(`${path} is readable`);
   if (perm.has("fs.write", "/") || perm.has("fs.write", home)) p.push("writes are not confined");
+  return p;
+}
+
+// variables through which node or the loader take options or code before the script runs: a
+// NODE_OPTIONS=--allow-fs-read=<key> widens the grants without touching argv (Codex R4 P1-1)
+export const INJECTION_ENV = /^(NODE_.*|DYLD_.*|BASH_ENV|ENV|BASH_FUNC_.*|SHELLOPTS|PS4)$/;
+
+/**
+ * The launch itself, exactly: node's own flags (`execArgv`) are the plist's and nothing else, and
+ * no option-injecting variable is in the environment. `repo` is this checkout, `home` the home
+ * directory, `envNames` the environment's variable names. Returns the problems. Pure.
+ */
+export function launchProblems({ execArgv, envNames, home, repo }) {
+  const p = [];
+  const d = `${home}/.aoa-pause-detector`;
+  const flag = execArgv?.[0];
+  const want = [
+    flag,
+    `--allow-fs-read=${repo}`,
+    `--allow-fs-read=${d}`,
+    `--allow-fs-write=${d}/state`,
+  ];
+  if (
+    !Array.isArray(execArgv) ||
+    !["--permission", "--experimental-permission"].includes(flag) ||
+    execArgv.join("\n") !== want.join("\n")
+  )
+    p.push(
+      "node was not started with exactly the plist's flags (--permission, reads of the repo and ~/.aoa-pause-detector, writes of its state)"
+    );
+  const bad = (envNames ?? []).filter(n => INJECTION_ENV.test(n));
+  if (bad.length) p.push(`option-injecting variables are set: ${bad.join(", ")}`);
   return p;
 }
 
@@ -346,7 +381,15 @@ export async function deliver(st, due, resolved, header, now, send) {
 
 async function main() {
   // first of all: nothing else runs outside the permission model
-  const pp = permissionProblems(process.permission, homedir());
+  const pp = [
+    ...permissionProblems(process.permission, homedir()),
+    ...launchProblems({
+      execArgv: process.execArgv,
+      envNames: Object.keys(process.env),
+      home: homedir(),
+      repo: resolve(dirname(fileURLToPath(import.meta.url)), "../.."),
+    }),
+  ];
   if (pp.length) die(78, `refusing to run: ${pp.join("; ")}`);
   const args = process.argv.slice(2);
   const i = args.indexOf("--config");

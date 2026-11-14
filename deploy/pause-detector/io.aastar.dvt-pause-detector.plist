@@ -3,7 +3,8 @@
 <!-- The rc.8 pause detector (README.md). Read-only: no key. It runs under Node's permission
      model with the pinned node (the dedicated v24.21.0, not Homebrew's, whose directories admin
      can write): no child process, worker, addon or WASI; reads only the repo and
-     ~/.aoa-pause-detector; writes only its state. detector.mjs refuses to start otherwise. Render __HOME__ and __REPO__ (absolute
+     ~/.aoa-pause-detector; writes only its state. detector.mjs refuses to start otherwise.
+     This guards against an accidental signing path, not a malicious dependency (README). Render __HOME__ and __REPO__ (absolute
      paths), then launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.aastar.dvt-pause-detector.plist
      and check `launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector | grep "run interval"` shows
      3600. StartInterval is a top-level key: nested inside another dict it passes plutil -lint and

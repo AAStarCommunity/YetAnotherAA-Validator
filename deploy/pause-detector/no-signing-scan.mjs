@@ -75,7 +75,7 @@ export const FORBIDDEN_NAMES = new Set([
 ]);
 // globals the detector may use, and only these members of them, never computed or aliased
 export const GLOBALS_OK = new Map([
-  ["process", new Set(["argv", "exit", "getuid", "pid", "permission"])],
+  ["process", new Set(["argv", "env", "execArgv", "exit", "getuid", "pid", "permission"])],
   ["console", new Set(["log", "error"])],
 ]);
 // text in string literals and template parts

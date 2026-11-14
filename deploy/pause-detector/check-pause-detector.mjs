@@ -5,9 +5,9 @@
 // The first group is the guarantee DSR asked for: the detector has NO key, keystore, signing or
 // broadcast code. It fails if any such call appears in the detector or anything it imports, and
 // its own control cells prove the scanner sees one when it is there.
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
@@ -35,6 +35,7 @@ import {
   telegram,
   MESSAGE_CHARS,
   rpcTransport,
+  launchProblems,
 } from "./detector.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
@@ -137,13 +138,28 @@ await cell(
       return { ok: true, json: async () => ({ result: "0x" }) };
     };
     try {
-      let refused = false;
-      try {
-        await rpcTransport("http://x")("eth_" + "sendRaw" + "Transaction", ["0x00"]);
-      } catch (e) {
-        refused = /refused/.test(e.message);
+      // DSR: every send, sign and personal_* method is refused, each one tried
+      for (const m of [
+        "eth_" + "sendRaw" + "Transaction",
+        "eth_sendTransaction",
+        "eth_sign",
+        "eth_signTransaction",
+        "eth_signTypedData",
+        "eth_signTypedData_v4",
+        "personal_sign",
+        "personal_sendTransaction",
+        "personal_unlockAccount",
+        "personal_importRawKey",
+      ]) {
+        let refused = false;
+        try {
+          await rpcTransport("http://x")(m, ["0x00"]);
+        } catch (e) {
+          refused = /refused/.test(e.message);
+        }
+        assert(refused, `${m} not refused`);
       }
-      assert(refused && fetched === 0, `refused=${refused} fetched=${fetched}`);
+      assert(fetched === 0, `fetched=${fetched}`);
       await rpcTransport("http://x")("eth_chainId", []);
       assert(fetched === 1, "a read method did not pass (control)");
     } finally {
@@ -200,7 +216,15 @@ await cell(
       "eth_sendTransaction",
       "eth_sign",
       "eth_signTransaction",
+      "eth_signTypedData",
+      "eth_signTypedData_v3",
+      "eth_signTypedData_v4",
       "personal_sign",
+      "personal_sendTransaction",
+      "personal_signTransaction",
+      "personal_unlockAccount",
+      "personal_importRawKey",
+      "eth_accounts",
       "eth_estimateGas",
       "eth_getTransactionCount",
     ]) {
@@ -1046,6 +1070,92 @@ await cell(
       child.problems.some(x => /child processes/.test(x)),
       "control: child processes not refused"
     );
+  }
+);
+await cell(
+  "permission: launchProblems accepts exactly the plist's flags and no injection variable",
+  () => {
+    const H = "/Users/u";
+    const R = "/Users/u/repo";
+    const good = [
+      "--permission",
+      `--allow-fs-read=${R}`,
+      `--allow-fs-read=${H}/.aoa-pause-detector`,
+      `--allow-fs-write=${H}/.aoa-pause-detector/state`,
+    ];
+    const ok = x => launchProblems({ home: H, repo: R, envNames: ["PATH", "HOME"], ...x });
+    assert(ok({ execArgv: good }).length === 0, ok({ execArgv: good }).join("; "));
+    assert(
+      ok({ execArgv: ["--experimental-permission", ...good.slice(1)] }).length === 0,
+      "node 20 form"
+    );
+    for (const [what, argv] of [
+      ["an extra read", [...good, `--allow-fs-read=${H}/.ssh/id_ed25519`]],
+      ["child processes", [...good, "--allow-child-process"]],
+      ["no --permission", good.slice(1)],
+      [
+        "another read path",
+        good.map(a => (a === `--allow-fs-read=${R}` ? "--allow-fs-read=/" : a)),
+      ],
+    ])
+      assert(ok({ execArgv: argv }).length > 0, `accepted ${what}`);
+    for (const n of ["NODE_OPTIONS", "NODE_PATH", "DYLD_INSERT_LIBRARIES", "BASH_ENV"])
+      assert(ok({ execArgv: good, envNames: ["PATH", n] }).length > 0, `accepted ${n}`);
+  }
+);
+await cell(
+  "permission: a NODE_OPTIONS grant under the plist's flags makes detector.mjs refuse (Codex R4 P1-1)",
+  () => {
+    const home = realpathSync(mkdtempSync(join(homedir(), ".pd-check-")));
+    try {
+      const d = join(home, ".aoa-pause-detector");
+      mkdirSync(join(d, "state"), { recursive: true });
+      const repo = resolve(HERE, "../..");
+      const r = spawnSync(
+        process.execPath,
+        [
+          PERM_FLAG,
+          `--allow-fs-read=${repo}`,
+          `--allow-fs-read=${d}`,
+          `--allow-fs-write=${join(d, "state")}`,
+          join(HERE, "detector.mjs"),
+          "--config",
+          join(d, "config.json"),
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            PATH: process.env.PATH,
+            HOME: home,
+            NODE_OPTIONS: `--allow-fs-read=${join(home, "key.env")}`,
+          },
+        }
+      );
+      assert(
+        r.status === 78 && /option-injecting variables are set: NODE_OPTIONS/.test(r.stderr),
+        `${r.status} ${r.stderr}`
+      );
+      // control: the same launch without NODE_OPTIONS gets past the guard (to the missing config)
+      const c = spawnSync(
+        process.execPath,
+        [
+          PERM_FLAG,
+          `--allow-fs-read=${repo}`,
+          `--allow-fs-read=${d}`,
+          `--allow-fs-write=${join(d, "state")}`,
+          join(HERE, "detector.mjs"),
+          "--config",
+          join(d, "config.json"),
+        ],
+        { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+      );
+      assert(
+        c.status === 78 && /config is missing/.test(c.stderr),
+        `control: ${c.status} ${c.stderr}`
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   }
 );
 await cell("permission: detector.mjs refuses to start outside the permission model", () => {
