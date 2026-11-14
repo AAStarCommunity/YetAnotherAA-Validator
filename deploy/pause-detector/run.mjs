@@ -227,7 +227,9 @@ export function dueAlerts(st, alerts, realertMinutes, now) {
  * Pure.
  */
 export function resolvedKeys(st, alerts, report) {
-  if (!report?.canonical) return [];
+  // nothing resolves on a round that could not see the chain as it is now: B left the chain, or B
+  // was stale by the end (Codex R17 P2)
+  if (!report?.canonical || report.fresh === false) return [];
   const now = new Set(alerts.map(a => a.key));
   const seen = new Map((report.operators ?? []).map(r => [r.operator, r.status]));
   return Object.keys(st.alerts).filter(k => {

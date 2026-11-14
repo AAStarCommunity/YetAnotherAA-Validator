@@ -652,6 +652,7 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
       key: "stale-at-end",
       text: `unknown: block ${B.number} is older than ${cfg.maxHeadAgeSec} s by the end of the round`,
     });
+  report.fresh = freshAtEnd;
   report.clear =
     freshAtEnd &&
     id.ok &&

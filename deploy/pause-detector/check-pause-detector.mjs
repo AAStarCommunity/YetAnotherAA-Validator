@@ -1454,6 +1454,10 @@ await cell(
     );
     assert(resolvedKeys(st, [], { ...ok, canonical: false }).length === 0, "resolved on a reorg");
     assert(
+      resolvedKeys(st, [], { ...ok, fresh: false }).length === 0,
+      "resolved on a head stale by the end (Codex R17)"
+    );
+    assert(
       !resolvedKeys(st, [], { ...ok, identity: { ok: false } }).includes(k),
       "resolved without identity"
     );
