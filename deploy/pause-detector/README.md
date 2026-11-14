@@ -196,6 +196,25 @@ a missed one.
 6. **Canonical check.** B is re-checked canonical after every read. If it left
    the chain, the whole round is unknown.
 
+### Trust in the RPC providers (DSR scope ruling)
+
+The detector **trusts its two RPC providers not to equivocate on finalized
+blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
+
+- **What holds without that trust.** Every read failure and every inconsistency
+  the detector can see yields `unknown`, never clear. Honest providers with
+  ordinary lag, load balancing or reorgs cannot produce a false clear. That is
+  the hash-bound, chain-linked cross-check watermark above, and the
+  commit-on-canonical rounds.
+- **The known residual.** A provider that **deliberately** answers one finalized
+  block two different ways, consistently, could still hide an operator. For
+  example, it might serve another fork's block by number and by hash alike, with
+  matching empty logs, along a whole linked stretch. That case is outside the
+  threat model and is not mitigated.
+- **A follow-up, not required for rc.8.** With both providers configured, read
+  the decision inputs at B (role, minStake, effectiveStake, isPaused) from both
+  and treat a disagreement as `unknown`.
+
 ## Alerts (Telegram, the aastar-monitor bot)
 
 | Result                                                                                                 | Alert                                                                                                                                          |
