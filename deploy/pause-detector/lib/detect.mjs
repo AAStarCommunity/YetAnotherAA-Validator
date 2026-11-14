@@ -510,6 +510,8 @@ async function roundOnce(st, { chain, cfg, now }) {
     // from startBlock, cursor with it, and the alert says so (Codex R11 P1-2, R12 P1-1)
     if (
       st.checked > finalized ||
+      // an advanced watermark must carry the hash it was checked on (Codex R13 P1-2)
+      (st.checked >= st.startBlock && st.checkedHash === null) ||
       (st.checkedHash !== null && lc(await canon(st.checked)) !== lc(st.checkedHash))
     )
       resetVerification(
@@ -519,8 +521,23 @@ async function roundOnce(st, { chain, cfg, now }) {
       );
     const lo = st.checked + 1;
     const hi = Math.min(B.number, lo + MAX_CHECK - 1);
+    // the watermark advances only along ONE chain (Codex R13 P1-1): at or below finalized, block n's
+    // header is read by its hash and its parent must be the block before it (the stored
+    // checkedHash, then each block of this window). Above finalized the hashes come from B's own
+    // ancestry walk, which joined canon(finalized), the same hash this loop uses at finalized; so
+    // the checked chain reaches B link by link, and a by-number answer from another fork breaks it.
+    let prev = st.checkedHash;
     for (let n = lo; n <= hi; n++) {
       const hn = n > finalized ? hashes.get(n) : await canon(n);
+      if (n <= finalized) {
+        const blk = await chain.blockByHash(hn);
+        if (!blk || Number(blk.number) !== n || lc(blk.hash) !== lc(hn))
+          throw new SafeError(`block ${n} cannot be read by its hash`);
+        if (prev !== null && lc(blk.parentHash) !== lc(prev))
+          throw new SafeError(
+            `block ${n} does not follow the checked chain (another fork answered)`
+          );
+      }
       // a block no range answer of this round covered gets its own
       if (!covered.some(([a, b]) => n >= a && n <= b))
         await operatorLogs(chain, st.spProxy, n, n, cfg.logChunk, rangeSaw, canon);
@@ -543,6 +560,7 @@ async function roundOnce(st, { chain, cfg, now }) {
         st.checked = n;
         st.checkedHash = hn;
       }
+      prev = hn;
     }
     if (hi < B.number)
       throw new SafeError(

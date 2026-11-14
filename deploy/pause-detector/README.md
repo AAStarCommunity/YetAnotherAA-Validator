@@ -150,6 +150,13 @@ a missed one.
        past finalized, since a block above it can still be replaced.
      - It starts below `startBlock`, so every block is compared once, even if
        the first rounds fail (Codex R11).
+     - **One chain.** It only advances along a single chain. At or below
+       finalized, each block's header is read by its hash, and its parent must
+       be the previous checked block. Above finalized, the hashes come from B's
+       own ancestry walk, which joins the finalized block. So the checked chain
+       reaches B link by link, and a by-number answer from another fork breaks
+       it (Codex R13). An advanced watermark without its hash re-verifies from
+       `startBlock`.
      - It is bound to the canonical hash of its block. If that hash changes, or
        the watermark or cursor is above the finalized block, the chain under
        them changed. Nothing below them can be assumed, so everything is read

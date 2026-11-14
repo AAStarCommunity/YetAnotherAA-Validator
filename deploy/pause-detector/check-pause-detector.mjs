@@ -330,6 +330,10 @@ function fakeChain(w) {
     blockByHash: async h => {
       failIf("blockByHash");
       const n = Number(BigInt(h));
+      if (w.oldFork && Object.values(w.oldFork).includes(h)) {
+        const m = Number(Object.keys(w.oldFork).find(k => w.oldFork[k] === h));
+        return { number: m, hash: h, parentHash: hashOf(m - 1) };
+      }
       if (!(n >= 0 && n <= w.latest) || h !== hashOf(n)) return null;
       return {
         number: n,
@@ -339,6 +343,7 @@ function fakeChain(w) {
     },
     blockByNumber: async n => {
       if (n === "latest") return w.noLatest ? null : { number: w.latest, hash: hashOf(w.latest) };
+      if (w.oldFork?.[n]) return { number: n, hash: w.oldFork[n] };
       afterB = true;
       return { number: n, hash: w.reorg ? hashOf(n + 9999) : hashOf(n) };
     },
@@ -348,6 +353,7 @@ function fakeChain(w) {
       let b;
       if (f.blockHash) {
         // EIP-234: one block by hash; a backend that has not indexed it fails
+        if (w.oldFork && Object.values(w.oldFork).includes(f.blockHash)) return [];
         const n = Number(BigInt(f.blockHash));
         assert(f.blockHash === hashOf(n) && n <= w.latest, "blockHash filter of an unknown block");
         if (n === w.latest) failIf("logs-at-B");
@@ -1020,7 +1026,13 @@ await cell(
   "round: a cross-check backlog over MAX_CHECK blocks is worked off over rounds, unknown meanwhile",
   async () => {
     const cfg = cfgOf({ rescanBlocks: 0, logChunk: 5000 });
-    const st = { ...emptyState(cfg), lastFullScan: 1e12, cursor: 9000, checked: 100 };
+    const st = {
+      ...emptyState(cfg),
+      lastFullScan: 1e12,
+      cursor: 9000,
+      checked: 100,
+      checkedHash: ethers.zeroPadValue(ethers.toBeHex(100), 32),
+    };
     const w = world({ latest: 9010, finalized: 9000 });
     const r = await round(w, cfg, st, 1e12 + 1000);
     assert(
@@ -1186,6 +1198,61 @@ await cell(
     const after = JSON.stringify({ c: st.cursor, k: st.checked, f: st.lastFullScan });
     assert(after === before, `progress kept after a throw: ${after} vs ${before}`);
     assert(Object.keys(st.operators).length === 1, "the inventory should still keep what it saw");
+  }
+);
+
+await cell(
+  "round: a by-number hash from another fork below finalized breaks the checked chain (Codex R13 P1-1)",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0 });
+    const st = { ...emptyState(cfg), lastFullScan: 1e12, cursor: 250 };
+    // the backend answers block 150 by number from an old fork (empty logs both ways), while the
+    // canonical chain has an understaked operator configured at 150
+    const w = world({
+      latest: 300,
+      finalized: 250,
+      rangeHides: new Set([150]),
+      oldFork: { 150: `0x${"0f".repeat(32)}` },
+    });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 1n,
+      logBlock: 150,
+    };
+    const r = await round(w, cfg, st, 1e12 + 1000);
+    assert(
+      !r.report.clear && r.alerts.some(a => /does not follow the checked chain/.test(a.text)),
+      r.alerts.map(a => a.text).join("; ")
+    );
+    assert(st.checked < 151, `the watermark crossed the fork: ${st.checked}`);
+  }
+);
+await cell(
+  "round: an advanced watermark without its hash re-verifies from startBlock (Codex R13 P1-2)",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0 });
+    const st = {
+      ...emptyState(cfg),
+      lastFullScan: 1e12,
+      cursor: 250,
+      checked: 250,
+      checkedHash: null,
+    };
+    const w = world({ latest: 300, finalized: 250, rangeHides: new Set([150]) });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 500n,
+      logBlock: 150,
+    };
+    const r = await round(w, cfg, st, 1e12 + 1000);
+    assert(
+      r.alerts.some(a => a.key === "reverify") && !r.report.clear,
+      r.alerts.map(a => a.key).join(",")
+    );
   }
 );
 
