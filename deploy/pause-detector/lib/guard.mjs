@@ -108,6 +108,26 @@ const CRASH_NAMES = new Set([
   "TimeoutError",
 ]);
 
+/** No completed detector round for this long is an outage (DSR: 2 h); shared by both entries. */
+export const MAX_SILENCE_MS = 2 * 3600_000;
+
+/**
+ * The heartbeat's list of outages the dead-man has not acknowledged yet (Codex dm-R5): the old
+ * heartbeat's gaps minus those `acked` (the dead-man's reportedGaps), plus a new gap when the
+ * previous completed round is more than MAX_SILENCE_MS before `nowIso`. At most 20 kept: the
+ * first and the latest. Pure.
+ */
+export function carryGaps(old, acked, nowIso) {
+  const valid = g => typeof g?.from === "string" && typeof g?.to === "string";
+  const ack = new Set(Array.isArray(acked) ? acked : []);
+  let gaps = (Array.isArray(old?.gaps) ? old.gaps.filter(valid) : []).filter(g => !ack.has(g.from));
+  const prev = Date.parse(old?.at);
+  if (Number.isFinite(prev) && Date.parse(nowIso) - prev > MAX_SILENCE_MS && !ack.has(old.at))
+    gaps.push({ from: old.at, to: nowIso });
+  if (gaps.length > 20) gaps = [gaps[0], ...gaps.slice(-19)];
+  return gaps;
+}
+
 /** The bundle's manifest file name, at the bundle root. */
 export const MANIFEST = "MANIFEST.json";
 /** The detector's directory, under the home directory: config, secrets, state and the bundle. */

@@ -11,13 +11,13 @@
 import { lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { GuardError, DIR, readOwnJson, recordStop } from "./lib/guard.mjs";
+import { GuardError, DIR, MAX_SILENCE_MS, readOwnJson, recordStop } from "./lib/guard.mjs";
 import { DETECTOR_SECRETS, telegram, writeDurable } from "./run.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { safeText } from "../pause-job/lib/safe-error.mjs";
 
 /** No completed detector round for this long is an alert (DSR: 2 h). */
-export const MAX_SILENCE_MS = 2 * 3600_000;
+export { MAX_SILENCE_MS };
 /** While it lasts, the alert repeats this often. */
 export const REALERT_MS = 6 * 3600_000;
 
@@ -48,21 +48,22 @@ export function deadmanDecision(hb, now, st) {
       next: {
         alerting: true,
         lastSent: due ? now : lastSent,
-        gapReported: st?.gapReported ?? null,
+        reportedGaps: Array.isArray(st?.reportedGaps) ? st.reportedGaps : [],
       },
     };
   }
-  // a gap between the last two completed rounds longer than the deadline is reported once, from the
-  // heartbeat itself: if a host crash lost this run's queued outage alert (no fsync under the
-  // permission model), the outage is still reported when rounds resume (Codex dm-R4 P1)
-  const prev = Date.parse(hb?.prevAt);
-  const gap = Number.isFinite(prev) ? at - prev : 0;
-  const gapNew = gap > MAX_SILENCE_MS && st?.gapReported !== hb.prevAt;
+  // every outage the heartbeat still carries and this dead-man has not reported yet is reported
+  // once (Codex dm-R4, dm-R5); the detector drops a gap from the heartbeat only after it appears in
+  // reportedGaps here
+  const reported = new Set(Array.isArray(st?.reportedGaps) ? st.reportedGaps : []);
+  const gaps = (Array.isArray(hb?.gaps) ? hb.gaps : []).filter(
+    g => typeof g?.from === "string" && typeof g?.to === "string" && !reported.has(g.from)
+  );
   const msgs = [];
   if (alerting) msgs.push("DEAD-MAN: the pause detector's rounds have resumed.");
-  if (gapNew)
+  for (const g of gaps)
     msgs.push(
-      `DEAD-MAN: the pause detector had no successful round from ${hb.prevAt} to ${hb.at} (${Math.round(gap / 60_000)} min).`
+      `DEAD-MAN: the pause detector had no successful round from ${g.from} to ${g.to} (${Math.round((Date.parse(g.to) - Date.parse(g.from)) / 60_000)} min).`
     );
   return {
     silent,
@@ -71,7 +72,7 @@ export function deadmanDecision(hb, now, st) {
     next: {
       alerting: false,
       lastSent,
-      gapReported: gapNew ? hb.prevAt : (st?.gapReported ?? null),
+      reportedGaps: [...reported, ...gaps.map(g => g.from)].slice(-50),
     },
   };
 }

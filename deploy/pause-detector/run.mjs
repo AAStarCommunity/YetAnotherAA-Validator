@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ethers } from "ethers";
 import { emptyState, headStale, runRound, stateProblems } from "./lib/detect.mjs";
-import { GuardError, readOwnJson, recordStop } from "./lib/guard.mjs";
+import { DIR, GuardError, carryGaps, readOwnJson, recordStop } from "./lib/guard.mjs";
 import { readSecretFile, dirProblems, okDir } from "../pause-job/lib/secret-file.mjs";
 import { SafeError, safeText, isOurs } from "../pause-job/lib/safe-error.mjs";
 
@@ -484,20 +484,31 @@ export async function main() {
     // the heartbeat the dead-man check reads (DSR): written only by a COMPLETED round (no throw, B
     // still canonical), clear or not; a run that never gets here leaves it to age
     if (result.report?.canonical === true) {
-      // prevAt: the previous completed round, so a gap is visible in the heartbeat itself even if
-      // the dead-man's own record of it was lost (no fsync under the permission model; Codex dm-R4)
-      let prevAt = null;
+      // gaps: every outage (no completed round for more than 2 h) the dead-man has not yet
+      // acknowledged, carried from heartbeat to heartbeat until it has (its reportedGaps). So an
+      // outage survives both a lost dead-man queue (no fsync, Codex dm-R4) and a later round
+      // overwriting the heartbeat before the dead-man sampled it (Codex dm-R5)
+      let old = null;
       try {
-        const old = readOwnJson(join(stateDir, "heartbeat.json"), "heartbeat");
-        if (typeof old?.at === "string") prevAt = old.at;
+        old = readOwnJson(join(stateDir, "heartbeat.json"), "heartbeat");
       } catch {
-        prevAt = null;
+        old = null;
       }
+      let acked = [];
+      try {
+        acked = readOwnJson(
+          join(homedir(), DIR, "deadman", "state.json"),
+          "dead-man state"
+        ).reportedGaps;
+      } catch {
+        acked = [];
+      }
+      const at = new Date().toISOString();
       writeDurable(join(stateDir, "heartbeat.json"), {
         schema: "aoa-pause-detector-heartbeat/1",
         // when the round COMPLETED, not when it started (Codex dm-R1 P2)
-        at: new Date().toISOString(),
-        prevAt,
+        at,
+        gaps: carryGaps(old, acked, at),
         block: result.report.block?.number ?? null,
         clear: result.report.clear === true,
       });

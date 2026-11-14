@@ -286,11 +286,19 @@ unrelated process. So a **separate** launchd job watches it:
     count of what was folded, and the latest messages.
   - An existing state that cannot be read stops the run visibly, and the file is
     left as it is.
-- **A host crash** (no fsync under the permission model) can still roll back the
-  queue. So the heartbeat also carries `prevAt`, the previous completed round.
-  When rounds resume after a gap of more than 2 h, the dead-man reports that gap
-  once, from the heartbeat itself. An outage is therefore reported even if its
-  queued alert was lost; the worst case is a duplicate (Codex dm-R4).
+- **Outages carried until acknowledged.** A host crash (no fsync under the
+  permission model) can still roll back the queue, and a later round can
+  overwrite the heartbeat before the dead-man reads it. So the heartbeat itself
+  carries `gaps`: every outage (no completed round for more than 2 h) the
+  dead-man has not acknowledged yet.
+  - A new gap is added when the previous completed round is more than 2 h old.
+  - The detector drops a gap only once it appears in the dead-man's
+    `reportedGaps`.
+  - The dead-man reports each gap it has not reported yet, once.
+
+  So an outage is reported even if its queued alert was lost or the heartbeat
+  has moved on twice. The worst case is a duplicate (Codex dm-R4, dm-R5).
+
 - **Confinement.** It runs from the same bundle, under the same permission
   model, with the same startup guards as the detector. It reads
   `~/.aoa-pause-detector` and writes **only** `~/.aoa-pause-detector/deadman`,

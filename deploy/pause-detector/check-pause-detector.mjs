@@ -52,6 +52,7 @@ import {
   bundleProblems,
   launchProblems,
   crashLabel,
+  carryGaps,
   readOwnJson,
   recordStop,
   symlinkProblems,
@@ -1999,30 +2000,42 @@ await cell(
 );
 
 await cell(
-  "dead-man: a gap between completed rounds is reported once from the heartbeat, even after a lost queue (Codex dm-R4 P1)",
+  "dead-man: an outage survives a later heartbeat and a lost dead-man queue until acknowledged (Codex dm-R4, dm-R5)",
   () => {
-    const T = 1e12;
+    const T0 = Date.parse("2026-11-14T00:00:00Z");
     const iso = ms => new Date(ms).toISOString();
-    // rounds resumed a minute ago after 5 h of silence; the dead-man's state was rolled back (no
-    // record of having alerted): the gap is still reported
-    const hb = {
+    const beat = (old, acked, ms) => ({
       schema: "aoa-pause-detector-heartbeat/1",
-      at: iso(T - 60_000),
-      prevAt: iso(T - 60_000 - 5 * 3600_000),
-    };
-    const a = deadmanDecision(hb, T, {});
-    assert(!a.silent && /no successful round from .* \(300 min\)/.test(a.message ?? ""), a.message);
-    // the next run, with that recorded, says nothing more
-    const b = deadmanDecision(hb, T + 900_000, a.next);
-    assert(b.message === null, `reported twice: ${b.message}`);
-    // control: a normal hourly gap is not reported
-    const c = deadmanDecision({ ...hb, prevAt: iso(T - 60_000 - 3600_000) }, T, {});
-    assert(c.message === null, `an hourly gap reported: ${c.message}`);
+      at: iso(ms),
+      gaps: carryGaps(old, acked, iso(ms)),
+    });
+    const h0 = beat(null, [], T0);
+    assert(h0.gaps.length === 0, "a first heartbeat has no gap");
+    // 3 h of nothing, then two rounds a minute apart before the dead-man samples (dm-R5)
+    const h1 = beat(h0, [], T0 + 3 * 3600_000);
+    const h2 = beat(h1, [], T0 + 3 * 3600_000 + 60_000);
+    assert(
+      h2.gaps.length === 1 && h2.gaps[0].from === h0.at,
+      `the outage did not survive the second round: ${JSON.stringify(h2.gaps)}`
+    );
+    // the dead-man (state rolled back or never written: dm-R4) reports it once
+    const a = deadmanDecision(h2, T0 + 3 * 3600_000 + 120_000, {});
+    assert(
+      !a.silent &&
+        /no successful round from 2026-11-14T00:00:00.000Z to .* \(180 min\)/.test(a.message ?? ""),
+      a.message
+    );
+    assert(
+      deadmanDecision(h2, T0 + 3 * 3600_000 + 180_000, a.next).message === null,
+      "reported twice"
+    );
+    // the next heartbeat drops it only now that the dead-man acknowledged it
+    const h3 = beat(h2, a.next.reportedGaps, T0 + 4 * 3600_000);
+    assert(h3.gaps.length === 0, `an acknowledged gap was kept: ${JSON.stringify(h3.gaps)}`);
+    // control: hourly rounds never record a gap
+    assert(beat(h0, [], T0 + 3600_000).gaps.length === 0, "an hourly gap recorded");
   }
 );
-
-// ---------------------------------------------------------------- dead-man (DSR)
-
 await cell("dead-man: the decision (alive, silent, re-alert, resume, missing, future)", () => {
   const T = 1e12;
   const hb = msAgo => ({
