@@ -44,10 +44,8 @@ import {
   telegram,
   MESSAGE_CHARS,
   rpcTransport,
-  launchProblems,
-  readOwnJson,
-  symlinkProblems,
-} from "./detector.mjs";
+} from "./run.mjs";
+import { bundleProblems, launchProblems, readOwnJson, symlinkProblems } from "./lib/guard.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
 
@@ -1047,146 +1045,125 @@ await cell(
     }
   }
 );
-// the process boundary: Node's permission model (the plist's flags), proven by running node
+// the confinement: Node's permission model with the plist's flags, run from a real bundle
 const PERM_FLAG =
   Number(process.versions.node.split(".")[0]) >= 22 ? "--permission" : "--experimental-permission";
 const runNode = (flags, code) =>
   spawnSync(process.execPath, [...flags, "--input-type=module", "-e", code], { encoding: "utf8" });
+/** A fresh home with ~/.aoa-pause-detector/{state,app}: the app built by bundle.mjs. */
+const makeHome = () => {
+  const home = realpathSync(mkdtempSync(join(homedir(), ".pd-check-")));
+  const d = join(home, ".aoa-pause-detector");
+  mkdirSync(join(d, "state"), { recursive: true, mode: 0o700 });
+  const b = spawnSync(
+    process.execPath,
+    [join(HERE, "bundle.mjs"), "--out", join(d, "app"), "--allow-dirty"],
+    {
+      encoding: "utf8",
+    }
+  );
+  if (b.status !== 0) throw new Error(`bundle failed: ${b.stderr}`);
+  return { home, d, app: join(d, "app") };
+};
+const plistFlags = d => [PERM_FLAG, `--allow-fs-read=${d}`, `--allow-fs-write=${join(d, "state")}`];
+const runDetector = ({ home, d }, env = {}) =>
+  spawnSync(
+    process.execPath,
+    [
+      ...plistFlags(d),
+      join(d, "app/deploy/pause-detector/detector.mjs"),
+      "--config",
+      join(d, "config.json"),
+    ],
+    { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, ...env } }
+  );
+const withHome = fn => {
+  const h = makeHome();
+  try {
+    fn(h);
+  } finally {
+    rmSync(h.home, { recursive: true, force: true });
+  }
+};
+
 await cell(
   "permission: under the plist's flags no child process, worker or outside read is possible",
-  () => {
-    const home = mkdtempSync(join(tmpdir(), "pd-home-"));
-    mkdirSync(join(home, ".aoa-pause-detector/state"), { recursive: true });
-    writeFileSync(join(home, "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key");
-    const repo = resolve(HERE, "../..");
-    const flags = [
-      PERM_FLAG,
-      `--allow-fs-read=${repo}`,
-      `--allow-fs-read=${join(home, ".aoa-pause-detector")}`,
-      `--allow-fs-write=${join(home, ".aoa-pause-detector/state")}`,
-    ];
-    const probe = `
-    const out = [];
-    try { (await import("node:child_process")).execFileSync("/usr/bin/true"); out.push("spawn"); } catch {}
-    try { new (await import("node:worker_threads")).Worker("1", { eval: true }); out.push("worker"); } catch {}
-    try { (await import("node:fs")).readFileSync(${JSON.stringify(join(home, "key.env"))}); out.push("read"); } catch {}
-    const { permissionProblems } = await import(${JSON.stringify(join(HERE, "detector.mjs"))});
-    console.log(JSON.stringify({ out, problems: permissionProblems(process.permission, ${JSON.stringify(home)}) }));`;
-    const r = runNode(flags, probe);
-    const j = JSON.parse(r.stdout.trim().split("\n").pop());
-    assert(j.out.length === 0, `allowed: ${j.out.join(",")}`);
-    assert(j.problems.length === 0, j.problems.join("; "));
-    // controls: without the model, and with child processes allowed, the detector refuses
-    const bare = JSON.parse(runNode([], probe).stdout.trim().split("\n").pop());
-    assert(bare.problems.length > 0 && bare.out.includes("spawn"), "control: no model not refused");
-    const child = JSON.parse(
-      runNode(
-        [
-          ...flags,
-          Number(process.versions.node.split(".")[0]) >= 22
-            ? "--allow-child-process"
-            : "--allow-child-process",
-        ],
-        probe
-      )
-        .stdout.trim()
-        .split("\n")
-        .pop()
-    );
-    assert(
-      child.problems.some(x => /child processes/.test(x)),
-      "control: child processes not refused"
-    );
-  }
-);
-await cell(
-  "permission: launchProblems accepts exactly the plist's flags and no injection variable",
-  () => {
-    const H = "/Users/u";
-    const R = "/Users/u/repo";
-    const good = [
-      "--permission",
-      `--allow-fs-read=${R}`,
-      `--allow-fs-read=${H}/.aoa-pause-detector`,
-      `--allow-fs-write=${H}/.aoa-pause-detector/state`,
-    ];
-    const ok = x => launchProblems({ home: H, repo: R, envNames: ["PATH", "HOME"], ...x });
-    assert(ok({ execArgv: good }).length === 0, ok({ execArgv: good }).join("; "));
-    assert(
-      ok({ execArgv: ["--experimental-permission", ...good.slice(1)] }).length === 0,
-      "node 20 form"
-    );
-    for (const [what, argv] of [
-      ["an extra read", [...good, `--allow-fs-read=${H}/.ssh/id_ed25519`]],
-      ["child processes", [...good, "--allow-child-process"]],
-      ["no --permission", good.slice(1)],
-      [
-        "another read path",
-        good.map(a => (a === `--allow-fs-read=${R}` ? "--allow-fs-read=/" : a)),
-      ],
-    ])
-      assert(ok({ execArgv: argv }).length > 0, `accepted ${what}`);
-    for (const n of ["NODE_OPTIONS", "NODE_PATH", "DYLD_INSERT_LIBRARIES", "BASH_ENV"])
-      assert(ok({ execArgv: good, envNames: ["PATH", n] }).length > 0, `accepted ${n}`);
-  }
-);
-await cell(
-  "permission: a NODE_OPTIONS grant under the plist's flags makes detector.mjs refuse (Codex R4 P1-1)",
-  () => {
-    const home = realpathSync(mkdtempSync(join(homedir(), ".pd-check-")));
-    try {
-      const d = join(home, ".aoa-pause-detector");
-      mkdirSync(join(d, "state"), { recursive: true });
-      const repo = resolve(HERE, "../..");
-      const r = spawnSync(
-        process.execPath,
-        [
-          PERM_FLAG,
-          `--allow-fs-read=${repo}`,
-          `--allow-fs-read=${d}`,
-          `--allow-fs-write=${join(d, "state")}`,
-          join(HERE, "detector.mjs"),
-          "--config",
-          join(d, "config.json"),
-        ],
-        {
-          encoding: "utf8",
-          env: {
-            PATH: process.env.PATH,
-            HOME: home,
-            NODE_OPTIONS: `--allow-fs-read=${join(home, "key.env")}`,
-          },
-        }
-      );
+  () =>
+    withHome(({ home, d, app }) => {
+      writeFileSync(join(home, "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key");
+      const probe = `
+      const out = [];
+      try { (await import("node:child_process")).execFileSync("/usr/bin/true"); out.push("spawn"); } catch {}
+      try { new (await import("node:worker_threads")).Worker("1", { eval: true }); out.push("worker"); } catch {}
+      try { (await import("node:fs")).readFileSync(${JSON.stringify(join(home, "key.env"))}); out.push("read"); } catch {}
+      try { (await import("node:fs")).readFileSync(${JSON.stringify(join(resolve(HERE, "../.."), "package.json"))}); out.push("read-repo"); } catch {}
+      const { permissionProblems } = await import(${JSON.stringify(join(app, "deploy/pause-detector/lib/guard.mjs"))});
+      console.log(JSON.stringify({ out, problems: permissionProblems(process.permission, ${JSON.stringify(home)}) }));`;
+      const last = r => JSON.parse(r.stdout.trim().split("\n").pop());
+      const j = last(runNode(plistFlags(d), probe));
+      assert(j.out.length === 0, `allowed: ${j.out.join(",")}`);
+      assert(j.problems.length === 0, j.problems.join("; "));
+      // controls: without the model, and with child processes allowed, the guard reports problems
+      const bare = last(runNode([], probe));
       assert(
-        r.status === 78 && /option-injecting variables are set: NODE_OPTIONS/.test(r.stderr),
-        `${r.status} ${r.stderr}`
+        bare.problems.length > 0 && bare.out.includes("spawn"),
+        "control: no model not refused"
       );
-      // control: the same launch without NODE_OPTIONS gets past the guard (to the missing config)
-      const c = spawnSync(
-        process.execPath,
-        [
-          PERM_FLAG,
-          `--allow-fs-read=${repo}`,
-          `--allow-fs-read=${d}`,
-          `--allow-fs-write=${join(d, "state")}`,
-          join(HERE, "detector.mjs"),
-          "--config",
-          join(d, "config.json"),
-        ],
-        { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
-      );
+      const child = last(runNode([...plistFlags(d), "--allow-child-process"], probe));
       assert(
-        c.status === 78 && /config: missing/.test(c.stderr),
-        `control: ${c.status} ${c.stderr}`
+        child.problems.some(x => /child processes/.test(x)),
+        "control: child processes not refused"
       );
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  }
+    })
+);
+await cell("permission: launchProblems accepts exactly the plist's launch and nothing more", () => {
+  const H = "/Users/u";
+  const d = `${H}/.aoa-pause-detector`;
+  const good = ["--permission", `--allow-fs-read=${d}`, `--allow-fs-write=${d}/state`];
+  const script = `${d}/app/deploy/pause-detector/detector.mjs`;
+  const ok = x => launchProblems({ home: H, script, envNames: ["PATH", "HOME"], ...x });
+  assert(ok({ execArgv: good }).length === 0, ok({ execArgv: good }).join("; "));
+  assert(
+    ok({ execArgv: ["--experimental-permission", ...good.slice(1)] }).length === 0,
+    "node 20 form"
+  );
+  for (const [what, x] of [
+    ["an extra read", { execArgv: [...good, `--allow-fs-read=${H}/.ssh/id_ed25519`] }],
+    [
+      "the repo granted (Codex R7)",
+      { execArgv: [good[0], "--allow-fs-read=/Users/u/Dev/repo", ...good.slice(1)] },
+    ],
+    ["child processes", { execArgv: [...good, "--allow-child-process"] }],
+    ["no --permission", { execArgv: good.slice(1) }],
+    [
+      "run from a checkout, not the bundle",
+      { execArgv: good, script: "/Users/u/Dev/repo/deploy/pause-detector/detector.mjs" },
+    ],
+  ])
+    assert(ok(x).length > 0, `accepted ${what}`);
+  for (const n of ["NODE_OPTIONS", "NODE_PATH", "DYLD_INSERT_LIBRARIES", "BASH_ENV"])
+    assert(ok({ execArgv: good, envNames: ["PATH", n] }).length > 0, `accepted ${n}`);
+});
+await cell(
+  "permission: the real bundle, launched as the plist does, passes every guard (control)",
+  () =>
+    withHome(h => {
+      const r = runDetector(h);
+      // past the guards and into run.mjs: it stops at the missing config, nothing earlier
+      assert(r.status === 78 && /config: missing/.test(r.stderr), `${r.status} ${r.stderr}`);
+    })
+);
+await cell("permission: a NODE_OPTIONS grant makes detector.mjs refuse (Codex R4 P1-1)", () =>
+  withHome(h => {
+    const r = runDetector(h, { NODE_OPTIONS: `--allow-fs-read=${join(h.home, "key.env")}` });
+    assert(
+      r.status === 78 && /option-injecting variables are set: NODE_OPTIONS/.test(r.stderr),
+      `${r.status} ${r.stderr}`
+    );
+  })
 );
 await cell(
-  "files: config and state are read without following a symlink, owned and not group-writable",
+  "files: readOwnJson never follows a symlink, needs our own file, never echoes bytes",
   () => {
     const d = realpathSync(mkdtempSync(join(tmpdir(), "pd-own-")));
     try {
@@ -1200,6 +1177,7 @@ await cell(
         ["link.json", /symlink/],
         ["gw.json", /group or others/],
         ["none.json", /missing/],
+        ["key.env", /not JSON/],
       ]) {
         let why = "";
         try {
@@ -1207,7 +1185,7 @@ await cell(
         } catch (e) {
           why = e.message;
         }
-        assert(re.test(why), `${f}: ${why}`);
+        assert(re.test(why) && !/not-a-key/.test(why), `${f}: ${why}`);
       }
       assert(
         symlinkProblems(d).some(x => x.includes("link.json")),
@@ -1215,144 +1193,130 @@ await cell(
       );
       rmSync(join(d, "link.json"));
       assert(symlinkProblems(d).length === 0, "control: no symlink");
-      // with `inside`: a link within the tree is allowed, one leading out is not (Codex R6 P1)
-      mkdirSync(join(d, "in"));
-      writeFileSync(join(d, "in", "t.js"), "", { mode: 0o600 });
-      const out = realpathSync(mkdtempSync(join(tmpdir(), "pd-out-")));
-      try {
-        symlinkSync(join(d, "in", "t.js"), join(d, "in", "inner"));
-        symlinkSync(out, join(d, "in", "outer"));
-        const q = symlinkProblems(join(d, "in"), 100, join(d, "in"));
-        assert(q.length === 1 && q[0].includes("outer") && q[0].includes("leaving"), q.join("; "));
-      } finally {
-        rmSync(out, { recursive: true, force: true });
-      }
-      // the real checkout passes (its node_modules/.bin links stay inside it)
-      const repo = resolve(HERE, "../..");
-      const rp = symlinkProblems(repo, 500_000, repo);
-      assert(rp.length === 0, `the repo has a link leaving it: ${rp.slice(0, 2).join("; ")}`);
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
   }
 );
 await cell(
-  "permission: a config.json symlinked to a key file makes detector.mjs refuse before reading it",
-  () => {
-    const home = realpathSync(mkdtempSync(join(homedir(), ".pd-check-")));
-    try {
-      const d = join(home, ".aoa-pause-detector");
-      mkdirSync(join(d, "state"), { recursive: true });
+  "bundle: bundle.mjs makes a bundle that is exactly its manifest; any change is refused",
+  () =>
+    withHome(({ app }) => {
+      assert(bundleProblems(app).length === 0, bundleProblems(app).join("; "));
+      const man = JSON.parse(readFileSync(join(app, "MANIFEST.json"), "utf8"));
+      for (const f of [
+        "deploy/pause-detector/detector.mjs",
+        "deploy/pause-detector/run.mjs",
+        "deploy/pause-detector/lib/guard.mjs",
+        "deploy/pause-detector/lib/detect.mjs",
+        "deploy/pause-job/lib/secret-file.mjs",
+        "deploy/pause-job/lib/safe-error.mjs",
+        "deploy/pause-job/sp-pin.json",
+        "node_modules/ethers/package.json",
+      ])
+        assert(f in man.files, `${f} not bundled`);
+      assert(
+        !Object.keys(man.files).some(f =>
+          /node_state|\.env|\.keys|bundle\.mjs|check-|e2e-/.test(f)
+        ),
+        "a non-runtime file bundled"
+      );
+      const edits = [
+        [
+          "an extra file (a key someone left there)",
+          () => writeFileSync(join(app, "node_state.json"), "{}"),
+          /not in its manifest/,
+        ],
+        [
+          "a changed file",
+          () => writeFileSync(join(app, "deploy/pause-job/sp-pin.json"), "{}"),
+          /does not hash/,
+        ],
+        [
+          "a missing file",
+          () => rmSync(join(app, "deploy/pause-detector/lib/detect.mjs")),
+          /missing/,
+        ],
+        ["a symlink", () => symlinkSync("/etc/hosts", join(app, "x")), /is a symlink/],
+      ];
+      for (const [what, act, re] of edits) {
+        const before = readFileSync(join(app, "MANIFEST.json"));
+        act();
+        const p = bundleProblems(app);
+        assert(
+          p.some(x => re.test(x)),
+          `${what}: ${p.join("; ")}`
+        );
+        // undo by rebuilding the state the next edit expects
+        rmSync(join(app, "node_state.json"), { force: true });
+        rmSync(join(app, "x"), { force: true });
+        writeFileSync(join(app, "MANIFEST.json"), before);
+      }
+    })
+);
+await cell(
+  "permission: an sp-pin.json symlinked to a key makes detector.mjs refuse BEFORE run.mjs is loaded (Codex R7 P1-2)",
+  () =>
+    withHome(({ home, app, d }) => {
+      writeFileSync(join(home, "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key", { mode: 0o600 });
+      rmSync(join(app, "deploy/pause-job/sp-pin.json"));
+      symlinkSync(join(home, "key.env"), join(app, "deploy/pause-job/sp-pin.json"));
+      const r = runDetector({ home, d });
+      assert(
+        r.status === 78 && /refusing to run/.test(r.stderr) && /symlink/.test(r.stderr),
+        `${r.status} ${r.stderr}`
+      );
+      assert(!/not-a-key/.test(r.stderr + r.stdout), "key text leaked");
+    })
+);
+await cell(
+  "permission: a config.json symlinked to a key makes detector.mjs refuse without reading it",
+  () =>
+    withHome(({ home, d }) => {
       writeFileSync(join(home, "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key", { mode: 0o600 });
       symlinkSync(join(home, "key.env"), join(d, "config.json"));
-      const repo = resolve(HERE, "../..");
-      const r = spawnSync(
-        process.execPath,
-        [
-          PERM_FLAG,
-          `--allow-fs-read=${repo}`,
-          `--allow-fs-read=${d}`,
-          `--allow-fs-write=${join(d, "state")}`,
-          join(HERE, "detector.mjs"),
-          "--config",
-          join(d, "config.json"),
-        ],
-        { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
-      );
+      const r = runDetector({ home, d });
       assert(
         r.status === 78 && /symlink/.test(r.stderr) && !/not-a-key/.test(r.stderr + r.stdout),
         `${r.status} ${r.stderr}`
       );
-      // a symlink anywhere else in the tree (not the config): only the tree check sees it
-      rmSync(join(d, "config.json"));
-      writeFileSync(join(d, "config.json"), "{}", { mode: 0o600 });
-      symlinkSync(join(home, "key.env"), join(d, "state", "anything"));
-      const t = spawnSync(
-        process.execPath,
-        [
-          PERM_FLAG,
-          `--allow-fs-read=${repo}`,
-          `--allow-fs-read=${d}`,
-          `--allow-fs-write=${join(d, "state")}`,
-          join(HERE, "detector.mjs"),
-          "--config",
-          join(d, "config.json"),
-        ],
-        { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
-      );
-      assert(
-        t.status === 78 && /anything is a symlink/.test(t.stderr),
-        `tree: ${t.status} ${t.stderr}`
-      );
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  }
+    })
+);
+await cell("permission: detector.mjs refuses to start outside the permission model", () =>
+  withHome(({ home, d }) => {
+    const r = spawnSync(
+      process.execPath,
+      [join(d, "app/deploy/pause-detector/detector.mjs"), "--config", "/x"],
+      {
+        encoding: "utf8",
+        env: { PATH: process.env.PATH, HOME: home },
+      }
+    );
+    assert(r.status === 78 && /permission model/.test(r.stderr), `${r.status} ${r.stderr}`);
+  })
 );
 await cell(
-  "permission: a symlink in the repo leading outside it makes detector.mjs refuse (Codex R6 P1)",
+  "config: the plist runs the pinned node, under the permission model, from the bundle, exactly",
   () => {
-    const home = realpathSync(mkdtempSync(join(homedir(), ".pd-check-")));
-    const repo = resolve(HERE, "../..");
-    const link = join(repo, ".pd-check-outward-link");
-    try {
-      const d = join(home, ".aoa-pause-detector");
-      mkdirSync(join(d, "state"), { recursive: true });
-      writeFileSync(join(d, "config.json"), "{}", { mode: 0o600 });
-      mkdirSync(join(home, "keeper"));
-      writeFileSync(join(home, "keeper", "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key", {
-        mode: 0o600,
-      });
-      symlinkSync(join(home, "keeper"), link);
-      const r = spawnSync(
-        process.execPath,
-        [
-          PERM_FLAG,
-          `--allow-fs-read=${repo}`,
-          `--allow-fs-read=${d}`,
-          `--allow-fs-write=${join(d, "state")}`,
-          join(HERE, "detector.mjs"),
-          "--config",
-          join(d, "config.json"),
-        ],
-        { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
-      );
-      assert(
-        r.status === 78 &&
-          /pd-check-outward-link is a symlink leaving the repository/.test(r.stderr),
-        `${r.status} ${r.stderr}`
-      );
-    } finally {
-      rmSync(link, { force: true });
-      rmSync(home, { recursive: true, force: true });
-    }
+    const x = readFileSync(join(HERE, "io.aastar.dvt-pause-detector.plist"), "utf8");
+    const args = [
+      ...x
+        .match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)[1]
+        .matchAll(/<string>([^<]*)<\/string>/g),
+    ].map(m => m[1]);
+    const want = [
+      "__HOME__/.local/keeper-node/node-v24.21.0/bin/node",
+      "--permission",
+      "--allow-fs-read=__HOME__/.aoa-pause-detector",
+      "--allow-fs-write=__HOME__/.aoa-pause-detector/state",
+      "__HOME__/.aoa-pause-detector/app/deploy/pause-detector/detector.mjs",
+      "--config",
+      "__HOME__/.aoa-pause-detector/config.json",
+    ];
+    assert(args.join("\n") === want.join("\n"), args.join(" "));
+    assert(!x.includes("__REPO__"), "the plist still names a repository");
   }
 );
-await cell("permission: detector.mjs refuses to start outside the permission model", () => {
-  const r = spawnSync(process.execPath, [join(HERE, "detector.mjs"), "--config", "/nonexistent"], {
-    encoding: "utf8",
-  });
-  assert(r.status === 78 && /permission model/.test(r.stderr), `${r.status} ${r.stderr}`);
-});
-await cell("config: the plist runs the pinned node under the permission model, exactly", () => {
-  const x = readFileSync(join(HERE, "io.aastar.dvt-pause-detector.plist"), "utf8");
-  const args = [
-    ...x
-      .match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)[1]
-      .matchAll(/<string>([^<]*)<\/string>/g),
-  ].map(m => m[1]);
-  const want = [
-    "__HOME__/.local/keeper-node/node-v24.21.0/bin/node",
-    "--permission",
-    "--allow-fs-read=__REPO__",
-    "--allow-fs-read=__HOME__/.aoa-pause-detector",
-    "--allow-fs-write=__HOME__/.aoa-pause-detector/state",
-    "__REPO__/deploy/pause-detector/detector.mjs",
-    "--config",
-    "__HOME__/.aoa-pause-detector/config.json",
-  ];
-  assert(args.join("\n") === want.join("\n"), args.join(" "));
-});
 await cell("config: the plist runs only detector.mjs, hourly, and passes no secret in argv", () => {
   const x = readFileSync(join(HERE, "io.aastar.dvt-pause-detector.plist"), "utf8");
   assert(/<key>StartInterval<\/key>\s*<integer>3600<\/integer>/.test(x), "not hourly");

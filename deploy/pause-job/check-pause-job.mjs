@@ -839,10 +839,9 @@ cell(
     const good = [
       `${H}/.local/keeper-node/node-v24.21.0/bin/node`,
       "--permission",
-      "--allow-fs-read=/r",
       `--allow-fs-read=${H}/.aoa-pause-detector`,
       `--allow-fs-write=${H}/.aoa-pause-detector/state`,
-      "/r/deploy/pause-detector/detector.mjs",
+      `${H}/.aoa-pause-detector/app/deploy/pause-detector/detector.mjs`,
       "--config",
       `${H}/.aoa-pause-detector/config.json`,
     ];
@@ -854,7 +853,15 @@ cell(
         "--allow-child-process added",
         [...good.slice(0, 2), "--allow-child-process", ...good.slice(2)],
       ],
-      ["a wider read", good.map(a => (a === "--allow-fs-read=/r" ? "--allow-fs-read=/" : a))],
+      ["a wider read", good.map(a => (a.startsWith("--allow-fs-read") ? "--allow-fs-read=/" : a))],
+      [
+        "the repo granted (Codex R7)",
+        [...good.slice(0, 2), "--allow-fs-read=/r", ...good.slice(2)],
+      ],
+      [
+        "run from a checkout",
+        good.map(a => (a.endsWith("detector.mjs") ? "/r/deploy/pause-detector/detector.mjs" : a)),
+      ],
       [
         "a wider write",
         good.map(a => (a.startsWith("--allow-fs-write") ? `--allow-fs-write=${H}` : a)),

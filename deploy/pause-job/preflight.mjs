@@ -12,6 +12,7 @@
 //               (by its ProgramArguments, not its label: a job's name is not what it runs). The
 //               price keeper is the one approved sender and is not scanned; the detector is.
 // detector-args the loaded detector runs the pinned node under --permission, exactly as its plist
+// detector-bundle ~/.aoa-pause-detector/app is exactly its manifest; no symlink under the directory
 // pause-detector its last round's status.json is fresh (at most two intervals old): the trigger
 //               fired, not just the job loaded
 // node-slash-off every DVT node container has AUDIT_ENABLED and AUDIT_EXECUTE_SLASH absent or exactly
@@ -25,6 +26,11 @@ import { createHash } from "node:crypto";
 import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, posix } from "node:path";
+import {
+  DIR as DETECTOR_DIR,
+  bundleProblems as detectorBundle,
+  symlinkProblems as detectorSymlinks,
+} from "../pause-detector/lib/guard.mjs";
 
 export const DETECTOR_LABEL = "io.aastar.dvt-pause-detector";
 export const KEEPER_LABEL = "io.aastar.price-keeper";
@@ -310,28 +316,20 @@ export function detectorArgsProblems(args, home, env = [], inherited = []) {
   if (inj.length)
     return [`the detector's environment has option-injecting variables: ${inj.join(", ")}`];
   if (env === null) return ["the detector's loaded environment cannot be read"];
-  const script = args[5] ?? "";
-  const suffix = "/deploy/pause-detector/detector.mjs";
-  const repo = script.endsWith(suffix) ? script.slice(0, -suffix.length) : null;
   const d = `${home}/.aoa-pause-detector`;
-  const want = repo && [
+  // the bundle, never a repository checkout (which may hold keys; Codex R7 P1-1)
+  const want = [
     `${home}/${DETECTOR_NODE}`,
     "--permission",
-    `--allow-fs-read=${repo}`,
     `--allow-fs-read=${d}`,
     `--allow-fs-write=${d}/state`,
-    `${repo}${suffix}`,
+    `${d}/app/deploy/pause-detector/detector.mjs`,
     "--config",
     `${d}/config.json`,
   ];
-  if (
-    !want ||
-    !repo.startsWith("/") ||
-    repo.includes("/../") ||
-    args.join("\n") !== want.join("\n")
-  )
+  if (args.join("\n") !== want.join("\n"))
     return [
-      "the detector does not run exactly as its plist: the pinned node, --permission, reads of the repo and ~/.aoa-pause-detector, writes of its state only",
+      "the detector does not run exactly as its plist: the pinned node, --permission, reads of ~/.aoa-pause-detector only, writes of its state only, from its bundle",
     ];
   return [];
 }
@@ -496,6 +494,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       dl?.inherited ?? []
     );
     results.push(["detector-args", da.length ? "FAIL" : "PASS", da]);
+    // the bundle is exactly its manifest and nothing under ~/.aoa-pause-detector is a symlink:
+    // checked here from outside the permission model too, so the entry file itself is covered
+    const dd = join(homedir(), DETECTOR_DIR);
+    const db = [...detectorSymlinks(dd), ...detectorBundle(join(dd, "app"))];
+    results.push(["detector-bundle", db.length ? "FAIL" : "PASS", db.slice(0, 5)]);
   }
   const di = argv.indexOf("--detector-status");
   const statusPath =

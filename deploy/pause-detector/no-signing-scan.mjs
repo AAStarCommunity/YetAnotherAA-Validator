@@ -100,6 +100,7 @@ export const NODE_OK = new Map([
   ["node:path", null],
   ["node:url", null],
   ["node:net", new Set(["createServer"])], // the instance lock only
+  ["node:crypto", new Set(["createHash"])], // the bundle manifest's sha256 only
 ]);
 const GUARDED_OBJECTS = new Set(["process", "ethers", "Object", "console"]);
 const TELEGRAM = "https://api.telegram.org/bot";
@@ -155,7 +156,15 @@ export function scanSource(path, text, onImport = () => {}) {
         if (node.source) source(node, node.source.value, null);
         break;
       case "ImportExpression":
-        p.push(`${at(node)}: a dynamic import`);
+        // exactly one is allowed: the entry's import of run.mjs AFTER its guards (Codex R7 P1-2);
+        // it is followed like a static import
+        if (
+          path.endsWith("/deploy/pause-detector/detector.mjs") &&
+          node.source.type === "Literal" &&
+          node.source.value === "./run.mjs"
+        )
+          onImport("./run.mjs");
+        else p.push(`${at(node)}: a dynamic import`);
         break;
       case "Identifier":
         if (FORBIDDEN_NAMES.has(node.name)) p.push(`${at(node)}: forbidden name ${node.name}`);

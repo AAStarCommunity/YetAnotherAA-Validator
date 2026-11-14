@@ -26,7 +26,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { PIN, emptyState, runRound, spIface, regIface, IMPL_SLOT } from "./lib/detect.mjs";
-import { readOnlyChain, resolvedKeys } from "./detector.mjs";
+import { readOnlyChain, resolvedKeys } from "./run.mjs";
 
 const HERE_E2E = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -307,7 +307,13 @@ await section(async () => {
       rpc: { primary: "anvil-a", fallback: "anvil-b" },
     })
   );
-  const repo = join(HERE_E2E, "../..");
+  // the bundle, built by bundle.mjs as on the Mini, is the only code the detector reads
+  const b = spawnSync(
+    process.execPath,
+    [join(HERE_E2E, "bundle.mjs"), "--out", join(d, "app"), "--allow-dirty"],
+    { encoding: "utf8" }
+  );
+  if (b.status !== 0) throw new Error(`bundle failed: ${b.stderr}`);
   const flag =
     Number(process.versions.node.split(".")[0]) >= 22
       ? "--permission"
@@ -316,10 +322,9 @@ await section(async () => {
     process.execPath,
     [
       flag,
-      `--allow-fs-read=${repo}`,
       `--allow-fs-read=${d}`,
       `--allow-fs-write=${join(d, "state")}`,
-      join(HERE_E2E, "detector.mjs"),
+      join(d, "app/deploy/pause-detector/detector.mjs"),
       "--config",
       cfgPath,
     ],

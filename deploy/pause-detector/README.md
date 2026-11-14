@@ -17,41 +17,56 @@ malicious code, and nothing here claims it is.
 
 Three layers carry it, and they are not equally strong:
 
-1. **Node's permission model.** The plist runs the pinned node
-   (`~/.local/keeper-node/node-v24.21.0`, not Homebrew's, whose directories
-   admin can write) with `--permission`, reads of the repo and
-   `~/.aoa-pause-detector` only, and writes of its state directory only.
+1. **Node's permission model, run from a bundle.** The detector never runs from
+   a repository checkout, which may hold `node_state.json`, `.env.sepolia` or
+   `.keys/` (Codex R7). `bundle.mjs` builds `~/.aoa-pause-detector/app` from a
+   clean checkout. The bundle holds only the detector's own modules (the scan's
+   walk), `sp-pin.json`, and the ethers dependency closure, about 1.8k files,
+   plus a `MANIFEST.json` with each file's sha256. The plist runs the pinned
+   node (`~/.local/keeper-node/node-v24.21.0`, not Homebrew's, whose directories
+   admin can write) with `--permission`, reads of `~/.aoa-pause-detector` only,
+   and writes of its state directory only.
    - So the process cannot start a child process (no `cast`), a worker, a native
      addon or WASI.
    - It cannot read key material on the host: not the price keeper's `key.env`,
-     not a foundry keystore, not `~/.ssh`.
+     not a foundry keystore, not `~/.ssh`, not any checkout.
    - It holds no key and has no signing code, so there is no signing path by
      design.
-   - **Startup check.** `detector.mjs` refuses to start unless all of these
-     hold:
+   - **Startup guards.** `detector.mjs` is the entry and uses Node builtins only
+     (`lib/guard.mjs`). It refuses to start unless all of these hold:
      - `process.permission` exists and grants nothing more;
-     - node's own flags (`process.execArgv`) are exactly the plist's;
+     - node's own flags (`process.execArgv`) are exactly the plist's, and the
+       script is the bundle's entry;
      - no option-injecting variable is set (`NODE_OPTIONS`, `NODE_*`, `DYLD_*`,
        `BASH_ENV`). A `NODE_OPTIONS=--allow-fs-read=<key>` would widen the
-       grants with the arguments unchanged (Codex R4).
-   - **Symlinks.** The permission model follows a symlink inside a granted
-     directory to a target outside it (Codex R5). So the detector refuses to
-     start in two cases:
-     - anything under `~/.aoa-pause-detector` is a symlink;
-     - a symlink in the repository, which is granted too, has its real path
-       outside the repository (Codex R6). npm's `node_modules/.bin` links stay
-       inside, so they pass. The walk covers about 30k entries.
+       grants with the arguments unchanged (Codex R4);
+     - nothing under `~/.aoa-pause-detector` is a symlink. The permission model
+       follows a symlink inside a granted directory to a target outside it
+       (Codex R5);
+     - the bundle is exactly its manifest: no extra file, none missing, every
+       sha256 equal.
 
-     It also reads its config and state with `O_NOFOLLOW`, checked on the
-     descriptor: a regular file, this uid, writable by nobody else. The secrets
-     were already read that way.
+     Only then does it import `run.mjs`. So `sp-pin.json`, which `detect.mjs`
+     reads at import, is read only after it was verified (Codex R7). Config and
+     state are read with `O_NOFOLLOW`, checked on the descriptor: a regular
+     file, this uid, writable by nobody else. The secrets were already read that
+     way.
 
-   - **Preflight.** It checks that launchd LOADED exactly these arguments, and
-     that the loaded or inherited environment holds no such variable.
-   - **Tests.** A CI cell runs node with the plist's flags and proves that
-     spawn, a worker and an outside read all fail, and that a `NODE_OPTIONS`
-     grant makes the detector refuse. The anvil e2e runs `detector.mjs` itself
-     under the flags.
+   - **Preflight.** It runs outside the model, so it also covers the entry file
+     itself. It checks three things:
+     - launchd LOADED exactly the plist's arguments;
+     - the loaded or inherited environment holds no injecting variable;
+     - the bundle matches its manifest, with no symlink in the directory.
+   - **Tests.** CI cells build a real bundle and launch it with the plist's
+     flags. They prove that a spawn, a worker, an outside read and a read of the
+     repository all fail, and that the detector refuses each of these:
+     - a `NODE_OPTIONS` grant;
+     - a symlinked `config.json` or `sp-pin.json`;
+     - a file added to the bundle, changed in it or missing from it;
+     - a launch from a checkout.
+
+     The anvil e2e runs the bundle under the flags.
+
    - **Not covered.** Code inside the process can still use the network. A
      malicious module could POST a transaction someone else signed. That is the
      malicious-dependency case the guarantee excludes.
@@ -164,9 +179,14 @@ a missed one.
 
 ## Files
 
-- `detector.mjs`: config, lock, secrets, the read-only RPC client, delivery,
+- `detector.mjs`: the entry. It runs the startup guards, then imports `run.mjs`.
+- `lib/guard.mjs`: the guards (Node builtins only): the permission model, the
+  exact launch, no-follow reads, symlinks, bundle versus manifest.
+- `run.mjs`: config, lock, secrets, the read-only RPC client, delivery,
   `status.json`.
 - `lib/detect.mjs`: the round. It does no I/O; the chain is injected.
+- `bundle.mjs`: builds the bundle and its manifest. It is a deploy tool, never
+  in the bundle.
 - `check-pause-detector.mjs`: the CI cells (`npm run check:pause-detector`).
 - `no-signing-scan.mjs`: the AST scan those cells run (test code, not loaded by
   the detector).
@@ -212,18 +232,27 @@ secret-file reader, called with the detector's own name table) and
 
 4. Make the state dir 0700. The state is created on the first run and is bound
    to `{chainId, spProxy, startBlock}`. A new deployment needs a new `stateDir`.
-5. Render and load the plist, then check
+5. Build the bundle from a clean checkout at the merged commit:
+   `node deploy/pause-detector/bundle.mjs --out ~/.aoa-pause-detector/app`.
+   - It refuses if the output directory exists, and if the detector's files
+     differ from HEAD.
+   - It records the commit in `MANIFEST.json`.
+   - The checkout is not needed after this, and the detector cannot read it.
+   - To upgrade, build a new bundle into a new directory and swap it in.
+6. Render and load the plist, then check
    `launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector | grep "run interval"`
    shows 3600. The plist needs the pinned node at
    `~/.local/keeper-node/node-v24.21.0` (installed and verified on the Mini,
-   11-14), and the repo and `~/.aoa-pause-detector` both under the home
-   directory.
-6. Run `node deploy/pause-job/preflight.mjs`. It checks:
+   11-14).
+7. Run `node deploy/pause-job/preflight.mjs`. It checks:
    - **launchd-on**: the detector and the price keeper are loaded; the committee
      keeper, apply-rotation and the D2 pause job are not; no other loaded job
      runs a DVT sender;
    - **detector-args**: the loaded detector runs exactly the pinned node,
-     `--permission`, the two reads and the one write;
+     `--permission`, the one read, the one write and the bundle's entry, with no
+     injecting variable;
+   - **detector-bundle**: the bundle matches its manifest, with no symlink under
+     `~/.aoa-pause-detector`;
    - **pause-detector**: `status.json` is at most two intervals old.
 
 ## Before rc.8
