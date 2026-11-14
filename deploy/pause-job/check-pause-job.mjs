@@ -962,6 +962,8 @@ cell(
         now
       ).problems.length === 1 &&
       detectorFresh(st("2026-11-14T11:30:00Z", true, { report: {} }), now).problems.length === 1 &&
+      detectorFresh(st("2026-11-14T11:30:00Z", true, { delivery: { ok: false, failed: 1 } }), now)
+        .problems.length === 1 &&
       detectorFresh(st("2026-11-14T11:30:00Z"), now).problems.length === 0
   );
   cell(

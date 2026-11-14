@@ -36,6 +36,17 @@ export class GuardError extends Error {
 export function recordStop(home, text) {
   const dir = join(home, DIR, "state");
   const tmp = join(dir, `status.json.${process.pid}.stop`);
+  // only into our own real directories: a symlinked ~/.aoa-pause-detector or state would carry the
+  // write elsewhere (Codex R16 P1-1); then nothing is recorded (the exit code still says it)
+  for (const d of [join(home, DIR), dir]) {
+    let st;
+    try {
+      st = lstatSync(d);
+    } catch {
+      return;
+    }
+    if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid()) return;
+  }
   try {
     const fd = openSync(
       tmp,

@@ -354,10 +354,10 @@ export const pauseCommand = (spProxy, op) =>
  * the caller delivers them. `clear` in the report is true ONLY when every read succeeded at a
  * canonical B with the identity confirmed and no operator is actionable or unknown.
  */
-export async function runRound(st, { chain, cfg, now = Date.now() }) {
+export async function runRound(st, { chain, cfg, now = Date.now(), clock = () => now }) {
   // a state time after now (a clock that was ahead) would suppress re-alerts and the daily rescan
   // until that date: reset it first, so the progress snapshot below does not undo it (Codex R2 P2)
-  const clock = normalizeClock(st, now);
+  const clockReset = normalizeClock(st, now);
   // the round's progress is committed ONLY if the round ends with B still canonical: a throw at any
   // point, or a rejected B, leaves cursor, watermark and rescan time where they were (Codex R11
   // P1-2, R12 P1-2). The inventory keeps what it saw either way: a superset is safe.
@@ -369,13 +369,13 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
   };
   let result;
   try {
-    result = await roundOnce(st, { chain, cfg, now });
+    result = await roundOnce(st, { chain, cfg, now, clock });
   } catch (e) {
     Object.assign(st, before);
     throw e;
   }
   if (!result.report?.canonical) Object.assign(st, before);
-  if (clock)
+  if (clockReset)
     result.alerts.unshift({
       key: "clock",
       text: "the state held times after now (a clock that was ahead?); they were reset, so a full rescan and every alert run again",
@@ -383,7 +383,7 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
   return result;
 }
 
-async function roundOnce(st, { chain, cfg, now }) {
+async function roundOnce(st, { chain, cfg, now, clock }) {
   const alerts = [];
   const sp = stateProblems(st, cfg);
   if (sp.length) throw new SafeError(`state: ${sp.join("; ")}`);
@@ -468,7 +468,8 @@ async function roundOnce(st, { chain, cfg, now }) {
   };
   // a head that stopped moving is the commonest honest failure, and self-consistent: every other
   // check passes against a frozen node (clestons #434 B1). An old head stops the round.
-  if (headStale(head, now, cfg.maxHeadAgeSec))
+  // checked against the clock WHEN B is accepted, not the round's start (Codex R16 P1-2)
+  if (headStale(head, clock(), cfg.maxHeadAgeSec))
     throw new SafeError(
       `the latest block ${B.number} is ${Number.isSafeInteger(head.timestamp) ? Math.round(now / 1000 - head.timestamp) : "?"} s old (max ${cfg.maxHeadAgeSec}): a frozen or lagging node`
     );
@@ -644,7 +645,15 @@ async function roundOnce(st, { chain, cfg, now }) {
         text: `${r.operator} has OperatorConfigured but is not configured at block ${B.number}`,
       });
   }
+  // and again before anything is called clear: a scan can outlast the head's remaining freshness
+  const freshAtEnd = !headStale(B, clock(), cfg.maxHeadAgeSec);
+  if (!freshAtEnd)
+    alerts.push({
+      key: "stale-at-end",
+      text: `unknown: block ${B.number} is older than ${cfg.maxHeadAgeSec} s by the end of the round`,
+    });
   report.clear =
+    freshAtEnd &&
     id.ok &&
     inventoryOk &&
     recentOk &&

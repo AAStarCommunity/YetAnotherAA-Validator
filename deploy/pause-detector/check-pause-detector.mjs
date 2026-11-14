@@ -7,6 +7,7 @@
 // its own control cells prove the scanner sees one when it is there.
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -47,7 +48,13 @@ import {
   MESSAGE_CHARS,
   rpcTransport,
 } from "./run.mjs";
-import { bundleProblems, launchProblems, readOwnJson, symlinkProblems } from "./lib/guard.mjs";
+import {
+  bundleProblems,
+  launchProblems,
+  readOwnJson,
+  recordStop,
+  symlinkProblems,
+} from "./lib/guard.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
 
@@ -1315,6 +1322,56 @@ await cell(
         alerts.some(a => a.key === "identity" && /SuperPaymaster proxy/.test(a.text)),
       alerts.map(a => a.text).join("; ")
     );
+  }
+);
+
+await cell(
+  "round: a head fresh at the start but stale by the end of a long round is not clear (Codex R16 P1-2)",
+  async () => {
+    const cfg = cfgOf();
+    const w = world({ headAgeSec: 1790 });
+    w.nowMs = 1e12;
+    let calls = 0;
+    // the first look (accepting B) is at the start; every later one is 20 s on: 1810 s > 1800
+    const clock = () => (calls++ === 0 ? 1e12 : 1e12 + 20_000);
+    const r = await runRound(emptyState(cfg), { chain: fakeChain(w), cfg, now: 1e12, clock });
+    assert(
+      !r.report.clear && r.alerts.some(a => a.key === "stale-at-end"),
+      r.alerts.map(a => a.key).join(",")
+    );
+    // control: the same round with a clock that does not move reads clear
+    const c = await runRound(emptyState(cfg), {
+      chain: fakeChain(w),
+      cfg,
+      now: 1e12,
+      clock: () => 1e12,
+    });
+    assert(c.report.clear, "control: not clear");
+  }
+);
+await cell(
+  "files: recordStop writes only into our own real state directory (Codex R16 P1-1)",
+  () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "pd-rs-")));
+    try {
+      const d = join(home, ".aoa-pause-detector");
+      mkdirSync(d, { mode: 0o700 });
+      const elsewhere = join(home, "elsewhere");
+      mkdirSync(elsewhere);
+      symlinkSync(elsewhere, join(d, "state"));
+      recordStop(home, "x");
+      assert(
+        !existsSync(join(elsewhere, "status.json")),
+        "wrote through a symlinked state directory"
+      );
+      rmSync(join(d, "state"));
+      mkdirSync(join(d, "state"), { mode: 0o700 });
+      recordStop(home, "stopped for a reason");
+      const j = JSON.parse(readFileSync(join(d, "state", "status.json"), "utf8"));
+      assert(j.clear === false && j.startup === "stopped for a reason", "control: not written");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   }
 );
 

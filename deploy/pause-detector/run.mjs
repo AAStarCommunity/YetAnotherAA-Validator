@@ -350,12 +350,15 @@ export async function main() {
   // one instance: a listening socket on 127.0.0.1:lockPort, taken first; the kernel frees it
   const lockServer = createServer();
   const locked = await new Promise(resolve => {
-    lockServer.once("error", () => resolve(false));
+    lockServer.once("error", e => resolve(e?.code === "EADDRINUSE" ? "busy" : safeText("lock", e)));
     lockServer.listen({ host: "127.0.0.1", port: cfg.lockPort, exclusive: true }, () =>
       resolve(true)
     );
   });
-  if (!locked) die(75, `another run holds the lock (127.0.0.1:${cfg.lockPort})`);
+  // only real contention is the lock loser (exit 75, no status); any other socket error is a stop
+  // that says so (Codex R16 P2-3)
+  if (locked === "busy") die(75, `another run holds the lock (127.0.0.1:${cfg.lockPort})`);
+  if (locked !== true) die(1, `the lock socket cannot be opened (${locked})`);
 
   const statusPath = join(stateDir, "status.json");
   const statePath = join(stateDir, "state.json");
@@ -443,7 +446,7 @@ export async function main() {
     const now = Date.now();
     let result;
     try {
-      result = await runRound(st, { chain, cfg });
+      result = await runRound(st, { chain, cfg, now, clock: () => Date.now() });
     } catch (e) {
       result = {
         alerts: [{ key: "round", text: `unknown: the round stopped (${safeText("round", e)})` }],

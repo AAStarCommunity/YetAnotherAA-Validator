@@ -374,8 +374,8 @@ export function detectorFresh(text, now, maxAgeMs = 2 * 3600_000 + 600_000) {
   if (typeof j.startup === "string")
     return { problems: [`the detector's last run failed at startup: ${j.startup}`], note: "" };
   const n = Array.isArray(j.alerts) ? j.alerts.length : 0;
-  if (n > 0 && j.delivery?.ok !== true)
-    return { problems: [`the last round's ${n} alert(s) were not delivered`], note: "" };
+  if ((n > 0 && j.delivery?.ok !== true) || j.delivery?.ok === false)
+    return { problems: ["the last round's alerts or resolutions were not delivered"], note: "" };
   if (j.clear === true) {
     const ts = Number(j.report?.block?.timestamp);
     if (!Number.isSafeInteger(ts) || now - ts * 1000 > maxAgeMs)
