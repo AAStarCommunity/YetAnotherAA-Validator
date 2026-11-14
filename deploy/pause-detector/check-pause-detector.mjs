@@ -616,7 +616,7 @@ await cell(
   }
 );
 await cell(
-  "round: an operator configured after finalized (cursor, B] is read this round, not persisted",
+  "round: an operator configured after finalized (cursor, B] is read and kept (the inventory only grows)",
   async () => {
     const w = world();
     w.ops[OP2.toLowerCase()] = {
@@ -631,10 +631,8 @@ await cell(
       alerts.some(a => a.key === `actionable:${ethers.getAddress(OP2)}`),
       "recent operator not read"
     );
-    assert(
-      st.operators[ethers.getAddress(OP2)] === undefined,
-      "recent operator persisted before finality"
-    );
+    // the inventory only grows (Codex R9): seen once, read every round from now on
+    assert(st.operators[ethers.getAddress(OP2)] === 280, "a seen operator was not persisted");
   }
 );
 await cell(
@@ -823,7 +821,7 @@ await cell(
       "the omitted operator was not read"
     );
     assert(
-      alerts.some(a => /block 280 differ/.test(a.text)) && !report.clear,
+      alerts.some(a => /block\(s\) 280 differ/.test(a.text)) && !report.clear,
       alerts.map(a => a.text).join("; ")
     );
   }
@@ -843,7 +841,7 @@ await cell("round: B == finalized == cursor still asks B by hash and compares", 
     "B's by-hash operator dropped"
   );
   assert(
-    !report.clear && alerts.some(a => /block 250 differ/.test(a.text)),
+    !report.clear && alerts.some(a => /block\(s\) 250 differ/.test(a.text)),
     alerts.map(a => a.text).join("; ")
   );
 });
@@ -935,6 +933,48 @@ await cell(
     assert(
       r2.alerts.some(a => a.key === `actionable:${ethers.getAddress(OP2)}`) && !r2.report.clear,
       "no PAUSE NEEDED after recovery"
+    );
+  }
+);
+
+await cell(
+  "round: a disputed block stays disputed across finalization until by-hash and by-range agree (Codex R9 P1)",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 20000 });
+    const st = { ...emptyState(cfg), lastFullScan: 1e12 };
+    const w = world({ latest: 300, finalized: 250, rangeHides: new Set([290]) });
+    // a staked operator, so "clear" is a real claim once the dispute resolves
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 500n,
+      logBlock: 290,
+    };
+    const r1 = await round(w, cfg, st, 1e12 + 1000);
+    assert(
+      !r1.report.clear && st.disputed["290"],
+      `round 1: clear=${r1.report.clear} disputed=${JSON.stringify(st.disputed)}`
+    );
+    assert(st.operators[ethers.getAddress(OP2)] === 290, "the hash-only operator was not kept");
+    // block 290 is now finalized; the range backend STILL omits it: not clear, still disputed
+    Object.assign(w, { latest: 600, finalized: 550 });
+    const r2 = await round(w, cfg, st, 1e12 + 2000);
+    assert(
+      !r2.report.clear && st.disputed["290"],
+      `round 2: clear=${r2.report.clear} disputed=${JSON.stringify(st.disputed)}`
+    );
+    assert(
+      r2.report.operators.some(o => o.operator === ethers.getAddress(OP2)),
+      "the operator disappeared"
+    );
+    // control: the range backend recovers; the dispute is released and the round is clear
+    w.rangeHides = new Set();
+    Object.assign(w, { latest: 601, finalized: 551 });
+    const r3 = await round(w, cfg, st, 1e12 + 3000);
+    assert(
+      r3.report.clear && Object.keys(st.disputed).length === 0,
+      `round 3: clear=${r3.report.clear} disputed=${JSON.stringify(st.disputed)} ${r3.alerts.map(a => a.text).join("; ")}`
     );
   }
 );

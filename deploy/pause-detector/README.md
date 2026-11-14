@@ -143,6 +143,15 @@ a missed one.
      a block's by-hash answer differs from its number-range answer, the round is
      unknown. This runs every round, even when the cursor has reached B, so a
      lagging range backend that omits a log is caught.
+   - **Disputed blocks.** A block whose two answers differ is recorded in the
+     state (`disputed`, block → hash) and the cursor moves back before it. Every
+     later round asks it again, by hash and by range, across finalization. The
+     round stays unknown until both answers agree. A disputed block that left
+     the canonical chain is released (Codex R8, R9).
+   - **The inventory only grows.** Every operator seen by range or by hash is
+     kept, whatever else failed that round. So an incomplete later answer cannot
+     make one disappear. One that is not real costs a read and reads
+     `not-configured`, never a false clear.
    - A latest block below the finalized block or the cursor (a lagging backend),
      or a height that is not a safe integer, stops the round. Range construction
      is bounded.

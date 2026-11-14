@@ -76,7 +76,8 @@ export function emptyState({ chainId, spProxy, startBlock }) {
     startBlock,
     cursor: startBlock - 1, // last block whose OperatorConfigured logs are in the inventory
     lastFullScan: 0, // ms of the last successful rescan from startBlock (daily)
-    operators: {}, // checksummed addr -> first block seen
+    operators: {}, // checksummed addr -> first block seen (only ever grows: a superset is safe)
+    disputed: {}, // block -> hash: blocks whose by-hash and by-range answers differed, until they agree
     alerts: {}, // key -> last alert time (ms)
   };
 }
@@ -110,6 +111,13 @@ export function stateProblems(st, cfg) {
         break;
       }
     }
+  if (!plainObject(st.disputed)) p.push("the state's disputed is not a plain map");
+  else if (
+    Object.entries(st.disputed).some(
+      ([k, v]) => !/^[0-9]+$/.test(k) || Number(k) < st.startBlock || !HASH32.test(String(v))
+    )
+  )
+    p.push("the state's disputed has an entry that is not <block>: <hash>");
   if (!plainObject(st.alerts)) p.push("the state's alerts is not a plain map");
   else if (Object.values(st.alerts).some(v => !Number.isFinite(v)))
     p.push("the state's alerts has a time that is not a number");
@@ -420,7 +428,14 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
   //    - every block above finalized, and B itself, is asked for its logs BY HASH (EIP-234). Those
   //      operators count, and the number-range answer for each such block must say the same: a
   //      lagging or forked range backend that omits a log is caught (Codex R3 P1-2).
-  const recent = new Set();
+  // every operator seen this round by range or by hash, with its block; ALL are persisted after the
+  // round: an inventory that only grows cannot lose one an incomplete answer later omits (Codex R9
+  // P1). One that is not real costs a read and reads "not-configured", never a false clear.
+  const recent = new Map();
+  const saw = (op, n) => {
+    if (!recent.has(op)) recent.set(op, n);
+  };
+  const mismatched = [];
   let recentOk = true;
   try {
     if (B.number - finalized > MAX_UNFINALIZED)
@@ -448,13 +463,37 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
         cfg.logChunk,
         (logs, b, a) => {
           byRange(logs, a, b);
-          for (const lg of logs) recent.add(opOf(lg.topics[1]));
+          for (const lg of logs) saw(opOf(lg.topics[1]), Number(lg.blockNumber));
         },
         canon
       );
+    // blocks disputed in an earlier round (Codex R9 P1): released only when their by-hash and
+    // by-range answers agree; one that left the canonical chain is released (its operators were
+    // persisted when seen). Those above finalized are checked below with the others.
+    for (const k of Object.keys(st.disputed)) {
+      const n = Number(k);
+      if (n > finalized) continue;
+      if (lc(await canon(n)) !== lc(st.disputed[k])) {
+        delete st.disputed[k];
+        continue;
+      }
+      hashes.set(n, st.disputed[k]);
+      if (!covered.some(([a, b]) => n >= a && n <= b))
+        await operatorLogs(
+          chain,
+          st.spProxy,
+          n,
+          n,
+          cfg.logChunk,
+          (logs, b, a) => byRange(logs, a, b),
+          canon
+        );
+    }
     const byHashBlocks = [];
     for (let n = finalized + 1; n <= B.number; n++) byHashBlocks.push(n);
     if (!byHashBlocks.includes(B.number)) byHashBlocks.push(B.number);
+    for (const k of Object.keys(st.disputed))
+      if (Number(k) <= finalized) byHashBlocks.push(Number(k));
     for (const n of byHashBlocks) {
       const logs = await chain.getLogs({
         address: st.spProxy,
@@ -463,20 +502,28 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
       });
       await checkLogs(logs, st.spProxy, n, n, canon);
       const mine = new Set(logs.map(lg => opOf(lg.topics[1])));
-      for (const op of mine) recent.add(op);
+      for (const op of mine) saw(op, n);
       // only a block some range answer of this round covered can be compared; one no range
       // answer covered is already unknown through the failed scan
       if (covered.some(([a, b]) => n >= a && n <= b)) {
         const theirs = rangeOps.get(n) ?? new Set();
         if ([...mine].sort().join() !== [...theirs].sort().join()) {
-          // the range answer for n is not trusted: move the cursor back so the next round reads
-          // n again by range (and by hash, if still above finalized), instead of passing it by
-          // (Codex R8 P1-1)
+          // the range answer for n is not trusted: remember the block, and move the cursor back
+          // so the next round reads it again by range (Codex R8 P1-1, R9 P1)
+          const key = String(n);
+          st.disputed[key] = hashes.get(n);
           if (st.cursor >= n) st.cursor = n - 1;
-          throw new SafeError(`the backend's logs for block ${n} differ by hash and by range`);
+          mismatched.push(n);
+        } else {
+          const key = String(n);
+          delete st.disputed[key];
         }
       }
     }
+    if (mismatched.length)
+      throw new SafeError(
+        `the backend's logs for block(s) ${mismatched.join(", ")} differ by hash and by range`
+      );
   } catch (e) {
     recentOk = false;
     alerts.push({
@@ -485,8 +532,11 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
     });
   }
 
+  // the inventory only grows: every operator seen this round, whatever else failed
+  for (const [op, n] of recent) st.operators[op] ??= n;
+
   // 5. every operator at B
-  const ops = [...new Set([...Object.keys(st.operators), ...recent])].sort();
+  const ops = Object.keys(st.operators).sort();
   const results = [];
   for (const op of ops) results.push({ operator: op, ...(await operatorAt(chain, B, cfg, op)) });
 
