@@ -1998,6 +1998,29 @@ await cell(
   }
 );
 
+await cell(
+  "dead-man: a gap between completed rounds is reported once from the heartbeat, even after a lost queue (Codex dm-R4 P1)",
+  () => {
+    const T = 1e12;
+    const iso = ms => new Date(ms).toISOString();
+    // rounds resumed a minute ago after 5 h of silence; the dead-man's state was rolled back (no
+    // record of having alerted): the gap is still reported
+    const hb = {
+      schema: "aoa-pause-detector-heartbeat/1",
+      at: iso(T - 60_000),
+      prevAt: iso(T - 60_000 - 5 * 3600_000),
+    };
+    const a = deadmanDecision(hb, T, {});
+    assert(!a.silent && /no successful round from .* \(300 min\)/.test(a.message ?? ""), a.message);
+    // the next run, with that recorded, says nothing more
+    const b = deadmanDecision(hb, T + 900_000, a.next);
+    assert(b.message === null, `reported twice: ${b.message}`);
+    // control: a normal hourly gap is not reported
+    const c = deadmanDecision({ ...hb, prevAt: iso(T - 60_000 - 3600_000) }, T, {});
+    assert(c.message === null, `an hourly gap reported: ${c.message}`);
+  }
+);
+
 // ---------------------------------------------------------------- dead-man (DSR)
 
 await cell("dead-man: the decision (alive, silent, re-alert, resume, missing, future)", () => {

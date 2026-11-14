@@ -483,14 +483,25 @@ export async function main() {
     });
     // the heartbeat the dead-man check reads (DSR): written only by a COMPLETED round (no throw, B
     // still canonical), clear or not; a run that never gets here leaves it to age
-    if (result.report?.canonical === true)
+    if (result.report?.canonical === true) {
+      // prevAt: the previous completed round, so a gap is visible in the heartbeat itself even if
+      // the dead-man's own record of it was lost (no fsync under the permission model; Codex dm-R4)
+      let prevAt = null;
+      try {
+        const old = readOwnJson(join(stateDir, "heartbeat.json"), "heartbeat");
+        if (typeof old?.at === "string") prevAt = old.at;
+      } catch {
+        prevAt = null;
+      }
       writeDurable(join(stateDir, "heartbeat.json"), {
         schema: "aoa-pause-detector-heartbeat/1",
         // when the round COMPLETED, not when it started (Codex dm-R1 P2)
         at: new Date().toISOString(),
+        prevAt,
         block: result.report.block?.number ?? null,
         clear: result.report.clear === true,
       });
+    }
     return result.alerts.length || !delivery.ok ? 1 : 0;
   } catch (e) {
     await fatal(1, safeText("startup", e));

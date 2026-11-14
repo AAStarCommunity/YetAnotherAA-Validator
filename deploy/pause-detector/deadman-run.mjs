@@ -45,14 +45,34 @@ export function deadmanDecision(hb, now, st) {
       message: due
         ? `DEAD-MAN: the pause detector has had no successful round for more than 2 h (${since}). Check the job (launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector) and its status.json.`
         : null,
-      next: { alerting: true, lastSent: due ? now : lastSent },
+      next: {
+        alerting: true,
+        lastSent: due ? now : lastSent,
+        gapReported: st?.gapReported ?? null,
+      },
     };
   }
+  // a gap between the last two completed rounds longer than the deadline is reported once, from the
+  // heartbeat itself: if a host crash lost this run's queued outage alert (no fsync under the
+  // permission model), the outage is still reported when rounds resume (Codex dm-R4 P1)
+  const prev = Date.parse(hb?.prevAt);
+  const gap = Number.isFinite(prev) ? at - prev : 0;
+  const gapNew = gap > MAX_SILENCE_MS && st?.gapReported !== hb.prevAt;
+  const msgs = [];
+  if (alerting) msgs.push("DEAD-MAN: the pause detector's rounds have resumed.");
+  if (gapNew)
+    msgs.push(
+      `DEAD-MAN: the pause detector had no successful round from ${hb.prevAt} to ${hb.at} (${Math.round(gap / 60_000)} min).`
+    );
   return {
     silent,
     ageMs,
-    message: alerting ? "DEAD-MAN: the pause detector's rounds have resumed." : null,
-    next: { alerting: false, lastSent },
+    message: msgs.length ? msgs.join(" ") : null,
+    next: {
+      alerting: false,
+      lastSent,
+      gapReported: gapNew ? hb.prevAt : (st?.gapReported ?? null),
+    },
   };
 }
 

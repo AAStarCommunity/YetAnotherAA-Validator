@@ -279,6 +279,18 @@ unrelated process. So a **separate** launchd job watches it:
   future counts as silence. It sends one `rounds resumed` notice when the
   heartbeat is fresh again. An alert that was not delivered is retried at the
   next run.
+- **No message lost silently.**
+  - Undelivered messages are queued in the dead-man's state, written **before**
+    each delivery attempt and emptied only once Telegram accepted them.
+  - A long queue is compacted, never truncated: it keeps the first outage, a
+    count of what was folded, and the latest messages.
+  - An existing state that cannot be read stops the run visibly, and the file is
+    left as it is.
+- **A host crash** (no fsync under the permission model) can still roll back the
+  queue. So the heartbeat also carries `prevAt`, the previous completed round.
+  When rounds resume after a gap of more than 2 h, the dead-man reports that gap
+  once, from the heartbeat itself. An outage is therefore reported even if its
+  queued alert was lost; the worst case is a duplicate (Codex dm-R4).
 - **Confinement.** It runs from the same bundle, under the same permission
   model, with the same startup guards as the detector. It reads
   `~/.aoa-pause-detector` and writes **only** `~/.aoa-pause-detector/deadman`,
