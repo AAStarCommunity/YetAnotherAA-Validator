@@ -41,5 +41,17 @@ const first = [
 if (first.length) refuse(first);
 const tree = [...symlinkProblems(d), ...bundleProblems(join(d, "app"))];
 if (tree.length) refuse(tree);
+// from here on nothing dies silently (DSR): an uncaught exception or rejection is recorded as a stop
+// (its code or class only, never its message, which may carry a URL) and the process exits non-zero
+const crashed = e => {
+  const what =
+    typeof e?.code === "string" ? e.code : typeof e?.name === "string" ? e.name : "error";
+  const text = `uncaught ${what}`;
+  console.error(`pause-detector: ${text}`);
+  recordStop(home, text);
+  process.exit(1);
+};
+process.on("uncaughtException", crashed);
+process.on("unhandledRejection", crashed);
 const { main } = await import("./run.mjs");
 process.exit(await main());

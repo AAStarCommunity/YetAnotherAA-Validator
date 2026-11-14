@@ -43,7 +43,11 @@ if (existsSync(out)) die("the output exists; a bundle is written once, into a ne
 
 // 1. the detector's own modules, by the scan's walk; the scan must be clean
 const seen = new Set();
-const problems = scanTree(join(HERE, "detector.mjs"), undefined, seen);
+// both entries: the detector and its dead-man check
+const problems = [
+  ...scanTree(join(HERE, "detector.mjs"), undefined, seen),
+  ...scanTree(join(HERE, "deadman.mjs"), undefined, seen),
+];
 if (problems.length) die(`the no-signing scan fails: ${problems.slice(0, 3).join("; ")}`);
 const own = [...seen].map(f => relative(REPO, f));
 own.push("deploy/pause-job/sp-pin.json");

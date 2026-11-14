@@ -75,7 +75,8 @@ export const FORBIDDEN_NAMES = new Set([
 ]);
 // globals the detector may use, and only these members of them, never computed or aliased
 export const GLOBALS_OK = new Map([
-  ["process", new Set(["argv", "env", "execArgv", "exit", "getuid", "pid", "permission"])],
+  // `on`: the entries' uncaught-exception recorders (DSR: nothing dies silently)
+  ["process", new Set(["argv", "env", "execArgv", "exit", "getuid", "on", "pid", "permission"])],
   ["console", new Set(["log", "error"])],
 ]);
 // text in string literals and template parts
@@ -102,6 +103,10 @@ export const NODE_OK = new Map([
   ["node:net", new Set(["createServer"])], // the instance lock only
   ["node:crypto", new Set(["createHash"])], // the bundle manifest's sha256 only
 ]);
+const DYNAMIC_OK = [
+  ["/deploy/pause-detector/detector.mjs", "./run.mjs"],
+  ["/deploy/pause-detector/deadman.mjs", "./deadman-run.mjs"],
+];
 const GUARDED_OBJECTS = new Set(["process", "ethers", "Object", "console"]);
 const TELEGRAM = "https://api.telegram.org/bot";
 
@@ -158,12 +163,12 @@ export function scanSource(path, text, onImport = () => {}) {
       case "ImportExpression":
         // exactly one is allowed: the entry's import of run.mjs AFTER its guards (Codex R7 P1-2);
         // it is followed like a static import
+        // (and the dead-man entry's import of deadman-run.mjs, likewise after its guards)
         if (
-          path.endsWith("/deploy/pause-detector/detector.mjs") &&
           node.source.type === "Literal" &&
-          node.source.value === "./run.mjs"
+          DYNAMIC_OK.some(([f, spec]) => path.endsWith(f) && node.source.value === spec)
         )
-          onImport("./run.mjs");
+          onImport(node.source.value);
         else p.push(`${at(node)}: a dynamic import`);
         break;
       case "Identifier":

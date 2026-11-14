@@ -57,6 +57,7 @@ import {
 } from "./lib/guard.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
+import { deadmanDecision, MAX_SILENCE_MS, REALERT_MS } from "./deadman-run.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let pass = 0;
@@ -1865,7 +1866,7 @@ const runBundleAgainst = async (age, fn) => {
       );
       const r = await runDetectorAsync(h);
       const status = JSON.parse(readFileSync(join(h.d, "state", "status.json"), "utf8"));
-      fn(r, status);
+      fn(r, status, h);
     });
   } finally {
     srv.close();
@@ -1874,7 +1875,11 @@ const runBundleAgainst = async (age, fn) => {
 await cell(
   "provider: a frozen head (a week old) on both providers ends the run unknown, never clear (clestons #434 B1, end to end)",
   async () =>
-    runBundleAgainst(7 * 86400, (r, status) => {
+    runBundleAgainst(7 * 86400, (r, status, h) => {
+      assert(
+        !existsSync(join(h.d, "state", "heartbeat.json")),
+        "a run on a frozen head wrote a heartbeat"
+      );
       assert(r.status !== 0 && status.clear === false, `exit ${r.status}, clear ${status.clear}`);
       assert(
         /no RPC provider has a fresh head \(stale: alchemy, infura/.test(status.startup ?? ""),
@@ -1885,13 +1890,174 @@ await cell(
 await cell(
   "provider: CONTROL a fresh head gets past the probe (and fails later, unknown, on the missing reads)",
   async () =>
-    runBundleAgainst(5, (r, status) => {
+    runBundleAgainst(5, (r, status, h) => {
+      // a completed round, even one that reads unknown, is proof of life for the dead-man
+      assert(
+        existsSync(join(h.d, "state", "heartbeat.json")),
+        "a completed round wrote no heartbeat"
+      );
       assert(
         status.clear === false && !/fresh head/.test(JSON.stringify(status)),
         JSON.stringify(status).slice(0, 300)
       );
     })
 );
+// ---------------------------------------------------------------- dead-man (DSR)
+
+await cell("dead-man: the decision (alive, silent, re-alert, resume, missing, future)", () => {
+  const T = 1e12;
+  const hb = msAgo => ({
+    schema: "aoa-pause-detector-heartbeat/1",
+    at: new Date(T - msAgo).toISOString(),
+  });
+  const fresh = deadmanDecision(hb(3600_000), T, {});
+  assert(!fresh.silent && fresh.message === null, "a 1 h old heartbeat is not alive");
+  const edge = deadmanDecision(hb(MAX_SILENCE_MS), T, {});
+  assert(!edge.silent, "exactly 2 h is still alive (control)");
+  const late = deadmanDecision(hb(MAX_SILENCE_MS + 1000), T, {});
+  assert(
+    late.silent && /no successful round for more than 2 h/.test(late.message) && late.next.alerting,
+    "not alerted"
+  );
+  const again = deadmanDecision(hb(MAX_SILENCE_MS + 2000), T, {
+    alerting: true,
+    lastSent: T - 1000,
+  });
+  assert(again.silent && again.message === null, "re-alerted too soon");
+  const later = deadmanDecision(hb(MAX_SILENCE_MS + 2000), T, {
+    alerting: true,
+    lastSent: T - REALERT_MS,
+  });
+  assert(later.message !== null, "not re-alerted after REALERT_MS");
+  const back = deadmanDecision(hb(60_000), T, { alerting: true, lastSent: T - 1000 });
+  assert(
+    !back.silent && /resumed/.test(back.message) && back.next.alerting === false,
+    "no resume notice"
+  );
+  for (const h of [null, {}, { schema: "x", at: new Date(T).toISOString() }, hb(-600_000)])
+    assert(deadmanDecision(h, T, {}).silent, `alive on ${JSON.stringify(h)}`);
+});
+await cell(
+  "dead-man: launchProblems accepts only the dead-man's own launch (writes deadman/, runs deadman.mjs)",
+  () => {
+    const H = "/Users/u";
+    const d = `${H}/.aoa-pause-detector`;
+    const base = {
+      home: H,
+      args: ["--config", `${d}/config.json`],
+      envNames: ["PATH", "HOME"],
+      entry: "deadman",
+    };
+    const ok = ["--permission", `--allow-fs-read=${d}`, `--allow-fs-write=${d}/deadman`];
+    assert(
+      launchProblems({
+        ...base,
+        execArgv: ok,
+        script: `${d}/app/deploy/pause-detector/deadman.mjs`,
+      }).length === 0,
+      "control"
+    );
+    assert(
+      launchProblems({
+        ...base,
+        execArgv: [ok[0], ok[1], `--allow-fs-write=${d}/state`],
+        script: `${d}/app/deploy/pause-detector/deadman.mjs`,
+      }).length > 0,
+      "may write the detector's state"
+    );
+    assert(
+      launchProblems({
+        ...base,
+        execArgv: ok,
+        script: `${d}/app/deploy/pause-detector/detector.mjs`,
+      }).length > 0,
+      "runs the detector"
+    );
+  }
+);
+await cell("dead-man: the bundle carries both entries and the scan covers deadman.mjs", () =>
+  withHome(({ app }) => {
+    const man = JSON.parse(readFileSync(join(app, "MANIFEST.json"), "utf8"));
+    for (const f of ["deploy/pause-detector/deadman.mjs", "deploy/pause-detector/deadman-run.mjs"])
+      assert(f in man.files, `${f} not bundled`);
+    const p = scanTree(join(HERE, "deadman.mjs"));
+    assert(p.length === 0, p.join("; "));
+  })
+);
+await cell("dead-man: the plist runs the dead-man every 15 minutes, exactly", () => {
+  const x = readFileSync(join(HERE, "io.aastar.dvt-pause-detector-deadman.plist"), "utf8");
+  const args = [
+    ...x
+      .match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)[1]
+      .matchAll(/<string>([^<]*)<\/string>/g),
+  ].map(m => m[1]);
+  assert(
+    args.join("\n") ===
+      [
+        "__HOME__/.local/keeper-node/node-v24.21.0/bin/node",
+        "--permission",
+        "--allow-fs-read=__HOME__/.aoa-pause-detector",
+        "--allow-fs-write=__HOME__/.aoa-pause-detector/deadman",
+        "__HOME__/.aoa-pause-detector/app/deploy/pause-detector/deadman.mjs",
+        "--config",
+        "__HOME__/.aoa-pause-detector/config.json",
+      ].join("\n"),
+    args.join(" ")
+  );
+  assert(/<key>StartInterval<\/key>\s*<integer>900<\/integer>/.test(x), "not every 15 min");
+  assert(/<string>io\.aastar\.dvt-pause-detector-deadman<\/string>/.test(x), "label");
+});
+await cell(
+  "dead-man: end to end, launched as its plist does: no heartbeat is silent; a fresh one is alive",
+  () =>
+    withHome(({ home, d }) => {
+      mkdirSync(join(d, "deadman"), { mode: 0o700 });
+      writeFileSync(join(d, "config.json"), JSON.stringify({ chainId: 11155111, telegram: null }), {
+        mode: 0o600,
+      });
+      const run = () =>
+        spawnSync(
+          process.execPath,
+          [
+            PERM_FLAG,
+            `--allow-fs-read=${d}`,
+            `--allow-fs-write=${join(d, "deadman")}`,
+            join(d, "app/deploy/pause-detector/deadman.mjs"),
+            "--config",
+            join(d, "config.json"),
+          ],
+          { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+        );
+      const status = () => JSON.parse(readFileSync(join(d, "deadman", "status.json"), "utf8"));
+      const r1 = run();
+      assert(
+        r1.status === 1 && status().silent === true && /DEAD-MAN/.test(r1.stderr),
+        `no heartbeat: ${r1.status} ${r1.stderr}`
+      );
+      // a heartbeat a minute old, written as the detector writes it
+      writeFileSync(
+        join(d, "state", "heartbeat.json"),
+        JSON.stringify({
+          schema: "aoa-pause-detector-heartbeat/1",
+          at: new Date(Date.now() - 60_000).toISOString(),
+          block: 1,
+          clear: true,
+        }),
+        { mode: 0o600 }
+      );
+      const r2 = run();
+      assert(
+        r2.status === 0 && status().silent === false,
+        `fresh heartbeat: ${r2.status} ${r2.stderr}`
+      );
+      // and it may not write the detector's state (the grant is deadman/ only)
+      assert(
+        !existsSync(join(d, "state", "status.json")),
+        "the dead-man wrote the detector's status"
+      );
+    })
+);
+
 await cell("permission: detector.mjs refuses to start outside the permission model", () =>
   withHome(({ home, d }) => {
     const r = spawnSync(

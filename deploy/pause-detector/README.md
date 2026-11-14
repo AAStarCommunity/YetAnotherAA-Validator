@@ -257,10 +257,37 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   a failed startup. The only exception is a second instance that loses the lock;
   the run holding the lock writes its own status. The same goes for a round
   whose alerts were not delivered.
-  - **Follow-up.** Nothing yet runs preflight on a schedule. Until a dead-man
-    check exists, a detector that no longer starts at all (an unloaded plist, a
-    missing node) shows only as a stale `status.json` the next time someone runs
-    preflight.
+- **Uncaught exceptions** and rejections, once the entry's guards have passed,
+  are recorded as a stop too, then the process exits non-zero. Only the error's
+  code or class is recorded, never its message, which may carry a URL.
+
+## Dead-man (DSR: required before this is rc.8's pause path)
+
+A detector that stops silently gives no signal at all. That covers an unloaded
+plist, a missing node, a hang, a crash before the guards, and a lock held by an
+unrelated process. So a **separate** launchd job watches it:
+`io.aastar.dvt-pause-detector-deadman`, every 15 minutes (`deadman.mjs`).
+
+- **Heartbeat.** Every **completed** round writes
+  `state/heartbeat.json { at, block, clear }`. A completed round means no throw
+  and B still canonical, whether or not it reads clear. A round that reads
+  unknown still alerts on its own, so the heartbeat only answers "is the
+  detector running rounds at all".
+- **Check.** The dead-man reads only that timestamp. With no completed round for
+  more than **2 hours**, it alerts via aastar-monitor, repeating every 6 hours
+  while that lasts. A missing heartbeat, an unreadable one or one dated in the
+  future counts as silence. It sends one `rounds resumed` notice when the
+  heartbeat is fresh again. An alert that was not delivered is retried at the
+  next run.
+- **Confinement.** It runs from the same bundle, under the same permission
+  model, with the same startup guards as the detector. It reads
+  `~/.aoa-pause-detector` and writes **only** `~/.aoa-pause-detector/deadman`,
+  its own state and `status.json`. It reads no chain and holds no key.
+- **Preflight** checks that it is loaded with exactly its plist's arguments
+  (`deadman-args`). It also checks its own `status.json`
+  (`pause-detector-deadman`): written within three of its intervals, not a stop,
+  the detector reported alive, and nothing undelivered. A dead-man that is not
+  running is as silent as the detector it watches.
 
 ## Files
 
@@ -270,6 +297,8 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
 - `run.mjs`: config, lock, secrets, the read-only RPC client, delivery,
   `status.json`.
 - `lib/detect.mjs`: the round. It does no I/O; the chain is injected.
+- `deadman.mjs`, `deadman-run.mjs`: the dead-man check's entry (the same guards)
+  and its run.
 - `bundle.mjs`: builds the bundle and its manifest. It is a deploy tool, never
   in the bundle.
 - `check-pause-detector.mjs`: the CI cells (`npm run check:pause-detector`).
@@ -343,10 +372,14 @@ secret-file reader, called with the detector's own name table) and
    shows 3600. The plist needs the pinned node at
    `~/.local/keeper-node/node-v24.21.0` (installed and verified on the Mini,
    11-14).
+   - Then the dead-man: `mkdir -m 700 ~/.aoa-pause-detector/deadman`, render and
+     load `io.aastar.dvt-pause-detector-deadman.plist`, and check that its run
+     interval is 900.
 7. Run `node deploy/pause-job/preflight.mjs`. It checks:
-   - **launchd-on**: the detector and the price keeper are loaded; the committee
-     keeper, apply-rotation and the D2 pause job are not; no other loaded job
-     runs a DVT sender;
+   - **launchd-on**: the detector, its dead-man and the price keeper are loaded;
+     the committee keeper, apply-rotation and the D2 pause job are not; no other
+     loaded job runs a DVT sender;
+   - **deadman-args** and **pause-detector-deadman**: see "Dead-man" above;
    - **detector-args**: the loaded detector runs exactly the pinned node,
      `--permission`, the one read, the one write and the bundle's entry, with no
      injecting variable;

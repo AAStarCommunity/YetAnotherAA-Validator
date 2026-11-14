@@ -481,6 +481,15 @@ export async function main() {
       alerts: result.alerts.map(a => a.text),
       delivery,
     });
+    // the heartbeat the dead-man check reads (DSR): written only by a COMPLETED round (no throw, B
+    // still canonical), clear or not; a run that never gets here leaves it to age
+    if (result.report?.canonical === true)
+      writeDurable(join(stateDir, "heartbeat.json"), {
+        schema: "aoa-pause-detector-heartbeat/1",
+        at: new Date(now).toISOString(),
+        block: result.report.block?.number ?? null,
+        clear: result.report.clear === true,
+      });
     return result.alerts.length || !delivery.ok ? 1 : 0;
   } catch (e) {
     await fatal(1, safeText("startup", e));
