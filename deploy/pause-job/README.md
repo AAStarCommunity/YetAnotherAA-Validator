@@ -191,6 +191,13 @@ over.
 
 ## Preflight (DSR 502ccd64)
 
+> **rc.8 status:** this job is retired and never deployed (DSR fae09c1e): its
+> signer was refunded and deleted. Its code stays: the pause detector
+> (`deploy/pause-detector`) reuses its read path, its secret-file reader
+> (`lib/secret-file.mjs`) and its SP pin. Preflight below now checks
+> launchd-**on** for the detector and the keeper, plus the detector's last
+> status.
+
 **What preflight is, and what it is not (clestons #432 L4).** Preflight guards
 against operator mistakes, such as a forgotten keeper still loaded or an armed
 node container. It is not a security boundary. Anything running as this account
@@ -205,10 +212,14 @@ boundary is elsewhere:
 `preflight.mjs` covers the three Phase D items that live on DVT's own host.
 Until this PR merged, they were manual items on the launch checklist.
 
-- **launchd-off**:
+- **launchd-on** (rc.8: the D2 job is retired, DSR fae09c1e; pausing is "detect,
+  then act by hand" with `deploy/pause-detector`):
   - the committee keeper is not loaded;
   - apply-rotation is not loaded;
-  - the pause job **is** loaded;
+  - this D2 pause job (`io.aastar.dvt-pause-job`) is **not** loaded;
+  - the read-only pause detector (`io.aastar.dvt-pause-detector`) **is** loaded,
+    and so is the price keeper (`io.aastar.price-keeper`, the one approved
+    sender, not scanned);
   - no other loaded job runs a DVT transaction-sending script. This is judged by
     the job's ProgramArguments, not its label: a script name anywhere in an
     argument counts, and shell wrapper scripts are read. A wrapper that cannot

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The rc.8 pause detector (README.md). Read-only: no key. It runs from its BUNDLE
+     (~/.aoa-pause-detector/app, built by bundle.mjs) under Node's permission model with the pinned
+     node (the dedicated v24.21.0, not Homebrew's, whose directories admin can write): no child
+     process, worker, addon or WASI; reads only ~/.aoa-pause-detector (never a repository checkout,
+     which may hold keys); writes only its state. detector.mjs refuses to start otherwise. This
+     guards against an accidental signing path, not a malicious dependency (README).
+     Render __HOME__ (an absolute path), then
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.aastar.dvt-pause-detector.plist
+     and check `launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector | grep "run interval"` shows
+     3600. StartInterval is a top-level key: nested inside another dict it passes plutil -lint and
+     launchd ignores it. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.aastar.dvt-pause-detector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/keeper-node/node-v24.21.0/bin/node</string>
+    <string>--permission</string>
+    <string>--allow-fs-read=__HOME__/.aoa-pause-detector</string>
+    <string>--allow-fs-write=__HOME__/.aoa-pause-detector/state</string>
+    <string>__HOME__/.aoa-pause-detector/app/deploy/pause-detector/detector.mjs</string>
+    <string>--config</string>
+    <string>__HOME__/.aoa-pause-detector/config.json</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/aoa-pause-detector.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/aoa-pause-detector.log</string>
+</dict>
+</plist>

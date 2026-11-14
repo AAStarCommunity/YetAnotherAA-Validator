@@ -4,10 +4,17 @@
 // gate cannot see. Until this PR merges they are manual launch-checklist items.
 //
 //   node deploy/pause-job/preflight.mjs [--nodes dvt-node-1,dvt-node-2,dvt-node-3]
+//                                       [--detector-status <path to the detector's status.json>]
 //
-// launchd-off   the committee keeper and apply-rotation are not loaded, the pause job IS loaded, and
-//               no other loaded job of this user runs a DVT transaction-sending script (by its
-//               ProgramArguments, not its label: a job's name is not what it runs)
+// launchd-on    (rc.8, DSR: "detect, then act by hand") the read-only pause detector and the price
+//               keeper ARE loaded; the committee keeper, apply-rotation and the retired D2 pause job
+//               are NOT; and no other loaded job of this user runs a DVT transaction-sending script
+//               (by its ProgramArguments, not its label: a job's name is not what it runs). The
+//               price keeper is the one approved sender and is not scanned; the detector is.
+// detector-args the loaded detector runs the pinned node under --permission, exactly as its plist
+// detector-bundle ~/.aoa-pause-detector/app is exactly its manifest; no symlink under the directory
+// pause-detector its last round's status.json is fresh (at most two intervals old): the trigger
+//               fired, not just the job loaded
 // node-slash-off every DVT node container has AUDIT_ENABLED and AUDIT_EXECUTE_SLASH absent or exactly
 //               "false" (the node arms only on exactly "true", src/config/configuration.ts:206/265;
 //               anything else is refused here, fail closed)
@@ -19,12 +26,26 @@ import { createHash } from "node:crypto";
 import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, posix } from "node:path";
+import {
+  DIR as DETECTOR_DIR,
+  ENV_OK as DETECTOR_ENV_OK,
+  bundleProblems as detectorBundle,
+  symlinkProblems as detectorSymlinks,
+} from "../pause-detector/lib/guard.mjs";
 
-export const PAUSE_LABEL = "io.aastar.dvt-pause-job";
-export const FORBIDDEN_LABELS = ["io.aastar.dvt-committee-keeper", "io.aastar.dvt-apply-rotation"];
+export const DETECTOR_LABEL = "io.aastar.dvt-pause-detector";
+export const KEEPER_LABEL = "io.aastar.price-keeper";
+export const REQUIRED_LABELS = [DETECTOR_LABEL, KEEPER_LABEL];
+export const FORBIDDEN_LABELS = [
+  "io.aastar.dvt-committee-keeper",
+  "io.aastar.dvt-apply-rotation",
+  // the D2 pause job is retired (DSR fae09c1e): its signer was refunded and deleted
+  "io.aastar.dvt-pause-job",
+];
 // DVT scripts that send transactions; a loaded job running any of them (other than ours) fails
 export const SENDING_SCRIPTS = [
   "committee-keeper.mjs",
+  "pause-job.mjs",
   "apply-verifier-rotation.mjs",
   "reregister-guardians.mjs",
   "register-node.mjs",
@@ -231,7 +252,7 @@ export function reviewProblems(r, plist, loaded, shaOf) {
 const asLoaded = x => (x === null || x === undefined ? null : Array.isArray(x) ? { args: x } : x);
 
 /**
- * launchd-off. `plists` maps a label to its LaunchAgents plist (parsed) or is missing it. Pure
+ * launchd-on. `plists` maps a label to its LaunchAgents plist (parsed) or is missing it. Pure
  * given the injected readers.
  */
 export function launchdOff(
@@ -244,10 +265,10 @@ export function launchdOff(
 ) {
   const p = [];
   for (const f of FORBIDDEN_LABELS) if (labels.includes(f)) p.push(`${f} is loaded`);
-  if (!labels.includes(PAUSE_LABEL)) p.push(`${PAUSE_LABEL} is not loaded`);
+  for (const q of REQUIRED_LABELS) if (!labels.includes(q)) p.push(`${q} is not loaded`);
   const cleared = new Set();
   for (const r of reviewed) {
-    if (FORBIDDEN_LABELS.includes(r.label) || r.label === PAUSE_LABEL) {
+    if (FORBIDDEN_LABELS.includes(r.label) || REQUIRED_LABELS.includes(r.label)) {
       p.push(`${r.label} cannot be a reviewed exception`);
       continue;
     }
@@ -257,7 +278,7 @@ export function launchdOff(
     else cleared.add(r.label);
   }
   for (const l of labels) {
-    if (l === PAUSE_LABEL || cleared.has(l)) continue;
+    if (l === KEEPER_LABEL || cleared.has(l)) continue;
     const loaded = asLoaded(programOf(l));
     const args = loaded?.args ?? null;
     if (args === null) {
@@ -273,6 +294,100 @@ export function launchdOff(
     }
   }
   return [...new Set(p)];
+}
+
+/** The pinned node the detector runs under (the dedicated install, not Homebrew's). */
+export const DETECTOR_NODE = ".local/keeper-node/node-v24.21.0/bin/node";
+
+/**
+ * detector-args: the LOADED detector job runs exactly
+ *   [<home>/<DETECTOR_NODE>, --permission, --allow-fs-read=<repo>,
+ *    --allow-fs-read=<home>/.aoa-pause-detector, --allow-fs-write=<home>/.aoa-pause-detector/state,
+ *    <repo>/deploy/pause-detector/detector.mjs, --config, <home>/.aoa-pause-detector/config.json]
+ * so it is under the permission model with nothing more allowed (no --allow-child-process, no
+ * wider read or write). `args` is what launchd loaded (null when unreadable). Pure.
+ */
+export function detectorArgsProblems(args, home, env = [], inherited = []) {
+  if (!Array.isArray(args)) return ["the detector's loaded arguments cannot be read"];
+  // NODE_OPTIONS=--allow-fs-read=<key> would widen the grants with the arguments unchanged
+  // (Codex R4 P1-1): no option-injecting variable, set or inherited
+  const inj = [...(env ?? []), ...(inherited ?? [])].filter(
+    n => STARTUP_ENV.test(n) || /^NODE_/.test(n)
+  );
+  if (inj.length)
+    return [`the detector's environment has option-injecting variables: ${inj.join(", ")}`];
+  // the same allowlist the detector enforces at startup (Codex R8 P1-2)
+  const extra = [...(env ?? []), ...(inherited ?? [])].filter(n => !DETECTOR_ENV_OK.has(n));
+  if (extra.length)
+    return [`the detector's environment has variables outside the allowlist: ${extra.join(", ")}`];
+  if (env === null) return ["the detector's loaded environment cannot be read"];
+  const d = `${home}/.aoa-pause-detector`;
+  // the bundle, never a repository checkout (which may hold keys; Codex R7 P1-1)
+  const want = [
+    `${home}/${DETECTOR_NODE}`,
+    "--permission",
+    `--allow-fs-read=${d}`,
+    `--allow-fs-write=${d}/state`,
+    `${d}/app/deploy/pause-detector/detector.mjs`,
+    "--config",
+    `${d}/config.json`,
+  ];
+  if (args.join("\n") !== want.join("\n"))
+    return [
+      "the detector does not run exactly as its plist: the pinned node, --permission, reads of ~/.aoa-pause-detector only, writes of its state only, from its bundle",
+    ];
+  return [];
+}
+
+/** detector-bundle: no symlink under ~/.aoa-pause-detector, and the bundle exactly its manifest. */
+export function detectorBundleItem(home) {
+  const dd = join(home, DETECTOR_DIR);
+  return [...detectorSymlinks(dd), ...detectorBundle(join(dd, "app"))];
+}
+
+/**
+ * pause-detector: the detector's last status.json (`text`, or null when missing) is fresh: written
+ * at most `maxAgeMs` before `now`, by the detector. Returns { problems, note }. Pure.
+ */
+export function detectorFresh(text, now, maxAgeMs = 2 * 3600_000 + 600_000) {
+  if (text === null) return { problems: ["the detector has written no status.json"], note: "" };
+  let j;
+  try {
+    j = JSON.parse(text);
+  } catch {
+    return { problems: ["the detector's status.json is not JSON"], note: "" };
+  }
+  if (j?.schema !== "aoa-pause-detector-status/1")
+    return { problems: ["status.json is not the detector's"], note: "" };
+  const at = Date.parse(j.at);
+  if (!Number.isFinite(at)) return { problems: ["status.json has no time"], note: "" };
+  if (now - at > maxAgeMs)
+    return {
+      problems: [`the detector's last round is ${Math.round((now - at) / 60_000)} min old`],
+      note: "",
+    };
+  // written on this host by this host's clock: any time after now is a rolled-back clock or a
+  // forged file, never fresh (Codex R1 P1-6)
+  if (at > now) return { problems: ["status.json is dated in the future"], note: "" };
+  // a fresh file is not a healthy detector (clestons #434 F2, B1): a run that failed at startup,
+  // alerts that never reached Telegram, and a "clear" read on an old head all FAIL
+  if (typeof j.startup === "string")
+    return { problems: [`the detector's last run failed at startup: ${j.startup}`], note: "" };
+  const n = Array.isArray(j.alerts) ? j.alerts.length : 0;
+  if ((n > 0 && j.delivery?.ok !== true) || j.delivery?.ok === false)
+    return { problems: ["the last round's alerts or resolutions were not delivered"], note: "" };
+  if (j.clear === true) {
+    const ts = Number(j.report?.block?.timestamp);
+    if (!Number.isSafeInteger(ts) || now - ts * 1000 > maxAgeMs)
+      return {
+        problems: ["the last round reads clear on a head that is old or undated"],
+        note: "",
+      };
+  }
+  return {
+    problems: [],
+    note: j.clear === true ? "last round clear" : `last round NOT clear (${n} alert(s))`,
+  };
 }
 
 /** node-slash-off from each container's environment (array of "K=V"). Pure. */
@@ -347,7 +462,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     .filter(Boolean);
   const results = [];
   const list = run("launchctl", ["list"]);
-  if (list === null) results.push(["launchd-off", "FAIL", ["launchctl list failed"]]);
+  if (list === null) results.push(["launchd-on", "FAIL", ["launchctl list failed"]]);
   else {
     const labels = list
       .split("\n")
@@ -395,8 +510,35 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       else plists[d.Label] = d;
     }
     const p = [...extra, ...launchdOff(labels, programOf, readText, reviewed, shaOf, plists)];
-    results.push(["launchd-off", p.length ? "FAIL" : "PASS", p]);
+    results.push(["launchd-on", p.length ? "FAIL" : "PASS", p]);
+    const dl = programOf(DETECTOR_LABEL);
+    const da = detectorArgsProblems(
+      dl?.args ?? null,
+      homedir(),
+      dl?.env ?? null,
+      dl?.inherited ?? []
+    );
+    results.push(["detector-args", da.length ? "FAIL" : "PASS", da]);
+    // the bundle is exactly its manifest and nothing under ~/.aoa-pause-detector is a symlink:
+    // checked here from outside the permission model too, so the entry file itself is covered
+    const db = detectorBundleItem(homedir());
+    results.push(["detector-bundle", db.length ? "FAIL" : "PASS", db.slice(0, 5)]);
   }
+  const di = argv.indexOf("--detector-status");
+  const statusPath =
+    di >= 0 ? argv[di + 1] : join(homedir(), ".aoa-pause-detector/state/status.json");
+  let statusText = null;
+  try {
+    statusText = readFileSync(statusPath, "utf8");
+  } catch {
+    statusText = null;
+  }
+  const fr = detectorFresh(statusText, Date.now());
+  results.push([
+    "pause-detector",
+    fr.problems.length ? "FAIL" : "PASS",
+    fr.problems.length ? fr.problems : [fr.note],
+  ]);
   const envOf = n => {
     const out = run("docker", ["inspect", n, "--format", "{{json .Config.Env}}"]);
     try {

@@ -42,6 +42,7 @@
     "check:a7-fork": "node deploy/guardian-watcher/check-a7-fork.mjs",
     "check:pause-job": "node deploy/pause-job/check-pause-job.mjs",
     "check:pause-job-pin": "node deploy/pause-job/gen-sp-pin.mjs --check",
+    "check:pause-detector": "node deploy/pause-detector/check-pause-detector.mjs",
     "e2e:committee": "node scripts/e2e/committee-e2e.mjs",
     "e2e:selftest": "node scripts/e2e/selftest.mjs",
     "check:pin-rate": "node scripts/check-pin-rate.mjs"
@@ -100,6 +101,8 @@
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.69.0",
     "@typescript-eslint/parser": "^8.69.0",
+    "acorn": "8.17.0",
+    "acorn-walk": "8.3.4",
     "ajv": "8.20.0",
     "eslint": "^10.9.1",
     "jest": "^30.5.0",
