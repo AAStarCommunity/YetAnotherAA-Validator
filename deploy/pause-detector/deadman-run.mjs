@@ -12,7 +12,7 @@ import { lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GuardError, DIR, MAX_SILENCE_MS, readOwnJson, recordStop } from "./lib/guard.mjs";
-import { DETECTOR_SECRETS, telegram, writeDurable } from "./run.mjs";
+import { DETECTOR_SECRETS, batches, telegram, writeDurable } from "./run.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { safeText } from "../pause-job/lib/safe-error.mjs";
 
@@ -157,30 +157,54 @@ export async function main({ send = null } = {}) {
   // messages not yet delivered are queued in the state and sent first next run, whatever the
   // heartbeat says by then: an outage alert that failed is never dropped because a round completed
   // before the retry (Codex dm-R1 P1-1). The state machine (alerting) advances regardless.
+  // a message already waiting is not queued twice (an unacknowledged gap is re-derived every run
+  // until its delivery is confirmed)
+  const old = Array.isArray(st.queue) ? st.queue.filter(q => typeof q === "string") : [];
+  const waiting = dec.message && old.some(q => q.endsWith(` ${dec.message}`));
   const queue = compactQueue([
-    ...(Array.isArray(st.queue) ? st.queue.filter(q => typeof q === "string") : []),
-    ...(dec.message ? [`${new Date(now).toISOString()} ${dec.message}`] : []),
+    ...old,
+    ...(dec.message && !waiting ? [`${new Date(now).toISOString()} ${dec.message}`] : []),
   ]);
+  // what is acknowledged only once delivered: the gaps this run reports (Codex dm-R6 P1), or the
+  // detector would drop them from the heartbeat before Telegram ever saw them
+  const ackBefore = { reportedGaps: Array.isArray(st.reportedGaps) ? st.reportedGaps : [] };
   // WRITE-AHEAD (Codex dm-R3 P1): the transition and the queue are persisted BEFORE delivery, so a
-  // run killed mid-request leaves the outage queued for the next one; the queue is emptied only
-  // after Telegram accepted it
+  // run killed mid-request leaves the outage queued for the next one; new acknowledgements are not
   try {
-    writeDurable(join(own, "state.json"), { ...dec.next, queue });
+    writeDurable(join(own, "state.json"), { ...dec.next, ...ackBefore, queue });
   } catch (e) {
     return stop(1, safeText("dead-man state", e));
   }
+  // delivered in bounded messages of whole lines (Codex dm-R6 P2: one oversized message would be
+  // refused on every retry); each delivered message leaves the queue
   let delivery = { ok: true, sent: 0 };
   let undelivered = [];
   if (queue.length) {
-    const text = `DVT pause detector (chain ${cfg.chainId}):\n${queue.join("\n")}`;
-    // `send` is injectable for the cells; the entry passes none
-    const r = await (send ? send(text) : telegram(cfg, token, text));
-    delivery = { ...r, sent: r.ok ? queue.length : 0 };
-    if (!r.ok) undelivered = queue;
+    const header = `DVT pause detector (chain ${cfg.chainId}):`;
+    let sent = 0;
+    let why;
+    for (const b of batches(
+      header,
+      queue.map(line => ({ line }))
+    )) {
+      // `send` is injectable for the cells; the entry passes none
+      const r = await (send ? send(b.text) : telegram(cfg, token, b.text));
+      if (r.ok) sent += b.items.length;
+      else {
+        undelivered.push(...b.items.map(i => i.line));
+        why = r.why;
+      }
+    }
+    delivery = { ok: undelivered.length === 0, sent, ...(why ? { why } : {}) };
   }
   try {
-    if (!undelivered.length && queue.length)
-      writeDurable(join(own, "state.json"), { ...dec.next, queue: [] });
+    // everything delivered: the new acknowledgements are committed now, and only now
+    writeDurable(
+      join(own, "state.json"),
+      undelivered.length
+        ? { ...dec.next, ...ackBefore, queue: undelivered }
+        : { ...dec.next, queue: [] }
+    );
     writeDurable(join(own, "status.json"), {
       schema: "aoa-pause-detector-deadman/1",
       at: new Date(now).toISOString(),

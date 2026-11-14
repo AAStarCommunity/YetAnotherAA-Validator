@@ -2036,6 +2036,102 @@ await cell(
     assert(beat(h0, [], T0 + 3600_000).gaps.length === 0, "an hourly gap recorded");
   }
 );
+// a temp home with a config and a fresh heartbeat that carries one outage, for in-process runs
+const deadmanHome = async fn => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "pd-ack-")));
+  const realHome = process.env.HOME;
+  try {
+    const d = join(home, ".aoa-pause-detector");
+    mkdirSync(join(d, "deadman"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(d, "state"), { mode: 0o700 });
+    writeFileSync(join(d, "config.json"), JSON.stringify({ chainId: 11155111, telegram: null }), {
+      mode: 0o600,
+    });
+    const now = Date.now();
+    writeFileSync(
+      join(d, "state", "heartbeat.json"),
+      JSON.stringify({
+        schema: "aoa-pause-detector-heartbeat/1",
+        at: new Date(now - 60_000).toISOString(),
+        gaps: [
+          {
+            from: new Date(now - 4 * 3600_000).toISOString(),
+            to: new Date(now - 60_000).toISOString(),
+          },
+        ],
+      }),
+      { mode: 0o600 }
+    );
+    process.env.HOME = home;
+    await fn({
+      d,
+      state: () => JSON.parse(readFileSync(join(d, "deadman", "state.json"), "utf8")),
+    });
+  } finally {
+    process.env.HOME = realHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+};
+await cell(
+  "dead-man: a gap is acknowledged only after its message was delivered (Codex dm-R6 P1)",
+  async () =>
+    deadmanHome(async ({ state }) => {
+      let during = null;
+      await deadmanMain({
+        send: async () => {
+          during = state();
+          return { ok: false, why: "down" };
+        },
+      });
+      assert(
+        during && (during.reportedGaps ?? []).length === 0,
+        `acknowledged before delivery: ${JSON.stringify(during)}`
+      );
+      const st = state();
+      assert(
+        (st.reportedGaps ?? []).length === 0 && st.queue.length === 1,
+        `acknowledged after a failed delivery: ${JSON.stringify(st)}`
+      );
+      // a second failing run re-derives the same gap and does not queue it twice
+      await deadmanMain({ send: async () => ({ ok: false, why: "down" }) });
+      assert(state().queue.length === 1, `queued twice: ${JSON.stringify(state().queue)}`);
+      // delivered: acknowledged now, and the queue is empty
+      await deadmanMain({ send: async () => ({ ok: true }) });
+      assert(
+        state().reportedGaps.length === 1 && state().queue.length === 0,
+        JSON.stringify(state())
+      );
+    })
+);
+await cell(
+  "dead-man: a long queue goes out in bounded messages; delivered ones leave the queue (Codex dm-R6 P2)",
+  async () =>
+    deadmanHome(async ({ d, state }) => {
+      const long = Array.from(
+        { length: 10 },
+        (_, k) => `2026-11-14T00:00:0${k}.000Z DEAD-MAN: ${"x".repeat(900)} ${k}`
+      );
+      writeFileSync(
+        join(d, "deadman", "state.json"),
+        JSON.stringify({ alerting: false, lastSent: 0, queue: long, reportedGaps: [] }),
+        { mode: 0o600 }
+      );
+      const sizes = [];
+      let n = 0;
+      await deadmanMain({
+        send: async text => {
+          sizes.push(text.length);
+          return n++ === 0 ? { ok: true } : { ok: false, why: "down" };
+        },
+      });
+      assert(sizes.length > 1 && sizes.every(z => z <= MESSAGE_CHARS), `sizes ${sizes.join(",")}`);
+      const left = state().queue;
+      assert(
+        left.length > 0 && !left.includes(long[0]) && left.includes(long[9]),
+        `queue after a partial delivery: ${left.length}`
+      );
+    })
+);
 await cell("dead-man: the decision (alive, silent, re-alert, resume, missing, future)", () => {
   const T = 1e12;
   const hb = msAgo => ({
