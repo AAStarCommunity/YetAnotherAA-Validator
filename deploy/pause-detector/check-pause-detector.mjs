@@ -5,7 +5,9 @@
 // The first group is the guarantee DSR asked for: the detector has NO key, keystore, signing or
 // broadcast code. It fails if any such call appears in the detector or anything it imports, and
 // its own control cells prove the scanner sees one when it is there.
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
@@ -19,6 +21,7 @@ import {
   OPERATOR_CONFIGURED,
   ROLE_PAYMASTER_SUPER,
   pauseCommand,
+  ranges,
 } from "./lib/detect.mjs";
 import {
   configProblems,
@@ -109,6 +112,11 @@ const CAUGHT = {
   "Function via .constructor": '(() => 1).constructor("return 1")();',
   getBuiltinModule: "process.getBuiltinModule('node:child_process');",
   "console beyond log and error": "console.table(x);",
+  // Codex R3's bypasses (the ones a static scan can see; see README for what it cannot)
+  "a constructor name in a string": 'const k = "constructor"; const F = (() => {})[k];',
+  "a quoted constructor key": 'const { "constructor": F } = () => {};',
+  "a signing method on a class": "class A { signTransaction() {} }",
+  "a getBuiltinModule string": 'const m = "getBuiltinModule";',
 };
 await cell(
   "no-signing CONTROL: every forbidden form is caught (incl. Codex R1's four bypasses)",
@@ -283,7 +291,7 @@ function fakeChain(w) {
     calls: [],
     chainId: async () => "0xaa36a7",
     blockNumber: async tag => {
-      if (tag === "finalized") return w.finalized;
+      if (tag === "finalized") return w.finalizedRaw ?? w.finalized;
       return w.latest;
     },
     blockByHash: async h => {
@@ -307,9 +315,10 @@ function fakeChain(w) {
       let b;
       if (f.blockHash) {
         // EIP-234: one block by hash; a backend that has not indexed it fails
-        failIf("logs-at-B");
-        assert(f.blockHash === hashOf(w.latest), "blockHash filter not B");
-        a = b = w.latest;
+        const n = Number(BigInt(f.blockHash));
+        assert(f.blockHash === hashOf(n) && n <= w.latest, "blockHash filter of an unknown block");
+        if (n === w.latest) failIf("logs-at-B");
+        a = b = n;
       } else {
         if (w.failOnce?.delete(`logs:${Number(f.fromBlock)}`)) throw new Error("once");
         failIf(`logs:${Number(f.fromBlock)}`);
@@ -324,7 +333,8 @@ function fakeChain(w) {
             o.logBlock >= a &&
             o.logBlock <= b &&
             !w.hidden?.has(o.logBlock) &&
-            !(w.rangeSkipsB && !f.blockHash && o.logBlock === w.latest)
+            !(w.rangeSkipsB && !f.blockHash && o.logBlock === w.latest) &&
+            !(w.rangeHides?.has(o.logBlock) && !f.blockHash)
         )
         .map(([op, o]) => ({
           address: SP,
@@ -762,6 +772,89 @@ await cell(
   }
 );
 
+await cell(
+  "round: a log above finalized that the range answer omits is caught by its by-hash answer",
+  async () => {
+    const w = world({ rangeHides: new Set([280]) });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 1n,
+      logBlock: 280,
+    };
+    const { alerts, report } = await round(w);
+    assert(
+      report.operators.some(o => o.operator === ethers.getAddress(OP2)),
+      "the omitted operator was not read"
+    );
+    assert(
+      alerts.some(a => /block 280 differ/.test(a.text)) && !report.clear,
+      alerts.map(a => a.text).join("; ")
+    );
+  }
+);
+await cell("round: B == finalized == cursor still asks B by hash and compares", async () => {
+  const w = world({ latest: 250, finalized: 250, rangeHides: new Set([250]) });
+  w.ops[OP2.toLowerCase()] = {
+    configured: true,
+    paused: false,
+    role: true,
+    eff: 1n,
+    logBlock: 250,
+  };
+  const { alerts, report } = await round(w);
+  assert(
+    report.operators.some(o => o.operator === ethers.getAddress(OP2)),
+    "B's by-hash operator dropped"
+  );
+  assert(
+    !report.clear && alerts.some(a => /block 250 differ/.test(a.text)),
+    alerts.map(a => a.text).join("; ")
+  );
+});
+await cell(
+  "round: a latest block below finalized (a lagging backend) stops the round",
+  async () => {
+    let stopped = false;
+    try {
+      await round(world({ latest: 200, finalized: 250 }));
+    } catch (e) {
+      stopped = /lagging backend/.test(e.message);
+    }
+    assert(stopped, "not stopped");
+  }
+);
+await cell(
+  "round: a non-integer finalized height stops the round before any range is built",
+  async () => {
+    let stopped = false;
+    try {
+      await round(world({ finalizedRaw: Infinity }));
+    } catch (e) {
+      stopped = /not a block number/.test(e.message);
+    }
+    assert(stopped, "not stopped");
+  }
+);
+await cell("ranges: refuses non-integer bounds and an unbounded number of chunks", () => {
+  for (const [a, b, z] of [
+    [0, Infinity, 10],
+    [0, 1e12, 1],
+    [0.5, 10, 1],
+    [0, 10, 0],
+  ]) {
+    let refused = false;
+    try {
+      ranges(a, b, z);
+    } catch {
+      refused = true;
+    }
+    assert(refused, `accepted ${a},${b},${z}`);
+  }
+  assert(ranges(1, 10, 5).length === 2, "control");
+});
+
 // ---------------------------------------------------------------- delivery
 
 await cell("delivery: many alerts are split into whole-line messages under the limit", () => {
@@ -903,6 +996,83 @@ await cell(
     }
   }
 );
+// the process boundary: Node's permission model (the plist's flags), proven by running node
+const PERM_FLAG =
+  Number(process.versions.node.split(".")[0]) >= 22 ? "--permission" : "--experimental-permission";
+const runNode = (flags, code) =>
+  spawnSync(process.execPath, [...flags, "--input-type=module", "-e", code], { encoding: "utf8" });
+await cell(
+  "permission: under the plist's flags no child process, worker or outside read is possible",
+  () => {
+    const home = mkdtempSync(join(tmpdir(), "pd-home-"));
+    mkdirSync(join(home, ".aoa-pause-detector/state"), { recursive: true });
+    writeFileSync(join(home, "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key");
+    const repo = resolve(HERE, "../..");
+    const flags = [
+      PERM_FLAG,
+      `--allow-fs-read=${repo}`,
+      `--allow-fs-read=${join(home, ".aoa-pause-detector")}`,
+      `--allow-fs-write=${join(home, ".aoa-pause-detector/state")}`,
+    ];
+    const probe = `
+    const out = [];
+    try { (await import("node:child_process")).execFileSync("/usr/bin/true"); out.push("spawn"); } catch {}
+    try { new (await import("node:worker_threads")).Worker("1", { eval: true }); out.push("worker"); } catch {}
+    try { (await import("node:fs")).readFileSync(${JSON.stringify(join(home, "key.env"))}); out.push("read"); } catch {}
+    const { permissionProblems } = await import(${JSON.stringify(join(HERE, "detector.mjs"))});
+    console.log(JSON.stringify({ out, problems: permissionProblems(process.permission, ${JSON.stringify(home)}) }));`;
+    const r = runNode(flags, probe);
+    const j = JSON.parse(r.stdout.trim().split("\n").pop());
+    assert(j.out.length === 0, `allowed: ${j.out.join(",")}`);
+    assert(j.problems.length === 0, j.problems.join("; "));
+    // controls: without the model, and with child processes allowed, the detector refuses
+    const bare = JSON.parse(runNode([], probe).stdout.trim().split("\n").pop());
+    assert(bare.problems.length > 0 && bare.out.includes("spawn"), "control: no model not refused");
+    const child = JSON.parse(
+      runNode(
+        [
+          ...flags,
+          Number(process.versions.node.split(".")[0]) >= 22
+            ? "--allow-child-process"
+            : "--allow-child-process",
+        ],
+        probe
+      )
+        .stdout.trim()
+        .split("\n")
+        .pop()
+    );
+    assert(
+      child.problems.some(x => /child processes/.test(x)),
+      "control: child processes not refused"
+    );
+  }
+);
+await cell("permission: detector.mjs refuses to start outside the permission model", () => {
+  const r = spawnSync(process.execPath, [join(HERE, "detector.mjs"), "--config", "/nonexistent"], {
+    encoding: "utf8",
+  });
+  assert(r.status === 78 && /permission model/.test(r.stderr), `${r.status} ${r.stderr}`);
+});
+await cell("config: the plist runs the pinned node under the permission model, exactly", () => {
+  const x = readFileSync(join(HERE, "io.aastar.dvt-pause-detector.plist"), "utf8");
+  const args = [
+    ...x
+      .match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)[1]
+      .matchAll(/<string>([^<]*)<\/string>/g),
+  ].map(m => m[1]);
+  const want = [
+    "__HOME__/.local/keeper-node/node-v24.21.0/bin/node",
+    "--permission",
+    "--allow-fs-read=__REPO__",
+    "--allow-fs-read=__HOME__/.aoa-pause-detector",
+    "--allow-fs-write=__HOME__/.aoa-pause-detector/state",
+    "__REPO__/deploy/pause-detector/detector.mjs",
+    "--config",
+    "__HOME__/.aoa-pause-detector/config.json",
+  ];
+  assert(args.join("\n") === want.join("\n"), args.join(" "));
+});
 await cell("config: the plist runs only detector.mjs, hourly, and passes no secret in argv", () => {
   const x = readFileSync(join(HERE, "io.aastar.dvt-pause-detector.plist"), "utf8");
   assert(/<key>StartInterval<\/key>\s*<integer>3600<\/integer>/.test(x), "not hourly");

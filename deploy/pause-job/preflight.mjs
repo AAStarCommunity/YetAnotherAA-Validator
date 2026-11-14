@@ -11,6 +11,7 @@
 //               are NOT; and no other loaded job of this user runs a DVT transaction-sending script
 //               (by its ProgramArguments, not its label: a job's name is not what it runs). The
 //               price keeper is the one approved sender and is not scanned; the detector is.
+// detector-args the loaded detector runs the pinned node under --permission, exactly as its plist
 // pause-detector its last round's status.json is fresh (at most two intervals old): the trigger
 //               fired, not just the job loaded
 // node-slash-off every DVT node container has AUDIT_ENABLED and AUDIT_EXECUTE_SLASH absent or exactly
@@ -288,6 +289,45 @@ export function launchdOff(
   return [...new Set(p)];
 }
 
+/** The pinned node the detector runs under (the dedicated install, not Homebrew's). */
+export const DETECTOR_NODE = ".local/keeper-node/node-v24.21.0/bin/node";
+
+/**
+ * detector-args: the LOADED detector job runs exactly
+ *   [<home>/<DETECTOR_NODE>, --permission, --allow-fs-read=<repo>,
+ *    --allow-fs-read=<home>/.aoa-pause-detector, --allow-fs-write=<home>/.aoa-pause-detector/state,
+ *    <repo>/deploy/pause-detector/detector.mjs, --config, <home>/.aoa-pause-detector/config.json]
+ * so it is under the permission model with nothing more allowed (no --allow-child-process, no
+ * wider read or write). `args` is what launchd loaded (null when unreadable). Pure.
+ */
+export function detectorArgsProblems(args, home) {
+  if (!Array.isArray(args)) return ["the detector's loaded arguments cannot be read"];
+  const script = args[5] ?? "";
+  const suffix = "/deploy/pause-detector/detector.mjs";
+  const repo = script.endsWith(suffix) ? script.slice(0, -suffix.length) : null;
+  const d = `${home}/.aoa-pause-detector`;
+  const want = repo && [
+    `${home}/${DETECTOR_NODE}`,
+    "--permission",
+    `--allow-fs-read=${repo}`,
+    `--allow-fs-read=${d}`,
+    `--allow-fs-write=${d}/state`,
+    `${repo}${suffix}`,
+    "--config",
+    `${d}/config.json`,
+  ];
+  if (
+    !want ||
+    !repo.startsWith("/") ||
+    repo.includes("/../") ||
+    args.join("\n") !== want.join("\n")
+  )
+    return [
+      "the detector does not run exactly as its plist: the pinned node, --permission, reads of the repo and ~/.aoa-pause-detector, writes of its state only",
+    ];
+  return [];
+}
+
 /**
  * pause-detector: the detector's last status.json (`text`, or null when missing) is fresh: written
  * at most `maxAgeMs` before `now`, by the detector. Returns { problems, note }. Pure.
@@ -440,6 +480,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     }
     const p = [...extra, ...launchdOff(labels, programOf, readText, reviewed, shaOf, plists)];
     results.push(["launchd-on", p.length ? "FAIL" : "PASS", p]);
+    const da = detectorArgsProblems(programOf(DETECTOR_LABEL)?.args ?? null, homedir());
+    results.push(["detector-args", da.length ? "FAIL" : "PASS", da]);
   }
   const di = argv.indexOf("--detector-status");
   const statusPath =

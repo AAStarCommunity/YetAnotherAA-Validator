@@ -10,14 +10,25 @@
 //
 // This file is a TEST: it holds anvil test keys and sends transactions to set the chain up. The
 // detector (detector.mjs, lib/detect.mjs) does neither; check-pause-detector.mjs proves that.
-import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { PIN, emptyState, runRound, spIface, regIface, IMPL_SLOT } from "./lib/detect.mjs";
 import { readOnlyChain, resolvedKeys } from "./detector.mjs";
 
+const HERE_E2E = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const die = (c, m) => {
   console.error(`detector e2e: ${m}`);
@@ -272,6 +283,71 @@ await section(async () => {
   cell("a wrong Registry code hash: identity unknown", !r2.report.identity.ok, r2.report.identity);
 });
 await revert(s2);
+
+// ---- D5: detector.mjs itself, as launchd runs it: under the plist's permission flags
+await section(async () => {
+  // under the real home, as on the Mini (repo and ~/.aoa-pause-detector share /Users/<u>): Node
+  // 24's permission model mishandles a rename when the allowed paths have no common root
+  const home = realpathSync(mkdtempSync(join(homedir(), ".pd-e2e-")));
+  process.on("exit", () => rmSync(home, { recursive: true, force: true }));
+  const d = join(home, ".aoa-pause-detector");
+  for (const x of [d, join(d, "state"), join(d, "secrets")]) mkdirSync(x, { mode: 0o700 });
+  for (const n of ["aoa-dvt-detector-rpc-primary", "aoa-dvt-detector-rpc-fallback"])
+    writeFileSync(join(d, "secrets", n), URL, { mode: 0o600 });
+  const cfgPath = join(d, "config.json");
+  writeFileSync(
+    cfgPath,
+    JSON.stringify({
+      ...CFG,
+      stateDir: join(d, "state"),
+      secretsDir: join(d, "secrets"),
+      telegram: null,
+      realertMinutes: 360,
+      lockPort: 40000 + Math.floor(Math.random() * 20000),
+      rpc: { primary: "anvil-a", fallback: "anvil-b" },
+    })
+  );
+  const repo = join(HERE_E2E, "../..");
+  const flag =
+    Number(process.versions.node.split(".")[0]) >= 22
+      ? "--permission"
+      : "--experimental-permission";
+  const r = spawnSync(
+    process.execPath,
+    [
+      flag,
+      `--allow-fs-read=${repo}`,
+      `--allow-fs-read=${d}`,
+      `--allow-fs-write=${join(d, "state")}`,
+      join(HERE_E2E, "detector.mjs"),
+      "--config",
+      cfgPath,
+    ],
+    { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+  );
+  if (!existsSync(join(d, "state", "status.json")))
+    throw new Error(`no status.json; exit ${r.status}: ${r.stderr.slice(0, 400)}`);
+  const status = JSON.parse(readFileSync(join(d, "state", "status.json"), "utf8"));
+  cell(
+    "the detector process runs under the permission model and ends a clear round",
+    r.status === 0 && status.clear === true,
+    { code: r.status, stderr: r.stderr.slice(0, 300), clear: status.clear }
+  );
+  cell(
+    "its status names both operators read ok at a canonical B",
+    status.report?.canonical &&
+      status.report.operators.length === 2 &&
+      status.report.operators.every(o => o.status === "ok"),
+    status.report?.operators
+  );
+  const st = JSON.parse(readFileSync(join(d, "state", "state.json"), "utf8"));
+  cell(
+    "its state persisted the inventory with a mode-600 file",
+    Object.keys(st.operators).length === 2 &&
+      (statSync(join(d, "state", "state.json")).mode & 0o777) === 0o600,
+    st.operators
+  );
+});
 
 // ---- D4: the RPC client refuses a broadcast even against a live node
 await section(async () => {

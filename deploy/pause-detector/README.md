@@ -6,24 +6,49 @@ retired. This detector watches, and a person pauses with the exact command it
 sends.
 
 It is D2's read path with every send path removed. It holds **no key**. There is
-no keystore, no signer, and no signing or broadcast code:
+no keystore, no signer, and no signing or broadcast code. Three layers back
+this, and they are not equally strong:
 
-- **Runtime.** Only seven read-only JSON-RPC methods are allowed. The check runs
-  twice: in the client, and again in the transport itself, which is a plain
-  `fetch` POST with no ethers provider. A write method is refused before any
-  request is made.
-- **Static.** `no-signing-scan.mjs` parses (acorn) the detector and every module
-  it reaches by static import or re-export. CI fails on any of these:
-  - a name or string that holds a key, signs, broadcasts or runs a program;
-  - dynamic import, `require`, `eval`, `globalThis`, `.constructor`;
-  - a computed member built from strings;
-  - `process` or `console` used other than as a few named members;
-  - ethers used other than as nine pure utilities;
-  - any `fetch` other than to the Telegram Bot API or from the one JSON-RPC
-    transport.
+1. **The boundary: Node's permission model.** The plist runs the pinned node
+   (`~/.local/keeper-node/node-v24.21.0`, not Homebrew's, whose directories
+   admin can write) with `--permission`, reads of the repo and
+   `~/.aoa-pause-detector` only, and writes of its state directory only.
+   - So the process cannot start a child process (no `cast`), a worker, a native
+     addon or WASI.
+   - It cannot read any key on the host: not the price keeper's `key.env`, not a
+     foundry keystore, not `~/.ssh`.
+   - It holds no key, so it cannot sign.
+   - `detector.mjs` checks `process.permission` first and refuses to start
+     without the model or with anything more allowed.
+   - Preflight checks that launchd LOADED exactly these arguments.
+   - A CI cell runs node with the plist's flags and proves spawn, worker and an
+     outside read all fail. The anvil e2e runs `detector.mjs` itself that way.
+2. **Runtime allowlist.** Only seven read-only JSON-RPC methods are allowed. The
+   check runs twice: in the client, and again in the transport, which is a plain
+   `fetch` POST with no ethers provider. A write method is refused before any
+   request is made.
+3. **Static scan, a review aid.** `no-signing-scan.mjs` parses (acorn) the
+   detector and every module it reaches by static import or re-export. CI fails
+   on any of these:
+   - a name, key or string that holds a key, signs, broadcasts or runs a
+     program;
+   - dynamic import, `require`, `eval`, `globalThis`, `.constructor`;
+   - a computed member built from strings;
+   - `process` or `console` used other than as a few named members;
+   - ethers used other than as nine pure utilities;
+   - any `fetch` other than to the Telegram Bot API or from the one JSON-RPC
+     transport.
 
-  Control cells show the scan catching each form, including every bypass Codex
-  found in rounds 1 and 2.
+   Control cells show the scan catching each form Codex found in rounds 1–3.
+   **It is not complete and cannot be.** JavaScript can build a name at run time
+   (`const k = "constr" + "uctor"; f[k]`) in ways no static scan of this kind
+   rules out. It catches direct and accidental code. Layers 1 and 2 hold against
+   deliberate code.
+
+**Durability under the model.** Node 24 disables `fsync` under the permission
+model. State writes stay atomic (temp file + rename) but are not fsynced. A
+crash can lose the last write, which costs a rescan and a repeated alert, never
+a missed one.
 
 ## What one round does (hourly, launchd)
 
@@ -56,9 +81,14 @@ no keystore, no signer, and no signing or broadcast code:
      number. Every log above finalized must come from that chain, so a
      load-balanced endpoint answering from another fork is caught. More than
      2048 blocks above finalized is unknown.
-   - **B's own logs.** The backend must answer `getLogs` for B by hash
-     (EIP-234). Those operators count too. If that answer differs from the range
-     answer for block B, the round is unknown.
+   - **Every unfinalized block by hash.** Every block above finalized, and B
+     itself, is asked for its logs by hash (EIP-234). Those operators count. If
+     a block's by-hash answer differs from its number-range answer, the round is
+     unknown. This runs every round, even when the cursor has reached B, so a
+     lagging range backend that omits a log is caught.
+   - A latest block below the finalized block or the cursor (a lagging backend),
+     or a height that is not a safe integer, stops the round. Range construction
+     is bounded.
 5. **Each operator at B.**
    - It reads `operators(op).{isConfigured, isPaused}` and the three Registry
      reads of `SuperPaymasterStorage._hasEffectiveSuperStake`:
@@ -151,11 +181,16 @@ secret-file reader, called with the detector's own name table) and
    to `{chainId, spProxy, startBlock}`. A new deployment needs a new `stateDir`.
 5. Render and load the plist, then check
    `launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector | grep "run interval"`
-   shows 3600.
+   shows 3600. The plist needs the pinned node at
+   `~/.local/keeper-node/node-v24.21.0` (installed and verified on the Mini,
+   11-14), and the repo and `~/.aoa-pause-detector` both under the home
+   directory.
 6. Run `node deploy/pause-job/preflight.mjs`. It checks:
    - **launchd-on**: the detector and the price keeper are loaded; the committee
      keeper, apply-rotation and the D2 pause job are not; no other loaded job
      runs a DVT sender;
+   - **detector-args**: the loaded detector runs exactly the pinned node,
+     `--permission`, the two reads and the one write;
    - **pause-detector**: `status.json` is at most two intervals old.
 
 ## Before rc.8

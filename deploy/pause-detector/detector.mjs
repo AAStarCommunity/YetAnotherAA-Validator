@@ -55,6 +55,30 @@ const die = (code, m) => {
 const tilde = p => (typeof p === "string" ? p.replace(/^~\//, `${homedir()}/`) : undefined);
 const HASH = /^0x[0-9a-fA-F]{64}$/;
 
+/**
+ * The process-level boundary (Codex R3: a static scan of JavaScript cannot be complete): the
+ * detector runs ONLY under Node's permission model, with no child processes, no workers, no native
+ * addons, no WASI, and file reads limited so that no key anywhere on the host (the price keeper's
+ * key.env, a foundry keystore, ...) is readable. `perm` is process.permission; `home` the home
+ * directory. Returns the problems (empty = run). Pure.
+ */
+export function permissionProblems(perm, home) {
+  if (!perm || typeof perm.has !== "function")
+    return ["not running under Node's permission model (node --permission, see the plist)"];
+  const p = [];
+  for (const [scope, what] of [
+    ["child", "child processes"],
+    ["worker", "worker threads"],
+    ["addon", "native addons"],
+    ["wasi", "WASI"],
+  ])
+    if (perm.has(scope)) p.push(`${what} are allowed`);
+  for (const path of ["/", home, `${home}/.config`, `${home}/.foundry`, `${home}/.ssh`])
+    if (perm.has("fs.read", path)) p.push(`${path} is readable`);
+  if (perm.has("fs.write", "/") || perm.has("fs.write", home)) p.push("writes are not confined");
+  return p;
+}
+
 /** Problems with a config object, fixed wording. Pure. */
 export function configProblems(c) {
   if (!c || typeof c !== "object") return ["config is not an object"];
@@ -91,7 +115,20 @@ export function configProblems(c) {
   return p;
 }
 
-/** Write `obj` to `path` durably: 0600 temp file, fsync, rename, fsync the directory. */
+/**
+ * fsync, except where Node's permission model disables it (ERR_ACCESS_DENIED, Node 24): there the
+ * write is still atomic (temp file + rename); a crash can lose the last write, which costs a
+ * rescan and a repeated alert, never a missed one.
+ */
+const syncFd = fd => {
+  try {
+    fsyncSync(fd);
+  } catch (e) {
+    if (e?.code !== "ERR_ACCESS_DENIED") throw e;
+  }
+};
+
+/** Write `obj` to `path`: 0600 temp file, fsync (see syncFd), rename, fsync the directory. */
 export function writeDurable(path, obj) {
   const tmp = `${path}.${process.pid}.tmp`;
   const fd = openSync(
@@ -107,14 +144,14 @@ export function writeDurable(path, obj) {
       if (!(n > 0)) throw new SafeError("state write made no progress");
       off += n;
     }
-    fsyncSync(fd);
+    syncFd(fd);
   } finally {
     closeSync(fd);
   }
   renameSync(tmp, path);
   const d = openSync(dirname(path), constants.O_RDONLY);
   try {
-    fsyncSync(d);
+    syncFd(d);
   } finally {
     closeSync(d);
   }
@@ -308,6 +345,9 @@ export async function deliver(st, due, resolved, header, now, send) {
 }
 
 async function main() {
+  // first of all: nothing else runs outside the permission model
+  const pp = permissionProblems(process.permission, homedir());
+  if (pp.length) die(78, `refusing to run: ${pp.join("; ")}`);
   const args = process.argv.slice(2);
   const i = args.indexOf("--config");
   const next = i + 1;

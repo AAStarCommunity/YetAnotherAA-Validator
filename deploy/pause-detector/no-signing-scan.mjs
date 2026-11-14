@@ -75,12 +75,12 @@ export const FORBIDDEN_NAMES = new Set([
 ]);
 // globals the detector may use, and only these members of them, never computed or aliased
 export const GLOBALS_OK = new Map([
-  ["process", new Set(["argv", "exit", "getuid", "pid"])],
+  ["process", new Set(["argv", "exit", "getuid", "pid", "permission"])],
   ["console", new Set(["log", "error"])],
 ]);
 // text in string literals and template parts
 export const FORBIDDEN_TEXT =
-  /(sendRawTransaction|sendTransaction|eth_sign|personal_sign|signTransaction|signTypedData|privatekey|private_key|keystore|mnemonic|child_process|worker_threads|node:vm|node:module|mktx)/i;
+  /(constructor|getBuiltinModule|sendRawTransaction|sendTransaction|eth_sign|personal_sign|signTransaction|signTypedData|privatekey|private_key|keystore|mnemonic|child_process|worker_threads|node:vm|node:module|mktx)/i;
 // the only members of ethers the detector may use: pure ABI, hashing and formatting utilities
 export const ETHERS_OK = new Set([
   "Interface",
@@ -220,10 +220,26 @@ export function scanSource(path, text, onImport = () => {}) {
         )
           p.push(`${at(node)}: a computed member that is not a variable or a number`);
         break;
-      case "Property":
-        if (!node.computed && node.key.type === "Identifier" && FORBIDDEN_NAMES.has(node.key.name))
-          p.push(`${at(node)}: forbidden key ${node.key.name}`);
+      case "ObjectPattern":
+        // acorn-walk visits a pattern's values, not its keys: check the keys here
+        for (const prop of node.properties) {
+          const k =
+            prop.type === "Property" && !prop.computed ? (prop.key.name ?? prop.key.value) : null;
+          if (typeof k === "string" && (FORBIDDEN_NAMES.has(k) || FORBIDDEN_TEXT.test(k)))
+            p.push(`${at(prop)}: forbidden key ${k} in a pattern`);
+        }
         break;
+      case "Property":
+      case "MethodDefinition":
+      case "PropertyDefinition": {
+        // `{ constructor: F } = ...` and `{ "constructor": F } = ...` alike (Codex R3 P1-1)
+        const k = node.computed ? null : (node.key.name ?? node.key.value);
+        // a class's own `constructor() {}` is not a way to reach Function; every other name is checked
+        const classCtor = node.type === "MethodDefinition" && node.kind === "constructor";
+        if (typeof k === "string" && FORBIDDEN_NAMES.has(k) && !classCtor)
+          p.push(`${at(node)}: forbidden key ${k}`);
+        break;
+      }
       case "Literal":
         if (typeof node.value === "string" && FORBIDDEN_TEXT.test(node.value))
           p.push(`${at(node)}: forbidden text in a string`);

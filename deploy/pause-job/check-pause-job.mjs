@@ -36,6 +36,7 @@ import {
   DETECTOR_LABEL,
   KEEPER_LABEL,
   detectorFresh,
+  detectorArgsProblems,
 } from "./preflight.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -833,6 +834,36 @@ cell(
     ds.some(p => p.includes("runs pause-job.mjs")),
     ds
   );
+  {
+    const H = "/Users/u";
+    const good = [
+      `${H}/.local/keeper-node/node-v24.21.0/bin/node`,
+      "--permission",
+      "--allow-fs-read=/r",
+      `--allow-fs-read=${H}/.aoa-pause-detector`,
+      `--allow-fs-write=${H}/.aoa-pause-detector/state`,
+      "/r/deploy/pause-detector/detector.mjs",
+      "--config",
+      `${H}/.aoa-pause-detector/config.json`,
+    ];
+    cell("detector-args passes the exact plist form", detectorArgsProblems(good, H).length === 0);
+    const bad = [
+      ["no --permission", good.filter(a => a !== "--permission")],
+      ["Homebrew node", ["/opt/homebrew/bin/node", ...good.slice(1)]],
+      [
+        "--allow-child-process added",
+        [...good.slice(0, 2), "--allow-child-process", ...good.slice(2)],
+      ],
+      ["a wider read", good.map(a => (a === "--allow-fs-read=/r" ? "--allow-fs-read=/" : a))],
+      [
+        "a wider write",
+        good.map(a => (a.startsWith("--allow-fs-write") ? `--allow-fs-write=${H}` : a)),
+      ],
+      ["unreadable", null],
+    ];
+    for (const [what, args] of bad)
+      cell(`detector-args fails: ${what}`, detectorArgsProblems(args, H).length === 1);
+  }
   const now = Date.parse("2026-11-14T12:00:00Z");
   const st = (at, clear = true) =>
     JSON.stringify({

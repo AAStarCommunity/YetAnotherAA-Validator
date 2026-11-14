@@ -42,6 +42,12 @@ const hex = n => ethers.toQuantity(n);
 
 /** The most blocks above finalized whose ancestry a round walks by hash. */
 export const MAX_UNFINALIZED = 2048;
+/** The most getLogs chunks one scan may make (a full rescan of Sepolia at logChunk 5000 is ~400). */
+export const MAX_CHUNKS = 200_000;
+const height = (n, what) => {
+  if (!Number.isSafeInteger(n) || n < 0) throw new SafeError(`${what} is not a block number`);
+  return n;
+};
 
 /**
  * Reset state times after `now` (a clock that was ahead): lastFullScan to 0, alert stamps to 0.
@@ -111,6 +117,11 @@ export function stateProblems(st, cfg) {
 
 /** Split [from, to] into chunks of at most `size` blocks. Pure. */
 export function ranges(from, to, size) {
+  // heights come from an RPC answer: never trust them to bound a loop (Codex R3 P2)
+  if (![from, to, size].every(Number.isSafeInteger) || size < 1)
+    throw new SafeError("a block range is not made of block numbers");
+  if (to >= from && (to - from) / size > MAX_CHUNKS)
+    throw new SafeError(`a block range of ${to - from + 1} blocks is too many getLogs calls`);
   const out = [];
   for (let a = from; a <= to; a += size) out.push([a, Math.min(to, a + size - 1)]);
   return out;
@@ -159,7 +170,7 @@ async function operatorLogs(chain, spProxy, from, to, size, each, canon) {
       throw new SafeError(`${safeText("getLogs", e)} (blocks ${a}-${b})`);
     }
     await checkLogs(logs, spProxy, a, b, canon);
-    each(logs, b);
+    each(logs, b, a);
   }
 }
 
@@ -335,7 +346,7 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
   // 1. inventory, finalized ranges only. Each round also re-reads the last `rescanBlocks` before
   //    the cursor, and once a day everything from startBlock: a lagging backend that answered []
   //    for a range it had not indexed yet cannot hide an operator for good (Codex R1 P1-2)
-  const finalized = Number(await chain.blockNumber("finalized"));
+  const finalized = height(Number(await chain.blockNumber("finalized")), "the finalized block");
   // a cursor past the finalized block would skip discovery for good (Codex R2 P1-4)
   if (!(st.cursor <= finalized))
     throw new SafeError(
@@ -344,6 +355,18 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
   const full = now - st.lastFullScan >= 24 * 3600_000;
   const from = full ? st.startBlock : Math.max(st.startBlock, st.cursor + 1 - cfg.rescanBlocks);
   let inventoryOk = true;
+  // what the number-range answers said, block by block, this round: compared below with the
+  // by-hash answers for every block above finalized and for B
+  const rangeOps = new Map();
+  const covered = []; // [a, b] ranges whose getLogs succeeded this round
+  const byRange = (logs, a, b) => {
+    for (const lg of logs) {
+      const n = Number(lg.blockNumber);
+      if (!rangeOps.has(n)) rangeOps.set(n, new Set());
+      rangeOps.get(n).add(opOf(lg.topics[1]));
+    }
+    covered.push([a, b]);
+  };
   try {
     await operatorLogs(
       chain,
@@ -351,7 +374,8 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
       from,
       finalized,
       cfg.logChunk,
-      (logs, b) => {
+      (logs, b, a) => {
+        byRange(logs, a, b);
         for (const lg of logs) {
           const op = opOf(lg.topics[1]);
           st.operators[op] ??= Number(lg.blockNumber);
@@ -372,66 +396,81 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
   // 2. one block, by hash, for every read of this round
   const head = await chain.blockByNumber("latest");
   if (!head?.hash) throw new SafeError("no latest block");
-  const B = { number: Number(head.number), hash: head.hash };
+  const B = { number: height(Number(head.number), "the latest block"), hash: head.hash };
+  // a backend whose latest is below what it calls finalized (or below our cursor) is lagging or
+  // inconsistent: nothing it says this round is used (Codex R3 P1-3)
+  if (B.number < finalized || B.number < st.cursor)
+    throw new SafeError(
+      `the latest block ${B.number} is below the finalized block ${finalized} or the cursor ${st.cursor}: a lagging backend`
+    );
   const id = await identityAt(chain, B, cfg);
 
-  // 4. operators configured after the cursor, up to B: this round only
+  // 4. operators configured after the cursor, up to B: this round only (not persisted). This ALWAYS
+  //    runs, even when the cursor reached B (Codex R3 P1-3):
+  //    - B's ancestry is walked by hash down to the finalized block and must join it (Codex R2
+  //      P1-3: a load-balanced endpoint can answer numbers from another fork than B);
+  //    - every block above finalized, and B itself, is asked for its logs BY HASH (EIP-234). Those
+  //      operators count, and the number-range answer for each such block must say the same: a
+  //      lagging or forked range backend that omits a log is caught (Codex R3 P1-2).
   const recent = new Set();
   let recentOk = true;
-  if (B.number > st.cursor)
-    try {
-      // B's ancestry, by hash, back to the finalized block: every block in (finalized, B] is
-      // B's own ancestor, and the walk joins the finalized block read by number. A log above the
-      // finalized block is accepted only from this chain (Codex R2 P1-3: a load-balanced endpoint
-      // can answer numbers from another fork than B)
-      if (B.number - finalized > MAX_UNFINALIZED)
-        throw new SafeError(`${B.number - finalized} blocks above finalized: too many to walk`);
-      let h = B.hash;
-      for (let n = B.number; n > finalized; n--) {
-        const blk = await chain.blockByHash(h);
-        if (!blk || Number(blk.number) !== n || lc(blk.hash) !== lc(h))
-          throw new SafeError(`block ${n} of B's ancestry cannot be read by hash`);
-        hashes.set(n, blk.hash);
-        h = blk.parentHash;
-      }
-      if (lc(h) !== lc(await canon(finalized)))
-        throw new SafeError("B does not descend from the finalized block the backend reports");
-      // the backend must know B's logs (EIP-234 blockHash filter): a node that has not indexed B
-      // fails here instead of answering [] for the recent range; its operators count too, and the
-      // range answer must agree with it (Codex R2 P1-2)
-      const atB = await chain.getLogs({
-        address: st.spProxy,
-        topics: [OPERATOR_CONFIGURED],
-        blockHash: B.hash,
-      });
-      await checkLogs(atB, st.spProxy, B.number, B.number, canon);
-      const byHash = new Set(atB.map(lg => opOf(lg.topics[1])));
-      const byRange = new Set();
+  try {
+    if (B.number - finalized > MAX_UNFINALIZED)
+      throw new SafeError(`${B.number - finalized} blocks above finalized: too many to walk`);
+    let h = B.hash;
+    for (let n = B.number; n > finalized; n--) {
+      const blk = await chain.blockByHash(h);
+      if (!blk || Number(blk.number) !== n || lc(blk.hash) !== lc(h))
+        throw new SafeError(`block ${n} of B's ancestry cannot be read by hash`);
+      hashes.set(n, blk.hash);
+      h = blk.parentHash;
+    }
+    if (B.number > finalized && lc(h) !== lc(await canon(finalized)))
+      throw new SafeError("B does not descend from the finalized block the backend reports");
+    if (B.number === finalized && lc(B.hash) !== lc(await canon(finalized)))
+      throw new SafeError("B is not the finalized block the backend reports");
+    hashes.set(B.number, B.hash);
+    // the range answer above the cursor (B included)
+    if (B.number > st.cursor)
       await operatorLogs(
         chain,
         st.spProxy,
         st.cursor + 1,
         B.number,
         cfg.logChunk,
-        logs => {
-          for (const lg of logs) {
-            const op = opOf(lg.topics[1]);
-            recent.add(op);
-            if (Number(lg.blockNumber) === B.number) byRange.add(op);
-          }
+        (logs, b, a) => {
+          byRange(logs, a, b);
+          for (const lg of logs) recent.add(opOf(lg.topics[1]));
         },
         canon
       );
-      for (const op of byHash) recent.add(op);
-      if ([...byHash].sort().join() !== [...byRange].sort().join())
-        throw new SafeError(`the backend's logs for block ${B.number} differ by hash and by range`);
-    } catch (e) {
-      recentOk = false;
-      alerts.push({
-        key: "inventory-recent",
-        text: `unknown: operators configured after block ${st.cursor} could not be read (${safeText("recent", e)})`,
+    const byHashBlocks = [];
+    for (let n = finalized + 1; n <= B.number; n++) byHashBlocks.push(n);
+    if (!byHashBlocks.includes(B.number)) byHashBlocks.push(B.number);
+    for (const n of byHashBlocks) {
+      const logs = await chain.getLogs({
+        address: st.spProxy,
+        topics: [OPERATOR_CONFIGURED],
+        blockHash: hashes.get(n),
       });
+      await checkLogs(logs, st.spProxy, n, n, canon);
+      const mine = new Set(logs.map(lg => opOf(lg.topics[1])));
+      for (const op of mine) recent.add(op);
+      // only a block some range answer of this round covered can be compared; one no range
+      // answer covered is already unknown through the failed scan
+      if (covered.some(([a, b]) => n >= a && n <= b)) {
+        const theirs = rangeOps.get(n) ?? new Set();
+        if ([...mine].sort().join() !== [...theirs].sort().join())
+          throw new SafeError(`the backend's logs for block ${n} differ by hash and by range`);
+      }
     }
+  } catch (e) {
+    recentOk = false;
+    alerts.push({
+      key: "inventory-recent",
+      text: `unknown: operators configured after block ${st.cursor} could not be read (${safeText("recent", e)})`,
+    });
+  }
 
   // 5. every operator at B
   const ops = [...new Set([...Object.keys(st.operators), ...recent])].sort();
