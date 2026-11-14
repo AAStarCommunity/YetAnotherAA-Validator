@@ -486,7 +486,8 @@ export async function main() {
     if (result.report?.canonical === true)
       writeDurable(join(stateDir, "heartbeat.json"), {
         schema: "aoa-pause-detector-heartbeat/1",
-        at: new Date(now).toISOString(),
+        // when the round COMPLETED, not when it started (Codex dm-R1 P2)
+        at: new Date().toISOString(),
         block: result.report.block?.number ?? null,
         clear: result.report.clear === true,
       });

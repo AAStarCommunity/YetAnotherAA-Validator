@@ -14,6 +14,7 @@ import { join } from "node:path";
 import {
   DIR,
   bundleProblems,
+  crashLabel,
   launchProblems,
   permissionProblems,
   recordStop,
@@ -44,8 +45,7 @@ if (tree.length) refuse(tree);
 // from here on nothing dies silently (DSR): an uncaught exception or rejection is recorded as a stop
 // (its code or class only, never its message, which may carry a URL) and the process exits non-zero
 const crashed = e => {
-  const what =
-    typeof e?.code === "string" ? e.code : typeof e?.name === "string" ? e.name : "error";
+  const what = crashLabel(e);
   const text = `uncaught ${what}`;
   console.error(`pause-detector: ${text}`);
   recordStop(home, text);

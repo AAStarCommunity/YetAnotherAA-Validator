@@ -961,7 +961,9 @@ cell(
         schema: "aoa-pause-detector-deadman/1",
         at,
         silent: false,
+        heartbeatAt: "2026-11-14T11:00:00Z",
         delivery: { ok: true },
+        undelivered: 0,
         ...extra,
       });
     cell(
@@ -969,6 +971,15 @@ cell(
       deadmanFresh(dmst("2026-11-14T11:50:00Z"), t).length === 0
     );
     for (const [what, text] of [
+      [
+        "an alive snapshot whose heartbeat is now past 2 h (Codex dm-R1 P1-2)",
+        dmst("2026-11-14T11:50:00Z", { heartbeatAt: "2026-11-14T09:55:00Z" }),
+      ],
+      [
+        "undelivered queued alerts (Codex dm-R1 P1-1)",
+        dmst("2026-11-14T11:50:00Z", { undelivered: 1 }),
+      ],
+      ["no heartbeat time", dmst("2026-11-14T11:50:00Z", { heartbeatAt: null })],
       ["no status", null],
       ["a run 50 min ago (3 intervals is 45)", dmst("2026-11-14T11:10:00Z")],
       ["a future run", dmst("2026-11-14T12:05:00Z")],

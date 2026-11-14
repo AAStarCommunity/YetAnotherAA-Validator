@@ -366,7 +366,13 @@ export function deadmanFresh(text, now, maxAgeMs = 3 * 15 * 60_000) {
     return [`the dead-man's last run is ${Math.round((now - at) / 60_000)} min old`];
   if (typeof j.startup === "string") return [`the dead-man's last run stopped: ${j.startup}`];
   if (j.silent !== false) return ["the dead-man reports no successful detector round in 2 h"];
-  if (j.delivery?.ok === false) return ["the dead-man's last alert was not delivered"];
+  // its snapshot can be up to three intervals old: the heartbeat it saw must still be within 2 h
+  // NOW, or the deadline passed since (Codex dm-R1 P1-2)
+  const hb = Date.parse(j.heartbeatAt);
+  if (!Number.isFinite(hb) || now - hb > 2 * 3600_000)
+    return ["the last successful detector round is more than 2 h ago"];
+  if (j.delivery?.ok === false || (Number.isSafeInteger(j.undelivered) && j.undelivered > 0))
+    return ["the dead-man has undelivered alerts"];
   return [];
 }
 

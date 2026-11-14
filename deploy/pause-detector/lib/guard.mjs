@@ -76,6 +76,38 @@ export const ENTRIES = Object.freeze({
   deadman: { script: "deadman.mjs", write: "deadman" },
 });
 
+/**
+ * A fixed label for an uncaught error (DSR: logged; Codex dm-R1 P1-3: never its text). Only an
+ * allowlisted code shape (ERR_* / E*) or a known error class name passes; anything else, and any
+ * getter that throws, is "error". Never throws.
+ */
+export function crashLabel(e) {
+  try {
+    const c = e?.code;
+    if (typeof c === "string" && /^(ERR_[A-Z0-9_]{1,60}|E[A-Z0-9]{2,20})$/.test(c)) return c;
+  } catch {
+    /* a throwing getter */
+  }
+  try {
+    const n = e?.name;
+    if (typeof n === "string" && CRASH_NAMES.has(n)) return n;
+  } catch {
+    /* a throwing getter */
+  }
+  return "error";
+}
+const CRASH_NAMES = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "SafeError",
+  "GuardError",
+  "AbortError",
+  "TimeoutError",
+]);
+
 /** The bundle's manifest file name, at the bundle root. */
 export const MANIFEST = "MANIFEST.json";
 /** The detector's directory, under the home directory: config, secrets, state and the bundle. */

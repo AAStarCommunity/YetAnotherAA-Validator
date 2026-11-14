@@ -51,6 +51,7 @@ import {
 import {
   bundleProblems,
   launchProblems,
+  crashLabel,
   readOwnJson,
   recordStop,
   symlinkProblems,
@@ -1902,6 +1903,33 @@ await cell(
       );
     })
 );
+await cell(
+  "crash label: only an allowlisted code or class, never text, never a throw (Codex dm-R1 P1-3)",
+  () => {
+    assert(crashLabel({ code: "ERR_ACCESS_DENIED" }) === "ERR_ACCESS_DENIED", "control code");
+    assert(crashLabel(new TypeError("x https://key@rpc")) === "TypeError", "control class");
+    for (const e of [
+      { code: "https://provider.example/secret" },
+      { name: "https://provider.example/secret" },
+      { code: "E" + "x".repeat(40) },
+      "a string with a url https://x",
+      null,
+      {
+        get code() {
+          throw new Error("boom");
+        },
+        get name() {
+          throw new Error("boom");
+        },
+      },
+    ])
+      assert(
+        crashLabel(e) === "error",
+        "a non-allowlisted error produced a label other than error"
+      );
+  }
+);
+
 // ---------------------------------------------------------------- dead-man (DSR)
 
 await cell("dead-man: the decision (alive, silent, re-alert, resume, missing, future)", () => {
@@ -2046,9 +2074,11 @@ await cell(
         { mode: 0o600 }
       );
       const r2 = run();
+      // alive now; with telegram null nothing can be delivered, so the outage alert and the
+      // resume notice stay queued (exit 1) and are never dropped (Codex dm-R1 P1-1)
       assert(
-        r2.status === 0 && status().silent === false,
-        `fresh heartbeat: ${r2.status} ${r2.stderr}`
+        r2.status === 1 && status().silent === false && status().undelivered === 2,
+        `fresh heartbeat: ${r2.status} ${JSON.stringify(status())}`
       );
       // and it may not write the detector's state (the grant is deadman/ only)
       assert(

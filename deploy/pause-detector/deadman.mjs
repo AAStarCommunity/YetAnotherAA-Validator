@@ -17,6 +17,7 @@ import { join } from "node:path";
 import {
   DIR,
   bundleProblems,
+  crashLabel,
   launchProblems,
   permissionProblems,
   recordStop,
@@ -46,8 +47,7 @@ if (first.length) refuse(first);
 const tree = [...symlinkProblems(d), ...bundleProblems(join(d, "app"))];
 if (tree.length) refuse(tree);
 const crashed = e => {
-  const what =
-    typeof e?.code === "string" ? e.code : typeof e?.name === "string" ? e.name : "error";
+  const what = crashLabel(e);
   console.error(`pause-detector dead-man: uncaught ${what}`);
   recordStop(home, `uncaught ${what}`, "deadman");
   process.exit(1);

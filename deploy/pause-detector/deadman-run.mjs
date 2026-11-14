@@ -97,18 +97,25 @@ export async function main() {
   }
   const now = Date.now();
   const dec = deadmanDecision(hb, now, st);
+  // messages not yet delivered are queued in the state and sent first next run, whatever the
+  // heartbeat says by then: an outage alert that failed is never dropped because a round completed
+  // before the retry (Codex dm-R1 P1-1). The state machine (alerting) advances regardless.
+  const queue = (Array.isArray(st.queue) ? st.queue.filter(q => typeof q === "string") : []).slice(
+    -10
+  );
+  if (dec.message) queue.push(`${new Date(now).toISOString()} ${dec.message}`);
   let delivery = { ok: true, sent: 0 };
-  let keep = dec.next;
-  if (dec.message) {
+  let undelivered = [];
+  if (queue.length) {
     const r = await telegram(
       cfg,
       token,
-      `DVT pause detector (chain ${cfg.chainId}): ${dec.message}`
+      `DVT pause detector (chain ${cfg.chainId}):\n${queue.join("\n")}`
     );
-    delivery = { ...r, sent: r.ok ? 1 : 0 };
-    // an alert not delivered is retried next run (the old state is kept)
-    if (!r.ok) keep = st;
+    delivery = { ...r, sent: r.ok ? queue.length : 0 };
+    if (!r.ok) undelivered = queue.slice(-10);
   }
+  const keep = { ...dec.next, queue: undelivered };
   try {
     writeDurable(join(own, "state.json"), keep);
     writeDurable(join(own, "status.json"), {
@@ -117,9 +124,10 @@ export async function main() {
       heartbeatAt: hb?.at ?? null,
       silent: dec.silent,
       delivery,
+      undelivered: undelivered.length,
     });
   } catch (e) {
     return stop(1, safeText("dead-man state", e));
   }
-  return dec.silent || !delivery.ok ? 1 : 0;
+  return dec.silent || undelivered.length ? 1 : 0;
 }
