@@ -1215,6 +1215,22 @@ await cell(
       );
       rmSync(join(d, "link.json"));
       assert(symlinkProblems(d).length === 0, "control: no symlink");
+      // with `inside`: a link within the tree is allowed, one leading out is not (Codex R6 P1)
+      mkdirSync(join(d, "in"));
+      writeFileSync(join(d, "in", "t.js"), "", { mode: 0o600 });
+      const out = realpathSync(mkdtempSync(join(tmpdir(), "pd-out-")));
+      try {
+        symlinkSync(join(d, "in", "t.js"), join(d, "in", "inner"));
+        symlinkSync(out, join(d, "in", "outer"));
+        const q = symlinkProblems(join(d, "in"), 100, join(d, "in"));
+        assert(q.length === 1 && q[0].includes("outer") && q[0].includes("leaving"), q.join("; "));
+      } finally {
+        rmSync(out, { recursive: true, force: true });
+      }
+      // the real checkout passes (its node_modules/.bin links stay inside it)
+      const repo = resolve(HERE, "../..");
+      const rp = symlinkProblems(repo, 500_000, repo);
+      assert(rp.length === 0, `the repo has a link leaving it: ${rp.slice(0, 2).join("; ")}`);
     } finally {
       rmSync(d, { recursive: true, force: true });
     }
@@ -1269,6 +1285,45 @@ await cell(
         `tree: ${t.status} ${t.stderr}`
       );
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+);
+await cell(
+  "permission: a symlink in the repo leading outside it makes detector.mjs refuse (Codex R6 P1)",
+  () => {
+    const home = realpathSync(mkdtempSync(join(homedir(), ".pd-check-")));
+    const repo = resolve(HERE, "../..");
+    const link = join(repo, ".pd-check-outward-link");
+    try {
+      const d = join(home, ".aoa-pause-detector");
+      mkdirSync(join(d, "state"), { recursive: true });
+      writeFileSync(join(d, "config.json"), "{}", { mode: 0o600 });
+      mkdirSync(join(home, "keeper"));
+      writeFileSync(join(home, "keeper", "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key", {
+        mode: 0o600,
+      });
+      symlinkSync(join(home, "keeper"), link);
+      const r = spawnSync(
+        process.execPath,
+        [
+          PERM_FLAG,
+          `--allow-fs-read=${repo}`,
+          `--allow-fs-read=${d}`,
+          `--allow-fs-write=${join(d, "state")}`,
+          join(HERE, "detector.mjs"),
+          "--config",
+          join(d, "config.json"),
+        ],
+        { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+      );
+      assert(
+        r.status === 78 &&
+          /pd-check-outward-link is a symlink leaving the repository/.test(r.stderr),
+        `${r.status} ${r.stderr}`
+      );
+    } finally {
+      rmSync(link, { force: true });
       rmSync(home, { recursive: true, force: true });
     }
   }

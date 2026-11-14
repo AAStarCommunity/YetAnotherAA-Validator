@@ -21,6 +21,7 @@ import {
   openSync,
   readSync,
   readdirSync,
+  realpathSync,
   renameSync,
   writeSync,
 } from "node:fs";
@@ -155,10 +156,19 @@ export function readOwnJson(path, what) {
 }
 
 /**
- * Symlinks anywhere under `dir` (lstat, never followed), at most `limit` entries visited. Any one
- * is a problem: the permission model would follow it out of the granted tree. Returns the problems.
+ * Symlinks under `dir` (lstat, never followed), at most `limit` entries visited. The permission
+ * model would follow a symlink out of the granted tree, so: with `inside` unset every symlink is a
+ * problem; with `inside` set (the repo: npm's node_modules/.bin links), a symlink is allowed only
+ * if its real path lies inside `inside` (Codex R6 P1). Returns the problems.
  */
-export function symlinkProblems(dir, limit = 10_000) {
+export function symlinkProblems(dir, limit = 10_000, inside = null) {
+  let root = null;
+  if (inside)
+    try {
+      root = realpathSync(inside);
+    } catch {
+      return [`${inside} cannot be resolved`];
+    }
   const p = [];
   const stack = [dir];
   let seen = 0;
@@ -173,7 +183,15 @@ export function symlinkProblems(dir, limit = 10_000) {
     }
     if (++seen > limit) return [...p, `more than ${limit} entries under ${dir}`];
     if (st.isSymbolicLink()) {
-      p.push(`${d} is a symlink`);
+      let target = null;
+      if (root)
+        try {
+          target = realpathSync(d);
+        } catch {
+          target = null;
+        }
+      if (!root || !target || !target.startsWith(`${root}/`))
+        p.push(`${d} is a symlink${root ? " leaving the repository" : ""}`);
       continue;
     }
     if (st.isDirectory()) {
@@ -472,7 +490,15 @@ async function main() {
   const cfgPath = tilde(i >= 0 ? args[next] : undefined);
   if (!cfgPath) die(2, "usage: detector.mjs --config <file>");
   // nothing under ~/.aoa-pause-detector may be a symlink (Codex R5 P1-1)
-  const sl = symlinkProblems(join(homedir(), ".aoa-pause-detector"));
+  const sl = [
+    ...symlinkProblems(join(homedir(), ".aoa-pause-detector")),
+    // the repo is granted too: no symlink in it may lead outside it (Codex R6 P1)
+    ...symlinkProblems(
+      resolve(dirname(fileURLToPath(import.meta.url)), "../.."),
+      500_000,
+      resolve(dirname(fileURLToPath(import.meta.url)), "../..")
+    ),
+  ];
   if (sl.length) die(78, `refusing to run: ${sl.slice(0, 3).join("; ")}`);
   let cfg;
   try {

@@ -36,10 +36,16 @@ Three layers carry it, and they are not equally strong:
        grants with the arguments unchanged (Codex R4).
    - **Symlinks.** The permission model follows a symlink inside a granted
      directory to a target outside it (Codex R5). So the detector refuses to
-     start if anything under `~/.aoa-pause-detector` is a symlink. It also reads
-     its config and state with `O_NOFOLLOW`, checked on the descriptor: a
-     regular file, this uid, writable by nobody else. The secrets were already
-     read that way.
+     start in two cases:
+     - anything under `~/.aoa-pause-detector` is a symlink;
+     - a symlink in the repository, which is granted too, has its real path
+       outside the repository (Codex R6). npm's `node_modules/.bin` links stay
+       inside, so they pass. The walk covers about 30k entries.
+
+     It also reads its config and state with `O_NOFOLLOW`, checked on the
+     descriptor: a regular file, this uid, writable by nobody else. The secrets
+     were already read that way.
+
    - **Preflight.** It checks that launchd LOADED exactly these arguments, and
      that the loaded or inherited environment holds no such variable.
    - **Tests.** A CI cell runs node with the plist's flags and proves that
