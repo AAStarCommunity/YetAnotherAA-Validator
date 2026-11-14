@@ -273,12 +273,12 @@ unrelated process. So a **separate** launchd job watches it:
   throw and B still canonical, whether or not it reads clear. A round that reads
   unknown still alerts on its own, so the heartbeat only answers "is the
   detector running rounds at all".
-- **Check.** The dead-man reads only that timestamp. With no completed round for
-  more than **2 hours**, it alerts via aastar-monitor, repeating every 6 hours
-  while that lasts. A missing heartbeat, an unreadable one or one dated in the
-  future counts as silence. It sends one `rounds resumed` notice when the
-  heartbeat is fresh again. An alert that was not delivered is retried at the
-  next run.
+- **Check.** Of the heartbeat the dead-man reads only `schema`, `at` and `gaps`.
+  With no completed round for more than **2 hours**, it alerts via
+  aastar-monitor, repeating every 6 hours while that lasts. A missing heartbeat,
+  an unreadable one or one dated in the future counts as silence. It sends one
+  `rounds resumed` notice when the heartbeat is fresh again. An alert that was
+  not delivered is retried at the next run.
 - **No message lost silently.**
   - Undelivered messages are queued in the dead-man's state, written **before**
     each delivery attempt and emptied only once Telegram accepted them.
@@ -295,13 +295,18 @@ unrelated process. So a **separate** launchd job watches it:
 - **Outages carried until acknowledged.** A host crash (no fsync under the
   permission model) can still roll back the queue, and a later round can
   overwrite the heartbeat before the dead-man reads it. So the heartbeat itself
-  carries `gaps`: every outage (no completed round for more than 2 h) the
-  dead-man has not acknowledged yet.
+  carries `gaps`: the outages (no completed round for more than 2 h) the
+  dead-man has not acknowledged yet, at most 20 of them.
   - A new gap is added when the previous completed round is more than 2 h old.
   - The detector drops a gap only once it appears in the dead-man's
     `reportedGaps`.
   - The dead-man reports each gap it has not reported yet, once, and adds it to
     `reportedGaps` only after the whole queue was delivered (Codex dm-R6 P1).
+
+  - Past 20 unacknowledged gaps, the first and the latest 19 are kept and the
+    ones in between are dropped unreported. That needs 20 separate outages with
+    the dead-man not running or not delivering through all of them, a state
+    preflight already fails on (`pause-detector-deadman`).
 
   So an outage is reported even if its queued alert was lost or the heartbeat
   has moved on twice. The worst case is a duplicate (Codex dm-R4, dm-R5).
