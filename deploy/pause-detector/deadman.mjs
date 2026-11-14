@@ -8,10 +8,11 @@
 //     --allow-fs-write=~/.aoa-pause-detector/deadman \
 //     ~/.aoa-pause-detector/app/deploy/pause-detector/deadman.mjs --config ~/.aoa-pause-detector/config.json
 //
-// It reads ONLY the detector's heartbeat (state/heartbeat.json, written by each completed round)
-// and alerts via aastar-monitor when there has been no completed round for 2 hours: a detector that
-// stops silently, never starts, hangs or crashes then still gives a signal. Guards first, as in
-// detector.mjs; then deadman-run.mjs.
+// Of the detector's files it reads only the heartbeat (state/heartbeat.json, written by each
+// completed round); besides that it reads the shared config, the alert bot token and its own state.
+// It alerts through the detector's Telegram path (aastar-monitor) when there has been no completed
+// round for 2 hours, so a detector that never starts, hangs, crashes or is killed still gives a
+// signal. Guards first, as in detector.mjs; then deadman-run.mjs.
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {

@@ -5,7 +5,10 @@
 //   - no completed round for more than MAX_SILENCE_MS (2 h, DSR), the heartbeat missing,
 //     unreadable or dated in the future: ALERT "no successful round", repeated every REALERT_MS
 //     while it lasts;
-//   - a fresh heartbeat after an alert: one "rounds resumed" notice.
+//   - a fresh heartbeat after an alert: one "rounds resumed" notice;
+//   - a fresh heartbeat that carries an outage (gaps) not yet acknowledged: one notice per gap,
+//     acknowledged (reportedGaps) only once every queued message was delivered.
+// Undelivered messages stay queued in its state and are retried first on the next run.
 // It writes only ~/.aoa-pause-detector/deadman (its own state and status). It holds no key and
 // reads no chain: it watches the detector, not SuperPaymaster.
 import { lstatSync } from "node:fs";
@@ -23,9 +26,10 @@ export const REALERT_MS = 6 * 3600_000;
 
 /**
  * The decision, pure. `hb` is the parsed heartbeat (or null when missing/unreadable), `st` the
- * dead-man's own state { alerting, lastSent }. Returns { silent, ageMs, message, next } where
- * `message` is the text to send (or null) and `next` the state to keep IF that message was sent
- * (when it was not, the caller keeps `st`, so the alert is retried next run).
+ * dead-man's own state { alerting, lastSent, reportedGaps }. Returns { silent, ageMs, message,
+ * next } where `message` is the text to queue (or null) and `next` the next state. The caller
+ * persists `next` with the message queued (so a failed send is retried from the queue, not
+ * re-decided), and commits `next.reportedGaps` only after the whole queue was delivered.
  */
 export function deadmanDecision(hb, now, st) {
   const at = hb?.schema === "aoa-pause-detector-heartbeat/1" ? Date.parse(hb.at) : NaN;

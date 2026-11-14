@@ -269,8 +269,8 @@ unrelated process. So a **separate** launchd job watches it:
 `io.aastar.dvt-pause-detector-deadman`, every 15 minutes (`deadman.mjs`).
 
 - **Heartbeat.** Every **completed** round writes
-  `state/heartbeat.json { at, block, clear }`. A completed round means no throw
-  and B still canonical, whether or not it reads clear. A round that reads
+  `state/heartbeat.json { at, gaps, block, clear }`. A completed round means no
+  throw and B still canonical, whether or not it reads clear. A round that reads
   unknown still alerts on its own, so the heartbeat only answers "is the
   detector running rounds at all".
 - **Check.** The dead-man reads only that timestamp. With no completed round for
@@ -282,10 +282,16 @@ unrelated process. So a **separate** launchd job watches it:
 - **No message lost silently.**
   - Undelivered messages are queued in the dead-man's state, written **before**
     each delivery attempt and emptied only once Telegram accepted them.
+  - The queue goes out in messages of whole lines under Telegram's limit; each
+    delivered message leaves the queue, the rest is retried (Codex dm-R6 P2). A
+    message already queued is not queued again.
   - A long queue is compacted, never truncated: it keeps the first outage, a
     count of what was folded, and the latest messages.
   - An existing state that cannot be read stops the run visibly, and the file is
     left as it is.
+  - Its directory `~/.aoa-pause-detector/deadman` must be a real directory owned
+    by the job's account, mode `700`, the same rule as the detector's state
+    directory; otherwise the run stops (exit 78) (Codex dm-R7).
 - **Outages carried until acknowledged.** A host crash (no fsync under the
   permission model) can still roll back the queue, and a later round can
   overwrite the heartbeat before the dead-man reads it. So the heartbeat itself
@@ -294,7 +300,8 @@ unrelated process. So a **separate** launchd job watches it:
   - A new gap is added when the previous completed round is more than 2 h old.
   - The detector drops a gap only once it appears in the dead-man's
     `reportedGaps`.
-  - The dead-man reports each gap it has not reported yet, once.
+  - The dead-man reports each gap it has not reported yet, once, and adds it to
+    `reportedGaps` only after the whole queue was delivered (Codex dm-R6 P1).
 
   So an outage is reported even if its queued alert was lost or the heartbeat
   has moved on twice. The worst case is a duplicate (Codex dm-R4, dm-R5).

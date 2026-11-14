@@ -42,8 +42,9 @@ const first = [
 if (first.length) refuse(first);
 const tree = [...symlinkProblems(d), ...bundleProblems(join(d, "app"))];
 if (tree.length) refuse(tree);
-// from here on nothing dies silently (DSR): an uncaught exception or rejection is recorded as a stop
-// (its code or class only, never its message, which may carry a URL) and the process exits non-zero
+// from here on an uncaught exception or rejection is recorded as a stop (DSR: logged; its code or
+// class only, never its message, which may carry a URL) and the process exits non-zero. A death
+// nothing can catch (SIGKILL, power loss) records nothing: the dead-man check covers that
 const crashed = e => {
   const what = crashLabel(e);
   const text = `uncaught ${what}`;
