@@ -351,6 +351,7 @@ function fakeChain(w) {
         const n = Number(BigInt(f.blockHash));
         assert(f.blockHash === hashOf(n) && n <= w.latest, "blockHash filter of an unknown block");
         if (n === w.latest) failIf("logs-at-B");
+        failIf(`logs-at-${n}`);
         a = b = n;
       } else {
         if (w.failOnce?.delete(`logs:${Number(f.fromBlock)}`)) throw new Error("once");
@@ -367,7 +368,8 @@ function fakeChain(w) {
             o.logBlock <= b &&
             !w.hidden?.has(o.logBlock) &&
             !(w.rangeSkipsB && !f.blockHash && o.logBlock === w.latest) &&
-            !(w.rangeHides?.has(o.logBlock) && !f.blockHash)
+            !(w.rangeHides?.has(o.logBlock) && !f.blockHash) &&
+            !(w.hashHides?.has(o.logBlock) && f.blockHash)
         )
         .map(([op, o]) => ({
           address: SP,
@@ -821,7 +823,7 @@ await cell(
       "the omitted operator was not read"
     );
     assert(
-      alerts.some(a => /block\(s\) 280 differ/.test(a.text)) && !report.clear,
+      alerts.some(a => /block 280 differ/.test(a.text)) && !report.clear,
       alerts.map(a => a.text).join("; ")
     );
   }
@@ -841,7 +843,7 @@ await cell("round: B == finalized == cursor still asks B by hash and compares", 
     "B's by-hash operator dropped"
   );
   assert(
-    !report.clear && alerts.some(a => /block\(s\) 250 differ/.test(a.text)),
+    !report.clear && alerts.some(a => /block 250 differ/.test(a.text)),
     alerts.map(a => a.text).join("; ")
   );
 });
@@ -938,12 +940,12 @@ await cell(
 );
 
 await cell(
-  "round: a disputed block stays disputed across finalization until by-hash and by-range agree (Codex R9 P1)",
+  "round: a block not yet cross-checked stays pending across finalization until by-hash and by-range agree (Codex R9, R10)",
   async () => {
     const cfg = cfgOf({ rescanBlocks: 20000 });
     const st = { ...emptyState(cfg), lastFullScan: 1e12 };
     const w = world({ latest: 300, finalized: 250, rangeHides: new Set([290]) });
-    // a staked operator, so "clear" is a real claim once the dispute resolves
+    // a staked operator, so "clear" is a real claim once the check catches up
     w.ops[OP2.toLowerCase()] = {
       configured: true,
       paused: false,
@@ -953,29 +955,95 @@ await cell(
     };
     const r1 = await round(w, cfg, st, 1e12 + 1000);
     assert(
-      !r1.report.clear && st.disputed["290"],
-      `round 1: clear=${r1.report.clear} disputed=${JSON.stringify(st.disputed)}`
+      !r1.report.clear && st.checked < 290,
+      `round 1: clear=${r1.report.clear} checked=${st.checked}`
     );
     assert(st.operators[ethers.getAddress(OP2)] === 290, "the hash-only operator was not kept");
-    // block 290 is now finalized; the range backend STILL omits it: not clear, still disputed
+    // block 290 is finalized now; the range backend STILL omits it: not clear, 290 still pending
     Object.assign(w, { latest: 600, finalized: 550 });
     const r2 = await round(w, cfg, st, 1e12 + 2000);
     assert(
-      !r2.report.clear && st.disputed["290"],
-      `round 2: clear=${r2.report.clear} disputed=${JSON.stringify(st.disputed)}`
+      !r2.report.clear && st.checked < 290,
+      `round 2: clear=${r2.report.clear} checked=${st.checked}`
     );
     assert(
       r2.report.operators.some(o => o.operator === ethers.getAddress(OP2)),
       "the operator disappeared"
     );
-    // control: the range backend recovers; the dispute is released and the round is clear
+    // a failed by-hash read at 290 (Codex R10 #1): still pending, not clear
+    w.fail = new Set(["logs-at-290"]);
     w.rangeHides = new Set();
+    const r2b = await round(w, cfg, st, 1e12 + 2500);
+    assert(
+      !r2b.report.clear && st.checked < 290,
+      `failed read: clear=${r2b.report.clear} checked=${st.checked}`
+    );
+    // control: both answers recover; the watermark catches up and the round is clear
+    w.fail = new Set();
     Object.assign(w, { latest: 601, finalized: 551 });
     const r3 = await round(w, cfg, st, 1e12 + 3000);
     assert(
-      r3.report.clear && Object.keys(st.disputed).length === 0,
-      `round 3: clear=${r3.report.clear} disputed=${JSON.stringify(st.disputed)} ${r3.alerts.map(a => a.text).join("; ")}`
+      r3.report.clear && st.checked === 551,
+      `round 3: clear=${r3.report.clear} checked=${st.checked} ${r3.alerts.map(a => a.text).join("; ")}`
     );
+  }
+);
+await cell(
+  "round: a watermark above the finalized block is pulled back, so those blocks are compared again",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0 });
+    const st = { ...emptyState(cfg), lastFullScan: 1e12, cursor: 250, checked: 280 };
+    const w = world({ latest: 300, finalized: 250, rangeHides: new Set([260]) });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 500n,
+      logBlock: 260,
+    };
+    const r = await round(w, cfg, st, 1e12 + 1000);
+    assert(
+      !r.report.clear && r.alerts.some(a => /block 260 differ/.test(a.text)),
+      r.alerts.map(a => a.text).join("; ")
+    );
+  }
+);
+await cell(
+  "round: a cross-check backlog over MAX_CHECK blocks is worked off over rounds, unknown meanwhile",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0, logChunk: 5000 });
+    const st = { ...emptyState(cfg), lastFullScan: 1e12, cursor: 9000, checked: 100 };
+    const w = world({ latest: 9010, finalized: 9000 });
+    const r = await round(w, cfg, st, 1e12 + 1000);
+    assert(
+      !r.report.clear && r.alerts.some(a => /cross-check is behind/.test(a.text)),
+      "a backlog read clear"
+    );
+    assert(st.checked === 100 + 4096, `watermark ${st.checked}`);
+    await round(w, cfg, st, 1e12 + 2000);
+    const r3 = await round(w, cfg, st, 1e12 + 3000);
+    assert(
+      r3.report.clear && st.checked === 9000,
+      `after the backlog: clear=${r3.report.clear} checked=${st.checked}`
+    );
+  }
+);
+await cell(
+  "round: an operator seen only in a block's own range retry is kept (Codex R10 #2)",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0 });
+    const st = { ...emptyState(cfg), lastFullScan: 1e12, cursor: 299, checked: 279 };
+    // the range retry of block 280 (not covered by this round's scans) shows it; by hash it is missing
+    const w = world({ latest: 300, finalized: 300, hashHides: new Set([280]) });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 1n,
+      logBlock: 280,
+    };
+    await round(w, cfg, st, 1e12 + 1000);
+    assert(st.operators[ethers.getAddress(OP2)] === 280, "the range-retry operator was not kept");
   }
 );
 

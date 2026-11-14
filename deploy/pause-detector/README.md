@@ -138,16 +138,22 @@ a missed one.
      number. Every log above finalized must come from that chain, so a
      load-balanced endpoint answering from another fork is caught. More than
      2048 blocks above finalized is unknown.
-   - **Every unfinalized block by hash.** Every block above finalized, and B
-     itself, is asked for its logs by hash (EIP-234). Those operators count. If
-     a block's by-hash answer differs from its number-range answer, the round is
-     unknown. This runs every round, even when the cursor has reached B, so a
-     lagging range backend that omits a log is caught.
-   - **Disputed blocks.** A block whose two answers differ is recorded in the
-     state (`disputed`, block → hash) and the cursor moves back before it. Every
-     later round asks it again, by hash and by range, across finalization. The
-     round stays unknown until both answers agree. A disputed block that left
-     the canonical chain is released (Codex R8, R9).
+   - **The cross-check watermark (`checked`).** Every block up to `checked` was
+     asked for its logs both by hash (EIP-234) and by range, and the two answers
+     agreed. Each round asks every block in (`checked`, B] both ways and
+     compares them. A block above finalized uses the hash from B's ancestry
+     walk; one at or below it uses the canonical hash by number. A block that no
+     range scan of this round covered gets its own range query.
+     - The watermark only advances over contiguous blocks that agreed, and never
+       past finalized, since a block above it can still be replaced.
+     - A failed read or a disagreement stops it where it is. On a disagreement
+       the cursor also moves back before that block.
+     - So the block is asked again next round, before and after finalization
+       alike. The round stays unknown until the watermark is within reach of B.
+     - This runs every round, even when the cursor has reached B, so a lagging
+       or forked range backend that omits a log is caught (Codex R3, R8–R10).
+     - At most 4096 blocks are checked per round. A larger backlog (after a long
+       outage) is worked off over several rounds and reads unknown meanwhile.
    - **The inventory only grows.** Every operator seen by range or by hash is
      kept, whatever else failed that round. So an incomplete later answer cannot
      make one disappear. One that is not real costs a read and reads
