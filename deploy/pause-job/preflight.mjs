@@ -35,7 +35,9 @@ import {
 
 export const DETECTOR_LABEL = "io.aastar.dvt-pause-detector";
 export const KEEPER_LABEL = "io.aastar.price-keeper";
-export const REQUIRED_LABELS = [DETECTOR_LABEL, KEEPER_LABEL];
+// the detector's dead-man check (DSR: required before the detector is rc.8's pause path)
+export const DEADMAN_LABEL = "io.aastar.dvt-pause-detector-deadman";
+export const REQUIRED_LABELS = [DETECTOR_LABEL, DEADMAN_LABEL, KEEPER_LABEL];
 export const FORBIDDEN_LABELS = [
   "io.aastar.dvt-committee-keeper",
   "io.aastar.dvt-apply-rotation",
@@ -307,7 +309,9 @@ export const DETECTOR_NODE = ".local/keeper-node/node-v24.21.0/bin/node";
  * so it is under the permission model with nothing more allowed (no --allow-child-process, no
  * wider read or write). `args` is what launchd loaded (null when unreadable). Pure.
  */
-export function detectorArgsProblems(args, home, env = [], inherited = []) {
+export function detectorArgsProblems(args, home, env = [], inherited = [], entry = "detector") {
+  const write = entry === "deadman" ? "deadman" : "state";
+  const script = entry === "deadman" ? "deadman.mjs" : "detector.mjs";
   if (!Array.isArray(args)) return ["the detector's loaded arguments cannot be read"];
   // NODE_OPTIONS=--allow-fs-read=<key> would widen the grants with the arguments unchanged
   // (Codex R4 P1-1): no option-injecting variable, set or inherited
@@ -327,15 +331,48 @@ export function detectorArgsProblems(args, home, env = [], inherited = []) {
     `${home}/${DETECTOR_NODE}`,
     "--permission",
     `--allow-fs-read=${d}`,
-    `--allow-fs-write=${d}/state`,
-    `${d}/app/deploy/pause-detector/detector.mjs`,
+    `--allow-fs-write=${d}/${write}`,
+    `${d}/app/deploy/pause-detector/${script}`,
     "--config",
     `${d}/config.json`,
   ];
   if (args.join("\n") !== want.join("\n"))
     return [
-      "the detector does not run exactly as its plist: the pinned node, --permission, reads of ~/.aoa-pause-detector only, writes of its state only, from its bundle",
+      `the ${entry} does not run exactly as its plist: the pinned node, --permission, reads of ~/.aoa-pause-detector only, writes of its ${write} only, from its bundle`,
     ];
+  return [];
+}
+
+/**
+ * pause-detector-deadman: the dead-man check itself ran recently (at most three of its 15-minute
+ * intervals ago, not in the future), reports the detector alive, and delivered whatever it sent.
+ * A dead-man that is not running is as silent as the detector it watches. Returns the problems.
+ * Pure.
+ */
+export function deadmanFresh(text, now, maxAgeMs = 3 * 15 * 60_000) {
+  if (text === null) return ["the dead-man check has written no status.json"];
+  let j;
+  try {
+    j = JSON.parse(text);
+  } catch {
+    return ["the dead-man's status.json is not JSON"];
+  }
+  if (j?.schema !== "aoa-pause-detector-deadman/1")
+    return ["the dead-man's status.json is not the dead-man's"];
+  const at = Date.parse(j.at);
+  if (!Number.isFinite(at)) return ["the dead-man's status.json has no time"];
+  if (at > now) return ["the dead-man's status.json is dated in the future"];
+  if (now - at > maxAgeMs)
+    return [`the dead-man's last run is ${Math.round((now - at) / 60_000)} min old`];
+  if (typeof j.startup === "string") return [`the dead-man's last run stopped: ${j.startup}`];
+  if (j.silent !== false) return ["the dead-man reports no successful detector round in 2 h"];
+  // its snapshot can be up to three intervals old: the heartbeat it saw must still be within 2 h
+  // NOW, or the deadline passed since (Codex dm-R1 P1-2)
+  const hb = Date.parse(j.heartbeatAt);
+  if (!Number.isFinite(hb) || now - hb > 2 * 3600_000)
+    return ["the last successful detector round is more than 2 h ago"];
+  if (j.delivery?.ok === false || (Number.isSafeInteger(j.undelivered) && j.undelivered > 0))
+    return ["the dead-man has undelivered alerts"];
   return [];
 }
 
@@ -519,6 +556,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       dl?.inherited ?? []
     );
     results.push(["detector-args", da.length ? "FAIL" : "PASS", da]);
+    const ml = programOf(DEADMAN_LABEL);
+    const ma = detectorArgsProblems(
+      ml?.args ?? null,
+      homedir(),
+      ml?.env ?? null,
+      ml?.inherited ?? [],
+      "deadman"
+    );
+    results.push(["deadman-args", ma.length ? "FAIL" : "PASS", ma]);
     // the bundle is exactly its manifest and nothing under ~/.aoa-pause-detector is a symlink:
     // checked here from outside the permission model too, so the entry file itself is covered
     const db = detectorBundleItem(homedir());
@@ -539,6 +585,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     fr.problems.length ? "FAIL" : "PASS",
     fr.problems.length ? fr.problems : [fr.note],
   ]);
+  let deadmanText = null;
+  try {
+    deadmanText = readFileSync(join(homedir(), ".aoa-pause-detector/deadman/status.json"), "utf8");
+  } catch {
+    deadmanText = null;
+  }
+  const dm = deadmanFresh(deadmanText, Date.now());
+  results.push(["pause-detector-deadman", dm.length ? "FAIL" : "PASS", dm]);
   const envOf = n => {
     const out = run("docker", ["inspect", n, "--format", "{{json .Config.Env}}"]);
     try {

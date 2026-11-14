@@ -1,0 +1,234 @@
+// The dead-man check's run (deadman.mjs is the entry and its guards come first). README "Dead-man".
+//
+// One run reads the detector's heartbeat (~/.aoa-pause-detector/state/heartbeat.json, written by
+// every COMPLETED round, clear or not) and decides:
+//   - no completed round for more than MAX_SILENCE_MS (2 h, DSR), the heartbeat missing,
+//     unreadable or dated in the future: ALERT "no successful round", repeated every REALERT_MS
+//     while it lasts;
+//   - a fresh heartbeat after an alert: one "rounds resumed" notice;
+//   - a fresh heartbeat that carries an outage (gaps) not yet acknowledged: one notice per gap,
+//     acknowledged (reportedGaps) only once every queued message was delivered.
+// Undelivered messages stay queued in its state and are retried first on the next run.
+// It writes only ~/.aoa-pause-detector/deadman (its own state and status). It holds no key and
+// reads no chain: it watches the detector, not SuperPaymaster.
+import { lstatSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { GuardError, DIR, MAX_SILENCE_MS, readOwnJson, recordStop } from "./lib/guard.mjs";
+import { DETECTOR_SECRETS, batches, telegram, writeDurable } from "./run.mjs";
+import { dirProblems, readSecretFile } from "../pause-job/lib/secret-file.mjs";
+import { safeText } from "../pause-job/lib/safe-error.mjs";
+
+/** No completed detector round for this long is an alert (DSR: 2 h). */
+export { MAX_SILENCE_MS };
+/** While it lasts, the alert repeats this often. */
+export const REALERT_MS = 6 * 3600_000;
+
+/**
+ * The decision, pure. `hb` is the parsed heartbeat (or null when missing/unreadable), `st` the
+ * dead-man's own state { alerting, lastSent, reportedGaps }. Returns { silent, ageMs, message,
+ * next } where `message` is the text to queue (or null) and `next` the next state. The caller
+ * persists `next` with the message queued (so a failed send is retried from the queue, not
+ * re-decided), and commits `next.reportedGaps` only after the whole queue was delivered.
+ */
+export function deadmanDecision(hb, now, st) {
+  const at = hb?.schema === "aoa-pause-detector-heartbeat/1" ? Date.parse(hb.at) : NaN;
+  const ageMs = Number.isFinite(at) ? now - at : Infinity;
+  // a heartbeat from the future is a clock problem or a forged file: never "alive"
+  const silent = !(ageMs >= 0 && ageMs <= MAX_SILENCE_MS);
+  const alerting = st?.alerting === true;
+  const lastSent = Number.isFinite(st?.lastSent) ? st.lastSent : 0;
+  if (silent) {
+    const due = !alerting || now - lastSent >= REALERT_MS || lastSent > now;
+    const since = Number.isFinite(at)
+      ? `the last one was ${new Date(at).toISOString()}`
+      : "no heartbeat on record";
+    return {
+      silent,
+      ageMs,
+      message: due
+        ? `DEAD-MAN: the pause detector has had no successful round for more than 2 h (${since}). Check the job (launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector) and its status.json.`
+        : null,
+      next: {
+        alerting: true,
+        lastSent: due ? now : lastSent,
+        reportedGaps: Array.isArray(st?.reportedGaps) ? st.reportedGaps : [],
+      },
+    };
+  }
+  // every outage the heartbeat still carries and this dead-man has not reported yet is reported
+  // once (Codex dm-R4, dm-R5); the detector drops a gap from the heartbeat only after it appears in
+  // reportedGaps here
+  const reported = new Set(Array.isArray(st?.reportedGaps) ? st.reportedGaps : []);
+  const gaps = (Array.isArray(hb?.gaps) ? hb.gaps : []).filter(
+    g => typeof g?.from === "string" && typeof g?.to === "string" && !reported.has(g.from)
+  );
+  const msgs = [];
+  if (alerting) msgs.push("DEAD-MAN: the pause detector's rounds have resumed.");
+  for (const g of gaps)
+    msgs.push(
+      `DEAD-MAN: the pause detector had no successful round from ${g.from} to ${g.to} (${Math.round((Date.parse(g.to) - Date.parse(g.from)) / 60_000)} min).`
+    );
+  return {
+    silent,
+    ageMs,
+    message: msgs.length ? msgs.join(" ") : null,
+    next: {
+      alerting: false,
+      lastSent,
+      reportedGaps: [...reported, ...gaps.map(g => g.from)].slice(-50),
+    },
+  };
+}
+
+/** The most queued messages kept as they are; past it the queue is compacted, never truncated. */
+export const QUEUE_MAX = 10;
+
+/**
+ * A queue of undelivered messages, at most QUEUE_MAX lines, losing nothing silently (Codex dm-R2
+ * P1-1): past the limit it keeps the FIRST message (the original outage), one line counting what
+ * is folded, and the latest messages. Pure.
+ */
+export function compactQueue(q) {
+  if (q.length <= QUEUE_MAX) return q;
+  const keepTail = QUEUE_MAX - 2;
+  const dropped = q.slice(1, q.length - keepTail);
+  // a fold line already in the queue counts for the messages it stands for
+  const count = dropped.reduce((n, x) => {
+    const m = x.match(FOLD);
+    return n + (m ? Number(m[1]) : 1);
+  }, 0);
+  return [q[0], `(${count} more undelivered dead-man messages folded here)`, ...q.slice(-keepTail)];
+}
+const FOLD = /^\((\d+) more undelivered dead-man messages folded here\)$/;
+
+/** One run. Returns the exit code: 0 alive, 1 silent (alerted or not), 78 unusable config. */
+export async function main({ send = null } = {}) {
+  const home = homedir();
+  const d = join(home, DIR);
+  const own = join(d, "deadman");
+  const stop = (code, text) => {
+    console.error(`pause-detector dead-man: ${text}`);
+    recordStop(home, text, "deadman");
+    return code;
+  };
+  // its own directory is held to the detector's rule for its state directory: a real directory,
+  // owned by this account, mode exactly 700 (Codex dm-R7 P1)
+  let ownSt = null;
+  try {
+    ownSt = lstatSync(own);
+  } catch {
+    ownSt = null;
+  }
+  const dp = dirProblems(ownSt, process.getuid(), "dead-man directory");
+  if (dp.length) return stop(78, `dead-man directory: ${dp.join("; ")}`);
+  let cfg;
+  try {
+    cfg = readOwnJson(join(d, "config.json"), "config");
+  } catch (e) {
+    return stop(78, e instanceof GuardError ? e.message : "config unreadable");
+  }
+  const tgOk = cfg?.telegram === null || /^-?[0-9]+$/.test(String(cfg?.telegram?.chatId ?? ""));
+  if (!tgOk) return stop(78, "config: telegram must be null or { chatId }");
+  let token = null;
+  if (cfg.telegram)
+    try {
+      token = readSecretFile(DETECTOR_SECRETS.telegram, join(d, "secrets"), {
+        names: DETECTOR_SECRETS,
+      });
+    } catch (e) {
+      return stop(78, `the alert bot token file: ${safeText("secrets", e)}`);
+    }
+  let hb = null;
+  try {
+    hb = readOwnJson(join(d, "state", "heartbeat.json"), "heartbeat");
+  } catch {
+    hb = null; // missing or unreadable: no proof of life
+  }
+  // a MISSING state is a first run; an existing one that cannot be read is a visible stop, and it is
+  // left as it is (it may hold queued alerts), never overwritten as healthy (Codex dm-R2 P1-2)
+  let st = { alerting: false, lastSent: 0, queue: [] };
+  let exists = true;
+  try {
+    lstatSync(join(own, "state.json"));
+  } catch (e) {
+    if (e?.code !== "ENOENT") return stop(1, "the dead-man state cannot be checked");
+    exists = false;
+  }
+  if (exists)
+    try {
+      const j = readOwnJson(join(own, "state.json"), "dead-man state");
+      if (!j || typeof j !== "object" || Array.isArray(j)) throw new GuardError("not an object");
+      st = j;
+    } catch (e) {
+      return stop(
+        1,
+        `the dead-man state is unreadable (${e instanceof GuardError ? e.message : "error"}); left as it is`
+      );
+    }
+  const now = Date.now();
+  const dec = deadmanDecision(hb, now, st);
+  // messages not yet delivered are queued in the state and sent first next run, whatever the
+  // heartbeat says by then: an outage alert that failed is never dropped because a round completed
+  // before the retry (Codex dm-R1 P1-1). The state machine (alerting) advances regardless.
+  // a message already waiting is not queued twice (an unacknowledged gap is re-derived every run
+  // until its delivery is confirmed)
+  const old = Array.isArray(st.queue) ? st.queue.filter(q => typeof q === "string") : [];
+  const waiting = dec.message && old.some(q => q.endsWith(` ${dec.message}`));
+  const queue = compactQueue([
+    ...old,
+    ...(dec.message && !waiting ? [`${new Date(now).toISOString()} ${dec.message}`] : []),
+  ]);
+  // what is acknowledged only once delivered: the gaps this run reports (Codex dm-R6 P1), or the
+  // detector would drop them from the heartbeat before Telegram ever saw them
+  const ackBefore = { reportedGaps: Array.isArray(st.reportedGaps) ? st.reportedGaps : [] };
+  // WRITE-AHEAD (Codex dm-R3 P1): the transition and the queue are persisted BEFORE delivery, so a
+  // run killed mid-request leaves the outage queued for the next one; new acknowledgements are not
+  try {
+    writeDurable(join(own, "state.json"), { ...dec.next, ...ackBefore, queue });
+  } catch (e) {
+    return stop(1, safeText("dead-man state", e));
+  }
+  // delivered in bounded messages of whole lines (Codex dm-R6 P2: one oversized message would be
+  // refused on every retry); each delivered message leaves the queue
+  let delivery = { ok: true, sent: 0 };
+  let undelivered = [];
+  if (queue.length) {
+    const header = `DVT pause detector (chain ${cfg.chainId}):`;
+    let sent = 0;
+    let why;
+    for (const b of batches(
+      header,
+      queue.map(line => ({ line }))
+    )) {
+      // `send` is injectable for the cells; the entry passes none
+      const r = await (send ? send(b.text) : telegram(cfg, token, b.text));
+      if (r.ok) sent += b.items.length;
+      else {
+        undelivered.push(...b.items.map(i => i.line));
+        why = r.why;
+      }
+    }
+    delivery = { ok: undelivered.length === 0, sent, ...(why ? { why } : {}) };
+  }
+  try {
+    // everything delivered: the new acknowledgements are committed now, and only now
+    writeDurable(
+      join(own, "state.json"),
+      undelivered.length
+        ? { ...dec.next, ...ackBefore, queue: undelivered }
+        : { ...dec.next, queue: [] }
+    );
+    writeDurable(join(own, "status.json"), {
+      schema: "aoa-pause-detector-deadman/1",
+      at: new Date(now).toISOString(),
+      heartbeatAt: hb?.at ?? null,
+      silent: dec.silent,
+      delivery,
+      undelivered: undelivered.length,
+    });
+  } catch (e) {
+    return stop(1, safeText("dead-man state", e));
+  }
+  return dec.silent || undelivered.length ? 1 : 0;
+}

@@ -44,10 +44,12 @@ import {
   runsSender,
   parseLaunchctlPrint,
   DETECTOR_LABEL,
+  DEADMAN_LABEL,
   KEEPER_LABEL,
   detectorFresh,
   detectorArgsProblems,
   detectorBundleItem,
+  deadmanFresh,
 } from "./preflight.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -814,7 +816,7 @@ cell(
 // ---- preflight rules
 {
   const ok = launchdOff(
-    [DETECTOR_LABEL, KEEPER_LABEL, "com.apple.x"],
+    [DETECTOR_LABEL, DEADMAN_LABEL, KEEPER_LABEL, "com.apple.x"],
     l => (l === "com.apple.x" ? null : ["/bin/bash", `/x/${l}.sh`]),
     () => ({ kind: "text", text: "echo unrelated" })
   );
@@ -921,6 +923,72 @@ cell(
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  }
+  {
+    const nd = launchdOff([DETECTOR_LABEL, KEEPER_LABEL], () => []);
+    cell(
+      "launchd-on fails when the dead-man check is not loaded",
+      nd.some(p => p.includes(`${DEADMAN_LABEL} is not loaded`)),
+      nd
+    );
+    const H = "/Users/u";
+    const dm = [
+      `${H}/.local/keeper-node/node-v24.21.0/bin/node`,
+      "--permission",
+      `--allow-fs-read=${H}/.aoa-pause-detector`,
+      `--allow-fs-write=${H}/.aoa-pause-detector/deadman`,
+      `${H}/.aoa-pause-detector/app/deploy/pause-detector/deadman.mjs`,
+      "--config",
+      `${H}/.aoa-pause-detector/config.json`,
+    ];
+    cell(
+      "deadman-args passes the dead-man's exact plist form",
+      detectorArgsProblems(dm, H, [], [], "deadman").length === 0
+    );
+    cell(
+      "deadman-args fails when the dead-man may write the detector's state, or runs the detector",
+      detectorArgsProblems(
+        dm.map(a => a.replace("/deadman", "/state")),
+        H,
+        [],
+        [],
+        "deadman"
+      ).length === 1 && detectorArgsProblems(dm, H, [], [], "detector").length === 1
+    );
+    const t = Date.parse("2026-11-14T12:00:00Z");
+    const dmst = (at, extra = {}) =>
+      JSON.stringify({
+        schema: "aoa-pause-detector-deadman/1",
+        at,
+        silent: false,
+        heartbeatAt: "2026-11-14T11:00:00Z",
+        delivery: { ok: true },
+        undelivered: 0,
+        ...extra,
+      });
+    cell(
+      "pause-detector-deadman passes a recent run that saw the detector alive",
+      deadmanFresh(dmst("2026-11-14T11:50:00Z"), t).length === 0
+    );
+    for (const [what, text] of [
+      [
+        "an alive snapshot whose heartbeat is now past 2 h (Codex dm-R1 P1-2)",
+        dmst("2026-11-14T11:50:00Z", { heartbeatAt: "2026-11-14T09:55:00Z" }),
+      ],
+      [
+        "undelivered queued alerts (Codex dm-R1 P1-1)",
+        dmst("2026-11-14T11:50:00Z", { undelivered: 1 }),
+      ],
+      ["no heartbeat time", dmst("2026-11-14T11:50:00Z", { heartbeatAt: null })],
+      ["no status", null],
+      ["a run 50 min ago (3 intervals is 45)", dmst("2026-11-14T11:10:00Z")],
+      ["a future run", dmst("2026-11-14T12:05:00Z")],
+      ["a silent detector", dmst("2026-11-14T11:50:00Z", { silent: true })],
+      ["an undelivered alert", dmst("2026-11-14T11:50:00Z", { delivery: { ok: false } })],
+      ["a stopped dead-man", dmst("2026-11-14T11:50:00Z", { startup: "refusing to run" })],
+      ["another schema", JSON.stringify({ schema: "x", at: "2026-11-14T11:50:00Z" })],
+    ])
+      cell(`pause-detector-deadman fails on ${what}`, deadmanFresh(text, t).length === 1);
   }
   const now = Date.parse("2026-11-14T12:00:00Z");
   const st = (at, clear = true, extra = {}) =>
@@ -1270,14 +1338,14 @@ cell(
       pl,
       loaded = args,
       s = sha,
-      labels = [KEEPER_LABEL, DETECTOR_LABEL, r.label],
+      labels = [KEEPER_LABEL, DETECTOR_LABEL, DEADMAN_LABEL, r.label],
       env = LOADED_ENV,
       inherited = ["SSH_AUTH_SOCK"]
     ) =>
       launchdOff(
         labels,
         l =>
-          l === DETECTOR_LABEL
+          l === DETECTOR_LABEL || l === DEADMAN_LABEL
             ? { args: ["/usr/bin/node", "/d/detector.mjs"], env: [], inherited: [] }
             : { args: loaded, env, inherited },
         txt,
