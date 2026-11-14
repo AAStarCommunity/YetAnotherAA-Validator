@@ -146,6 +146,14 @@ a missed one.
      range scan of this round covered gets its own range query.
      - The watermark only advances over contiguous blocks that agreed, and never
        past finalized, since a block above it can still be replaced.
+     - It starts below `startBlock`, so every block is compared once, even if
+       the first rounds fail (Codex R11).
+     - It is bound to the canonical hash of its block. If that hash changes, the
+       chain under it changed: the watermark and the cursor move back 2048
+       blocks, and an alert says so.
+     - A round's progress (cursor, watermark, rescan time) is committed only if
+       B is still canonical at the end. A rejected round leaves them where they
+       were. The inventory still keeps what it saw, since a superset is safe.
      - A failed read or a disagreement stops it where it is. On a disagreement
        the cursor also moves back before that block.
      - So the block is asked again next round, before and after finalization

@@ -1029,6 +1029,89 @@ await cell(
   }
 );
 await cell(
+  "round: a failed first round skips nothing: the watermark starts below startBlock (Codex R11 P1-1)",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 20000 });
+    const st = emptyState(cfg);
+    assert(st.checked === cfg.startBlock - 1 && st.checkedHash === null, "fresh watermark");
+    const w = world({
+      latest: 300,
+      finalized: 250,
+      rangeHides: new Set([290]),
+      fail: new Set(["blockByHash"]),
+    });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 1n,
+      logBlock: 290,
+    };
+    const r1 = await round(w, cfg, st, 1e12);
+    assert(!r1.report.clear, "round 1 clear with a failed ancestry walk");
+    // the backend recovers its ancestry, much later; the range still omits 290
+    Object.assign(w, { fail: new Set(), latest: 600, finalized: 550 });
+    const r2 = await round(w, cfg, st, 1e12 + 3600_000);
+    assert(
+      !r2.report.clear && st.operators[ethers.getAddress(OP2)] === 290,
+      `round 2: clear=${r2.report.clear}`
+    );
+    assert(
+      r2.alerts.some(a => /block 290 differ/.test(a.text)),
+      r2.alerts.map(a => a.text).join("; ")
+    );
+  }
+);
+await cell(
+  "round: a round whose B left the chain commits no progress (Codex R11 P1-2)",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0 });
+    const st = { ...emptyState(cfg), lastFullScan: 1e12, cursor: 250, checked: 249 };
+    const before = JSON.stringify({
+      c: st.cursor,
+      k: st.checked,
+      h: st.checkedHash,
+      f: st.lastFullScan,
+    });
+    const r = await round(
+      world({ latest: 300, finalized: 300, reorg: true }),
+      cfg,
+      st,
+      1e12 + 1000
+    );
+    assert(r.alerts.some(a => a.key === "reorg") && !r.report.clear, "no reorg");
+    const after = JSON.stringify({
+      c: st.cursor,
+      k: st.checked,
+      h: st.checkedHash,
+      f: st.lastFullScan,
+    });
+    assert(after === before, `progress kept: ${after} vs ${before}`);
+  }
+);
+await cell(
+  "round: a watermark whose block hash changed moves back, cursor with it, and says so",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0 });
+    const st = {
+      ...emptyState(cfg),
+      lastFullScan: 1e12,
+      cursor: 250,
+      checked: 240,
+      checkedHash: `0x${"ee".repeat(32)}`,
+    };
+    const r = await round(world({ latest: 300, finalized: 250 }), cfg, st, 1e12 + 1000);
+    assert(
+      r.alerts.some(a => a.key === "watermark-reorg"),
+      r.alerts.map(a => a.key).join(",")
+    );
+    assert(
+      st.checked === 250 && st.checkedHash !== null,
+      `re-checked from the start: checked=${st.checked}`
+    );
+  }
+);
+await cell(
   "round: an operator seen only in a block's own range retry is kept (Codex R10 #2)",
   async () => {
     const cfg = cfgOf({ rescanBlocks: 0 });

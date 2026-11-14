@@ -79,9 +79,11 @@ export function emptyState({ chainId, spProxy, startBlock }) {
     cursor: startBlock - 1, // last block whose OperatorConfigured logs are in the inventory
     lastFullScan: 0, // ms of the last successful rescan from startBlock (daily)
     operators: {}, // checksummed addr -> first block seen (only ever grows: a superset is safe)
-    // every block at or below `checked` had its by-hash and by-range answers compared and agree
-    // (null: not started; the first round starts it at the finalized block)
-    checked: null,
+    // every block at or below `checked` had its by-hash and by-range answers compared and agree;
+    // it starts below startBlock, so every block is compared once (Codex R11 P1-1), and is bound to
+    // the canonical hash of block `checked` (null while nothing is checked yet)
+    checked: startBlock - 1,
+    checkedHash: null,
     alerts: {}, // key -> last alert time (ms)
   };
 }
@@ -115,8 +117,10 @@ export function stateProblems(st, cfg) {
         break;
       }
     }
-  if (st.checked !== null && (!Number.isSafeInteger(st.checked) || st.checked < st.startBlock - 1))
+  if (!Number.isSafeInteger(st.checked) || st.checked < st.startBlock - 1)
     p.push("the state's checked is not a block at or after startBlock - 1");
+  if (st.checkedHash !== null && !HASH32.test(String(st.checkedHash)))
+    p.push("the state's checkedHash is not a block hash");
   if (!plainObject(st.alerts)) p.push("the state's alerts is not a plain map");
   else if (Object.values(st.alerts).some(v => !Number.isFinite(v)))
     p.push("the state's alerts has a time that is not a number");
@@ -331,6 +335,15 @@ export const pauseCommand = (spProxy, op) =>
  */
 export async function runRound(st, { chain, cfg, now = Date.now() }) {
   const alerts = [];
+  // the round's progress, committed only if B is still canonical at the end (Codex R11 P1-2): a
+  // round whose chain is rejected leaves cursor, watermark and rescan time where they were
+  const progress = () => ({
+    cursor: st.cursor,
+    checked: st.checked,
+    checkedHash: st.checkedHash,
+    lastFullScan: st.lastFullScan,
+  });
+  const before = progress();
   const sp = stateProblems(st, cfg);
   if (sp.length) throw new SafeError(`state: ${sp.join("; ")}`);
   if (!Number.isSafeInteger(cfg.rescanBlocks) || cfg.rescanBlocks < 0)
@@ -464,10 +477,23 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
     // never past finalized (a block above finalized can still be replaced). A failed read or a
     // disagreement stops it where it is, so the block is asked again next round, before and after
     // finalization alike, and the round is unknown until the watermark is within reach of B.
-    // the first round starts the watermark just below the finalized block, so B (and the finalized
-    // block) are always compared; a watermark above finalized (a deeper reorg) is pulled back
-    if (st.checked === null) st.checked = Math.max(st.startBlock - 1, finalized - 1);
-    if (st.checked > finalized) st.checked = finalized;
+    // a watermark above finalized (a deeper reorg) is pulled back; one whose block is no longer the
+    // one it was checked on (the chain under it changed) moves back MAX_UNFINALIZED blocks, the
+    // cursor with it, and is reported (Codex R11 P1-2)
+    if (st.checked > finalized) {
+      st.checked = finalized;
+      st.checkedHash = null;
+    }
+    if (st.checkedHash !== null && lc(await canon(st.checked)) !== lc(st.checkedHash)) {
+      const back = Math.max(st.startBlock - 1, st.checked - MAX_UNFINALIZED);
+      alerts.push({
+        key: "watermark-reorg",
+        text: `the chain under block ${st.checked} changed since it was checked: re-reading from block ${back + 1}`,
+      });
+      st.checked = back;
+      st.checkedHash = null;
+      if (st.cursor > back) st.cursor = back;
+    }
     const lo = st.checked + 1;
     const hi = Math.min(B.number, lo + MAX_CHECK - 1);
     for (let n = lo; n <= hi; n++) {
@@ -490,7 +516,10 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
         if (st.cursor >= n) st.cursor = n - 1;
         throw new SafeError(`the backend's logs for block ${n} differ by hash and by range`);
       }
-      if (n <= finalized && st.checked === n - 1) st.checked = n;
+      if (n <= finalized && st.checked === n - 1) {
+        st.checked = n;
+        st.checkedHash = hn;
+      }
     }
     if (hi < B.number)
       throw new SafeError(
@@ -526,6 +555,7 @@ export async function runRound(st, { chain, cfg, now = Date.now() }) {
     clear: false,
   };
   if (!canonical) {
+    Object.assign(st, before);
     alerts.push({
       key: "reorg",
       text: `unknown: block ${B.number} left the canonical chain during the round; nothing of it is reported`,
