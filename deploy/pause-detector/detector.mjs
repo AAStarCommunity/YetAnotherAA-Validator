@@ -15,10 +15,12 @@ import {
   closeSync,
   constants,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   openSync,
-  readFileSync,
+  readSync,
+  readdirSync,
   renameSync,
   writeSync,
 } from "node:fs";
@@ -111,6 +113,79 @@ export function launchProblems({ execArgv, envNames, home, repo }) {
     );
   const bad = (envNames ?? []).filter(n => INJECTION_ENV.test(n));
   if (bad.length) p.push(`option-injecting variables are set: ${bad.join(", ")}`);
+  return p;
+}
+
+/**
+ * Read a JSON file of ours without following a symlink, checked on its descriptor: a regular file,
+ * owned by this uid, writable by nobody else, at most 1 MB. Node's permission model follows a
+ * symlink inside a granted directory to a target outside it (Codex R5 P1-1), so a config.json
+ * linked to a key file must never be read. Throws a SafeError naming `what` only.
+ */
+export function readOwnJson(path, what) {
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (e) {
+    throw new SafeError(
+      `${what}: ${e?.code === "ELOOP" ? "is a symlink" : "missing or unreadable"}`
+    );
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new SafeError(`${what}: not a regular file`);
+    if (st.uid !== process.getuid()) throw new SafeError(`${what}: not owned by this account`);
+    if ((st.mode & 0o022) !== 0) throw new SafeError(`${what}: writable by group or others`);
+    if (st.size > 1 << 20) throw new SafeError(`${what}: too large`);
+    const buf = Buffer.alloc(st.size);
+    let off = 0;
+    while (off < st.size) {
+      const n = readSync(fd, buf, off, st.size - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    try {
+      return JSON.parse(buf.subarray(0, off).toString("utf8"));
+    } catch {
+      throw new SafeError(`${what}: not JSON`);
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Symlinks anywhere under `dir` (lstat, never followed), at most `limit` entries visited. Any one
+ * is a problem: the permission model would follow it out of the granted tree. Returns the problems.
+ */
+export function symlinkProblems(dir, limit = 10_000) {
+  const p = [];
+  const stack = [dir];
+  let seen = 0;
+  while (stack.length) {
+    const d = stack.pop();
+    let st;
+    try {
+      st = lstatSync(d);
+    } catch {
+      p.push(`${d} cannot be checked`);
+      continue;
+    }
+    if (++seen > limit) return [...p, `more than ${limit} entries under ${dir}`];
+    if (st.isSymbolicLink()) {
+      p.push(`${d} is a symlink`);
+      continue;
+    }
+    if (st.isDirectory()) {
+      let names = [];
+      try {
+        names = readdirSync(d);
+      } catch {
+        p.push(`${d} cannot be listed`);
+      }
+      for (const n of names) stack.push(join(d, n));
+    }
+  }
   return p;
 }
 
@@ -396,11 +471,14 @@ async function main() {
   const next = i + 1;
   const cfgPath = tilde(i >= 0 ? args[next] : undefined);
   if (!cfgPath) die(2, "usage: detector.mjs --config <file>");
+  // nothing under ~/.aoa-pause-detector may be a symlink (Codex R5 P1-1)
+  const sl = symlinkProblems(join(homedir(), ".aoa-pause-detector"));
+  if (sl.length) die(78, `refusing to run: ${sl.slice(0, 3).join("; ")}`);
   let cfg;
   try {
-    cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
-  } catch {
-    die(78, "config is missing or not JSON");
+    cfg = readOwnJson(cfgPath, "config");
+  } catch (e) {
+    die(78, isOurs(e) ? e.message : "config is missing or not JSON");
   }
   const stateDir = tilde(cfg?.stateDir);
   const secrets = tilde(cfg?.secretsDir);
@@ -492,9 +570,7 @@ async function main() {
     }
     if (!chain) throw new SafeError("neither RPC provider answers for this chain");
     // the state is created on the first run and bound to { chainId, spProxy, startBlock }
-    const st = existsSync(statePath)
-      ? JSON.parse(readFileSync(statePath, "utf8"))
-      : emptyState(cfg);
+    const st = existsSync(statePath) ? readOwnJson(statePath, "state") : emptyState(cfg);
     const sp = stateProblems(st, cfg);
     if (sp.length)
       throw new SafeError(`state: ${sp.join("; ")} (a new deployment needs a new stateDir)`);

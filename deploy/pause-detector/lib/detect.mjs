@@ -269,7 +269,7 @@ export async function operatorAt(chain, B, cfg, op) {
   // zero address: the function is permissionless, so the caller cannot change the answer
   let sim;
   try {
-    await chain.call(
+    const out = await chain.call(
       {
         from: ethers.ZeroAddress,
         to: cfg.spProxy,
@@ -277,6 +277,13 @@ export async function operatorAt(chain, B, cfg, op) {
       },
       at(B)
     );
+    // pauseUnderstakedOperator returns nothing: success is exactly "0x". Anything else (null, a
+    // word, not hex) is not SP's answer (Codex R5 P1-2)
+    if (out !== "0x")
+      return {
+        status: "unknown",
+        why: `${op}: the pauseUnderstakedOperator simulation returned something other than empty data`,
+      };
     sim = "understaked";
   } catch (e) {
     const d = revertData(e);

@@ -5,7 +5,16 @@
 // The first group is the guarantee DSR asked for: the detector has NO key, keystore, signing or
 // broadcast code. It fails if any such call appears in the detector or anything it imports, and
 // its own control cells prove the scanner sees one when it is there.
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -36,6 +45,8 @@ import {
   MESSAGE_CHARS,
   rpcTransport,
   launchProblems,
+  readOwnJson,
+  symlinkProblems,
 } from "./detector.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
@@ -428,6 +439,7 @@ function fakeChain(w) {
       if (p.name === "getEffectiveStake") return enc(regIface, "getEffectiveStake", [o?.eff ?? 0n]);
       if (p.name === "pauseUnderstakedOperator") {
         assert(tx.from === ethers.ZeroAddress, "simulated from a non-zero address");
+        if ("simResult" in w) return w.simResult;
         if (w.simSays)
           return w.simSays === "ok" ? "0x" : revert(spIface.getError(w.simSays).selector);
         if (!o?.configured) revert(spIface.getError("OperatorNotConfigured").selector);
@@ -879,6 +891,21 @@ await cell("ranges: refuses non-integer bounds and an unbounded number of chunks
   assert(ranges(1, 10, 5).length === 2, "control");
 });
 
+await cell(
+  "round: a simulation that returns anything but empty data is unknown, never clear (Codex R5 P1-2)",
+  async () => {
+    for (const bad of [null, "0x00", "0x" + "00".repeat(32), undefined]) {
+      const w = world({ simResult: bad });
+      Object.assign(w.ops[OP1.toLowerCase()], { eff: 0n, paused: true });
+      const { report } = await round(w);
+      assert(
+        report.operators[0].status === "unknown" && !report.clear,
+        `${bad}: ${report.operators[0].status}`
+      );
+    }
+  }
+);
+
 // ---------------------------------------------------------------- delivery
 
 await cell("delivery: many alerts are split into whole-line messages under the limit", () => {
@@ -1150,8 +1177,96 @@ await cell(
         { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
       );
       assert(
-        c.status === 78 && /config is missing/.test(c.stderr),
+        c.status === 78 && /config: missing/.test(c.stderr),
         `control: ${c.status} ${c.stderr}`
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+);
+await cell(
+  "files: config and state are read without following a symlink, owned and not group-writable",
+  () => {
+    const d = realpathSync(mkdtempSync(join(tmpdir(), "pd-own-")));
+    try {
+      writeFileSync(join(d, "ok.json"), '{"a":1}', { mode: 0o600 });
+      assert(readOwnJson(join(d, "ok.json"), "x").a === 1, "control");
+      writeFileSync(join(d, "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key", { mode: 0o600 });
+      symlinkSync(join(d, "key.env"), join(d, "link.json"));
+      writeFileSync(join(d, "gw.json"), "{}");
+      chmodSync(join(d, "gw.json"), 0o664);
+      for (const [f, re] of [
+        ["link.json", /symlink/],
+        ["gw.json", /group or others/],
+        ["none.json", /missing/],
+      ]) {
+        let why = "";
+        try {
+          readOwnJson(join(d, f), "x");
+        } catch (e) {
+          why = e.message;
+        }
+        assert(re.test(why), `${f}: ${why}`);
+      }
+      assert(
+        symlinkProblems(d).some(x => x.includes("link.json")),
+        "symlink not found"
+      );
+      rmSync(join(d, "link.json"));
+      assert(symlinkProblems(d).length === 0, "control: no symlink");
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+);
+await cell(
+  "permission: a config.json symlinked to a key file makes detector.mjs refuse before reading it",
+  () => {
+    const home = realpathSync(mkdtempSync(join(homedir(), ".pd-check-")));
+    try {
+      const d = join(home, ".aoa-pause-detector");
+      mkdirSync(join(d, "state"), { recursive: true });
+      writeFileSync(join(home, "key.env"), "KEEPER_PRIVATE_KEY=0xnot-a-key", { mode: 0o600 });
+      symlinkSync(join(home, "key.env"), join(d, "config.json"));
+      const repo = resolve(HERE, "../..");
+      const r = spawnSync(
+        process.execPath,
+        [
+          PERM_FLAG,
+          `--allow-fs-read=${repo}`,
+          `--allow-fs-read=${d}`,
+          `--allow-fs-write=${join(d, "state")}`,
+          join(HERE, "detector.mjs"),
+          "--config",
+          join(d, "config.json"),
+        ],
+        { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+      );
+      assert(
+        r.status === 78 && /symlink/.test(r.stderr) && !/not-a-key/.test(r.stderr + r.stdout),
+        `${r.status} ${r.stderr}`
+      );
+      // a symlink anywhere else in the tree (not the config): only the tree check sees it
+      rmSync(join(d, "config.json"));
+      writeFileSync(join(d, "config.json"), "{}", { mode: 0o600 });
+      symlinkSync(join(home, "key.env"), join(d, "state", "anything"));
+      const t = spawnSync(
+        process.execPath,
+        [
+          PERM_FLAG,
+          `--allow-fs-read=${repo}`,
+          `--allow-fs-read=${d}`,
+          `--allow-fs-write=${join(d, "state")}`,
+          join(HERE, "detector.mjs"),
+          "--config",
+          join(d, "config.json"),
+        ],
+        { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+      );
+      assert(
+        t.status === 78 && /anything is a symlink/.test(t.stderr),
+        `tree: ${t.status} ${t.stderr}`
       );
     } finally {
       rmSync(home, { recursive: true, force: true });
