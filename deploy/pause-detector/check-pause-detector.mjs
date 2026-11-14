@@ -338,7 +338,7 @@ function fakeChain(w) {
       };
     },
     blockByNumber: async n => {
-      if (n === "latest") return { number: w.latest, hash: hashOf(w.latest) };
+      if (n === "latest") return w.noLatest ? null : { number: w.latest, hash: hashOf(w.latest) };
       afterB = true;
       return { number: n, hash: w.reorg ? hashOf(n + 9999) : hashOf(n) };
     },
@@ -781,16 +781,24 @@ await cell("round: B's ancestry must reach the finalized block the backend repor
   );
 });
 await cell(
-  "round: a state cursor ahead of the finalized block stops the round (no silent skip)",
+  "round: a state cursor ahead of the finalized block re-reads everything from startBlock (no silent skip)",
   async () => {
-    const st = { ...emptyState(cfgOf()), cursor: 10_000, lastFullScan: 1e12 };
-    let stopped = false;
-    try {
-      await runRound(st, { chain: fakeChain(world()), cfg: cfgOf(), now: 1e12 + 1000 });
-    } catch (e) {
-      stopped = /ahead of the finalized/.test(e.message);
-    }
-    assert(stopped, "not stopped");
+    const w = world();
+    w.ops[OP1.toLowerCase()].eff = 0n;
+    const st = { ...emptyState(cfgOf()), cursor: 10_000, checked: 10_000, lastFullScan: 1e12 };
+    const r = await runRound(st, { chain: fakeChain(w), cfg: cfgOf(), now: 1e12 + 1000 });
+    assert(
+      r.alerts.some(a => a.key === "reverify") && !r.report.clear,
+      r.alerts.map(a => a.key).join(",")
+    );
+    assert(
+      r.alerts.some(a => a.key.startsWith("actionable:")),
+      "the operator at block 120 was not found again"
+    );
+    assert(
+      st.cursor === 250 && st.checked === 250,
+      `rebuilt: cursor=${st.cursor} checked=${st.checked}`
+    );
   }
 );
 await cell(
@@ -1090,7 +1098,7 @@ await cell(
   }
 );
 await cell(
-  "round: a watermark whose block hash changed moves back, cursor with it, and says so",
+  "round: a watermark whose block hash changed re-verifies from startBlock, cursor with it, and says so (Codex R12)",
   async () => {
     const cfg = cfgOf({ rescanBlocks: 0 });
     const st = {
@@ -1102,7 +1110,7 @@ await cell(
     };
     const r = await round(world({ latest: 300, finalized: 250 }), cfg, st, 1e12 + 1000);
     assert(
-      r.alerts.some(a => a.key === "watermark-reorg"),
+      r.alerts.some(a => a.key === "reverify"),
       r.alerts.map(a => a.key).join(",")
     );
     assert(
@@ -1127,6 +1135,57 @@ await cell(
     };
     await round(w, cfg, st, 1e12 + 1000);
     assert(st.operators[ethers.getAddress(OP2)] === 280, "the range-retry operator was not kept");
+  }
+);
+
+await cell(
+  "round: a replaced chain under the watermark re-verifies from startBlock, so an omitted older log is caught (Codex R12 P1-1)",
+  async () => {
+    const cfg = cfgOf({ rescanBlocks: 0 });
+    // an earlier round's inventory failed (cursor 99) while its cross-check reached 250
+    const st = {
+      ...emptyState(cfg),
+      lastFullScan: 1e12,
+      cursor: 99,
+      checked: 250,
+      checkedHash: ethers.zeroPadValue(ethers.toBeHex(250), 32),
+    };
+    // the replacement chain finalizes only 200; an understaked operator at 150 is omitted by range
+    const w = world({ latest: 220, finalized: 200, rangeHides: new Set([150]) });
+    w.ops[OP2.toLowerCase()] = {
+      configured: true,
+      paused: false,
+      role: true,
+      eff: 1n,
+      logBlock: 150,
+    };
+    const r = await round(w, cfg, st, 1e12 + 1000);
+    assert(
+      !r.report.clear && r.alerts.some(a => a.key === "reverify"),
+      r.alerts.map(a => a.key).join(",")
+    );
+    assert(
+      r.alerts.some(a => /block 150 differ/.test(a.text)),
+      "block 150 was never compared"
+    );
+  }
+);
+await cell(
+  "round: a throw after the inventory advanced leaves cursor and rescan time as they were (Codex R12 P1-2)",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    const before = JSON.stringify({ c: st.cursor, k: st.checked, f: st.lastFullScan });
+    let threw = false;
+    try {
+      await round(world({ noLatest: true }), cfg, st, 1e12);
+    } catch (e) {
+      threw = /no latest block/.test(e.message);
+    }
+    assert(threw, "did not throw");
+    const after = JSON.stringify({ c: st.cursor, k: st.checked, f: st.lastFullScan });
+    assert(after === before, `progress kept after a throw: ${after} vs ${before}`);
+    assert(Object.keys(st.operators).length === 1, "the inventory should still keep what it saw");
   }
 );
 

@@ -119,8 +119,10 @@ a missed one.
    - Each round re-reads the last `rescanBlocks` behind the cursor. Once a day
      it re-reads everything from `startBlock`. So a lagging backend that
      answered `[]` cannot hide an operator for good.
-   - A cursor ahead of the finalized block stops the round. State times after
-     now (a clock that was ahead) are reset and reported.
+   - A cursor ahead of the finalized block means the chain is not the one the
+     state was built on, so everything is read and verified again from
+     `startBlock`. State times after now (a clock that was ahead) are reset and
+     reported.
 2. **One block.** It pins B, the latest block, by hash. Every read below is at B
    (EIP-1898, `requireCanonical`).
 3. **Identity at B.**
@@ -148,12 +150,15 @@ a missed one.
        past finalized, since a block above it can still be replaced.
      - It starts below `startBlock`, so every block is compared once, even if
        the first rounds fail (Codex R11).
-     - It is bound to the canonical hash of its block. If that hash changes, the
-       chain under it changed: the watermark and the cursor move back 2048
-       blocks, and an alert says so.
+     - It is bound to the canonical hash of its block. If that hash changes, or
+       the watermark or cursor is above the finalized block, the chain under
+       them changed. Nothing below them can be assumed, so everything is read
+       and verified again from `startBlock`, and an alert says so (Codex R12).
+       This is rare, and it costs one backlog.
      - A round's progress (cursor, watermark, rescan time) is committed only if
-       B is still canonical at the end. A rejected round leaves them where they
-       were. The inventory still keeps what it saw, since a superset is safe.
+       the round ends with B still canonical. A throw at any point, or a
+       rejected B, leaves them where they were. The inventory still keeps what
+       it saw, since a superset is safe.
      - A failed read or a disagreement stops it where it is. On a disagreement
        the cursor also moves back before that block.
      - So the block is asked again next round, before and after finalization
