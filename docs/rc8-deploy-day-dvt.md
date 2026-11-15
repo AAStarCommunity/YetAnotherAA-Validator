@@ -7,10 +7,12 @@ executed (DSR, 2026-11-15).
 ## Why there is a DVT step at all
 
 DSR ruled on 2026-11-15 that rc.8 adds a step A7.dvt. It deploys a **new**
-DVTValidator (0.9.0 at the tag) together with a **new** BLSAggregator-4.14.0.
-Without that step, the new aggregator would have been wired to the old
-DVTValidator that is live on Sepolia today. `firstProposalId` is computed from
-the chain when the step runs.
+DVTValidator (0.9.0 at the tag; SP main at `9cacd4ec` still reports
+`DVTValidator-0.8.0`, and 0.9.0 arrives with SP's step 4, so always go by
+`version()` in the tag's tree, never by SP main) together with a **new**
+BLSAggregator-4.14.0. Without that step, the new aggregator would have been
+wired to the old DVTValidator that is live on Sepolia today. `firstProposalId`
+is computed from the chain when the step runs.
 
 Both contracts get new addresses and start with empty state:
 
@@ -162,7 +164,10 @@ Read from SP main `9cacd4ec`. Re-check them against the step-4 merge commit.
     `BLSAggregator.revokeAndSuspend(validator)` directly. It skips the quorum
     check, suspends the guardian and revokes its key. A direct owner call to
     `revokeBLSPublicKey` also skips the check, but it does not suspend, so the
-    guardian could register again on the permissionless path.
+    guardian could register again on the permissionless path. That path is open
+    only while `permissionlessBLSRegistration()` is true. rc.8 expects it to be
+    false. **If the flag is true, revoke does not mean removal**: use
+    `revokeAndSuspend`.
   - Losing that guardian then leaves the committee below that quorum. Proofs
     that need the quorum stop working until a new guardian registers.
 - **`proposalSignersCommitment` keys depend on the path** (`_commitSigners`):
@@ -183,9 +188,17 @@ Read from SP main `9cacd4ec`. Re-check them against the step-4 merge commit.
   - The fork drill (`--export-fraud-drill`) writes the commitment straight into
     the fork using the old pre-image, so it would still pass and hide this.
   - Neither matters for rc.8: no fraud-proof verifier is set there (next item).
+    Tracked in #441 as a prerequisite for enabling guardian slash.
+  - The deploy script already blocks this: Gate A' in
+    `contracts/script/DeployOverIssueVerifier.s.sol` refuses to deploy the
+    current verifier against any BLSAggregator from 4.13.0 on, with no override.
   - Before any 5.5.0 verifier is deployed against a 4.14.0 or later aggregator,
     the verifier and the drill must take the parent block hash as an input.
-- **Do not verify any stake-slash path on deploy day.** The rc.8 aggregator is
-  not authorised as a `GTokenStaking` slasher. With `fraudProofVerifier == 0`,
-  the 5.5.0 guardian-slash path cannot be reached. Deploy day checks
-  registration, proofs and the detector only.
+- **Do not verify any stake-slash path on deploy day.** DSR stated on 2026-11-15
+  that the rc.8 aggregator will not be authorised as a `GTokenStaking` slasher.
+  That is deploy state, not code: SP's own comment (`BLSAggregator.sol:43`) says
+  the aggregator is already authorised. Read
+  `GTokenStaking.authorizedSlashers(aggregator)` from the chain on deploy day
+  and record the value rather than relying on this line. With
+  `fraudProofVerifier == 0`, the 5.5.0 guardian-slash path cannot be reached.
+  Deploy day checks registration, proofs and the detector only.
