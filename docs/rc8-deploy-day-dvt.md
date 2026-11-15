@@ -37,9 +37,9 @@ reuse it.
 
 | Where                               | Setting                                                           | Today                                                       | rc.8 value                                                                | Live nodes read it today?                |
 | ----------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------- |
-| node env (all 3 containers)         | `AUDIT_DVT_VALIDATOR_ADDRESS`                                     | unset; the code default is `0x568b1486…` (old DVTValidator) | new DVTValidator                                                          | no: audit is off (`AUDIT_ENABLED` unset) |
-| node env (all 3 containers)         | `AUDIT_BLS_AGGREGATOR_ADDRESS`                                    | unset; the code default is `0xEaeC2F51…` (4.11.0)           | new BLSAggregator-4.14.0, also checked against `Registry.blsAggregator()` | no: audit and guardian watch are off     |
-| node env (all 3 containers)         | `AUDIT_GUARDIAN_WATCH_FROM_BLOCK`                                 | unset (0)                                                   | block where the new aggregator was deployed                               | no: guardian watch is off                |
+| node env (all 3 containers)         | `AUDIT_DVT_VALIDATOR_ADDRESS` **(required)**                      | unset; the code default is `0x568b1486…` (old DVTValidator) | new DVTValidator                                                          | no: audit is off (`AUDIT_ENABLED` unset) |
+| node env (all 3 containers)         | `AUDIT_BLS_AGGREGATOR_ADDRESS` **(required)**                     | unset; the code default is `0xEaeC2F51…` (4.11.0)           | new BLSAggregator-4.14.0, also checked against `Registry.blsAggregator()` | no: audit and guardian watch are off     |
+| node env (all 3 containers)         | `AUDIT_GUARDIAN_WATCH_FROM_BLOCK` **(required)**                  | unset (0)                                                   | block where the new aggregator was deployed                               | no: guardian watch is off                |
 | node env                            | start proposal id                                                 | **no such setting**: the node keeps no proposal-id cursor   | none                                                                      | —                                        |
 | node env                            | `VALIDATOR_CONTRACT_ADDRESS`                                      | `0x539B9681…` (AAStarValidator, the signing path)           | **unchanged**: this is not SP's DVTValidator                              | yes                                      |
 | `src/config/configuration.ts`       | code defaults for the two addresses above                         | old DVTValidator / 4.11.0 aggregator                        | new addresses, in a code PR after the read-back                           | only if the env is unset                 |
@@ -59,11 +59,12 @@ Notes:
   the node settings therefore does not change today's behaviour. It matters once
   a BLS-proof step needs the nodes' audit or co-sign path. Which steps those are
   comes from SP's step-13 list, and enabling audit is a separate decision.
-- **Set the addresses explicitly anyway.** A node left on the code defaults does
-  not fail. It watches the superseded contracts and silently sees nothing. The
-  comment at `configuration.ts` "FAIL-SILENT" explains why. After the switch,
-  read `Registry.blsAggregator()` and compare it with
-  `AUDIT_BLS_AGGREGATOR_ADDRESS` on every node.
+- **The three node settings marked required must be set explicitly** (DSR
+  2026-11-15), even though the live nodes do not read them today. A node left on
+  the code defaults does not fail. It watches the superseded contracts and
+  silently sees nothing. The comment at `configuration.ts` "FAIL-SILENT"
+  explains why. After the switch, read `Registry.blsAggregator()` and compare it
+  with `AUDIT_BLS_AGGREGATOR_ADDRESS` on every node.
 
 ## Guardian re-registration
 
@@ -115,5 +116,9 @@ registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point
 2. `src/modules/audit`: file evidence with the four-argument
    `createProposal(address,uint8,string,bytes32)`, by selector. There is no
    function named `createProposalWithEvidence`.
-3. `configuration.ts`: the address defaults move to the read-back values.
+3. `configuration.ts`: the address defaults move to the read-back values, and
+   the node's startup check fails when `AUDIT_DVT_VALIDATOR_ADDRESS` or
+   `AUDIT_BLS_AGGREGATOR_ADDRESS` is empty or equals a superseded address (DSR
+   2026-11-15). If it is a single assertion it ships in the re-registration PR;
+   if it needs structural change, it goes back to DSR first.
 4. The sp-parity pin (`ci/sp-parity-pin`) is set to SP's step-4 merge commit.
