@@ -416,6 +416,12 @@ secret-file reader, called with the detector's own name table) and
    only if it reports no High. (The merge gate for this read-only directory is
    the clestons approval. If the directory ever gains a signing or sending
    capability, the stricter merge gate applies again.)
+   - **Known issue, could not reproduce (DSR 2026-11-15, part of this gate).**
+     On #439's head `fda1990f` one Node 20.20.2 run of `check:pause-detector`
+     had one failed cell, which was not captured. It was then run 30 times in a
+     row on Node 20.20.2 (`node deploy/pause-detector/check-pause-detector.mjs`,
+     each run's full log kept): 30/30 passed, 109/109 each. Not chased further.
+     If it recurs, keep the full log and name the cell before deploying.
 1. Regenerate the pin at the rc.8 tag:
    `node deploy/pause-job/gen-sp-pin.mjs <tag commit>`, and review the diff.
 2. Write `~/.aoa-pause-detector/config.json`. The addresses, implementations,
