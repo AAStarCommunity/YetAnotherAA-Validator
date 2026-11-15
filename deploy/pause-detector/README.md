@@ -257,10 +257,95 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   a failed startup. The only exception is a second instance that loses the lock;
   the run holding the lock writes its own status. The same goes for a round
   whose alerts were not delivered.
-  - **Follow-up.** Nothing yet runs preflight on a schedule. Until a dead-man
-    check exists, a detector that no longer starts at all (an unloaded plist, a
-    missing node) shows only as a stale `status.json` the next time someone runs
-    preflight.
+- **Uncaught exceptions** and rejections, once the entry's guards have passed,
+  are recorded as a stop too, then the process exits non-zero. Only the error's
+  code or class is recorded, never its message, which may carry a URL.
+
+## Dead-man (DSR: required before this is rc.8's pause path)
+
+A detector that stops silently gives no signal at all. So a **separate** launchd
+job watches it: `io.aastar.dvt-pause-detector-deadman`, every 15 minutes
+(`deadman.mjs`).
+
+**What it covers, and what it does not** (clestons #435 B1). The two jobs share
+the pinned node, the bundle, `config.json` and the startup guards, so a failure
+of a shared part stops **both**, and neither sends anything.
+
+| The detector stops because                                                                | Dead-man alerts? |
+| ----------------------------------------------------------------------------------------- | ---------------- |
+| its plist is unloaded, or its launch arguments are wrong                                  | yes              |
+| it hangs, crashes, or a round throws on every run                                         | yes              |
+| an unrelated process holds its lock port                                                  | yes              |
+| its state directory, or an RPC secret, is unusable                                        | yes              |
+| the pinned node is missing or moved                                                       | **no**           |
+| a bundle file does not match `MANIFEST.json`                                              | **no**           |
+| any symlink under `~/.aoa-pause-detector` (including a stray one in `state/`)             | **no**           |
+| `config.json` is missing, unreadable or invalid                                           | **no**           |
+| the alert bot token file is unusable (both jobs read the same file)                       | **no**           |
+| the dead-man itself is down (plist unloaded; its directory missing; its state unreadable) | **no**           |
+
+In every **no** row the failure shows **only** when someone runs preflight
+(stale or stopped `status.json`, a missing label, bundle or symlink items).
+**Nothing runs preflight on a schedule yet**, so these are visible only on a
+manual preflight. In particular a broken redeploy (a node, bundle or config
+problem) is the most likely way to stop the detector, and it stops the dead-man
+with it: **run preflight after every deploy.** Narrowing the dead-man's guards
+to the files it actually uses, and having each job check the other's
+`status.json`, is a follow-up.
+
+- **Heartbeat.** Every **completed** round writes
+  `state/heartbeat.json { at, gaps, block, clear }`. A completed round means no
+  throw and B still canonical, whether or not it reads clear. A round that reads
+  unknown still alerts on its own, so the heartbeat only answers "is the
+  detector running rounds at all".
+- **Check.** Of the heartbeat the dead-man reads only `schema`, `at` and `gaps`.
+  With no completed round for more than **2 hours**, it alerts via
+  aastar-monitor, repeating every 6 hours while that lasts. A missing heartbeat,
+  an unreadable one or one dated in the future counts as silence. It sends one
+  `rounds resumed` notice when the heartbeat is fresh again. An alert that was
+  not delivered is retried at the next run.
+- **No message lost silently.**
+  - Undelivered messages are queued in the dead-man's state, written **before**
+    each delivery attempt and emptied only once Telegram accepted them.
+  - The queue goes out in messages of whole lines under Telegram's limit; each
+    delivered message leaves the queue, the rest is retried (Codex dm-R6 P2). A
+    message already queued is not queued again.
+  - A long queue is compacted, never truncated: it keeps the first outage, a
+    count of what was folded, and the latest messages.
+  - An existing state that cannot be read stops the run, and the file is left as
+    it is. That stop sends nothing; it is visible only on preflight (see the
+    table above).
+  - Its directory `~/.aoa-pause-detector/deadman` must be a real directory owned
+    by the job's account, mode `700`, the same rule as the detector's state
+    directory; otherwise the run stops (exit 78) (Codex dm-R7).
+- **Outages carried until acknowledged.** A host crash (no fsync under the
+  permission model) can still roll back the queue, and a later round can
+  overwrite the heartbeat before the dead-man reads it. So the heartbeat itself
+  carries `gaps`: the outages (no completed round for more than 2 h) the
+  dead-man has not acknowledged yet, at most 20 of them.
+  - A new gap is added when the previous completed round is more than 2 h old.
+  - The detector drops a gap only once it appears in the dead-man's
+    `reportedGaps`.
+  - The dead-man reports each gap it has not reported yet, once, and adds it to
+    `reportedGaps` only after the whole queue was delivered (Codex dm-R6 P1).
+
+  - Past 20 unacknowledged gaps, the first and the latest 19 are kept and the
+    ones in between are dropped unreported. That needs 20 separate outages with
+    the dead-man not running or not delivering through all of them, a state
+    preflight already fails on (`pause-detector-deadman`).
+
+  So an outage is reported even if its queued alert was lost or the heartbeat
+  has moved on twice. The worst case is a duplicate (Codex dm-R4, dm-R5).
+
+- **Confinement.** It runs from the same bundle, under the same permission
+  model, with the same startup guards as the detector. It reads
+  `~/.aoa-pause-detector` and writes **only** `~/.aoa-pause-detector/deadman`,
+  its own state and `status.json`. It reads no chain and holds no key.
+- **Preflight** checks that it is loaded with exactly its plist's arguments
+  (`deadman-args`). It also checks its own `status.json`
+  (`pause-detector-deadman`): written within three of its intervals, not a stop,
+  the detector reported alive, and nothing undelivered. A dead-man that is not
+  running is as silent as the detector it watches.
 
 ## Files
 
@@ -270,6 +355,8 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
 - `run.mjs`: config, lock, secrets, the read-only RPC client, delivery,
   `status.json`.
 - `lib/detect.mjs`: the round. It does no I/O; the chain is injected.
+- `deadman.mjs`, `deadman-run.mjs`: the dead-man check's entry (the same guards)
+  and its run.
 - `bundle.mjs`: builds the bundle and its manifest. It is a deploy tool, never
   in the bundle.
 - `check-pause-detector.mjs`: the CI cells (`npm run check:pause-detector`).
@@ -343,10 +430,14 @@ secret-file reader, called with the detector's own name table) and
    shows 3600. The plist needs the pinned node at
    `~/.local/keeper-node/node-v24.21.0` (installed and verified on the Mini,
    11-14).
+   - Then the dead-man: `mkdir -m 700 ~/.aoa-pause-detector/deadman`, render and
+     load `io.aastar.dvt-pause-detector-deadman.plist`, and check that its run
+     interval is 900.
 7. Run `node deploy/pause-job/preflight.mjs`. It checks:
-   - **launchd-on**: the detector and the price keeper are loaded; the committee
-     keeper, apply-rotation and the D2 pause job are not; no other loaded job
-     runs a DVT sender;
+   - **launchd-on**: the detector, its dead-man and the price keeper are loaded;
+     the committee keeper, apply-rotation and the D2 pause job are not; no other
+     loaded job runs a DVT sender;
+   - **deadman-args** and **pause-detector-deadman**: see "Dead-man" above;
    - **detector-args**: the loaded detector runs exactly the pinned node,
      `--permission`, the one read, the one write and the bundle's entry, with no
      injecting variable;

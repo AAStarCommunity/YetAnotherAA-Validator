@@ -353,6 +353,15 @@ await section(async () => {
       (statSync(join(d, "state", "state.json")).mode & 0o777) === 0o600,
     st.operators
   );
+  // the completed round left the heartbeat the dead-man reads (DSR)
+  const hb = JSON.parse(readFileSync(join(d, "state", "heartbeat.json"), "utf8"));
+  cell(
+    "the completed round wrote the dead-man's heartbeat",
+    hb.schema === "aoa-pause-detector-heartbeat/1" &&
+      Date.now() - Date.parse(hb.at) < 600_000 &&
+      hb.clear === true,
+    hb
+  );
 });
 
 // ---- D4: the RPC client refuses a broadcast even against a live node

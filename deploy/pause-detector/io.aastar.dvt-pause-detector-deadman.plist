@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The pause detector's DEAD-MAN check (README "Dead-man", DSR): every 15 minutes it reads the
+     detector's heartbeat and alerts via aastar-monitor when there has been no completed round for
+     2 hours. Same bundle and confinement as the detector, but it may write only
+     ~/.aoa-pause-detector/deadman. Render __HOME__, then
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.aastar.dvt-pause-detector-deadman.plist
+     and check `launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector-deadman | grep "run interval"`
+     shows 900. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.aastar.dvt-pause-detector-deadman</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/keeper-node/node-v24.21.0/bin/node</string>
+    <string>--permission</string>
+    <string>--allow-fs-read=__HOME__/.aoa-pause-detector</string>
+    <string>--allow-fs-write=__HOME__/.aoa-pause-detector/deadman</string>
+    <string>__HOME__/.aoa-pause-detector/app/deploy/pause-detector/deadman.mjs</string>
+    <string>--config</string>
+    <string>__HOME__/.aoa-pause-detector/config.json</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/aoa-pause-detector-deadman.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/aoa-pause-detector-deadman.log</string>
+</dict>
+</plist>

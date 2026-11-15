@@ -33,8 +33,8 @@ export class GuardError extends Error {
  * reason in `startup` (fixed text from our own checks); preflight FAILs on it. Written as a temp
  * file (O_EXCL, O_NOFOLLOW) and renamed; any error is swallowed: the exit code and log still say it.
  */
-export function recordStop(home, text) {
-  const dir = join(home, DIR, "state");
+export function recordStop(home, text, sub = "state") {
+  const dir = join(home, DIR, sub);
   const tmp = join(dir, `status.json.${process.pid}.stop`);
   // only into our own real directories: a symlinked ~/.aoa-pause-detector or state would carry the
   // write elsewhere (Codex R16 P1-1); then nothing is recorded (the exit code still says it)
@@ -65,6 +65,67 @@ export function recordStop(home, text) {
   } catch {
     /* best effort */
   }
+}
+
+/**
+ * The bundle's two entries, each with the one directory it may write: the detector writes its
+ * state, the dead-man check (DSR: "no successful round in 2 h" alerts) writes only its own.
+ */
+export const ENTRIES = Object.freeze({
+  detector: { script: "detector.mjs", write: "state" },
+  deadman: { script: "deadman.mjs", write: "deadman" },
+});
+
+/**
+ * A fixed label for an uncaught error (DSR: logged; Codex dm-R1 P1-3: never its text). Only an
+ * allowlisted code shape (ERR_* / E*) or a known error class name passes; anything else, and any
+ * getter that throws, is "error". Never throws.
+ */
+export function crashLabel(e) {
+  try {
+    const c = e?.code;
+    if (typeof c === "string" && /^(ERR_[A-Z0-9_]{1,60}|E[A-Z0-9]{2,20})$/.test(c)) return c;
+  } catch {
+    /* a throwing getter */
+  }
+  try {
+    const n = e?.name;
+    if (typeof n === "string" && CRASH_NAMES.has(n)) return n;
+  } catch {
+    /* a throwing getter */
+  }
+  return "error";
+}
+const CRASH_NAMES = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "SafeError",
+  "GuardError",
+  "AbortError",
+  "TimeoutError",
+]);
+
+/** No completed detector round for this long is an outage (DSR: 2 h); shared by both entries. */
+export const MAX_SILENCE_MS = 2 * 3600_000;
+
+/**
+ * The heartbeat's list of outages the dead-man has not acknowledged yet (Codex dm-R5): the old
+ * heartbeat's gaps minus those `acked` (the dead-man's reportedGaps), plus a new gap when the
+ * previous completed round is more than MAX_SILENCE_MS before `nowIso`. At most 20 kept: the
+ * first and the latest. Pure.
+ */
+export function carryGaps(old, acked, nowIso) {
+  const valid = g => typeof g?.from === "string" && typeof g?.to === "string";
+  const ack = new Set(Array.isArray(acked) ? acked : []);
+  let gaps = (Array.isArray(old?.gaps) ? old.gaps.filter(valid) : []).filter(g => !ack.has(g.from));
+  const prev = Date.parse(old?.at);
+  if (Number.isFinite(prev) && Date.parse(nowIso) - prev > MAX_SILENCE_MS && !ack.has(old.at))
+    gaps.push({ from: old.at, to: nowIso });
+  if (gaps.length > 20) gaps = [gaps[0], ...gaps.slice(-19)];
+  return gaps;
 }
 
 /** The bundle's manifest file name, at the bundle root. */
@@ -134,21 +195,23 @@ export const ENV_OK = new Set([
  * variable is set. Reads reach ONLY the detector's own directory: never a repository checkout,
  * which may hold node_state.json, .env.sepolia or .keys/ (Codex R7 P1-1). Pure.
  */
-export function launchProblems({ execArgv, script, args, envNames, home }) {
+export function launchProblems({ execArgv, script, args, envNames, home, entry = "detector" }) {
   const p = [];
   const d = `${home}/${DIR}`;
+  const e = ENTRIES[entry];
+  if (!e) return [`unknown entry ${entry}`];
   const flag = execArgv?.[0];
-  const want = [flag, `--allow-fs-read=${d}`, `--allow-fs-write=${d}/state`];
+  const want = [flag, `--allow-fs-read=${d}`, `--allow-fs-write=${d}/${e.write}`];
   if (
     !Array.isArray(execArgv) ||
     !["--permission", "--experimental-permission"].includes(flag) ||
     execArgv.join("\n") !== want.join("\n")
   )
     p.push(
-      "node was not started with exactly the plist's flags (--permission, reads of ~/.aoa-pause-detector, writes of its state)"
+      `node was not started with exactly the plist's flags (--permission, reads of ~/.aoa-pause-detector, writes of its ${e.write})`
     );
-  if (script !== `${d}/app/deploy/pause-detector/detector.mjs`)
-    p.push("the detector is not run from its bundle, ~/.aoa-pause-detector/app");
+  if (script !== `${d}/app/deploy/pause-detector/${e.script}`)
+    p.push(`the ${entry} is not run from its bundle, ~/.aoa-pause-detector/app`);
   // and nothing after the script but the plist's own arguments (clestons #434 F3)
   if (!Array.isArray(args) || args.join("\n") !== ["--config", `${d}/config.json`].join("\n"))
     p.push(

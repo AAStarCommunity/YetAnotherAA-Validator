@@ -51,12 +51,22 @@ import {
 import {
   bundleProblems,
   launchProblems,
+  crashLabel,
+  carryGaps,
   readOwnJson,
   recordStop,
   symlinkProblems,
 } from "./lib/guard.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
+import {
+  compactQueue,
+  deadmanDecision,
+  main as deadmanMain,
+  MAX_SILENCE_MS,
+  QUEUE_MAX,
+  REALERT_MS,
+} from "./deadman-run.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 let pass = 0;
@@ -1537,7 +1547,10 @@ const makeHome = () => {
       encoding: "utf8",
     }
   );
-  if (b.status !== 0) throw new Error(`bundle failed: ${b.stderr}`);
+  if (b.status !== 0) {
+    rmSync(home, { recursive: true, force: true }); // no home left behind on a failed build
+    throw new Error(`bundle failed: ${b.stderr}`);
+  }
   return { home, d, app: join(d, "app") };
 };
 const plistFlags = d => [PERM_FLAG, `--allow-fs-read=${d}`, `--allow-fs-write=${join(d, "state")}`];
@@ -1865,7 +1878,7 @@ const runBundleAgainst = async (age, fn) => {
       );
       const r = await runDetectorAsync(h);
       const status = JSON.parse(readFileSync(join(h.d, "state", "status.json"), "utf8"));
-      fn(r, status);
+      fn(r, status, h);
     });
   } finally {
     srv.close();
@@ -1874,7 +1887,11 @@ const runBundleAgainst = async (age, fn) => {
 await cell(
   "provider: a frozen head (a week old) on both providers ends the run unknown, never clear (clestons #434 B1, end to end)",
   async () =>
-    runBundleAgainst(7 * 86400, (r, status) => {
+    runBundleAgainst(7 * 86400, (r, status, h) => {
+      assert(
+        !existsSync(join(h.d, "state", "heartbeat.json")),
+        "a run on a frozen head wrote a heartbeat"
+      );
       assert(r.status !== 0 && status.clear === false, `exit ${r.status}, clear ${status.clear}`);
       assert(
         /no RPC provider has a fresh head \(stale: alchemy, infura/.test(status.startup ?? ""),
@@ -1885,13 +1902,427 @@ await cell(
 await cell(
   "provider: CONTROL a fresh head gets past the probe (and fails later, unknown, on the missing reads)",
   async () =>
-    runBundleAgainst(5, (r, status) => {
+    runBundleAgainst(5, (r, status, h) => {
+      // a completed round, even one that reads unknown, is proof of life for the dead-man
+      assert(
+        existsSync(join(h.d, "state", "heartbeat.json")),
+        "a completed round wrote no heartbeat"
+      );
       assert(
         status.clear === false && !/fresh head/.test(JSON.stringify(status)),
         JSON.stringify(status).slice(0, 300)
       );
     })
 );
+await cell(
+  "crash label: only an allowlisted code or class, never text, never a throw (Codex dm-R1 P1-3)",
+  () => {
+    assert(crashLabel({ code: "ERR_ACCESS_DENIED" }) === "ERR_ACCESS_DENIED", "control code");
+    assert(crashLabel(new TypeError("x https://key@rpc")) === "TypeError", "control class");
+    for (const e of [
+      { code: "https://provider.example/secret" },
+      { name: "https://provider.example/secret" },
+      { code: "E" + "x".repeat(40) },
+      "a string with a url https://x",
+      null,
+      {
+        get code() {
+          throw new Error("boom");
+        },
+        get name() {
+          throw new Error("boom");
+        },
+      },
+    ])
+      assert(
+        crashLabel(e) === "error",
+        "a non-allowlisted error produced a label other than error"
+      );
+  }
+);
+
+await cell(
+  "dead-man: a long undelivered queue keeps the first outage and the full count (Codex dm-R2 P1-1)",
+  () => {
+    let q = [];
+    for (let k = 0; k < 30; k++) q = compactQueue([...q, `m${k}`]);
+    assert(q.length <= QUEUE_MAX && q[0] === "m0" && q[q.length - 1] === "m29", q.join(" | "));
+    const folded = Number(/^\((\d+) more/.exec(q[1])?.[1]);
+    assert(
+      1 + folded + (q.length - 2) === 30,
+      `messages represented: ${1 + folded + (q.length - 2)}`
+    );
+    assert(compactQueue(["a", "b"]).join() === "a,b", "control: a short queue is untouched");
+  }
+);
+
+await cell(
+  "dead-man: the outage is on disk BEFORE delivery is attempted (write-ahead, Codex dm-R3 P1)",
+  async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "pd-wa-")));
+    const realHome = process.env.HOME;
+    try {
+      const d = join(home, ".aoa-pause-detector");
+      mkdirSync(join(d, "deadman"), { recursive: true, mode: 0o700 });
+      mkdirSync(join(d, "state"), { mode: 0o700 });
+      writeFileSync(join(d, "config.json"), JSON.stringify({ chainId: 11155111, telegram: null }), {
+        mode: 0o600,
+      });
+      process.env.HOME = home;
+      let onDisk = null;
+      // the delivery "dies": it never returns ok, and before it does we look at what is persisted
+      const code = await deadmanMain({
+        send: async () => {
+          onDisk = JSON.parse(readFileSync(join(d, "deadman", "state.json"), "utf8"));
+          return { ok: false, why: "killed" };
+        },
+      });
+      assert(
+        onDisk &&
+          onDisk.alerting === true &&
+          onDisk.queue.length === 1 &&
+          /DEAD-MAN/.test(onDisk.queue[0]),
+        `not written ahead: ${JSON.stringify(onDisk)}`
+      );
+      assert(code === 1, `exit ${code}`);
+      // a later run that delivers empties the queue
+      const code2 = await deadmanMain({ send: async () => ({ ok: true }) });
+      const after = JSON.parse(readFileSync(join(d, "deadman", "state.json"), "utf8"));
+      assert(
+        after.queue.length === 0 && code2 === 1,
+        `after delivery: ${JSON.stringify(after)} exit ${code2}`
+      );
+    } finally {
+      process.env.HOME = realHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+);
+
+await cell(
+  "dead-man: an outage survives a later heartbeat and a lost dead-man queue until acknowledged (Codex dm-R4, dm-R5)",
+  () => {
+    const T0 = Date.parse("2026-11-14T00:00:00Z");
+    const iso = ms => new Date(ms).toISOString();
+    const beat = (old, acked, ms) => ({
+      schema: "aoa-pause-detector-heartbeat/1",
+      at: iso(ms),
+      gaps: carryGaps(old, acked, iso(ms)),
+    });
+    const h0 = beat(null, [], T0);
+    assert(h0.gaps.length === 0, "a first heartbeat has no gap");
+    // 3 h of nothing, then two rounds a minute apart before the dead-man samples (dm-R5)
+    const h1 = beat(h0, [], T0 + 3 * 3600_000);
+    const h2 = beat(h1, [], T0 + 3 * 3600_000 + 60_000);
+    assert(
+      h2.gaps.length === 1 && h2.gaps[0].from === h0.at,
+      `the outage did not survive the second round: ${JSON.stringify(h2.gaps)}`
+    );
+    // the dead-man (state rolled back or never written: dm-R4) reports it once
+    const a = deadmanDecision(h2, T0 + 3 * 3600_000 + 120_000, {});
+    assert(
+      !a.silent &&
+        /no successful round from 2026-11-14T00:00:00.000Z to .* \(180 min\)/.test(a.message ?? ""),
+      a.message
+    );
+    assert(
+      deadmanDecision(h2, T0 + 3 * 3600_000 + 180_000, a.next).message === null,
+      "reported twice"
+    );
+    // the next heartbeat drops it only now that the dead-man acknowledged it
+    const h3 = beat(h2, a.next.reportedGaps, T0 + 4 * 3600_000);
+    assert(h3.gaps.length === 0, `an acknowledged gap was kept: ${JSON.stringify(h3.gaps)}`);
+    // control: hourly rounds never record a gap
+    assert(beat(h0, [], T0 + 3600_000).gaps.length === 0, "an hourly gap recorded");
+  }
+);
+// a temp home with a config and a fresh heartbeat that carries one outage, for in-process runs
+const deadmanHome = async fn => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "pd-ack-")));
+  const realHome = process.env.HOME;
+  try {
+    const d = join(home, ".aoa-pause-detector");
+    mkdirSync(join(d, "deadman"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(d, "state"), { mode: 0o700 });
+    writeFileSync(join(d, "config.json"), JSON.stringify({ chainId: 11155111, telegram: null }), {
+      mode: 0o600,
+    });
+    const now = Date.now();
+    writeFileSync(
+      join(d, "state", "heartbeat.json"),
+      JSON.stringify({
+        schema: "aoa-pause-detector-heartbeat/1",
+        at: new Date(now - 60_000).toISOString(),
+        gaps: [
+          {
+            from: new Date(now - 4 * 3600_000).toISOString(),
+            to: new Date(now - 60_000).toISOString(),
+          },
+        ],
+      }),
+      { mode: 0o600 }
+    );
+    process.env.HOME = home;
+    await fn({
+      d,
+      state: () => JSON.parse(readFileSync(join(d, "deadman", "state.json"), "utf8")),
+    });
+  } finally {
+    process.env.HOME = realHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+};
+await cell(
+  "dead-man: its directory must be its own and mode 700, like the detector's state (Codex dm-R7 P1)",
+  async () =>
+    deadmanHome(async ({ d }) => {
+      const own = join(d, "deadman");
+      for (const mode of [0o770, 0o777, 0o750]) {
+        chmodSync(own, mode);
+        let sent = false;
+        const code = await deadmanMain({
+          send: async () => {
+            sent = true;
+            return { ok: true };
+          },
+        });
+        assert(code === 78 && !sent, `mode ${mode.toString(8)}: exit ${code}, sent ${sent}`);
+        assert(!existsSync(join(own, "state.json")), `mode ${mode.toString(8)}: state written`);
+      }
+      // control: 700 runs
+      chmodSync(own, 0o700);
+      const code = await deadmanMain({ send: async () => ({ ok: true }) });
+      assert(code === 0, `control exit ${code}`);
+    })
+);
+await cell(
+  "dead-man: a gap is acknowledged only after its message was delivered (Codex dm-R6 P1)",
+  async () =>
+    deadmanHome(async ({ state }) => {
+      let during = null;
+      await deadmanMain({
+        send: async () => {
+          during = state();
+          return { ok: false, why: "down" };
+        },
+      });
+      assert(
+        during && (during.reportedGaps ?? []).length === 0,
+        `acknowledged before delivery: ${JSON.stringify(during)}`
+      );
+      const st = state();
+      assert(
+        (st.reportedGaps ?? []).length === 0 && st.queue.length === 1,
+        `acknowledged after a failed delivery: ${JSON.stringify(st)}`
+      );
+      // a second failing run re-derives the same gap and does not queue it twice
+      await deadmanMain({ send: async () => ({ ok: false, why: "down" }) });
+      assert(state().queue.length === 1, `queued twice: ${JSON.stringify(state().queue)}`);
+      // delivered: acknowledged now, and the queue is empty
+      await deadmanMain({ send: async () => ({ ok: true }) });
+      assert(
+        state().reportedGaps.length === 1 && state().queue.length === 0,
+        JSON.stringify(state())
+      );
+    })
+);
+await cell(
+  "dead-man: a long queue goes out in bounded messages; delivered ones leave the queue (Codex dm-R6 P2)",
+  async () =>
+    deadmanHome(async ({ d, state }) => {
+      const long = Array.from(
+        { length: 10 },
+        (_, k) => `2026-11-14T00:00:0${k}.000Z DEAD-MAN: ${"x".repeat(900)} ${k}`
+      );
+      writeFileSync(
+        join(d, "deadman", "state.json"),
+        JSON.stringify({ alerting: false, lastSent: 0, queue: long, reportedGaps: [] }),
+        { mode: 0o600 }
+      );
+      const sizes = [];
+      let n = 0;
+      await deadmanMain({
+        send: async text => {
+          sizes.push(text.length);
+          return n++ === 0 ? { ok: true } : { ok: false, why: "down" };
+        },
+      });
+      assert(sizes.length > 1 && sizes.every(z => z <= MESSAGE_CHARS), `sizes ${sizes.join(",")}`);
+      const left = state().queue;
+      assert(
+        left.length > 0 && !left.includes(long[0]) && left.includes(long[9]),
+        `queue after a partial delivery: ${left.length}`
+      );
+    })
+);
+await cell("dead-man: the decision (alive, silent, re-alert, resume, missing, future)", () => {
+  const T = 1e12;
+  const hb = msAgo => ({
+    schema: "aoa-pause-detector-heartbeat/1",
+    at: new Date(T - msAgo).toISOString(),
+  });
+  const fresh = deadmanDecision(hb(3600_000), T, {});
+  assert(!fresh.silent && fresh.message === null, "a 1 h old heartbeat is not alive");
+  const edge = deadmanDecision(hb(MAX_SILENCE_MS), T, {});
+  assert(!edge.silent, "exactly 2 h is still alive (control)");
+  const late = deadmanDecision(hb(MAX_SILENCE_MS + 1000), T, {});
+  assert(
+    late.silent && /no successful round for more than 2 h/.test(late.message) && late.next.alerting,
+    "not alerted"
+  );
+  const again = deadmanDecision(hb(MAX_SILENCE_MS + 2000), T, {
+    alerting: true,
+    lastSent: T - 1000,
+  });
+  assert(again.silent && again.message === null, "re-alerted too soon");
+  const later = deadmanDecision(hb(MAX_SILENCE_MS + 2000), T, {
+    alerting: true,
+    lastSent: T - REALERT_MS,
+  });
+  assert(later.message !== null, "not re-alerted after REALERT_MS");
+  const back = deadmanDecision(hb(60_000), T, { alerting: true, lastSent: T - 1000 });
+  assert(
+    !back.silent && /resumed/.test(back.message) && back.next.alerting === false,
+    "no resume notice"
+  );
+  for (const h of [null, {}, { schema: "x", at: new Date(T).toISOString() }, hb(-600_000)])
+    assert(deadmanDecision(h, T, {}).silent, `alive on ${JSON.stringify(h)}`);
+});
+await cell(
+  "dead-man: launchProblems accepts only the dead-man's own launch (writes deadman/, runs deadman.mjs)",
+  () => {
+    const H = "/Users/u";
+    const d = `${H}/.aoa-pause-detector`;
+    const base = {
+      home: H,
+      args: ["--config", `${d}/config.json`],
+      envNames: ["PATH", "HOME"],
+      entry: "deadman",
+    };
+    const ok = ["--permission", `--allow-fs-read=${d}`, `--allow-fs-write=${d}/deadman`];
+    assert(
+      launchProblems({
+        ...base,
+        execArgv: ok,
+        script: `${d}/app/deploy/pause-detector/deadman.mjs`,
+      }).length === 0,
+      "control"
+    );
+    assert(
+      launchProblems({
+        ...base,
+        execArgv: [ok[0], ok[1], `--allow-fs-write=${d}/state`],
+        script: `${d}/app/deploy/pause-detector/deadman.mjs`,
+      }).length > 0,
+      "may write the detector's state"
+    );
+    assert(
+      launchProblems({
+        ...base,
+        execArgv: ok,
+        script: `${d}/app/deploy/pause-detector/detector.mjs`,
+      }).length > 0,
+      "runs the detector"
+    );
+  }
+);
+await cell("dead-man: the bundle carries both entries and the scan covers deadman.mjs", () =>
+  withHome(({ app }) => {
+    const man = JSON.parse(readFileSync(join(app, "MANIFEST.json"), "utf8"));
+    for (const f of ["deploy/pause-detector/deadman.mjs", "deploy/pause-detector/deadman-run.mjs"])
+      assert(f in man.files, `${f} not bundled`);
+    const p = scanTree(join(HERE, "deadman.mjs"));
+    assert(p.length === 0, p.join("; "));
+  })
+);
+await cell("dead-man: the plist runs the dead-man every 15 minutes, exactly", () => {
+  const x = readFileSync(join(HERE, "io.aastar.dvt-pause-detector-deadman.plist"), "utf8");
+  const args = [
+    ...x
+      .match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)[1]
+      .matchAll(/<string>([^<]*)<\/string>/g),
+  ].map(m => m[1]);
+  assert(
+    args.join("\n") ===
+      [
+        "__HOME__/.local/keeper-node/node-v24.21.0/bin/node",
+        "--permission",
+        "--allow-fs-read=__HOME__/.aoa-pause-detector",
+        "--allow-fs-write=__HOME__/.aoa-pause-detector/deadman",
+        "__HOME__/.aoa-pause-detector/app/deploy/pause-detector/deadman.mjs",
+        "--config",
+        "__HOME__/.aoa-pause-detector/config.json",
+      ].join("\n"),
+    args.join(" ")
+  );
+  assert(/<key>StartInterval<\/key>\s*<integer>900<\/integer>/.test(x), "not every 15 min");
+  assert(/<string>io\.aastar\.dvt-pause-detector-deadman<\/string>/.test(x), "label");
+});
+await cell(
+  "dead-man: end to end, launched as its plist does: no heartbeat is silent; a fresh one is alive",
+  () =>
+    withHome(({ home, d }) => {
+      mkdirSync(join(d, "deadman"), { mode: 0o700 });
+      writeFileSync(join(d, "config.json"), JSON.stringify({ chainId: 11155111, telegram: null }), {
+        mode: 0o600,
+      });
+      const run = () =>
+        spawnSync(
+          process.execPath,
+          [
+            PERM_FLAG,
+            `--allow-fs-read=${d}`,
+            `--allow-fs-write=${join(d, "deadman")}`,
+            join(d, "app/deploy/pause-detector/deadman.mjs"),
+            "--config",
+            join(d, "config.json"),
+          ],
+          { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+        );
+      const status = () => JSON.parse(readFileSync(join(d, "deadman", "status.json"), "utf8"));
+      const r1 = run();
+      assert(
+        r1.status === 1 && status().silent === true && /DEAD-MAN/.test(r1.stderr),
+        `no heartbeat: ${r1.status} ${r1.stderr}`
+      );
+      // a heartbeat a minute old, written as the detector writes it
+      writeFileSync(
+        join(d, "state", "heartbeat.json"),
+        JSON.stringify({
+          schema: "aoa-pause-detector-heartbeat/1",
+          at: new Date(Date.now() - 60_000).toISOString(),
+          block: 1,
+          clear: true,
+        }),
+        { mode: 0o600 }
+      );
+      const r2 = run();
+      // alive now; with telegram null nothing can be delivered, so the outage alert and the
+      // resume notice stay queued (exit 1) and are never dropped (Codex dm-R1 P1-1)
+      assert(
+        r2.status === 1 && status().silent === false && status().undelivered === 2,
+        `fresh heartbeat: ${r2.status} ${JSON.stringify(status())}`
+      );
+      // an existing state that cannot be read is a visible stop, and it is left as it is
+      // (Codex dm-R2 P1-2): never overwritten as healthy
+      writeFileSync(join(d, "deadman", "state.json"), "{ not json", { mode: 0o600 });
+      const r3 = run();
+      assert(
+        r3.status === 1 && /unreadable/.test(status().startup ?? ""),
+        `unreadable state: ${r3.status} ${JSON.stringify(status())}`
+      );
+      assert(
+        readFileSync(join(d, "deadman", "state.json"), "utf8") === "{ not json",
+        "the unreadable state was overwritten"
+      );
+      // and it may not write the detector's state (the grant is deadman/ only)
+      assert(
+        !existsSync(join(d, "state", "status.json")),
+        "the dead-man wrote the detector's status"
+      );
+    })
+);
+
 await cell("permission: detector.mjs refuses to start outside the permission model", () =>
   withHome(({ home, d }) => {
     const r = spawnSync(
