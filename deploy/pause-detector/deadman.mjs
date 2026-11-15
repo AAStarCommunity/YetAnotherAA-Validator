@@ -16,13 +16,14 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  DEADMAN_GRAPH,
   DIR,
-  bundleProblems,
   crashLabel,
+  graphProblems,
   launchProblems,
   permissionProblems,
+  realDirProblems,
   recordStop,
-  symlinkProblems,
 } from "./lib/guard.mjs";
 
 const home = homedir();
@@ -45,7 +46,15 @@ const first = [
   }),
 ];
 if (first.length) refuse(first);
-const tree = [...symlinkProblems(d), ...bundleProblems(join(d, "app"))];
+// only what this job itself loads and reads (clestons #435 B1, #436): its own module graph against
+// the manifest, and a real ~/.aoa-pause-detector. A detector file that drifted, a stray file in the
+// bundle or a stray symlink in state/ stops the detector but not the job that alerts about it. The
+// paths it reads are opened without following a link and their directories are lstat-checked
+// where they are read (config and token, heartbeat, its own directory: deadman-run.mjs).
+const tree = [
+  ...realDirProblems(d, "~/.aoa-pause-detector"),
+  ...graphProblems(join(d, "app"), DEADMAN_GRAPH),
+];
 if (tree.length) refuse(tree);
 const crashed = e => {
   const what = crashLabel(e);

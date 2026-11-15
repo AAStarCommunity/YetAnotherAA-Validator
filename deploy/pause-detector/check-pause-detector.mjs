@@ -49,7 +49,11 @@ import {
   rpcTransport,
 } from "./run.mjs";
 import {
+  DEADMAN_GRAPH,
+  DEADMAN_STALE_MS,
   bundleProblems,
+  deadmanRunProblems,
+  graphProblems,
   launchProblems,
   crashLabel,
   carryGaps,
@@ -1530,11 +1534,17 @@ await cell(
     }
   }
 );
+// every child gets a deadline: a run that hangs fails its cell (status null, SIGTERM) instead of
+// stalling the whole suite (a hung dead-man under a mutant once held it for 15 h)
+const SPAWN_TIMEOUT_MS = 120_000;
 // the confinement: Node's permission model with the plist's flags, run from a real bundle
 const PERM_FLAG =
   Number(process.versions.node.split(".")[0]) >= 22 ? "--permission" : "--experimental-permission";
 const runNode = (flags, code) =>
-  spawnSync(process.execPath, [...flags, "--input-type=module", "-e", code], { encoding: "utf8" });
+  spawnSync(process.execPath, [...flags, "--input-type=module", "-e", code], {
+    encoding: "utf8",
+    timeout: SPAWN_TIMEOUT_MS,
+  });
 /** A fresh home with ~/.aoa-pause-detector/{state,app}: the app built by bundle.mjs. */
 const makeHome = () => {
   const home = realpathSync(mkdtempSync(join(homedir(), ".pd-check-")));
@@ -1545,6 +1555,7 @@ const makeHome = () => {
     [join(HERE, "bundle.mjs"), "--out", join(d, "app"), "--allow-dirty"],
     {
       encoding: "utf8",
+      timeout: SPAWN_TIMEOUT_MS,
     }
   );
   if (b.status !== 0) {
@@ -1563,7 +1574,11 @@ const runDetector = ({ home, d }, env = {}) =>
       "--config",
       join(d, "config.json"),
     ],
-    { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home, ...env } }
+    {
+      encoding: "utf8",
+      timeout: SPAWN_TIMEOUT_MS,
+      env: { PATH: process.env.PATH, HOME: home, ...env },
+    }
   );
 const withHomeAsync = async fn => {
   const h = makeHome();
@@ -1583,7 +1598,7 @@ const runDetectorAsync = ({ home, d }, env = {}) =>
         "--config",
         join(d, "config.json"),
       ],
-      { env: { PATH: process.env.PATH, HOME: home, ...env } }
+      { env: { PATH: process.env.PATH, HOME: home, ...env }, timeout: SPAWN_TIMEOUT_MS }
     );
     let stderr = "";
     c.stderr.on("data", x => (stderr += x));
@@ -2277,7 +2292,11 @@ await cell(
             "--config",
             join(d, "config.json"),
           ],
-          { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+          {
+            encoding: "utf8",
+            timeout: SPAWN_TIMEOUT_MS,
+            env: { PATH: process.env.PATH, HOME: home },
+          }
         );
       const status = () => JSON.parse(readFileSync(join(d, "deadman", "status.json"), "utf8"));
       const r1 = run();
@@ -2323,6 +2342,210 @@ await cell(
     })
 );
 
+// ---------------------------------------------------------------- #436: the dead-man is independent
+await cell("#436: DEADMAN_GRAPH is exactly deadman.mjs's static import closure", () => {
+  const root = resolve(HERE, "../..");
+  const seen = new Set();
+  const stack = [join(HERE, "deadman.mjs")];
+  while (stack.length) {
+    const f = stack.pop();
+    const rel = f.slice(root.length + 1);
+    if (seen.has(rel)) continue;
+    seen.add(rel);
+    const src = readFileSync(f, "utf8");
+    for (const m of src.matchAll(/(?:from|import)\s*\(?\s*"(\.{1,2}\/[^"]+)"/g))
+      stack.push(resolve(dirname(f), m[1]));
+  }
+  const want = [...DEADMAN_GRAPH].sort().join(",");
+  const got = [...seen].sort().join(",");
+  assert(got === want, `closure ${got}\nlisted ${want}`);
+  assert(!/(^|,)deploy\/pause-detector\/run\.mjs/.test(got), "the dead-man imports run.mjs");
+});
+await cell(
+  "#436: the dead-man's graph check ignores a drifted detector file but catches its own",
+  () =>
+    withHome(({ app }) => {
+      assert(graphProblems(app, DEADMAN_GRAPH).length === 0, "the real bundle fails");
+      // a detector-only file drifts: the detector's full check refuses, the dead-man's does not
+      const det = join(app, "deploy/pause-detector/lib/detect.mjs");
+      writeFileSync(det, `${readFileSync(det, "utf8")}\n`);
+      assert(bundleProblems(app).length > 0, "control: the full check passed a drifted file");
+      assert(
+        graphProblems(app, DEADMAN_GRAPH).length === 0,
+        "a detector file stopped the dead-man"
+      );
+      // one of its own files drifts: refused
+      const own = join(app, "deploy/pause-detector/lib/notify.mjs");
+      writeFileSync(own, `${readFileSync(own, "utf8")}\n`);
+      const p = graphProblems(app, DEADMAN_GRAPH);
+      assert(
+        p.some(x => /notify\.mjs does not hash/.test(x)),
+        p.join("; ")
+      );
+    })
+);
+await cell("#436: the graph check refuses a symlinked directory on the way to its files", () =>
+  withHome(({ app }) => {
+    const lib = join(app, "deploy/pause-job/lib");
+    const moved = join(app, "deploy/pause-job/lib-real");
+    spawnSync("mv", [lib, moved]);
+    symlinkSync(moved, lib);
+    const p = graphProblems(app, DEADMAN_GRAPH);
+    assert(
+      p.some(x => /pause-job\/lib is not a real directory/.test(x)),
+      p.join("; ")
+    );
+  })
+);
+await cell(
+  "#436: end to end, a stray symlink in state/ or a drifted detector file stops the detector but the dead-man still alerts",
+  () =>
+    withHome(({ home, d }) => {
+      mkdirSync(join(d, "deadman"), { mode: 0o700 });
+      writeFileSync(join(d, "config.json"), JSON.stringify({ chainId: 11155111, telegram: null }), {
+        mode: 0o600,
+      });
+      const run = () =>
+        spawnSync(
+          process.execPath,
+          [
+            PERM_FLAG,
+            `--allow-fs-read=${d}`,
+            `--allow-fs-write=${join(d, "deadman")}`,
+            join(d, "app/deploy/pause-detector/deadman.mjs"),
+            "--config",
+            join(d, "config.json"),
+          ],
+          {
+            encoding: "utf8",
+            timeout: SPAWN_TIMEOUT_MS,
+            env: { PATH: process.env.PATH, HOME: home },
+          }
+        );
+      const status = () => JSON.parse(readFileSync(join(d, "deadman", "status.json"), "utf8"));
+      // both failures at once (each is one clestons R4 reproduced)
+      symlinkSync("/etc", join(d, "state", "stray"));
+      const det = join(d, "app/deploy/pause-detector/lib/detect.mjs");
+      writeFileSync(det, `${readFileSync(det, "utf8")}\n`);
+      // control: the detector refuses to start on either
+      const rd = runDetector({ home, d });
+      assert(rd.status === 78, `control: the detector ran (${rd.status})`);
+      const r = run();
+      assert(
+        r.status === 1 && /DEAD-MAN/.test(r.stderr) && status().silent === true,
+        `the dead-man did not alert: ${r.status} ${r.stderr.slice(0, 300)}`
+      );
+      assert(typeof status().startup !== "string", `the dead-man stopped: ${status().startup}`);
+    })
+);
+await cell("#436: a symlinked state/ is no proof of life: the dead-man reads it as silence", () =>
+  withHome(({ home, d }) => {
+    mkdirSync(join(d, "deadman"), { mode: 0o700 });
+    writeFileSync(join(d, "config.json"), JSON.stringify({ chainId: 11155111, telegram: null }), {
+      mode: 0o600,
+    });
+    // a fresh heartbeat, but reached only through a symlinked state/
+    const real = join(home, "elsewhere");
+    mkdirSync(real, { mode: 0o700 });
+    writeFileSync(
+      join(real, "heartbeat.json"),
+      JSON.stringify({ schema: "aoa-pause-detector-heartbeat/1", at: new Date().toISOString() }),
+      { mode: 0o600 }
+    );
+    rmSync(join(d, "state"), { recursive: true, force: true });
+    symlinkSync(real, join(d, "state"));
+    const r = spawnSync(
+      process.execPath,
+      [
+        PERM_FLAG,
+        `--allow-fs-read=${d}`,
+        `--allow-fs-write=${join(d, "deadman")}`,
+        join(d, "app/deploy/pause-detector/deadman.mjs"),
+        "--config",
+        join(d, "config.json"),
+      ],
+      { encoding: "utf8", timeout: SPAWN_TIMEOUT_MS, env: { PATH: process.env.PATH, HOME: home } }
+    );
+    const st = JSON.parse(readFileSync(join(d, "deadman", "status.json"), "utf8"));
+    assert(r.status === 1 && st.silent === true, `${r.status} ${JSON.stringify(st)}`);
+  })
+);
+await cell("#436: deadmanRunProblems (the rule the detector and preflight share)", () => {
+  const now = Date.parse("2026-11-14T12:00:00Z");
+  const ok = {
+    schema: "aoa-pause-detector-deadman/1",
+    at: new Date(now - 60_000).toISOString(),
+    silent: true, // the detector's own liveness is not this rule's business
+    delivery: { ok: true, sent: 1 },
+    undelivered: 0,
+  };
+  const t = o => JSON.stringify({ ...ok, ...o });
+  assert(deadmanRunProblems(t({}), now).length === 0, "ok");
+  assert(/no status/.test(deadmanRunProblems(null, now)[0]), "missing");
+  assert(/not JSON/.test(deadmanRunProblems("{", now)[0]), "json");
+  assert(/not the dead-man/.test(deadmanRunProblems(t({ schema: "x" }), now)[0]), "schema");
+  assert(
+    /future/.test(deadmanRunProblems(t({ at: new Date(now + 1000).toISOString() }), now)[0]),
+    "future"
+  );
+  assert(
+    /min old/.test(
+      deadmanRunProblems(t({ at: new Date(now - DEADMAN_STALE_MS - 1000).toISOString() }), now)[0]
+    ),
+    "stale"
+  );
+  assert(
+    deadmanRunProblems(t({ at: new Date(now - DEADMAN_STALE_MS + 1000).toISOString() }), now)
+      .length === 0,
+    "edge"
+  );
+  assert(/stopped: x/.test(deadmanRunProblems(t({ startup: "x" }), now)[0]), "stop");
+  assert(/undelivered/.test(deadmanRunProblems(t({ undelivered: 2 }), now)[0]), "undelivered");
+  assert(
+    /undelivered/.test(deadmanRunProblems(t({ delivery: { ok: false } }), now)[0]),
+    "delivery"
+  );
+});
+await cell(
+  "#436: a dead-man stop is recorded with the dead-man's schema, so preflight names it (L4)",
+  () =>
+    withHome(({ home, d }) => {
+      mkdirSync(join(d, "deadman"), { mode: 0o700 });
+      recordStop(home, "the token file: x", "deadman");
+      const text = readFileSync(join(d, "deadman", "status.json"), "utf8");
+      assert(JSON.parse(text).schema === "aoa-pause-detector-deadman/1", text);
+      assert(/stopped: the token file/.test(deadmanRunProblems(text, Date.now())[0]), text);
+      // the detector's own stop keeps the detector's schema
+      recordStop(home, "y");
+      assert(
+        JSON.parse(readFileSync(join(d, "state", "status.json"), "utf8")).schema ===
+          "aoa-pause-detector-status/1",
+        "detector stop schema"
+      );
+    })
+);
+await cell(
+  "#436: a queued gap is not queued again when a newer gap arrives beside it (L2)",
+  async () =>
+    deadmanHome(async ({ d, state }) => {
+      await deadmanMain({ send: async () => ({ ok: false, why: "down" }) });
+      assert(state().queue.length === 1, JSON.stringify(state().queue));
+      // a second, newer gap appears in the heartbeat; the first is still unacknowledged
+      const hbPath = join(d, "state", "heartbeat.json");
+      const hb = JSON.parse(readFileSync(hbPath, "utf8"));
+      const now = Date.now();
+      hb.gaps.push({
+        from: new Date(now - 30 * 60_000).toISOString(),
+        to: new Date(now - 60_000).toISOString(),
+      });
+      writeFileSync(hbPath, JSON.stringify(hb), { mode: 0o600 });
+      await deadmanMain({ send: async () => ({ ok: false, why: "down" }) });
+      const q = state().queue;
+      assert(q.length === 2, `expected the two gaps once each: ${JSON.stringify(q)}`);
+      assert(q.filter(x => x.includes(hb.gaps[0].from)).length === 1, "the first gap twice");
+    })
+);
+
 await cell("permission: detector.mjs refuses to start outside the permission model", () =>
   withHome(({ home, d }) => {
     const r = spawnSync(
@@ -2330,6 +2553,7 @@ await cell("permission: detector.mjs refuses to start outside the permission mod
       [join(d, "app/deploy/pause-detector/detector.mjs"), "--config", "/x"],
       {
         encoding: "utf8",
+        timeout: SPAWN_TIMEOUT_MS,
         env: { PATH: process.env.PATH, HOME: home },
       }
     );

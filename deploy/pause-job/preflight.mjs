@@ -29,7 +29,9 @@ import { join, posix } from "node:path";
 import {
   DIR as DETECTOR_DIR,
   ENV_OK as DETECTOR_ENV_OK,
+  DEADMAN_STALE_MS,
   bundleProblems as detectorBundle,
+  deadmanRunProblems,
   symlinkProblems as detectorSymlinks,
 } from "../pause-detector/lib/guard.mjs";
 
@@ -349,22 +351,11 @@ export function detectorArgsProblems(args, home, env = [], inherited = [], entry
  * A dead-man that is not running is as silent as the detector it watches. Returns the problems.
  * Pure.
  */
-export function deadmanFresh(text, now, maxAgeMs = 3 * 15 * 60_000) {
-  if (text === null) return ["the dead-man check has written no status.json"];
-  let j;
-  try {
-    j = JSON.parse(text);
-  } catch {
-    return ["the dead-man's status.json is not JSON"];
-  }
-  if (j?.schema !== "aoa-pause-detector-deadman/1")
-    return ["the dead-man's status.json is not the dead-man's"];
-  const at = Date.parse(j.at);
-  if (!Number.isFinite(at)) return ["the dead-man's status.json has no time"];
-  if (at > now) return ["the dead-man's status.json is dated in the future"];
-  if (now - at > maxAgeMs)
-    return [`the dead-man's last run is ${Math.round((now - at) / 60_000)} min old`];
-  if (typeof j.startup === "string") return [`the dead-man's last run stopped: ${j.startup}`];
+export function deadmanFresh(text, now, maxAgeMs = DEADMAN_STALE_MS) {
+  // the dead-man itself runs and delivers: the same rule the detector checks every round (#436)
+  const run = deadmanRunProblems(text, now, maxAgeMs);
+  if (run.length) return run;
+  const j = JSON.parse(text);
   if (j.silent !== false) return ["the dead-man reports no successful detector round in 2 h"];
   // its snapshot can be up to three intervals old: the heartbeat it saw must still be within 2 h
   // NOW, or the deadline passed since (Codex dm-R1 P1-2)

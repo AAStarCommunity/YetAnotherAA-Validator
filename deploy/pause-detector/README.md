@@ -267,31 +267,51 @@ A detector that stops silently gives no signal at all. So a **separate** launchd
 job watches it: `io.aastar.dvt-pause-detector-deadman`, every 15 minutes
 (`deadman.mjs`).
 
-**What it covers, and what it does not** (clestons #435 B1). The two jobs share
-the pinned node, the bundle, `config.json` and the startup guards, so a failure
-of a shared part stops **both**, and neither sends anything.
+**What it covers, and what it does not** (clestons #435 B1, #436). The dead-man
+checks only what it uses itself: its own six files against `MANIFEST.json`
+(`DEADMAN_GRAPH` in `lib/guard.mjs`), with every directory on their path a real
+one, and the heartbeat read through a real `state/` directory. A failure in a
+part only the detector uses therefore no longer stops the dead-man.
 
-| The detector stops because                                                                | Dead-man alerts? |
-| ----------------------------------------------------------------------------------------- | ---------------- |
-| its plist is unloaded, or its launch arguments are wrong                                  | yes              |
-| it hangs, crashes, or a round throws on every run                                         | yes              |
-| an unrelated process holds its lock port                                                  | yes              |
-| its state directory, or an RPC secret, is unusable                                        | yes              |
-| the pinned node is missing or moved                                                       | **no**           |
-| a bundle file does not match `MANIFEST.json`                                              | **no**           |
-| any symlink under `~/.aoa-pause-detector` (including a stray one in `state/`)             | **no**           |
-| `config.json` is missing, unreadable or invalid                                           | **no**           |
-| the alert bot token file is unusable (both jobs read the same file)                       | **no**           |
-| the dead-man itself is down (plist unloaded; its directory missing; its state unreadable) | **no**           |
+| The detector stops because                                                                                     | Dead-man alerts?   |
+| -------------------------------------------------------------------------------------------------------------- | ------------------ |
+| its plist is unloaded, or its launch arguments are wrong                                                       | yes                |
+| it hangs, crashes, or a round throws on every run                                                              | yes                |
+| an unrelated process holds its lock port                                                                       | yes                |
+| its state directory or an RPC secret is unusable, including a symlink in `state/` or `state/` itself           | yes                |
+| a file only the detector loads does not match `MANIFEST.json`, or a stray symlink outside the dead-man's files | yes                |
+| a `config.json` field only the detector uses is invalid                                                        | yes                |
+| the pinned node is missing or moved                                                                            | **no** (known gap) |
+| `config.json` is missing, unreadable or not JSON, or its `telegram` field is invalid                           | **no** (known gap) |
+| the alert bot token file is unusable (both jobs read the same file)                                            | **no** (known gap) |
+| one of the dead-man's own six files does not match `MANIFEST.json` (the detector checks them too)              | **no** (known gap) |
 
-In every **no** row the failure shows **only** when someone runs preflight
-(stale or stopped `status.json`, a missing label, bundle or symlink items).
-**Nothing runs preflight on a schedule yet**, so these are visible only on a
-manual preflight. In particular a broken redeploy (a node, bundle or config
-problem) is the most likely way to stop the detector, and it stops the dead-man
-with it: **run preflight after every deploy.** Narrowing the dead-man's guards
-to the files it actually uses, and having each job check the other's
-`status.json`, is a follow-up.
+**The detector watches the dead-man back** (#436). Every round reads
+`deadman/status.json`. If it is missing, not the dead-man's schema, older than
+three dead-man intervals (45 min), dated in the future, a stop, or reports
+undelivered messages, the round raises the alert
+`the dead-man check is not working`. The alert resolves on its own once the
+dead-man runs cleanly again. So a dead-man that is down (plist unloaded,
+directory missing, state unreadable, its own guards failing) is reported by the
+detector, as long as the detector itself is running.
+
+**Known gaps.** DSR accepted the first three on 2026-11-15 and ruled that no
+further mechanism be added for them; the fourth is put to DSR in #436. In each,
+both jobs stop and neither sends anything. What covers each:
+
+- **The pinned node** lives at a fixed path
+  (`~/.local/keeper-node/node-v24.21.0`) that nothing upgrades automatically.
+- **`config.json`** changes only at a deploy, and **preflight runs after every
+  deploy**; it reports both jobs' stopped `status.json`.
+- **The alert bot token file**: if it fails, neither job can deliver an alert.
+  On deploy day the author checks by hand, once, that an alert actually arrives.
+- **The dead-man's own files**: the bundle is never edited in place (an upgrade
+  is a new directory swapped in), and preflight's `detector-bundle` checks it
+  after every deploy.
+
+**Nothing runs preflight on a schedule yet**, so these four are visible only on
+a manual preflight. A broken redeploy is the most likely way to hit one: **run
+preflight after every deploy.**
 
 - **Heartbeat.** Every **completed** round writes
   `state/heartbeat.json { at, gaps, block, clear }`. A completed round means no
@@ -338,9 +358,10 @@ to the files it actually uses, and having each job check the other's
   has moved on twice. The worst case is a duplicate (Codex dm-R4, dm-R5).
 
 - **Confinement.** It runs from the same bundle, under the same permission
-  model, with the same startup guards as the detector. It reads
-  `~/.aoa-pause-detector` and writes **only** `~/.aoa-pause-detector/deadman`,
-  its own state and `status.json`. It reads no chain and holds no key.
+  model, with the detector's startup guards except the whole-tree ones: it
+  checks only its own files (see above). It reads `~/.aoa-pause-detector` and
+  writes **only** `~/.aoa-pause-detector/deadman`, its own state and
+  `status.json`. It reads no chain and holds no key.
 - **Preflight** checks that it is loaded with exactly its plist's arguments
   (`deadman-args`). It also checks its own `status.json`
   (`pause-detector-deadman`): written within three of its intervals, not a stop,
@@ -355,8 +376,10 @@ to the files it actually uses, and having each job check the other's
 - `run.mjs`: config, lock, secrets, the read-only RPC client, delivery,
   `status.json`.
 - `lib/detect.mjs`: the round. It does no I/O; the chain is injected.
-- `deadman.mjs`, `deadman-run.mjs`: the dead-man check's entry (the same guards)
-  and its run.
+- `deadman.mjs`, `deadman-run.mjs`: the dead-man check's entry (its guards cover
+  only its own files, `DEADMAN_GRAPH`) and its run.
+- `lib/notify.mjs`: delivery shared by both jobs (Telegram batches, durable
+  writes, the secret names); it imports no detector code.
 - `bundle.mjs`: builds the bundle and its manifest. It is a deploy tool, never
   in the bundle.
 - `check-pause-detector.mjs`: the CI cells (`npm run check:pause-detector`).
@@ -382,6 +405,11 @@ secret-file reader, called with the detector's own name table) and
 
 ## Deploy (on the Mini, after the rc.8 read-back)
 
+0. **Deploy gate (DSR 2026-11-15).** Run Codex once over the whole
+   `deploy/pause-detector` directory on the master commit being deployed. Deploy
+   only if it reports no High. (The merge gate for this read-only directory is
+   the clestons approval. If the directory ever gains a signing or sending
+   capability, the stricter merge gate applies again.)
 1. Regenerate the pin at the rc.8 tag:
    `node deploy/pause-job/gen-sp-pin.mjs <tag commit>`, and review the diff.
 2. Write `~/.aoa-pause-detector/config.json`. The addresses, implementations,
@@ -446,6 +474,12 @@ secret-file reader, called with the detector's own name table) and
    - **pause-detector**: `status.json` is at most two intervals old, is not a
      startup failure, has no undelivered alerts, and a `clear` in it is on a
      head no older than two intervals.
+8. **On deploy day the author checks by hand that an alert arrives** in the
+   aastar-monitor chat (DSR 2026-11-15: this is what covers the shared token
+   file). Any message from this deployment counts. If none came, unload the
+   detector (`launchctl bootout gui/$(id -u)/io.aastar.dvt-pause-detector`).
+   Within 2 h 15 min the dead-man must send `DEAD-MAN: … no successful round`.
+   Then load the detector again and wait for `rounds resumed`.
 
 ## Before rc.8
 
