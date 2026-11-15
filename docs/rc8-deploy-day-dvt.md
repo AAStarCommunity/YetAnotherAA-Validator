@@ -68,9 +68,11 @@ Notes:
 
 ## Guardian re-registration
 
-The interface below is taken from SP's unmerged branch `cc125/rc8-bls-dvt` at
-`91758361d0b538e58572c94a27deb9a4a0465497`, `DVTValidator.sol:207`. It must be
-checked again against SP's step-4 merge commit.
+The interface below was checked against SP main at
+`9cacd4ecf228ca3eb9fb99470861c57de12608c4` (SP #630, BLSAggregator-4.14.0 and
+DVTValidator-0.8.0), `DVTValidator.sol:209`. It is unchanged from SP's earlier
+branch. SP's step 4 is still to come, so check it once more against the step-4
+merge commit.
 
 ```
 registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point pop)
@@ -85,18 +87,31 @@ registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point
   - Before sending, it reads `permissionlessBLSRegistration()` and records it.
 - **Addresses.** No address is hard-coded. The DVTValidator and aggregator
   addresses come from SP's deploy log or manifest output.
-- **PoP.**
-  - SP's natspec says every registration, including owner forwarding, needs an
-    address-bound PoP.
-  - The current script binds the PoP to the aggregator's `domainSeparator()`. It
-    checks the digest byte for byte against the contract's `popDigest()` (gates
-    4 and 7).
-  - Whether the 4.14.0 digest is bound to the aggregator, the DVTValidator or
-    the validator address must be checked against the merged code. Either way
-    the PoPs are recomputed for the new addresses; old PoPs are worthless.
-- **Who sends.** The DVTValidator owner. If DVT does not hold that key, the
-  script's `--export-pop` writes the public PoP data for the owner to submit. It
-  never signs a transaction.
+- **PoP.** Every registration, including owner forwarding, needs a PoP. At
+  `9cacd4ec` the PoP format is the same as the one the script already computes:
+  - `popDigest = keccak256(abi.encode(domainSeparator(), TAG_POP, validator, pk))`,
+    with `TAG_POP = keccak256("SuperPaymaster.BLS.PoP.v1")`
+    (`BLSAggregator.sol:290`);
+  - `domainSeparator() = keccak256(abi.encode(keccak256("SuperPaymaster.BLSConsensus.v1"), chainid, aggregator, registry))`;
+  - DST `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`, and `blsKeyOwner` is
+    keyed by `keccak256(abi.encode(pk))`.
+
+  The digest is bound to the **aggregator** address and the validator address,
+  not to the DVTValidator. PoPs are still recomputed for the new aggregator; old
+  ones are worthless. The script keeps checking its digest byte for byte against
+  the contract's `popDigest()` (gates 4 and 7).
+
+- **Call target.** On 4.14.0, `BLSAggregator.registerBLSPublicKey` accepts only
+  `msg.sender == DVT_VALIDATOR`. The script's current direct call to the
+  aggregator would revert, so it must call the DVTValidator.
+- **Who sends.** At `9cacd4ec`, the DVTValidator's registration branch checks
+  `msg.sender == DVTValidator.owner()`. A follow-up SP fix changes that check to
+  `aggregator.owner() == msg.sender`, as `removeValidator` already does. On rc.8
+  both owners should be the same address. **Before sending, the script reads
+  `DVTValidator.owner()` and `aggregator.owner()` and stops if they differ**
+  (DSR 2026-11-15). If DVT does not hold that key, the script's `--export-pop`
+  writes the public PoP data for the owner to submit. It never signs a
+  transaction.
 - **Rehearsal.**
   1. Once SP's manifest PR is out, run the script's dry run (staticCall from the
      on-chain owner) against SP's Sepolia fork rehearsal.
@@ -111,14 +126,66 @@ registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point
 1. `deploy/reregister-guardians.mjs`:
    - target DVTValidator's owner path;
    - read `permissionlessBLSRegistration()`;
+   - call the DVTValidator, not the aggregator;
+   - stop if `DVTValidator.owner()` and `aggregator.owner()` differ;
    - re-derive the PoP domain;
    - new `--expect-version`.
-2. `src/modules/audit`: file evidence with the four-argument
-   `createProposal(address,uint8,string,bytes32)`, by selector. There is no
-   function named `createProposalWithEvidence`.
+2. `src/modules/audit`: evidence is filed through
+   `BlockchainService.createProposalWithEvidence` (`blockchain.service.ts`).
+   That is a TypeScript method, not a contract function. Underneath it calls the
+   four-argument `createProposal(address,uint8,string,bytes32)`, which is
+   unchanged at `9cacd4ec` (`DVTValidator.sol:275`). Check that the ABI fragment
+   still matches the step-4 code. The node keeps no proposal-id cursor.
 3. `configuration.ts`: the address defaults move to the read-back values, and
    the node's startup check fails when `AUDIT_DVT_VALIDATOR_ADDRESS` or
    `AUDIT_BLS_AGGREGATOR_ADDRESS` is empty or equals a superseded address (DSR
    2026-11-15). If it is a single assertion it ships in the re-registration PR;
    if it needs structural change, it goes back to DSR first.
 4. The sp-parity pin (`ci/sp-parity-pin`) is set to SP's step-4 merge commit.
+
+## Operations notes from SP #630 (BLSAggregator-4.14.0)
+
+Read from SP main `9cacd4ec`. Re-check them against the step-4 merge commit.
+
+- **A guardian cannot leave when the committee sits exactly at a quorum.**
+  - Two calls refuse a departure that would break a configured quorum:
+    `requestGuardianExit` (guardian-initiated) and
+    `DVTValidator.removeValidator` (owner, forwarded through the DVTValidator).
+  - They refuse when the number of counted guardians equals any configured
+    threshold: `minThreshold`, `defaultThreshold`, or any
+    `slashThresholds[level]` (`_isRequiredThreshold`, `BLSAggregator.sol:1780`).
+    A guardian is counted when it has an active key, is not suspended, holds
+    `ROLE_DVT` with at least the minimum stake, and its exit notice has not
+    matured (`_requireCommitteeSurvivesExit`, `BLSAggregator.sol:1800`). At N=3
+    with a threshold of 3, both calls revert.
+  - The way out is for the aggregator owner to call
+    `BLSAggregator.revokeAndSuspend(validator)` directly. It skips the quorum
+    check, suspends the guardian and revokes its key. A direct owner call to
+    `revokeBLSPublicKey` also skips the check, but it does not suspend, so the
+    guardian could register again on the permissionless path.
+  - Losing that guardian then leaves the committee below that quorum. Proofs
+    that need the quorum stop working until a new guardian registers.
+- **`proposalSignersCommitment` keys depend on the path** (`_commitSigners`):
+  - execute-slash and reputation: the key is the `proposalId`;
+  - queue-slash: the key is `uint256(expectedMessageHash)`;
+  - generic `executeProposal`: the key is its replay key.
+
+  The `SignersCommitted(key, signerMask)` event carries the key. Nothing in the
+  node or audit reads this mapping today. The users are the over-issue fraud
+  verifier and the fork drill in `reregister-guardians.mjs`, both on the
+  execute-slash path.
+
+- **The commitment now includes a block hash.** The 4.14.0 pre-image ends with
+  `blockhash(block.number - 1)` (`BLSAggregator.sol:1386`).
+  `contracts/src/verifiers/OverIssueFraudProofVerifier.sol` recomputes the
+  commitment without it, so against 4.14.0 it never matches and every honest
+  fraud proof is rejected.
+  - The fork drill (`--export-fraud-drill`) writes the commitment straight into
+    the fork using the old pre-image, so it would still pass and hide this.
+  - Neither matters for rc.8: no fraud-proof verifier is set there (next item).
+  - Before any 5.5.0 verifier is deployed against a 4.14.0 or later aggregator,
+    the verifier and the drill must take the parent block hash as an input.
+- **Do not verify any stake-slash path on deploy day.** The rc.8 aggregator is
+  not authorised as a `GTokenStaking` slasher. With `fraudProofVerifier == 0`,
+  the 5.5.0 guardian-slash path cannot be reached. Deploy day checks
+  registration, proofs and the detector only.
