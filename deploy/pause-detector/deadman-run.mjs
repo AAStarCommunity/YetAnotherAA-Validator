@@ -14,8 +14,15 @@
 import { lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { GuardError, DIR, MAX_SILENCE_MS, readOwnJson, recordStop } from "./lib/guard.mjs";
-import { DETECTOR_SECRETS, batches, telegram, writeDurable } from "./run.mjs";
+import {
+  GuardError,
+  DIR,
+  MAX_SILENCE_MS,
+  readOwnJson,
+  realDirProblems,
+  recordStop,
+} from "./lib/guard.mjs";
+import { DETECTOR_SECRETS, batches, telegram, writeDurable } from "./lib/notify.mjs";
 import { dirProblems, readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { safeText } from "../pause-job/lib/safe-error.mjs";
 
@@ -27,7 +34,8 @@ export const REALERT_MS = 6 * 3600_000;
 /**
  * The decision, pure. `hb` is the parsed heartbeat (or null when missing/unreadable), `st` the
  * dead-man's own state { alerting, lastSent, reportedGaps }. Returns { silent, ageMs, message,
- * next } where `message` is the text to queue (or null) and `next` the next state. The caller
+ * messages, next } where `messages` are the notices to queue, one line each (`message` is them
+ * joined, or null), and `next` the next state. The caller
  * persists `next` with the message queued (so a failed send is retried from the queue, not
  * re-decided), and commits `next.reportedGaps` only after the whole queue was delivered.
  */
@@ -43,12 +51,14 @@ export function deadmanDecision(hb, now, st) {
     const since = Number.isFinite(at)
       ? `the last one was ${new Date(at).toISOString()}`
       : "no heartbeat on record";
+    const message = due
+      ? `DEAD-MAN: the pause detector has had no successful round for more than 2 h (${since}). Check the job (launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector) and its status.json.`
+      : null;
     return {
       silent,
       ageMs,
-      message: due
-        ? `DEAD-MAN: the pause detector has had no successful round for more than 2 h (${since}). Check the job (launchctl print gui/$(id -u)/io.aastar.dvt-pause-detector) and its status.json.`
-        : null,
+      message,
+      messages: message ? [message] : [],
       next: {
         alerting: true,
         lastSent: due ? now : lastSent,
@@ -73,6 +83,9 @@ export function deadmanDecision(hb, now, st) {
     silent,
     ageMs,
     message: msgs.length ? msgs.join(" ") : null,
+    // one queue line per notice, so a gap already queued is recognised and not queued again when a
+    // newer gap arrives beside it (clestons #435 L2)
+    messages: msgs,
     next: {
       alerting: false,
       lastSent,
@@ -139,9 +152,12 @@ export async function main({ send = null } = {}) {
     } catch (e) {
       return stop(78, `the alert bot token file: ${safeText("secrets", e)}`);
     }
+  // the heartbeat only through a real state/ directory (the dead-man no longer scans the whole tree
+  // for symlinks, #436): a symlinked state/ is no proof of life, so it reads as silence and alerts
   let hb = null;
   try {
-    hb = readOwnJson(join(d, "state", "heartbeat.json"), "heartbeat");
+    if (realDirProblems(join(d, "state"), "the state directory").length === 0)
+      hb = readOwnJson(join(d, "state", "heartbeat.json"), "heartbeat");
   } catch {
     hb = null; // missing or unreadable: no proof of life
   }
@@ -174,11 +190,8 @@ export async function main({ send = null } = {}) {
   // a message already waiting is not queued twice (an unacknowledged gap is re-derived every run
   // until its delivery is confirmed)
   const old = Array.isArray(st.queue) ? st.queue.filter(q => typeof q === "string") : [];
-  const waiting = dec.message && old.some(q => q.endsWith(` ${dec.message}`));
-  const queue = compactQueue([
-    ...old,
-    ...(dec.message && !waiting ? [`${new Date(now).toISOString()} ${dec.message}`] : []),
-  ]);
+  const fresh = dec.messages.filter(m => !old.some(q => q.endsWith(` ${m}`)));
+  const queue = compactQueue([...old, ...fresh.map(m => `${new Date(now).toISOString()} ${m}`)]);
   // what is acknowledged only once delivered: the gaps this run reports (Codex dm-R6 P1), or the
   // detector would drop them from the heartbeat before Telegram ever saw them
   const ackBefore = { reportedGaps: Array.isArray(st.reportedGaps) ? st.reportedGaps : [] };

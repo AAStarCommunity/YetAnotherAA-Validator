@@ -33,6 +33,11 @@ export class GuardError extends Error {
  * reason in `startup` (fixed text from our own checks); preflight FAILs on it. Written as a temp
  * file (O_EXCL, O_NOFOLLOW) and renamed; any error is swallowed: the exit code and log still say it.
  */
+/** A stop record carries the schema of the job whose directory it is in (clestons #435 L4). */
+const STOP_SCHEMA = Object.freeze({
+  state: "aoa-pause-detector-status/1",
+  deadman: "aoa-pause-detector-deadman/1",
+});
 export function recordStop(home, text, sub = "state") {
   const dir = join(home, DIR, sub);
   const tmp = join(dir, `status.json.${process.pid}.stop`);
@@ -55,7 +60,7 @@ export function recordStop(home, text, sub = "state") {
     );
     try {
       const body = Buffer.from(
-        `${JSON.stringify({ schema: "aoa-pause-detector-status/1", at: new Date().toISOString(), clear: false, startup: text })}\n`
+        `${JSON.stringify({ schema: STOP_SCHEMA[sub] ?? STOP_SCHEMA.state, at: new Date().toISOString(), clear: false, startup: text })}\n`
       );
       writeSync(fd, body);
     } finally {
@@ -348,4 +353,113 @@ export function bundleProblems(app) {
   }
   for (const f of listed) p.push(`${f} is in the manifest but missing`);
   return p.slice(0, 20);
+}
+
+/**
+ * The dead-man check's own module graph, as bundle paths (clestons #435 B1, #436). The dead-man
+ * verifies only these against the manifest, so a detector file that drifted, or a stray file
+ * elsewhere in the bundle, stops the detector but not the job that alerts about it. A cell keeps
+ * this list equal to deadman.mjs's static import closure.
+ */
+export const DEADMAN_GRAPH = Object.freeze([
+  "deploy/pause-detector/deadman.mjs",
+  "deploy/pause-detector/deadman-run.mjs",
+  "deploy/pause-detector/lib/guard.mjs",
+  "deploy/pause-detector/lib/notify.mjs",
+  "deploy/pause-job/lib/safe-error.mjs",
+  "deploy/pause-job/lib/secret-file.mjs",
+]);
+
+/**
+ * `files` (bundle paths) are in the bundle at `app` exactly as its manifest lists them: every
+ * directory on the way a real directory (lstat, so the loader cannot be led through a symlinked
+ * directory), every file read without following a link (readOwn) and hashing to its entry.
+ * Nothing else in the bundle is looked at. Returns the problems.
+ */
+export function graphProblems(app, files) {
+  let man;
+  try {
+    man = readOwnJson(join(app, MANIFEST), "the bundle manifest");
+  } catch (e) {
+    return [e instanceof GuardError ? e.message : "the bundle manifest cannot be read"];
+  }
+  if (man?.schema !== "aoa-pause-detector-bundle/1" || !man.files || typeof man.files !== "object")
+    return ["the bundle manifest is not a detector bundle manifest"];
+  const p = [];
+  const dirs = new Set([app]);
+  for (const f of files) {
+    const parts = f.split("/");
+    for (let k = 1; k < parts.length; k++) dirs.add(join(app, ...parts.slice(0, k)));
+  }
+  for (const d of dirs) {
+    let st;
+    try {
+      st = lstatSync(d);
+    } catch {
+      p.push(`${d} cannot be checked`);
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) p.push(`${d} is not a real directory`);
+  }
+  for (const f of files) {
+    if (typeof man.files[f] !== "string") {
+      p.push(`${f} is not in the manifest`);
+      continue;
+    }
+    let h;
+    try {
+      h = createHash("sha256")
+        .update(readOwn(join(app, f), f, 64 << 20))
+        .digest("hex");
+    } catch (e) {
+      p.push(e instanceof GuardError ? e.message : `${f}: unreadable`);
+      continue;
+    }
+    if (h !== man.files[f]) p.push(`${f} does not hash to its manifest entry`);
+  }
+  return p.slice(0, 20);
+}
+
+/** `d` is a real directory owned by this account (lstat). Returns the problems. */
+export function realDirProblems(d, what) {
+  let st;
+  try {
+    st = lstatSync(d);
+  } catch {
+    return [`${what} is not present`];
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) return [`${what} is not a real directory`];
+  if (st.uid !== process.getuid()) return [`${what} is not owned by this account`];
+  return [];
+}
+
+/** How often launchd runs the dead-man check, and how stale its status may be (three runs). */
+export const DEADMAN_INTERVAL_MS = 15 * 60_000;
+export const DEADMAN_STALE_MS = 3 * DEADMAN_INTERVAL_MS;
+
+/**
+ * Is the dead-man check itself running and delivering? `text` is its status.json (null when
+ * missing). Not about the detector's heartbeat: the detector asks this every round (clestons #435
+ * M1, #436: a dead-man that stopped is otherwise seen only on a manual preflight), and preflight
+ * asks it before its own heartbeat checks. Returns the problems, fixed wording. Pure.
+ */
+export function deadmanRunProblems(text, now, maxAgeMs = DEADMAN_STALE_MS) {
+  if (text === null) return ["the dead-man check has written no status.json"];
+  let j;
+  try {
+    j = JSON.parse(text);
+  } catch {
+    return ["the dead-man's status.json is not JSON"];
+  }
+  if (j?.schema !== "aoa-pause-detector-deadman/1")
+    return ["the dead-man's status.json is not the dead-man's"];
+  const at = Date.parse(j.at);
+  if (!Number.isFinite(at)) return ["the dead-man's status.json has no time"];
+  if (at > now) return ["the dead-man's status.json is dated in the future"];
+  if (now - at > maxAgeMs)
+    return [`the dead-man's last run is ${Math.round((now - at) / 60_000)} min old`];
+  if (typeof j.startup === "string") return [`the dead-man's last run stopped: ${j.startup}`];
+  if (j.delivery?.ok === false || (Number.isSafeInteger(j.undelivered) && j.undelivered > 0))
+    return ["the dead-man has undelivered alerts"];
+  return [];
 }

@@ -319,18 +319,41 @@ await section(async () => {
     Number(process.versions.node.split(".")[0]) >= 22
       ? "--permission"
       : "--experimental-permission";
-  const r = spawnSync(
-    process.execPath,
-    [
-      flag,
-      `--allow-fs-read=${d}`,
-      `--allow-fs-write=${join(d, "state")}`,
-      join(d, "app/deploy/pause-detector/detector.mjs"),
-      "--config",
-      cfgPath,
-    ],
-    { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home } }
+  const runDetector = () =>
+    spawnSync(
+      process.execPath,
+      [
+        flag,
+        `--allow-fs-read=${d}`,
+        `--allow-fs-write=${join(d, "state")}`,
+        join(d, "app/deploy/pause-detector/detector.mjs"),
+        "--config",
+        cfgPath,
+      ],
+      // a hung run fails here (status null) rather than stalling the end to end
+      { encoding: "utf8", env: { PATH: process.env.PATH, HOME: home }, timeout: 300_000 }
+    );
+  // no dead-man status yet: the detector watches it back and says so (clestons #435 M1, #436)
+  const r0 = runDetector();
+  cell(
+    "with no dead-man status the detector still reads clear but alerts that the dead-man is not working",
+    r0.status === 1 && /the dead-man check is not working/.test(r0.stderr),
+    { code: r0.status, stderr: r0.stderr.slice(0, 300) }
   );
+  // a fresh dead-man status, as its job writes it: the next round has nothing to report
+  mkdirSync(join(d, "deadman"), { mode: 0o700 });
+  writeFileSync(
+    join(d, "deadman", "status.json"),
+    JSON.stringify({
+      schema: "aoa-pause-detector-deadman/1",
+      at: new Date().toISOString(),
+      silent: false,
+      delivery: { ok: true, sent: 0 },
+      undelivered: 0,
+    }),
+    { mode: 0o600 }
+  );
+  const r = runDetector();
   if (!existsSync(join(d, "state", "status.json")))
     throw new Error(`no status.json; exit ${r.status}: ${r.stderr.slice(0, 400)}`);
   const status = JSON.parse(readFileSync(join(d, "state", "status.json"), "utf8"));
