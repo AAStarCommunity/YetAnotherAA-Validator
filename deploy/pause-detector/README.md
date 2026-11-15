@@ -295,9 +295,9 @@ dead-man runs cleanly again. So a dead-man that is down (plist unloaded,
 directory missing, state unreadable, its own guards failing) is reported by the
 detector, as long as the detector itself is running.
 
-**Known gaps.** DSR accepted the first three on 2026-11-15 and ruled that no
-further mechanism be added for them; the fourth is put to DSR in #436. In each,
-both jobs stop and neither sends anything. What covers each:
+**Known gaps.** DSR accepted all four on 2026-11-15 and ruled that no further
+mechanism be added for them. In each, both jobs stop and neither sends anything.
+What covers each:
 
 - **The pinned node** lives at a fixed path
   (`~/.local/keeper-node/node-v24.21.0`) that nothing upgrades automatically.
@@ -308,6 +308,12 @@ both jobs stop and neither sends anything. What covers each:
 - **The dead-man's own files**: the bundle is never edited in place (an upgrade
   is a new directory swapped in), and preflight's `detector-bundle` checks it
   after every deploy.
+
+One more case is not a stop but a false alarm: if the Mini's clock is set back,
+the dead-man's `status.json` can read as dated in the future, and the detector
+raises `the dead-man check is not working` for a round until the clock passes it
+again. Both jobs run on the same machine and clock, so this needs a clock step,
+and it errs towards alerting (clestons #438).
 
 **Nothing runs preflight on a schedule yet**, so these four are visible only on
 a manual preflight. A broken redeploy is the most likely way to hit one: **run
@@ -410,6 +416,12 @@ secret-file reader, called with the detector's own name table) and
    only if it reports no High. (The merge gate for this read-only directory is
    the clestons approval. If the directory ever gains a signing or sending
    capability, the stricter merge gate applies again.)
+   - **Known issue, could not reproduce (DSR 2026-11-15, part of this gate).**
+     On #439's head `fda1990f` one Node 20.20.2 run of `check:pause-detector`
+     had one failed cell, which was not captured. It was then run 30 times in a
+     row on Node 20.20.2 (`node deploy/pause-detector/check-pause-detector.mjs`,
+     each run's full log kept): 30/30 passed, 109/109 each. Not chased further.
+     If it recurs, keep the full log and name the cell before deploying.
 1. Regenerate the pin at the rc.8 tag:
    `node deploy/pause-job/gen-sp-pin.mjs <tag commit>`, and review the diff.
 2. Write `~/.aoa-pause-detector/config.json`. The addresses, implementations,

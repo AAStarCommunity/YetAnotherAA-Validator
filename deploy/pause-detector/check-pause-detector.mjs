@@ -1871,7 +1871,7 @@ const rpcServer = age =>
     });
     srv.listen(0, "127.0.0.1", () => res(srv));
   });
-const runBundleAgainst = async (age, fn) => {
+const runBundleAgainst = async (age, fn, setup = () => {}) => {
   const srv = await rpcServer(age);
   try {
     await withHomeAsync(async h => {
@@ -1891,6 +1891,7 @@ const runBundleAgainst = async (age, fn) => {
         }),
         { mode: 0o600 }
       );
+      setup(h);
       const r = await runDetectorAsync(h);
       const status = JSON.parse(readFileSync(join(h.d, "state", "status.json"), "utf8"));
       fn(r, status, h);
@@ -1928,6 +1929,56 @@ await cell(
         JSON.stringify(status).slice(0, 300)
       );
     })
+);
+// the detector watches the dead-man back (#436), driven through run.mjs itself, not only the rule
+// (clestons #438 finding 1: with the watch switched off, no CI cell went red)
+const DEADMAN_ALERT = /the dead-man check is not working/;
+const writeDeadmanStatus = (h, at) => {
+  mkdirSync(join(h.d, "deadman"), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(h.d, "deadman", "status.json"),
+    JSON.stringify({
+      schema: "aoa-pause-detector-deadman/1",
+      at: new Date(at).toISOString(),
+      heartbeatAt: null,
+      silent: false,
+      delivery: { ok: true, sent: 0 },
+      undelivered: 0,
+    }),
+    { mode: 0o600 }
+  );
+};
+await cell("#438: a round with no dead-man status.json raises the dead-man alert", async () =>
+  runBundleAgainst(5, (r, status) => {
+    const hit = (status.alerts ?? []).filter(a => DEADMAN_ALERT.test(a));
+    assert(hit.length === 1, JSON.stringify(status.alerts));
+    assert(/has written no status\.json/.test(hit[0]), hit[0]);
+  })
+);
+await cell("#438: a round with a stale dead-man status.json raises the dead-man alert", async () =>
+  runBundleAgainst(
+    5,
+    (r, status) => {
+      const hit = (status.alerts ?? []).filter(a => DEADMAN_ALERT.test(a));
+      assert(
+        hit.length === 1 && /last run is \d+ min old/.test(hit[0]),
+        JSON.stringify(status.alerts)
+      );
+    },
+    h => writeDeadmanStatus(h, Date.now() - DEADMAN_STALE_MS - 60_000)
+  )
+);
+await cell(
+  "#438: CONTROL a round with a fresh dead-man status.json raises no dead-man alert",
+  async () =>
+    runBundleAgainst(
+      5,
+      (r, status) => {
+        assert(Array.isArray(status.alerts), JSON.stringify(status).slice(0, 300));
+        assert(!status.alerts.some(a => DEADMAN_ALERT.test(a)), JSON.stringify(status.alerts));
+      },
+      h => writeDeadmanStatus(h, Date.now() - 60_000)
+    )
 );
 await cell(
   "crash label: only an allowlisted code or class, never text, never a throw (Codex dm-R1 P1-3)",
