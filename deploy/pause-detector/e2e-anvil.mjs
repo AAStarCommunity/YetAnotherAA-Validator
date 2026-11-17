@@ -25,7 +25,15 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { PIN, emptyState, runRound, spIface, regIface, IMPL_SLOT } from "./lib/detect.mjs";
+import {
+  PIN,
+  emptyState,
+  runRound,
+  spIface,
+  regIface,
+  IMPL_SLOT,
+  OPERATOR_CONFIGURED,
+} from "./lib/detect.mjs";
 import { readOnlyChain, resolvedKeys } from "./run.mjs";
 
 const HERE_E2E = dirname(fileURLToPath(import.meta.url));
@@ -142,6 +150,14 @@ const CFG = {
   logChunk: 50,
   rescanBlocks: 20000,
   maxHeadAgeSec: 1800,
+  // a fresh deployment at the pin: only the pin's own signature (DSR 2026-11-18)
+  operatorConfiguredTopics: [
+    {
+      signature: "OperatorConfigured(address,address,address)",
+      topic0: OPERATOR_CONFIGURED,
+      source: "the pin (a fresh anvil deployment at it)",
+    },
+  ],
 };
 const chain = readOnlyChain(URL);
 const deployer = new ethers.Wallet(DEPLOYER_PK, p);

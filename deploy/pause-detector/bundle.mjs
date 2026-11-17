@@ -91,6 +91,9 @@ const visit = dir => {
   // both identities are checked against the audit exceptions (Codex pre-PR): the manifest's name and
   // the directory it is installed under (an alias installs a package under another name)
   if (typeof pj.name !== "string" || !pj.name) die(`${key} has no package name`);
+  // every closure package is installed under a node_modules (clestons #452 Low): anything else is
+  // refused rather than checked under a garbled name
+  if (!key.includes("node_modules/")) die(`${key} is not under a node_modules`);
   names.push(pj.name, key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length));
   const locked = lock.packages[key];
   if (!locked) die(`${key} is not in package-lock.json: install with npm ci`);

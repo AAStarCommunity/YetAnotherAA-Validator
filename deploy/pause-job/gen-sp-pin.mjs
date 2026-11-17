@@ -5,7 +5,9 @@
 //   - the ABI fragments the job calls or filters on, copied from SP's committed abis/ files;
 //   - the ROLE_* set, parsed from the Registry's role constants (IRegistry.sol), each id recomputed
 //     as keccak256 of its name and checked against the literal in the source;
-//   - the git blob SHA of every file read, so the pin says exactly what it was made from.
+//   - the git blob SHA of every file read, so the pin says exactly what it was made from;
+//   - every event of SuperPaymaster's full ABI, as { signature, topic0 } (DSR 2026-11-18): the
+//     pause detector classifies every log the SP proxy emits against them.
 //
 //   node deploy/pause-job/gen-sp-pin.mjs <40-hex SP commit>            # write sp-pin.json
 //   node deploy/pause-job/gen-sp-pin.mjs --check                       # re-derive at the file's
@@ -119,6 +121,21 @@ export function parseRoles(raw) {
   return roles;
 }
 
+/** Every event of an ABI file as { signature, topic0 }, sorted by signature, each once. */
+function allEvents(abiFile, label) {
+  const abi = JSON.parse(abiFile.toString("utf8"));
+  const items = (Array.isArray(abi) ? abi : abi.abi).filter(x => x?.type === "event");
+  if (!items.length) fail(1, `${label}: no events`);
+  const out = new Map();
+  for (const e of items) {
+    const f = ethers.EventFragment.from(e);
+    out.set(f.format("sighash"), f.topicHash);
+  }
+  return [...out]
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .map(([signature, topic0]) => ({ signature, topic0 }));
+}
+
 export function derive(spCommit, fetch = fetchAt) {
   const sp = fetch(FILES.sp, spCommit);
   const reg = fetch(FILES.registry, spCommit);
@@ -139,6 +156,7 @@ export function derive(spCommit, fetch = fetchAt) {
       registry: pick(reg.buf, REG_NAMES, FILES.registry),
     },
     roles,
+    spEvents: allEvents(sp.buf, FILES.sp),
   };
   // the fragments must load, and the job's decision inputs must have the shape it relies on
   const spI = new ethers.Interface(pin.abi.superPaymaster);

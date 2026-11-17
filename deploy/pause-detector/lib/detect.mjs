@@ -33,6 +33,102 @@ export const spIface = new ethers.Interface(PIN.abi.superPaymaster);
 export const regIface = new ethers.Interface(PIN.abi.registry);
 export const ROLE_PAYMASTER_SUPER = PIN.roles.ROLE_PAYMASTER_SUPER;
 export const OPERATOR_CONFIGURED = spIface.getEvent("OperatorConfigured").topicHash;
+/** How many historical OperatorConfigured signatures a config may list. */
+export const MAX_OPERATOR_TOPICS = 16;
+
+/**
+ * Problems with the config's `operatorConfiguredTopics`, or [] (DSR 2026-11-18). An SP proxy that
+ * was upgraded in place emitted OperatorConfigured under every implementation it ever had, and the
+ * event's signature changed (v5.3.x had a 4th argument, `uint256 exchangeRate`; v5.4 dropped it), so
+ * its topic0 changed: filtering on the pin's topic alone silently misses every operator configured
+ * under an older implementation. The list is given by SP with its source, never recalled here:
+ * each entry is { signature, topic0, source }, topic0 must be keccak256(signature), the operator
+ * must be the first argument (it is read from topics[1]), and the pin's own topic must be listed.
+ * Pure.
+ */
+export function topicProblems(list) {
+  if (!Array.isArray(list) || list.length < 1 || list.length > MAX_OPERATOR_TOPICS)
+    return [`operatorConfiguredTopics must be a list of 1..${MAX_OPERATOR_TOPICS} entries`];
+  const p = [];
+  const seen = new Set();
+  for (const e of list) {
+    const sig = e?.signature;
+    if (typeof sig !== "string" || !/^OperatorConfigured\(address(,[a-z0-9[\]]+)*\)$/.test(sig)) {
+      p.push(
+        `operatorConfiguredTopics: ${JSON.stringify(sig)} is not OperatorConfigured(address,...)`
+      );
+      continue;
+    }
+    if (lc(e.topic0) !== topicOf(sig))
+      p.push(`operatorConfiguredTopics: ${sig}'s topic0 is not keccak256 of it`);
+    if (typeof e.source !== "string" || !e.source.trim() || e.source.length > 300)
+      p.push(`operatorConfiguredTopics: ${sig} has no source (who gave it, from what)`);
+    if (seen.has(topicOf(sig))) p.push(`operatorConfiguredTopics: ${sig} is listed twice`);
+    seen.add(topicOf(sig));
+  }
+  if (!seen.has(OPERATOR_CONFIGURED))
+    p.push("operatorConfiguredTopics must include the pin's own OperatorConfigured signature");
+  return p;
+}
+
+/** keccak256 of an event signature: its topic0 (ethers.id, from the scan's allowed utilities). */
+const topicOf = sig => ethers.keccak256(new TextEncoder().encode(sig));
+
+/** How many extra historical proxy events a config may list, and unknown topic0s a state records. */
+export const MAX_KNOWN_EVENTS = 64;
+export const MAX_UNKNOWN_TOPICS = 32;
+/** The most blocks one round classifies (every log of the proxy, unfiltered, in logChunk ranges). */
+export const CLASSIFY_MAX_BLOCKS = 2_000_000;
+
+/**
+ * Problems with cfg.knownProxyEvents (absent = none), or [] (DSR 2026-11-18). Events the proxy
+ * emitted under an older implementation and the pin's ABI no longer has, each { signature, topic0,
+ * source } from SP's read-back of the proxy's history. Pure.
+ */
+export function knownEventProblems(list) {
+  if (list === undefined) return [];
+  if (!Array.isArray(list) || list.length > MAX_KNOWN_EVENTS)
+    return [`knownProxyEvents must be a list of at most ${MAX_KNOWN_EVENTS} entries`];
+  const p = [];
+  for (const e of list) {
+    const sig = e?.signature;
+    if (typeof sig !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*\([a-z0-9,[\]()]*\)$/.test(sig)) {
+      p.push(`knownProxyEvents: ${JSON.stringify(sig)} is not an event signature`);
+      continue;
+    }
+    if (lc(e.topic0) !== topicOf(sig))
+      p.push(`knownProxyEvents: ${sig}'s topic0 is not keccak256 of it`);
+    // an operator configuration must be DISCOVERED, not merely known (Codex pre-PR r1)
+    if (sig.startsWith("OperatorConfigured("))
+      p.push(
+        `knownProxyEvents: ${sig} belongs in operatorConfiguredTopics, where its operators are read`
+      );
+    if (typeof e.source !== "string" || !e.source.trim() || e.source.length > 300)
+      p.push(`knownProxyEvents: ${sig} has no source`);
+  }
+  return p;
+}
+
+/**
+ * Every topic0 the proxy may emit that is classified: every event of SP's full ABI in the pin, the
+ * configured OperatorConfigured signatures, and the configured extra historical events. Pure.
+ */
+export function knownProxyTopics(cfg) {
+  // every event of SP's full ABI at the pinned commit (gen-sp-pin.mjs writes them; absent, none is
+  // known, so every other event is unknown: fail closed)
+  const t = new Set(
+    (PIN.spEvents ?? [])
+      // an OperatorConfigured variant counts only when it is in the discovery set, below
+      .filter(e => !String(e.signature).startsWith("OperatorConfigured("))
+      .map(e => lc(e.topic0))
+  );
+  for (const x of operatorTopics(cfg)) t.add(x);
+  for (const e of cfg.knownProxyEvents ?? []) t.add(lc(e.topic0));
+  return t;
+}
+
+/** The topic0 values an OperatorConfigured log may carry, from a checked config. Pure. */
+export const operatorTopics = cfg => cfg.operatorConfiguredTopics.map(e => lc(e.topic0));
 const SEL_NOT_CONFIGURED = spIface.getError("OperatorNotConfigured").selector;
 const SEL_MEETS = spIface.getError("OperatorMeetsMinimumStake").selector;
 // EIP-1967: bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)
@@ -44,6 +140,52 @@ const hex = n => ethers.toQuantity(n);
 export const MAX_UNFINALIZED = 2048;
 /** The most blocks one round cross-checks (a backlog is worked off over several rounds). */
 export const MAX_CHECK = 4096;
+/**
+ * Catch-up (DSR 2026-11-18, option (a)): while the watermark is more than MAX_CHECK blocks behind B
+ * (a first sync from an old proxy's deploy block, or after a long outage), a round may check up to
+ * cfg.catchUp.maxBlocksPerRound blocks, fetching `concurrency` blocks at a time, for at most
+ * maxSeconds. Only HOW MANY blocks a round checks changes: every block gets exactly the same checks,
+ * in the same order, and the round is unknown until the watermark reaches B. Once within MAX_CHECK
+ * of B, rounds are ordinary again by themselves (the mode is decided per round from the backlog).
+ * Bounds keep one round inside the hourly interval and under the head-age limit.
+ */
+export const CATCHUP_MAX_BLOCKS = 200_000;
+export const CATCHUP_MAX_CONCURRENCY = 16;
+export const CATCHUP_MAX_SECONDS = 1500;
+/** The most halvings of catch-up concurrency after rate limits (DSR 2026-11-18). */
+export const CATCHUP_MAX_THROTTLE = 4;
+/**
+ * A provider's "too many requests" (HTTP 429, JSON-RPC -32005/429, or a rate-limit message), as
+ * the transport marks it. In catch-up it means WE are sending too fast: the round stops, incomplete,
+ * and later rounds send less; it is not a sign that the provider is down. Pure.
+ */
+export const isRateLimited = e =>
+  e?.rateLimited === true || /RATE_LIMITED/.test(String(e?.message ?? ""));
+
+/** Problems with cfg.catchUp (absent = no catch-up), or []. Pure. */
+export function catchUpProblems(c) {
+  if (c === undefined || c === null) return [];
+  const p = [];
+  if (!(
+    Number.isSafeInteger(c.maxBlocksPerRound) &&
+    c.maxBlocksPerRound > MAX_CHECK &&
+    c.maxBlocksPerRound <= CATCHUP_MAX_BLOCKS
+  ))
+    p.push(`catchUp.maxBlocksPerRound must be ${MAX_CHECK + 1}..${CATCHUP_MAX_BLOCKS}`);
+  if (!(
+    Number.isSafeInteger(c.concurrency) &&
+    c.concurrency >= 1 &&
+    c.concurrency <= CATCHUP_MAX_CONCURRENCY
+  ))
+    p.push(`catchUp.concurrency must be 1..${CATCHUP_MAX_CONCURRENCY}`);
+  if (!(
+    Number.isSafeInteger(c.maxSeconds) &&
+    c.maxSeconds >= 60 &&
+    c.maxSeconds <= CATCHUP_MAX_SECONDS
+  ))
+    p.push(`catchUp.maxSeconds must be 60..${CATCHUP_MAX_SECONDS}`);
+  return p;
+}
 /** The most getLogs chunks one scan may make (a full rescan of Sepolia at logChunk 5000 is ~400). */
 export const MAX_CHUNKS = 200_000;
 const height = (n, what) => {
@@ -85,6 +227,7 @@ function resetVerification(st, alerts, why) {
   st.checkedHash = null;
   st.lastFullScan = 0;
   st.lastFallbackFullScan = 0;
+  st.classifiedTo = st.startBlock - 1;
   alerts.push({
     key: "reverify",
     text: `unknown: ${why}; everything is read and verified again from block ${st.startBlock}`,
@@ -139,6 +282,10 @@ export function emptyState({ chainId, spProxy, startBlock }) {
     alerts: {}, // key -> last alert time (ms)
     // the proxy has no code at startBlock - 1, read once (Daybreak H2): no earlier event exists
     startBlockVerified: false,
+    // every log of the proxy up to here was classified (DSR 2026-11-18): its topic0 is known
+    classifiedTo: startBlock - 1,
+    unknownTopics: {}, // topic0 (or "anonymous") -> first block it was seen, at most MAX_UNKNOWN_TOPICS
+    unknownTopicsMore: 0, // distinct unknown topic0s past that cap (they keep every round unknown)
     crossCheck: emptyCrossCheck(),
     undeliveredSince: null, // ms since some due alert could not be delivered (Daybreak M7), or null
   };
@@ -226,6 +373,39 @@ export function stateProblems(st, cfg) {
     !(Number.isFinite(st.undeliveredSince) && st.undeliveredSince >= 0)
   )
     p.push("the state's undeliveredSince is not a time");
+  // the classification fields are optional (a state from before them starts at startBlock - 1)
+  if (
+    st.classifiedTo !== undefined &&
+    !(Number.isSafeInteger(st.classifiedTo) && st.classifiedTo >= st.startBlock - 1)
+  )
+    p.push("the state's classifiedTo is not a block at or after startBlock - 1");
+  if (
+    st.unknownTopics !== undefined &&
+    !(
+      plainObject(st.unknownTopics) &&
+      Object.keys(st.unknownTopics).length <= MAX_UNKNOWN_TOPICS &&
+      Object.entries(st.unknownTopics).every(
+        ([k, v]) => (HASH32.test(k) || k === "anonymous") && Number.isSafeInteger(v)
+      )
+    )
+  )
+    p.push("the state's unknownTopics is not a map of topic0 to block");
+  if (st.topicSet !== undefined && typeof st.topicSet !== "string")
+    p.push("the state's topicSet is not a string");
+  if (
+    st.catchUpThrottle !== undefined &&
+    !(
+      Number.isSafeInteger(st.catchUpThrottle) &&
+      st.catchUpThrottle >= 0 &&
+      st.catchUpThrottle <= CATCHUP_MAX_THROTTLE
+    )
+  )
+    p.push("the state's catchUpThrottle is not 0..4");
+  if (
+    st.unknownTopicsMore !== undefined &&
+    !(Number.isSafeInteger(st.unknownTopicsMore) && st.unknownTopicsMore >= 0)
+  )
+    p.push("the state's unknownTopicsMore is not a count");
   if (st.startBlockVerified !== undefined && typeof st.startBlockVerified !== "boolean")
     p.push("the state's startBlockVerified is not a boolean");
   if (st.crossCheck !== undefined) {
@@ -297,10 +477,10 @@ const HASH32 = /^0x[0-9a-fA-F]{64}$/;
  * address topic, and its blockHash the CANONICAL hash of its block number (Codex R1 P1-2: a stale
  * or forked backend's logs are not accepted). `canon(n)` answers the canonical hash of block n.
  */
-async function checkLogs(logs, spProxy, a, b, canon) {
+async function checkLogs(logs, spProxy, a, b, canon, topics) {
   if (!Array.isArray(logs)) throw new SafeError(`getLogs: not a list (blocks ${a}-${b})`);
   for (const lg of logs) {
-    if (lc(lg?.address) !== spProxy || lg.topics?.[0] !== OPERATOR_CONFIGURED || lg.removed)
+    if (lc(lg?.address) !== spProxy || !topics.includes(lc(lg.topics?.[0])) || lg.removed)
       throw new SafeError(`getLogs: a log outside the filter (blocks ${a}-${b})`);
     const n = Number(lg.blockNumber);
     if (!(Number.isSafeInteger(n) && n >= a && n <= b))
@@ -317,20 +497,78 @@ async function checkLogs(logs, spProxy, a, b, canon) {
 }
 
 /** The operators of OperatorConfigured logs over [from, to]; every log checked. Throws a SafeError. */
-async function operatorLogs(chain, spProxy, from, to, size, each, canon) {
+/** A log's topic0, lower-case, or "anonymous". Pure. */
+const topic0Of = lg =>
+  Array.isArray(lg?.topics) && HASH32.test(String(lg.topics[0])) ? lc(lg.topics[0]) : "anonymous";
+
+/**
+ * The operator of an unfiltered log that is a configured OperatorConfigured topic, or null (Codex
+ * pre-PR r3: an index that omits it from topic-filtered answers still has it here). Throws on one
+ * whose operator topic is not an address.
+ */
+function operatorOfAny(lg, t0, T, n) {
+  if (!T.includes(t0)) return null;
+  if (typeof lg.topics?.[1] !== "string" || !ADDRESS_TOPIC.test(lg.topics[1]))
+    throw new SafeError(`getLogs: a log whose operator topic is not an address (block ${n})`);
+  return opOf(lg.topics[1]);
+}
+
+/** Record an unclassified topic0 in the state, bounded (MAX_UNKNOWN_TOPICS, then a count). */
+function recordUnknown(st, t0, n) {
+  if (t0 in st.unknownTopics) return;
+  if (Object.keys(st.unknownTopics).length < MAX_UNKNOWN_TOPICS) st.unknownTopics[t0] = n;
+  else st.unknownTopicsMore += 1;
+}
+
+/**
+ * Every log of the proxy over [from, to], UNFILTERED (DSR 2026-11-18): each must be the proxy's, not
+ * removed, in its range, and carry the hash `hashAt(n)` gives for its block. `each(lg, t0, n)` per
+ * log. Throws a SafeError (keeping a rate limit's mark).
+ */
+async function allLogs(chain, spProxy, from, to, size, hashAt, each) {
+  for (const [a, b] of ranges(from, to, size)) {
+    let logs;
+    try {
+      logs = await chain.getLogs({ address: spProxy, fromBlock: hex(a), toBlock: hex(b) });
+    } catch (e) {
+      const err = new SafeError(`${safeText("getLogs", e)} (every log, blocks ${a}-${b})`);
+      if (isRateLimited(e)) err.rateLimited = true;
+      throw err;
+    }
+    if (!Array.isArray(logs))
+      throw new SafeError(`getLogs: not a list (every log, blocks ${a}-${b})`);
+    for (const lg of logs) {
+      const n = Number(lg?.blockNumber);
+      if (
+        lc(lg?.address) !== spProxy ||
+        lg.removed ||
+        !(Number.isSafeInteger(n) && n >= a && n <= b)
+      )
+        throw new SafeError(`getLogs: a log outside the filter (every log, blocks ${a}-${b})`);
+      const h = await hashAt(n);
+      if (typeof lg.blockHash !== "string" || !h || lc(h) !== lc(lg.blockHash))
+        throw new SafeError(`getLogs: a log from block ${n} that is not on the canonical chain`);
+      each(lg, topic0Of(lg), n);
+    }
+  }
+}
+
+async function operatorLogs(chain, spProxy, from, to, size, each, canon, topics) {
   for (const [a, b] of ranges(from, to, size)) {
     let logs;
     try {
       logs = await chain.getLogs({
         address: spProxy,
-        topics: [OPERATOR_CONFIGURED],
+        topics: [topics],
         fromBlock: hex(a),
         toBlock: hex(b),
       });
     } catch (e) {
-      throw new SafeError(`${safeText("getLogs", e)} (blocks ${a}-${b})`);
+      const err = new SafeError(`${safeText("getLogs", e)} (blocks ${a}-${b})`);
+      if (isRateLimited(e)) err.rateLimited = true;
+      throw err;
     }
-    await checkLogs(logs, spProxy, a, b, canon);
+    await checkLogs(logs, spProxy, a, b, canon, topics);
     each(logs, b, a);
   }
 }
@@ -498,6 +736,9 @@ export async function runRound(
     checkedHash: st.checkedHash,
     lastFullScan: st.lastFullScan,
     lastFallbackFullScan: st.lastFallbackFullScan,
+    classifiedTo: st.classifiedTo,
+    topicSet: st.topicSet,
+    crossCheck: st.crossCheck && { ...st.crossCheck },
   };
   let result;
   try {
@@ -519,6 +760,28 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   const alerts = [];
   const sp = stateProblems(st, cfg);
   if (sp.length) throw new SafeError(`state: ${sp.join("; ")}`);
+  const tp = topicProblems(cfg.operatorConfiguredTopics);
+  if (tp.length) throw new SafeError(`config: ${tp.join("; ")}`);
+  const cp = catchUpProblems(cfg.catchUp);
+  if (cp.length) throw new SafeError(`config: ${cp.join("; ")}`);
+  const kp = knownEventProblems(cfg.knownProxyEvents);
+  if (kp.length) throw new SafeError(`config: ${kp.join("; ")}`);
+  const T = operatorTopics(cfg);
+  // the inventory was built and verified with ONE set of OperatorConfigured topics: when the set
+  // changes (a signature was added), nothing below the cursor was read with it, so everything is read
+  // and verified again from startBlock, and the cross-check's coverage starts over (Codex pre-PR r1)
+  const topicSet = [...T].sort().join(",");
+  if (st.topicSet !== topicSet) {
+    if (st.cursor >= st.startBlock) {
+      resetVerification(st, alerts, "the configured OperatorConfigured signatures changed");
+      if (st.crossCheck) {
+        st.crossCheck.lastComplete = 0;
+        st.crossCheck.coveredTo = 0;
+        st.crossCheck.lastAttempt = 0;
+      }
+    }
+    st.topicSet = topicSet;
+  }
   if (!Number.isSafeInteger(cfg.rescanBlocks) || cfg.rescanBlocks < 0)
     throw new SafeError("rescanBlocks is not a block count");
   if (!Number.isSafeInteger(cfg.logChunk) || cfg.logChunk < 1)
@@ -581,6 +844,9 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   const full = now - (st[scanKey] ?? 0) >= 24 * 3600_000;
   const from = full ? st.startBlock : Math.max(st.startBlock, st.cursor + 1 - cfg.rescanBlocks);
   let inventoryOk = true;
+  // any rate limit this round (Codex pre-PR r2): catch-up does not start after one, and the throttle
+  // never goes down in a round that met one
+  let rateLimited = false;
   // what the number-range answers said, block by block, this round: compared below with the
   // by-hash answers for every block above finalized and for B
   const rangeOps = new Map();
@@ -608,16 +874,66 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
         }
         if (b > st.cursor) st.cursor = b;
       },
-      canon
+      canon,
+      T
     );
     if (full) st[scanKey] = now;
   } catch (e) {
     inventoryOk = false;
+    if (isRateLimited(e)) rateLimited = true;
     alerts.push({
       key: "inventory",
       text: `unknown: the operator inventory could not be extended (${safeText("inventory", e)}); retried next round`,
     });
   }
+
+  // 1b. every log of the proxy, unfiltered, over the finalized blocks not yet classified (DSR
+  //     2026-11-18): each topic0 must be a known event. An unknown one may be an operator
+  //     configuration under a signature nobody listed, so it keeps every round unknown until the
+  //     config names it (knownProxyEvents or operatorConfiguredTopics, with SP's source). Finalized
+  //     logs do not change, so this runs once per block; a reorg reset classifies again
+  let classifyOk = true;
+  const known = knownProxyTopics(cfg);
+  st.unknownTopics ??= {};
+  st.unknownTopicsMore ??= 0;
+  st.classifiedTo ??= st.startBlock - 1;
+  try {
+    // the daily full rescan classifies everything again too (Codex pre-PR r2): a response that
+    // omitted a log once is asked again, by whichever provider the round uses
+    const cFrom = full ? st.startBlock : st.classifiedTo + 1;
+    const cTo = Math.min(finalized, cFrom + CLASSIFY_MAX_BLOCKS - 1);
+    if (cTo >= cFrom)
+      await allLogs(chain, st.spProxy, cFrom, cTo, cfg.logChunk, canon, (lg, t0, n) => {
+        if (!known.has(t0)) recordUnknown(st, t0, n);
+        // an operator configuration seen here enters the inventory too (a superset is safe)
+        const op = operatorOfAny(lg, t0, T, n);
+        if (op) st.operators[op] ??= n;
+      });
+    st.classifiedTo = Math.max(st.classifiedTo, cTo);
+    if (st.classifiedTo < finalized)
+      throw new SafeError(`classified up to block ${st.classifiedTo}, finalized is ${finalized}`);
+  } catch (e) {
+    classifyOk = false;
+    if (isRateLimited(e)) rateLimited = true;
+    alerts.push({
+      key: "events",
+      text: `unknown: the proxy's logs could not all be classified (${safeText("events", e)}); retried next round`,
+    });
+  }
+  // an unknown topic0 named in the config since is known now: it is dropped
+  for (const t of Object.keys(st.unknownTopics)) if (known.has(t)) delete st.unknownTopics[t];
+  const unknownEvents = Object.entries(st.unknownTopics);
+  if (unknownEvents.length || st.unknownTopicsMore)
+    alerts.push({
+      key: "unknown-event",
+      text:
+        `unknown: the SuperPaymaster proxy emitted events nobody listed: ${unknownEvents.map(([t, n]) => `${t} (first at block ${n})`).join(", ")}` +
+        (st.unknownTopicsMore ? `, and ${st.unknownTopicsMore} more` : "") +
+        "; one could be an operator configuration under an unlisted signature. Ask SP what each is and add it to knownProxyEvents (or operatorConfiguredTopics) with its source" +
+        (st.unknownTopicsMore ? "; past the cap, a new stateDir is needed after that" : ""),
+    });
+  const eventsOk = classifyOk && !unknownEvents.length && !st.unknownTopicsMore;
+  // (and no unclassified event above finalized: checked in step 4, required for clear below)
 
   // 2. one block, by hash, for every read of this round
   const head = await chain.blockByNumber("latest");
@@ -659,6 +975,8 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     for (const lg of logs) saw(opOf(lg.topics[1]), Number(lg.blockNumber));
   };
   let recentOk = true;
+  const recentUnknown = new Set(); // unclassified topic0s above finalized, this round only
+  let catchUp = null; // { from, to, upTo } when this round ran in catch-up mode
   try {
     if (B.number - finalized > MAX_UNFINALIZED)
       throw new SafeError(`${B.number - finalized} blocks above finalized: too many to walk`);
@@ -675,9 +993,35 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     if (B.number === finalized && lc(B.hash) !== lc(await canon(finalized)))
       throw new SafeError("B is not the finalized block the backend reports");
     hashes.set(B.number, B.hash);
+    // every log above finalized, unfiltered, against B's own ancestry (Codex pre-PR r2): an
+    // unlisted event there is unknown THIS round; it is recorded for good once finalized
+    if (B.number > finalized)
+      await allLogs(
+        chain,
+        st.spProxy,
+        finalized + 1,
+        B.number,
+        cfg.logChunk,
+        async n => hashes.get(n),
+        (lg, t0, n) => {
+          if (!known.has(t0)) recentUnknown.add(t0);
+          // an operator configuration above finalized counts this round, like the filtered reads'
+          const op = operatorOfAny(lg, t0, T, n);
+          if (op) saw(op, n);
+        }
+      );
     // the range answer above the cursor (B included)
     if (B.number > st.cursor)
-      await operatorLogs(chain, st.spProxy, st.cursor + 1, B.number, cfg.logChunk, rangeSaw, canon);
+      await operatorLogs(
+        chain,
+        st.spProxy,
+        st.cursor + 1,
+        B.number,
+        cfg.logChunk,
+        rangeSaw,
+        canon,
+        T
+      );
     // THE CROSS-CHECK (Codex R3, R8, R9, R10): every block in (checked, B] is asked for its logs BY
     // HASH (EIP-234) and BY RANGE, and the two must agree. `checked` is a watermark: every block at
     // or below it was compared and agreed. It advances only over contiguous agreeing blocks, and
@@ -699,7 +1043,52 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
         `the chain under block ${st.checked} changed since it was checked`
       );
     const lo = st.checked + 1;
-    const hi = Math.min(B.number, lo + MAX_CHECK - 1);
+    // catch-up is decided from THIS round's backlog alone: once within MAX_CHECK of B, ordinary
+    const behindFar = Boolean(cfg.catchUp) && B.number - st.checked > MAX_CHECK;
+    const catching = behindFar && !rateLimited;
+    if (behindFar && rateLimited)
+      catchUp = { from: lo, to: lo - 1, upTo: null, concurrency: 0, throttled: true };
+    let hi = Math.min(B.number, lo + (catching ? cfg.catchUp.maxBlocksPerRound : MAX_CHECK) - 1);
+    // in catch-up, the answers each block needs are fetched ahead, `concurrency` at a time, into
+    // these caches (keyed by the block's hash); the loop below still checks every block itself,
+    // and fetches anything not cached the ordinary way
+    const ahead = { blk: new Map(), logs: new Map() };
+    const t0 = clock();
+    // after a rate limit, later catch-up rounds send less: concurrency halves per throttled round
+    // and recovers one step per round that was not throttled (DSR 2026-11-18)
+    const throttle = st.catchUpThrottle ?? 0;
+    const width = catching ? Math.max(1, cfg.catchUp.concurrency >> throttle) : 1;
+    let throttled = false;
+    const fetchAhead = async (from, to) => {
+      const ns = [];
+      for (let n = from; n <= Math.min(to, finalized); n++) ns.push(n);
+      let i = 0;
+      const worker = async () => {
+        while (i < ns.length && !throttled) {
+          const k = i;
+          i += 1;
+          const n = ns[k];
+          try {
+            const h = await canon(n);
+            const [b, l] = await Promise.all([
+              chain.blockByHash(h),
+              chain.getLogs({ address: st.spProxy, topics: [T], blockHash: h }),
+            ]);
+            ahead.blk.set(lc(h), b);
+            ahead.logs.set(lc(h), l);
+          } catch (e) {
+            // a rate limit stops every worker: this round ends, incomplete, at the window's start
+            if (isRateLimited(e)) throttled = true;
+            /* otherwise not cached: the loop fetches it again and its error stops the round there */
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: width }, worker));
+    };
+    if (catching) {
+      catchUp = { from: lo, to: hi, upTo: null, concurrency: width, throttled: false };
+    }
+    const WINDOW = catching ? width * 64 : Infinity;
     // the watermark advances only along ONE chain (Codex R13 P1-1): at or below finalized, block n's
     // header is read by its hash and its parent must be the block before it (the stored
     // checkedHash, then each block of this window). Above finalized the hashes come from B's own
@@ -707,9 +1096,30 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     // the checked chain reaches B link by link, and a by-number answer from another fork breaks it.
     let prev = st.checkedHash;
     for (let n = lo; n <= hi; n++) {
+      if (catching && (n - lo) % WINDOW === 0) {
+        // the time budget is checked between windows: the round stops at a block boundary, with
+        // the watermark wherever the contiguous checked blocks reached
+        if (clock() - t0 > cfg.catchUp.maxSeconds * 1000) {
+          hi = n - 1;
+          break;
+        }
+        // this window's range answers, one getLogs per logChunk instead of one per block below, read
+        // window by window after the budget check, so every window's work counts (Codex pre-PR r5)
+        // (a rate limit here throws, and the catch below counts it as a throttled round)
+        const wTop = Math.min(hi, n + WINDOW - 1, finalized);
+        if (wTop >= n && !covered.some(([a, b]) => n >= a && wTop <= b))
+          await operatorLogs(chain, st.spProxy, n, wTop, cfg.logChunk, rangeSaw, canon, T);
+        await fetchAhead(n, Math.min(hi, n + WINDOW - 1));
+        if (throttled) {
+          // nothing of this window is checked: the round stops at its start, and is not clear
+          catchUp.throttled = true;
+          hi = n - 1;
+          break;
+        }
+      }
       const hn = n > finalized ? hashes.get(n) : await canon(n);
       if (n <= finalized) {
-        const blk = await chain.blockByHash(hn);
+        const blk = ahead.blk.get(lc(hn)) ?? (await chain.blockByHash(hn));
         if (!blk || Number(blk.number) !== n || lc(blk.hash) !== lc(hn))
           throw new SafeError(`block ${n} cannot be read by its hash`);
         if (prev !== null && lc(blk.parentHash) !== lc(prev))
@@ -719,13 +1129,15 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
       }
       // a block no range answer of this round covered gets its own
       if (!covered.some(([a, b]) => n >= a && n <= b))
-        await operatorLogs(chain, st.spProxy, n, n, cfg.logChunk, rangeSaw, canon);
-      const logs = await chain.getLogs({
-        address: st.spProxy,
-        topics: [OPERATOR_CONFIGURED],
-        blockHash: hn,
-      });
-      await checkLogs(logs, st.spProxy, n, n, canon);
+        await operatorLogs(chain, st.spProxy, n, n, cfg.logChunk, rangeSaw, canon, T);
+      const logs =
+        ahead.logs.get(lc(hn)) ??
+        (await chain.getLogs({
+          address: st.spProxy,
+          topics: [T],
+          blockHash: hn,
+        }));
+      await checkLogs(logs, st.spProxy, n, n, canon, T);
       const mine = new Set(logs.map(lg => opOf(lg.topics[1])));
       for (const op of mine) saw(op, n);
       const theirs = rangeOps.get(n) ?? new Set();
@@ -743,14 +1155,34 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     }
     if (hi < B.number)
       throw new SafeError(
-        `the cross-check is behind: every block is checked up to ${st.checked}, B is ${B.number}`
+        `the cross-check is behind: every block is checked up to ${st.checked}, B is ${B.number}${catchUp ? (throttled ? " (catching up: the provider rate-limited us; later rounds send less)" : " (catching up)") : ""}`
       );
   } catch (e) {
     recentOk = false;
+    // a rate limit anywhere in a catch-up round counts as one (Codex pre-PR r1): later rounds send less
+    if (isRateLimited(e)) {
+      rateLimited = true;
+      if (catchUp) catchUp.throttled = true;
+    }
     alerts.push({
       key: "inventory-recent",
       text: `unknown: operators configured after block ${st.cursor} could not be read (${safeText("recent", e)})`,
     });
+  }
+
+  if (recentUnknown.size)
+    alerts.push({
+      key: "unknown-event-recent",
+      text: `unknown: the SuperPaymaster proxy emitted events nobody listed above the finalized block: ${[...recentUnknown].join(", ")}; one could be an operator configuration under an unlisted signature`,
+    });
+
+  // the catch-up throttle (DSR 2026-11-18): halved per throttled catch-up round, one step back per
+  // catch-up round that was not
+  if (catchUp) {
+    const t = st.catchUpThrottle ?? 0;
+    st.catchUpThrottle = catchUp.throttled
+      ? Math.min(CATCHUP_MAX_THROTTLE, t + 1)
+      : Math.max(0, t - 1);
   }
 
   // the inventory only grows: every operator seen this round, whatever else failed
@@ -776,6 +1208,8 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     identity: id,
     canonical,
     operators: results,
+    // where a catch-up round's contiguous checked blocks reached, whether it then threw or not
+    catchUp: catchUp && { ...catchUp, upTo: st.checked },
     clear: false,
   };
   if (!canonical) {
@@ -855,6 +1289,11 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   report.clear =
     freshAtEnd &&
     startOk &&
+    eventsOk &&
+    // a reset later in the round (the chain under the watermark changed) sends classification back
+    // to startBlock: what it found earlier this round no longer covers the history (Codex pre-PR r1)
+    st.classifiedTo >= finalized &&
+    recentUnknown.size === 0 &&
     crossOk &&
     id.ok &&
     inventoryOk &&
@@ -932,6 +1371,9 @@ export async function crossCheckInventory(
     };
   };
   try {
+    if (topicProblems(cfg.operatorConfiguredTopics).length)
+      throw new SafeError("the config's operatorConfiguredTopics is not valid");
+    const T = operatorTopics(cfg);
     if (!other) throw new SafeError(unavailable);
     const id = Number(await other.chainId());
     if (id !== st.chainId) throw new SafeError(`the other provider is on chain ${id}`);
@@ -990,7 +1432,29 @@ export async function crossCheckInventory(
       persist();
     };
     const theirs = new Map(); // operator -> first block the other provider has its log at
-    if (H >= st.startBlock)
+    // the other provider is asked BOTH ways (Codex pre-PR r2, r4): topic-filtered, as before, and
+    // unfiltered, which also classifies every other topic0, so an event the round's provider once
+    // omitted from classification is seen by a second provider within a day. The operators either
+    // answer names are compared, as one set
+    const known = knownProxyTopics(cfg);
+    const otherCanon = canonOf(other);
+    const take = (op, n) => {
+      if (theirs.has(op)) {
+        if (n < theirs.get(op)) theirs.set(op, n);
+        return;
+      }
+      theirs.set(op, n);
+      if (mine.has(op) || op in st.operators) return;
+      if (room > 0) {
+        st.operators[op] = n;
+        st.fromCrossCheck[op] = { provider: otherName, block: n, at: now };
+        room--;
+      } else {
+        overCap.add(op);
+        markOverflow(overCap.size);
+      }
+    };
+    if (H >= st.startBlock) {
       await operatorLogs(
         other,
         st.spProxy,
@@ -998,24 +1462,17 @@ export async function crossCheckInventory(
         H,
         cfg.logChunk,
         logs => {
-          for (const lg of logs) {
-            const op = opOf(lg.topics[1]);
-            if (theirs.has(op)) continue;
-            const n = Number(lg.blockNumber);
-            theirs.set(op, n);
-            if (mine.has(op) || op in st.operators) continue;
-            if (room > 0) {
-              st.operators[op] = n;
-              st.fromCrossCheck[op] = { provider: otherName, block: n, at: now };
-              room--;
-            } else {
-              overCap.add(op);
-              markOverflow(overCap.size);
-            }
-          }
+          for (const lg of logs) take(opOf(lg.topics[1]), Number(lg.blockNumber));
         },
-        canonOf(other)
+        otherCanon,
+        T
       );
+      await allLogs(other, st.spProxy, st.startBlock, H, cfg.logChunk, otherCanon, (lg, t0, n) => {
+        const op = operatorOfAny(lg, t0, T, n);
+        if (op) take(op, n);
+        else if (!known.has(t0)) recordUnknown(st, t0, n);
+      });
+    }
     // what the other provider has that the inventory lacks, each with who found it and how far
     // that comparison reached
     const found = {};
@@ -1074,14 +1531,14 @@ export async function crossCheckInventory(
         try {
           logs = await primary.getLogs({
             address: st.spProxy,
-            topics: [OPERATOR_CONFIGURED, group.map(op => ethers.zeroPadValue(op, 32))],
+            topics: [T, group.map(op => ethers.zeroPadValue(op, 32))],
             fromBlock: hex(a),
             toBlock: hex(b),
           });
         } catch (e) {
           throw new SafeError(`${safeText("getLogs", e)} (primary, blocks ${a}-${b})`);
         }
-        await checkLogs(logs, st.spProxy, a, b, primaryCanon);
+        await checkLogs(logs, st.spProxy, a, b, primaryCanon, T);
         for (const lg of logs) {
           const op = opOf(lg.topics[1]);
           if (want.has(op)) confirmed.add(op);

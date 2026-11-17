@@ -14,8 +14,57 @@
   "maxHeadAgeSec": 1800,
   "stateDir": "/Users/REPLACE/.aoa-pause-detector/state",
   "secretsDir": "/Users/REPLACE/.aoa-pause-detector/secrets",
-  "telegram": { "chatId": "-1000000000000" },
+  "telegram": {
+    "chatId": "-1000000000000"
+  },
   "realertMinutes": 360,
   "lockPort": 47221,
-  "rpc": { "primary": "alchemy", "fallback": "infura" }
+  "rpc": {
+    "primary": "alchemy",
+    "fallback": "infura"
+  },
+  "operatorConfiguredTopics": [
+    {
+      "signature": "OperatorConfigured(address,address,address)",
+      "topic0": "0x823c9466affb5a8646bc5f7e6304f72a4622cc01af819ec2f51b1130a725c6d1",
+      "source": "EXAMPLE ONLY: ISuperPaymaster.sol at SP v5.4.2 and the pin 23e9633d. The deployed list comes from SP's read-back of the proxy's history, with its source"
+    },
+    {
+      "signature": "OperatorConfigured(address,address,address,uint256)",
+      "topic0": "0xff8a1775e676e9fe3cc41088a092f762a9c36c13098d2a9c6a02d1814e0ecbd7",
+      "source": "EXAMPLE ONLY: ISuperPaymaster.sol at SP v4.4.0..v5.3.2 (with exchangeRate). The deployed list comes from SP's read-back, with its source"
+    }
+  ],
+  "knownProxyEvents": [
+    {
+      "signature": "PriceUpdated(int256,uint256)",
+      "topic0": "0xdb6fb3cf4cc5fb760bcd63b958a53b2396776dff32c063188e864296541e76bd",
+      "source": "EXAMPLE ONLY: SP read-back of proxy 0x09DF…4DE9, 2026-11-18 (not in SP main c3745455 full ABI; in abis/SuperPaymaster.json at v5.4.0-beta.1-redeploy, v5.4.1-rc.1, v5.4.2). The deployed list is the rc.8 read-back"
+    },
+    {
+      "signature": "SlashQueued(address)",
+      "topic0": "0x75c311f3c3abe120497595cc3441171c6dcfdc922b816a2f4944f4f4daa67960",
+      "source": "EXAMPLE ONLY: SP read-back of proxy 0x09DF…4DE9, 2026-11-18 (not in SP main c3745455 full ABI; in abis/SuperPaymaster.json at v5.4.1-rc.1, v5.4.2). The deployed list is the rc.8 read-back"
+    },
+    {
+      "signature": "OperatorSlashed(address,uint256,uint8)",
+      "topic0": "0xa7503227727e36abb7f0ecf24f626347ccc20233c48c554d49d7d2077a1a3040",
+      "source": "EXAMPLE ONLY: SP read-back of proxy 0x09DF…4DE9, 2026-11-18 (not in SP main c3745455 full ABI; in abis/SuperPaymaster.json at the three 5.4.x tags). The deployed list is the rc.8 read-back"
+    },
+    {
+      "signature": "ReputationUpdated(address,uint256)",
+      "topic0": "0xfc577563f1b9a0461e24abef1e1fcc0d33d3d881f20b5df6dda59de4aae2c821",
+      "source": "EXAMPLE ONLY: SP read-back of proxy 0x09DF…4DE9, 2026-11-18 (not in SP main c3745455 full ABI; in abis/SuperPaymaster.json at the three 5.4.x tags). The deployed list is the rc.8 read-back"
+    },
+    {
+      "signature": "OperatorPaused(address)",
+      "topic0": "0xc5437eb8dd091f69800961953f2bb0bc16ae1ff2d3e52caa96796db65f8271da",
+      "source": "EXAMPLE ONLY: SP read-back of proxy 0x09DF…4DE9, 2026-11-18 (not in SP main c3745455 full ABI; in abis/SuperPaymaster.json at the three 5.4.x tags). The deployed list is the rc.8 read-back"
+    },
+    {
+      "signature": "OperatorUnpaused(address)",
+      "topic0": "0xae02c1bd695006b6d891af37fdeefea45a10ebcc17071e3471787db4f1772885",
+      "source": "EXAMPLE ONLY: SP read-back of proxy 0x09DF…4DE9, 2026-11-18 (not in SP main c3745455 full ABI; in abis/SuperPaymaster.json at the three 5.4.x tags). The deployed list is the rc.8 read-back"
+    }
+  ]
 }
