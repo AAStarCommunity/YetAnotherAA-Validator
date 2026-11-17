@@ -57,7 +57,7 @@ for (let i = 1; i <= 3; i++) {
 JS
 )
 
-# The versions the deployed contracts must report, e.g. "BLSAggregator-4.14.1,DVTValidator-0.8.1".
+# The versions the deployed contracts must report, e.g. "BLSAggregator-4.14.1,DVTValidator-0.9.0".
 # Required: taken from the SP commit's tree, never assumed here.
 check_versions() { # $1 aggregator  $2 dvtValidator  $3 label
   local a d
@@ -120,7 +120,9 @@ fi
 # ---- SP A7.dvt + A7, in the order the pin assumed --------------------------------------------------
 DBC=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['bytecode']['object'])" "$SP_DIR/out/DVTValidator.sol/DVTValidator.json")
 ABC=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['bytecode']['object'])" "$SP_DIR/out/BLSAggregator.sol/BLSAggregator.json")
-DARGS=$("$C" abi-encode 'c(address,uint256)' "$REG" 1)
+# DVTValidator-0.9.0 (SP #635): (registry, firstProposalId, bytes32[] categories, address[] checkers).
+# rc.8 deploys no evidence category (categoryCount() == 0), so both lists are empty here.
+DARGS=$("$C" abi-encode 'c(address,uint256,bytes32[],address[])' "$REG" 1 '[]' '[]')
 "$C" send --private-key "$K0" --rpc-url "$R" --create "$DBC${DARGS:2}" >/dev/null
 NDVT=$("$C" compute-address "$D" --nonce $(( $("$C" nonce "$D" --rpc-url "$R") - 1 )) | awk '{print $NF}')
 AARGS=$("$C" abi-encode 'c(address,address,address)' "$REG" "$SPX" "$NDVT")

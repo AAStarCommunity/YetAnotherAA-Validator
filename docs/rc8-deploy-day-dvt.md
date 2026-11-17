@@ -193,19 +193,26 @@ Before signing in the SAFE, the signers check:
 
 Checked against SP main `b5e7544e3970eab24dc9a3412366140207e36b28`
 (BLSAggregator-4.14.0, DVTValidator-0.8.0). SP #633 moves main to 4.14.1 / 0.8.1
-and step 4 moves the DVTValidator to 0.9.0. The script holds no version string:
-`--expect-versions` takes them from the tag's tree. Check the interface again
-against the step-4 merge commit.
+and step 4 (SP #635) moves the DVTValidator to 0.9.0. Rechecked at #635's head
+`d55f76f8ac379718e47e7f5c1d8fa46467914d69` (unmerged; BLSAggregator-4.14.1,
+DVTValidator-0.9.0): `BLSAggregator.sol` is byte-identical to `1845b124`, so
+`popDigest`, `domainSeparator()` and the aggregator's registration gate are
+unchanged; `registerBLSPublicKey` is unchanged (selector `0xaded17c5`). What
+0.9.0 changes is the DVTValidator constructor, now
+`(registry, firstProposalId, bytes32[] categories, address[] checkers)`; rc.8
+passes two empty lists (`categoryCount() == 0`). The script holds no version
+string: `--expect-versions` takes them from the tag's tree. Check the interface
+again against the step-4 merge commit.
 
 ```
 DVTValidator.registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point pop)
 ```
 
 - **Owner path only.** The owner branch requires the caller to be both
-  `DVTValidator.owner()` and `aggregator.owner()` (`DVTValidator.sol:209`, the
-  check at `:227`). The permissionless path picks the slot itself, and slot
-  identity matters (mask bits, historical proofs). The script reads and records
-  `permissionlessBLSRegistration()`.
+  `DVTValidator.owner()` and `aggregator.owner()` (`DVTValidator.sol:254` at
+  `d55f76f8`, the check at `:272`). The permissionless path picks the slot
+  itself, and slot identity matters (mask bits, historical proofs). The script
+  reads and records `permissionlessBLSRegistration()`.
 - **PoP.**
   - `popDigest = keccak256(abi.encode(domainSeparator(), TAG_POP, validator, pk))`;
   - `domainSeparator() = keccak256(abi.encode(DOMAIN_NAME, chainid, aggregator, registry))`;
@@ -223,8 +230,10 @@ These ran against SP's `DeployAnvil` at `b5e7544e` with throwaway BLS keys. The
 pre-deployment flow is `deploy/rehearse-reregister-plan.sh` (`good` and
 `nonce-moved`, with a required `EXPECT_VERSIONS`). It passed again on SP
 `1845b124` (BLSAggregator-4.14.1, DVTValidator-0.8.1): `good` exit 0,
-`nonce-moved` exit 3, both generations reporting the expected versions. Rerun it
-against the step-4 commit before this PR leaves draft:
+`nonce-moved` exit 3, both generations reporting the expected versions. With the
+0.9.0 constructor it passed on #635's head `d55f76f8` (BLSAggregator-4.14.1,
+DVTValidator-0.9.0): `good` exit 0, `nonce-moved` exit 3 with both stops. Rerun
+it against the step-4 merge commit before this PR leaves draft:
 
 - **Pre-deployment flow:**
   1. Generation 1 plays the old stack.
