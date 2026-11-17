@@ -203,7 +203,9 @@ DVTValidator.registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot
 
 ### Rehearsed on anvil (2026-11-17)
 
-These ran against SP's `DeployAnvil` at `b5e7544e` with throwaway BLS keys:
+These ran against SP's `DeployAnvil` at `b5e7544e` with throwaway BLS keys. The
+pre-deployment flow is `deploy/rehearse-reregister-plan.sh` (`good` and
+`nonce-moved`); rerun it against the step-4 commit before this PR leaves draft:
 
 - **Pre-deployment flow:**
   1. Generation 1 plays the old stack.
