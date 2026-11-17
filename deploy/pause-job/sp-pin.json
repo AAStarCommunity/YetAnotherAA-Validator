@@ -467,5 +467,211 @@
     "ROLE_DVT": "0x3b5016dc6721b132ddcb7027030b137a739df81e419695dae0899a866c1c514d",
     "ROLE_ANODE": "0x3aa2e9509f29532b71f822e18bcde843a8070a508d564188ec8a6adf59eff28a",
     "ROLE_KMS": "0x6fb2b25080d21c908f32ff8ff99eb1d552c210854f7de48a40406764c09c68f8"
-  }
+  },
+  "spEvents": [
+    {
+      "signature": "APNTsPriceUpdated(uint256,uint256)",
+      "topic0": "0xfcc60d1b1dedb59d33b8eef97db5a70c8f8f8523c70d6a027dbf676f1290f8d2"
+    },
+    {
+      "signature": "APNTsTokenChangeCancelled(address)",
+      "topic0": "0xde82ad51cc1336e141528846e966b9e7f7ae89a78ebb71d1f0da0d851592d8ee"
+    },
+    {
+      "signature": "APNTsTokenChangeExecuted(address,address,uint256)",
+      "topic0": "0xbbb759660e3239a80c3b3a0326287b69c8a5388b2ba43876c6b91c7c85f21fb8"
+    },
+    {
+      "signature": "APNTsTokenChangeQueued(address,uint256)",
+      "topic0": "0x98f60c65a2b39c6b97ac2ab59944af0f43d99c0d1756339e5c607fd64341971c"
+    },
+    {
+      "signature": "APNTsTokenUpdated(address,address)",
+      "topic0": "0x75f4cc3f3f70100dc11e396f47f8af2dec5cf7ec94e06062222be779cf2f3dec"
+    },
+    {
+      "signature": "AgentRegistriesUpdated(address,address)",
+      "topic0": "0x92f63be5e4bfac76f996bbbee86c4933f30141307811e42d6977a697dd8fc3ec"
+    },
+    {
+      "signature": "BLSAggregatorQueued(address,uint48)",
+      "topic0": "0x0b969f7dbdbaad518bf93d6f72458e8fd633fe345297219a90f56b035d14468d"
+    },
+    {
+      "signature": "BLSAggregatorUpdated(address,address)",
+      "topic0": "0x019f532f6e08ee8944dc2e7ac40f3c97ad4a20618aee847ddf7c502821c7dad4"
+    },
+    {
+      "signature": "BlsSlashCooldownPrimed(uint48)",
+      "topic0": "0x18e257fa1330af492bc6ba2454ed697ff9a225a325b2ba1c8f436508e7b102c2"
+    },
+    {
+      "signature": "DebtRecordFailed(address,address,uint256)",
+      "topic0": "0x8d05946ad7acf1695cdb2c1c7b76b11a907b33e5224f086eea17d6a23841e17f"
+    },
+    {
+      "signature": "EmergencyPriceCancelled(int256)",
+      "topic0": "0xd1cdd29a2fc16e6ed81266a11c8f7f06897e72e22d1bb9ccf34d63c3583d5df3"
+    },
+    {
+      "signature": "EmergencyPriceExecuted(int256)",
+      "topic0": "0xfb96594f297e98363f469f68dba1862f6b4e6dbe060a9fd971f41087b2bb2106"
+    },
+    {
+      "signature": "EmergencyPriceQueued(int256,uint256)",
+      "topic0": "0x028dfa1d2bc951d60682384a066c9424c3829ea5f25cb00a5f659caed927faea"
+    },
+    {
+      "signature": "GasParamsCancelled()",
+      "topic0": "0x644df2ca8e50cc6469fa4e7260119a1a60f3146e0218f378ec342ad1d59fe494"
+    },
+    {
+      "signature": "GasParamsExecuted(uint32,uint32,uint32,uint32)",
+      "topic0": "0x9995b9b78ccf8754a92553c09d3f85d1c27ec162113bb629069fe1d73a6c3384"
+    },
+    {
+      "signature": "GasParamsQueued(uint32,uint32,uint32,uint32,uint64)",
+      "topic0": "0xe59e383c70ea8897183b97ba6f529c524f603dd04667d60a4e686dbbb5fd40e2"
+    },
+    {
+      "signature": "GlobalPauseSet(address,bool)",
+      "topic0": "0xde0c166bd04b7c5598a692aa3a66306b07503d9ad8f5099063811005e828f332"
+    },
+    {
+      "signature": "GuardianSet(address,address)",
+      "topic0": "0xc3ce29e3ab42e524b6f6f1b4d3674898d503ee3577a64ac87b555904ebc14138"
+    },
+    {
+      "signature": "Initialized(uint64)",
+      "topic0": "0xc7f505b2f371ae2175ee4913f4499e1f2633a7b5936321eed1cdaeb6115181d2"
+    },
+    {
+      "signature": "OperatorConfigured(address,address,address)",
+      "topic0": "0x823c9466affb5a8646bc5f7e6304f72a4622cc01af819ec2f51b1130a725c6d1"
+    },
+    {
+      "signature": "OperatorDeposited(address,uint256)",
+      "topic0": "0x06653c045d0a3144153a51ac6909baae43b8d5b67184cb74e988b72858727fe4"
+    },
+    {
+      "signature": "OperatorMinTxIntervalUpdated(address,uint48)",
+      "topic0": "0x4419a541734858dec04cd4ea31aff7b399a0b82dc61f30cc777c1907dc8102ed"
+    },
+    {
+      "signature": "OperatorPaused(address)",
+      "topic0": "0xc5437eb8dd091f69800961953f2bb0bc16ae1ff2d3e52caa96796db65f8271da"
+    },
+    {
+      "signature": "OperatorSlashed(address,uint256,uint8)",
+      "topic0": "0xa7503227727e36abb7f0ecf24f626347ccc20233c48c554d49d7d2077a1a3040"
+    },
+    {
+      "signature": "OperatorUnpaused(address)",
+      "topic0": "0xae02c1bd695006b6d891af37fdeefea45a10ebcc17071e3471787db4f1772885"
+    },
+    {
+      "signature": "OperatorWithdrawalCancelled(address,uint256)",
+      "topic0": "0x84ef7829b4a3747e85238efd0f23cbb7850b76134685a7cb211ce77b545e736a"
+    },
+    {
+      "signature": "OperatorWithdrawalExpired(address,uint256)",
+      "topic0": "0x0f0090bc0468d6a0fb2aaab9e3008147ac9dc37374e894588ac8e56945fe965b"
+    },
+    {
+      "signature": "OperatorWithdrawalRequested(address,uint256,uint48,uint48)",
+      "topic0": "0xc177084ef107b3a6f664ee81be44e98e43624d04948b6a3873efe105ae373e83"
+    },
+    {
+      "signature": "OperatorWithdrawn(address,uint256)",
+      "topic0": "0x4eea589c35918e3c4d8e0371a062a1d544e41d78fb522381678923b9cd6e6dfa"
+    },
+    {
+      "signature": "OracleFallbackTriggered(uint256)",
+      "topic0": "0x190405c3325ce607eef93c6240d9728b865e09aa174052e80e380f33d165c4f4"
+    },
+    {
+      "signature": "OwnershipTransferStarted(address,address)",
+      "topic0": "0x38d16b8cac22d99fc7c124b9cd0de2d3fa1faef420bfe791d8c362d765e22700"
+    },
+    {
+      "signature": "OwnershipTransferred(address,address)",
+      "topic0": "0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0"
+    },
+    {
+      "signature": "PendingDebtCleared(address,address,uint256)",
+      "topic0": "0xe4ddb9696b79889a2b0002aa61f703666d072c319c0694d71624728605bdd287"
+    },
+    {
+      "signature": "PendingDebtRetried(address,address,uint256)",
+      "topic0": "0x84b561bfeda3b329970b08af25d20086abe657da83a1dbd00fdfaad913e8cfed"
+    },
+    {
+      "signature": "PriceModeChanged(uint8,uint8)",
+      "topic0": "0x5e5763e2a601dbb21ceae7f64e18f3d572378b373daa8d75a325f22f377f0ecb"
+    },
+    {
+      "signature": "PriceUpdated(int256,uint256)",
+      "topic0": "0xdb6fb3cf4cc5fb760bcd63b958a53b2396776dff32c063188e864296541e76bd"
+    },
+    {
+      "signature": "ProtocolFeeUpdated(uint256,uint256)",
+      "topic0": "0xb404cac19fb1cbeff98d325795b08886e3cd8fe8cb1a2f193aac66f13fb239c3"
+    },
+    {
+      "signature": "ProtocolRevenueUnderflow(address,uint256,uint256)",
+      "topic0": "0x418c06850785ce4239177091a96c1757ba1d5ba22df98a4cf818e1510fa028cd"
+    },
+    {
+      "signature": "ProtocolRevenueWithdrawn(address,uint256)",
+      "topic0": "0xf7595c4fd7fa675e456dd9520ac8266c06d237d52900fc573bccc85b7c177c9e"
+    },
+    {
+      "signature": "ReputationUpdated(address,uint256)",
+      "topic0": "0xfc577563f1b9a0461e24abef1e1fcc0d33d3d881f20b5df6dda59de4aae2c821"
+    },
+    {
+      "signature": "SlashCancelled(address)",
+      "topic0": "0xd3ca4980136f13cbba649b8d8d400d91e1fb63eb0d304a5074fa99165d3d978e"
+    },
+    {
+      "signature": "SlashExecutedWithProof(address,uint8,uint256,bytes32,uint256)",
+      "topic0": "0xa49f25e6b37dc7492af788d36761dc1b25f8fb6dcc448fb5637dc828725f0d88"
+    },
+    {
+      "signature": "SlashQueued(address)",
+      "topic0": "0x75c311f3c3abe120497595cc3441171c6dcfdc922b816a2f4944f4f4daa67960"
+    },
+    {
+      "signature": "SponsorshipReleased(bytes32,address,uint256)",
+      "topic0": "0xf706070ffd178e4517ea48c69540804a239fd4b0fb2f1273a167a1ac62d501af"
+    },
+    {
+      "signature": "TransactionSponsored(address,address,uint256,uint256)",
+      "topic0": "0xcde7e91a718e2439d8ff2a679ad52713e82a37b72622fb530c8c41039fdd5bf0"
+    },
+    {
+      "signature": "TreasuryUpdated(address,address)",
+      "topic0": "0x4ab5be82436d353e61ca18726e984e561f5c1cc7c6d38b29d2553c790434705a"
+    },
+    {
+      "signature": "Upgraded(address)",
+      "topic0": "0xbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b"
+    },
+    {
+      "signature": "UserBlockedStatusUpdated(address,address,bool)",
+      "topic0": "0x272958aacfbf07577da4ede62cc7d612dfb0881c6489c961988ef59378d7709f"
+    },
+    {
+      "signature": "UserReputationAccrued(address,uint256)",
+      "topic0": "0xd2d5a1362bcd0d05f9c4cdcf180554d9198405ba5a938a59bf2ae807acf90eba"
+    },
+    {
+      "signature": "ValidationFailed(bytes32,bytes32)",
+      "topic0": "0xf0131e6cc0fc7174d6c29a5082ba7a09d8f2356d5fdd89e02d323f1a66194939"
+    },
+    {
+      "signature": "XPNTsFactoryUpdated(address,address)",
+      "topic0": "0x05ba7ce38b27f49ba3b81247ac7a13b30021ce3e90f633a2498fa9d1a0957990"
+    }
+  ]
 }

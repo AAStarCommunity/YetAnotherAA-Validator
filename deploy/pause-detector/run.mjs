@@ -17,6 +17,11 @@ import {
   headStale,
   runRound,
   stateProblems,
+  topicProblems,
+  catchUpProblems,
+  knownEventProblems,
+  classifyMaxProblems,
+  isRateLimited,
 } from "./lib/detect.mjs";
 import {
   DIR,
@@ -71,7 +76,7 @@ export function configProblems(c) {
   ])
     if (!HASH.test(c[k] ?? "")) p.push(`${k} must be a 32-byte hex hash (from the tag read-back)`);
   if (!Number.isSafeInteger(c.startBlock) || c.startBlock < 1)
-    p.push("startBlock must be a positive block (SP's deploy block)");
+    p.push("startBlock must be a positive block (the SP proxy's deploy block)");
   if (!Number.isSafeInteger(c.logChunk) || c.logChunk < 1 || c.logChunk > 50000)
     p.push("logChunk must be 1..50000");
   if (!Number.isSafeInteger(c.maxHeadAgeSec) || c.maxHeadAgeSec < 60 || c.maxHeadAgeSec > 86_400)
@@ -91,6 +96,10 @@ export function configProblems(c) {
     p.push("rpc must be { primary, fallback } provider names");
   else if (c.rpc.primary === c.rpc.fallback)
     p.push("rpc.primary and rpc.fallback must be different providers");
+  p.push(...topicProblems(c.operatorConfiguredTopics));
+  p.push(...catchUpProblems(c.catchUp));
+  p.push(...knownEventProblems(c.knownProxyEvents));
+  p.push(...classifyMaxProblems(c.classifyMaxBlocks));
   return p;
 }
 
@@ -111,6 +120,11 @@ export function rpcTransport(url) {
       body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }),
       signal: AbortSignal.timeout(30_000),
     });
+    if (res.status === 429) {
+      const e = new SafeError(`${method}: RATE_LIMITED (HTTP 429)`);
+      e.rateLimited = true;
+      throw e;
+    }
     if (!res.ok) throw new SafeError(`${method}: HTTP ${res.status}`);
     let j;
     try {
@@ -119,9 +133,14 @@ export function rpcTransport(url) {
       throw new SafeError(`${method}: not JSON`);
     }
     if (j?.error) {
+      const limited =
+        j.error.code === -32005 ||
+        j.error.code === 429 ||
+        /rate.?limit|too many requests|exceeded .*(capacity|limit)/i.test(String(j.error.message));
       const e = new SafeError(
-        `${method}: ${j.error.code === 3 || /revert/i.test(String(j.error.message)) ? "CALL_EXCEPTION" : "SERVER_ERROR"}`
+        `${method}: ${limited ? "RATE_LIMITED" : j.error.code === 3 || /revert/i.test(String(j.error.message)) ? "CALL_EXCEPTION" : "SERVER_ERROR"}`
       );
+      if (limited) e.rateLimited = true;
       if (typeof j.error.data === "string") e.data = j.error.data;
       throw e;
     }
@@ -143,6 +162,7 @@ export function readOnlyChain(url, send = null) {
       return await transport(m, params);
     } catch (e) {
       const err = new SafeError(safeText(m, e));
+      if (e?.rateLimited === true) err.rateLimited = true;
       for (const d of [e?.data, e?.info?.error?.data, e?.error?.data])
         if (typeof d === "string" && /^0x[0-9a-fA-F]*$/.test(d)) err.data = d;
       throw err;
@@ -250,6 +270,50 @@ export function crossCheckPlan(provider, cfg) {
   };
 }
 
+/**
+ * ONE provider for the whole round: the primary unless it fails a probe. A provider whose head is
+ * older than maxHeadAgeSec is a failed probe (clestons #434 B1: a node frozen at a height is
+ * self-consistent and would otherwise read clear forever), so the fallback takes over.
+ * EXCEPT a rate limit right after our own throttled catch-up (DSR 2026-11-18): the primary is not
+ * down, we were sending too fast, so the round is skipped (unknown) rather than run on the
+ * fallback, which would move the fallback's rescan clock and the cross-check's roles. `probes` is
+ * [{ name, chain }] in order, primary first. Throws a SafeError when no round can run.
+ */
+export const PROBE_SKIP_MS = 2 * 3600_000;
+export async function chooseProvider(probes, cfg, st) {
+  const stale = [];
+  for (const [i, pr] of probes.entries()) {
+    try {
+      if (Number(await pr.chain.chainId()) !== cfg.chainId) continue;
+      const h = await pr.chain.blockByNumber("latest");
+      if (!(h?.number > 0)) continue;
+      if (headStale(h, Date.now(), cfg.maxHeadAgeSec)) {
+        stale.push(pr.name);
+        continue;
+      }
+      return { chain: pr.chain, provider: pr.name };
+    } catch (e) {
+      // only right after OUR throttled catch-up (clestons #453 Medium): within PROBE_SKIP_MS of the
+      // last throttled round; later, or with no throttle, a rate-limited primary hands over as usual
+      if (
+        i === 0 &&
+        isRateLimited(e) &&
+        (st?.catchUpThrottle ?? 0) > 0 &&
+        Date.now() - (st?.lastThrottledAt ?? 0) < PROBE_SKIP_MS
+      )
+        throw new SafeError(
+          `the primary RPC (${pr.name}) rate-limited the probe after a throttled catch-up round: this round is skipped, not run on the fallback`
+        );
+      /* try the next */
+    }
+  }
+  throw new SafeError(
+    stale.length
+      ? `no RPC provider has a fresh head (stale: ${stale.join(", ")}; max age ${cfg.maxHeadAgeSec} s)`
+      : "neither RPC provider answers for this chain"
+  );
+}
+
 /** One run, after detector.mjs's guards passed. Returns the exit code. */
 export async function main() {
   const args = process.argv.slice(2);
@@ -339,40 +403,17 @@ export async function main() {
         url: secret(DETECTOR_SECRETS.rpcFallback, "the fallback RPC file"),
       },
     ];
-    // ONE provider for the whole round: the primary unless it fails a probe. A provider whose head
-    // is older than maxHeadAgeSec is a failed probe (clestons #434 B1: a node frozen at a height is
-    // self-consistent and would otherwise read clear forever), so the fallback takes over
-    let chain = null;
-    let provider = null;
-    const stale = [];
-    for (const pr of providers) {
-      const c = readOnlyChain(pr.url);
-      try {
-        if (Number(await c.chainId()) !== cfg.chainId) continue;
-        const h = await c.blockByNumber("latest");
-        if (!(h?.number > 0)) continue;
-        if (headStale(h, Date.now(), cfg.maxHeadAgeSec)) {
-          stale.push(pr.name);
-          continue;
-        }
-        chain = c;
-        provider = pr.name;
-        break;
-      } catch {
-        /* try the next */
-      }
-    }
-    if (!chain)
-      throw new SafeError(
-        stale.length
-          ? `no RPC provider has a fresh head (stale: ${stale.join(", ")}; max age ${cfg.maxHeadAgeSec} s)`
-          : "neither RPC provider answers for this chain"
-      );
-    // the state is created on the first run and bound to { chainId, spProxy, startBlock }
+    // the state is created on the first run and bound to { chainId, spProxy, startBlock }; read
+    // before the probe, which needs to know whether a catch-up was being rate-limited
     const st = existsSync(statePath) ? readOwnJson(statePath, "state") : emptyState(cfg);
     const sp = stateProblems(st, cfg);
     if (sp.length)
       throw new SafeError(`state: ${sp.join("; ")} (a new deployment needs a new stateDir)`);
+    const { chain, provider } = await chooseProvider(
+      providers.map(pr => ({ name: pr.name, chain: readOnlyChain(pr.url) })),
+      cfg,
+      st
+    );
     const now = Date.now();
     // the daily inventory cross-check (Daybreak H1, DSR 2026-11-17), before the round, so the round
     // reports its result. It records its own failures (an incomplete day does not by itself make a

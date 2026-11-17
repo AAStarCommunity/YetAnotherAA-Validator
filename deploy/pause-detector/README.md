@@ -150,7 +150,38 @@ a missed one.
      all hash to their configured code hashes. SP and the Registry are both
      ERC-1967 proxies with the same proxy bytecode, so a proxy's code hash alone
      identifies nothing.
-4. **Recent operators.** Operators configured after the cursor, up to B, are
+4. **Every log of the proxy is classified** (DSR 2026-11-18, the approach of
+   SP's inventory script; it runs right after the inventory, before B is
+   pinned). Over the finalized blocks not yet classified, every log the SP proxy
+   emitted is read unfiltered, and its topic0 must be known: an event of SP's
+   full ABI at the pin (`sp-pin.json` `spEvents`), a configured
+   `operatorConfiguredTopics` signature, or a configured `knownProxyEvents`
+   entry. An unknown one may be an operator configuration under a signature
+   nobody listed. It is recorded with its first block and keeps every round
+   `unknown` (`unknown-event`) until the config names it, with SP's source. An
+   anonymous log counts as unknown. Each new block is classified once; a reorg
+   reset classifies again.
+   - **The daily replay** (Codex pre-PR r2; clestons #453 H1, H2). Each
+     provider's daily full round classifies everything from `startBlock` again,
+     so a response that once omitted a log is asked again. The replay goes in
+     segments of `classifyMaxBlocks` (optional, default 2,000,000), with its own
+     cursor per clock (`replayNext`).
+     - The daily clock (`lastFullScan` / `lastFallbackFullScan`) moves only when
+       the inventory rescan succeeded AND the replay reached finalized.
+     - A replay that fails, or is not finished, therefore keeps the rounds full
+       and resumes where it stopped. It is never counted as done.
+     - Forward classification of new blocks is separate and runs every round.
+   - The cross-check classifies too: it asks the fallback both ways, filtered
+     and unfiltered.
+   - Blocks above finalized are classified against B's ancestry. An unknown
+     there makes that round `unknown` and is recorded only once finalized.
+   - Past 32 distinct unknown topic0s only a sticky flag is kept, and it keeps
+     rounds `unknown` until a new `stateDir`.
+   - This costs about N / `logChunk` `getLogs` calls once, then a few per round.
+     On Sepolia the proxy had 495 logs in total at SP's read-back of 2026-11-18.
+     A much busier proxy can exceed a provider's per-response log limit; that
+     reads `unknown` (fail-closed) until `logChunk` is lowered.
+5. **Recent operators.** Operators configured after the cursor, up to B, are
    read this round too. They are not persisted until finalized.
    - **Ancestry.** It walks B's ancestry by hash (`eth_getBlockByHash`) down to
      the finalized block, and the walk must join the finalized block read by
@@ -198,7 +229,7 @@ a missed one.
    - A latest block below the finalized block or the cursor (a lagging backend),
      or a height that is not a safe integer, stops the round. Range construction
      is bounded.
-5. **Each operator at B.**
+6. **Each operator at B.**
    - It reads `operators(op).{isConfigured, isPaused}` and the three Registry
      reads of `SuperPaymasterStorage._hasEffectiveSuperStake`:
      `hasRole(ROLE_PAYMASTER_SUPER, op)`,
@@ -210,7 +241,7 @@ a missed one.
      the zero address. The function is permissionless; an eth_call broadcasts
      nothing. If the reads and SP's own check disagree, the result is
      **unknown**.
-6. **Canonical check.** B is re-checked canonical after every read. If it left
+7. **Canonical check.** B is re-checked canonical after every read. If it left
    the chain, the whole round is unknown.
 
 ### Trust in the RPC providers (DSR scope ruling)
@@ -351,16 +382,20 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   named cells in `check-pause-detector.mjs`, and each of those fails under a
   mutant that removes the guard.
 
-  | Invariant                                                                                                                                         | Cells                                                                                                                                                                                                                                                                            |
-  | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-  | The inventory is never checked as passing by the provider that built it                                                                           | `B2: the provider that built the inventory, comparing over the full height, cannot clear the other's finding`; `B2: only the configured primary's rounds are cross-checked, and only by the configured fallback`                                                                 |
-  | A standing fallback-only operator leaves the disagreement only by entering the inventory                                                          | `B1': the same fallback missing OP2 at the same height later does not clear it: OP2 stays checked`; `B1': a fallback that keeps missing OP2 for days never clears it`                                                                                                            |
-  | What the fallback found enters the inventory (over the cap: the overflow marker is set and written at once) even if the rest of the attempt fails | `N2: what the fallback found enters the inventory even when the primary's re-query then fails`; `chunk (Codex pre-push r3): …` (both); `N8+N2: …`; `persist (Codex pre-push r3): …`                                                                                              |
-  | A comparison that reaches less than a standing disagreement, or than an earlier completed one, settles nothing                                    | `H1-R2: a standing disagreement is cleared only by a comparison that reaches its height`; `H1-R2: a cross-check whose H is below what an earlier one covered is incomplete`; `High B: a shorter comparison that itself disagrees does not replace a standing disagreement`       |
-  | Every provider's round does the full rescan when its 24 h are up; only the primary's moves `lastFullScan`                                         | `B1'': the primary misses OP2 at 130 and then goes down: …`; `B1'': the fallback's rescan recurs every 24 h: …`; `N6: a fallback round's due full rescan is recorded apart (lastFallbackFullScan), never as the primary's`                                                       |
-  | No round is clear before a first cross-check has completed                                                                                        | `(b): a fresh or lost state is never clear before a first cross-check completes (coveredTo starts at 0)`; `N5: a first cross-check with the fallback's finalized block below startBlock is not completed`                                                                        |
-  | Coverage more than 3 days behind the inventory is `unknown`                                                                                       | `High A: coverage up to 3 days of blocks behind the inventory still reads clear; one block more is unknown`                                                                                                                                                                      |
-  | Additions from cross-checks are capped; after an overflow every round stays `unknown` until an operator resets it                                 | `N8: 100 invented operators (within the cap) …`; `N8: a lying fallback's 1,001 invented operators: …`; `N8 overflow (Codex pre-push, DSR 2026-11-18): …`; `N8+N2: with the cap used up and the last comparison clean, an over-cap finding survives a failed re-query: not clear` |
+  | Invariant                                                                                                                                                                                                  | Cells                                                                                                                                                                                                                                                                                                                                                                                                             |
+  | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | The inventory is never checked as passing by the provider that built it                                                                                                                                    | `B2: the provider that built the inventory, comparing over the full height, cannot clear the other's finding`; `B2: only the configured primary's rounds are cross-checked, and only by the configured fallback`                                                                                                                                                                                                  |
+  | A standing fallback-only operator leaves the disagreement only by entering the inventory                                                                                                                   | `B1': the same fallback missing OP2 at the same height later does not clear it: OP2 stays checked`; `B1': a fallback that keeps missing OP2 for days never clears it`                                                                                                                                                                                                                                             |
+  | What the fallback found enters the inventory (over the cap: the overflow marker is set and written at once) even if the rest of the attempt fails                                                          | `N2: what the fallback found enters the inventory even when the primary's re-query then fails`; `chunk (Codex pre-push r3): …` (both); `N8+N2: …`; `persist (Codex pre-push r3): …`                                                                                                                                                                                                                               |
+  | A comparison that reaches less than a standing disagreement, or than an earlier completed one, settles nothing                                                                                             | `H1-R2: a standing disagreement is cleared only by a comparison that reaches its height`; `H1-R2: a cross-check whose H is below what an earlier one covered is incomplete`; `High B: a shorter comparison that itself disagrees does not replace a standing disagreement`                                                                                                                                        |
+  | Every provider's round does the full rescan when its 24 h are up; only the primary's moves `lastFullScan`                                                                                                  | `B1'': the primary misses OP2 at 130 and then goes down: …`; `B1'': the fallback's rescan recurs every 24 h: …`; `N6: a fallback round's due full rescan is recorded apart (lastFallbackFullScan), never as the primary's`                                                                                                                                                                                        |
+  | The daily replay (inventory and classification) completes before its clock moves: a failed or unfinished replay resumes, in segments, until it reaches finalized                                           | `#453 H1: a full round whose replay fails does not move the daily clock; …`; `#453 H2: a replay longer than classifyMaxBlocks goes in segments with its own cursor; …`                                                                                                                                                                                                                                            |
+  | No round is clear before a first cross-check has completed                                                                                                                                                 | `(b): a fresh or lost state is never clear before a first cross-check completes (coveredTo starts at 0)`; `N5: a first cross-check with the fallback's finalized block below startBlock is not completed`                                                                                                                                                                                                         |
+  | Coverage more than 3 days behind the inventory is `unknown`                                                                                                                                                | `High A: coverage up to 3 days of blocks behind the inventory still reads clear; one block more is unknown`                                                                                                                                                                                                                                                                                                       |
+  | Additions from cross-checks are capped; after an overflow every round stays `unknown` until an operator resets it                                                                                          | `N8: 100 invented operators (within the cap) …`; `N8: a lying fallback's 1,001 invented operators: …`; `N8 overflow (Codex pre-push, DSR 2026-11-18): …`; `N8+N2: with the cap used up and the last comparison clean, an over-cap finding survives a failed re-query: not clear`                                                                                                                                  |
+  | The inventory's filter covers every OperatorConfigured signature the proxy ever used (configured, with SP's source), and every topic0 the proxy emits is classified; an unknown one keeps rounds `unknown` | `topics: an operator configured under an OLD OperatorConfigured signature enters the inventory and is checked`; `topics: a provider that returns a log with a topic0 outside the list makes the round unknown`; `topics: the cross-check and its re-query use the list too …`; `events: an unknown topic0 from the proxy keeps every round unknown and names it; …`; `events: past 32 distinct unknown topic0s …` |
+  | Catch-up changes only how many blocks a round checks: every block keeps every check, `clear` is never relaxed, and rounds are ordinary again within 4096 blocks of B                                       | `catch-up: a backlog larger than MAX_CHECK is checked in one round, every block by hash; …`; `catch-up never relaxes clear: …`; `catch-up: once within MAX_CHECK of B, rounds are ordinary again …`; `catch-up: a by-hash/by-range disagreement in its window stops the watermark there, …`                                                                                                                       |
+  | A rate limit while catching up ends that round incomplete and slows later rounds; it never hands the round to the fallback                                                                                 | `rate limit in catch-up: the round stops at a window's start, incomplete; …`; `rate limit at the probe: after a throttled catch-up the round is skipped, not run on the fallback; …`; `rate limit: the transport marks HTTP 429 and JSON-RPC limit errors, …`                                                                                                                                                     |
 
 - **The known residuals.**
   - Both providers missing the **same** log the same way is not found.
@@ -592,6 +627,11 @@ secret-file reader, called with the detector's own name table) and
      If it recurs, keep the full log and name the cell before deploying.
 1. Regenerate the pin at the rc.8 tag:
    `node deploy/pause-job/gen-sp-pin.mjs <tag commit>`, and review the diff.
+   **The order of steps 1, 2 and 8 is fixed (DSR 2026-11-18):** first the pin at
+   the tag (its `spEvents`, every event of SP's full ABI, change with the tag),
+   then `config.json` with `knownProxyEvents` taken against that pin, then,
+   after the first round, the positive control (step 8). Writing
+   `knownProxyEvents` against an older pin lists the wrong events.
 2. Write `~/.aoa-pause-detector/config.json`. The addresses, implementations,
    code hashes and deploy block come from the tag read-back, never from this
    repo.
@@ -602,13 +642,25 @@ secret-file reader, called with the detector's own name table) and
      too wide makes every round `unknown` until it is fixed; it never makes a
      round clear.
    - `maxHeadAgeSec` (60..86400) is the oldest head a round accepts.
-   - `startBlock` is the rc.8 SP deploy block, or earlier. The detector checks
-     it once per state (Daybreak H2, DSR 2026-11-17): SuperPaymaster must have
-     **no code at `startBlock − 1`**, so no earlier `OperatorConfigured` can
-     exist. Until that read returns empty code, every round is `unknown`
-     (`start-block`). A later `startBlock` would leave earlier operators unread
-     for good; fix it with a new `stateDir`. The read needs historical
-     `eth_getCode`, which both configured providers serve.
+   - `startBlock` is **the block the SP proxy was deployed at**, or earlier (DSR
+     2026-11-18):
+     - **Sepolia:** the SP proxy is upgraded in place (rc.8 changes only its
+       implementation), so `startBlock` is the proxy's ORIGINAL deploy block,
+       not the rc.8 upgrade block. The implementation is checked separately at
+       every round against the tag's values (`implementation`,
+       `implementationCodeHash`, the EIP-1967 slot). SP's read-back of the
+       proxy, 2026-11-18 (current values; the deploy uses the rc.8 read-back):
+       deployed at block 11151016, no code at 11151015.
+     - **OP Mainnet:** a fresh deployment, so its deploy block.
+
+     The detector checks it once per state (Daybreak H2, DSR 2026-11-17):
+     SuperPaymaster must have **no code at `startBlock − 1`**, so no earlier
+     `OperatorConfigured` can exist. The rc.8 upgrade block on Sepolia fails
+     this check, loudly. Until that read returns empty code, every round is
+     `unknown` (`start-block`). A later `startBlock` would leave earlier
+     operators unread for good; fix it with a new `stateDir`. The read needs
+     historical `eth_getCode`, which both configured providers serve.
+
    - The state file is read with a 1 MiB limit. The inventory only grows, at
      about 60 bytes per operator, so that is roughly 17,000 operators (Daybreak
      L11); rc.8 has a handful. Cross-checks add at most 100 of them
@@ -616,6 +668,71 @@ secret-file reader, called with the detector's own name table) and
    - The first rounds cross-check every block from there, at most 4096 per
      round, so a start far in the past reads `cross-check is behind` (unknown,
      fail-closed) for a while (clestons #434 F5).
+   - **`operatorConfiguredTopics`** (required; DSR 2026-11-18): every signature
+     `OperatorConfigured` has had on this proxy, each
+     `{ signature, topic0, source }`. SP gives the list from the proxy's
+     history, with its source; it is never recalled here. topic0 must be
+     keccak256 of the signature, the operator must be the first argument (it is
+     read from `topics[1]`), and the pin's own signature must be listed.
+     - Why: the event lost its `uint256 exchangeRate` argument between SP v5.3.2
+       and v5.4.2, so its topic0 changed. Filtering on the pin's topic alone
+       silently misses every operator configured under an older implementation
+       of an upgraded proxy, and the second provider filters the same way, so
+       the cross-check cannot see it either.
+     - Sepolia, per SP's read-back of 2026-11-18: the proxy's three
+       implementations (5.4.0, 5.4.1, 5.4.2) all emit only the 3-argument topic0
+       `0x823c9466…c6d1`, so the gap does not trigger there. The 4-argument
+       topic0 `0xff8a1775…ecbd7` is still listed, as a known historical
+       signature: it costs nothing and covers any other proxy.
+   - **`knownProxyEvents`** (optional): events the proxy emitted under an older
+     implementation that SP's full ABI at the pin no longer has, in the same
+     `{ signature, topic0, source }` form, from SP's read-back.
+     - On Sepolia, per SP's read-back of 2026-11-18 (blocks 11151016–12157255,
+       495 logs, 26 topic0s, against SP main `c3745455`'s full ABI), six are not
+       in the new ABI, because SP 5.5.2 changed their signatures:
+       `PriceUpdated(int256,uint256)`, `SlashQueued(address)`,
+       `OperatorSlashed(address,uint256,uint8)`,
+       `ReputationUpdated(address,uint256)`, `OperatorPaused(address)` and
+       `OperatorUnpaused(address)`. `config.example.json` lists them, recomputed
+       here as keccak256 of each signature, marked example-only. The deployed
+       list is SP's rc.8 read-back.
+   - **`catchUp`** (optional; DSR 2026-11-18, option (a)):
+     `{ maxBlocksPerRound (4097..200000), concurrency (1..16), maxSeconds (60..1500) }`.
+     - Used only by a round whose watermark is more than 4096 blocks behind B.
+       It checks up to `maxBlocksPerRound` blocks, fetching `concurrency` blocks
+       at a time, and stops at a block boundary after `maxSeconds`.
+     - Every block gets the same checks in the same order. The round stays
+       `unknown` until the watermark reaches B; nothing about `clear` is
+       relaxed. Within 4096 blocks of B, rounds are ordinary again by
+       themselves.
+     - **Provider calls**: about 3 per block (the block by number, the block by
+       hash, its logs by hash), plus one `getLogs` per `logChunk` blocks for the
+       range answers.
+     - For a backlog of N blocks that is about 3·N calls, in about N /
+       `maxBlocksPerRound` rounds if each round finishes inside `maxSeconds`.
+     - The Sepolia proxy's backlog at SP's read-back of 2026-11-18 was about 1.0
+       million blocks (deploy block 11151016, head about 12.16 million): a
+       current value, to be recomputed from the rc.8 read-back. That is about 3
+       million calls. Check them against the providers' plans before deploy day.
+     - The daily full rescan and the cross-check also read `getLogs` from
+       `startBlock`. Each reads twice, topic-filtered and unfiltered (the
+       unfiltered read classifies every topic0, Codex pre-PR r2/r4), so about
+       2·N / `logChunk` calls a day each.
+     - **Rate limits** (DSR 2026-11-18). A provider's "too many requests" (HTTP
+       429, JSON-RPC -32005/429, or a rate-limit message) while catching up
+       means we were sending too fast, not that the provider is down:
+       - the round stops at the start of the window it was fetching, with
+         nothing of that window checked, and is not clear;
+       - later catch-up rounds halve concurrency per throttled round (at most 4
+         halvings), and recover one step per round that was not throttled;
+       - if the primary also rate-limits the next run's probe **within 2 h of
+         the last throttled catch-up round** (`PROBE_SKIP_MS`), that run is
+         skipped as `unknown` rather than run on the fallback. A fallback round
+         would move the fallback's rescan clock and the cross-check's roles.
+         Later, or with no throttle, a rate-limited primary hands over as usual.
+         So does a primary that is down (clestons #453).
+       - the throttle is reset once the watermark is within 4096 blocks of B, so
+         it cannot stay armed after catch-up has ended.
 3. Create the secrets as 0600 files in a 0700 directory, without argv or
    history:
    - `aoa-dvt-detector-rpc-primary` and `aoa-dvt-detector-rpc-fallback` (RPC
@@ -678,7 +795,24 @@ secret-file reader, called with the detector's own name table) and
    - **pause-detector**: `status.json` is at most two intervals old, is not a
      startup failure, has no undelivered alerts, and a `clear` in it is on a
      head no older than two intervals.
-8. **On deploy day the author checks by hand that an alert arrives** in the
+8. **Positive control (DSR 2026-11-18): the deployment is not complete until
+   this passes.** Once the first round's inventory is built, compare it with the
+   operator list from SP's post-deploy read-back (a JSON list of addresses):
+   `node deploy/pause-detector/compare-inventory.mjs <stateDir>/state.json <sp-operators.json> --chain-id <id> --sp <SP proxy>`.
+   It must exit 0, which means the two sets are equal. A `missing` operator
+   means the detector's filter or `startBlock` is wrong.
+   - The state must be for that chain and that SP (exit 2 otherwise).
+   - An empty SP list fails (exit 1): an empty read-back is more likely a failed
+     one. `--allow-empty` passes it only when SP truly has no configured
+     operator (clestons #453).
+   - The list is the **configured operators**: those with an
+     `OperatorConfigured` on SP and `isConfigured` true. It is not the members
+     of the `PAYMASTER_SUPER` role. SP's read-back of 2026-11-18 found five role
+     members on Sepolia, three of them never configured on SP. The configured
+     operators were two, `0xEcAACb91…33c9` and `0xb5600060…df0E`, so the
+     inventory should hold those two. The rc.8 read-back's list is the one that
+     counts.
+9. **On deploy day the author checks by hand that an alert arrives** in the
    aastar-monitor chat (DSR 2026-11-15: this is what covers the shared token
    file). Any message from this deployment counts. If none came, unload the
    detector (`launchctl bootout gui/$(id -u)/io.aastar.dvt-pause-detector`).

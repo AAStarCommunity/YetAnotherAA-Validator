@@ -42,6 +42,11 @@ import {
   CROSS_CHECK_ALERT_DAYS,
   CROSS_CHECK_MAX_LAG_BLOCKS,
   MAX_CROSS_CHECK_ADDED,
+  topicProblems,
+  catchUpProblems,
+  knownEventProblems,
+  MAX_UNKNOWN_TOPICS,
+  MAX_CHECK,
 } from "./lib/detect.mjs";
 import {
   configProblems,
@@ -55,6 +60,7 @@ import {
   telegram,
   MESSAGE_CHARS,
   rpcTransport,
+  chooseProvider,
   nextUndeliveredSince,
   crossCheckPlan,
 } from "./run.mjs";
@@ -72,6 +78,7 @@ import {
   recordStop,
   symlinkProblems,
 } from "./lib/guard.mjs";
+import { compareInventory } from "./compare-inventory.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
 import {
@@ -90,6 +97,13 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const emptyState = cfg => {
   const st = freshState(cfg);
   st.crossCheck.lastComplete = 1;
+  // built with the config's OperatorConfigured topics (cells that hand-set a cursor past startBlock
+  // would otherwise read as a state from before the topic set existed, and be re-verified)
+  if (cfg?.operatorConfiguredTopics)
+    st.topicSet = cfg.operatorConfiguredTopics
+      .map(e => e.topic0.toLowerCase())
+      .sort()
+      .join(",");
   return st;
 };
 let pass = 0;
@@ -320,6 +334,9 @@ const REG_CODE = "0x6003";
 const REG_IMPL = "0x00000000000000000000000000000000000000c4";
 const REG_IMPL_CODE = "0x6004";
 const OP1 = "0x1111111111111111111111111111111111111111";
+// SP's OperatorConfigured before v5.4 (with exchangeRate): another topic0 (DSR 2026-11-18)
+const OLD_SIG = "OperatorConfigured(address,address,address,uint256)";
+const OLD_TOPIC = ethers.id(OLD_SIG);
 const OP2 = "0x2222222222222222222222222222222222222222";
 const cfgOf = over => ({
   chainId: 11155111,
@@ -335,6 +352,14 @@ const cfgOf = over => ({
   logChunk: 50,
   rescanBlocks: 60,
   maxHeadAgeSec: 1800,
+  operatorConfiguredTopics: [
+    {
+      signature: "OperatorConfigured(address,address,address)",
+      topic0: OPERATOR_CONFIGURED,
+      source: "test",
+    },
+    { signature: OLD_SIG, topic0: OLD_TOPIC, source: "test" },
+  ],
   ...over,
 });
 
@@ -392,11 +417,20 @@ function fakeChain(w) {
           ? null
           : { number: w.latest, hash: hashOf(w.latest), timestamp: w.frozenAt ?? ts };
       if (w.oldFork?.[n]) return { number: n, hash: w.oldFork[n] };
+      // B (the latest block, read by number only in the round's last canonical re-check) left the chain
+      if (w.reorgB && n === w.latest) return { number: n, hash: hashOf(n + 9999) };
       afterB = true;
       return { number: n, hash: w.reorg ? hashOf(n + 9999) : hashOf(n) };
     },
     getLogs: async f => {
-      assert(f.address === SP && f.topics[0] === OPERATOR_CONFIGURED, "log filter");
+      // the topic0 filter is a list (an OR): every historical OperatorConfigured signature. With no
+      // topics at all it is the classification pass (DSR 2026-11-18): every log of the proxy
+      const all = f.topics === undefined;
+      assert(
+        f.address === SP &&
+          (all || (Array.isArray(f.topics[0]) && f.topics[0].includes(OPERATOR_CONFIGURED))),
+        "log filter"
+      );
       let a;
       let b;
       if (f.blockHash) {
@@ -414,20 +448,58 @@ function fakeChain(w) {
         a = Number(f.fromBlock);
         b = Number(f.toBlock);
       }
+      if (all) {
+        failIf("all-logs");
+        const other = (w.otherLogs ?? [])
+          .filter(o => o.block >= a && o.block <= b)
+          .map(o => ({
+            address: SP,
+            topics: o.topic0 ? [o.topic0] : [],
+            blockNumber: ethers.toQuantity(o.block),
+            blockHash: hashOf(o.block),
+            removed: false,
+          }));
+        // operators exactly as the filtered answer encodes them (the cross-check reads them here)
+        const ops = Object.entries(w.ops)
+          .filter(
+            ([, o]) =>
+              o.logBlock >= a &&
+              o.logBlock <= b &&
+              !w.hidden?.has(o.logBlock) &&
+              !w.rangeHides?.has(o.logBlock)
+          )
+          .map(([op, o]) => ({
+            address: SP,
+            topics: [
+              o.topic0 ?? OPERATOR_CONFIGURED,
+              w.topicOf?.(op) ?? ethers.zeroPadValue(op, 32),
+            ],
+            blockNumber: ethers.toQuantity(o.logBlock),
+            blockHash: hashOf(o.logBlock),
+            removed: false,
+          }));
+        // w.classifyHides: blocks a provider's UNFILTERED answer omits (a transient index gap)
+        return [...ops, ...other].filter(lg => !w.classifyHides?.has(Number(lg.blockNumber)));
+      }
       w.scanned = [...(w.scanned ?? []), [a, b]];
+      const wanted = new Set(f.topics[0].map(t => t.toLowerCase()));
       return Object.entries(w.ops)
         .filter(
           ([, o]) =>
+            // a real node returns only logs whose topic0 is in the filter; w.ignoresTopic misbehaves
+            (w.ignoresTopic || wanted.has((o.topic0 ?? OPERATOR_CONFIGURED).toLowerCase())) &&
             o.logBlock >= a &&
             o.logBlock <= b &&
             !w.hidden?.has(o.logBlock) &&
+            // w.filteredHides: an index that omits the log from topic-filtered answers only
+            !w.filteredHides?.has(o.logBlock) &&
             !(w.rangeSkipsB && !f.blockHash && o.logBlock === w.latest) &&
             !(w.rangeHides?.has(o.logBlock) && !f.blockHash) &&
             !(w.hashHides?.has(o.logBlock) && f.blockHash)
         )
         .map(([op, o]) => ({
           address: SP,
-          topics: [OPERATOR_CONFIGURED, w.topicOf?.(op) ?? ethers.zeroPadValue(op, 32)],
+          topics: [o.topic0 ?? OPERATOR_CONFIGURED, w.topicOf?.(op) ?? ethers.zeroPadValue(op, 32)],
           blockNumber: ethers.toQuantity(o.logBlock),
           blockHash: w.forkedLog === o.logBlock ? hashOf(o.logBlock + 5555) : hashOf(o.logBlock),
           removed: false,
@@ -2658,6 +2730,1011 @@ await cell(
         src
       ),
       "bundle.mjs does not check a vendored package.json"
+    );
+  }
+);
+
+// ---- the proxy's historical OperatorConfigured signatures (DSR 2026-11-18) -----------------------
+/** OP2 (understaked) configured at 130 under the OLD signature (with exchangeRate). */
+const oldSigOps = () => ({
+  [OP1.toLowerCase()]: { configured: true, paused: false, role: true, eff: 150n, logBlock: 120 },
+  [OP2.toLowerCase()]: {
+    configured: true,
+    paused: false,
+    role: true,
+    eff: 0n,
+    logBlock: 130,
+    topic0: OLD_TOPIC,
+  },
+});
+await cell(
+  "topics: an operator configured under an OLD OperatorConfigured signature enters the inventory and is checked",
+  async () => {
+    const { st, alerts, report } = await round(world({ ops: oldSigOps() }));
+    assert(ethers.getAddress(OP2) in st.operators, "the old-signature operator is not inventoried");
+    assert(
+      !report.clear && alerts.some(a => a.key === `actionable:${ethers.getAddress(OP2)}`),
+      alerts.map(a => a.key).join(",")
+    );
+  }
+);
+await cell(
+  "topics CONTROL: listing only the pin's signature misses that operator (why the list exists)",
+  async () => {
+    const cfg = cfgOf({ operatorConfiguredTopics: [cfgOf().operatorConfiguredTopics[0]] });
+    const { st } = await round(world({ ops: oldSigOps() }), cfg);
+    assert(!(ethers.getAddress(OP2) in st.operators), "found without its signature listed");
+  }
+);
+await cell(
+  "topics: a provider that returns a log with a topic0 outside the list makes the round unknown",
+  async () => {
+    const ops = oldSigOps();
+    ops[OP2.toLowerCase()].topic0 = ethers.id("SomethingElse(address)");
+    const { alerts, report } = await round(world({ ops, ignoresTopic: true }));
+    assert(
+      !report.clear && alerts.some(a => /outside the filter/.test(a.text)),
+      alerts.map(a => a.text).join("; ")
+    );
+  }
+);
+await cell(
+  "topics: the cross-check and its re-query use the list too (an old-signature operator the primary missed)",
+  async () => {
+    const primaryW = world({ ops: oldSigOps(), hidden: new Set([130]) });
+    const st = await inventoried(primaryW);
+    await cross(st, primaryW, world({ ops: oldSigOps() }), 1e12 + 1000);
+    assert(
+      st.crossCheck.mismatch?.fallbackOnly?.includes(ethers.getAddress(OP2)) &&
+        ethers.getAddress(OP2) in st.operators,
+      JSON.stringify(st.crossCheck)
+    );
+  }
+);
+await cell(
+  "topics: the config's list is checked (topicProblems, configProblems, the round)",
+  async () => {
+    const good = cfgOf().operatorConfiguredTopics;
+    assert(topicProblems(good).length === 0, topicProblems(good).join("; "));
+    const bad = [
+      [[], "an empty list"],
+      [[good[1]], "without the pin's own signature"],
+      [
+        [good[0], { ...good[1], topic0: OPERATOR_CONFIGURED }],
+        "a topic0 that is not keccak256 of its signature",
+      ],
+      [
+        [
+          good[0],
+          {
+            ...good[1],
+            signature: "OperatorConfigured(uint256,address)",
+            topic0: ethers.id("OperatorConfigured(uint256,address)"),
+          },
+        ],
+        "an operator that is not the first argument",
+      ],
+      [[good[0], { ...good[1], source: " " }], "no source"],
+      [[good[0], good[0]], "a duplicate"],
+      [Array.from({ length: 17 }, () => good[0]), "too many"],
+      ["x", "not a list"],
+    ];
+    for (const [list, why] of bad) assert(topicProblems(list).length > 0, `accepted ${why}`);
+    const c = JSON.parse(readFileSync(join(HERE, "config.example.json"), "utf8"));
+    assert(
+      !configProblems(c).some(p => /operatorConfiguredTopics/.test(p)),
+      "the example's list refused"
+    );
+    delete c.operatorConfiguredTopics;
+    assert(
+      configProblems(c).some(p => /operatorConfiguredTopics/.test(p)),
+      "a config without the list accepted"
+    );
+    let why = "";
+    try {
+      await round(world(), cfgOf({ operatorConfiguredTopics: undefined }));
+    } catch (e) {
+      why = e.message;
+    }
+    assert(/config: operatorConfiguredTopics/.test(why), why || "a round ran without the list");
+  }
+);
+
+// ---- catch-up (DSR 2026-11-18, option (a)) ----------------------------------------------------------
+const CU = { maxBlocksPerRound: 50_000, concurrency: 4, maxSeconds: 600 };
+const deep = over => world({ finalized: 20_000, latest: 20_050, ...over });
+/** A fake chain that counts by-hash getLogs and the most requests in flight at once. */
+const counted = w => {
+  const c = fakeChain(w);
+  const stats = { byHash: 0, inFlight: 0, maxInFlight: 0 };
+  for (const k of ["blockByHash", "getLogs", "blockByNumber"]) {
+    const f = c[k];
+    c[k] = async (...a) => {
+      stats.inFlight++;
+      stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
+      try {
+        await new Promise(r => setImmediate(r));
+        if (k === "getLogs" && a[0]?.blockHash) stats.byHash++;
+        return await f(...a);
+      } finally {
+        stats.inFlight--;
+      }
+    };
+  }
+  return { c, stats };
+};
+const cuRound = async (w, cfg, st, now = 1e12, clock = () => now) => {
+  w.nowMs = now;
+  const { c, stats } = counted(w);
+  return { stats, ...(await runRound(st, { chain: c, cfg, now, clock })) };
+};
+await cell(
+  "catch-up: a backlog larger than MAX_CHECK is checked in one round, every block by hash; CONTROL: without it, MAX_CHECK blocks and unknown",
+  async () => {
+    const cfg = cfgOf({ catchUp: CU });
+    const st = emptyState(cfg);
+    const r = await cuRound(deep(), cfg, st);
+    assert(st.checked === 20_000, `checked ${st.checked}`);
+    assert(
+      r.report.catchUp?.from === 100 && r.report.catchUp.upTo === 20_000,
+      JSON.stringify(r.report.catchUp)
+    );
+    assert(r.stats.byHash >= 20_050 - 100 + 1, `${r.stats.byHash} by-hash reads`);
+    assert(r.report.clear, r.alerts.map(a => a.key).join(","));
+    const st0 = emptyState(cfgOf());
+    const r0 = await cuRound(deep(), cfgOf(), st0);
+    assert(
+      st0.checked === 99 + MAX_CHECK && !r0.report.clear && r0.report.catchUp === null,
+      `control: ${st0.checked}`
+    );
+  }
+);
+await cell(
+  "catch-up never relaxes clear: a backlog beyond maxBlocksPerRound reads unknown that round",
+  async () => {
+    const cfg = cfgOf({ catchUp: { ...CU, maxBlocksPerRound: 5000 } });
+    const st = emptyState(cfg);
+    const r = await cuRound(deep(), cfg, st);
+    assert(st.checked === 99 + 5000, `checked ${st.checked}`);
+    assert(
+      !r.report.clear && r.alerts.some(a => /cross-check is behind.*catching up/.test(a.text)),
+      r.alerts.map(a => a.text).join("; ")
+    );
+  }
+);
+await cell(
+  "catch-up: once within MAX_CHECK of B, rounds are ordinary again (no catch-up parameters)",
+  async () => {
+    const cfg = cfgOf({ catchUp: CU });
+    const st = emptyState(cfg);
+    const w = deep();
+    await cuRound(w, cfg, st);
+    assert(st.checked === 20_000, `not caught up: ${st.checked}`);
+    w.finalized += 100;
+    w.latest += 100;
+    const r = await cuRound(w, cfg, st, 1e12 + 3600_000);
+    assert(r.report.catchUp === null, `still catching up: ${JSON.stringify(r.report.catchUp)}`);
+    assert(r.stats.maxInFlight <= 1, `ordinary rounds fetch one at a time: ${r.stats.maxInFlight}`);
+    assert(st.checked === 20_100 && r.report.clear, r.alerts.map(a => a.key).join(","));
+  }
+);
+await cell(
+  "catch-up: the time budget stops a round at a block boundary; the next round goes on from there",
+  async () => {
+    const cfg = cfgOf({ catchUp: { ...CU, maxSeconds: 60 } });
+    const st = emptyState(cfg);
+    let t = 1e12;
+    const r = await cuRound(deep(), cfg, st, 1e12, () => (t += 20_000)); // 20 s per look at the clock
+    assert(st.checked > 99 && st.checked < 20_000, `checked ${st.checked}`);
+    assert(
+      !r.report.clear && r.report.catchUp.upTo === st.checked,
+      JSON.stringify(r.report.catchUp)
+    );
+    const at = st.checked;
+    await cuRound(deep(), cfg, st, 1e12 + 3600_000);
+    assert(st.checked === 20_000 && at < 20_000, `continued to ${st.checked}`);
+  }
+);
+await cell(
+  "catch-up: a by-hash/by-range disagreement in its window stops the watermark there, as in an ordinary round",
+  async () => {
+    const cfg = cfgOf({ catchUp: CU });
+    const st = emptyState(cfg);
+    const w = deep({
+      ops: {
+        ...world().ops,
+        [OP2.toLowerCase()]: {
+          configured: true,
+          paused: false,
+          role: true,
+          eff: 150n,
+          logBlock: 5000,
+        },
+      },
+      hashHides: new Set([5000]),
+    });
+    const r = await cuRound(w, cfg, st);
+    assert(st.checked === 4999 && st.cursor <= 4999, `checked ${st.checked} cursor ${st.cursor}`);
+    assert(
+      !r.report.clear && r.alerts.some(a => /differ by hash and by range/.test(a.text)),
+      r.alerts.map(a => a.text).join("; ")
+    );
+  }
+);
+await cell(
+  "catch-up: requests in flight stay within concurrency (two per block: header and logs)",
+  async () => {
+    const cfg = cfgOf({ catchUp: { ...CU, concurrency: 3 } });
+    const r = await cuRound(deep(), cfg, emptyState(cfg));
+    assert(
+      r.stats.maxInFlight > 1 && r.stats.maxInFlight <= 2 * 3,
+      `max in flight ${r.stats.maxInFlight}`
+    );
+  }
+);
+await cell(
+  "catch-up: its config is bounded (catchUpProblems, configProblems, the round)",
+  async () => {
+    assert(
+      catchUpProblems(undefined).length === 0 && catchUpProblems(CU).length === 0,
+      "a valid catchUp refused"
+    );
+    for (const bad of [
+      { ...CU, maxBlocksPerRound: MAX_CHECK },
+      { ...CU, maxBlocksPerRound: 200_001 },
+      { ...CU, concurrency: 0 },
+      { ...CU, concurrency: 17 },
+      { ...CU, maxSeconds: 59 },
+      { ...CU, maxSeconds: 1501 },
+      {},
+    ])
+      assert(catchUpProblems(bad).length > 0, `accepted ${JSON.stringify(bad)}`);
+    const c = JSON.parse(readFileSync(join(HERE, "config.example.json"), "utf8"));
+    c.catchUp = { ...CU, concurrency: 99 };
+    assert(
+      configProblems(c).some(p => /catchUp\.concurrency/.test(p)),
+      "configProblems accepted it"
+    );
+    let why = "";
+    try {
+      await round(world(), cfgOf({ catchUp: { ...CU, maxSeconds: 1 } }));
+    } catch (e) {
+      why = e.message;
+    }
+    assert(/config: catchUp\.maxSeconds/.test(why), why || "a round ran with a bad catchUp");
+  }
+);
+
+// ---- every topic0 the proxy emits must be classified (DSR 2026-11-18, SP's inventory approach) -----
+const UNKNOWN_SIG = "OperatorSet(address,address)";
+const UNKNOWN_T0 = ethers.id(UNKNOWN_SIG);
+await cell(
+  "events: an unknown topic0 from the proxy keeps every round unknown and names it; listing it (with a source) clears that",
+  async () => {
+    const cfg = cfgOf();
+    const w = world({ otherLogs: [{ block: 140, topic0: UNKNOWN_T0 }] });
+    const st = emptyState(cfg);
+    const r = await round(w, cfg, st);
+    assert(
+      !r.report.clear &&
+        r.alerts.some(a => a.key === "unknown-event" && a.text.includes(UNKNOWN_T0)),
+      r.alerts.map(a => a.text).join("; ")
+    );
+    assert(st.unknownTopics[UNKNOWN_T0] === 140, JSON.stringify(st.unknownTopics));
+    // later rounds: still unknown (the record persists; the block is not read again)
+    const r2 = await round(w, cfg, st, 1e12 + 3600_000);
+    assert(!r2.report.clear && r2.alerts.some(a => a.key === "unknown-event"), "cleared by itself");
+    const named = cfgOf({
+      knownProxyEvents: [
+        { signature: UNKNOWN_SIG, topic0: UNKNOWN_T0, source: "SP read-back (test)" },
+      ],
+    });
+    const r3 = await round(w, named, st, 1e12 + 7200_000);
+    assert(
+      r3.report.clear && !(UNKNOWN_T0 in st.unknownTopics),
+      r3.alerts.map(a => a.key).join(",")
+    );
+  }
+);
+await cell(
+  "events CONTROL: the pin ABI's own events, and an anonymous log, are classified as they should be",
+  async () => {
+    const PIN_EVENTS = JSON.parse(
+      readFileSync(resolve(HERE, "../pause-job/sp-pin.json"), "utf8")
+    ).spEvents;
+    const pinEvent = PIN_EVENTS.find(e => e.signature.startsWith("OperatorDeposited("));
+    const ok = await round(world({ otherLogs: [{ block: 141, topic0: pinEvent.topic0 }] }));
+    assert(ok.report.clear, ok.alerts.map(a => a.key).join(","));
+    const anon = await round(world({ otherLogs: [{ block: 142 }] }));
+    assert(
+      !anon.report.clear && anon.st.unknownTopics.anonymous === 142,
+      JSON.stringify(anon.st.unknownTopics)
+    );
+  }
+);
+await cell(
+  `events: past ${MAX_UNKNOWN_TOPICS} distinct unknown topic0s the rest are counted, and naming the listed ones does not clear it`,
+  async () => {
+    const otherLogs = Array.from({ length: MAX_UNKNOWN_TOPICS + 1 }, (_, i) => ({
+      block: 140 + (i % 50),
+      topic0: ethers.id(`E${i}()`),
+    }));
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    await round(world({ otherLogs }), cfg, st);
+    assert(
+      Object.keys(st.unknownTopics).length === MAX_UNKNOWN_TOPICS &&
+        st.unknownTopicsOverflow === true,
+      JSON.stringify(st.unknownTopicsOverflow)
+    );
+    const named = cfgOf({
+      knownProxyEvents: Object.keys(st.unknownTopics).map(t => {
+        const i = otherLogs.findIndex(o => o.topic0 === t);
+        return { signature: `E${i}()`, topic0: t, source: "test" };
+      }),
+    });
+    const r = await round(world({ otherLogs }), named, st, 1e12 + 3600_000);
+    assert(
+      !r.report.clear && r.alerts.some(a => /more than 32 distinct/.test(a.text)),
+      r.alerts.map(a => a.text).join("; ")
+    );
+  }
+);
+await cell(
+  "events: a failed classification read is unknown and retried; each block is classified once",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    const r = await round(world({ fail: new Set(["all-logs"]) }), cfg, st);
+    assert(
+      !r.report.clear && r.alerts.some(a => a.key === "events") && st.classifiedTo === 99,
+      `classifiedTo ${st.classifiedTo}`
+    );
+    const w = world();
+    let unfiltered = 0;
+    const c = fakeChain(w);
+    const g = c.getLogs;
+    c.getLogs = async f => {
+      if (f.topics === undefined && Number(f.fromBlock) <= w.finalized) unfiltered++;
+      return g(f);
+    };
+    w.nowMs = 1e12 + 3600_000;
+    await runRound(st, { chain: c, cfg, now: 1e12 + 3600_000 });
+    assert(st.classifiedTo === 250, `classifiedTo ${st.classifiedTo}`);
+    const first = unfiltered;
+    w.nowMs = 1e12 + 7200_000;
+    await runRound(st, { chain: c, cfg, now: 1e12 + 7200_000 });
+    assert(
+      /* the failed round left its replay pending (#453 H1): forward 4 + replay 4, then none */ first ===
+        8 && unfiltered === first,
+      `${first} then ${unfiltered - first} unfiltered reads`
+    );
+  }
+);
+await cell(
+  "events: classification progress is committed only with the round (a reorged B rolls it back)",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    const r = await round(world({ reorgB: true }), cfg, st);
+    assert(!r.report.canonical && st.classifiedTo === 99, `classifiedTo ${st.classifiedTo}`);
+    // CONTROL: the same round with B still canonical commits it
+    const ok = await round(world(), cfg, st);
+    assert(
+      ok.report.canonical && st.classifiedTo === 250,
+      `control: classifiedTo ${st.classifiedTo}`
+    );
+  }
+);
+await cell("events: the config's knownProxyEvents is checked", () => {
+  assert(knownEventProblems(undefined).length === 0, "absent refused");
+  assert(
+    knownEventProblems([{ signature: UNKNOWN_SIG, topic0: UNKNOWN_T0, source: "s" }]).length === 0,
+    "valid refused"
+  );
+  for (const bad of [
+    [{ signature: UNKNOWN_SIG, topic0: OPERATOR_CONFIGURED, source: "s" }],
+    [{ signature: "not a signature", topic0: UNKNOWN_T0, source: "s" }],
+    [{ signature: UNKNOWN_SIG, topic0: UNKNOWN_T0, source: "" }],
+    "x",
+  ])
+    assert(knownEventProblems(bad).length > 0, `accepted ${JSON.stringify(bad)}`);
+});
+
+await cell(
+  "compare-inventory: equal passes; a missing or extra operator fails and is named; bad input exits 2",
+  () => {
+    const A = "0xEcAACb915f7D92e9916f449F7ad42BD0408733c9";
+    const Bx = "0xb5600060e6de5E11D3636731964218E53caadf0E";
+    const id = { chainId: 11155111, sp: SP };
+    const st = { chainId: 11155111, spProxy: SP, operators: { [A]: 11151052, [Bx]: 11151077 } };
+    assert(compareInventory(st, [Bx.toLowerCase(), A], id).equal, "equal sets differ");
+    const m = compareInventory({ ...st, operators: { [A]: 1 } }, [A, Bx], id);
+    assert(!m.equal && m.missing[0] === Bx && !m.extra.length, JSON.stringify(m));
+    const x = compareInventory(st, [A], id);
+    assert(!x.equal && x.extra[0] === Bx, JSON.stringify(x));
+    const dir = mkdtempSync(join(tmpdir(), "cmp-"));
+    writeFileSync(join(dir, "state.json"), JSON.stringify(st));
+    writeFileSync(join(dir, "ok.json"), JSON.stringify([A, Bx]));
+    writeFileSync(join(dir, "short.json"), JSON.stringify([A]));
+    writeFileSync(join(dir, "bad.json"), JSON.stringify(["not an address"]));
+    writeFileSync(join(dir, "empty.json"), "[]");
+    writeFileSync(join(dir, "nostate.json"), JSON.stringify({ ...st, operators: {} }));
+    const run = (f, extra = [], state = "state.json") =>
+      spawnSync(
+        process.execPath,
+        [
+          join(HERE, "compare-inventory.mjs"),
+          join(dir, state),
+          join(dir, f),
+          "--chain-id",
+          "11155111",
+          "--sp",
+          SP,
+          ...extra,
+        ],
+        { encoding: "utf8" }
+      ).status;
+    assert(run("ok.json") === 0 && run("short.json") === 1 && run("bad.json") === 2, "exit codes");
+    // clestons #453 Medium: an empty read-back (empty against empty) fails unless --allow-empty
+    assert(run("empty.json", [], "nostate.json") === 1, "empty against empty passed");
+    assert(run("empty.json", ["--allow-empty"], "nostate.json") === 0, "--allow-empty refused");
+    // and the state must be this chain's and this SP's
+    const wrong = spawnSync(
+      process.execPath,
+      [
+        join(HERE, "compare-inventory.mjs"),
+        join(dir, "state.json"),
+        join(dir, "ok.json"),
+        "--chain-id",
+        "10",
+        "--sp",
+        SP,
+      ],
+      { encoding: "utf8" }
+    ).status;
+    assert(wrong === 2, `another chain's state: exit ${wrong}`);
+    rmSync(dir, { recursive: true, force: true });
+  }
+);
+
+// ---- rate limits during catch-up (DSR 2026-11-18) --------------------------------------------------
+const limited = () => {
+  const e = new Error("RATE_LIMITED");
+  e.rateLimited = true;
+  return e;
+};
+await cell(
+  "rate limit: the transport marks HTTP 429 and JSON-RPC limit errors, and readOnlyChain keeps the mark",
+  async () => {
+    const real = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => ({ ok: false, status: 429 });
+      let e1 = null;
+      await rpcTransport("http://x")("eth_chainId", []).catch(e => (e1 = e));
+      assert(e1?.rateLimited === true && /RATE_LIMITED/.test(e1.message), String(e1?.message));
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ error: { code: -32005, message: "limit exceeded" } }),
+      });
+      let e2 = null;
+      await rpcTransport("http://x")("eth_chainId", []).catch(e => (e2 = e));
+      assert(e2?.rateLimited === true, String(e2?.message));
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ error: { code: -32000, message: "header not found" } }),
+      });
+      let e3 = null;
+      await rpcTransport("http://x")("eth_chainId", []).catch(e => (e3 = e));
+      assert(e3 && e3.rateLimited !== true, "CONTROL: an ordinary error marked as a rate limit");
+    } finally {
+      globalThis.fetch = real;
+    }
+    let e4 = null;
+    await readOnlyChain("http://x", async () => {
+      throw limited();
+    })
+      .chainId()
+      .catch(e => (e4 = e));
+    assert(e4?.rateLimited === true, "readOnlyChain dropped the mark");
+  }
+);
+await cell(
+  "rate limit in catch-up: the round stops at a window's start, incomplete; later rounds halve concurrency, then recover",
+  async () => {
+    const cfg = cfgOf({ catchUp: { ...CU, concurrency: 4 } });
+    const st = emptyState(cfg);
+    const w = deep();
+    // the provider rate-limits by-hash log reads after the first 600 of them
+    let n = 0;
+    const c = fakeChain(w);
+    const g = c.getLogs;
+    c.getLogs = async f => {
+      if (f.blockHash && ++n > 600) throw limited();
+      return g(f);
+    };
+    w.nowMs = 1e12;
+    const r = await runRound(st, { chain: c, cfg, now: 1e12 });
+    assert(
+      r.report.catchUp?.throttled === true && !r.report.clear,
+      JSON.stringify(r.report.catchUp)
+    );
+    assert(
+      (st.checked - 99) % (4 * 64) === 0 && st.checked > 99,
+      `stopped at ${st.checked}, not a window start`
+    );
+    assert(
+      st.catchUpThrottle === 1 && r.alerts.some(a => /rate-limited us/.test(a.text)),
+      `throttle ${st.catchUpThrottle}`
+    );
+    const r2 = await cuRound(deep(), cfg, st, 1e12 + 3600_000);
+    assert(
+      r2.report.catchUp?.concurrency === 2 && r2.stats.maxInFlight <= 4,
+      JSON.stringify(r2.report.catchUp)
+    );
+    assert(
+      st.catchUpThrottle === 0 && st.checked === 20_000,
+      `throttle ${st.catchUpThrottle} checked ${st.checked}`
+    );
+  }
+);
+await cell(
+  "rate limit at the probe: after a throttled catch-up the round is skipped, not run on the fallback; otherwise the fallback takes over",
+  async () => {
+    const cfg = cfgOf();
+    const up = fakeChain(world());
+    const rl = {
+      chainId: async () => {
+        throw limited();
+      },
+    };
+    const down = {
+      chainId: async () => {
+        throw new Error("ECONNREFUSED");
+      },
+    };
+    let why = "";
+    await chooseProvider(
+      [
+        { name: "alchemy", chain: rl },
+        { name: "infura", chain: up },
+      ],
+      cfg,
+      { catchUpThrottle: 1, lastThrottledAt: Date.now() - 3600_000 }
+    ).catch(e => (why = e.message));
+    assert(/skipped, not run on the fallback/.test(why), why || "ran on the fallback");
+    const a = await chooseProvider(
+      [
+        { name: "alchemy", chain: rl },
+        { name: "infura", chain: up },
+      ],
+      cfg,
+      { catchUpThrottle: 0 }
+    );
+    assert(a.provider === "infura", "CONTROL: no throttle, the fallback should take over");
+    const b = await chooseProvider(
+      [
+        { name: "alchemy", chain: down },
+        { name: "infura", chain: up },
+      ],
+      cfg,
+      { catchUpThrottle: 1 }
+    );
+    assert(b.provider === "infura", "CONTROL: a primary that is down is not a rate limit");
+    const st = emptyState(cfg);
+    st.catchUpThrottle = 5;
+    assert(
+      stateProblems(st, cfg).some(p => /catchUpThrottle/.test(p)),
+      "a throttle past 4 accepted"
+    );
+  }
+);
+
+// ---- Codex pre-PR review, round 1 ------------------------------------------------------------------
+await cell(
+  "r1-1: adding a signature to operatorConfiguredTopics re-reads and re-verifies everything; the round is not clear meanwhile",
+  async () => {
+    const only = cfgOf({ operatorConfiguredTopics: [cfgOf().operatorConfiguredTopics[0]] });
+    const w = world({ ops: oldSigOps() });
+    const st = emptyState(only);
+    await round(w, only, st);
+    assert(
+      !(ethers.getAddress(OP2) in st.operators) && st.checked === 250,
+      `checked ${st.checked}`
+    );
+    // SP names the old signature an hour later
+    const both = cfgOf();
+    const r = await round(w, both, st, 1e12 + 3600_000);
+    assert(
+      r.alerts.some(a => a.key === "reverify" && /signatures changed/.test(a.text)),
+      r.alerts.map(a => a.key).join(",")
+    );
+    assert(ethers.getAddress(OP2) in st.operators && !r.report.clear, `clear ${r.report.clear}`);
+    assert(
+      st.crossCheck.lastComplete === 0 && st.crossCheck.coveredTo === 0,
+      "the cross-check's coverage was kept"
+    );
+    // a state written before the topic set existed is re-verified the same way
+    const old = emptyState(both);
+    old.cursor = 250;
+    delete old.topicSet;
+    const r2 = await round(w, both, old, 1e12);
+    assert(
+      r2.alerts.some(a => a.key === "reverify"),
+      "a state without topicSet was trusted"
+    );
+  }
+);
+await cell(
+  "r1-2: a reset later in the round sends classification back to startBlock, so that round is not clear",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    await round(world(), cfg, st);
+    assert(st.classifiedTo === 250 && st.checked === 250, "setup");
+    // the chain under the watermark changed: block 250's hash is no longer what was checked
+    st.checkedHash = ethers.zeroPadValue(ethers.toBeHex(777_777), 32);
+    const r = await round(
+      world({ otherLogs: [{ block: 130, topic0: UNKNOWN_T0 }] }),
+      cfg,
+      st,
+      1e12 + 3600_000
+    );
+    assert(
+      r.alerts.some(a => a.key === "reverify") && st.classifiedTo === 99,
+      `classifiedTo ${st.classifiedTo}`
+    );
+    assert(!r.report.clear, "clear with classification sent back to startBlock");
+  }
+);
+await cell(
+  "r1-3: knownProxyEvents may not hold an OperatorConfigured variant (it must be discovered, not just known)",
+  () => {
+    const p = knownEventProblems([{ signature: OLD_SIG, topic0: OLD_TOPIC, source: "s" }]);
+    assert(
+      p.some(x => /belongs in operatorConfiguredTopics/.test(x)),
+      JSON.stringify(p)
+    );
+  }
+);
+await cell(
+  "r1-4: a rate limit on the catch-up range read, or on the loop's own fetch, counts as throttled",
+  async () => {
+    const cfg = cfgOf({ catchUp: CU });
+    for (const which of ["range", "loop"]) {
+      const st = emptyState(cfg);
+      const w = deep();
+      const c = fakeChain(w);
+      const g = c.getLogs;
+      let n = 0;
+      if (which === "range")
+        c.getLogs = async f => {
+          // the inventory (~398 chunks) and the read above the cursor come first; then the catch-up range read
+          if (Array.isArray(f.topics?.[0]) && !f.blockHash && ++n === 450) throw limited();
+          return g(f);
+        };
+      // the loop's own fetch: blocks above finalized are never fetched ahead; their logs by hash are
+      else
+        c.getLogs = async f => {
+          if (f.blockHash && Number(BigInt(f.blockHash)) > w.finalized) throw limited();
+          return g(f);
+        };
+      w.nowMs = 1e12;
+      const r = await runRound(st, { chain: c, cfg, now: 1e12 });
+      assert(
+        !r.report.clear && st.catchUpThrottle === 1,
+        `${which}: throttle ${st.catchUpThrottle} ${JSON.stringify(r.report.catchUp)}`
+      );
+    }
+  }
+);
+
+// ---- Codex pre-PR review, round 2 ------------------------------------------------------------------
+const UNLISTED = ethers.id("OperatorConfigured(address,address,address,bytes32)");
+const unlistedOps = (logBlock = 140) => ({
+  [OP1.toLowerCase()]: { configured: true, paused: false, role: true, eff: 150n, logBlock: 120 },
+  [OP2.toLowerCase()]: {
+    configured: true,
+    paused: false,
+    role: true,
+    eff: 0n,
+    logBlock,
+    topic0: UNLISTED,
+  },
+});
+await cell(
+  "r2-1: a classification answer that once omitted an unlisted event is asked again: by the daily full rescan, and by the cross-check's unfiltered read",
+  async () => {
+    const cfg = cfgOf();
+    {
+      const st = emptyState(cfg);
+      const w = world({ ops: unlistedOps(), classifyHides: new Set([140]) });
+      await round(w, cfg, st);
+      assert(
+        !(UNLISTED in st.unknownTopics) && st.classifiedTo === 250,
+        "setup: the omission was not silent"
+      );
+      w.classifyHides = new Set(); // the index recovers
+      const r = await round(w, cfg, st, 1e12 + 25 * 3600_000); // the daily full rescan is due
+      assert(
+        st.unknownTopics[UNLISTED] === 140 && !r.report.clear,
+        JSON.stringify(st.unknownTopics)
+      );
+    }
+    {
+      const st = emptyState(cfg);
+      const primaryW = world({ ops: unlistedOps(), classifyHides: new Set([140]) });
+      await round(primaryW, cfg, st);
+      // the fallback's unfiltered read has it
+      await cross(st, primaryW, world({ ops: unlistedOps() }), 1e12 + 1000);
+      assert(
+        st.unknownTopics[UNLISTED] === 140,
+        `cross-check: ${JSON.stringify(st.unknownTopics)}`
+      );
+      const r = await round(primaryW, cfg, st, 1e12 + 2000);
+      assert(
+        !r.report.clear && r.alerts.some(a => a.key === "unknown-event"),
+        r.alerts.map(a => a.key).join(",")
+      );
+    }
+  }
+);
+await cell(
+  "r2-2: an unlisted event above the finalized block makes that round unknown (not persisted until finalized)",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    const r = await round(world({ ops: unlistedOps(275) }), cfg, st);
+    assert(
+      !r.report.clear &&
+        r.alerts.some(a => a.key === "unknown-event-recent" && a.text.includes(UNLISTED)),
+      r.alerts.map(a => a.key).join(",")
+    );
+    assert(!(UNLISTED in st.unknownTopics), "recorded before finalization");
+    const r2 = await round(
+      world({ ops: unlistedOps(275), finalized: 280 }),
+      cfg,
+      st,
+      1e12 + 3600_000
+    );
+    assert(
+      st.unknownTopics[UNLISTED] === 275 && !r2.report.clear,
+      JSON.stringify(st.unknownTopics)
+    );
+  }
+);
+await cell(
+  "r2-3: a rate limit earlier in a round that would catch up: catch-up does not start, and the throttle goes up, not down",
+  async () => {
+    const cfg = cfgOf({ catchUp: CU });
+    const st = emptyState(cfg);
+    st.catchUpThrottle = 2;
+    const w = deep();
+    const c = fakeChain(w);
+    const g = c.getLogs;
+    let first = true;
+    c.getLogs = async f => {
+      // the round's first range read (the inventory's) is rate-limited
+      if (first && Array.isArray(f.topics?.[0]) && !f.blockHash) {
+        first = false;
+        throw limited();
+      }
+      return g(f);
+    };
+    w.nowMs = 1e12;
+    const r = await runRound(st, { chain: c, cfg, now: 1e12 });
+    assert(
+      st.catchUpThrottle === 3 && r.report.catchUp?.throttled === true,
+      `throttle ${st.catchUpThrottle} ${JSON.stringify(r.report.catchUp)}`
+    );
+    assert(
+      st.checked === 99 + MAX_CHECK && !r.report.clear,
+      `checked ${st.checked}: catch-up ran after a rate limit`
+    );
+  }
+);
+
+await cell(
+  "r3-1: an operator configuration missing from both filtered answers but in the unfiltered one is checked (finalized and above)",
+  async () => {
+    for (const logBlock of [130, 275]) {
+      const ops = {
+        ...world().ops,
+        [OP2.toLowerCase()]: { configured: true, paused: false, role: true, eff: 0n, logBlock },
+      };
+      const { st, alerts, report } = await round(
+        world({ ops, filteredHides: new Set([logBlock]) })
+      );
+      assert(
+        ethers.getAddress(OP2) in st.operators &&
+          !report.clear &&
+          alerts.some(a => a.key === `actionable:${ethers.getAddress(OP2)}`),
+        `block ${logBlock}: ${alerts.map(a => a.key).join(",")}`
+      );
+    }
+  }
+);
+
+await cell(
+  "r4-1: the cross-check asks the other provider both ways: its filtered answer has OP2 though its unfiltered one omits it",
+  async () => {
+    const { primaryW, st } = await (async () => {
+      const ops = {
+        ...world().ops,
+        [OP2.toLowerCase()]: {
+          configured: true,
+          paused: false,
+          role: true,
+          eff: 0n,
+          logBlock: 130,
+        },
+      };
+      const primaryW = world({ ops, hidden: new Set([130]) }); // the primary omits it every way
+      const st = await inventoried(primaryW);
+      await cross(st, primaryW, world({ ops, classifyHides: new Set([130]) }), 1e12 + 1000);
+      return { primaryW, st };
+    })();
+    assert(
+      ethers.getAddress(OP2) in st.operators &&
+        st.crossCheck.mismatch?.fallbackOnly?.includes(ethers.getAddress(OP2)),
+      JSON.stringify(st.crossCheck.mismatch)
+    );
+    await stillFlagged(primaryW, st, 1e12 + 2000);
+  }
+);
+
+await cell(
+  "r5-1: a short time budget with many range reads still advances the watermark every round (no stuck catch-up)",
+  async () => {
+    const cfg = cfgOf({ catchUp: { ...CU, maxSeconds: 60 } });
+    const st = emptyState(cfg);
+    let calls = 0;
+    const marks = [];
+    for (let k = 0; k < 3; k++) {
+      const w = deep();
+      const c = fakeChain(w);
+      for (const m of ["getLogs", "blockByHash", "blockByNumber"]) {
+        const f = c[m];
+        c[m] = async (...a) => {
+          calls++;
+          return f(...a);
+        };
+      }
+      const now = 1e12 + k * 3600_000;
+      w.nowMs = now;
+      const t0 = calls;
+      // 200 ms per provider call: 60 s is about 300 calls
+      await runRound(st, { chain: c, cfg, now, clock: () => now + (calls - t0) * 200 });
+      marks.push(st.checked);
+    }
+    assert(
+      marks[0] > 99 && marks[1] > marks[0] && marks[2] > marks[1],
+      `watermark ${marks.join(" -> ")}`
+    );
+  }
+);
+
+// ---- clestons #453 ---------------------------------------------------------------------------------
+await cell(
+  "#453 H1: a full round whose replay fails does not move the daily clock; the next round replays and finds what the first answer hid",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    const w = world({ ops: unlistedOps(130), classifyHides: new Set([130]) });
+    await round(w, cfg, st, 1e12);
+    assert(st.lastFullScan === 1e12 && !(UNLISTED in st.unknownTopics), "setup");
+    w.classifyHides = new Set();
+    w.fail = new Set(["all-logs"]); // the replay fails in the next daily full round
+    const r2 = await round(w, cfg, st, 1e12 + 25 * 3600_000);
+    assert(!r2.report.clear && st.lastFullScan === 1e12, `the clock moved to ${st.lastFullScan}`);
+    w.fail = new Set();
+    const r3 = await round(w, cfg, st, 1e12 + 26 * 3600_000); // still a full round: the replay resumes
+    assert(
+      st.unknownTopics[UNLISTED] === 130 && !r3.report.clear,
+      JSON.stringify(st.unknownTopics)
+    );
+    assert(st.lastFullScan === 1e12 + 26 * 3600_000, "the completed replay did not move the clock");
+    // CONTROL: a replay that succeeds in its own full round finds it there
+    const st2 = emptyState(cfg);
+    const w2 = world({ ops: unlistedOps(130), classifyHides: new Set([130]) });
+    await round(w2, cfg, st2, 1e12);
+    w2.classifyHides = new Set();
+    const c = await round(w2, cfg, st2, 1e12 + 25 * 3600_000);
+    assert(
+      st2.unknownTopics[UNLISTED] === 130 && c.alerts.some(a => a.key === "unknown-event"),
+      "control"
+    );
+  }
+);
+await cell(
+  "#453 H2: a replay longer than classifyMaxBlocks goes in segments with its own cursor; a log hidden in the SUFFIX is found, and the clock waits",
+  async () => {
+    const cfg = cfgOf({ classifyMaxBlocks: 60 });
+    for (const [hideAt, what] of [
+      [220, "suffix"],
+      [130, "prefix (control)"],
+    ]) {
+      const st = emptyState(cfg);
+      const w = world({ ops: unlistedOps(hideAt), classifyHides: new Set([hideAt]) });
+      // first sync: forward classification 60 blocks a round, then the first replay, all hidden
+      let t = 1e12;
+      for (let k = 0; k < 12 && !(st.lastFullScan > 0); k++, t += 3600_000)
+        await round(w, cfg, st, t);
+      assert(
+        st.lastFullScan > 0 && st.classifiedTo === 250,
+        `${what}: setup ${st.lastFullScan} ${st.classifiedTo}`
+      );
+      w.classifyHides = new Set(); // the index recovers
+      const stamp = st.lastFullScan;
+      let found = -1;
+      for (let k = 0; k < 4; k++) {
+        const now = stamp + 25 * 3600_000 + k * 3600_000;
+        const r = await round(w, cfg, st, now);
+        if (found < 0 && UNLISTED in st.unknownTopics) found = k;
+        if (k < 2)
+          assert(st.lastFullScan === stamp, `${what}: the clock moved after ${k + 1} segment(s)`);
+        assert(found < 0 || !r.report.clear, `${what}: clear after the unknown was found`);
+      }
+      // 151 blocks of history in 60-block segments: within ceil(151 / 60) = 3 full rounds
+      assert(found >= 0 && found <= 2, `${what}: found at round ${found}`);
+      assert(st.lastFullScan > stamp, `${what}: the finished replay did not move the clock`);
+    }
+  }
+);
+await cell(
+  "#453 Medium: once caught up the catch-up throttle is gone; long after a throttled round the probe hands over",
+  async () => {
+    const cfg = cfgOf({ catchUp: CU });
+    const st = emptyState(cfg);
+    st.catchUpThrottle = 2;
+    st.lastThrottledAt = 1e12 - 3600_000;
+    await round(world(), cfg, st); // an ordinary, caught-up round
+    assert(st.catchUpThrottle === 0, `throttle ${st.catchUpThrottle}`);
+    const up = fakeChain(world());
+    const rl = {
+      chainId: async () => {
+        throw limited();
+      },
+    };
+    const c = await chooseProvider(
+      [
+        { name: "alchemy", chain: rl },
+        { name: "infura", chain: up },
+      ],
+      cfg,
+      { catchUpThrottle: 1, lastThrottledAt: Date.now() - 3 * 3600_000 }
+    );
+    assert(c.provider === "infura", "a throttle from three hours ago still kept the fallback away");
+  }
+);
+await cell(
+  "#453 Low: the cross-check can record an unknown topic0 on a state from before the field existed",
+  async () => {
+    const w = world();
+    const st = await inventoried(w);
+    delete st.unknownTopics;
+    await cross(st, w, world({ otherLogs: [{ block: 140, topic0: UNKNOWN_T0 }] }), 1e12 + 1000);
+    assert(
+      st.unknownTopics?.[UNKNOWN_T0] === 140 && st.crossCheck.lastComplete === 1e12 + 1000,
+      JSON.stringify(st.crossCheck.lastError)
+    );
+  }
+);
+
+await cell(
+  "#453 Codex: an earlier build's unknownTopicsMore count is kept as the overflow flag",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    await round(world(), cfg, st);
+    st.unknownTopicsMore = 1; // an over-cap unknown recorded by the previous build, not named
+    delete st.unknownTopicsOverflow;
+    const r = await round(world(), cfg, st, 1e12 + 3600_000);
+    assert(
+      st.unknownTopicsOverflow === true && !("unknownTopicsMore" in st) && !r.report.clear,
+      "the legacy count was dropped"
     );
   }
 );
