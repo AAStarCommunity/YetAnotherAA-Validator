@@ -390,6 +390,8 @@ export async function main() {
         unavailable: plan.why,
         cfg,
         now,
+        // an overflow marker is on disk before anything else in the run can fail (Codex pre-push r3)
+        persist: () => writeDurable(statePath, st),
       });
     } catch {
       /* not reached: crossCheckInventory catches what it does */

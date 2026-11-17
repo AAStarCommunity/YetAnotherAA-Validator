@@ -237,11 +237,17 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
     provider whose answers built it. Only the configured fallback compares, and
     only on a round that the configured primary ran (`crossCheckPlan`,
     `run.mjs`). A round that ran on the fallback records an incomplete attempt
-    instead, and does no daily full rescan (clestons #448 N6: only the primary's
-    rounds do, and record it). Residual: blocks that the fallback itself added
-    to the inventory, on rounds when the primary failed its probe, are compared
-    against the fallback's own answers until the primary's next daily full
-    rescan re-reads them.
+    instead.
+  - **The daily full rescan runs on whichever provider the round uses**
+    (clestons #448 B1'', DSR 2026-11-18), each on its own 24 h clock: the
+    primary's rescan is recorded in `lastFullScan`, the fallback's in
+    `lastFallbackFullScan`. With the primary down for days, the fallback still
+    re-reads everything from `startBlock` once a day (not every hour), so an
+    operator the primary's index missed is found within a day. A fallback rescan
+    never moves `lastFullScan`, so it never stands in for the primary's (N6).
+    Residual: blocks that the fallback itself added to the inventory, on rounds
+    when the primary failed its probe, are compared against the fallback's own
+    answers until the primary's next daily full rescan re-reads them.
   - An operator only the fallback has: the primary's index missed it. That round
     is `unknown` and the alert names it. The operator **enters the inventory at
     once**, recorded in `fromCrossCheck` as the fallback's, so its stake is
@@ -255,6 +261,43 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
     simulation. So one that a lying fallback invents reads `not-configured` (a
     notice), never `PAUSE NEEDED`, and a manual pause of it reverts
     `OperatorNotConfigured`.
+  - It enters **as each validated chunk of the fallback's answer arrives**, so
+    before a later chunk is asked for and before the primary is re-asked about
+    the entries the fallback lacks (clestons #448 N2; Codex pre-push review). A
+    later chunk or the re-query failing leaves the attempt incomplete, but what
+    was seen is already checked.
+  - **At most `MAX_CROSS_CHECK_ADDED` (100) operators ever enter the inventory
+    from cross-checks, per state** (clestons #448 N8, DSR 2026-11-18). Past
+    that, the rest are only counted (`mismatch.unlisted`), not named or stored,
+    and the disagreement stands: every round is `unknown` while any of them is
+    reported, and the alert says how many were not added. That disagreement is
+    recorded before the fallible re-query of the primary, so a failed re-query
+    cannot lose an over-cap finding (Codex pre-push review). So a lying fallback
+    can add at most 100 addresses to read (each a `not-configured` notice) and
+    cannot grow the state without bound. The cap counts over the state's life,
+    not per comparison: a disagreement is compared again every round, so a
+    per-comparison cap would still let a persistent liar add 100 an hour.
+  - **An overflow is never settled by the detector** (DSR 2026-11-18). The first
+    comparison that goes over the cap writes a persistent marker
+    (`crossCheck.overflow`: provider, first time, largest count). From then on
+    every round is `unknown` (`crosscheck-overflow`), whatever later comparisons
+    find, because past the cap the over-cap operators are unnamed and a
+    comparison cannot tell an honest omission from a lying one (Codex pre-push
+    review: a real understaked operator counted over the cap, then omitted,
+    would otherwise read clear). The marker is set as soon as the chunk that
+    goes over the cap arrives, and the state is written to disk at that moment,
+    before anything else in the run can fail, so a crash later in the run cannot
+    lose it. Under Node's permission model that write, like every state write,
+    is atomic but not fsynced: a power loss right after it can lose it (see
+    `lib/notify.mjs`); a process crash cannot. Only an operator resets it; see
+    "Recovering from a cross-check overflow". Within the cap, an honest
+    comparison after invented operators still completes and rounds read clear
+    again. The cap covers only what cross-checks add. A provider's own rounds
+    add what that provider reports, as before, and now that includes the
+    fallback's daily rescan when it runs the round; that path is the inventory
+    itself and is not capped. A provider that invents logs there falls under the
+    trust ruling above, and the 1 MiB state limit then stops the detector
+    loudly, never as clear.
   - A first comparison whose height is below `startBlock` compares nothing and
     is not a completed cross-check (clestons #448 N5).
   - An inventory entry the other provider lacks is asked of the primary again,
@@ -302,6 +345,22 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   So an honest provider's index gap is found within a day, and a fallback that
   is down for under 3 days does not turn every round unknown once a first
   cross-check exists.
+
+  **The cross-check's invariants** (DSR 2026-11-18). A later review finding is
+  first matched against this table: which row broke. Each row is held by the
+  named cells in `check-pause-detector.mjs`, and each of those fails under a
+  mutant that removes the guard.
+
+  | Invariant                                                                                                                                         | Cells                                                                                                                                                                                                                                                                            |
+  | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | The inventory is never checked as passing by the provider that built it                                                                           | `B2: the provider that built the inventory, comparing over the full height, cannot clear the other's finding`; `B2: only the configured primary's rounds are cross-checked, and only by the configured fallback`                                                                 |
+  | A standing fallback-only operator leaves the disagreement only by entering the inventory                                                          | `B1': the same fallback missing OP2 at the same height later does not clear it: OP2 stays checked`; `B1': a fallback that keeps missing OP2 for days never clears it`                                                                                                            |
+  | What the fallback found enters the inventory (over the cap: the overflow marker is set and written at once) even if the rest of the attempt fails | `N2: what the fallback found enters the inventory even when the primary's re-query then fails`; `chunk (Codex pre-push r3): …` (both); `N8+N2: …`; `persist (Codex pre-push r3): …`                                                                                              |
+  | A comparison that reaches less than a standing disagreement, or than an earlier completed one, settles nothing                                    | `H1-R2: a standing disagreement is cleared only by a comparison that reaches its height`; `H1-R2: a cross-check whose H is below what an earlier one covered is incomplete`; `High B: a shorter comparison that itself disagrees does not replace a standing disagreement`       |
+  | Every provider's round does the full rescan when its 24 h are up; only the primary's moves `lastFullScan`                                         | `B1'': the primary misses OP2 at 130 and then goes down: …`; `B1'': the fallback's rescan recurs every 24 h: …`; `N6: a fallback round's due full rescan is recorded apart (lastFallbackFullScan), never as the primary's`                                                       |
+  | No round is clear before a first cross-check has completed                                                                                        | `(b): a fresh or lost state is never clear before a first cross-check completes (coveredTo starts at 0)`; `N5: a first cross-check with the fallback's finalized block below startBlock is not completed`                                                                        |
+  | Coverage more than 3 days behind the inventory is `unknown`                                                                                       | `High A: coverage up to 3 days of blocks behind the inventory still reads clear; one block more is unknown`                                                                                                                                                                      |
+  | Additions from cross-checks are capped; after an overflow every round stays `unknown` until an operator resets it                                 | `N8: 100 invented operators (within the cap) …`; `N8: a lying fallback's 1,001 invented operators: …`; `N8 overflow (Codex pre-push, DSR 2026-11-18): …`; `N8+N2: with the cap used up and the last comparison clean, an over-cap finding survives a failed re-query: not clear` |
 
 - **The known residuals.**
   - Both providers missing the **same** log the same way is not found.
@@ -552,7 +611,8 @@ secret-file reader, called with the detector's own name table) and
      `eth_getCode`, which both configured providers serve.
    - The state file is read with a 1 MiB limit. The inventory only grows, at
      about 60 bytes per operator, so that is roughly 17,000 operators (Daybreak
-     L11); rc.8 has a handful.
+     L11); rc.8 has a handful. Cross-checks add at most 100 of them
+     (`MAX_CROSS_CHECK_ADDED`).
    - The first rounds cross-check every block from there, at most 4096 per
      round, so a start far in the past reads `cross-check is behind` (unknown,
      fail-closed) for a while (clestons #434 F5).
@@ -624,6 +684,25 @@ secret-file reader, called with the detector's own name table) and
    detector (`launchctl bootout gui/$(id -u)/io.aastar.dvt-pause-detector`).
    Within 2 h 15 min the dead-man must send `DEAD-MAN: … no successful round`.
    Then load the detector again and wait for `rounds resumed`.
+
+### Recovering from a cross-check overflow
+
+`crosscheck-overflow` means the fallback reported more operators than the
+inventory may take from cross-checks (100 per state). The detector never clears
+it; every round reads `unknown` until it is reset by hand:
+
+1. Check the fallback provider and replace it (`aoa-dvt-detector-rpc-fallback`
+   and `rpc.fallback` in `config.json`). A provider that reports over 100
+   operators the primary does not have is the incident.
+2. Start a new `stateDir` (point `config.json` at a new 0700 directory; keep the
+   old one for the record).
+3. Restart and wait for the first cross-check to complete.
+
+A new `stateDir` loses everything the state held: the inventory is rebuilt from
+`startBlock`, `coveredTo` starts at 0, the cross-check watermark and both rescan
+clocks start again, and the 100-operator budget is new. Until the first
+cross-check completes, no round is clear (`crosscheck-pending`), and the first
+rounds re-verify every block from `startBlock` at most 4096 per round.
 
 ## Before rc.8
 

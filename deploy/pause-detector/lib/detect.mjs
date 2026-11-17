@@ -57,10 +57,11 @@ const height = (n, what) => {
  */
 export function normalizeClock(st, now) {
   let changed = false;
-  if (st.lastFullScan > now) {
-    st.lastFullScan = 0;
-    changed = true;
-  }
+  for (const k of ["lastFullScan", "lastFallbackFullScan"])
+    if (st[k] > now) {
+      st[k] = 0;
+      changed = true;
+    }
   for (const k of Object.keys(st.alerts))
     if (st.alerts[k] > now) {
       st.alerts[k] = 0;
@@ -83,6 +84,7 @@ function resetVerification(st, alerts, why) {
   st.checked = st.startBlock - 1;
   st.checkedHash = null;
   st.lastFullScan = 0;
+  st.lastFallbackFullScan = 0;
   alerts.push({
     key: "reverify",
     text: `unknown: ${why}; everything is read and verified again from block ${st.startBlock}`,
@@ -124,7 +126,10 @@ export function emptyState({ chainId, spProxy, startBlock }) {
     spProxy: lc(spProxy),
     startBlock,
     cursor: startBlock - 1, // last block whose OperatorConfigured logs are in the inventory
-    lastFullScan: 0, // ms of the last successful rescan from startBlock (daily)
+    lastFullScan: 0, // ms of the primary's last successful rescan from startBlock (daily)
+    // the fallback's, kept apart (clestons #448 B1'', DSR 2026-11-18): a fallback rescan is done when
+    // due but never stands in for the primary's (N6)
+    lastFallbackFullScan: 0,
     operators: {}, // checksummed addr -> first block seen (only ever grows: a superset is safe)
     // every block at or below `checked` had its by-hash and by-range answers compared and agree;
     // it starts below startBlock, so every block is compared once (Codex R11 P1-1), and is bound to
@@ -151,6 +156,10 @@ export function emptyCrossCheck() {
     // not complete. 0 = none yet
     coveredTo: 0,
     mismatch: null, // { at, height, provider, fallbackOnly: [op], primaryOnly: [op] } or null
+    // set once a comparison found more than MAX_CROSS_CHECK_ADDED could add, and NEVER cleared by the
+    // detector (DSR 2026-11-18): { provider, since, maxCount }. Every round is unknown until an
+    // operator replaces the fallback and starts a new stateDir
+    overflow: null,
   };
 }
 
@@ -167,6 +176,11 @@ export function stateProblems(st, cfg) {
     p.push("the state cursor is not a block at or after startBlock - 1");
   if (!Number.isFinite(st.lastFullScan) || st.lastFullScan < 0)
     p.push("the state has no lastFullScan time");
+  if (
+    st.lastFallbackFullScan !== undefined &&
+    !(Number.isFinite(st.lastFallbackFullScan) && st.lastFallbackFullScan >= 0)
+  )
+    p.push("the state's lastFallbackFullScan is not a time");
   // a JSON array here would silently drop every operator on the next write (Codex R1 P1-4)
   if (!plainObject(st.operators)) p.push("the state's operators is not a plain map");
   else
@@ -227,12 +241,23 @@ export function stateProblems(st, cfg) {
       (c.lastComplete > 0 && c.coveredTo === undefined) ||
       !(c.lastError === null || typeof c.lastError === "string") ||
       !(
+        c.overflow === undefined ||
+        c.overflow === null ||
+        (plainObject(c.overflow) &&
+          typeof c.overflow.provider === "string" &&
+          Number.isFinite(c.overflow.since) &&
+          Number.isSafeInteger(c.overflow.maxCount) &&
+          c.overflow.maxCount > 0)
+      ) ||
+      !(
         c.mismatch === null ||
         (plainObject(c.mismatch) &&
           Number.isSafeInteger(c.mismatch.height) &&
           c.mismatch.height >= 0 &&
           addrs(c.mismatch.fallbackOnly) &&
           addrs(c.mismatch.primaryOnly) &&
+          (c.mismatch.unlisted === undefined ||
+            (Number.isSafeInteger(c.mismatch.unlisted) && c.mismatch.unlisted >= 0)) &&
           (c.mismatch.found === undefined ||
             (plainObject(c.mismatch.found) &&
               Object.entries(c.mismatch.found).every(
@@ -472,6 +497,7 @@ export async function runRound(
     checked: st.checked,
     checkedHash: st.checkedHash,
     lastFullScan: st.lastFullScan,
+    lastFallbackFullScan: st.lastFallbackFullScan,
   };
   let result;
   try {
@@ -547,9 +573,12 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
       alerts,
       `the state cursor ${st.cursor} is ahead of the finalized block ${finalized}`
     );
-  // the daily full rescan is the primary's (clestons #448 N6): a round on the fallback reads only the
-  // window, and does not move lastFullScan, so the primary's next round re-reads everything
-  const full = isPrimary && now - st.lastFullScan >= 24 * 3600_000;
+  // the daily full rescan runs on whichever provider the round uses, each on its own 24 h clock
+  // (clestons #448 B1'', DSR 2026-11-18): with the primary down for days the fallback still re-reads
+  // everything once a day, so an operator the primary's index missed is found within a day. Only the
+  // primary's rescan moves lastFullScan, so a fallback rescan never stands in for it (N6)
+  const scanKey = isPrimary ? "lastFullScan" : "lastFallbackFullScan";
+  const full = now - (st[scanKey] ?? 0) >= 24 * 3600_000;
   const from = full ? st.startBlock : Math.max(st.startBlock, st.cursor + 1 - cfg.rescanBlocks);
   let inventoryOk = true;
   // what the number-range answers said, block by block, this round: compared below with the
@@ -581,7 +610,7 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
       },
       canon
     );
-    if (full) st.lastFullScan = now;
+    if (full) st[scanKey] = now;
   } catch (e) {
     inventoryOk = false;
     alerts.push({
@@ -807,7 +836,20 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
       key: "crosscheck-behind",
       text: `unknown: the inventory is ${behind} blocks past what the last cross-check covered (block ${st.crossCheck?.coveredTo}; max ${CROSS_CHECK_ALERT_DAYS * CROSS_CHECK_MAX_LAG_BLOCKS})`,
     });
-  const crossOk = crossDone && coverageOk && !st.crossCheck?.mismatch;
+  // an overflow is never settled by a later comparison (DSR 2026-11-18): past the cap the over-cap
+  // operators are unnamed, and a comparison cannot tell an honest omission from a lying one
+  const overflow = st.crossCheck?.overflow ?? null;
+  if (overflow)
+    alerts.push({
+      key: "crosscheck-overflow",
+      text:
+        `unknown: the cross-check with ${overflow.provider} found more operators than the inventory may take from it ` +
+        `(up to ${overflow.maxCount} over the cap of ${MAX_CROSS_CHECK_ADDED}, since ${new Date(overflow.since).toISOString()}); ` +
+        "no round is clear until an operator resets it: 1. check that fallback provider and replace it; " +
+        "2. start a new stateDir (the inventory and coveredTo are rebuilt); " +
+        "3. after the restart, wait for the first cross-check to complete (rounds read unknown until then)",
+    });
+  const crossOk = crossDone && coverageOk && !st.crossCheck?.mismatch && !overflow;
   report.startBlockVerified = startOk;
   report.crossCheck = st.crossCheck ?? null;
   report.clear =
@@ -827,6 +869,13 @@ export const CROSS_CHECK_ALERT_DAYS = 3;
 /** The most inventory entries one cross-check re-asks the primary about, and per getLogs topic list. */
 export const MAX_REQUERY_OPERATORS = 1000;
 export const REQUERY_TOPICS = 50;
+/**
+ * The most operators that ever enter the inventory from cross-checks, per state (clestons #448 N8,
+ * DSR 2026-11-18). Past it the rest are only counted (mismatch.unlisted) and the disagreement stands:
+ * the round is never clear while any is reported. A lying fallback can therefore add at most this
+ * many addresses to read, and cannot grow the state without bound.
+ */
+export const MAX_CROSS_CHECK_ADDED = 100;
 /**
  * The most blocks the cross-check may trail the primary's cursor: one day at Sepolia's 12 s.
  * CHAIN-SPECIFIC, NOT CONFIGURED PER CHAIN (DSR 2026-11-17): the value is chosen for Sepolia's block
@@ -854,7 +903,16 @@ export const CROSS_CHECK_MAX_LAG_BLOCKS = 7200;
  */
 export async function crossCheckInventory(
   st,
-  { primary, primaryName, other, otherName, cfg, now, unavailable = "no second provider to ask" }
+  {
+    primary,
+    primaryName,
+    other,
+    otherName,
+    cfg,
+    now,
+    unavailable = "no second provider to ask",
+    persist = () => {},
+  }
 ) {
   const cc = (st.crossCheck ??= emptyCrossCheck());
   const daily = now - cc.lastAttempt >= CROSS_CHECK_MS;
@@ -903,6 +961,34 @@ export async function crossCheckInventory(
       throw new SafeError(
         `this comparison reaches block ${H}, below the standing disagreement at block ${cc.mismatch.height}`
       );
+    const mine = new Set(
+      Object.entries(st.operators)
+        .filter(([, n]) => n <= H)
+        .map(([op]) => op)
+    );
+    // what the other provider reported and the inventory lacked ENTERS the inventory (clestons #448
+    // B1', DSR 2026-11-17), recorded as coming from it, so the very next round checks its stake. The
+    // failure direction is safe: an operator only goes into the list of addresses to read; whether it
+    // is reported comes from the primary's chain reads at B and SP's own pauseUnderstakedOperator
+    // simulation. One a lying provider invented reads "not-configured" (a notice), never PAUSE NEEDED.
+    // - chunk by chunk, as each validated chunk arrives (Codex pre-push round 3), and so before the
+    //   primary is re-asked (clestons #448 N2, DSR 2026-11-18): a later chunk or the re-query failing
+    //   leaves the attempt incomplete but what was seen already checked;
+    // - at most MAX_CROSS_CHECK_ADDED per state (N8); past that the overflow marker is set at once,
+    //   kept for good (DSR 2026-11-18), and written to disk at once (`persist`, Codex pre-push round
+    //   3): a crash later in the run cannot lose it
+    st.fromCrossCheck ??= {};
+    let room = MAX_CROSS_CHECK_ADDED - Object.keys(st.fromCrossCheck).length;
+    const overCap = new Set();
+    const markOverflow = count => {
+      if (count <= (cc.overflow?.maxCount ?? 0)) return;
+      cc.overflow = {
+        provider: otherName,
+        since: cc.overflow?.since ?? now,
+        maxCount: count,
+      };
+      persist();
+    };
     const theirs = new Map(); // operator -> first block the other provider has its log at
     if (H >= st.startBlock)
       await operatorLogs(
@@ -914,16 +1000,22 @@ export async function crossCheckInventory(
         logs => {
           for (const lg of logs) {
             const op = opOf(lg.topics[1]);
-            if (!theirs.has(op)) theirs.set(op, Number(lg.blockNumber));
+            if (theirs.has(op)) continue;
+            const n = Number(lg.blockNumber);
+            theirs.set(op, n);
+            if (mine.has(op) || op in st.operators) continue;
+            if (room > 0) {
+              st.operators[op] = n;
+              st.fromCrossCheck[op] = { provider: otherName, block: n, at: now };
+              room--;
+            } else {
+              overCap.add(op);
+              markOverflow(overCap.size);
+            }
           }
         },
         canonOf(other)
       );
-    const mine = new Set(
-      Object.entries(st.operators)
-        .filter(([, n]) => n <= H)
-        .map(([op]) => op)
-    );
     // what the other provider has that the inventory lacks, each with who found it and how far
     // that comparison reached
     const found = {};
@@ -940,7 +1032,31 @@ export async function crossCheckInventory(
     for (const op of cc.mismatch?.found ? [] : (cc.mismatch?.fallbackOnly ?? []))
       if (!(op in found) && !(op in st.operators))
         found[op] = { provider: cc.mismatch.provider, height: cc.mismatch.height };
+    // over-cap operators (not added during the scan) are dropped from `found` and only counted, so
+    // the record stays bounded and the disagreement stands while they are reported
+    let unlisted = 0;
+    for (const op of Object.keys(found))
+      if (overCap.has(op)) {
+        delete found[op];
+        unlisted++;
+      }
     const fallbackOnly = Object.keys(found).sort();
+    // what the fallback found stands as a disagreement NOW, before the fallible re-query (Codex on
+    // 4e6dc27, High): an over-cap operator is only counted, so if the re-query below threw, nothing
+    // would be left of it and the round could read clear. The attempt is still incomplete; the
+    // re-query's outcome replaces this record when it completes. The guards above already passed,
+    // so this comparison reaches any standing disagreement's height
+    if (fallbackOnly.length || unlisted)
+      cc.mismatch = {
+        at: now,
+        height: H,
+        provider: otherName,
+        primary: primaryName,
+        fallbackOnly,
+        primaryOnly: cc.mismatch?.primaryOnly ?? [],
+        found,
+        unlisted,
+      };
     // inventory entries the other provider lacks are asked of the primary again, all at once: one
     // getLogs per chunk with the operators as an OR topic (clestons #448 N1: not operators x chunks)
     const candidates = [...mine].filter(op => !theirs.has(op)).sort();
@@ -975,7 +1091,7 @@ export async function crossCheckInventory(
     }
     const primaryOnly = candidates.filter(op => confirmed.has(op));
     const outcome =
-      fallbackOnly.length || primaryOnly.length
+      fallbackOnly.length || primaryOnly.length || unlisted
         ? {
             at: now,
             height: H,
@@ -984,19 +1100,9 @@ export async function crossCheckInventory(
             fallbackOnly,
             primaryOnly,
             found,
+            unlisted,
           }
         : null;
-    // what the other provider reported and the inventory lacked ENTERS the inventory now (clestons
-    // #448 B1', DSR 2026-11-17), recorded as coming from it, so the very next round checks its stake.
-    // The failure direction is safe: an operator only goes into the list of addresses to read; whether
-    // it is reported comes from the primary's chain reads at B and SP's own pauseUnderstakedOperator
-    // simulation. One a lying provider invented reads "not-configured" (a notice), never PAUSE NEEDED
-    st.fromCrossCheck ??= {};
-    for (const op of Object.keys(found))
-      if (theirs.has(op) && !(op in st.operators)) {
-        st.operators[op] = theirs.get(op);
-        st.fromCrossCheck[op] = { provider: otherName, block: theirs.get(op), at: now };
-      }
     cc.lastComplete = now;
     cc.failedDays = 0;
     cc.lastError = null;
@@ -1020,7 +1126,11 @@ export function crossCheckAlerts(st) {
       key: "crosscheck",
       text:
         `unknown: the two RPC providers disagree on the operator inventory up to block ${m.height} ` +
-        `(only ${m.provider} has: ${list(m.fallbackOnly)}; only ${m.primary ?? "the round's provider"} has: ${list(m.primaryOnly)}); ` +
+        `(only ${m.provider} has: ${list(m.fallbackOnly)}` +
+        (m.unlisted
+          ? `, and ${m.unlisted} more not added to the inventory (at most ${MAX_CROSS_CHECK_ADDED} are)`
+          : "") +
+        `; only ${m.primary ?? "the round's provider"} has: ${list(m.primaryOnly)}); ` +
         "one provider's log index is wrong; every operator either one names is checked",
     });
   }
