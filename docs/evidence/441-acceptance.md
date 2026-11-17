@@ -10,11 +10,20 @@ wrote itself, through its real execute path, verify under
 `OverIssueFraudProofVerifier-2.0.0`? And does the whole
 `queueGuardianSlash → executeGuardianSlash` chain then complete?
 
+## Rerun on SP 1845b124 (BLSAggregator-4.14.1, DVTValidator-0.8.1), 2026-11-17
+
+After SP #633 merged (`1845b12482e13a9937c7ec7f7f059ed9a3d33829`), the rehearsal
+was rerun with `EXPECT_VERSIONS=BLSAggregator-4.14.1,DVTValidator-0.8.1`.
+DeployAnvil no longer authorises the aggregator as a slasher; E1 is still done
+explicitly in the rehearsal. **18/18 checks passed**, the same results as below.
+Raw report: `docs/evidence/441-acceptance-report-1845b124.json`.
+
 ## How to rerun
 
 ```
 cd contracts && forge build && cd ..
-SP_DIR=<SP checkout, built> SP_COMMIT=<40-hex> deploy/rehearse-guardian-slash.sh [report.json]
+SP_DIR=<SP checkout, built> SP_COMMIT=<40-hex> EXPECT_VERSIONS=BLSAggregator-<x>,DVTValidator-<y> \
+  deploy/rehearse-guardian-slash.sh [report.json]
 ```
 
 `SP_DIR` must be fetched into its own directory with
