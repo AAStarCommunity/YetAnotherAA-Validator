@@ -9,16 +9,18 @@
 #              `gh api repos/AAStarCommunity/SuperPaymaster/tarball/<sha>` plus its contracts/lib
 #              submodules; never use another session's worktree.
 #   SP_COMMIT  the 40-hex commit SP_DIR was fetched at.
+#   EXPECT_VERSIONS  "BLSAggregator-<x>,DVTValidator-<y>" from SP_COMMIT's tree; both generations
+#              deployed by the rehearsal must report exactly these.
 #   PORT       anvil port (default 18645; must be free).
 # The three guardian BLS keys are generated fresh inside the run's temporary directory, so no real
 # guardian key can be used by accident (Codex round 3, L5).
 #
-# Usage: SP_DIR=... SP_COMMIT=... deploy/rehearse-reregister-plan.sh [good|nonce-moved]
+# Usage: SP_DIR=... SP_COMMIT=... EXPECT_VERSIONS=... deploy/rehearse-reregister-plan.sh [good|nonce-moved]
 #   good         exit 0 and "REHEARSAL PASSED"; any failed assertion exits non-zero.
 #   nonce-moved  the deployer sends one unplanned transaction after the export. The re-export must stop
 #                on the nonce check and the address assertion must stop the send: exit 3.
 set -euo pipefail
-: "${SP_DIR:?set SP_DIR}" "${SP_COMMIT:?set SP_COMMIT}"
+: "${SP_DIR:?set SP_DIR}" "${SP_COMMIT:?set SP_COMMIT}" "${EXPECT_VERSIONS:?set EXPECT_VERSIONS=BLSAggregator-<x>,DVTValidator-<y>}"
 [ -z "${NODES_DIR:-}" ] || { echo "NODES_DIR is no longer accepted: keys are generated per run"; exit 1; }
 PORT=${PORT:-18645}
 MODE=${1:-good}
@@ -55,6 +57,15 @@ for (let i = 1; i <= 3; i++) {
 JS
 )
 
+# The versions the deployed contracts must report, e.g. "BLSAggregator-4.14.1,DVTValidator-0.8.1".
+# Required: taken from the SP commit's tree, never assumed here.
+check_versions() { # $1 aggregator  $2 dvtValidator  $3 label
+  local a d
+  a=$("$C" call "$1" 'version()(string)' --rpc-url "$R" | tr -d '"'); d=$("$C" call "$2" 'version()(string)' --rpc-url "$R" | tr -d '"')
+  [ "$a,$d" = "$EXPECT_VERSIONS" ] || { echo "FAIL: $3 versions are $a,$d; EXPECT_VERSIONS is $EXPECT_VERSIONS"; exit 1; }
+  echo "$3 versions: $a, $d (as expected)"
+}
+
 lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null && { echo "port $PORT is busy"; exit 1; }
 "$ANVIL" --port "$PORT" --chain-id 31337 --hardfork prague --code-size-limit 100000 --silent > "$B/anvil.log" 2>&1 &
 APID=$!
@@ -70,6 +81,7 @@ G1=$SP_DIR/deployments/config.anvil.json
 jget() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"; }
 OLDAGG=$(jget "$G1" blsAggregator); REG=$(jget "$G1" registry); SPX=$(jget "$G1" superPaymaster)
 echo "gen1 (old) aggregator $OLDAGG registry $REG"
+check_versions "$OLDAGG" "$(jget "$G1" dvtValidator)" "gen1"
 
 # ---- SP pin: nonce, block, and the precomputed addresses of the next two CREATEs ---------------------
 N=$("$C" nonce "$D" --rpc-url "$R"); BLK=$("$C" block-number --rpc-url "$R")
@@ -115,6 +127,7 @@ AARGS=$("$C" abi-encode 'c(address,address,address)' "$REG" "$SPX" "$NDVT")
 "$C" send --private-key "$K0" --rpc-url "$R" --create "$ABC${AARGS:2}" >/dev/null
 NAGG=$("$C" compute-address "$D" --nonce $(( $("$C" nonce "$D" --rpc-url "$R") - 1 )) | awk '{print $NF}')
 echo "deployed: DVT $NDVT AGG $NAGG"
+check_versions "$NAGG" "$NDVT" "new pair"
 
 # ---- A10-equivalent: deployed addresses == the export's, else STOP ---------------------------------
 # Exit 0 = match, 10 = verified mismatch, anything else = the check itself failed (Codex round 3, M2).
