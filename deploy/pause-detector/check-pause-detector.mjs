@@ -23,7 +23,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import {
-  emptyState,
+  emptyState as freshState,
   runRound,
   stateProblems,
   spIface,
@@ -40,6 +40,7 @@ import {
   crossCheckAlerts,
   CROSS_CHECK_MS,
   CROSS_CHECK_ALERT_DAYS,
+  CROSS_CHECK_MAX_LAG_BLOCKS,
 } from "./lib/detect.mjs";
 import {
   configProblems,
@@ -80,6 +81,14 @@ import {
 } from "./deadman-run.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+// The cells' default state has one completed inventory cross-check on record: since DSR's
+// 2026-11-17 ruling no round is clear before one, and most cells test something else. Cells about
+// a really fresh state (a first deployment or a lost state file) use freshState.
+const emptyState = cfg => {
+  const st = freshState(cfg);
+  st.crossCheck.lastComplete = 1;
+  return st;
+};
 let pass = 0;
 let fail = 0;
 const cell = async (name, fn) => {
@@ -1720,6 +1729,123 @@ await cell(
     );
   }
 );
+// ---- the Daybreak rerun High and DSR's conditions (DSR 2026-11-17) ------------------------------
+await cell(
+  "H1-R2: a cross-check whose H is below what an earlier one covered is incomplete",
+  async () => {
+    const w = world();
+    const st = await inventoried(w);
+    await cross(st, w, world(), 1e12 + 1000);
+    assert(st.crossCheck.coveredTo === 250, `coveredTo ${st.crossCheck.coveredTo}`);
+    const complete = st.crossCheck.lastComplete;
+    // a day later the other provider's finalized block went back to 200
+    await cross(st, w, world({ finalized: 200 }), 1e12 + 1000 + CROSS_CHECK_MS);
+    assert(
+      st.crossCheck.failedDays === 1 &&
+        st.crossCheck.lastComplete === complete &&
+        /below block 250/.test(st.crossCheck.lastError ?? ""),
+      JSON.stringify(st.crossCheck)
+    );
+  }
+);
+await cell(
+  "H1-R2: a standing disagreement is cleared only by a comparison that reaches its height",
+  async () => {
+    const w = world();
+    const st = await inventoried(w);
+    await cross(st, w, world({ hidden: new Set([120]) }), 1e12 + 1000); // primaryOnly at H = 250
+    assert(st.crossCheck.mismatch?.height === 250, JSON.stringify(st.crossCheck.mismatch));
+    st.crossCheck.coveredTo = 0; // isolate this rule from the coveredTo one (e.g. a pre-coveredTo state)
+    // the other provider now agrees, but only up to 200: the disagreement stands, the attempt is not complete
+    await cross(st, w, world({ finalized: 200 }), 1e12 + 2000);
+    assert(st.crossCheck.mismatch?.height === 250, "a shorter comparison cleared the disagreement");
+    assert(
+      /below the standing disagreement/.test(st.crossCheck.lastError ?? ""),
+      st.crossCheck.lastError
+    );
+    // control: a comparison that reaches 250 and agrees clears it
+    await cross(st, w, world(), 1e12 + 3000);
+    assert(st.crossCheck.mismatch === null, "not cleared at its height");
+  }
+);
+await cell(
+  `H1-R2: a cross-check more than ${CROSS_CHECK_MAX_LAG_BLOCKS} blocks behind the inventory is incomplete`,
+  async () => {
+    const w = world();
+    const late = await inventoried(w);
+    late.cursor = 250 + CROSS_CHECK_MAX_LAG_BLOCKS + 1; // the other provider's finalized block is 250
+    await cross(late, w, world(), 1e12 + 1000);
+    assert(
+      late.crossCheck.failedDays === 1 &&
+        /blocks behind the inventory/.test(late.crossCheck.lastError ?? ""),
+      JSON.stringify(late.crossCheck)
+    );
+    // control: exactly the limit behind is complete
+    const ok = await inventoried(w);
+    ok.cursor = 250 + CROSS_CHECK_MAX_LAG_BLOCKS;
+    await cross(ok, w, world(), 1e12 + 1000);
+    assert(
+      ok.crossCheck.failedDays === 0 && ok.crossCheck.lastComplete > 0,
+      JSON.stringify(ok.crossCheck)
+    );
+  }
+);
+await cell(
+  "(b): a fresh or lost state is never clear before a first cross-check completes (coveredTo starts at 0)",
+  async () => {
+    const cfg = cfgOf();
+    const w = world();
+    const st = freshState(cfg); // a first deployment, or a state file that was lost or emptied
+    assert(st.crossCheck.coveredTo === 0 && st.crossCheck.lastComplete === 0, "not fresh");
+    const r1 = await round(w, cfg, st, 1e12);
+    assert(
+      !r1.report.clear &&
+        r1.alerts.some(a => a.key === "crosscheck-pending" && /^unknown:/.test(a.text)),
+      r1.alerts.map(a => a.key).join(",")
+    );
+    // the other provider down: still not clear (the right behaviour on a first deployment)
+    await cross(st, w, world({ fail: new Set(["logs"]) }), 1e12 + 1000);
+    const r2 = await round(w, cfg, st, 1e12 + 2000);
+    assert(!r2.report.clear, "clear without a completed cross-check");
+    // once one completes, the round can be clear
+    await cross(st, w, world(), 1e12 + 1000 + CROSS_CHECK_MS);
+    const r3 = await round(w, cfg, st, 1e12 + 2000 + CROSS_CHECK_MS);
+    assert(
+      r3.report.clear && !r3.alerts.some(a => a.key === "crosscheck-pending"),
+      r3.alerts.map(a => a.key).join(",")
+    );
+  }
+);
+await cell(
+  "(a)-1: a failed re-query by the primary is not an empty answer: the disagreement stands, the day is incomplete",
+  async () => {
+    const w = world();
+    const st = await inventoried(w);
+    const otherLacksOp1 = world({ hidden: new Set([120]) });
+    await cross(st, w, otherLacksOp1, 1e12 + 1000);
+    assert(
+      st.crossCheck.mismatch?.primaryOnly?.length === 1,
+      JSON.stringify(st.crossCheck.mismatch)
+    );
+    // the next day the primary's per-operator re-query fails (its getLogs from startBlock errors)
+    await cross(
+      st,
+      world({ fail: new Set(["logs:100"]) }),
+      otherLacksOp1,
+      1e12 + 1000 + CROSS_CHECK_MS
+    );
+    assert(
+      st.crossCheck.mismatch?.primaryOnly?.length === 1 &&
+        st.crossCheck.failedDays === 1 &&
+        /primary/.test(st.crossCheck.lastError ?? ""),
+      JSON.stringify(st.crossCheck)
+    );
+    // control: the same re-query answering [] (the primary has no such log) is a superset entry
+    await cross(st, world({ ops: {} }), otherLacksOp1, 1e12 + 1000 + 2 * CROSS_CHECK_MS);
+    assert(st.crossCheck.mismatch === null, "an empty answer was not read as a superset entry");
+  }
+);
+
 await cell("state: a malformed crossCheck record is refused", () => {
   const st = emptyState(cfgOf());
   st.crossCheck = {

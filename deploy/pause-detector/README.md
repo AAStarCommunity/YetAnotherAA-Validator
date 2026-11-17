@@ -247,8 +247,21 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
     `the daily inventory cross-check … has not completed for N days`, until one
     completes.
 
+  - **It must keep up** (Daybreak rerun High, DSR 2026-11-17). The highest block
+    a completed cross-check covered is kept (`coveredTo`). An attempt whose
+    height is below it, or more than 7200 blocks (a day at 12 s) behind the
+    primary's cursor, is incomplete: the other provider's finalized block
+    stalled or went back. A standing disagreement is cleared only by a
+    comparison that reaches its height.
+  - **No round is clear before a first cross-check has completed** (DSR
+    2026-11-17): a first deployment, or a state file that was lost or emptied
+    (which also resets `coveredTo`), reads `unknown`
+    (`no inventory cross-check … has completed yet`) until one completes. On a
+    first deployment with the fallback down, that means `unknown` until it
+    answers.
+
   So an honest provider's index gap is found within a day, and a fallback that
-  is down does not turn every round unknown.
+  is down does not turn every round unknown once a first cross-check exists.
 
 - **The known residuals.**
   - Both providers missing the **same** log the same way is not found.
@@ -515,7 +528,11 @@ secret-file reader, called with the detector's own name table) and
      (Daybreak H4); the dead-man then reports the detector's silence.
    - Every bundled package must be exactly the version `package-lock.json` lists
      at that path, with an integrity entry; otherwise the bundler stops
-     (Daybreak H5b).
+     (Daybreak H5b). **This checks metadata, not the installed bytes:** a file
+     changed inside `node_modules/ethers` with its `package.json` left alone is
+     not caught here. The bytes are checked by `npm ci`, which verifies each
+     tarball against the lockfile's integrity at install time, so build from a
+     fresh `npm ci` (Daybreak rerun Low, disclosed; DSR 2026-11-17).
    - The checkout is not needed after this, and the detector cannot read it.
    - To upgrade, build a new bundle into a new directory and swap it in.
    - It copies ethers from the checkout's `node_modules`. So install that with

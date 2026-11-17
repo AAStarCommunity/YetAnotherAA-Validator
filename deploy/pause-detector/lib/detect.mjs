@@ -144,6 +144,10 @@ export function emptyCrossCheck() {
     lastComplete: 0, // ms of the last attempt that completed
     failedDays: 0, // consecutive daily attempts that did not complete
     lastError: null, // why the last attempt did not complete
+    // the highest block a completed cross-check covered (Daybreak rerun High, DSR 2026-11-17): a
+    // later one that covers less (the other provider's finalized block stalled or went back) is
+    // not complete. 0 = none yet
+    coveredTo: 0,
     mismatch: null, // { at, height, provider, fallbackOnly: [op], primaryOnly: [op] } or null
   };
 }
@@ -201,6 +205,7 @@ export function stateProblems(st, cfg) {
       !["lastAttempt", "lastComplete"].every(k => Number.isFinite(c[k]) && c[k] >= 0) ||
       !Number.isSafeInteger(c.failedDays) ||
       c.failedDays < 0 ||
+      !(c.coveredTo === undefined || (Number.isSafeInteger(c.coveredTo) && c.coveredTo >= 0)) ||
       !(c.lastError === null || typeof c.lastError === "string") ||
       !(
         c.mismatch === null ||
@@ -746,7 +751,15 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
   report.fresh = freshAtEnd;
   // the daily cross-check's standing results (crossCheckInventory ran before this round)
   alerts.push(...crossCheckAlerts(st));
-  const crossOk = !st.crossCheck?.mismatch;
+  // no round is clear before a first cross-check has completed (DSR 2026-11-17): a fresh state,
+  // a first deployment or a lost state file, would otherwise read clear with nothing compared
+  const crossDone = st.crossCheck?.lastComplete > 0;
+  if (!crossDone)
+    alerts.push({
+      key: "crosscheck-pending",
+      text: "unknown: no inventory cross-check with the other RPC provider has completed yet; no round is clear until one has",
+    });
+  const crossOk = crossDone && !st.crossCheck?.mismatch;
   report.startBlockVerified = startOk;
   report.crossCheck = st.crossCheck ?? null;
   report.clear =
@@ -763,6 +776,11 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
 /** The daily cross-check's period, and how many failed days in a row raise an alert (DSR 2026-11-17). */
 export const CROSS_CHECK_MS = 24 * 3600_000;
 export const CROSS_CHECK_ALERT_DAYS = 3;
+/**
+ * The most blocks the cross-check may trail the primary's cursor: one day at Sepolia's 12 s (on OP
+ * Mainnet's 2 s blocks that is 4 h: stricter, and its cost is incomplete days, never a false clear).
+ */
+export const CROSS_CHECK_MAX_LAG_BLOCKS = 7200;
 
 /**
  * The daily inventory cross-check against the OTHER provider (Daybreak H1, DSR 2026-11-17). Once a
@@ -807,6 +825,17 @@ export async function crossCheckInventory(
     if (id !== st.chainId) throw new SafeError(`the other provider is on chain ${id}`);
     const otherFinal = height(Number(await other.blockNumber("finalized")), "its finalized block");
     const H = Math.min(st.cursor, otherFinal);
+    // the comparison must keep up (Daybreak rerun High, DSR 2026-11-17): an H below what a completed
+    // cross-check already covered, or more than a day of blocks behind the primary's cursor, means
+    // the other provider's finalized block stalled or went back. Such an attempt is incomplete
+    if (H < (cc.coveredTo ?? 0))
+      throw new SafeError(
+        `the other provider's finalized block ${otherFinal} is below block ${cc.coveredTo}, which an earlier cross-check covered`
+      );
+    if (st.cursor - H > CROSS_CHECK_MAX_LAG_BLOCKS)
+      throw new SafeError(
+        `the other provider's finalized block ${otherFinal} is ${st.cursor - H} blocks behind the inventory (max ${CROSS_CHECK_MAX_LAG_BLOCKS})`
+      );
     const theirs = new Set();
     if (H >= st.startBlock)
       await operatorLogs(
@@ -850,10 +879,7 @@ export async function crossCheckInventory(
       }
       if (found) primaryOnly.push(op);
     }
-    cc.lastComplete = now;
-    cc.failedDays = 0;
-    cc.lastError = null;
-    cc.mismatch =
+    const outcome =
       fallbackOnly.length || primaryOnly.length
         ? {
             at: now,
@@ -864,6 +890,17 @@ export async function crossCheckInventory(
             primaryOnly,
           }
         : null;
+    // a standing disagreement is cleared only by a comparison that reaches its height (DSR
+    // 2026-11-17); a shorter one that agrees leaves it, and is not complete
+    if (!outcome && cc.mismatch && H < cc.mismatch.height)
+      throw new SafeError(
+        `this comparison reaches block ${H}, below the standing disagreement at block ${cc.mismatch.height}`
+      );
+    cc.lastComplete = now;
+    cc.failedDays = 0;
+    cc.lastError = null;
+    cc.coveredTo = Math.max(cc.coveredTo ?? 0, H);
+    cc.mismatch = outcome;
   } catch (e) {
     if (daily) cc.failedDays += 1;
     cc.lastError = safeText("cross-check", e);
