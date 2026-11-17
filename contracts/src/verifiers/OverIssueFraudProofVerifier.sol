@@ -66,6 +66,14 @@ interface IOverIssuable {
  *      deployment where `executeGuardianSlash` moves real stake. Test/E2E use only until that lands.
  */
 contract OverIssueFraudProofVerifier is IFraudProofVerifier {
+    /// @notice Machine-readable build marker (#441, DSR 2026-11-17). SP's manifest reads these two
+    ///         instead of relying only on a pinned sha256: a verifier without them predates the
+    ///         BLSAggregator-4.14.0 commitment layout and can never verify a proof there.
+    string public constant VERIFIER_VERSION = "OverIssueFraudProofVerifier-2.0.0";
+    /// @notice True: the recomputed signer commitment ends with blockhash(executionBlock - 1),
+    ///         supplied in the fraudProof (SP #630, BLSAggregator.sol:1376-1388).
+    bool public constant COMMITMENT_BINDS_PARENT_BLOCKHASH = true;
+
     string internal constant FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1"; // DVT-internal fraudProofId derivation
     string internal constant OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1"; // DVT evidence convention
     uint256 internal constant MAX_SIGNERS = 13; // == BLSAggregator.MAX_VALIDATORS
@@ -155,7 +163,11 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
      * @inheritdoc IFraudProofVerifier
      * @dev fraudProof = abi.encode(
      *        uint256 proposalId, address operator, uint8 slashLevel, uint256 epoch,
-     *        address disputedToken, uint256 signerMask, address[] claimedSigners)
+     *        address disputedToken, uint256 signerMask, address[] claimedSigners,
+     *        bytes32 parentBlockHash)
+     *      parentBlockHash is blockhash(executionBlock - 1) of the block that executed the disputed
+     *      slash. It is caller-supplied, which is safe: it only enters the commitment pre-image, so a
+     *      wrong value cannot reproduce SP's stored commitment (#441).
      *      Wraps the real check in a self-staticcall so a malformed proof or a malicious
      *      `disputedToken` that reverts can only make verify return false — never revert.
      */
@@ -194,8 +206,10 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
             uint256 epoch,
             address disputedToken,
             uint256 signerMask,
-            address[] memory claimedSigners
-        ) = abi.decode(fraudProof, (uint256, address, uint8, uint256, address, uint256, address[]));
+            address[] memory claimedSigners,
+            bytes32 parentBlockHash
+        ) = abi.decode(fraudProof, (uint256, address, uint8, uint256, address, uint256, address[], bytes32));
+        if (parentBlockHash == bytes32(0)) return false;
 
         // 1. Content binding: fraudProofId MUST be the canonical derivation of proposalId.
         if (fraudProofId != deriveFraudProofId(proposalId)) return false;
@@ -205,7 +219,11 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
 
         // 3. Commitment check with disputedToken bound in via evidenceHash → messageHash (an
         //    attacker can't swap disputedToken without breaking evidenceHash → messageHash → commitment).
-        if (!_commitmentMatches(proposalId, operator, slashLevel, epoch, disputedToken, signerMask, claimedSigners)) {
+        if (
+            !_commitmentMatches(
+                proposalId, operator, slashLevel, epoch, disputedToken, signerMask, claimedSigners, parentBlockHash
+            )
+        ) {
             return false;
         }
 
@@ -240,18 +258,25 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         uint256 epoch,
         address disputedToken,
         uint256 signerMask,
-        address[] memory claimedSigners
+        address[] memory claimedSigners,
+        bytes32 parentBlockHash
     ) internal view returns (bool) {
         bytes32 anchor = IBLSAggregatorCommitment(AGGREGATOR).proposalSignersCommitment(proposalId);
         if (anchor == bytes32(0)) return false; // not a recorded proposal
         bytes32 messageHash = slashMessageHash(proposalId, operator, slashLevel, epoch, disputedToken);
-        // Byte-identical to BLSAggregator._computeSignersCommitment (BLSAggregator.sol:1299):
-        // keccak256(abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash,
-        //                      signerMask, signers)). domainSeparator() binds chainid+aggregator+
-        // Registry, replacing the obsolete pre-4.11 `string tag + raw chainid + raw aggregator` shape.
+        // Byte-identical to BLSAggregator-4.14.0 _computeSignersCommitment (SP #630,
+        // BLSAggregator.sol:1376-1388): keccak256(abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT,
+        // key, messageHash, signerMask, signers, blockhash(block.number - 1))). On the execute-slash
+        // path the key is the proposalId. The 4.11 layout without the last field is no longer accepted.
         bytes32 recomputed = keccak256(
             abi.encode(
-                domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, claimedSigners
+                domainSeparator(),
+                TAG_SIGNERS_COMMITMENT,
+                proposalId,
+                messageHash,
+                signerMask,
+                claimedSigners,
+                parentBlockHash
             )
         );
         return recomputed == anchor;

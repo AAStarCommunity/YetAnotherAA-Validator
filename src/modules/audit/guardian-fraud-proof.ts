@@ -142,16 +142,20 @@ export interface OverIssueFraudProofInputs {
   signerMask: bigint;
   /** MUST be the strictly-ascending set from resolveClaimedSigners. */
   claimedSigners: string[];
+  /** blockhash(executionBlock - 1): the last field of SP 4.14.0's commitment pre-image (#441). */
+  parentBlockHash: string;
 }
 
 /**
  * Assemble the `fraudProof` bytes the verifier decodes:
  *   abi.encode(uint256 proposalId, address operator, uint8 slashLevel, uint256 epoch,
- *              address disputedToken, uint256 signerMask, address[] claimedSigners)
+ *              address disputedToken, uint256 signerMask, address[] claimedSigners,
+ *              bytes32 parentBlockHash)
+ * The last field is new with the #441 verifier (SP BLSAggregator-4.14.0 commitment layout).
  */
 export function encodeOverIssueFraudProof(i: OverIssueFraudProofInputs): string {
   return ethers.AbiCoder.defaultAbiCoder().encode(
-    ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]"],
+    ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]", "bytes32"],
     [
       i.proposalId,
       i.operator,
@@ -160,6 +164,7 @@ export function encodeOverIssueFraudProof(i: OverIssueFraudProofInputs): string 
       i.disputedToken,
       i.signerMask,
       i.claimedSigners,
+      i.parentBlockHash,
     ]
   );
 }
@@ -270,9 +275,10 @@ export function decodeVerifyAndExecuteCalldata(data: string): VerifyAndExecuteAr
 }
 
 /**
- * Recompute SP's A' `proposalSignersCommitment` — byte-identical to the LIVE
- * `_computeSignersCommitment` (:1299): `keccak256(abi.encode(domainSeparator, TAG_SIGNERS_COMMITMENT,
- * proposalId, messageHash, signerMask, signers))`. The watcher can self-check that its assembled
+ * Recompute SP's A' `proposalSignersCommitment` — byte-identical to BLSAggregator-4.14.0's
+ * `_computeSignersCommitment` (SP #630, BLSAggregator.sol:1376-1388): `keccak256(abi.encode(
+ * domainSeparator, TAG_SIGNERS_COMMITMENT, key, messageHash, signerMask, signers,
+ * blockhash(block.number - 1)))`. For the execute-slash path `key` is the proposalId. The watcher can self-check that its assembled
  * proof WILL pass on-chain before submitting. `messageHash` MUST be built with the SAME `domain`.
  */
 export function computeSignersCommitment(
@@ -280,7 +286,15 @@ export function computeSignersCommitment(
   proposalId: bigint,
   messageHash: string,
   signerMask: bigint,
-  claimedSigners: string[]
+  claimedSigners: string[],
+  parentBlockHash: string
 ): string {
-  return signersCommitment(domain, proposalId, messageHash, signerMask, claimedSigners);
+  return signersCommitment(
+    domain,
+    proposalId,
+    messageHash,
+    signerMask,
+    claimedSigners,
+    parentBlockHash
+  );
 }

@@ -104,12 +104,20 @@ export async function buildGuardianSignerRecord(
           args.epoch
         );
 
+  // SP 4.14.0 binds blockhash(block.number - 1) of the executing block into the commitment (#441).
+  // Read it from the chain here: it is the one input that cannot be rebuilt from calldata later.
+  const parent = await provider.getBlock(executionBlock - 1);
+  if (!parent?.hash)
+    throw new WatcherRecordError(`parent block ${executionBlock - 1} not available`);
+  const parentBlockHash = parent.hash;
+
   const localCommitment = computeSignersCommitment(
     domain,
     args.proposalId,
     messageHash,
     args.signerMask,
-    claimedSigners
+    claimedSigners,
+    parentBlockHash
   );
 
   // Read the on-chain commitment at the execution block (immutable once set, but pin for reorg
@@ -137,5 +145,6 @@ export async function buildGuardianSignerRecord(
     commitment: onChainCommitment,
     commitmentVerified,
     executionBlockTimestamp,
+    parentBlockHash,
   };
 }

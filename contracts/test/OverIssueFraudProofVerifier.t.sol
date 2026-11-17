@@ -56,8 +56,26 @@ contract MockAggregator {
         );
     }
 
-    /// @notice Record an A' commitment in the CURRENT SP layout (BLSAggregator.sol:1299).
-    function recordSP(uint256 proposalId, bytes32 messageHash, uint256 signerMask, address[] memory sortedSigners)
+    /// @notice Record an A' commitment in the CURRENT SP layout: BLSAggregator-4.14.0
+    ///         (SP #630, BLSAggregator.sol:1376-1388), which ends with blockhash(block.number - 1).
+    ///         The parent hash is a parameter so the fixtures are deterministic (#441).
+    function recordSP(
+        uint256 proposalId,
+        bytes32 messageHash,
+        uint256 signerMask,
+        address[] memory sortedSigners,
+        bytes32 parentBlockHash
+    ) external {
+        proposalSignersCommitment[proposalId] = keccak256(
+            abi.encode(
+                domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, sortedSigners, parentBlockHash
+            )
+        );
+    }
+
+    /// @notice Record a commitment in the 4.11 layout (no parent block hash). Exists ONLY to prove the
+    ///         #441 verifier REJECTS it.
+    function recordSP411(uint256 proposalId, bytes32 messageHash, uint256 signerMask, address[] memory sortedSigners)
         external
     {
         proposalSignersCommitment[proposalId] = keccak256(
@@ -119,6 +137,8 @@ contract OverIssueFraudProofVerifierTest is Test {
     uint256 internal constant EPOCH = 1000;
     uint256 internal constant PROPOSAL_ID = 42;
     uint256 internal constant SIGNER_MASK = 0x7; // bits 1,2,3
+    /// blockhash(executionBlock - 1) in the fixtures (#441, SP BLSAggregator-4.14.0 commitment layout).
+    bytes32 internal constant PARENT = 0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a;
 
     function setUp() public {
         agg = new MockAggregator(REGISTRY);
@@ -166,11 +186,19 @@ contract OverIssueFraudProofVerifierTest is Test {
     /// records the commitment for a slash over `disputedToken` in the CURRENT SP layout, computed by
     /// the mock independently of the verifier (so a verifier format regression is NOT masked).
     function _record(address[] memory signers, address disputedToken) internal {
-        agg.recordSP(PROPOSAL_ID, _spMessageHash(disputedToken), SIGNER_MASK, signers);
+        agg.recordSP(PROPOSAL_ID, _spMessageHash(disputedToken), SIGNER_MASK, signers, PARENT);
     }
 
     function _proof(address[] memory claimedSigners, address disputedToken) internal pure returns (bytes memory) {
-        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, disputedToken, SIGNER_MASK, claimedSigners);
+        return _proofWith(claimedSigners, disputedToken, PARENT);
+    }
+
+    function _proofWith(address[] memory claimedSigners, address disputedToken, bytes32 parent)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, disputedToken, SIGNER_MASK, claimedSigners, parent);
     }
 
     function _fpid() internal view returns (uint256) {
@@ -444,6 +472,49 @@ contract OverIssueFraudProofVerifierTest is Test {
         assertTrue(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, _proof(_claimed(), address(token))));
     }
 
+    /// #441: a commitment in the 4.11 layout (no parent block hash) is rejected, even with an
+    /// otherwise perfect proof. This is the layout the pre-#441 verifier reconstructed.
+    function test_441_Layout411Commitment_Rejected() public {
+        agg.recordSP411(PROPOSAL_ID, _spMessageHash(address(token)), SIGNER_MASK, _claimed());
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, _proof(_claimed(), address(token))));
+    }
+
+    /// #441: the parent block hash is load-bearing. A proof with a different one does not reproduce
+    /// the stored commitment.
+    function test_441_WrongParentBlockHash_Rejected() public {
+        _record(_claimed(), address(token));
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        bytes memory p = _proofWith(_claimed(), address(token), bytes32(uint256(PARENT) ^ 1));
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, p));
+    }
+
+    /// #441: a zero parent block hash is refused outright.
+    function test_441_ZeroParentBlockHash_Rejected() public {
+        agg.recordSP(PROPOSAL_ID, _spMessageHash(address(token)), SIGNER_MASK, _claimed(), bytes32(0));
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        bytes memory p = _proofWith(_claimed(), address(token), bytes32(0));
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, p));
+    }
+
+    /// #441: a proof in the old 7-field shape (no parent block hash) is refused, not misread.
+    function test_441_SevenFieldProof_Rejected() public {
+        _record(_claimed(), address(token));
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        bytes memory p = abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token), SIGNER_MASK, _claimed());
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, p));
+    }
+
+    /// #441: the build marker SP's manifest reads.
+    function test_441_BuildMarker() public view {
+        assertEq(verifier.VERIFIER_VERSION(), "OverIssueFraudProofVerifier-2.0.0");
+        assertTrue(verifier.COMMITMENT_BINDS_PARENT_BLOCKHASH());
+    }
+
     function test_OldFormatCommitment_Rejected() public {
         // Obsolete pre-4.11 commitment (string tag + raw chainid/aggregator, old empty-array message).
         agg.recordOldFormat(PROPOSAL_ID, _oldMessageHash(address(token)), SIGNER_MASK, _claimed());
@@ -505,10 +576,13 @@ contract OverIssueFraudProofVerifierTest is Test {
                 uint256(42),
                 mh,
                 uint256(0x7),
-                signers
+                signers,
+                PARENT
             )
         );
-        assertEq(commitment, bytes32(0xb35d1e5b965d5a628e796f584596cf57080b6b00f9c566226adf70990db15ad4), "commitment");
+        // 4.14.0 layout with PARENT (#441). Recomputed independently with `cast abi-encode` + `cast keccak`;
+        // the same method reproduces the old 4.11 golden 0xb35d1e5b…, and the TS suite pins the same hex.
+        assertEq(commitment, bytes32(0xc625f31395b05a23504334285c8ed4ce6ea71a7c8305295b249e16fb67e79fcd), "commitment");
     }
 
     // ---- (CRITICAL #2 disclosure) current-token-state limitation, documented as a test ----
@@ -568,6 +642,8 @@ contract OverIssueFraudProofVerifierConformanceTest is Test {
     uint256 internal constant EPOCH = 1000;
     uint256 internal constant PROPOSAL_ID = 42;
     uint256 internal constant SIGNER_MASK = 0x7;
+    /// blockhash(executionBlock - 1) in the fixtures (#441, SP BLSAggregator-4.14.0 commitment layout).
+    bytes32 internal constant PARENT = 0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a;
 
     function setUp() public {
         aggA = new MockAggregator(REGISTRY);
@@ -580,7 +656,7 @@ contract OverIssueFraudProofVerifierConformanceTest is Test {
         // built independently of the verifier (Codex MEDIUM #3).
         bytes32 evidence = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", address(token), OPERATOR, EPOCH));
         bytes32 mh = aggA.slashMessage(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, evidence);
-        aggA.recordSP(PROPOSAL_ID, mh, SIGNER_MASK, _claimed());
+        aggA.recordSP(PROPOSAL_ID, mh, SIGNER_MASK, _claimed(), PARENT);
     }
 
     function _claimed() internal pure returns (address[] memory a) {
@@ -595,7 +671,7 @@ contract OverIssueFraudProofVerifierConformanceTest is Test {
     }
 
     function _proof() internal view returns (bytes memory) {
-        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token), SIGNER_MASK, _claimed());
+        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token), SIGNER_MASK, _claimed(), PARENT);
     }
 
     /// SP release gate 1: domain binding.

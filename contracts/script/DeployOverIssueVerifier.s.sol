@@ -87,36 +87,40 @@ contract DeployOverIssueVerifier is Script {
     ///         decision here (or via EXPECTED_AGGREGATOR_VERSION) rather than a silent pass.
     /// @dev    Version alone is NOT identity: any contract can return this string. See the
     ///         canonical-pin note at the domain-parity gate below.
-    string internal constant SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.11.0";
+    string internal constant SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.14.0";
 
-    /// @dev True unless `v` is exactly "BLSAggregator-<major>.<minor>.<patch>" optionally followed by
-    ///      "-<suffix>" (non-empty, [0-9A-Za-z.-]), each number 1-6 digits with no leading zero
-    ///      (except "0" itself), and
-    ///      (major, minor) < (4, 13). Anything that does not parse is treated as new (fail closed).
-    function _isAnchoredCommitmentRelease(string memory v) internal pure returns (bool) {
+    /// @dev Classifies `v`: RELEASE_UNPARSEABLE unless it is exactly
+    ///      "BLSAggregator-<major>.<minor>.<patch>" optionally followed by "-<suffix>" (non-empty,
+    ///      [0-9A-Za-z.-]), each number 1-6 digits with no leading zero (except "0" itself); otherwise
+    ///      RELEASE_ANCHORED when (major, minor) >= (4, 13), else RELEASE_PRE_ANCHOR.
+    uint8 internal constant RELEASE_UNPARSEABLE = 0;
+    uint8 internal constant RELEASE_PRE_ANCHOR = 1;
+    uint8 internal constant RELEASE_ANCHORED = 2;
+
+    function _releaseClass(string memory v) internal pure returns (uint8) {
         bytes memory b = bytes(v);
         bytes memory prefix = bytes("BLSAggregator-");
-        if (b.length <= prefix.length) return true;
+        if (b.length <= prefix.length) return RELEASE_UNPARSEABLE;
         for (uint256 i = 0; i < prefix.length; i++) {
-            if (b[i] != prefix[i]) return true;
+            if (b[i] != prefix[i]) return RELEASE_UNPARSEABLE;
         }
         (bool ok1, uint256 major, uint256 i1) = _readStrictUint(b, prefix.length);
-        if (!ok1 || i1 >= b.length || b[i1] != ".") return true;
+        if (!ok1 || i1 >= b.length || b[i1] != ".") return RELEASE_UNPARSEABLE;
         (bool ok2, uint256 minor, uint256 i2) = _readStrictUint(b, i1 + 1);
-        if (!ok2 || i2 >= b.length || b[i2] != ".") return true;
+        if (!ok2 || i2 >= b.length || b[i2] != ".") return RELEASE_UNPARSEABLE;
         (bool ok3,, uint256 i3) = _readStrictUint(b, i2 + 1);
-        if (!ok3) return true;
+        if (!ok3) return RELEASE_UNPARSEABLE;
         if (i3 != b.length) {
             // "-<suffix>": non-empty, [0-9A-Za-z.-] only.
-            if (b[i3] != "-" || i3 + 1 == b.length) return true;
+            if (b[i3] != "-" || i3 + 1 == b.length) return RELEASE_UNPARSEABLE;
             for (uint256 k = i3 + 1; k < b.length; k++) {
                 bytes1 c = b[k];
                 bool okc = (c >= "0" && c <= "9") || (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || c == "."
                     || c == "-";
-                if (!okc) return true;
+                if (!okc) return RELEASE_UNPARSEABLE;
             }
         }
-        return major > 4 || (major == 4 && minor >= 13);
+        return (major > 4 || (major == 4 && minor >= 13)) ? RELEASE_ANCHORED : RELEASE_PRE_ANCHOR;
     }
 
     /// @dev Reads 1-6 decimal digits at `i` with no leading zero (a lone "0" is allowed). The six-digit
@@ -240,16 +244,21 @@ contract DeployOverIssueVerifier is Script {
             keccak256(bytes(reportedVersion)) == keccak256(bytes(expectedVersion)),
             "AGGREGATOR.version() != expected: re-verify the fraud-proof ABI and the arming path for that release, then set EXPECTED_AGGREGATOR_VERSION"
         );
-        // GATE A' — NO OVERRIDE PAST r3b. BLSAggregator-4.13.0 (SP rc.8 r3b) changed the signer
-        // commitment this verifier recomputes: it is now keyed per path and ends with
-        // blockhash(block.number - 1) (BLSAggregator.sol @ f00be603 :1376-1386). This verifier's
-        // `_commitmentMatches` predates that tuple, so on 4.13.0+ it can never verify a fraud proof:
-        // arming it would install a fraud-proof authority that silently never fires. 5.5.0 arms no
-        // verifier at all (M0 D9: fraudProofVerifier == 0); the 5.5.x historical-state verifier is
-        // a new contract. EXPECTED_AGGREGATOR_VERSION cannot lift this gate.
+        // GATE A' — ANCHORED RELEASES ONLY (#441), no override. BLSAggregator-4.13.0 (SP rc.8 r3b)
+        // changed the signer commitment: it is keyed per path and ends with blockhash(block.number - 1)
+        // (4.14.0, SP #630: BLSAggregator.sol:1376-1388). This verifier (VERIFIER_VERSION
+        // "OverIssueFraudProofVerifier-2.0.0") recomputes exactly that layout, with the parent block
+        // hash supplied in the fraudProof, so it can never verify against a pre-4.13 aggregator. The
+        // pre-#441 verifier was the reverse; this gate used to refuse >= 4.13.0. An unparseable
+        // version string is refused too (fail closed). EXPECTED_AGGREGATOR_VERSION cannot lift this.
+        uint8 releaseClass = _releaseClass(reportedVersion);
         require(
-            !_isAnchoredCommitmentRelease(reportedVersion),
-            "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
+            releaseClass != RELEASE_UNPARSEABLE,
+            "AGGREGATOR.version() is not a well-formed BLSAggregator-<major>.<minor>.<patch>[-suffix]: refusing"
+        );
+        require(
+            releaseClass == RELEASE_ANCHORED,
+            "AGGREGATOR is BLSAggregator < 4.13.0 (no parent-block-hash commitment): this verifier can never verify there"
         );
 
         // GATE B — ARMING DELAY. Independent of Gate A, and deliberately not implied by it: the

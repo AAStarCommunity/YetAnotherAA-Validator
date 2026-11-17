@@ -7,6 +7,8 @@ import {
 } from "./guardian-fraud-proof.js";
 import type { BlsConsensusDomain } from "./bls-consensus-domain.js";
 
+// blockhash(executionBlock - 1) in the fixtures (#441).
+const PARENT = "0x" + "5a".repeat(32);
 const coder = ethers.AbiCoder.defaultAbiCoder();
 
 const S1 = ethers.getAddress("0x0000000000000000000000000000000000001111");
@@ -69,8 +71,8 @@ class MockProvider {
     return { data: this.txData };
   }
 
-  async getBlock(_n: number): Promise<{ timestamp: number }> {
-    return { timestamp: 1_700_000_000 };
+  async getBlock(_n: number): Promise<{ timestamp: number; hash: string }> {
+    return { timestamp: 1_700_000_000, hash: PARENT };
   }
 }
 
@@ -92,7 +94,7 @@ function verifyAndExecuteCalldata(evidenceHash = EVIDENCE): string {
 /** The commitment SP would store for this slash (what the watcher must reproduce). */
 function correctCommitment(): string {
   const mh = rawSlashMessageHash(DOMAIN, PID, OPERATOR, LEVEL, EPOCH, EVIDENCE);
-  return computeSignersCommitment(DOMAIN, PID, mh, MASK, [S1, S2, S3]);
+  return computeSignersCommitment(DOMAIN, PID, mh, MASK, [S1, S2, S3], PARENT);
 }
 
 describe("buildGuardianSignerRecord (CC-89 stage-2 watcher core)", () => {

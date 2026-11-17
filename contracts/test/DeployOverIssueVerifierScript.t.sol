@@ -12,7 +12,7 @@ import {MockAggregator} from "./OverIssueFraudProofVerifier.t.sol";
 ///      re-implementation of SP's published layout rather than being copied a second time here.
 contract ScriptMockAggregator is MockAggregator {
     uint256 internal rotationDelay;
-    string internal reportedVersion = "BLSAggregator-4.11.0";
+    string internal reportedVersion = "BLSAggregator-4.14.0";
     address public fraudProofVerifier;
     address public pendingFraudProofVerifier;
     uint64 public pendingFraudProofVerifierReadyAt;
@@ -60,7 +60,7 @@ contract DivergentDomainMockAggregator {
     }
 
     function version() external pure returns (string memory) {
-        return "BLSAggregator-4.11.0";
+        return "BLSAggregator-4.14.0";
     }
 
     function VERIFIER_ROTATION_DELAY() external pure returns (uint256) {
@@ -288,9 +288,9 @@ contract DeployOverIssueVerifierScriptTest is Test {
         deployScript.deploy(_config(address(agg)));
     }
 
-    /// @notice 4.13.0+ changed the signer commitment (key + anchor); this verifier can never verify
-    ///         there, so not even an explicit EXPECTED_AGGREGATOR_VERSION may deploy against it.
-    function test_Deploy_RefusesAnchoredReleaseEvenWhenExpected() public {
+    /// @notice #441: the parent-block-hash verifier deploys against the anchored releases (>= 4.13.0)
+    ///         when they are named explicitly.
+    function test_Deploy_AcceptsAnchoredReleaseWhenExpected() public {
         string[4] memory vs =
             ["BLSAggregator-4.13.0", "BLSAggregator-4.13.1-rc", "BLSAggregator-4.20.0", "BLSAggregator-5.0.0"];
         for (uint256 i = 0; i < vs.length; i++) {
@@ -298,11 +298,6 @@ contract DeployOverIssueVerifierScriptTest is Test {
             agg.setVersion(vs[i]);
             DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
             cfg.expectedAggregatorVersion = vs[i];
-            vm.expectRevert(
-                bytes(
-                    "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
-                )
-            );
             deployScript.deploy(cfg);
         }
     }
@@ -336,16 +331,16 @@ contract DeployOverIssueVerifierScriptTest is Test {
             cfg.expectedAggregatorVersion = vs[i];
             vm.expectRevert(
                 bytes(
-                    "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
+                    "AGGREGATOR.version() is not a well-formed BLSAggregator-<major>.<minor>.<patch>[-suffix]: refusing"
                 )
             );
             deployScript.deploy(cfg);
         }
     }
 
-    /// @notice Well-formed pre-4.13 releases still deploy when named explicitly (the gate is not a
-    ///         blanket refusal).
-    function test_Deploy_AcceptsWellFormedOldReleaseWhenExpected() public {
+    /// @notice #441: well-formed pre-4.13 releases are refused even when named explicitly: their
+    ///         commitment has no parent block hash, so this verifier can never verify there.
+    function test_Deploy_RefusesPreAnchorReleaseEvenWhenExpected() public {
         string[6] memory vs = [
             "BLSAggregator-4.12.0",
             "BLSAggregator-4.12.3-rc1",
@@ -359,16 +354,28 @@ contract DeployOverIssueVerifierScriptTest is Test {
             agg.setVersion(vs[i]);
             DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
             cfg.expectedAggregatorVersion = vs[i];
+            vm.expectRevert(
+                bytes(
+                    "AGGREGATOR is BLSAggregator < 4.13.0 (no parent-block-hash commitment): this verifier can never verify there"
+                )
+            );
             deployScript.deploy(cfg);
         }
+        // The release the pre-#441 verifier was built for is refused too.
+        ScriptMockAggregator old = new ScriptMockAggregator(REGISTRY, 4 days);
+        old.setVersion("BLSAggregator-4.11.0");
+        DeployOverIssueVerifier.DeployConfig memory oc = _config(address(old));
+        oc.expectedAggregatorVersion = "BLSAggregator-4.11.0";
+        vm.expectRevert(bytes("AGGREGATOR is BLSAggregator < 4.13.0 (no parent-block-hash commitment): this verifier can never verify there"));
+        deployScript.deploy(oc);
     }
 
     /// @notice ...and the operator can accept that newer release only by naming it explicitly.
     function test_Deploy_AcceptsNewerVersionWhenExplicitlyExpected() public {
         ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
-        agg.setVersion("BLSAggregator-4.12.0");
+        agg.setVersion("BLSAggregator-4.14.1");
         DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
-        cfg.expectedAggregatorVersion = "BLSAggregator-4.12.0";
+        cfg.expectedAggregatorVersion = "BLSAggregator-4.14.1";
         deployScript.deploy(cfg);
     }
 

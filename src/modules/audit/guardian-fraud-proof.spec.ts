@@ -22,6 +22,8 @@ const S2 = ethers.getAddress("0x0000000000000000000000000000000000002222");
 const S3 = ethers.getAddress("0x0000000000000000000000000000000000003333");
 const OPERATOR = ethers.getAddress("0x000000000000000000000000000000000000abcd");
 const TOKEN = ethers.getAddress("0x000000000000000000000000000000000000beef");
+// blockhash(executionBlock - 1) in the fixtures (#441, SP BLSAggregator-4.14.0 commitment layout).
+const PARENT = "0x" + "5a".repeat(32);
 
 // Fixed BLS-consensus domain for the golden vector (mirrored in the Foundry test).
 const DOMAIN = {
@@ -69,13 +71,23 @@ describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
       disputedToken: TOKEN,
       signerMask: 0x7n,
       claimedSigners: [S1, S2, S3],
+      parentBlockHash: PARENT,
     };
     const bytes = encodeOverIssueFraudProof(inputs);
-    const [proposalId, operator, slashLevel, epoch, disputedToken, signerMask, claimedSigners] =
-      coder.decode(
-        ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]"],
-        bytes
-      );
+    const [
+      proposalId,
+      operator,
+      slashLevel,
+      epoch,
+      disputedToken,
+      signerMask,
+      claimedSigners,
+      parentBlockHash,
+    ] = coder.decode(
+      ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]", "bytes32"],
+      bytes
+    );
+    expect(parentBlockHash).toBe(PARENT);
     expect(BigInt(proposalId)).toBe(42n);
     expect(operator).toBe(OPERATOR);
     expect(Number(slashLevel)).toBe(2);
@@ -164,8 +176,11 @@ describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
     // and Solidity abi.encode ever diverge for the SP 4.11 domain layout, this hex changes and BOTH
     // suites break — the contract↔TS drift guard the obsolete-format cutover had removed.
     const mh = overIssueSlashMessageHash(DOMAIN, 42n, OPERATOR, 2, 1000n, TOKEN);
-    const commitment = computeSignersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3]);
+    // #441: the 4.14.0 layout appends blockhash(executionBlock - 1). Golden recomputed independently
+    // with `cast abi-encode` + `cast keccak` (the same method reproduces the old 4.11 golden
+    // 0xb35d1e5b…, which is how the method was checked).
+    const commitment = computeSignersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3], PARENT);
     expect(mh).toBe("0x7e794aa98ce38cd7e22a456963f67a1a7de057e15ee261a62373af7516cb820d");
-    expect(commitment).toBe("0xb35d1e5b965d5a628e796f584596cf57080b6b00f9c566226adf70990db15ad4");
+    expect(commitment).toBe("0xc625f31395b05a23504334285c8ed4ce6ea71a7c8305295b249e16fb67e79fcd");
   });
 });

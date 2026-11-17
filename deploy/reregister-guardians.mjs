@@ -55,12 +55,13 @@
 // each registration from the on-chain owner(), and writes the public PoP data for that owner to send.
 // It never creates a wallet, ignores any signing key in the env file, and refuses --broadcast.
 //
-// --export-fraud-drill <file> IS FOR A FORK REHEARSAL ONLY. It writes one valid over-issue fraud proof,
-// the state a fork must be given for it to pass, and four cases that must be rejected. It reads no node
-// file and produces NO BLS SIGNATURE: a guardian signature over a slash message has the same domain on
-// the fork and on the real chain, so the aggregator owner could use it for a real slash. The fork writes
-// proposalSignersCommitment directly instead. On the real chain that commitment is zero and the token
-// has no code, so the proof is rejected. This covers the verifier path, not verifyAndExecute's write.
+// --export-fraud-drill <file> IS FOR A FORK REHEARSAL ONLY. It writes one over-issue fraud proof
+// TEMPLATE plus four cases that must be rejected, and NO BLS SIGNATURE (a guardian signature over a
+// slash message has the same domain on the fork and on the real chain). Since #441 it no longer
+// writes proposalSignersCommitment into fork storage: a poked value made the drill pass by
+// construction. The fork must execute the slash through the aggregator, then put
+// blockhash(executionBlock - 1) into the template's last word. It requires the #441 verifier
+// (COMMITMENT_BINDS_PARENT_BLOCKHASH() == true).
 //
 // PARTIAL FAILURE IS SAFE TO RETRY. All gates run before the first transaction, so a pre-flight
 // failure sends nothing. If a LATER broadcast reverts, earlier registrations stay — just re-run.
@@ -137,10 +138,13 @@ if (EXPORT_FILE && BROADCAST) die("--export-pop never sends transactions; remove
 if (argv.includes("--export-fraud-drill") && (!DRILL_FILE || DRILL_FILE.startsWith("--"))) {
   die("--export-fraud-drill needs an output file path");
 }
-if (DRILL_FILE && BROADCAST) die("--export-fraud-drill never sends transactions; remove --broadcast");
+if (DRILL_FILE && BROADCAST)
+  die("--export-fraud-drill never sends transactions; remove --broadcast");
 if (DRILL_FILE && EXPORT_FILE) die("use --export-pop or --export-fraud-drill, not both");
-if (DRILL_FILE && !ethers.isAddress(VERIFIER ?? "")) die("--export-fraud-drill needs --verifier <address>");
-if (!AGGREGATOR) die("missing --aggregator <address> (the NEW BLSAggregator, from SP's B3 handoff)");
+if (DRILL_FILE && !ethers.isAddress(VERIFIER ?? ""))
+  die("--export-fraud-drill needs --verifier <address>");
+if (!AGGREGATOR)
+  die("missing --aggregator <address> (the NEW BLSAggregator, from SP's B3 handoff)");
 if (!ethers.isAddress(AGGREGATOR)) die(`--aggregator is not an address: ${AGGREGATOR}`);
 
 const strip = s => s.replace(/^["']|["']$/g, "");
@@ -171,11 +175,17 @@ try {
 const RPC = env.SEPOLIA_RPC_URL || env.ETH_RPC_URL || env.RPC_URL || process.env.SEPOLIA_RPC_URL;
 const KEY = READ_ONLY
   ? undefined
-  : env.OWNER_PRIVATE_KEY || env.DEPLOYER_PRIVATE_KEY || env.PRIVATE_KEY || process.env.OWNER_PRIVATE_KEY;
+  : env.OWNER_PRIVATE_KEY ||
+    env.DEPLOYER_PRIVATE_KEY ||
+    env.PRIVATE_KEY ||
+    process.env.OWNER_PRIVATE_KEY;
 if (!RPC) die(`no RPC url in ${ENV_FILE} (SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL)`);
-if (!READ_ONLY && !KEY) die(`no signing key in ${ENV_FILE} (OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY)`);
+if (!READ_ONLY && !KEY)
+  die(`no signing key in ${ENV_FILE} (OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY)`);
 if (process.env.SEPOLIA_RPC_URL && process.env.SEPOLIA_RPC_URL !== RPC) {
-  console.warn(`! ignoring ambient SEPOLIA_RPC_URL; ${ENV_FILE} wins (see the note above this check)`);
+  console.warn(
+    `! ignoring ambient SEPOLIA_RPC_URL; ${ENV_FILE} wins (see the note above this check)`
+  );
 }
 
 const ABI = [
@@ -199,7 +209,8 @@ const ABI = [
 /// 256 bytes (8 words); those map 1:1 onto SP's BLS.G1Point / BLS.G2Point structs.
 function toWords(hex, expectedBytes) {
   const b = ethers.getBytes(hex);
-  if (b.length !== expectedBytes) throw new Error(`expected ${expectedBytes} bytes, got ${b.length}`);
+  if (b.length !== expectedBytes)
+    throw new Error(`expected ${expectedBytes} bytes, got ${b.length}`);
   const words = [];
   for (let i = 0; i < b.length; i += 32) words.push(ethers.hexlify(b.slice(i, i + 32)));
   return words;
@@ -234,6 +245,8 @@ const DRILL_ABI = [
   "function domainSeparator() view returns (bytes32)",
   "function deriveFraudProofId(uint256) pure returns (uint256)",
   "function slashMessageHash(uint256,address,uint8,uint256,address) view returns (bytes32)",
+  "function VERIFIER_VERSION() view returns (string)",
+  "function COMMITMENT_BINDS_PARENT_BLOCKHASH() view returns (bool)",
 ];
 // Ascending by uint160, as the verifier requires. Slots 2, 1 and 3 in that order.
 const DRILL_GUARDIANS = [
@@ -248,7 +261,8 @@ const DRILL_MASK = 0x7n;
 /// Everything is derived from the aggregator address, so a re-run gives the same file and the ID
 /// cannot coincide with a real proposal by accident.
 async function exportFraudDrill({ provider, agg, owner, version, chainId, domainSep, coder }) {
-  const label = s => ethers.keccak256(ethers.toUtf8Bytes(`DVT_FRAUD_DRILL_V1:${s}:${AGGREGATOR.toLowerCase()}`));
+  const label = s =>
+    ethers.keccak256(ethers.toUtf8Bytes(`DVT_FRAUD_DRILL_V1:${s}:${AGGREGATOR.toLowerCase()}`));
   const proposalId = BigInt(label("proposal"));
   const operator = ethers.getAddress(ethers.dataSlice(label("operator"), 12));
   const token = ethers.getAddress(ethers.dataSlice(label("token"), 12));
@@ -265,7 +279,9 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
       agg.fraudProofVerifier(),
     ]);
   } catch (e) {
-    die(`${VERIFIER} does not answer as an OverIssueFraudProofVerifier: ${e.shortMessage ?? e.message}`);
+    die(
+      `${VERIFIER} does not answer as an OverIssueFraudProofVerifier: ${e.shortMessage ?? e.message}`
+    );
   }
   // queueGuardianSlash calls the aggregator's active verifier, so a drill built for any other one
   // would fail on the fork for a reason that says nothing about the proof.
@@ -278,8 +294,23 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
   if (boundRegistry.toLowerCase() !== registry.toLowerCase()) {
     die(`verifier.REGISTRY() is ${boundRegistry}, aggregator.REGISTRY() is ${registry}`);
   }
-  if (verifierDomain.toLowerCase() !== domainSep.toLowerCase()) die("verifier and aggregator domain separators differ");
-  if ((await provider.getCode(token)) !== "0x") die(`drill token address ${token} already has code on this chain`);
+  if (verifierDomain.toLowerCase() !== domainSep.toLowerCase())
+    die("verifier and aggregator domain separators differ");
+  if ((await provider.getCode(token)) !== "0x")
+    die(`drill token address ${token} already has code on this chain`);
+  // #441: only the parent-block-hash verifier can verify against BLSAggregator >= 4.13.0.
+  let binds = false;
+  try {
+    binds = await verifier.COMMITMENT_BINDS_PARENT_BLOCKHASH();
+  } catch {
+    /* pre-#441 verifier: no marker */
+  }
+  if (!binds) {
+    die(
+      `${VERIFIER} has no COMMITMENT_BINDS_PARENT_BLOCKHASH() == true: it predates #441 and cannot verify a\n` +
+        `  4.13.0+ commitment. Deploy the #441 verifier (VERIFIER_VERSION "OverIssueFraudProofVerifier-2.0.0").`
+    );
+  }
 
   const artifactPath = resolve(
     dirname(fileURLToPath(import.meta.url)),
@@ -293,17 +324,22 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
   }
 
   const fraudProofId = await verifier.deriveFraudProofId(proposalId);
-  const messageHash = await verifier.slashMessageHash(proposalId, operator, DRILL_SLASH_LEVEL, DRILL_EPOCH, token);
-  const commitment = ethers.keccak256(
-    coder.encode(
-      ["bytes32", "bytes32", "uint256", "bytes32", "uint256", "address[]"],
-      [domainSep, ethers.id("SuperPaymaster.BLS.SignersCommitment.v1"), proposalId, messageHash, DRILL_MASK, DRILL_GUARDIANS]
-    )
+  const messageHash = await verifier.slashMessageHash(
+    proposalId,
+    operator,
+    DRILL_SLASH_LEVEL,
+    DRILL_EPOCH,
+    token
   );
-  const encodeProof = mask =>
+  // #441: the drill no longer writes a commitment into fork storage. A value poked into storage
+  // makes the drill pass by construction and proves nothing; on 4.14.0 the commitment also binds
+  // blockhash(executionBlock - 1), which only a real execution produces. The fork must execute the
+  // slash through the aggregator, then fill parentBlockHash from that execution's parent block.
+  const PARENT_PLACEHOLDER = "0x" + "00".repeat(32);
+  const encodeProof = (mask, parent = PARENT_PLACEHOLDER) =>
     coder.encode(
-      ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]"],
-      [proposalId, operator, DRILL_SLASH_LEVEL, DRILL_EPOCH, token, mask, DRILL_GUARDIANS]
+      ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]", "bytes32"],
+      [proposalId, operator, DRILL_SLASH_LEVEL, DRILL_EPOCH, token, mask, DRILL_GUARDIANS, parent]
     );
   const proof = encodeProof(DRILL_MASK);
   const digest = await agg.fraudProofDigest(fraudProofId, DRILL_GUARDIANS);
@@ -311,7 +347,8 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
   flipped[31] ^= 1;
 
   const drill = {
-    purpose: "fork rehearsal only; contains no signature",
+    purpose:
+      "fork rehearsal only; contains no signature; fraudProof fields are templates until the fork executes the slash (#441)",
     chainId,
     aggregator: AGGREGATOR,
     version,
@@ -325,8 +362,10 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
       commitment: {
         mapping: "proposalSignersCommitment",
         key: proposalId.toString(),
-        value: commitment,
-        check: "proposalSignersCommitment(key) must read back as value, otherwise stop",
+        produce:
+          "execute the slash for (proposalId, operator, slashLevel, epoch, evidence of token) through the aggregator's real execute path; never write this slot directly",
+        check: "proposalSignersCommitment(key) is non-zero after that execution, otherwise stop",
+        messageHash,
       },
     },
     valid: {
@@ -336,6 +375,8 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
       fraudProofId: fraudProofId.toString(),
       guiltyGuardians: DRILL_GUARDIANS,
       fraudProof: proof,
+      fraudProofNote:
+        "TEMPLATE: the last 32 bytes are zero. Replace them with blockhash(executionBlock - 1) of the fork execution above; the verifier refuses a zero parent hash",
       domainDigest: digest,
       signerMask: ethers.toBeHex(DRILL_MASK),
       operator,
@@ -366,7 +407,8 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
       },
       {
         id: "N4",
-        change: "digest differs by one bit; call the verifier directly because the aggregator computes its own digest",
+        change:
+          "digest differs by one bit; call the verifier directly because the aggregator computes its own digest",
         call: "verifier.verify(domainDigest, fraudProofId, guiltyGuardians, fraudProof)",
         domainDigest: ethers.hexlify(flipped),
         guiltyGuardians: DRILL_GUARDIANS,
@@ -490,7 +532,8 @@ async function main() {
     const label = `${file} (${node.nodeName ?? "?"})`;
     const validator = node.operator;
     const slot = Number(node.slot);
-    if (!validator || !ethers.isAddress(validator)) die(`${label}: missing/invalid "operator" address`);
+    if (!validator || !ethers.isAddress(validator))
+      die(`${label}: missing/invalid "operator" address`);
     if (!Number.isInteger(slot) || slot < 1 || slot > Number(maxValidators)) {
       die(`${label}: slot ${node.slot} out of range 1..${maxValidators}`);
     }
@@ -505,7 +548,9 @@ async function main() {
     try {
       sk = ethers.getBytes(node.privateKey);
     } catch {
-      die(`${label}: "privateKey" is not a valid hex byte string (value withheld) — fix the node file`);
+      die(
+        `${label}: "privateKey" is not a valid hex byte string (value withheld) — fix the node file`
+      );
     }
     const pkPoint = bls.longSignatures.getPublicKey(sk);
     const derived = encodeG1(pkPoint);
@@ -520,7 +565,9 @@ async function main() {
     const pkWords = toWords(node.publicKeyEip2537, 128);
 
     // ---- gate 5a: our understanding of popDigest must match the contract's ---------------------
-    const onchainDigest = await read(`popDigest() for ${label}`, () => agg.popDigest(validator, pkWords));
+    const onchainDigest = await read(`popDigest() for ${label}`, () =>
+      agg.popDigest(validator, pkWords)
+    );
     const localDigest = ethers.keccak256(
       coder.encode(
         ["bytes32", "bytes32", "address", "bytes32", "bytes32", "bytes32", "bytes32"],
@@ -548,8 +595,13 @@ async function main() {
     const popWords = toWords(encodeG2(sigPoint), 256);
 
     // ---- gate 6: slot and key-ownership collisions ---------------------------------------------
-    const keyHash = ethers.keccak256(coder.encode(["bytes32", "bytes32", "bytes32", "bytes32"], pkWords));
-    const [slotHolder, keyOwner] = await Promise.all([agg.validatorAtSlot(slot), agg.blsKeyOwner(keyHash)]);
+    const keyHash = ethers.keccak256(
+      coder.encode(["bytes32", "bytes32", "bytes32", "bytes32"], pkWords)
+    );
+    const [slotHolder, keyOwner] = await Promise.all([
+      agg.validatorAtSlot(slot),
+      agg.blsKeyOwner(keyHash),
+    ]);
     if (slotHolder !== ethers.ZeroAddress && slotHolder.toLowerCase() !== validator.toLowerCase()) {
       die(`${label}: slot ${slot} is already held by ${slotHolder} — SP reverts SlotAlreadyTaken`);
     }
@@ -563,7 +615,9 @@ async function main() {
         from: owner,
       });
     } catch (e) {
-      die(`${label}: eth_call dry-run of registerBLSPublicKey reverted: ${e.shortMessage ?? e.message}`);
+      die(
+        `${label}: eth_call dry-run of registerBLSPublicKey reverted: ${e.shortMessage ?? e.message}`
+      );
     }
 
     console.log(`✓ ${label}`);
@@ -582,7 +636,9 @@ async function main() {
     seenValidator = new Map(),
     seenKey = new Map();
   for (const p of plans) {
-    const kh = ethers.keccak256(coder.encode(["bytes32", "bytes32", "bytes32", "bytes32"], p.pkWords));
+    const kh = ethers.keccak256(
+      coder.encode(["bytes32", "bytes32", "bytes32", "bytes32"], p.pkWords)
+    );
     for (const [m, k, what] of [
       [seenSlot, p.slot, `slot ${p.slot}`],
       [seenValidator, p.validator.toLowerCase(), `validator ${p.validator}`],
@@ -615,16 +671,25 @@ async function main() {
         popDigest: p.popDigest,
         popSignature: p.popWords,
         // The exact bytes gate 7 dry-ran, so a consumer does not have to re-encode the call.
-        calldata: agg.interface.encodeFunctionData("registerBLSPublicKey", [p.validator, p.pkWords, p.slot, p.popWords]),
+        calldata: agg.interface.encodeFunctionData("registerBLSPublicKey", [
+          p.validator,
+          p.pkWords,
+          p.slot,
+          p.popWords,
+        ]),
       })),
     };
     writeFileSync(EXPORT_FILE, JSON.stringify(exported, null, 2) + "\n");
-    console.log(`\nAll ${plans.length} registrations passed. Wrote ${EXPORT_FILE}. Nothing was sent.`);
+    console.log(
+      `\nAll ${plans.length} registrations passed. Wrote ${EXPORT_FILE}. Nothing was sent.`
+    );
     return;
   }
 
   if (!BROADCAST) {
-    console.log(`\nAll ${plans.length} registrations passed every pre-flight gate. Nothing was sent.`);
+    console.log(
+      `\nAll ${plans.length} registrations passed every pre-flight gate. Nothing was sent.`
+    );
     console.log("Re-run with --broadcast to submit.");
     return;
   }
@@ -669,7 +734,9 @@ async function main() {
     }
     if (!slotOk || !keyOk) bad++;
     console.log(`  slot ${p.slot} -> ${holder} ${slotOk ? "✓" : `✗ expected ${p.validator}`}`);
-    console.log(`    key      ${keyOk ? "✓ matches the key this run registered" : `✗ on-chain ${onchainKey}`}`);
+    console.log(
+      `    key      ${keyOk ? "✓ matches the key this run registered" : `✗ on-chain ${onchainKey}`}`
+    );
   }
   if (bad) die(`${bad} registration(s) did not read back as expected`);
   console.log("\nAll slots verified. Hand these tx hashes back to the B3 manifest:");

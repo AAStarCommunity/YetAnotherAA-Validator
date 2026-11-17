@@ -50,6 +50,8 @@ export interface GuardianSignerRecord {
   commitmentVerified: boolean;
   /** The executionBlock's timestamp (chain time, not wall-clock). */
   executionBlockTimestamp: number;
+  /** blockhash(executionBlock - 1), bound into SP 4.14.0's commitment and the #441 fraudProof. */
+  parentBlockHash: string;
 }
 
 /** A log the watcher could not turn into a record — durable retry queue entry. */
