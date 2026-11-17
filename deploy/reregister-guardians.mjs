@@ -80,8 +80,11 @@
 // is accepted (BLSAggregator.sol, `blsKeyOwner[keyHash] == validator` and the same-slot rule).
 //
 // env file (default .env.sepolia; Sepolia creds actually live in SuperPaymaster/.env.sepolia):
-//   SEPOLIA_RPC_URL (or ETH_RPC_URL/RPC_URL), and one of
-//   OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY
+//   SEPOLIA_RPC_URL (or ETH_RPC_URL/RPC_URL), and, only for a dry run or --broadcast against
+//   deployed contracts, REREGISTER_OWNER_PRIVATE_KEY. No other key name is read (DSR 2026-11-17):
+//   a fallback to PRIVATE_KEY is a silent fallback to the deployer EOA. On rc.8 this script only
+//   exports (--plan / --export-pop); after the hand-off the owner is the SAFE, which no EOA key
+//   can be, so --broadcast is for anvil rehearsals and the pre-hand-off window only.
 //
 // Usage:
 //   node deploy/reregister-guardians.mjs --deployment <sp-deploy.json> --env ../SuperPaymaster/.env.sepolia
@@ -338,15 +341,25 @@ try {
 const RPC = env.SEPOLIA_RPC_URL || env.ETH_RPC_URL || env.RPC_URL || process.env.SEPOLIA_RPC_URL;
 const KEY = READ_ONLY
   ? undefined
-  : env.OWNER_PRIVATE_KEY ||
-    env.DEPLOYER_PRIVATE_KEY ||
-    env.PRIVATE_KEY ||
-    process.env.OWNER_PRIVATE_KEY;
+  : env.REREGISTER_OWNER_PRIVATE_KEY || process.env.REREGISTER_OWNER_PRIVATE_KEY;
 if (!RPC) die(`no RPC url in ${ENV_FILE} (SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL)`);
 RPC_FOR_SCRUB = RPC;
 if (KEY) KEY_FOR_SCRUB = KEY;
-if (!READ_ONLY && !KEY)
-  die(`no signing key in ${ENV_FILE} (OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY / PRIVATE_KEY)`);
+if (!READ_ONLY && !KEY) {
+  die(
+    `no REREGISTER_OWNER_PRIVATE_KEY in ${ENV_FILE} or the environment. No other key name is read:\n` +
+      `  PRIVATE_KEY / OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY are the deployer EOA in the Sepolia env files.\n` +
+      `  On rc.8 use --plan or --export-pop, which need no key.`
+  );
+}
+if (KEY) {
+  // Validate at startup, never echo: ethers can quote a malformed key in its exception.
+  try {
+    new ethers.Wallet(KEY);
+  } catch {
+    die(`REREGISTER_OWNER_PRIVATE_KEY is not a valid private key (value withheld)`);
+  }
+}
 if (process.env.SEPOLIA_RPC_URL && process.env.SEPOLIA_RPC_URL !== RPC) {
   console.warn(
     `! ignoring ambient SEPOLIA_RPC_URL; ${ENV_FILE} wins (see the note above this check)`

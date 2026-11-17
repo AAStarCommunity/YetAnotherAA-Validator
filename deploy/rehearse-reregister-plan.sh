@@ -34,7 +34,7 @@ D=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 SRC=$SP_DIR/contracts/src/modules/monitoring/BLSAggregator.sol
 NODES_DIR=$B/nodes
 NODES="$NODES_DIR/node_test_1.json,$NODES_DIR/node_test_2.json,$NODES_DIR/node_test_3.json"
-( umask 077; printf 'RPC_URL=%s\nPRIVATE_KEY=%s\n' "$R" "$K0" > "$B/anvil.env" )
+( umask 077; printf 'RPC_URL=%s\nREREGISTER_OWNER_PRIVATE_KEY=%s\n' "$R" "$K0" > "$B/anvil.env" )
 # Fresh throwaway guardians: random BLS keys and random, never-funded validator addresses.
 ( umask 077; mkdir -p "$NODES_DIR" && cd "$WT" && node --input-type=module - "$NODES_DIR" <<'JS'
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";

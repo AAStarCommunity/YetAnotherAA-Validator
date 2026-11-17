@@ -159,6 +159,15 @@ the nonce still equals the pin nonce, so it must run before the manifest starts
 sending. If the contracts land elsewhere, A10's address assertion stops the
 send.
 
+### Signing key
+
+The script reads only `REREGISTER_OWNER_PRIVATE_KEY`, and only for a dry run or
+`--broadcast` against deployed contracts. It never falls back to `PRIVATE_KEY`,
+`OWNER_PRIVATE_KEY` or `DEPLOYER_PRIVATE_KEY`, which are the deployer EOA in the
+Sepolia env files (DSR 2026-11-17). On rc.8 nothing needs it: `--plan` and
+`--export-pop` read no key. After the hand-off the owner is the SAFE, so
+`--broadcast` cannot pass the owner check with any EOA key.
+
 ### After the hand-off
 
 Adding or removing a guardian goes through the SAFE. Run the script against the
