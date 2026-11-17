@@ -1,0 +1,9 @@
+[
+  {
+    "id": "GHSA-fc5q-39xc-vjpf",
+    "package": "picomatch",
+    "expires": "2026-12-17",
+    "reason": "picomatch ReDoS (<=4.0.7) with no fixed release (latest is 4.0.7); reached only through dev tooling (jest, ts-jest, @nestjs/cli, @typescript-eslint/parser); the production audit (--omit=dev) runs without this exception and must pass",
+    "approvedBy": "DSR 2026-11-18"
+  }
+]
