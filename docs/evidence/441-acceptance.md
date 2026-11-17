@@ -10,6 +10,54 @@ wrote itself, through its real execute path, verify under
 `OverIssueFraudProofVerifier-2.0.0`? And does the whole
 `queueGuardianSlash → executeGuardianSlash` chain then complete?
 
+## Rerun on SP #635's head d55f76f8 (BLSAggregator-4.14.1, DVTValidator-0.9.0), 2026-11-17
+
+SP step 4 (#635, unmerged head `d55f76f8ac379718e47e7f5c1d8fa46467914d69`) adds
+`bytes evidence` to `queueSlashWithProof` / `executeWithProof`, and DVTValidator
+recomputes the proposal's evidenceHash from it with the M0 §3.1 category rule.
+This branch therefore moves to **`OverIssueFraudProofVerifier-3.0.0`**:
+
+- `OVERISSUE_CATEGORY = keccak256("DVT.Evidence.OverIssue.v1")`;
+- body `abi.encode(address disputedToken, address operator, uint256 epoch)`;
+- `evidenceHash = keccak256(abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(body)))`.
+
+**This category string and body layout are a proposal, not finalized** (DSR
+2026-11-17). They are settled with SP, together with SP's checker contract,
+before the category is deployed. 2.0.0 (the old `DVT_OVERISSUE_EVIDENCE_V1`
+pre-image) was never deployed. The goldens were recomputed with `cast`, whose
+method reproduces all three 2.0.0 goldens.
+
+The rehearsal now includes enablement step **E3**. DVTValidator-0.9.0 fixes its
+categories at construction, so enabling one means deploying a new DVTValidator
+with it and rotating:
+
+1. deploy SP's `DVTValidator(registry, 1, [OverIssue.v1], [checker])`;
+2. `newDVT.setBLSAggregator(aggregator)` (owner);
+3. `aggregator.setDVTValidator(newDVT)` (owner);
+4. `newDVT.addValidator(guardian)` for each guardian.
+
+**28/28 checks passed**,
+`EXPECT_VERSIONS=BLSAggregator-4.14.1,DVTValidator-0.9.0`. Raw report:
+`docs/evidence/441-acceptance-report-d55f76f8.json`. Beyond the 18 checks below,
+it shows:
+
+- rc.8's state: DeployAnvil's DVTValidator has no category, and a slash-shaped
+  `createProposal` reverts `UnknownEvidenceCategory`;
+- after E3: the aggregator points at the new DVTValidator, the old one reverts
+  `NotCurrentDVT`, `ValidatorAdded` is emitted once per guardian, and the BLS
+  keys stay active in the same slots;
+- the verifier and the E3 DVTValidator use the same category;
+- **N0:** execute with evidence naming another token reverts
+  `EvidenceHashMismatch`.
+
+**The checker is SP's test-only `MockEvidenceCategory`, which accepts every
+body.** An honest OverIssue checker would refuse this slash, because the token
+is not over-issued, and the rehearsal needs a fraudulent slash. So this run
+proves that the pipeline is connected (category → checker → evidenceHash →
+aggregator commitment → fraud proof → guardian slash). It does **not** prove
+that an over-issue verdict is right. With an on-chain checker, the
+historical-state gap becomes wrongful slashing of honest guardians: see #447.
+
 ## Rerun on SP 1845b124 (BLSAggregator-4.14.1, DVTValidator-0.8.1), 2026-11-17
 
 After SP #633 merged (`1845b12482e13a9937c7ec7f7f059ed9a3d33829`), the rehearsal
@@ -117,5 +165,5 @@ written to the report.
     not at the disputed epoch. That is the historical-state gap in the
     verifier's NatSpec, which this run does not address. It remains a blocker
     for any deployment where `executeGuardianSlash` moves real stake.
-- Rerun against SP's step-4 merge commit, and against 4.14.1, before this branch
-  is used for anything.
+- Rerun against SP's step-4 merge commit before this branch is used for
+  anything.

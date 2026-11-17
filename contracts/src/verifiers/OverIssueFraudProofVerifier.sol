@@ -46,10 +46,15 @@ interface IOverIssuable {
  *      set. This is why the verifier passes SP's `FraudProofVerifierConformance.assertSetBound` (a
  *      documented release gate), which the pre-existing `⊆` implementation would have failed.
  *
- * @dev EVIDENCE STRUCTURE (cross-repo alignment). The disputed slash's `evidenceHash` (opaque to SP,
- *      supplied by the slash filer) MUST be `keccak256(abi.encode(OVERISSUE_EVIDENCE_TAG, token,
- *      operator, epoch))`. The E2E slash filer must file with exactly this — else the message
- *      reconstruction won't match and every proof is rejected.
+ * @dev EVIDENCE STRUCTURE (M0 §3.1; DVTValidator-0.9.0, SP #635). The disputed slash's
+ *      `evidenceHash` MUST be the category-rule value DVTValidator recomputes at execute:
+ *        body         = abi.encode(address disputedToken, address operator, uint256 epoch)
+ *        evidence     = abi.encode(OVERISSUE_CATEGORY, body)
+ *        evidenceHash = keccak256(abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(body)))
+ *      with OVERISSUE_CATEGORY = keccak256("DVT.Evidence.OverIssue.v1"). PROPOSAL, NOT FINALIZED
+ *      (DSR 2026-11-17): the category string and body layout are settled with SP, together with SP's
+ *      checker contract, before the category is deployed. A slash filed with any other evidenceHash
+ *      does not reconstruct here and every proof against it is rejected.
  *
  * @dev ⚠️ SECURITY — NOT PRODUCTION-SAFE / DO NOT WIRE TO A SLASH-CAPABLE DEPLOYMENT.
  *      Step 5 reads the disputed token's CURRENT `isOverIssued()`. This is the **testnet-E2E variant**,
@@ -69,13 +74,18 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
     /// @notice Machine-readable build marker (#441, DSR 2026-11-17). SP's manifest reads these two
     ///         instead of relying only on a pinned sha256: a verifier without them predates the
     ///         BLSAggregator-4.14.0 commitment layout and can never verify a proof there.
-    string public constant VERIFIER_VERSION = "OverIssueFraudProofVerifier-2.0.0";
+    ///         3.0.0: the over-issue evidenceHash follows the M0 §3.1 category rule (OVERISSUE_CATEGORY)
+    ///         instead of 2.0.0's DVT_OVERISSUE_EVIDENCE_V1 pre-image (2.0.0 was never deployed).
+    string public constant VERIFIER_VERSION = "OverIssueFraudProofVerifier-3.0.0";
     /// @notice True: the recomputed signer commitment ends with blockhash(executionBlock - 1),
     ///         supplied in the fraudProof (SP #630, BLSAggregator.sol:1376-1388).
     bool public constant COMMITMENT_BINDS_PARENT_BLOCKHASH = true;
 
     string internal constant FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1"; // DVT-internal fraudProofId derivation
-    string internal constant OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1"; // DVT evidence convention
+    /// @notice SP DVTValidator.TAG_EVIDENCE (0.9.0): the evidenceHash domain tag.
+    bytes32 public constant TAG_EVIDENCE = keccak256("SuperPaymaster.DVT.Evidence.v2");
+    /// @notice The over-issue evidence category (proposal, not finalized; see EVIDENCE STRUCTURE).
+    bytes32 public constant OVERISSUE_CATEGORY = keccak256("DVT.Evidence.OverIssue.v1");
     uint256 internal constant MAX_SIGNERS = 13; // == BLSAggregator.MAX_VALIDATORS
 
     /// @notice SP's BLS-consensus domain-separator + path-tag constants, byte-for-byte identical to
@@ -129,9 +139,22 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         return uint256(keccak256(abi.encode(FRAUD_ID_TAG, proposalId)));
     }
 
-    /// @notice The over-issue evidenceHash the slash filer MUST use (binds token+operator+epoch).
+    /// @notice The over-issue evidence body: abi.encode(disputedToken, operator, epoch).
+    function evidenceBody(address disputedToken, address operator, uint256 epoch) public pure returns (bytes memory) {
+        return abi.encode(disputedToken, operator, epoch);
+    }
+
+    /// @notice The `evidence` bytes DVTValidator-0.9.0 takes: abi.encode(OVERISSUE_CATEGORY, body).
+    function evidence(address disputedToken, address operator, uint256 epoch) external pure returns (bytes memory) {
+        return abi.encode(OVERISSUE_CATEGORY, evidenceBody(disputedToken, operator, epoch));
+    }
+
+    /// @notice The over-issue evidenceHash the slash filer MUST use (binds token+operator+epoch):
+    ///         keccak256(abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(body))).
     function evidenceHash(address disputedToken, address operator, uint256 epoch) public pure returns (bytes32) {
-        return keccak256(abi.encode(OVERISSUE_EVIDENCE_TAG, disputedToken, operator, epoch));
+        return keccak256(
+            abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(evidenceBody(disputedToken, operator, epoch)))
+        );
     }
 
     /// @notice Reconstruct SP's slash-only `expectedMessageHash`, byte-identical to the LIVE

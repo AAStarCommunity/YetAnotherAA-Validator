@@ -19,7 +19,7 @@
 //
 // Usage (real run — fields from SP):
 //   PROPOSAL_ID=42 OPERATOR=0x.. SLASH_LEVEL=1 EPOCH=100 \
-//     TOKEN=0x..            (over-issue evidenceHash = keccak(TAG,token,operator,epoch))  \
+//     TOKEN=0x..            (over-issue evidenceHash: M0 §3.1 OverIssue.v1 rule)  \
 //     AGGREGATOR=0xf44E7E51..  SEPOLIA_RPC_URL=..  node scripts/cc89-cosign.mjs
 //   (or pass EVIDENCE_HASH=0x.. directly instead of TOKEN)
 // Self-test (no SP fields — proves the 3-key aggregate passes on-chain verify):

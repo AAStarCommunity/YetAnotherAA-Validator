@@ -47,8 +47,9 @@ const EVIDENCE = overIssueEvidenceHash(TOKEN, OPERATOR, EPOCH);
 // level=2, epoch=1000, token=…beef, mask=0x7, signers=[S1,S2,S3]. (The TS↔Solidity byte-alignment
 // itself is pinned by the golden vector shared between guardian-fraud-proof.spec.ts and
 // OverIssueFraudProofVerifier.t.sol.)
-// 4.14.0 layout with PARENT (#441); recomputed independently with cast (old 4.11 value 0x6861ffee…).
-const ON_CHAIN_COMMITMENT = "0xd8896b47380143e591bdc377d03910f6a5881f4d7e9b62a11253bba871c0bfd8";
+// 4.14.0 layout with PARENT (#441) and the verifier-3.0.0 OverIssue.v1 evidence rule; recomputed
+// independently with cast (2.0.0 value 0xd8896b47…, old 4.11 value 0x6861ffee…).
+const ON_CHAIN_COMMITMENT = "0x55761c46fb62598dd036c840835da80bc16d18ce99bd2ab7d631c01b1bd5a11c";
 
 const va = new ethers.Interface([
   "function validatorAtSlot(uint8 slot) view returns (address)",

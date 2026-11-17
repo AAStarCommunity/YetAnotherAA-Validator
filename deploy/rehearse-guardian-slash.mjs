@@ -1,24 +1,30 @@
 // #441 acceptance on a LOCAL anvil: a commitment written by BLSAggregator-4.13.0+ through its real
-// execute path, recomputed by the parent-block-hash verifier (OverIssueFraudProofVerifier-2.0.0), and
-// the full queueGuardianSlash -> executeGuardianSlash chain.
+// execute path, recomputed by the parent-block-hash verifier (OverIssueFraudProofVerifier-3.0.0), and
+// the full queueGuardianSlash -> executeGuardianSlash chain, on DVTValidator-0.9.0 (SP #635).
 //
 // Run through deploy/rehearse-guardian-slash.sh, which starts a fresh anvil, runs SP's DeployAnvil
 // and passes the paths here. Local chain 31337 only; throwaway keys only (generated per run).
 //
-// The chain needs two things rc.8 will NOT have; this script sets them explicitly and records them,
-// because they are the two 5.5.x enablement steps:
+// The chain needs three things rc.8 will NOT have; this script sets them explicitly and records them,
+// because they are the three 5.5.x enablement steps:
 //   E1  GTokenStaking.setAuthorizedSlasher(aggregator, true)
-//   E2  aggregator.proposeFraudProofVerifier(v2) -> wait VERIFIER_ROTATION_DELAY -> applyFraudProofVerifier()
+//   E2  aggregator.proposeFraudProofVerifier(v) -> wait VERIFIER_ROTATION_DELAY -> applyFraudProofVerifier()
+//   E3  DVTValidator-0.9.0 fixes its evidence categories at construction (no setter), so enabling a slash
+//       category means deploying a new DVTValidator with it and rotating: new.setBLSAggregator(agg),
+//       agg.setDVTValidator(new), then addValidator for every guardian on the new DVTValidator. The BLS
+//       keys stay in the aggregator. The category's checker here is SP's test-only MockEvidenceCategory,
+//       which accepts every body: this proves the pipeline is connected, NOT that an over-issue verdict
+//       is right (an honest checker would refuse this fraudulent slash; see #447).
 //
-// Usage: node deploy/rehearse-guardian-slash.mjs <rpc> <sp config.anvil.json> <dvt contracts/out dir> <report.json>
+// Usage: node deploy/rehearse-guardian-slash.mjs <rpc> <sp config.anvil.json> <dvt contracts/out dir> <report.json> <sp out dir>
 import { ethers } from "ethers";
 import { readFileSync, writeFileSync } from "fs";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
 
-const [RPC, SP_CONFIG, DVT_OUT, REPORT] = process.argv.slice(2);
-if (!REPORT) {
+const [RPC, SP_CONFIG, DVT_OUT, REPORT, SP_OUT] = process.argv.slice(2);
+if (!SP_OUT) {
   console.error(
-    "usage: rehearse-guardian-slash.mjs <rpc> <sp config.anvil.json> <dvt contracts/out> <report.json>"
+    "usage: rehearse-guardian-slash.mjs <rpc> <sp config.anvil.json> <dvt contracts/out> <report.json> <sp out>"
   );
   process.exit(2);
 }
@@ -51,6 +57,9 @@ if (net.chainId !== 31337n) {
 }
 const cfg = JSON.parse(readFileSync(SP_CONFIG, "utf8"));
 const artifact = name => JSON.parse(readFileSync(`${DVT_OUT}/${name}.sol/${name}.json`, "utf8"));
+const spArtifact = name => JSON.parse(readFileSync(`${SP_OUT}/${name}.sol/${name}.json`, "utf8"));
+// The OverIssue.v1 evidence category (proposal, not finalized; DSR 2026-11-17).
+const OVERISSUE_CATEGORY = ethers.id("DVT.Evidence.OverIssue.v1");
 
 const AGG_ABI = [
   "function version() view returns (string)",
@@ -69,6 +78,9 @@ const AGG_ABI = [
   "function guardianSlashCases(uint256) view returns (bytes32,bytes32,uint64,uint8,uint16,uint16,uint16,address)",
   "function guardianSlashBps() view returns (uint16)",
   "function slashThresholds(uint8) view returns (uint256)",
+  "function setDVTValidator(address)",
+  "function DVT_VALIDATOR() view returns (address)",
+  "function getBLSPublicKey(address) view returns ((bytes32,bytes32,bytes32,bytes32),uint8,bool)",
   "event GuardianSlashQueued(uint256 indexed fraudProofId, bytes32 guardiansHash, uint256 deadline, address[] guardians)",
   "event GuardianSlashed(uint256 indexed fraudProofId, address indexed guardian, uint256 penalty)",
   "event GuardianSlashFailed(uint256 indexed fraudProofId, address indexed guardian)",
@@ -80,8 +92,16 @@ const DVT_ABI = [
   "function addValidator(address)",
   "function nextProposalId() view returns (uint256)",
   "function createProposal(address,uint8,string,bytes32) returns (uint256)",
-  "function queueSlashWithProof(address,uint8,uint256,bytes)",
-  "function executeWithProof(uint256,address[],uint256[],uint256,bytes)",
+  "function queueSlashWithProof(address,uint8,uint256,bytes,bytes)",
+  "function executeWithProof(uint256,address[],uint256[],uint256,bytes,bytes)",
+  "function setBLSAggregator(address)",
+  "function categoryCount() view returns (uint256)",
+  "function checkerOf(bytes32) view returns (address)",
+  "function version() view returns (string)",
+  "event ValidatorAdded(address indexed v)",
+  "error UnknownEvidenceCategory(bytes32 category)",
+  "error NotCurrentDVT()",
+  "error EvidenceHashMismatch()",
 ];
 const REG_ABI = [
   "function registerRole(bytes32,address,bytes)",
@@ -99,7 +119,7 @@ const TOKEN_ABI = [
 ];
 
 const agg = new ethers.Contract(cfg.blsAggregator, AGG_ABI, owner);
-const dvt = new ethers.Contract(cfg.dvtValidator, DVT_ABI, owner);
+const dvt0 = new ethers.Contract(cfg.dvtValidator, DVT_ABI, owner); // DeployAnvil's: no categories
 const registry = new ethers.Contract(cfg.registry, REG_ABI, owner);
 const staking = new ethers.Contract(cfg.staking, STAKING_ABI, owner);
 const gtoken = new ethers.Contract(cfg.gToken, TOKEN_ABI, owner);
@@ -183,7 +203,7 @@ for (let i = 1; i <= 3; i++) {
   const pop = words(encG2(await signHash(digest, sk)), 256);
   await send(
     `register guardian ${i} BLS key, slot ${i} (owner path)`,
-    dvt.registerBLSPublicKey(w.address, guardians[i - 1].pkWords, i, pop)
+    dvt0.registerBLSPublicKey(w.address, guardians[i - 1].pkWords, i, pop)
   );
 }
 check(
@@ -191,9 +211,114 @@ check(
   (await Promise.all(guardians.map(g => registry.hasRole(ROLE_DVT, g.address)))).every(Boolean)
 );
 for (const g of guardians)
-  await send(`DVTValidator.addValidator(guardian ${g.slot}) (owner)`, dvt.addValidator(g.address));
+  await send(`DVTValidator.addValidator(guardian ${g.slot}) (owner)`, dvt0.addValidator(g.address));
 
-// ---- 2. the v2 verifier and an over-issue token that is NOT over-issued (the slash was fraud) ---
+/** The custom error a static call reverts with, by name (or the short message when unparsed). */
+const revertName = async (contract, fn, args) => {
+  try {
+    await contract[fn].staticCall(...args);
+    return "accepted";
+  } catch (e) {
+    return contract.interface.parseError(e.data ?? "0x")?.name ?? e.shortMessage;
+  }
+};
+const SLASH_TARGET = await owner.getAddress(); // see step 2: a registered SuperPaymaster operator
+
+// ---- 1b. rc.8 state: no category, so every slash-shaped proposal is refused ----------------------
+check(
+  "DeployAnvil's DVTValidator has no evidence category (rc.8)",
+  (await dvt0.categoryCount()) === 0n
+);
+const rc8Refusal = await revertName(dvt0.connect(guardians[0].wallet), "createProposal", [
+  SLASH_TARGET,
+  SLASH_LEVEL,
+  "rc.8 state",
+  ethers.id("any evidence hash"),
+]);
+check(
+  "rc.8: a slash-shaped createProposal reverts UnknownEvidenceCategory",
+  rc8Refusal === "UnknownEvidenceCategory",
+  { revert: rc8Refusal }
+);
+
+// ---- 1c. enablement step E3: a DVTValidator with the OverIssue.v1 category, rotated in -----------
+const spDeploy = async (name, args = []) => {
+  const a = spArtifact(name);
+  const f = new ethers.ContractFactory(a.abi, a.bytecode.object, owner);
+  const c = await f.deploy(...args);
+  await c.waitForDeployment();
+  step(`deploy SP ${name}`, { address: await c.getAddress(), args: args.map(String) });
+  return c;
+};
+const checker = await spDeploy("MockEvidenceCategory");
+const checkerAddr = await checker.getAddress();
+const dvtNew = await spDeploy("DVTValidator", [
+  cfg.registry,
+  1n, // below the aggregator's floor on purpose: nextProposalId() lifts it (SP #635)
+  [OVERISSUE_CATEGORY],
+  [checkerAddr],
+]);
+const dvt = new ethers.Contract(await dvtNew.getAddress(), DVT_ABI, owner);
+report.e3 = {
+  dvtValidator: await dvt.getAddress(),
+  checker: checkerAddr,
+  category: OVERISSUE_CATEGORY,
+};
+check("E3 DVTValidator version", (await dvt.version()) === (await dvt0.version()), {
+  version: await dvt.version(),
+});
+check(
+  "E3 DVTValidator holds exactly the OverIssue.v1 category with the mock checker",
+  (await dvt.categoryCount()) === 1n &&
+    (await dvt.checkerOf(OVERISSUE_CATEGORY)).toLowerCase() === checkerAddr.toLowerCase()
+);
+await send(
+  "E3a newDVT.setBLSAggregator(aggregator) (owner)",
+  dvt.setBLSAggregator(cfg.blsAggregator)
+);
+await send(
+  "E3b aggregator.setDVTValidator(newDVT) (owner)",
+  agg.setDVTValidator(await dvt.getAddress())
+);
+check(
+  "aggregator.DVT_VALIDATOR() is the new DVTValidator",
+  (await agg.DVT_VALIDATOR()).toLowerCase() === (await dvt.getAddress()).toLowerCase()
+);
+const oldAfter = await revertName(dvt0.connect(guardians[0].wallet), "createProposal", [
+  SLASH_TARGET,
+  SLASH_LEVEL,
+  "old DVT after rotation",
+  ethers.id("any evidence hash"),
+]);
+check(
+  "the old DVTValidator can no longer file proposals (NotCurrentDVT)",
+  oldAfter === "NotCurrentDVT",
+  {
+    revert: oldAfter,
+  }
+);
+let added = 0;
+for (const g of guardians) {
+  const rc = await send(
+    `E3c newDVT.addValidator(guardian ${g.slot}) (owner)`,
+    dvt.addValidator(g.address)
+  );
+  added += rc.logs.filter(l => {
+    try {
+      return dvt.interface.parseLog(l)?.name === "ValidatorAdded";
+    } catch {
+      return false;
+    }
+  }).length;
+}
+check("ValidatorAdded emitted once per guardian on the new DVTValidator", added === 3, { added });
+const keys = await Promise.all(guardians.map(g => agg.getBLSPublicKey(g.address)));
+check(
+  "the guardians' BLS keys survive the rotation (active, same slots)",
+  keys.every((k, i) => k[2] === true && Number(k[1]) === guardians[i].slot)
+);
+
+// ---- 2. the #441 verifier (3.0.0) and an over-issue token that is NOT over-issued (the slash was fraud) ---
 const deploy = async (name, args = []) => {
   const a = artifact(name);
   const f = new ethers.ContractFactory(a.abi, a.bytecode.object, owner);
@@ -206,17 +331,23 @@ const verifier = await deploy("OverIssueFraudProofVerifier", [cfg.blsAggregator,
 const token = await deploy("MockOverIssuableToken");
 check(
   "verifier build marker",
-  (await verifier.VERIFIER_VERSION()) === "OverIssueFraudProofVerifier-2.0.0" &&
+  (await verifier.VERIFIER_VERSION()) === "OverIssueFraudProofVerifier-3.0.0" &&
     (await verifier.COMMITMENT_BINDS_PARENT_BLOCKHASH()) === true
+);
+check(
+  "verifier and E3 DVTValidator use the same evidence category",
+  (await verifier.OVERISSUE_CATEGORY()) === OVERISSUE_CATEGORY
 );
 const tokenAddr = await token.getAddress();
 // The slash target is the DeployAnvil deployer, a registered SuperPaymaster operator, so the SP side of
 // the slash runs for real: queueSlashWithConsensus (BLS) then verifyAndExecute -> executeSlashWithBLS.
-const operator = await owner.getAddress();
+const operator = SLASH_TARGET;
 report.operator = operator;
 
 // ---- 3. the guardians sign a slash; the aggregator executes it through verifyAndExecute -------
 const evidenceHash = await verifier.evidenceHash(tokenAddr, operator, EPOCH);
+const evidence = await verifier.evidence(tokenAddr, operator, EPOCH);
+report.evidenceHash = evidenceHash;
 // Guardian 1 files the proposal on the DVTValidator (the production path); the DVT allocates the id.
 const g1dvt = dvt.connect(guardians[0].wallet);
 const PROPOSAL_ID = await dvt.nextProposalId();
@@ -257,7 +388,7 @@ const qProof = coder.encode(
 );
 const qsRc = await send(
   "guardian 1 DVTValidator.queueSlashWithProof (BLS, SP two-step slash, step 1)",
-  g1dvt.queueSlashWithProof(operator, SLASH_LEVEL, EPOCH, qProof)
+  g1dvt.queueSlashWithProof(operator, SLASH_LEVEL, EPOCH, evidence, qProof)
 );
 const queueCommit = await agg.proposalSignersCommitment(BigInt(queueHash));
 check(
@@ -269,9 +400,27 @@ const sigs = await Promise.all(guardians.map(g => signHash(messageHash, g.sk)));
 const aggSig = bls.longSignatures.aggregateSignatures(sigs);
 const MASK = 0b111n;
 const proof = coder.encode(["uint256", "bytes"], [MASK, encG2(aggSig)]);
+// N0: the checker accepts any body, so evidence naming another token decodes and passes the checker,
+// but its evidenceHash differs from the proposal's: DVTValidator must refuse it.
+const otherEvidence = await verifier.evidence(guardians[0].address, operator, EPOCH);
+const n0 = await revertName(g1dvt, "executeWithProof", [
+  PROPOSAL_ID,
+  [],
+  [],
+  EPOCH,
+  otherEvidence,
+  proof,
+]);
+check(
+  "N0 execute with evidence for another token -> EvidenceHashMismatch",
+  n0 === "EvidenceHashMismatch",
+  {
+    revert: n0,
+  }
+);
 const execRc = await send(
   "guardian 1 DVTValidator.executeWithProof -> aggregator.verifyAndExecute (SP two-step slash step 2; writes the signer commitment)",
-  g1dvt.executeWithProof(PROPOSAL_ID, [], [], EPOCH, proof),
+  g1dvt.executeWithProof(PROPOSAL_ID, [], [], EPOCH, evidence, proof),
   {
     proposalId: PROPOSAL_ID.toString(),
     threshold: (await agg.slashThresholds(SLASH_LEVEL)).toString(),
@@ -323,9 +472,9 @@ check(
   recompute(false) !== commitment
 );
 
-// ---- 4. enablement step E2: arm the v2 verifier --------------------------------------------------
+// ---- 4. enablement step E2: arm the #441 verifier -------------------------------------------------
 await send(
-  "E2a proposeFraudProofVerifier(v2) (owner)",
+  "E2a proposeFraudProofVerifier(#441 verifier) (owner)",
   agg.proposeFraudProofVerifier(await verifier.getAddress())
 );
 const delay = await agg.VERIFIER_ROTATION_DELAY();
@@ -334,7 +483,7 @@ await provider.send("evm_mine", []);
 step(`wait VERIFIER_ROTATION_DELAY (${delay} s, anvil time warp)`);
 await send("E2b applyFraudProofVerifier() (permissionless)", agg.applyFraudProofVerifier());
 check(
-  "fraudProofVerifier() is the v2 verifier",
+  "fraudProofVerifier() is the #441 verifier",
   (await agg.fraudProofVerifier()).toLowerCase() === (await verifier.getAddress()).toLowerCase()
 );
 

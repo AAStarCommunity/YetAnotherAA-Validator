@@ -11,7 +11,8 @@ import {
   orderSignersFromSlotMap,
   VERIFY_AND_EXECUTE_ABI,
   FRAUD_ID_TAG,
-  OVERISSUE_EVIDENCE_TAG,
+  OVERISSUE_CATEGORY,
+  overIssueEvidence,
   OverIssueFraudProofInputs,
 } from "./guardian-fraud-proof.js";
 
@@ -49,15 +50,34 @@ describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
     expect(id).toBeLessThan(1n << 256n);
   });
 
-  it("overIssueEvidenceHash binds token/operator/epoch (fixed preimage)", () => {
+  it("overIssueEvidenceHash binds token/operator/epoch (M0 §3.1 category rule)", () => {
     const h = overIssueEvidenceHash(TOKEN, OPERATOR, 1000n);
+    const body = coder.encode(["address", "address", "uint256"], [TOKEN, OPERATOR, 1000n]);
     const expected = ethers.keccak256(
       coder.encode(
-        ["string", "address", "address", "uint256"],
-        [OVERISSUE_EVIDENCE_TAG, TOKEN, OPERATOR, 1000n]
+        ["bytes32", "bytes32", "bytes32"],
+        [
+          ethers.id("SuperPaymaster.DVT.Evidence.v2"),
+          ethers.id("DVT.Evidence.OverIssue.v1"),
+          ethers.keccak256(body),
+        ]
       )
     );
     expect(h).toBe(expected);
+    expect(OVERISSUE_CATEGORY).toBe(ethers.id("DVT.Evidence.OverIssue.v1"));
+    // the evidence bytes decode to (category, body), as DVTValidator-0.9.0 decodes them
+    const [c, b] = coder.decode(["bytes32", "bytes"], overIssueEvidence(TOKEN, OPERATOR, 1000n));
+    expect(c).toBe(OVERISSUE_CATEGORY);
+    expect(ethers.hexlify(b)).toBe(body);
+    // the 2.0.0 pre-image no longer matches
+    expect(h).not.toBe(
+      ethers.keccak256(
+        coder.encode(
+          ["string", "address", "address", "uint256"],
+          ["DVT_OVERISSUE_EVIDENCE_V1", TOKEN, OPERATOR, 1000n]
+        )
+      )
+    );
     const other = ethers.getAddress("0x000000000000000000000000000000000000c0de");
     expect(overIssueEvidenceHash(other, OPERATOR, 1000n)).not.toBe(h);
   });
@@ -180,7 +200,9 @@ describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
     // with `cast abi-encode` + `cast keccak` (the same method reproduces the old 4.11 golden
     // 0xb35d1e5b…, which is how the method was checked).
     const commitment = computeSignersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3], PARENT);
-    expect(mh).toBe("0x7e794aa98ce38cd7e22a456963f67a1a7de057e15ee261a62373af7516cb820d");
-    expect(commitment).toBe("0xc625f31395b05a23504334285c8ed4ce6ea71a7c8305295b249e16fb67e79fcd");
+    // Verifier 3.0.0 evidence rule (OverIssue.v1); recomputed with cast, which reproduces 2.0.0's
+    // 0x7e794aa9… / 0xc625f313… with the old pre-image.
+    expect(mh).toBe("0xbb533ecaa9492a031d8b2cedf23bd7ac1728776e03e86332efdaf50da1dd84d6");
+    expect(commitment).toBe("0x5b15a0d0e5ab230f8accd36c14a9878f4acb351b38d96ad3bfbf20a86d0e5d06");
   });
 });

@@ -65,10 +65,20 @@ describe("bls-consensus-domain helper", () => {
 
   // ── fix 3: the cc89-cosign.mjs encoding lib stays byte-identical to the TS helper ──
   describe("cross-language single-source (script .mjs == TS helper)", () => {
+    // M0 §3.1 category rule, OverIssue.v1 body (proposal): built inline, not via either helper
     const evidenceHash = ethers.keccak256(
       ethers.AbiCoder.defaultAbiCoder().encode(
-        ["string", "address", "address", "uint256"],
-        ["DVT_OVERISSUE_EVIDENCE_V1", TOKEN, OPERATOR, 1000n]
+        ["bytes32", "bytes32", "bytes32"],
+        [
+          ethers.id("SuperPaymaster.DVT.Evidence.v2"),
+          ethers.id("DVT.Evidence.OverIssue.v1"),
+          ethers.keccak256(
+            ethers.AbiCoder.defaultAbiCoder().encode(
+              ["address", "address", "uint256"],
+              [TOKEN, OPERATOR, 1000n]
+            )
+          ),
+        ]
       )
     );
 
@@ -88,7 +98,7 @@ describe("bls-consensus-domain helper", () => {
       const viaHelper = executeSlashMessageHash(DOMAIN, 42n, OPERATOR, 2, 1000n, evidenceHash);
       expect(viaScript).toBe(viaHelper);
       // Same golden pinned in guardian-fraud-proof.spec.ts + Foundry test_Golden_CrossLanguage_SPLayout.
-      expect(viaScript).toBe("0x7e794aa98ce38cd7e22a456963f67a1a7de057e15ee261a62373af7516cb820d");
+      expect(viaScript).toBe("0xbb533ecaa9492a031d8b2cedf23bd7ac1728776e03e86332efdaf50da1dd84d6");
     });
 
     it("overIssueEvidenceHash matches the DVT convention", () => {

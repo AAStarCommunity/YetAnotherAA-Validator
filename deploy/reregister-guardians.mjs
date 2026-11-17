@@ -308,7 +308,7 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
   if (!binds) {
     die(
       `${VERIFIER} has no COMMITMENT_BINDS_PARENT_BLOCKHASH() == true: it predates #441 and cannot verify a\n` +
-        `  4.13.0+ commitment. Deploy the #441 verifier (VERIFIER_VERSION "OverIssueFraudProofVerifier-2.0.0").`
+        `  4.13.0+ commitment. Deploy the #441 verifier (VERIFIER_VERSION "OverIssueFraudProofVerifier-3.0.0").`
     );
   }
 

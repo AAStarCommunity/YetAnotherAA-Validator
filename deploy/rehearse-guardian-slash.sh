@@ -30,6 +30,8 @@ check_versions() { # $1 aggregator  $2 dvtValidator  $3 label
 }
 
 [ -f "$WT/contracts/out/OverIssueFraudProofVerifier.sol/OverIssueFraudProofVerifier.json" ] || { echo "build contracts/ first"; exit 1; }
+# E3 deploys SP's own DVTValidator and its test-only MockEvidenceCategory from SP_DIR's build (DVTValidator-0.9.0+).
+[ -f "$SP_DIR/out/MockEvidenceCategory.sol/MockEvidenceCategory.json" ] || { echo "SP_DIR has no MockEvidenceCategory build (needs SP #635+, forge build)"; exit 1; }
 lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null && { echo "port $PORT is busy"; exit 1; }
 "$ANVIL" --port "$PORT" --chain-id 31337 --hardfork prague --code-size-limit 100000 --silent > "$B/anvil.log" 2>&1 &
 APID=$!
@@ -43,7 +45,7 @@ check_versions "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))
   "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['dvtValidator'])" "$CFG")" "DeployAnvil"
 mkdir -p "$(dirname "$REPORT")"
 set +e
-( cd "$WT" && node deploy/rehearse-guardian-slash.mjs "$R" "$SP_DIR/deployments/config.anvil.json" "$WT/contracts/out" "$REPORT" )
+( cd "$WT" && node deploy/rehearse-guardian-slash.mjs "$R" "$SP_DIR/deployments/config.anvil.json" "$WT/contracts/out" "$REPORT" "$SP_DIR/out" )
 RC=$?
 set -e
 [ -f "$REPORT" ] || { echo "FAIL: no report written (exit $RC)"; exit 1; }

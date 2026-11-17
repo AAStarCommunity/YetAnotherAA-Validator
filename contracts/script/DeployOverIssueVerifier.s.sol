@@ -249,7 +249,7 @@ contract DeployOverIssueVerifier is Script {
         // GATE A' — ANCHORED RELEASES ONLY (#441), no override. BLSAggregator-4.13.0 (SP rc.8 r3b)
         // changed the signer commitment: it is keyed per path and ends with blockhash(block.number - 1)
         // (4.14.0, SP #630: BLSAggregator.sol:1376-1388). This verifier (VERIFIER_VERSION
-        // "OverIssueFraudProofVerifier-2.0.0") recomputes exactly that layout, with the parent block
+        // "OverIssueFraudProofVerifier-3.0.0") recomputes exactly that layout, with the parent block
         // hash supplied in the fraudProof, so it can never verify against a pre-4.13 aggregator. The
         // pre-#441 verifier was the reverse; this gate used to refuse >= 4.13.0. An unparseable
         // version string is refused too (fail closed). EXPECTED_AGGREGATOR_VERSION cannot lift this.

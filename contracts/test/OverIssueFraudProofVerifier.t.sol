@@ -14,6 +14,18 @@ import {FraudProofVerifierConformance as Conformance} from "./helpers/FraudProof
 ///      TAG_SIGNERS_COMMITMENT :247, TAG_FRAUD_PROOF :248, domainSeparator() :255, fraudProofDigest()
 ///      :265, execute-slash message :977, _computeSignersCommitment :1299.
 ///      `signers` MUST be pre-sorted ascending by uint160.
+/// The over-issue evidenceHash under the M0 §3.1 category rule, built inline from its definition
+/// (never via the verifier): the filer, DVTValidator-0.9.0 and the verifier must all agree on it.
+function _ovEvidenceHash(address token_, address operator_, uint256 epoch_) pure returns (bytes32) {
+    return keccak256(
+        abi.encode(
+            keccak256("SuperPaymaster.DVT.Evidence.v2"),
+            keccak256("DVT.Evidence.OverIssue.v1"),
+            keccak256(abi.encode(token_, operator_, epoch_))
+        )
+    );
+}
+
 contract MockAggregator {
     mapping(uint256 => bytes32) public proposalSignersCommitment;
 
@@ -155,11 +167,12 @@ contract OverIssueFraudProofVerifierTest is Test {
         a[2] = S3;
     }
 
-    /// The DVT over-issue evidence convention (keccak256(abi.encode(TAG, token, operator, epoch))).
-    /// Computed inline — a genuinely SHARED cross-repo value both filer and verifier must agree on —
+    /// The over-issue evidenceHash under the M0 §3.1 category rule (DVTValidator-0.9.0):
+    /// keccak256(abi.encode(TAG_EVIDENCE, keccak256("DVT.Evidence.OverIssue.v1"),
+    ///                      keccak256(abi.encode(token, operator, epoch)))). Computed inline — a genuinely SHARED cross-repo value both filer and verifier must agree on —
     /// so the mock never calls the verifier to obtain it (Codex MEDIUM #3 independence).
     function _evidenceHash(address disputedToken) internal pure returns (bytes32) {
-        return keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", disputedToken, OPERATOR, EPOCH));
+        return _ovEvidenceHash(disputedToken, OPERATOR, EPOCH);
     }
 
     /// SP execute-slash messageHash (current 4.11 layout), built independently via the mock.
@@ -511,8 +524,25 @@ contract OverIssueFraudProofVerifierTest is Test {
 
     /// #441: the build marker SP's manifest reads.
     function test_441_BuildMarker() public view {
-        assertEq(verifier.VERIFIER_VERSION(), "OverIssueFraudProofVerifier-2.0.0");
+        assertEq(verifier.VERIFIER_VERSION(), "OverIssueFraudProofVerifier-3.0.0");
         assertTrue(verifier.COMMITMENT_BINDS_PARENT_BLOCKHASH());
+    }
+
+    /// 3.0.0: the evidence follows the M0 §3.1 category rule DVTValidator-0.9.0 recomputes, with the
+    /// proposed OverIssue.v1 body; the 2.0.0 pre-image no longer matches.
+    function test_Evidence_FollowsCategoryRule() public view {
+        address t = address(token);
+        assertEq(verifier.TAG_EVIDENCE(), keccak256("SuperPaymaster.DVT.Evidence.v2"), "TAG_EVIDENCE");
+        assertEq(verifier.OVERISSUE_CATEGORY(), keccak256("DVT.Evidence.OverIssue.v1"), "category");
+        assertEq(verifier.evidenceHash(t, OPERATOR, EPOCH), _ovEvidenceHash(t, OPERATOR, EPOCH), "evidenceHash");
+        (bytes32 c, bytes memory body) = abi.decode(verifier.evidence(t, OPERATOR, EPOCH), (bytes32, bytes));
+        assertEq(c, keccak256("DVT.Evidence.OverIssue.v1"), "evidence category");
+        assertEq(body, abi.encode(t, OPERATOR, EPOCH), "evidence body");
+        assertTrue(
+            verifier.evidenceHash(t, OPERATOR, EPOCH)
+                != keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", t, OPERATOR, EPOCH)),
+            "2.0.0 pre-image must not match"
+        );
     }
 
     function test_OldFormatCommitment_Rejected() public {
@@ -563,7 +593,9 @@ contract OverIssueFraudProofVerifierTest is Test {
         address goldenToken = address(0xBEEF);
 
         bytes32 mh = gv.slashMessageHash(42, OPERATOR, 2, 1000, goldenToken);
-        assertEq(mh, bytes32(0x7e794aa98ce38cd7e22a456963f67a1a7de057e15ee261a62373af7516cb820d), "messageHash");
+        // 3.0.0 evidence rule (OverIssue.v1 category). Recomputed independently with `cast abi-encode` +
+        // `cast keccak`; the same method reproduces 2.0.0's goldens 0x7e794aa9… / 0xc625f313….
+        assertEq(mh, bytes32(0xbb533ecaa9492a031d8b2cedf23bd7ac1728776e03e86332efdaf50da1dd84d6), "messageHash");
 
         address[] memory signers = new address[](3);
         signers[0] = S1;
@@ -582,7 +614,7 @@ contract OverIssueFraudProofVerifierTest is Test {
         );
         // 4.14.0 layout with PARENT (#441). Recomputed independently with `cast abi-encode` + `cast keccak`;
         // the same method reproduces the old 4.11 golden 0xb35d1e5b…, and the TS suite pins the same hex.
-        assertEq(commitment, bytes32(0xc625f31395b05a23504334285c8ed4ce6ea71a7c8305295b249e16fb67e79fcd), "commitment");
+        assertEq(commitment, bytes32(0x5b15a0d0e5ab230f8accd36c14a9878f4acb351b38d96ad3bfbf20a86d0e5d06), "commitment");
     }
 
     // ---- (CRITICAL #2 disclosure) current-token-state limitation, documented as a test ----
@@ -654,8 +686,8 @@ contract OverIssueFraudProofVerifierConformanceTest is Test {
 
         // Record the A' commitment on aggA for the exact claimed signer set, in the CURRENT SP layout,
         // built independently of the verifier (Codex MEDIUM #3).
-        bytes32 evidence = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", address(token), OPERATOR, EPOCH));
-        bytes32 mh = aggA.slashMessage(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, evidence);
+        bytes32 evidenceH = _ovEvidenceHash(address(token), OPERATOR, EPOCH);
+        bytes32 mh = aggA.slashMessage(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, evidenceH);
         aggA.recordSP(PROPOSAL_ID, mh, SIGNER_MASK, _claimed(), PARENT);
     }
 

@@ -28,7 +28,14 @@ import {
 
 /** Domain tags — MUST match OverIssueFraudProofVerifier.sol exactly. */
 export const FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1";
-export const OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1";
+/** SP DVTValidator.TAG_EVIDENCE (0.9.0), the M0 §3.1 evidenceHash domain tag. */
+export const TAG_EVIDENCE = ethers.id("SuperPaymaster.DVT.Evidence.v2");
+/**
+ * The over-issue evidence category, keccak256("DVT.Evidence.OverIssue.v1"). PROPOSAL, NOT FINALIZED
+ * (DSR 2026-11-17): the category string and body layout are settled with SP, with SP's checker
+ * contract, before the category is deployed.
+ */
+export const OVERISSUE_CATEGORY = ethers.id("DVT.Evidence.OverIssue.v1");
 /** BLSAggregator.MAX_VALIDATORS. */
 export const MAX_VALIDATORS = 13;
 
@@ -119,7 +126,31 @@ export function deriveFraudProofId(proposalId: bigint): bigint {
   );
 }
 
-/** The over-issue evidenceHash the slash filer MUST use — binds token+operator+epoch. */
+/** The over-issue evidence body (proposal): abi.encode(address disputedToken, address operator, uint256 epoch). */
+export function overIssueEvidenceBody(
+  disputedToken: string,
+  operator: string,
+  epoch: bigint
+): string {
+  return ethers.AbiCoder.defaultAbiCoder().encode(
+    ["address", "address", "uint256"],
+    [disputedToken, operator, epoch]
+  );
+}
+
+/** The `evidence` bytes DVTValidator-0.9.0 takes: abi.encode(OVERISSUE_CATEGORY, body). */
+export function overIssueEvidence(disputedToken: string, operator: string, epoch: bigint): string {
+  return ethers.AbiCoder.defaultAbiCoder().encode(
+    ["bytes32", "bytes"],
+    [OVERISSUE_CATEGORY, overIssueEvidenceBody(disputedToken, operator, epoch)]
+  );
+}
+
+/**
+ * The over-issue evidenceHash the slash filer MUST use — binds token+operator+epoch. The M0 §3.1
+ * category rule DVTValidator-0.9.0 recomputes at execute:
+ * keccak256(abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(body))).
+ */
 export function overIssueEvidenceHash(
   disputedToken: string,
   operator: string,
@@ -127,8 +158,12 @@ export function overIssueEvidenceHash(
 ): string {
   return ethers.keccak256(
     ethers.AbiCoder.defaultAbiCoder().encode(
-      ["string", "address", "address", "uint256"],
-      [OVERISSUE_EVIDENCE_TAG, disputedToken, operator, epoch]
+      ["bytes32", "bytes32", "bytes32"],
+      [
+        TAG_EVIDENCE,
+        OVERISSUE_CATEGORY,
+        ethers.keccak256(overIssueEvidenceBody(disputedToken, operator, epoch)),
+      ]
     )
   );
 }
