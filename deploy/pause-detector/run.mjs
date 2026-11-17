@@ -20,6 +20,7 @@ import {
   topicProblems,
   catchUpProblems,
   knownEventProblems,
+  classifyMaxProblems,
   isRateLimited,
 } from "./lib/detect.mjs";
 import {
@@ -98,6 +99,7 @@ export function configProblems(c) {
   p.push(...topicProblems(c.operatorConfiguredTopics));
   p.push(...catchUpProblems(c.catchUp));
   p.push(...knownEventProblems(c.knownProxyEvents));
+  p.push(...classifyMaxProblems(c.classifyMaxBlocks));
   return p;
 }
 
@@ -277,6 +279,7 @@ export function crossCheckPlan(provider, cfg) {
  * fallback, which would move the fallback's rescan clock and the cross-check's roles. `probes` is
  * [{ name, chain }] in order, primary first. Throws a SafeError when no round can run.
  */
+export const PROBE_SKIP_MS = 2 * 3600_000;
 export async function chooseProvider(probes, cfg, st) {
   const stale = [];
   for (const [i, pr] of probes.entries()) {
@@ -290,7 +293,14 @@ export async function chooseProvider(probes, cfg, st) {
       }
       return { chain: pr.chain, provider: pr.name };
     } catch (e) {
-      if (i === 0 && isRateLimited(e) && (st?.catchUpThrottle ?? 0) > 0)
+      // only right after OUR throttled catch-up (clestons #453 Medium): within PROBE_SKIP_MS of the
+      // last throttled round; later, or with no throttle, a rate-limited primary hands over as usual
+      if (
+        i === 0 &&
+        isRateLimited(e) &&
+        (st?.catchUpThrottle ?? 0) > 0 &&
+        Date.now() - (st?.lastThrottledAt ?? 0) < PROBE_SKIP_MS
+      )
         throw new SafeError(
           `the primary RPC (${pr.name}) rate-limited the probe after a throttled catch-up round: this round is skipped, not run on the fallback`
         );

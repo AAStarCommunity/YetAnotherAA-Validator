@@ -159,10 +159,24 @@ a missed one.
    entry. An unknown one may be an operator configuration under a signature
    nobody listed. It is recorded with its first block and keeps every round
    `unknown` (`unknown-event`) until the config names it, with SP's source. An
-   anonymous log counts as unknown. Each block is classified once; a reorg reset
-   classifies again.
-   - Past 32 distinct unknown topic0s the rest are only counted, and the count
-     keeps rounds `unknown` until a new `stateDir`.
+   anonymous log counts as unknown. Each new block is classified once; a reorg
+   reset classifies again.
+   - **The daily replay** (Codex pre-PR r2; clestons #453 H1, H2). Each
+     provider's daily full round classifies everything from `startBlock` again,
+     so a response that once omitted a log is asked again. The replay goes in
+     segments of `classifyMaxBlocks` (optional, default 2,000,000), with its own
+     cursor per clock (`replayNext`).
+     - The daily clock (`lastFullScan` / `lastFallbackFullScan`) moves only when
+       the inventory rescan succeeded AND the replay reached finalized.
+     - A replay that fails, or is not finished, therefore keeps the rounds full
+       and resumes where it stopped. It is never counted as done.
+     - Forward classification of new blocks is separate and runs every round.
+   - The cross-check classifies too: it asks the fallback both ways, filtered
+     and unfiltered.
+   - Blocks above finalized are classified against B's ancestry. An unknown
+     there makes that round `unknown` and is recorded only once finalized.
+   - Past 32 distinct unknown topic0s only a sticky flag is kept, and it keeps
+     rounds `unknown` until a new `stateDir`.
    - This costs about N / `logChunk` `getLogs` calls once, then a few per round.
      On Sepolia the proxy had 495 logs in total at SP's read-back of 2026-11-18.
      A much busier proxy can exceed a provider's per-response log limit; that
@@ -375,6 +389,7 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   | What the fallback found enters the inventory (over the cap: the overflow marker is set and written at once) even if the rest of the attempt fails                                                          | `N2: what the fallback found enters the inventory even when the primary's re-query then fails`; `chunk (Codex pre-push r3): …` (both); `N8+N2: …`; `persist (Codex pre-push r3): …`                                                                                                                                                                                                                               |
   | A comparison that reaches less than a standing disagreement, or than an earlier completed one, settles nothing                                                                                             | `H1-R2: a standing disagreement is cleared only by a comparison that reaches its height`; `H1-R2: a cross-check whose H is below what an earlier one covered is incomplete`; `High B: a shorter comparison that itself disagrees does not replace a standing disagreement`                                                                                                                                        |
   | Every provider's round does the full rescan when its 24 h are up; only the primary's moves `lastFullScan`                                                                                                  | `B1'': the primary misses OP2 at 130 and then goes down: …`; `B1'': the fallback's rescan recurs every 24 h: …`; `N6: a fallback round's due full rescan is recorded apart (lastFallbackFullScan), never as the primary's`                                                                                                                                                                                        |
+  | The daily replay (inventory and classification) completes before its clock moves: a failed or unfinished replay resumes, in segments, until it reaches finalized                                           | `#453 H1: a full round whose replay fails does not move the daily clock; …`; `#453 H2: a replay longer than classifyMaxBlocks goes in segments with its own cursor; …`                                                                                                                                                                                                                                            |
   | No round is clear before a first cross-check has completed                                                                                                                                                 | `(b): a fresh or lost state is never clear before a first cross-check completes (coveredTo starts at 0)`; `N5: a first cross-check with the fallback's finalized block below startBlock is not completed`                                                                                                                                                                                                         |
   | Coverage more than 3 days behind the inventory is `unknown`                                                                                                                                                | `High A: coverage up to 3 days of blocks behind the inventory still reads clear; one block more is unknown`                                                                                                                                                                                                                                                                                                       |
   | Additions from cross-checks are capped; after an overflow every round stays `unknown` until an operator resets it                                                                                          | `N8: 100 invented operators (within the cap) …`; `N8: a lying fallback's 1,001 invented operators: …`; `N8 overflow (Codex pre-push, DSR 2026-11-18): …`; `N8+N2: with the cap used up and the last comparison clean, an over-cap finding survives a failed re-query: not clear`                                                                                                                                  |
@@ -710,11 +725,14 @@ secret-file reader, called with the detector's own name table) and
          nothing of that window checked, and is not clear;
        - later catch-up rounds halve concurrency per throttled round (at most 4
          halvings), and recover one step per round that was not throttled;
-       - if the primary also rate-limits the next run's probe, that run is
+       - if the primary also rate-limits the next run's probe **within 2 h of
+         the last throttled catch-up round** (`PROBE_SKIP_MS`), that run is
          skipped as `unknown` rather than run on the fallback. A fallback round
-         would move the fallback's rescan clock and the cross-check's roles. A
-         primary that is down, not rate-limited, still hands over to the
-         fallback as before.
+         would move the fallback's rescan clock and the cross-check's roles.
+         Later, or with no throttle, a rate-limited primary hands over as usual.
+         So does a primary that is down (clestons #453).
+       - the throttle is reset once the watermark is within 4096 blocks of B, so
+         it cannot stay armed after catch-up has ended.
 3. Create the secrets as 0600 files in a 0700 directory, without argv or
    history:
    - `aoa-dvt-detector-rpc-primary` and `aoa-dvt-detector-rpc-fallback` (RPC
@@ -780,9 +798,13 @@ secret-file reader, called with the detector's own name table) and
 8. **Positive control (DSR 2026-11-18): the deployment is not complete until
    this passes.** Once the first round's inventory is built, compare it with the
    operator list from SP's post-deploy read-back (a JSON list of addresses):
-   `node deploy/pause-detector/compare-inventory.mjs <stateDir>/state.json <sp-operators.json>`.
+   `node deploy/pause-detector/compare-inventory.mjs <stateDir>/state.json <sp-operators.json> --chain-id <id> --sp <SP proxy>`.
    It must exit 0, which means the two sets are equal. A `missing` operator
    means the detector's filter or `startBlock` is wrong.
+   - The state must be for that chain and that SP (exit 2 otherwise).
+   - An empty SP list fails (exit 1): an empty read-back is more likely a failed
+     one. `--allow-empty` passes it only when SP truly has no configured
+     operator (clestons #453).
    - The list is the **configured operators**: those with an
      `OperatorConfigured` on SP and `isConfigured` true. It is not the members
      of the `PAYMASTER_SUPER` role. SP's read-back of 2026-11-18 found five role

@@ -162,6 +162,14 @@ export const CATCHUP_MAX_THROTTLE = 4;
 export const isRateLimited = e =>
   e?.rateLimited === true || /RATE_LIMITED/.test(String(e?.message ?? ""));
 
+/** Problems with cfg.classifyMaxBlocks (absent = CLASSIFY_MAX_BLOCKS), or []. Pure. */
+export function classifyMaxProblems(v) {
+  if (v === undefined) return [];
+  return Number.isSafeInteger(v) && v >= 1 && v <= CLASSIFY_MAX_BLOCKS
+    ? []
+    : [`classifyMaxBlocks must be 1..${CLASSIFY_MAX_BLOCKS}`];
+}
+
 /** Problems with cfg.catchUp (absent = no catch-up), or []. Pure. */
 export function catchUpProblems(c) {
   if (c === undefined || c === null) return [];
@@ -228,6 +236,7 @@ function resetVerification(st, alerts, why) {
   st.lastFullScan = 0;
   st.lastFallbackFullScan = 0;
   st.classifiedTo = st.startBlock - 1;
+  st.replayNext = {};
   alerts.push({
     key: "reverify",
     text: `unknown: ${why}; everything is read and verified again from block ${st.startBlock}`,
@@ -285,7 +294,10 @@ export function emptyState({ chainId, spProxy, startBlock }) {
     // every log of the proxy up to here was classified (DSR 2026-11-18): its topic0 is known
     classifiedTo: startBlock - 1,
     unknownTopics: {}, // topic0 (or "anonymous") -> first block it was seen, at most MAX_UNKNOWN_TOPICS
-    unknownTopicsMore: 0, // distinct unknown topic0s past that cap (they keep every round unknown)
+    unknownTopicsOverflow: false, // more distinct unknown topic0s than that cap (sticky: a new stateDir)
+    // the daily replay's progress, per provider clock (clestons #453): the next block to replay, or
+    // null when no replay is in progress
+    replayNext: {},
     crossCheck: emptyCrossCheck(),
     undeliveredSince: null, // ms since some due alert could not be delivered (Daybreak M7), or null
   };
@@ -406,6 +418,25 @@ export function stateProblems(st, cfg) {
     !(Number.isSafeInteger(st.unknownTopicsMore) && st.unknownTopicsMore >= 0)
   )
     p.push("the state's unknownTopicsMore is not a count");
+  if (st.unknownTopicsOverflow !== undefined && typeof st.unknownTopicsOverflow !== "boolean")
+    p.push("the state's unknownTopicsOverflow is not a boolean");
+  if (
+    st.replayNext !== undefined &&
+    !(
+      plainObject(st.replayNext) &&
+      Object.entries(st.replayNext).every(
+        ([k, v]) =>
+          (k === "lastFullScan" || k === "lastFallbackFullScan") &&
+          (v === null || (Number.isSafeInteger(v) && v >= st.startBlock))
+      )
+    )
+  )
+    p.push("the state's replayNext is not a replay cursor per clock");
+  if (
+    st.lastThrottledAt !== undefined &&
+    !(Number.isFinite(st.lastThrottledAt) && st.lastThrottledAt >= 0)
+  )
+    p.push("the state's lastThrottledAt is not a time");
   if (st.startBlockVerified !== undefined && typeof st.startBlockVerified !== "boolean")
     p.push("the state's startBlockVerified is not a boolean");
   if (st.crossCheck !== undefined) {
@@ -513,11 +544,15 @@ function operatorOfAny(lg, t0, T, n) {
   return opOf(lg.topics[1]);
 }
 
-/** Record an unclassified topic0 in the state, bounded (MAX_UNKNOWN_TOPICS, then a count). */
+/**
+ * Record an unclassified topic0 in the state, bounded: past MAX_UNKNOWN_TOPICS distinct ones only a
+ * sticky flag is kept (clestons #453 Low: a count re-counted the same topic on every re-read).
+ */
 function recordUnknown(st, t0, n) {
+  st.unknownTopics ??= {}; // (the cross-check can run before a round initialised it: clestons #453)
   if (t0 in st.unknownTopics) return;
   if (Object.keys(st.unknownTopics).length < MAX_UNKNOWN_TOPICS) st.unknownTopics[t0] = n;
-  else st.unknownTopicsMore += 1;
+  else st.unknownTopicsOverflow = true;
 }
 
 /**
@@ -738,6 +773,7 @@ export async function runRound(
     lastFallbackFullScan: st.lastFallbackFullScan,
     classifiedTo: st.classifiedTo,
     topicSet: st.topicSet,
+    replayNext: st.replayNext && { ...st.replayNext },
     crossCheck: st.crossCheck && { ...st.crossCheck },
   };
   let result;
@@ -764,7 +800,10 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   if (tp.length) throw new SafeError(`config: ${tp.join("; ")}`);
   const cp = catchUpProblems(cfg.catchUp);
   if (cp.length) throw new SafeError(`config: ${cp.join("; ")}`);
-  const kp = knownEventProblems(cfg.knownProxyEvents);
+  const kp = [
+    ...knownEventProblems(cfg.knownProxyEvents),
+    ...classifyMaxProblems(cfg.classifyMaxBlocks),
+  ];
   if (kp.length) throw new SafeError(`config: ${kp.join("; ")}`);
   const T = operatorTopics(cfg);
   // the inventory was built and verified with ONE set of OperatorConfigured topics: when the set
@@ -877,7 +916,6 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
       canon,
       T
     );
-    if (full) st[scanKey] = now;
   } catch (e) {
     inventoryOk = false;
     if (isRateLimited(e)) rateLimited = true;
@@ -895,23 +933,44 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   let classifyOk = true;
   const known = knownProxyTopics(cfg);
   st.unknownTopics ??= {};
-  st.unknownTopicsMore ??= 0;
+  // a count from an earlier build of this state (unknownTopicsMore) is evidence too: kept, as the flag
+  if (st.unknownTopicsMore > 0) st.unknownTopicsOverflow = true;
+  delete st.unknownTopicsMore;
+  st.unknownTopicsOverflow ??= false;
+  st.replayNext ??= {};
   st.classifiedTo ??= st.startBlock - 1;
+  const maxClassify = cfg.classifyMaxBlocks ?? CLASSIFY_MAX_BLOCKS;
+  const take = (lg, t0, n) => {
+    if (!known.has(t0)) recordUnknown(st, t0, n);
+    // an operator configuration seen here enters the inventory too (a superset is safe)
+    const op = operatorOfAny(lg, t0, T, n);
+    if (op) st.operators[op] ??= n;
+  };
+  let replayDone = false;
   try {
-    // the daily full rescan classifies everything again too (Codex pre-PR r2): a response that
-    // omitted a log once is asked again, by whichever provider the round uses
-    const cFrom = full ? st.startBlock : st.classifiedTo + 1;
-    const cTo = Math.min(finalized, cFrom + CLASSIFY_MAX_BLOCKS - 1);
-    if (cTo >= cFrom)
-      await allLogs(chain, st.spProxy, cFrom, cTo, cfg.logChunk, canon, (lg, t0, n) => {
-        if (!known.has(t0)) recordUnknown(st, t0, n);
-        // an operator configuration seen here enters the inventory too (a superset is safe)
-        const op = operatorOfAny(lg, t0, T, n);
-        if (op) st.operators[op] ??= n;
-      });
-    st.classifiedTo = Math.max(st.classifiedTo, cTo);
+    // forward: the finalized blocks never classified yet, at most maxClassify per round
+    const cFrom = st.classifiedTo + 1;
+    const cTo = Math.min(finalized, cFrom + maxClassify - 1);
+    if (cTo >= cFrom) {
+      await allLogs(chain, st.spProxy, cFrom, cTo, cfg.logChunk, canon, take);
+      st.classifiedTo = cTo;
+    }
     if (st.classifiedTo < finalized)
       throw new SafeError(`classified up to block ${st.classifiedTo}, finalized is ${finalized}`);
+    // the daily REPLAY (Codex pre-PR r2; clestons #453 High 1, 2): everything from startBlock again,
+    // by whichever provider the round uses, so a response that omitted a log once is asked again.
+    // It goes in segments of maxClassify, with its own cursor per clock; the clock moves only when
+    // the replay has reached finalized and the inventory rescan succeeded, so a replay that fails
+    // or is not finished is resumed next round, never counted as done
+    if (full) {
+      const rFrom = st.replayNext[scanKey] ?? st.startBlock;
+      const rTo = Math.min(finalized, rFrom + maxClassify - 1);
+      if (rTo >= rFrom) await allLogs(chain, st.spProxy, rFrom, rTo, cfg.logChunk, canon, take);
+      if (rTo >= finalized) {
+        st.replayNext[scanKey] = null;
+        replayDone = true;
+      } else st.replayNext[scanKey] = rTo + 1;
+    }
   } catch (e) {
     classifyOk = false;
     if (isRateLimited(e)) rateLimited = true;
@@ -920,19 +979,23 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
       text: `unknown: the proxy's logs could not all be classified (${safeText("events", e)}); retried next round`,
     });
   }
+  // the daily clock: only a full round whose inventory rescan AND replay both completed
+  if (full && inventoryOk && classifyOk && replayDone) st[scanKey] = now;
   // an unknown topic0 named in the config since is known now: it is dropped
   for (const t of Object.keys(st.unknownTopics)) if (known.has(t)) delete st.unknownTopics[t];
   const unknownEvents = Object.entries(st.unknownTopics);
-  if (unknownEvents.length || st.unknownTopicsMore)
+  if (unknownEvents.length || st.unknownTopicsOverflow)
     alerts.push({
       key: "unknown-event",
       text:
         `unknown: the SuperPaymaster proxy emitted events nobody listed: ${unknownEvents.map(([t, n]) => `${t} (first at block ${n})`).join(", ")}` +
-        (st.unknownTopicsMore ? `, and ${st.unknownTopicsMore} more` : "") +
+        (st.unknownTopicsOverflow
+          ? `, and more than ${MAX_UNKNOWN_TOPICS} distinct ones in all`
+          : "") +
         "; one could be an operator configuration under an unlisted signature. Ask SP what each is and add it to knownProxyEvents (or operatorConfiguredTopics) with its source" +
-        (st.unknownTopicsMore ? "; past the cap, a new stateDir is needed after that" : ""),
+        (st.unknownTopicsOverflow ? "; past the cap, a new stateDir is needed after that" : ""),
     });
-  const eventsOk = classifyOk && !unknownEvents.length && !st.unknownTopicsMore;
+  const eventsOk = classifyOk && !unknownEvents.length && !st.unknownTopicsOverflow;
   // (and no unclassified event above finalized: checked in step 4, required for clear below)
 
   // 2. one block, by hash, for every read of this round
@@ -977,6 +1040,7 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   let recentOk = true;
   const recentUnknown = new Set(); // unclassified topic0s above finalized, this round only
   let catchUp = null; // { from, to, upTo } when this round ran in catch-up mode
+  let caughtUp = false; // the watermark was within MAX_CHECK of B this round
   try {
     if (B.number - finalized > MAX_UNFINALIZED)
       throw new SafeError(`${B.number - finalized} blocks above finalized: too many to walk`);
@@ -1045,6 +1109,7 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     const lo = st.checked + 1;
     // catch-up is decided from THIS round's backlog alone: once within MAX_CHECK of B, ordinary
     const behindFar = Boolean(cfg.catchUp) && B.number - st.checked > MAX_CHECK;
+    caughtUp = B.number - st.checked <= MAX_CHECK;
     const catching = behindFar && !rateLimited;
     if (behindFar && rateLimited)
       catchUp = { from: lo, to: lo - 1, upTo: null, concurrency: 0, throttled: true };
@@ -1177,13 +1242,15 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     });
 
   // the catch-up throttle (DSR 2026-11-18): halved per throttled catch-up round, one step back per
-  // catch-up round that was not
+  // catch-up round that was not, and gone once caught up (clestons #453 Medium: it would otherwise
+  // stay armed and keep the probe from ever handing over to the fallback)
   if (catchUp) {
     const t = st.catchUpThrottle ?? 0;
     st.catchUpThrottle = catchUp.throttled
       ? Math.min(CATCHUP_MAX_THROTTLE, t + 1)
       : Math.max(0, t - 1);
-  }
+    if (catchUp.throttled) st.lastThrottledAt = now;
+  } else if (caughtUp) st.catchUpThrottle = 0;
 
   // the inventory only grows: every operator seen this round, whatever else failed
   for (const [op, n] of recent) st.operators[op] ??= n;
