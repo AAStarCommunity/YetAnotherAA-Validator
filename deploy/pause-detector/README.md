@@ -91,7 +91,10 @@ Three layers carry it, and they are not equally strong:
    - a name, key or string that holds a key, signs, broadcasts or runs a
      program;
    - dynamic import, `require`, `eval`, `globalThis`, `.constructor`;
-   - a computed member built from strings;
+   - an inline computed member built from strings (`x["send" + y]`). A variable
+     index (`x[k]`) is allowed: the scan does no data-flow analysis, and a send
+     method reached that way is still refused by the transport (layer 2)
+     (Daybreak M10);
    - `process` or `console` used other than as a few named members;
    - ethers used other than as nine pure utilities;
    - any `fetch` other than to the Telegram Bot API or from the one JSON-RPC
@@ -130,6 +133,11 @@ a missed one.
      Sepolia's block time is 12 s) stops the round as `unknown` (clestons #434
      B1). A node frozen at a height is self-consistent, so every other check
      passes against it; only the head's age shows it.
+   - **A head from the future** (Daybreak M8, DSR 2026-11-17). A head more than
+     300 s ahead of the Mini's clock also stops the round as `unknown`, naming
+     the clock. A real block is never far in the future, so either the Mini's
+     clock is behind (and a frozen head would look fresher than it is by that
+     much) or the provider is wrong.
    - The provider probe treats a stale head as a failed probe, so the fallback
      takes over from a frozen primary.
    - `status.json` records B's timestamp, and preflight FAILs a `clear` on an
@@ -216,13 +224,39 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   clear. That rests on the head-age check, the hash-bound chain-linked
   cross-check watermark above, and the commit-on-canonical rounds.
 - **One provider per round.** Each round reads from one provider, the primary
-  unless it fails its probe. So the trust in "two providers" holds for each one
-  on its own, not as a cross-check between them (see the follow-up below).
-- **The known residual.** A provider that **deliberately** answers one finalized
-  block two different ways, consistently, could still hide an operator. For
-  example, it might serve another fork's block by number and by hash alike, with
-  matching empty logs, along a whole linked stretch. That case is outside the
-  threat model and is not mitigated.
+  unless it fails its probe. Its range answers and its by-hash answers come from
+  the same backend, so a log index that consistently lacks one block's logs (an
+  honest indexer bug is enough) answers `[]` both ways, and the window and daily
+  rescans ask it again (Daybreak H1).
+- **The daily inventory cross-check** (Daybreak H1; **DSR ruling 2026-11-17**).
+  Once a day the detector reads the operator inventory from `startBlock` again
+  from the **other** provider, the one the round did not use, up to the lower of
+  the primary inventory's cursor and the other provider's finalized block. It
+  compares the two sets of operators (`crossCheckInventory`, `lib/detect.mjs`):
+  - An operator only the other provider has: the primary's index missed it.
+    Every round is `unknown` and the alert names it, and it is checked every
+    round from then on, until a later cross-check agrees. The check is repeated
+    every round while the two disagree.
+  - An inventory entry the other provider lacks is asked of the primary again,
+    by operator: if the primary has no such log either, it is a harmless
+    superset entry (a block that later left the chain) and not a disagreement;
+    otherwise it is one too, named the same way.
+  - If the other provider cannot answer, the day is recorded as incomplete
+    (`status.json` `report.crossCheck`), and **no round becomes unknown**. Three
+    incomplete days in a row raise
+    `the daily inventory cross-check … has not completed for N days`, until one
+    completes.
+
+  So an honest provider's index gap is found within a day, and a fallback that
+  is down does not turn every round unknown.
+
+- **The known residuals.**
+  - Both providers missing the **same** log the same way is not found.
+  - A provider that **deliberately** answers one finalized block two different
+    ways, consistently, could still hide an operator. For example, it might
+    serve another fork's block by number and by hash alike, with matching empty
+    logs, along a whole linked stretch. That case is outside the threat model
+    (DSR 2026-11-14) and is not mitigated.
 - **A follow-up, not required for rc.8.** With both providers configured, read
   the decision inputs at B (role, minStake, effectiveStake, isPaused) from both
   and treat a disagreement as `unknown`.
@@ -324,12 +358,22 @@ preflight after every deploy.**
   throw and B still canonical, whether or not it reads clear. A round that reads
   unknown still alerts on its own, so the heartbeat only answers "is the
   detector running rounds at all".
-- **Check.** Of the heartbeat the dead-man reads only `schema`, `at` and `gaps`.
-  With no completed round for more than **2 hours**, it alerts via
-  aastar-monitor, repeating every 6 hours while that lasts. A missing heartbeat,
-  an unreadable one or one dated in the future counts as silence. It sends one
-  `rounds resumed` notice when the heartbeat is fresh again. An alert that was
-  not delivered is retried at the next run.
+- **Undelivered alerts** (Daybreak M7, DSR 2026-11-17). The heartbeat also
+  carries `undeliveredSince`: since when some due alert of the detector could
+  not be delivered (it is retried every round, and the field clears on the first
+  round that delivers everything). A completed round still writes the heartbeat,
+  so without this a detector whose own messages fail would look alive. When
+  `undeliveredSince` is more than 2 h old, the dead-man alerts
+  `the pause detector runs, but its alerts have not been delivered since …`,
+  repeating every 6 hours, and sends one notice when they are delivered again.
+  Both jobs share the bot token, so this covers a failure of the detector's
+  messages only, not of the token (the known gap above).
+- **Check.** Of the heartbeat the dead-man reads only `schema`, `at`, `gaps` and
+  `undeliveredSince`. With no completed round for more than **2 hours**, it
+  alerts via aastar-monitor, repeating every 6 hours while that lasts. A missing
+  heartbeat, an unreadable one or one dated in the future counts as silence. It
+  sends one `rounds resumed` notice when the heartbeat is fresh again. An alert
+  that was not delivered is retried at the next run.
 - **No message lost silently.**
   - Undelivered messages are queued in the dead-man's state, written **before**
     each delivery attempt and emptied only once Telegram accepted them.
@@ -434,10 +478,19 @@ secret-file reader, called with the detector's own name table) and
      too wide makes every round `unknown` until it is fixed; it never makes a
      round clear.
    - `maxHeadAgeSec` (60..86400) is the oldest head a round accepts.
-   - `startBlock` is the rc.8 SP deploy block. The first rounds cross-check
-     every block from there, at most 4096 per round, so a start far in the past
-     reads `cross-check is behind` (unknown, fail-closed) for a while (clestons
-     #434 F5).
+   - `startBlock` is the rc.8 SP deploy block, or earlier. The detector checks
+     it once per state (Daybreak H2, DSR 2026-11-17): SuperPaymaster must have
+     **no code at `startBlock − 1`**, so no earlier `OperatorConfigured` can
+     exist. Until that read returns empty code, every round is `unknown`
+     (`start-block`). A later `startBlock` would leave earlier operators unread
+     for good; fix it with a new `stateDir`. The read needs historical
+     `eth_getCode`, which both configured providers serve.
+   - The state file is read with a 1 MiB limit. The inventory only grows, at
+     about 60 bytes per operator, so that is roughly 17,000 operators (Daybreak
+     L11); rc.8 has a handful.
+   - The first rounds cross-check every block from there, at most 4096 per
+     round, so a start far in the past reads `cross-check is behind` (unknown,
+     fail-closed) for a while (clestons #434 F5).
 3. Create the secrets as 0600 files in a 0700 directory, without argv or
    history:
    - `aoa-dvt-detector-rpc-primary` and `aoa-dvt-detector-rpc-fallback` (RPC
@@ -455,7 +508,14 @@ secret-file reader, called with the detector's own name table) and
      differ from HEAD.
    - It records the commit in `MANIFEST.json`, and prints the source commit and
      the sha256 of `MANIFEST.json`. **Record both in the deploy log.** SP puts
-     them in the step-13 manifest as the detector's identity (DSR).
+     them in the step-13 manifest as the detector's identity (DSR). Preflight
+     compares the running bundle against them (step 7; Daybreak H4).
+   - A bundle built with `--allow-dirty` from files that differ from the commit
+     is marked `dirty` in its manifest, and the detector and preflight refuse it
+     (Daybreak H4); the dead-man then reports the detector's silence.
+   - Every bundled package must be exactly the version `package-lock.json` lists
+     at that path, with an integrity entry; otherwise the bundler stops
+     (Daybreak H5b).
    - The checkout is not needed after this, and the detector cannot read it.
    - To upgrade, build a new bundle into a new directory and swap it in.
    - It copies ethers from the checkout's `node_modules`. So install that with
@@ -473,7 +533,9 @@ secret-file reader, called with the detector's own name table) and
    - Then the dead-man: `mkdir -m 700 ~/.aoa-pause-detector/deadman`, render and
      load `io.aastar.dvt-pause-detector-deadman.plist`, and check that its run
      interval is 900.
-7. Run `node deploy/pause-job/preflight.mjs`. It checks:
+7. Run
+   `node deploy/pause-job/preflight.mjs --detector-commit <commit> --detector-manifest-sha256 <sha256>`
+   with the two values from step 5's deploy log. It checks:
    - **launchd-on**: the detector, its dead-man and the price keeper are loaded;
      the committee keeper, apply-rotation and the D2 pause job are not; no other
      loaded job runs a DVT sender;
@@ -482,7 +544,8 @@ secret-file reader, called with the detector's own name table) and
      `--permission`, the one read, the one write and the bundle's entry, with no
      injecting variable;
    - **detector-bundle**: the bundle matches its manifest, with no symlink under
-     `~/.aoa-pause-detector`;
+     `~/.aoa-pause-detector`; the manifest is not `dirty`; its `commit` and its
+     sha256 are the recorded ones (missing values FAIL);
    - **pause-detector**: `status.json` is at most two intervals old, is not a
      startup failure, has no undelivered alerts, and a `clear` in it is on a
      head no older than two intervals.
