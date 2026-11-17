@@ -16,6 +16,34 @@ import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 
 /** Compare the state's inventory with SP's list. Pure. Throws on an input that is not addresses. */
+/**
+ * The command line, strictly: exactly two positional paths; --chain-id (a decimal integer) and --sp
+ * (an address), each exactly once; --allow-empty at most once; nothing else. Throws on anything
+ * else. Pure.
+ */
+export function parseArgs(argv) {
+  const pos = [];
+  const opt = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--allow-empty") {
+      if (opt.allowEmpty) throw new Error("--allow-empty is given twice");
+      opt.allowEmpty = true;
+    } else if (a === "--chain-id" || a === "--sp") {
+      if (a in opt) throw new Error(`${a} is given twice`);
+      const v = argv[++i];
+      if (v === undefined || v.startsWith("--")) throw new Error(`${a} has no value`);
+      opt[a] = v;
+    } else if (a.startsWith("-")) throw new Error(`unknown option ${a}`);
+    else pos.push(a);
+  }
+  if (pos.length !== 2) throw new Error(`expected 2 paths, got ${pos.length}`);
+  if (!/^[0-9]+$/.test(opt["--chain-id"] ?? ""))
+    throw new Error("--chain-id is not a decimal chain id");
+  if (!ethers.isAddress(opt["--sp"] ?? "")) throw new Error("--sp is not an address");
+  return { pos, opt };
+}
+
 export function compareInventory(state, list, { chainId, sp, allowEmpty = false } = {}) {
   if (!state || typeof state.operators !== "object" || Array.isArray(state.operators))
     throw new Error("the state has no operators map");
@@ -48,14 +76,19 @@ export function compareInventory(state, list, { chainId, sp, allowEmpty = false 
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const pos = [];
-  const opt = {};
-  const argv = process.argv.slice(2);
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--allow-empty") opt.allowEmpty = true;
-    else if (argv[i] === "--chain-id" || argv[i] === "--sp") opt[argv[i]] = argv[++i];
-    else pos.push(argv[i]);
+  // strict (DSR 2026-11-18, clestons #453 Low): this is the deploy-day positive control, so an
+  // ambiguous command line is refused rather than read one way
+  let parsed;
+  try {
+    parsed = parseArgs(process.argv.slice(2));
+  } catch (e) {
+    console.error(`compare-inventory: ${e.message}`);
+    console.error(
+      "usage: compare-inventory.mjs <state.json> <sp-operators.json> --chain-id <id> --sp <SP proxy> [--allow-empty]"
+    );
+    process.exit(2);
   }
+  const { pos, opt } = parsed;
   const [statePath, listPath] = pos;
   const flag = k => opt[k];
   if (!statePath || !listPath || !flag("--chain-id") || !flag("--sp")) {

@@ -171,6 +171,21 @@ a missed one.
      - A replay that fails, or is not finished, therefore keeps the rounds full
        and resumes where it stopped. It is never counted as done.
      - Forward classification of new blocks is separate and runs every round.
+     - **A round can be clear while a replay is in progress** (DSR 2026-11-18,
+       clestons #453 Low). The replay is a daily second ask of history that was
+       already classified once, like the 24 h between two replays, so it does
+       not hold back clear. With the default 2,000,000-block segments, a replay
+       normally finishes in its first full round.
+       - A replay unfinished 48 h after it began raises
+         `replay-overdue:<clock>`. It is a warning and does not change clear.
+       - A deployed config's `classifyMaxBlocks` is at least 10,000, far above
+         the blocks one hourly round adds (about 300 on Sepolia, 1800 on OP), so
+         a replay always outruns the chain.
+     - **The known-event set is fingerprinted** (`knownSet`): the pin's
+       `spEvents` (so a new tag), `knownProxyEvents`, and the configured topics.
+       When it changes, for example an event is removed from `knownProxyEvents`,
+       every log is classified again from `startBlock` at once (`reclassify`).
+       Rounds are not clear until that is done; verification is not reset.
    - The cross-check classifies too: it asks the fallback both ways, filtered
      and unfiltered.
    - Blocks above finalized are classified against B's ancestry. An unknown
@@ -390,6 +405,7 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   | A comparison that reaches less than a standing disagreement, or than an earlier completed one, settles nothing                                                                                             | `H1-R2: a standing disagreement is cleared only by a comparison that reaches its height`; `H1-R2: a cross-check whose H is below what an earlier one covered is incomplete`; `High B: a shorter comparison that itself disagrees does not replace a standing disagreement`                                                                                                                                        |
   | Every provider's round does the full rescan when its 24 h are up; only the primary's moves `lastFullScan`                                                                                                  | `B1'': the primary misses OP2 at 130 and then goes down: …`; `B1'': the fallback's rescan recurs every 24 h: …`; `N6: a fallback round's due full rescan is recorded apart (lastFallbackFullScan), never as the primary's`                                                                                                                                                                                        |
   | The daily replay (inventory and classification) completes before its clock moves: a failed or unfinished replay resumes, in segments, until it reaches finalized                                           | `#453 H1: a full round whose replay fails does not move the daily clock; …`; `#453 H2: a replay longer than classifyMaxBlocks goes in segments with its own cursor; …`                                                                                                                                                                                                                                            |
+  | Classification is redone from `startBlock` whenever the known-event set changes (a new pin, `knownProxyEvents`, or the topics)                                                                             | `#453 L2: removing an event from knownProxyEvents classifies everything again at once: …`                                                                                                                                                                                                                                                                                                                         |
   | No round is clear before a first cross-check has completed                                                                                                                                                 | `(b): a fresh or lost state is never clear before a first cross-check completes (coveredTo starts at 0)`; `N5: a first cross-check with the fallback's finalized block below startBlock is not completed`                                                                                                                                                                                                         |
   | Coverage more than 3 days behind the inventory is `unknown`                                                                                                                                                | `High A: coverage up to 3 days of blocks behind the inventory still reads clear; one block more is unknown`                                                                                                                                                                                                                                                                                                       |
   | Additions from cross-checks are capped; after an overflow every round stays `unknown` until an operator resets it                                                                                          | `N8: 100 invented operators (within the cap) …`; `N8: a lying fallback's 1,001 invented operators: …`; `N8 overflow (Codex pre-push, DSR 2026-11-18): …`; `N8+N2: with the cap used up and the last comparison clean, an over-cap finding survives a failed re-query: not clear`                                                                                                                                  |
@@ -732,7 +748,8 @@ secret-file reader, called with the detector's own name table) and
          Later, or with no throttle, a rate-limited primary hands over as usual.
          So does a primary that is down (clestons #453).
        - the throttle is reset once the watermark is within 4096 blocks of B, so
-         it cannot stay armed after catch-up has ended.
+         it cannot stay armed after catch-up has ended. A `lastThrottledAt` in
+         the future (a clock that was ahead) counts as no throttle record.
 3. Create the secrets as 0600 files in a 0700 directory, without argv or
    history:
    - `aoa-dvt-detector-rpc-primary` and `aoa-dvt-detector-rpc-fallback` (RPC
@@ -805,6 +822,10 @@ secret-file reader, called with the detector's own name table) and
    - An empty SP list fails (exit 1): an empty read-back is more likely a failed
      one. `--allow-empty` passes it only when SP truly has no configured
      operator (clestons #453).
+   - The command line is strict: exactly the two paths; `--chain-id` (decimal)
+     and `--sp` once each; anything else, including an extra path, a repeated
+     option or an unknown one, exits 2. An ambiguous command line would make an
+     ambiguous control.
    - The list is the **configured operators**: those with an
      `OperatorConfigured` on SP and `isConfigured` true. It is not the members
      of the `PAYMASTER_SUPER` role. SP's read-back of 2026-11-18 found five role

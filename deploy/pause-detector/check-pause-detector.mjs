@@ -78,7 +78,7 @@ import {
   recordStop,
   symlinkProblems,
 } from "./lib/guard.mjs";
-import { compareInventory } from "./compare-inventory.mjs";
+import { compareInventory, parseArgs } from "./compare-inventory.mjs";
 import { readSecretFile } from "../pause-job/lib/secret-file.mjs";
 import { scanSource, scanTree } from "./no-signing-scan.mjs";
 import {
@@ -3735,6 +3735,145 @@ await cell(
     assert(
       st.unknownTopicsOverflow === true && !("unknownTopicsMore" in st) && !r.report.clear,
       "the legacy count was dropped"
+    );
+  }
+);
+
+// ---- clestons #453 Lows (DSR 2026-11-18) ----------------------------------------------------------
+await cell(
+  "#453 L2: removing an event from knownProxyEvents classifies everything again at once: the now-unknown event makes the next round unknown",
+  async () => {
+    const X = { signature: UNKNOWN_SIG, topic0: UNKNOWN_T0, source: "test" };
+    const withX = cfgOf({ knownProxyEvents: [X] });
+    const w = world({ otherLogs: [{ block: 140, topic0: UNKNOWN_T0 }] });
+    const st = emptyState(withX);
+    const r1 = await round(w, withX, st);
+    assert(r1.report.clear && st.classifiedTo === 250, r1.alerts.map(a => a.key).join(","));
+    const without = cfgOf(); // X is no longer listed: an ordinary (not daily) round an hour later
+    const r2 = await round(w, without, st, 1e12 + 3600_000);
+    assert(
+      r2.alerts.some(a => a.key === "reclassify"),
+      r2.alerts.map(a => a.key).join(",")
+    );
+    assert(
+      st.unknownTopics[UNKNOWN_T0] === 140 && !r2.report.clear,
+      JSON.stringify(st.unknownTopics)
+    );
+  }
+);
+await cell(
+  "#453 L3: a deployed config's classifyMaxBlocks has a floor; a round still accepts small values for cells",
+  () => {
+    const c = JSON.parse(readFileSync(join(HERE, "config.example.json"), "utf8"));
+    c.classifyMaxBlocks = 9_999;
+    assert(
+      configProblems(c).some(p => /classifyMaxBlocks must be 10000\.\./.test(p)),
+      "a too-small value accepted"
+    );
+    c.classifyMaxBlocks = 10_000;
+    assert(!configProblems(c).some(p => /classifyMaxBlocks/.test(p)), "the floor itself refused");
+  }
+);
+await cell(
+  "#453 L3: a replay unfinished after 48 h raises replay-overdue (a warning: the round's clear is unchanged)",
+  async () => {
+    const cfg = cfgOf({ classifyMaxBlocks: 60 });
+    const st = emptyState(cfg);
+    const w = world();
+    let t = 1e12;
+    for (let k = 0; k < 12 && !(st.lastFullScan > 0); k++, t += 3600_000)
+      await round(w, cfg, st, t);
+    assert(st.lastFullScan > 0 && st.classifiedTo === 250, "setup");
+    const T = st.lastFullScan + 25 * 3600_000; // the next replay starts: one 60-block segment
+    const a = await round(w, cfg, st, T);
+    assert(
+      a.report.clear && !a.alerts.some(x => x.key.startsWith("replay-overdue")),
+      "overdue too early"
+    );
+    const b = await round(w, cfg, st, T + 49 * 3600_000); // its second segment, 49 h later
+    assert(
+      b.alerts.some(x => x.key === "replay-overdue:lastFullScan") && b.report.clear,
+      `${b.report.clear} ${b.alerts.map(x => x.key).join(",")}`
+    );
+  }
+);
+await cell(
+  "#453 L4: a lastThrottledAt in the future counts as no throttle record: the fallback takes over",
+  async () => {
+    const cfg = cfgOf();
+    const up = fakeChain(world());
+    const rl = {
+      chainId: async () => {
+        throw limited();
+      },
+    };
+    const c = await chooseProvider(
+      [
+        { name: "alchemy", chain: rl },
+        { name: "infura", chain: up },
+      ],
+      cfg,
+      { catchUpThrottle: 1, lastThrottledAt: Date.now() + 3600_000 }
+    );
+    assert(c.provider === "infura", "a future throttle record kept the fallback away");
+  }
+);
+await cell(
+  "#453 L5: compare-inventory's command line is strict: extra paths, repeated or unknown options, missing values exit 2",
+  () => {
+    const ok = ["s.json", "o.json", "--chain-id", "11155111", "--sp", SP];
+    assert(parseArgs(ok).pos.length === 2, "a valid command line refused");
+    for (const [argv, why] of [
+      [[...ok, "extra.json"], "an extra path"],
+      [[...ok, "--chain-id", "11155111"], "a repeated --chain-id"],
+      [[...ok, "--allow-empty", "--allow-empty"], "a repeated --allow-empty"],
+      [[...ok, "--force"], "an unknown option"],
+      [["s.json", "o.json", "--chain-id", "--sp", SP], "a missing value"],
+      [["s.json", "o.json", "--chain-id", "0xaa36a7", "--sp", SP], "a non-decimal chain id"],
+      [["s.json", "--chain-id", "11155111", "--sp", SP], "one path"],
+    ]) {
+      let threw = false;
+      try {
+        parseArgs(argv);
+      } catch {
+        threw = true;
+      }
+      assert(threw, `accepted ${why}`);
+    }
+    const r = spawnSync(
+      process.execPath,
+      [join(HERE, "compare-inventory.mjs"), ...ok, "extra.json"],
+      { encoding: "utf8" }
+    );
+    assert(r.status === 2, `the CLI exit ${r.status}`);
+  }
+);
+
+await cell(
+  "#453 L3 (Codex): a future replay start is reset to now; an overdue replay still warns on a round run by the other provider",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    await round(world(), cfg, st);
+    st.replayStartedAt = { lastFullScan: 1e12 + 10 * 86_400_000 }; // a clock that was ahead
+    await round(world(), cfg, st, 1e12 + 3600_000);
+    assert(
+      !(st.replayStartedAt.lastFullScan > 1e12 + 3600_000),
+      `kept ${st.replayStartedAt.lastFullScan}`
+    );
+    // the primary's replay began 49 h ago and is unfinished; this round runs on the fallback
+    st.replayStartedAt = { lastFullScan: 1e12 + 7200_000 - 49 * 3600_000 };
+    const w = world();
+    w.nowMs = 1e12 + 7200_000;
+    const r = await runRound(st, {
+      chain: fakeChain(w),
+      cfg,
+      now: 1e12 + 7200_000,
+      isPrimary: false,
+    });
+    assert(
+      r.alerts.some(a => a.key === "replay-overdue:lastFullScan"),
+      r.alerts.map(a => a.key).join(",")
     );
   }
 );

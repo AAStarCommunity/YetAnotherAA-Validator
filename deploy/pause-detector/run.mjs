@@ -21,6 +21,7 @@ import {
   catchUpProblems,
   knownEventProblems,
   classifyMaxProblems,
+  CLASSIFY_MIN_BLOCKS,
   isRateLimited,
 } from "./lib/detect.mjs";
 import {
@@ -99,7 +100,7 @@ export function configProblems(c) {
   p.push(...topicProblems(c.operatorConfiguredTopics));
   p.push(...catchUpProblems(c.catchUp));
   p.push(...knownEventProblems(c.knownProxyEvents));
-  p.push(...classifyMaxProblems(c.classifyMaxBlocks));
+  p.push(...classifyMaxProblems(c.classifyMaxBlocks, CLASSIFY_MIN_BLOCKS));
   return p;
 }
 
@@ -280,6 +281,13 @@ export function crossCheckPlan(provider, cfg) {
  * [{ name, chain }] in order, primary first. Throws a SafeError when no round can run.
  */
 export const PROBE_SKIP_MS = 2 * 3600_000;
+/** How long ago the last throttled catch-up round was, or null (none, or in the future). Pure. */
+export const throttleAge = (st, nowMs) => {
+  const t = st?.lastThrottledAt;
+  if (!Number.isFinite(t)) return null;
+  const age = nowMs - t;
+  return age >= 0 ? age : null;
+};
 export async function chooseProvider(probes, cfg, st) {
   const stale = [];
   for (const [i, pr] of probes.entries()) {
@@ -299,7 +307,10 @@ export async function chooseProvider(probes, cfg, st) {
         i === 0 &&
         isRateLimited(e) &&
         (st?.catchUpThrottle ?? 0) > 0 &&
-        Date.now() - (st?.lastThrottledAt ?? 0) < PROBE_SKIP_MS
+        // a lastThrottledAt in the future (a clock that was ahead) counts as no throttle record
+        // (clestons #453 Low): it would otherwise keep the fallback away indefinitely
+        throttleAge(st, Date.now()) !== null &&
+        throttleAge(st, Date.now()) < PROBE_SKIP_MS
       )
         throw new SafeError(
           `the primary RPC (${pr.name}) rate-limited the probe after a throttled catch-up round: this round is skipped, not run on the fallback`
