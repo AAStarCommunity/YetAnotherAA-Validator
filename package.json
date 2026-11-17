@@ -43,6 +43,7 @@
     "check:pause-job": "node deploy/pause-job/check-pause-job.mjs",
     "check:pause-job-pin": "node deploy/pause-job/gen-sp-pin.mjs --check",
     "check:pause-detector": "node deploy/pause-detector/check-pause-detector.mjs",
+    "check:audit-gate": "node scripts/ci/check-audit-decide.mjs",
     "e2e:committee": "node scripts/e2e/committee-e2e.mjs",
     "e2e:selftest": "node scripts/e2e/selftest.mjs",
     "check:pin-rate": "node scripts/check-pin-rate.mjs"
