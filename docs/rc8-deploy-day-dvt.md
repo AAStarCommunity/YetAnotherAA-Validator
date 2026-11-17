@@ -189,6 +189,23 @@ Before signing in the SAFE, the signers check:
 
 `cast calldata-decode` with the signature above prints these fields.
 
+**A guardian that comes back after a completed exit** (SP BLSAggregator-4.14.2,
+Daybreak M-01; DSR 2026-11-17). From 4.14.2, `consumeGuardianExit` also suspends
+the guardian and revokes its BLS key. Re-staking to get `ROLE_DVT` back does not
+restore it. Until it is re-registered, its proposals revert `ValidatorSuspended`
+and its signatures do not count (`UnknownValidatorSlot`). So the SAFE path for
+such a guardian is two steps, in this order:
+
+1. The owner (the SAFE) lifts the suspension on the aggregator.
+2. Re-register the key with a **new** PoP: `--export-pop` again, then the SAFE
+   signs as above.
+
+The script refuses a suspended guardian before it sends or exports anything
+(`reregister-guardians.mjs`, the `suspended(validator)` check: "is suspended on
+this aggregator — SP reverts ValidatorSuspended"). It never lifts a suspension
+itself. Deploy day's A10 registers guardians on a new aggregator, none of which
+has exited, so it is not affected.
+
 ### Interface
 
 Checked against SP main `b5e7544e3970eab24dc9a3412366140207e36b28`
