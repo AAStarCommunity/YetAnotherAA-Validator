@@ -66,8 +66,9 @@ if (!KEY) {
   );
   process.exit(1);
 }
-// Parse the key once, here, so a malformed key fails at startup with no echo: ethers can put the
-// offending text in its exception, and the watch loop logs exceptions (Codex round 2 on #rc8, M2).
+// Validate the key at startup, so a malformed key fails here with no echo: ethers can put the offending
+// text in its exception, and the watch loop logs exceptions. Each tick still builds its own wallet from
+// the same, now-validated string (Codex review of the rc.8 branch, round 2 M2 and PR round L1).
 try {
   new ethers.Wallet(KEY);
 } catch {

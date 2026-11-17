@@ -79,7 +79,8 @@ const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
 // KEEPER_PRIVATE_KEY ONLY. applyFraudProofVerifier is permissionless, so no owner or deployer key is
 // ever needed; the old fallbacks (PRIVATE_KEY / OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY) all resolve
 // to the deployer EOA 0xb5600060 in SuperPaymaster/.env.sepolia, which local-heartbeat.sh reads.
-// The CI workflow already passes a dedicated throwaway as KEEPER_PRIVATE_KEY (DSR 2026-11-17).
+// The CI workflow maps secrets.APPLY_KEEPER_KEY to KEEPER_PRIVATE_KEY; that the secret is a dedicated
+// throwaway is an operational requirement, not something this script can check (DSR 2026-11-17).
 const KEY = pick("KEEPER_PRIVATE_KEY");
 
 const ABI = [
