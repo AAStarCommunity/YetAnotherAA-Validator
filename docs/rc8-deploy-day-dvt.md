@@ -193,16 +193,19 @@ Before signing in the SAFE, the signers check:
 
 Checked against SP main `b5e7544e3970eab24dc9a3412366140207e36b28`
 (BLSAggregator-4.14.0, DVTValidator-0.8.0). SP #633 moves main to 4.14.1 / 0.8.1
-and step 4 (SP #635) moves the DVTValidator to 0.9.0. Rechecked at #635's head
-`d55f76f8ac379718e47e7f5c1d8fa46467914d69` (unmerged; BLSAggregator-4.14.1,
-DVTValidator-0.9.0): `BLSAggregator.sol` is byte-identical to `1845b124`, so
-`popDigest`, `domainSeparator()` and the aggregator's registration gate are
-unchanged; `registerBLSPublicKey` is unchanged (selector `0xaded17c5`). What
-0.9.0 changes is the DVTValidator constructor, now
+and step 4 (SuperPaymaster#635) moves the DVTValidator to 0.9.0. #635 merged as
+`053117cc8ca31eb69ae1f62755a1d7790e71190f` (SP main), whose tree is identical to
+the head rechecked here, `d55f76f8ac379718e47e7f5c1d8fa46467914d69` (GitHub's
+compare: no file changed; the DVTValidator, BLSAggregator and foundry.toml blobs
+match). At that commit (BLSAggregator-4.14.1, DVTValidator-0.9.0):
+`BLSAggregator.sol` is byte-identical to `1845b124`, so `popDigest`,
+`domainSeparator()` and the aggregator's registration gate are unchanged;
+`registerBLSPublicKey` is unchanged (selector `0xaded17c5`). What 0.9.0 changes
+is the DVTValidator constructor, now
 `(registry, firstProposalId, bytes32[] categories, address[] checkers)`; rc.8
 passes two empty lists (`categoryCount() == 0`). The script holds no version
 string: `--expect-versions` takes them from the tag's tree. Check the interface
-again against the step-4 merge commit.
+again against the tag commit at the rc.8 freeze.
 
 ```
 DVTValidator.registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point pop)
@@ -232,8 +235,9 @@ pre-deployment flow is `deploy/rehearse-reregister-plan.sh` (`good` and
 `1845b124` (BLSAggregator-4.14.1, DVTValidator-0.8.1): `good` exit 0,
 `nonce-moved` exit 3, both generations reporting the expected versions. With the
 0.9.0 constructor it passed on #635's head `d55f76f8` (BLSAggregator-4.14.1,
-DVTValidator-0.9.0): `good` exit 0, `nonce-moved` exit 3 with both stops. Rerun
-it against the step-4 merge commit before this PR leaves draft:
+DVTValidator-0.9.0): `good` exit 0, `nonce-moved` exit 3 with both stops, and
+again with `SP_COMMIT` = the merge commit `053117cc` (same tree): `good` exit 0,
+`nonce-moved` exit 3, both stops firing. The flow:
 
 - **Pre-deployment flow:**
   1. Generation 1 plays the old stack.
