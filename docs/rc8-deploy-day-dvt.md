@@ -221,7 +221,10 @@ DVTValidator.registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot
 
 These ran against SP's `DeployAnvil` at `b5e7544e` with throwaway BLS keys. The
 pre-deployment flow is `deploy/rehearse-reregister-plan.sh` (`good` and
-`nonce-moved`); rerun it against the step-4 commit before this PR leaves draft:
+`nonce-moved`, with a required `EXPECT_VERSIONS`). It passed again on SP
+`1845b124` (BLSAggregator-4.14.1, DVTValidator-0.8.1): `good` exit 0,
+`nonce-moved` exit 3, both generations reporting the expected versions. Rerun it
+against the step-4 commit before this PR leaves draft:
 
 - **Pre-deployment flow:**
   1. Generation 1 plays the old stack.
