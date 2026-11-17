@@ -37,6 +37,11 @@ Both contracts get new addresses and start with empty state:
      be merged first) (`SUPERSEDED_DVT_VALIDATORS`,
      `SUPERSEDED_BLS_AGGREGATORS`), so a node with audit on refuses to start on
      them (DSR 2026-11-17).
+   - With audit or the guardian watch on, the node also refuses an address with
+     surrounding whitespace, the zero address, or a mixed-case address with a
+     wrong EIP-55 checksum (#445, #446). Such a value used to start and then
+     silently disable the watcher; it now stops startup, so check the values
+     before restarting a node.
    - A node with audit and the guardian watch off does not check the addresses;
      its startup log says "audit addresses NOT checked".
 4. Only then may any step that needs a BLS proof run. SP marks these steps in
