@@ -32,7 +32,7 @@
 // Works against BOTH validator generations: it selects `snapshotEpoch(bytes32[])` (CC-112 D2, #244) or
 // the pre-D2 `snapshotEpoch()` by looking for the selector in the deployed bytecode.
 //
-// env (.env.sepolia): SEPOLIA_RPC_URL, KEEPER_PRIVATE_KEY (or PRIVATE_KEY), COMMITTEE_VALIDATOR
+// env (.env.sepolia): SEPOLIA_RPC_URL, KEEPER_PRIVATE_KEY (required; no fallback), COMMITTEE_VALIDATOR
 // Usage: node deploy/committee-keeper.mjs            (one pass)
 //        node deploy/committee-keeper.mjs --watch    (loop every ~30s)
 import { ethers } from "ethers";
@@ -54,7 +54,28 @@ const env = Object.fromEntries(
 // the keeper at a fork at all, which is what stopped its race-handling from being testable.
 const pick = (...names) => names.map(n => process.env[n] || env[n]).find(Boolean);
 const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
-const KEY = pick("KEEPER_PRIVATE_KEY", "PRIVATE_KEY");
+// KEEPER_PRIVATE_KEY ONLY. There used to be a fallback to PRIVATE_KEY, and in this repo's
+// .env.sepolia (and SuperPaymaster's) PRIVATE_KEY is the deployer EOA 0xb5600060. A keeper whose own
+// key is missing must not quietly sign as the deployer: the deployer has no standing duty after rc.8,
+// and its nonce is pinned during an SP deploy window (DSR 2026-11-17).
+const KEY = pick("KEEPER_PRIVATE_KEY");
+if (!KEY) {
+  console.error(
+    "✗ KEEPER_PRIVATE_KEY is not set (environment or .env.sepolia). Refusing to start: this keeper\n" +
+      "  does not fall back to PRIVATE_KEY, which is the deployer EOA. Give it a dedicated funded key."
+  );
+  process.exit(1);
+}
+// Parse the key once, here, so a malformed key fails at startup with no echo: ethers can put the
+// offending text in its exception, and the watch loop logs exceptions (Codex round 2 on #rc8, M2).
+try {
+  new ethers.Wallet(KEY);
+} catch {
+  console.error(
+    "✗ KEEPER_PRIVATE_KEY is not a valid private key (value withheld). Refusing to start."
+  );
+  process.exit(1);
+}
 // PRECEDENCE, copied from committee-health.mjs:138-147 rather than approximated. A validator from
 // the ENVIRONMENT is a deliberate act and outranks a router; one left behind in an env FILE is not.
 // Deleting the repository variable does not reach a stale .env.sepolia sitting next to a developer,

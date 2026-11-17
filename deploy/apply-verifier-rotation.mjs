@@ -76,7 +76,11 @@ try {
 const pick = (...n) =>
   n.map(k => (ENV_EXPLICIT ? env[k] || process.env[k] : process.env[k] || env[k])).find(Boolean);
 const RPC = pick("SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL");
-const KEY = pick("KEEPER_PRIVATE_KEY", "PRIVATE_KEY", "OWNER_PRIVATE_KEY", "DEPLOYER_PRIVATE_KEY");
+// KEEPER_PRIVATE_KEY ONLY. applyFraudProofVerifier is permissionless, so no owner or deployer key is
+// ever needed; the old fallbacks (PRIVATE_KEY / OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY) all resolve
+// to the deployer EOA 0xb5600060 in SuperPaymaster/.env.sepolia, which local-heartbeat.sh reads.
+// The CI workflow already passes a dedicated throwaway as KEEPER_PRIVATE_KEY (DSR 2026-11-17).
+const KEY = pick("KEEPER_PRIVATE_KEY");
 
 const ABI = [
   "function version() view returns (string)",
@@ -88,6 +92,22 @@ const ABI = [
 ];
 
 async function main() {
+  // Checked FIRST when a broadcast is asked for (Codex review of 20a0088, L6): a missing key must stop
+  // the run before any read, not only once the rotation is ready to apply.
+  if (BROADCAST && KEY) {
+    // Same reason as committee-keeper.mjs: never let ethers echo a malformed key into a log.
+    try {
+      new ethers.Wallet(KEY);
+    } catch {
+      die("KEEPER_PRIVATE_KEY is not a valid private key (value withheld)");
+    }
+  }
+  if (BROADCAST && !KEY) {
+    die(
+      `no KEEPER_PRIVATE_KEY (looked in ${ENV_FILE} and the environment). This script never falls back\n` +
+        `  to PRIVATE_KEY / OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY: those are the deployer EOA.`
+    );
+  }
   if (!RPC) die(`no RPC url (looked in ${ENV_FILE} and the environment)`);
   const provider = new ethers.JsonRpcProvider(RPC);
   const at = { blockTag: await provider.getBlockNumber() };
@@ -161,7 +181,6 @@ async function main() {
     console.log(`\nReady to apply. Nothing was sent — re-run with --broadcast.`);
     return;
   }
-  if (!KEY) die(`no signing key (looked in ${ENV_FILE} and the environment)`);
   const wallet = new ethers.Wallet(KEY, provider);
   console.log(`\nsigner     : ${wallet.address}  (permissionless — no owner rights needed)`);
   const tx = await new ethers.Contract(AGGREGATOR, ABI, wallet).applyFraudProofVerifier();
