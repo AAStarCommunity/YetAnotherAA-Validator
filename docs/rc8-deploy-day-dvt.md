@@ -33,9 +33,10 @@ Both contracts get new addresses and start with empty state:
 3. The DVT nodes and the pause detector are switched to the read-back values
    (see "Settings to change" below).
    - In the same change, add the DVTValidator and aggregator being replaced to
-     the superseded lists in `src/config/audit-address-guard.ts`
-     (`SUPERSEDED_DVT_VALIDATORS`, `SUPERSEDED_BLS_AGGREGATORS`), so a node with
-     audit on refuses to start on them (DSR 2026-11-17).
+     the superseded lists in `src/config/audit-address-guard.ts` (#442; it must
+     be merged first) (`SUPERSEDED_DVT_VALIDATORS`,
+     `SUPERSEDED_BLS_AGGREGATORS`), so a node with audit on refuses to start on
+     them (DSR 2026-11-17).
    - A node with audit and the guardian watch off does not check the addresses;
      its startup log says "audit addresses NOT checked".
 4. Only then may any step that needs a BLS proof run. SP marks these steps in
@@ -129,11 +130,12 @@ Their addresses come from SP's frozen plan, which SP precomputes at the pin.
    - the GitHub workflow "Apply Verifier Rotation".
 
    Check with `launchctl list | grep io.aastar.dvt-` (neither job listed) and
-   `gh workflow list --all` (shows `disabled_manually`). Neither job falls back
-   to the deployer key any more: both take `KEEPER_PRIVATE_KEY` only and refuse
-   to run without it. That does not stop someone from putting the deployer key
-   into `KEEPER_PRIVATE_KEY`; the guarantee is "no silent fallback", not "can
-   never be the deployer". They stay off anyway.
+   `gh workflow list --all` (shows `disabled_manually`). Once #443 is merged,
+   neither job falls back to the deployer key: both take `KEEPER_PRIVATE_KEY`
+   only and refuse to run without it. Until then they do fall back, so keeping
+   them off is the only protection. That does not stop someone from putting the
+   deployer key into `KEEPER_PRIVATE_KEY`; the guarantee is "no silent
+   fallback", not "can never be the deployer". They stay off anyway.
 
 5. **A10 sends** the three calldata entries to the new **DVTValidator**
    (`popContext.dvt`). On 4.14.0 the aggregator rejects any other caller, so
@@ -230,10 +232,15 @@ the exact head with no High, plus clestons approval.
 
 ## Code changes this needs
 
-Items 1 and 3 are on branch `feat/rc8-reregister-dvt`, written against SP main
-`b5e7544e3970eab24dc9a3412366140207e36b28` (BLSAggregator-4.14.0,
-DVTValidator-0.8.0). They are checked again against SP's step-4 merge commit
-before the PR leaves draft.
+Written against SP main `b5e7544e3970eab24dc9a3412366140207e36b28`
+(BLSAggregator-4.14.0, DVTValidator-0.8.0) and checked again against SP's step-4
+merge commit before deploy day. Three separate PRs, each from master (DSR
+2026-11-17); **none of these protections exists until its PR is merged**, so
+deploy day checks each one on master:
+
+- re-registration script and this document: this PR;
+- keeper key fallback removed: #443;
+- node startup address check: #442.
 
 1. `deploy/reregister-guardians.mjs`:
    - addresses come only from SP's output: `--plan <frozen plan>` before
@@ -248,8 +255,8 @@ before the PR leaves draft.
    - re-derives the PoP domain for the new aggregator; `--expect-versions` and
      `--expect-owner` come from SP's tag tree and owner table, never from the
      script.
-   - `committee-keeper.mjs` and `apply-verifier-rotation.mjs` take
-     `KEEPER_PRIVATE_KEY` only; their old fallback to `PRIVATE_KEY` (the
+   - (#443, pending) `committee-keeper.mjs` and `apply-verifier-rotation.mjs`
+     take `KEEPER_PRIVATE_KEY` only; their old fallback to `PRIVATE_KEY` (the
      deployer EOA) is removed (DSR 2026-11-17).
 2. `src/modules/audit`: evidence is filed through
    `BlockchainService.createProposalWithEvidence` (`blockchain.service.ts`).
@@ -258,12 +265,12 @@ before the PR leaves draft.
    fragment (`blockchain.service.ts:1854`) matches `abis/DVTValidator.json` at
    `b5e7544e`. Check it again against the step-4 code. The node keeps no
    proposal-id cursor.
-3. Node startup (`src/config/audit-address-guard.ts`): with `AUDIT_ENABLED` or
-   `AUDIT_GUARDIAN_WATCH_ENABLED` on, the node refuses to start when
-   `AUDIT_DVT_VALIDATOR_ADDRESS` or `AUDIT_BLS_AGGREGATOR_ADDRESS` is empty or
-   on the superseded list. With both off it does not check and logs that it did
-   not (DSR 2026-11-17). The code defaults in `configuration.ts` move to the
-   read-back values in a PR after the read-back.
+3. (#442, pending) Node startup (`src/config/audit-address-guard.ts`): with
+   `AUDIT_ENABLED` or `AUDIT_GUARDIAN_WATCH_ENABLED` on, the node refuses to
+   start when `AUDIT_DVT_VALIDATOR_ADDRESS` or `AUDIT_BLS_AGGREGATOR_ADDRESS` is
+   empty or on the superseded list. With both off it does not check and logs
+   that it did not (DSR 2026-11-17). The code defaults in `configuration.ts`
+   move to the read-back values in a PR after the read-back.
 4. The sp-parity pin (`ci/sp-parity-pin`) is set to SP's step-4 merge commit.
 
 ## Operations notes from SP #630 (BLSAggregator-4.14.0)

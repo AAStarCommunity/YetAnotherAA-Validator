@@ -159,10 +159,12 @@ const DEPLOYMENT_FILE = flag("--deployment");
 // (SuperPaymaster docs/security/rc8-owner-table.md), never from this file (DSR 2026-11-17).
 const EXPECT_OWNER = flag("--expect-owner");
 const ENV_FILE = flag("--env") || process.env.DVT_ENV_FILE || ".env.sepolia";
-const NODE_FILES = (flag("--nodes") || DEFAULT_NODES.join(","))
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+const NODE_FILES = (flag("--nodes") ?? DEFAULT_NODES.join(",")).split(",").map(s => s.trim());
+// Codex round 3, L6: `--nodes ,` used to become an empty list and a "successful" zero-registration run.
+if (NODE_FILES.length === 0 || NODE_FILES.some(f => f === "")) {
+  console.error("\n✗ --nodes needs a comma-separated list of node files with no empty entries");
+  process.exit(1);
+}
 // The version() strings both contracts must return, e.g.
 // "BLSAggregator-4.14.1,DVTValidator-0.8.1". Taken from the rc.8 tag's tree, never written here.
 const EXPECT_VERSIONS_RAW = flag("--expect-versions");
@@ -681,7 +683,11 @@ async function exportFromPlan({ provider, chainId }) {
     try {
       node = JSON.parse(readFileSync(file, "utf8"));
     } catch (e) {
-      die(`cannot read node file ${file}: ${e.message}`);
+      // Never the exception text: a JSON parse error can quote the file, and the file holds a BLS
+      // secret that scrub() does not know (Codex round 3, M1).
+      die(
+        `cannot read node file ${file}: ${e.code === "ENOENT" ? "no such file" : "unreadable or not valid JSON"} (details withheld)`
+      );
     }
     const label = `${file} (${node.nodeName ?? "?"})`;
     const validator = node.operator;
@@ -979,7 +985,11 @@ async function main() {
     try {
       node = JSON.parse(readFileSync(file, "utf8"));
     } catch (e) {
-      die(`cannot read node file ${file}: ${e.message}`);
+      // Never the exception text: a JSON parse error can quote the file, and the file holds a BLS
+      // secret that scrub() does not know (Codex round 3, M1).
+      die(
+        `cannot read node file ${file}: ${e.code === "ENOENT" ? "no such file" : "unreadable or not valid JSON"} (details withheld)`
+      );
     }
     const label = `${file} (${node.nodeName ?? "?"})`;
     const validator = node.operator;
