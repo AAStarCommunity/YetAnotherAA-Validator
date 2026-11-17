@@ -1,3 +1,5 @@
+import { assertAuditAddresses, auditAddressStatusLine } from "./audit-address-guard.js";
+
 export default () => {
   // Validate required environment variables
   const requiredVars = ["ETH_RPC_URL", "VALIDATOR_CONTRACT_ADDRESS"];
@@ -10,6 +12,10 @@ export default () => {
     );
   }
 
+  // Refuse to start when audit or the guardian watch is on but either SP address is unset or
+  // superseded (rc.8, DSR 2026-11-15). See audit-address-guard.ts.
+  assertAuditAddresses(process.env);
+
   const port = parseInt(process.env.PORT || "3000", 10);
 
   console.log("✅ Environment configuration validated successfully");
@@ -17,6 +23,7 @@ export default () => {
   console.log(`   - ETH RPC URL: ${process.env.ETH_RPC_URL}`);
   console.log(`   - Port: ${port}`);
   console.log(`   - Node State File: node_state.json (fixed)`);
+  console.log(`   - ${auditAddressStatusLine(process.env)}`);
 
   return {
     // Server
