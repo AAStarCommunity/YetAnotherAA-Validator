@@ -129,6 +129,25 @@ describe("audit address guard (rc.8 startup assertion)", () => {
     }
   });
 
+  it("a mixed-case address with a bad EIP-55 checksum → refused (#445 review note 1)", () => {
+    const p = auditAddressProblems({
+      AUDIT_ENABLED: "true",
+      ...good,
+      AUDIT_BLS_AGGREGATOR_ADDRESS: "0xabcDEF1234ABCDEf1234ABcdef1234ABCDef1234",
+    });
+    expect(p).toHaveLength(1);
+    expect(p[0]).toContain("EIP-55");
+  });
+
+  it("CONTROL: correctly checksummed, all-lowercase and all-uppercase addresses are accepted", () => {
+    const sum = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"; // EIP-55 reference vector
+    for (const a of [sum, sum.toLowerCase(), "0x" + sum.slice(2).toUpperCase()]) {
+      expect(
+        auditAddressProblems({ AUDIT_ENABLED: "true", ...good, AUDIT_BLS_AGGREGATOR_ADDRESS: a })
+      ).toEqual([]);
+    }
+  });
+
   it("the zero address → refused (#442 review L2)", () => {
     const p = auditAddressProblems({
       AUDIT_ENABLED: "true",
