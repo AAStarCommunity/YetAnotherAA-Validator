@@ -237,24 +237,36 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
     provider whose answers built it. Only the configured fallback compares, and
     only on a round that the configured primary ran (`crossCheckPlan`,
     `run.mjs`). A round that ran on the fallback records an incomplete attempt
-    instead. Residual: blocks that the fallback itself added to the inventory,
-    on rounds when the primary failed its probe, are compared against the
-    fallback's own answers until the primary's next daily full rescan re-reads
-    them.
-  - An operator only the fallback has: the primary's index missed it. Every
-    round is `unknown` and the alert names it, and it is checked every round
-    from then on. The check is repeated every round while the two disagree. **It
-    leaves the disagreement only** when it is in the inventory (then every round
-    checks it), or when the same provider that found it, over at least the
-    height at which it found it, no longer reports it (clestons #448 B1/B2: a
-    lower comparison, or one by the inventory's builder, cannot clear it).
+    instead, and does no daily full rescan (clestons #448 N6: only the primary's
+    rounds do, and record it). Residual: blocks that the fallback itself added
+    to the inventory, on rounds when the primary failed its probe, are compared
+    against the fallback's own answers until the primary's next daily full
+    rescan re-reads them.
+  - An operator only the fallback has: the primary's index missed it. That round
+    is `unknown` and the alert names it. The operator **enters the inventory at
+    once**, recorded in `fromCrossCheck` as the fallback's, so its stake is
+    checked from the next round on (clestons #448 B1', DSR 2026-11-17). Entering
+    the inventory is its **only** way out of the disagreement. A later
+    comparison that no longer reports it, whether by the same provider or a
+    lower or self-comparison, does not count: its log was seen on a finalized,
+    hash-checked block. The failure direction is safe. An operator only enters
+    the list of addresses to read; whether it is reported comes from the
+    primary's chain reads at B and SP's own `pauseUnderstakedOperator`
+    simulation. So one that a lying fallback invents reads `not-configured` (a
+    notice), never `PAUSE NEEDED`, and a manual pause of it reverts
+    `OperatorNotConfigured`.
+  - A first comparison whose height is below `startBlock` compares nothing and
+    is not a completed cross-check (clestons #448 N5).
   - An inventory entry the other provider lacks is asked of the primary again,
     by operator: if the primary has no such log either, it is a harmless
     superset entry (a block that later left the chain) and not a disagreement;
     otherwise it is one too, named the same way. The inventory entries the
     fallback lacks are re-asked in one `getLogs` per chunk, with up to 50
     operators as an OR topic; more than 1000 such entries make the attempt
-    incomplete (clestons #448 N1).
+    incomplete (clestons #448 N1). More than 1000 harmless superset entries
+    therefore keep every attempt incomplete. That fails safe (3 days later,
+    `crosscheck-incomplete` and then `crosscheck-behind`) and costs availability
+    only (clestons #448 N7, accepted).
   - If the fallback cannot answer, the day is recorded as incomplete
     (`status.json` `report.crossCheck`). Three incomplete days in a row raise
     `the daily inventory cross-check … has not completed for N days`.

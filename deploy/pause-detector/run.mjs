@@ -396,7 +396,13 @@ export async function main() {
     }
     let result;
     try {
-      result = await runRound(st, { chain, cfg, now, clock: () => Date.now() });
+      result = await runRound(st, {
+        chain,
+        cfg,
+        now,
+        clock: () => Date.now(),
+        isPrimary: provider === cfg.rpc.primary,
+      });
     } catch (e) {
       result = {
         alerts: [{ key: "round", text: `unknown: the round stopped (${safeText("round", e)})` }],

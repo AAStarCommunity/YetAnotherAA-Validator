@@ -1550,10 +1550,9 @@ await cell(
       r.alerts.some(x => x.key === `actionable:${ethers.getAddress(OP2)}`),
       r.alerts.map(x => x.key).join(",")
     );
-    assert(
-      !(ethers.getAddress(OP2) in st.operators),
-      "fallback-only entered the primary inventory"
-    );
+    // clestons #448 B1' (DSR 2026-11-17): it entered the inventory, recorded as the fallback's
+    assert(ethers.getAddress(OP2) in st.operators, "fallback-only did not enter the inventory");
+    assert(st.fromCrossCheck?.[ethers.getAddress(OP2)]?.provider === "infura", "no provenance");
   }
 );
 await cell(
@@ -2016,14 +2015,9 @@ await cell(
       cfg: cfgOf(),
       now: 1e12 + 2000,
     });
-    assert(
-      st.crossCheck.mismatch?.fallbackOnly?.includes(ethers.getAddress(OP2)),
-      "self-comparison cleared it"
-    );
-    assert(
-      st.crossCheck.mismatch.found[ethers.getAddress(OP2)].provider === "infura",
-      "finder lost"
-    );
+    // OP2 entered the inventory when the fallback found it (B1'), the one way out of the
+    // disagreement: a self-comparison cannot take it out again, and it stays checked
+    assert(ethers.getAddress(OP2) in st.operators, "OP2 left the inventory");
     await stillFlagged(primaryW, st, 1e12 + 3000);
   }
 );
@@ -2122,6 +2116,101 @@ await cell("N3: the head's age is compared unrounded", () => {
   assert(headStale({ timestamp: t - 1800 }, now + 400, 1800), "1800.4 s old accepted");
   assert(!headStale({ timestamp: t - 1800 }, now, 1800), "control: exactly 1800 s is accepted");
 });
+
+// ---- clestons #448 B1', N5, N6 (DSR 2026-11-17) --------------------------------------------------
+await cell(
+  "B1': the same fallback missing OP2 at the same height later does not clear it: OP2 stays checked",
+  async () => {
+    const { ops, primaryW, st } = await disputed();
+    // a later daily check: the same provider (infura), same H, now misses block 130 (index jitter)
+    await cross(st, primaryW, world({ ops, hidden: new Set([130]) }), 1e12 + 1000 + CROSS_CHECK_MS);
+    assert(ethers.getAddress(OP2) in st.operators, "OP2 left the inventory");
+    await stillFlagged(primaryW, st, 1e12 + 2000 + CROSS_CHECK_MS);
+  }
+);
+await cell("B1': a fallback that keeps missing OP2 for days never clears it", async () => {
+  const { ops, primaryW, st } = await disputed();
+  for (let d = 1; d <= 4; d++)
+    await cross(
+      st,
+      primaryW,
+      world({ ops, hidden: new Set([130]) }),
+      1e12 + 1000 + d * CROSS_CHECK_MS
+    );
+  assert(ethers.getAddress(OP2) in st.operators, "OP2 left the inventory");
+  await stillFlagged(primaryW, st, 1e12 + 2000 + 4 * CROSS_CHECK_MS);
+});
+await cell(
+  "B1': an operator a lying fallback invents enters the inventory but only ever reads not-configured",
+  async () => {
+    const w = world();
+    const st = await inventoried(w);
+    const Z = "0x3333333333333333333333333333333333333333";
+    // the fallback reports Z at block 140; on chain (the primary's reads at B) Z is not configured
+    const lying = world({
+      ops: {
+        ...w.ops,
+        [Z]: { configured: false, paused: false, role: false, eff: 0n, logBlock: 140 },
+      },
+    });
+    await cross(st, w, lying, 1e12 + 1000);
+    assert(ethers.getAddress(Z) in st.operators, "not inventoried");
+    const r = await round(w, cfgOf(), st, 1e12 + 2000);
+    assert(
+      !r.alerts.some(a => a.key.startsWith("actionable:")),
+      "a PAUSE NEEDED for an invented operator"
+    );
+    assert(
+      r.alerts.some(a => a.key === `not-configured:${ethers.getAddress(Z)}`),
+      r.alerts.map(a => a.key).join(",")
+    );
+  }
+);
+await cell(
+  "N5: a first cross-check with the fallback's finalized block below startBlock is not completed",
+  async () => {
+    const cfg = cfgOf();
+    const w = world();
+    const st = freshState(cfg);
+    await round(w, cfg, st, 1e12);
+    await cross(st, w, world({ finalized: 50 }), 1e12 + 1000);
+    assert(
+      st.crossCheck.lastComplete === 0 && st.crossCheck.failedDays === 1,
+      JSON.stringify(st.crossCheck)
+    );
+    assert(/below startBlock/.test(st.crossCheck.lastError ?? ""), st.crossCheck.lastError);
+    const r = await round(w, cfg, st, 1e12 + 2000);
+    assert(
+      !r.report.clear && r.alerts.some(a => a.key === "crosscheck-pending"),
+      r.alerts.map(a => a.key).join(",")
+    );
+  }
+);
+await cell(
+  "N6: a round on the fallback does not do or record the daily full rescan; the primary's does",
+  async () => {
+    const cfg = cfgOf();
+    const w = world();
+    const st = await inventoried(w);
+    const before = st.lastFullScan;
+    const later = 1e12 + 25 * 3600_000; // the daily full rescan is due
+    w.nowMs = later;
+    w.scanned = [];
+    await runRound(st, { chain: fakeChain(w), cfg, now: later, isPrimary: false });
+    assert(st.lastFullScan === before, "a fallback round recorded the full rescan");
+    assert(
+      !w.scanned.some(([a]) => a === cfg.startBlock),
+      `a fallback round re-read from startBlock: ${JSON.stringify(w.scanned)}`
+    );
+    w.scanned = [];
+    w.nowMs = later + 1000;
+    await runRound(st, { chain: fakeChain(w), cfg, now: later + 1000, isPrimary: true });
+    assert(
+      st.lastFullScan === later + 1000 && w.scanned.some(([a]) => a === cfg.startBlock),
+      "the primary's full rescan did not run"
+    );
+  }
+);
 
 await cell("state: a malformed crossCheck record is refused", () => {
   const st = emptyState(cfgOf());

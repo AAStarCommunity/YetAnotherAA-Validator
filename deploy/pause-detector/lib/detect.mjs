@@ -192,6 +192,21 @@ export function stateProblems(st, cfg) {
     p.push("the state's alerts has a time that is not a number");
   // both are optional (a state written before Daybreak r1 has neither; they start empty)
   if (
+    st.fromCrossCheck !== undefined &&
+    !(
+      plainObject(st.fromCrossCheck) &&
+      Object.entries(st.fromCrossCheck).every(
+        ([k, v]) =>
+          ADDRESS.test(k) &&
+          plainObject(v) &&
+          typeof v.provider === "string" &&
+          Number.isSafeInteger(v.block) &&
+          Number.isFinite(v.at)
+      )
+    )
+  )
+    p.push("the state's fromCrossCheck is not a map of operators the cross-check added");
+  if (
     st.undeliveredSince !== undefined &&
     st.undeliveredSince !== null &&
     !(Number.isFinite(st.undeliveredSince) && st.undeliveredSince >= 0)
@@ -442,7 +457,10 @@ export const pauseCommand = (spProxy, op) =>
  * the caller delivers them. `clear` in the report is true ONLY when every read succeeded at a
  * canonical B with the identity confirmed and no operator is actionable or unknown.
  */
-export async function runRound(st, { chain, cfg, now = Date.now(), clock = () => now }) {
+export async function runRound(
+  st,
+  { chain, cfg, now = Date.now(), clock = () => now, isPrimary = true }
+) {
   // a state time after now (a clock that was ahead) would suppress re-alerts and the daily rescan
   // until that date: reset it first, so the progress snapshot below does not undo it (Codex R2 P2)
   const clockReset = normalizeClock(st, now);
@@ -457,7 +475,7 @@ export async function runRound(st, { chain, cfg, now = Date.now(), clock = () =>
   };
   let result;
   try {
-    result = await roundOnce(st, { chain, cfg, now, clock });
+    result = await roundOnce(st, { chain, cfg, now, clock, isPrimary });
   } catch (e) {
     Object.assign(st, before);
     throw e;
@@ -471,7 +489,7 @@ export async function runRound(st, { chain, cfg, now = Date.now(), clock = () =>
   return result;
 }
 
-async function roundOnce(st, { chain, cfg, now, clock }) {
+async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   const alerts = [];
   const sp = stateProblems(st, cfg);
   if (sp.length) throw new SafeError(`state: ${sp.join("; ")}`);
@@ -529,7 +547,9 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
       alerts,
       `the state cursor ${st.cursor} is ahead of the finalized block ${finalized}`
     );
-  const full = now - st.lastFullScan >= 24 * 3600_000;
+  // the daily full rescan is the primary's (clestons #448 N6): a round on the fallback reads only the
+  // window, and does not move lastFullScan, so the primary's next round re-reads everything
+  const full = isPrimary && now - st.lastFullScan >= 24 * 3600_000;
   const from = full ? st.startBlock : Math.max(st.startBlock, st.cursor + 1 - cfg.rescanBlocks);
   let inventoryOk = true;
   // what the number-range answers said, block by block, this round: compared below with the
@@ -862,6 +882,12 @@ export async function crossCheckInventory(
     // the comparison must keep up (Daybreak rerun High, DSR 2026-11-17): an H below what a completed
     // cross-check already covered, or more than a day of blocks behind the primary's cursor, means
     // the other provider's finalized block stalled or went back. Such an attempt is incomplete
+    // nothing below startBlock can be compared: such an attempt is not a completed cross-check
+    // (clestons #448 N5; it would otherwise satisfy "no clear before a first cross-check")
+    if (H < st.startBlock)
+      throw new SafeError(
+        `the other provider's finalized block ${otherFinal} is below startBlock ${st.startBlock}: nothing to compare`
+      );
     if (H < (cc.coveredTo ?? 0))
       throw new SafeError(
         `the other provider's finalized block ${otherFinal} is below block ${cc.coveredTo}, which an earlier cross-check covered`
@@ -877,7 +903,7 @@ export async function crossCheckInventory(
       throw new SafeError(
         `this comparison reaches block ${H}, below the standing disagreement at block ${cc.mismatch.height}`
       );
-    const theirs = new Set();
+    const theirs = new Map(); // operator -> first block the other provider has its log at
     if (H >= st.startBlock)
       await operatorLogs(
         other,
@@ -886,7 +912,10 @@ export async function crossCheckInventory(
         H,
         cfg.logChunk,
         logs => {
-          for (const lg of logs) theirs.add(opOf(lg.topics[1]));
+          for (const lg of logs) {
+            const op = opOf(lg.topics[1]);
+            if (!theirs.has(op)) theirs.set(op, Number(lg.blockNumber));
+          }
         },
         canonOf(other)
       );
@@ -898,23 +927,19 @@ export async function crossCheckInventory(
     // what the other provider has that the inventory lacks, each with who found it and how far
     // that comparison reached
     const found = {};
-    for (const op of theirs) if (!mine.has(op)) found[op] = { provider: otherName, height: H };
-    // a standing fallback-only operator is CARRIED FORWARD (clestons #448 B1/B2): it leaves the
-    // disagreement only when it is in the inventory (then every round checks it), or when the SAME
-    // provider that found it, over at least the height it found it at, no longer reports it. So a
-    // shorter comparison, or one by the provider that built the inventory, cannot clear it
-    for (const [op, f] of Object.entries(cc.mismatch?.found ?? {})) {
-      if (op in found || op in st.operators) continue;
-      const denied = f.provider === otherName && H >= f.height && !theirs.has(op);
-      if (!denied) found[op] = f;
-    }
+    for (const op of theirs.keys())
+      if (!mine.has(op)) found[op] = { provider: otherName, height: H };
+    // a standing fallback-only operator is CARRIED FORWARD (clestons #448 B1/B2/B1'): its only way
+    // out of the disagreement is the inventory. A later comparison that no longer reports it, by any
+    // provider, does not count: its log was seen on a finalized, hash-checked block and cannot
+    // legitimately disappear; a provider that stops reporting it says less, it does not refute it
+    // (DSR 2026-11-17, withdrawing the "same provider no longer reports it" exit)
+    for (const [op, f] of Object.entries(cc.mismatch?.found ?? {}))
+      if (!(op in found) && !(op in st.operators)) found[op] = f;
     // a mismatch from before `found` existed carries its fallback-only operators the same way
-    for (const op of cc.mismatch?.found ? [] : (cc.mismatch?.fallbackOnly ?? [])) {
-      if (op in found || op in st.operators) continue;
-      const m = cc.mismatch;
-      const denied = m.provider === otherName && H >= m.height && !theirs.has(op);
-      if (!denied) found[op] = { provider: m.provider, height: m.height };
-    }
+    for (const op of cc.mismatch?.found ? [] : (cc.mismatch?.fallbackOnly ?? []))
+      if (!(op in found) && !(op in st.operators))
+        found[op] = { provider: cc.mismatch.provider, height: cc.mismatch.height };
     const fallbackOnly = Object.keys(found).sort();
     // inventory entries the other provider lacks are asked of the primary again, all at once: one
     // getLogs per chunk with the operators as an OR topic (clestons #448 N1: not operators x chunks)
@@ -961,6 +986,17 @@ export async function crossCheckInventory(
             found,
           }
         : null;
+    // what the other provider reported and the inventory lacked ENTERS the inventory now (clestons
+    // #448 B1', DSR 2026-11-17), recorded as coming from it, so the very next round checks its stake.
+    // The failure direction is safe: an operator only goes into the list of addresses to read; whether
+    // it is reported comes from the primary's chain reads at B and SP's own pauseUnderstakedOperator
+    // simulation. One a lying provider invented reads "not-configured" (a notice), never PAUSE NEEDED
+    st.fromCrossCheck ??= {};
+    for (const op of Object.keys(found))
+      if (theirs.has(op) && !(op in st.operators)) {
+        st.operators[op] = theirs.get(op);
+        st.fromCrossCheck[op] = { provider: otherName, block: theirs.get(op), at: now };
+      }
     cc.lastComplete = now;
     cc.failedDays = 0;
     cc.lastError = null;
