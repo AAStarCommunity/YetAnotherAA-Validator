@@ -777,8 +777,11 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
 export const CROSS_CHECK_MS = 24 * 3600_000;
 export const CROSS_CHECK_ALERT_DAYS = 3;
 /**
- * The most blocks the cross-check may trail the primary's cursor: one day at Sepolia's 12 s (on OP
- * Mainnet's 2 s blocks that is 4 h: stricter, and its cost is incomplete days, never a false clear).
+ * The most blocks the cross-check may trail the primary's cursor: one day at Sepolia's 12 s.
+ * CHAIN-SPECIFIC, NOT CONFIGURED PER CHAIN (DSR 2026-11-17): the value is chosen for Sepolia's block
+ * time and must be recomputed here, as (one day / block time), before the detector watches another
+ * chain. On OP Mainnet's 2 s blocks one day is 43200; left at 7200 it means 4 h, stricter, costing
+ * incomplete days, never a false clear.
  */
 export const CROSS_CHECK_MAX_LAG_BLOCKS = 7200;
 

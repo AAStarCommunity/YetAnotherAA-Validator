@@ -249,10 +249,13 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
 
   - **It must keep up** (Daybreak rerun High, DSR 2026-11-17). The highest block
     a completed cross-check covered is kept (`coveredTo`). An attempt whose
-    height is below it, or more than 7200 blocks (a day at 12 s) behind the
-    primary's cursor, is incomplete: the other provider's finalized block
-    stalled or went back. A standing disagreement is cleared only by a
-    comparison that reaches its height.
+    height is below it, or more than 7200 blocks (a day at Sepolia's 12 s;
+    `CROSS_CHECK_MAX_LAG_BLOCKS` in `lib/detect.mjs`, **chosen for Sepolia's
+    block time: recompute it there, as one day / block time, before watching
+    another chain**, e.g. 43200 on OP Mainnet) behind the primary's cursor, is
+    incomplete: the other provider's finalized block stalled or went back. A
+    standing disagreement is cleared only by a comparison that reaches its
+    height.
   - **No round is clear before a first cross-check has completed** (DSR
     2026-11-17): a first deployment, or a state file that was lost or emptied
     (which also resets `coveredTo`), reads `unknown`
