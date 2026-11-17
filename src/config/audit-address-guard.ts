@@ -1,3 +1,5 @@
+import { ethers } from "ethers";
+
 /**
  * Startup assertion for the two SP contract addresses the audit stack reads (DSR 2026-11-15, rc.8).
  *
@@ -64,6 +66,15 @@ export function auditAddressProblems(env: Env): string[] {
     }
     if (!/^0x[0-9a-fA-F]{40}$/.test(value)) {
       problems.push(`${name}=${value} is not a 20-byte hex address`);
+      return;
+    }
+    // #445 review note 1: a mixed-case address with a wrong EIP-55 checksum passed here and then the
+    // watcher bootstrap (ethers.getAddress) disabled itself. Apply the same check at startup.
+    // All-lowercase and all-uppercase addresses carry no checksum and are accepted, as ethers does.
+    try {
+      ethers.getAddress(value);
+    } catch {
+      problems.push(`${name}=${value} has a bad EIP-55 checksum`);
       return;
     }
     // #442 review L2: the zero address was left to the bootstrap getCode check; refuse it here.
