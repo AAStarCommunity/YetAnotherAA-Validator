@@ -192,13 +192,16 @@ Before signing in the SAFE, the signers check:
 **A guardian that comes back after a completed exit** (SP BLSAggregator-4.14.2,
 Daybreak M-01; DSR 2026-11-17). From 4.14.2, `consumeGuardianExit` also suspends
 the guardian and revokes its BLS key. Re-staking to get `ROLE_DVT` back does not
-restore it. Until it is re-registered, its proposals revert `ValidatorSuspended`
-and its signatures do not count (`UnknownValidatorSlot`). So the SAFE path for
-such a guardian is two steps, in this order:
+restore it: its proposals revert `ValidatorSuspended` and its signatures do not
+count (`UnknownValidatorSlot`). The two steps back each restore one half:
 
-1. The owner (the SAFE) lifts the suspension on the aggregator.
-2. Re-register the key with a **new** PoP: `--export-pop` again, then the SAFE
-   signs as above.
+1. The owner (the SAFE) lifts the suspension on the aggregator. From then on the
+   address can propose again (`createProposal`), even before its key is
+   re-registered.
+2. It signs again only after a re-registration with a valid PoP: `--export-pop`,
+   then the SAFE signs as above. The PoP digest does not include an admission
+   epoch, so the PoP from before the exit is still valid and can be reused; a
+   new one is not required.
 
 The script refuses a suspended guardian before it sends or exports anything
 (`reregister-guardians.mjs`, the `suspended(validator)` check: "is suspended on
