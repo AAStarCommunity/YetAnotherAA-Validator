@@ -102,10 +102,12 @@ export function headProblem(block, nowMs, maxAgeSec) {
   const t = Number(block?.timestamp);
   if (!Number.isSafeInteger(t) || t <= 0 || !Number.isSafeInteger(maxAgeSec))
     return "has no usable timestamp";
-  const age = Math.round(nowMs / 1000 - t);
+  // compared unrounded (clestons #448 N3): a head 300.5 s ahead or 1800.4 s old is out
+  const age = nowMs / 1000 - t;
   if (-age > MAX_FUTURE_SKEW_SEC)
-    return `is ${-age} s AHEAD of this machine's clock (max ${MAX_FUTURE_SKEW_SEC}): check the Mini's clock`;
-  if (age > maxAgeSec) return `is ${age} s old (max ${maxAgeSec}): a frozen or lagging node`;
+    return `is ${Math.round(-age)} s AHEAD of this machine's clock (max ${MAX_FUTURE_SKEW_SEC}): check the Mini's clock`;
+  if (age > maxAgeSec)
+    return `is ${Math.round(age)} s old (max ${maxAgeSec}): a frozen or lagging node`;
   return null;
 }
 
@@ -206,10 +208,26 @@ export function stateProblems(st, cfg) {
       !Number.isSafeInteger(c.failedDays) ||
       c.failedDays < 0 ||
       !(c.coveredTo === undefined || (Number.isSafeInteger(c.coveredTo) && c.coveredTo >= 0)) ||
+      // a completed record carries its coverage (Daybreak narrow rerun Medium, DSR 2026-11-17)
+      (c.lastComplete > 0 && c.coveredTo === undefined) ||
       !(c.lastError === null || typeof c.lastError === "string") ||
       !(
         c.mismatch === null ||
-        (plainObject(c.mismatch) && addrs(c.mismatch.fallbackOnly) && addrs(c.mismatch.primaryOnly))
+        (plainObject(c.mismatch) &&
+          Number.isSafeInteger(c.mismatch.height) &&
+          c.mismatch.height >= 0 &&
+          addrs(c.mismatch.fallbackOnly) &&
+          addrs(c.mismatch.primaryOnly) &&
+          (c.mismatch.found === undefined ||
+            (plainObject(c.mismatch.found) &&
+              Object.entries(c.mismatch.found).every(
+                ([k, f]) =>
+                  ADDRESS.test(k) &&
+                  plainObject(f) &&
+                  typeof f.provider === "string" &&
+                  Number.isSafeInteger(f.height) &&
+                  f.height >= 0
+              ))))
       )
     )
       p.push("the state's crossCheck is not a cross-check record");
@@ -759,7 +777,17 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
       key: "crosscheck-pending",
       text: "unknown: no inventory cross-check with the other RPC provider has completed yet; no round is clear until one has",
     });
-  const crossOk = crossDone && !st.crossCheck?.mismatch;
+  // an incomplete cross-check is tolerated for at most CROSS_CHECK_ALERT_DAYS days of blocks
+  // (Daybreak narrow rerun High A, DSR 2026-11-17): beyond that the inventory has outrun what was
+  // compared, and the round is unknown; it turns unknown when crosscheck-incomplete starts to alert
+  const behind = st.cursor - (st.crossCheck?.coveredTo ?? 0);
+  const coverageOk = behind <= CROSS_CHECK_ALERT_DAYS * CROSS_CHECK_MAX_LAG_BLOCKS;
+  if (crossDone && !coverageOk)
+    alerts.push({
+      key: "crosscheck-behind",
+      text: `unknown: the inventory is ${behind} blocks past what the last cross-check covered (block ${st.crossCheck?.coveredTo}; max ${CROSS_CHECK_ALERT_DAYS * CROSS_CHECK_MAX_LAG_BLOCKS})`,
+    });
+  const crossOk = crossDone && coverageOk && !st.crossCheck?.mismatch;
   report.startBlockVerified = startOk;
   report.crossCheck = st.crossCheck ?? null;
   report.clear =
@@ -776,6 +804,9 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
 /** The daily cross-check's period, and how many failed days in a row raise an alert (DSR 2026-11-17). */
 export const CROSS_CHECK_MS = 24 * 3600_000;
 export const CROSS_CHECK_ALERT_DAYS = 3;
+/** The most inventory entries one cross-check re-asks the primary about, and per getLogs topic list. */
+export const MAX_REQUERY_OPERATORS = 1000;
+export const REQUERY_TOPICS = 50;
 /**
  * The most blocks the cross-check may trail the primary's cursor: one day at Sepolia's 12 s.
  * CHAIN-SPECIFIC, NOT CONFIGURED PER CHAIN (DSR 2026-11-17): the value is chosen for Sepolia's block
@@ -803,7 +834,7 @@ export const CROSS_CHECK_MAX_LAG_BLOCKS = 7200;
  */
 export async function crossCheckInventory(
   st,
-  { primary, primaryName, other, otherName, cfg, now }
+  { primary, primaryName, other, otherName, cfg, now, unavailable = "no second provider to ask" }
 ) {
   const cc = (st.crossCheck ??= emptyCrossCheck());
   const daily = now - cc.lastAttempt >= CROSS_CHECK_MS;
@@ -823,7 +854,7 @@ export async function crossCheckInventory(
     };
   };
   try {
-    if (!other) throw new SafeError("no second provider to ask");
+    if (!other) throw new SafeError(unavailable);
     const id = Number(await other.chainId());
     if (id !== st.chainId) throw new SafeError(`the other provider is on chain ${id}`);
     const otherFinal = height(Number(await other.blockNumber("finalized")), "its finalized block");
@@ -838,6 +869,13 @@ export async function crossCheckInventory(
     if (st.cursor - H > CROSS_CHECK_MAX_LAG_BLOCKS)
       throw new SafeError(
         `the other provider's finalized block ${otherFinal} is ${st.cursor - H} blocks behind the inventory (max ${CROSS_CHECK_MAX_LAG_BLOCKS})`
+      );
+    // a standing disagreement is replaced or cleared only by a comparison that reaches its height,
+    // whatever that comparison finds (Daybreak narrow rerun High B, DSR 2026-11-17): a shorter one
+    // is not complete
+    if (cc.mismatch && H < cc.mismatch.height)
+      throw new SafeError(
+        `this comparison reaches block ${H}, below the standing disagreement at block ${cc.mismatch.height}`
       );
     const theirs = new Set();
     if (H >= st.startBlock)
@@ -857,17 +895,45 @@ export async function crossCheckInventory(
         .filter(([, n]) => n <= H)
         .map(([op]) => op)
     );
-    const fallbackOnly = [...theirs].filter(op => !mine.has(op)).sort();
-    const primaryOnly = [];
+    // what the other provider has that the inventory lacks, each with who found it and how far
+    // that comparison reached
+    const found = {};
+    for (const op of theirs) if (!mine.has(op)) found[op] = { provider: otherName, height: H };
+    // a standing fallback-only operator is CARRIED FORWARD (clestons #448 B1/B2): it leaves the
+    // disagreement only when it is in the inventory (then every round checks it), or when the SAME
+    // provider that found it, over at least the height it found it at, no longer reports it. So a
+    // shorter comparison, or one by the provider that built the inventory, cannot clear it
+    for (const [op, f] of Object.entries(cc.mismatch?.found ?? {})) {
+      if (op in found || op in st.operators) continue;
+      const denied = f.provider === otherName && H >= f.height && !theirs.has(op);
+      if (!denied) found[op] = f;
+    }
+    // a mismatch from before `found` existed carries its fallback-only operators the same way
+    for (const op of cc.mismatch?.found ? [] : (cc.mismatch?.fallbackOnly ?? [])) {
+      if (op in found || op in st.operators) continue;
+      const m = cc.mismatch;
+      const denied = m.provider === otherName && H >= m.height && !theirs.has(op);
+      if (!denied) found[op] = { provider: m.provider, height: m.height };
+    }
+    const fallbackOnly = Object.keys(found).sort();
+    // inventory entries the other provider lacks are asked of the primary again, all at once: one
+    // getLogs per chunk with the operators as an OR topic (clestons #448 N1: not operators x chunks)
+    const candidates = [...mine].filter(op => !theirs.has(op)).sort();
+    if (candidates.length > MAX_REQUERY_OPERATORS)
+      throw new SafeError(
+        `${candidates.length} inventory entries the other provider lacks (max ${MAX_REQUERY_OPERATORS} re-queried)`
+      );
+    const confirmed = new Set();
     const primaryCanon = canonOf(primary);
-    for (const op of [...mine].filter(op => !theirs.has(op)).sort()) {
-      let found = false;
+    for (let i = 0; i < candidates.length; i += REQUERY_TOPICS) {
+      const group = candidates.slice(i, i + REQUERY_TOPICS);
+      const want = new Set(group);
       for (const [a, b] of ranges(st.startBlock, H, cfg.logChunk)) {
         let logs;
         try {
           logs = await primary.getLogs({
             address: st.spProxy,
-            topics: [OPERATOR_CONFIGURED, ethers.zeroPadValue(op, 32)],
+            topics: [OPERATOR_CONFIGURED, group.map(op => ethers.zeroPadValue(op, 32))],
             fromBlock: hex(a),
             toBlock: hex(b),
           });
@@ -875,13 +941,14 @@ export async function crossCheckInventory(
           throw new SafeError(`${safeText("getLogs", e)} (primary, blocks ${a}-${b})`);
         }
         await checkLogs(logs, st.spProxy, a, b, primaryCanon);
-        if (logs.some(lg => opOf(lg.topics[1]) === op)) {
-          found = true;
-          break;
+        for (const lg of logs) {
+          const op = opOf(lg.topics[1]);
+          if (want.has(op)) confirmed.add(op);
         }
+        if (group.every(op => confirmed.has(op))) break;
       }
-      if (found) primaryOnly.push(op);
     }
+    const primaryOnly = candidates.filter(op => confirmed.has(op));
     const outcome =
       fallbackOnly.length || primaryOnly.length
         ? {
@@ -891,14 +958,9 @@ export async function crossCheckInventory(
             primary: primaryName,
             fallbackOnly,
             primaryOnly,
+            found,
           }
         : null;
-    // a standing disagreement is cleared only by a comparison that reaches its height (DSR
-    // 2026-11-17); a shorter one that agrees leaves it, and is not complete
-    if (!outcome && cc.mismatch && H < cc.mismatch.height)
-      throw new SafeError(
-        `this comparison reaches block ${H}, below the standing disagreement at block ${cc.mismatch.height}`
-      );
     cc.lastComplete = now;
     cc.failedDays = 0;
     cc.lastError = null;

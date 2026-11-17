@@ -230,22 +230,40 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   rescans ask it again (Daybreak H1).
 - **The daily inventory cross-check** (Daybreak H1; **DSR ruling 2026-11-17**).
   Once a day the detector reads the operator inventory from `startBlock` again
-  from the **other** provider, the one the round did not use, up to the lower of
-  the primary inventory's cursor and the other provider's finalized block. It
-  compares the two sets of operators (`crossCheckInventory`, `lib/detect.mjs`):
-  - An operator only the other provider has: the primary's index missed it.
-    Every round is `unknown` and the alert names it, and it is checked every
-    round from then on, until a later cross-check agrees. The check is repeated
-    every round while the two disagree.
+  from the configured **fallback**, up to the lower of the inventory's cursor
+  and the fallback's finalized block. It compares the two sets of operators
+  (`crossCheckInventory`, `lib/detect.mjs`).
+  - **Fixed roles** (clestons #448 B2). The inventory is never "checked" by the
+    provider whose answers built it. Only the configured fallback compares, and
+    only on a round that the configured primary ran (`crossCheckPlan`,
+    `run.mjs`). A round that ran on the fallback records an incomplete attempt
+    instead. Residual: blocks that the fallback itself added to the inventory,
+    on rounds when the primary failed its probe, are compared against the
+    fallback's own answers until the primary's next daily full rescan re-reads
+    them.
+  - An operator only the fallback has: the primary's index missed it. Every
+    round is `unknown` and the alert names it, and it is checked every round
+    from then on. The check is repeated every round while the two disagree. **It
+    leaves the disagreement only** when it is in the inventory (then every round
+    checks it), or when the same provider that found it, over at least the
+    height at which it found it, no longer reports it (clestons #448 B1/B2: a
+    lower comparison, or one by the inventory's builder, cannot clear it).
   - An inventory entry the other provider lacks is asked of the primary again,
     by operator: if the primary has no such log either, it is a harmless
     superset entry (a block that later left the chain) and not a disagreement;
-    otherwise it is one too, named the same way.
-  - If the other provider cannot answer, the day is recorded as incomplete
-    (`status.json` `report.crossCheck`), and **no round becomes unknown**. Three
-    incomplete days in a row raise
-    `the daily inventory cross-check … has not completed for N days`, until one
-    completes.
+    otherwise it is one too, named the same way. The inventory entries the
+    fallback lacks are re-asked in one `getLogs` per chunk, with up to 50
+    operators as an OR topic; more than 1000 such entries make the attempt
+    incomplete (clestons #448 N1).
+  - If the fallback cannot answer, the day is recorded as incomplete
+    (`status.json` `report.crossCheck`). Three incomplete days in a row raise
+    `the daily inventory cross-check … has not completed for N days`.
+  - **An incomplete cross-check is tolerated for at most 3 days** (Daybreak
+    narrow rerun High A, DSR 2026-11-17). Once the inventory's cursor is more
+    than 3 × `CROSS_CHECK_MAX_LAG_BLOCKS` (21600) blocks past what the last
+    completed cross-check covered, every round is `unknown`
+    (`crosscheck-behind`). That happens at the same point that
+    `crosscheck-incomplete` starts to alert.
 
   - **It must keep up** (Daybreak rerun High, DSR 2026-11-17). The highest block
     a completed cross-check covered is kept (`coveredTo`). An attempt whose
@@ -254,8 +272,9 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
     block time: recompute it there, as one day / block time, before watching
     another chain**, e.g. 43200 on OP Mainnet) behind the primary's cursor, is
     incomplete: the other provider's finalized block stalled or went back. A
-    standing disagreement is cleared only by a comparison that reaches its
-    height.
+    standing disagreement is replaced or cleared only by a comparison that
+    reaches its height, whatever that comparison finds (Daybreak narrow rerun
+    High B).
   - **No round is clear before a first cross-check has completed** (DSR
     2026-11-17): a first deployment, or a state file that was lost or emptied
     (which also resets `coveredTo`), reads `unknown`
@@ -263,11 +282,21 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
     first deployment with the fallback down, that means `unknown` until it
     answers.
 
+  - A state whose cross-check record is inconsistent (a completed record without
+    `coveredTo`, a disagreement without its height, Daybreak narrow rerun
+    Medium) is refused. The round stops and reports `unknown`; the state is
+    never rebuilt silently.
+
   So an honest provider's index gap is found within a day, and a fallback that
-  is down does not turn every round unknown once a first cross-check exists.
+  is down for under 3 days does not turn every round unknown once a first
+  cross-check exists.
 
 - **The known residuals.**
   - Both providers missing the **same** log the same way is not found.
+  - **The guards' combinations are covered by unit cells only** (DSR
+    2026-11-17). Each guard has its own cell and a mutant that fails it, and the
+    lower-height and swapped-role probes from clestons #448 are cells. No
+    further Daybreak round reviewed how the guards interact.
   - A provider that **deliberately** answers one finalized block two different
     ways, consistently, could still hide an operator. For example, it might
     serve another fork's block by number and by hash alike, with matching empty
@@ -295,6 +324,14 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   limit. A message counts as delivered only on HTTP 2xx with a JSON body
   `ok: true`. Only the alerts in delivered messages are marked sent; the rest
   are retried next round.
+  - `undeliveredSince` (for the dead-man) clears on a round in which **nothing
+    failed** (clestons #448 N2, DSR 2026-11-17). An alert whose condition went
+    away before it was ever delivered is no longer owed, so it does not hold the
+    field.
+  - The dead-man treats an unreadable, or future-dated, `undeliveredSince` as
+    "delivered" (clestons #448 N4). The detector writes the field clamped to its
+    own clock, so that needs a forged or corrupted heartbeat; disclosed, not
+    mitigated.
 - **Repeats.** An alert repeats every `realertMinutes` while it holds.
 - **Resolution.** A `resolved:` line is sent once a later round sees the
   condition gone. For an operator, that requires the operator to be read at a

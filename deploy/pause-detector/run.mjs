@@ -237,6 +237,19 @@ export function nextUndeliveredSince(prev, delivery, now) {
   return Number.isFinite(prev) && prev <= now ? prev : now;
 }
 
+/**
+ * Who checks the inventory this round (clestons #448 B2, DSR 2026-11-17). The inventory must never be
+ * "checked" by the provider whose answers built it: only the configured fallback compares, and only
+ * on a round the primary ran. Returns { run, why }. Pure.
+ */
+export function crossCheckPlan(provider, cfg) {
+  if (provider === cfg.rpc.primary) return { run: true, why: null };
+  return {
+    run: false,
+    why: `this round ran on ${provider}, the cross-check provider: no independent provider to compare with`,
+  };
+}
+
 /** One run, after detector.mjs's guards passed. Returns the exit code. */
 export async function main() {
   const args = process.argv.slice(2);
@@ -361,16 +374,20 @@ export async function main() {
     if (sp.length)
       throw new SafeError(`state: ${sp.join("; ")} (a new deployment needs a new stateDir)`);
     const now = Date.now();
-    // the daily inventory cross-check against the provider this round does NOT use (Daybreak H1,
-    // DSR 2026-11-17), before the round, so the round reports its result. It records its own
-    // failures; an incomplete day never makes the round unknown
-    const otherPr = providers.find(pr => pr.name !== provider);
+    // the daily inventory cross-check (Daybreak H1, DSR 2026-11-17), before the round, so the round
+    // reports its result. It records its own failures (an incomplete day does not by itself make a
+    // round unknown). FIXED ROLES (clestons #448 B2): the inventory is built by the primary, and only
+    // the configured fallback checks it; a round that ran on the fallback cannot check anything
+    // independently, so its attempt is incomplete (crossCheckPlan)
+    const plan = crossCheckPlan(provider, cfg);
+    const checker = providers.find(pr => pr.name === cfg.rpc.fallback);
     try {
       await crossCheckInventory(st, {
         primary: chain,
         primaryName: provider,
-        other: readOnlyChain(otherPr.url),
-        otherName: otherPr.name,
+        other: plan.run ? readOnlyChain(checker.url) : null,
+        otherName: cfg.rpc.fallback,
+        unavailable: plan.why,
         cfg,
         now,
       });
