@@ -135,6 +135,23 @@ export function carryGaps(old, acked, nowIso) {
 
 /** The bundle's manifest file name, at the bundle root. */
 export const MANIFEST = "MANIFEST.json";
+
+/**
+ * The bundled packages that CI's npm audit lets through by an exception (DSR 2026-11-18): none may
+ * be bundled. An exception in scripts/ci/audit-exceptions.json is granted because the package is
+ * dev tooling only; this is the check that the detector bundle, the thing deployed on the Mini,
+ * really does not carry it. Pure: `names` are the bundled package names, `exceptions` the parsed
+ * file. A file that is not a list of entries with a package is a problem too (fail closed).
+ */
+export function auditExceptedInBundle(names, exceptions) {
+  if (!Array.isArray(exceptions) || exceptions.some(e => typeof e?.package !== "string"))
+    return ["scripts/ci/audit-exceptions.json is not a list of exceptions with a package"];
+  const excepted = new Map(exceptions.map(e => [e.package, e.id]));
+  return [...new Set(names)]
+    .filter(n => excepted.has(n))
+    .sort()
+    .map(n => `${n} is bundled, but CI's audit lets ${excepted.get(n)} in it through as dev-only`);
+}
 /** The detector's directory, under the home directory: config, secrets, state and the bundle. */
 export const DIR = ".aoa-pause-detector";
 

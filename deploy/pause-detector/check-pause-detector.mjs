@@ -61,6 +61,7 @@ import {
 import {
   DEADMAN_GRAPH,
   DEADMAN_STALE_MS,
+  auditExceptedInBundle,
   bundleProblems,
   deadmanRunProblems,
   graphProblems,
@@ -2622,6 +2623,45 @@ await cell("persist: run.mjs passes the state write as the cross-check's checkpo
   );
 });
 
+await cell(
+  "bundle: a package CI's audit excepts as dev-only is refused; the real closure has none (DSR 2026-11-18)",
+  () => {
+    const exc = [{ id: "GHSA-fc5q-39xc-vjpf", package: "picomatch" }];
+    const p = auditExceptedInBundle(["ethers", "ws", "picomatch", "picomatch"], exc);
+    assert(p.length === 1 && /picomatch is bundled/.test(p[0]), JSON.stringify(p));
+    assert(
+      auditExceptedInBundle(["ethers", "ws"], exc).length === 0,
+      "CONTROL: a clean closure refused"
+    );
+    for (const bad of [null, {}, [{ id: "x" }]])
+      assert(
+        auditExceptedInBundle(["ethers"], bad).length === 1,
+        `accepted ${JSON.stringify(bad)}`
+      );
+    const src = readFileSync(resolve(HERE, "bundle.mjs"), "utf8");
+    assert(
+      /const excepted = auditExceptedInBundle\(names, auditExceptions\);\nif \(excepted\.length\) die/.test(
+        src
+      ),
+      "bundle.mjs does not apply it"
+    );
+    assert(
+      /names\.push\(pj\.name, key\.slice\(/.test(src),
+      "bundle.mjs does not check the installed name"
+    );
+    assert(
+      /if \(n === "node_modules" && d !== dir\)\n\s*die\(/.test(src),
+      "bundle.mjs copies a nested node_modules"
+    );
+    assert(
+      /if \(basename\(d\) === "package\.json"\) \{[\s\S]{0,400}auditExceptedInBundle\(\[name\], auditExceptions\)[\s\S]{0,120}\n\s*if \(p\.length\) die\(/.test(
+        src
+      ),
+      "bundle.mjs does not check a vendored package.json"
+    );
+  }
+);
+
 await cell("state: a malformed crossCheck record is refused", () => {
   const st = emptyState(cfgOf());
   st.crossCheck = {
@@ -3116,6 +3156,22 @@ await cell(
         ),
         "a non-runtime file bundled"
       );
+      // no package CI's audit excepts as dev-only is in the deployed bundle (DSR 2026-11-18): every
+      // package ROOT in the manifest (scoped names included), by the directory it is installed under
+      const roots = new Set();
+      for (const f of Object.keys(man.files))
+        for (const m of f.matchAll(/(?:^|\/)node_modules\/((?:@[^/]+\/)?[^/]+)(?=\/)/g))
+          roots.add(m[1]);
+      assert(
+        roots.has("ethers") && [...roots].some(r => r.startsWith("@noble/")),
+        [...roots].join(",")
+      );
+      const exc = JSON.parse(
+        readFileSync(resolve(HERE, "../../scripts/ci/audit-exceptions.json"), "utf8")
+      );
+      assert(exc.length > 0, "no audit exceptions to check against");
+      for (const e of exc)
+        assert(!roots.has(e.package), `${e.package} (audit-excepted ${e.id}) is in the bundle`);
       const edits = [
         [
           "an extra file (a key someone left there)",
