@@ -1920,7 +1920,10 @@ export class BlockchainService {
 
   /**
    * Step 1 of the two-step slash (SP #329):
-   *   queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof)
+   *   queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes evidence, bytes proof)
+   * (DVTValidator-0.9.0). `evidence` is abi.encode(bytes32 category, bytes body) per M0 §3.1; the
+   * DVTValidator runs that category's checker before forwarding, and an unknown category or an
+   * undecodable blob reverts, which the static-call preflight below turns into "not broadcast".
    * `proof` is abi.encode(uint256 signerMask, bytes sigG2) from the quorum co-sign over the
    * step-1 messageHash. Admin wallet + bumped fees + await-receipt (throws on non-success so the
    * caller logs and archives the evidence anyway). Returns the tx hash.
@@ -1930,6 +1933,7 @@ export class BlockchainService {
     operator: string,
     slashLevel: number,
     epoch: bigint | number,
+    evidence: string,
     proof: string,
     dryRun = false
   ): Promise<string> {
@@ -1938,7 +1942,7 @@ export class BlockchainService {
         throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
       }
       const abi = [
-        "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes proof) external",
+        "function queueSlashWithProof(address operator, uint8 slashLevel, uint256 epoch, bytes evidence, bytes proof) external",
       ];
       const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
       // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT call first. Any deterministic
@@ -1947,7 +1951,7 @@ export class BlockchainService {
       // try/catch degrades to file+archive instead of eating a PAID on-chain revert. Only a passing
       // simulation lets the real, irreversible tx broadcast.
       try {
-        await contract.queueSlashWithProof.staticCall(operator, slashLevel, epoch, proof);
+        await contract.queueSlashWithProof.staticCall(operator, slashLevel, epoch, evidence, proof);
       } catch (err: unknown) {
         const reason = err instanceof Error ? err.message : String(err);
         throw new Error(
@@ -1968,7 +1972,7 @@ export class BlockchainService {
       }
       const fees = await bumpedFees(this.provider);
       const tx: ethers.TransactionResponse = await this.enqueueWalletWrite(() =>
-        contract.queueSlashWithProof(operator, slashLevel, epoch, proof, fees)
+        contract.queueSlashWithProof(operator, slashLevel, epoch, evidence, proof, fees)
       );
       this.logger.log(
         `queueSlashWithProof(${operator}, ${slashLevel}, epoch ${epoch}) submitted: ${tx.hash}`
@@ -1986,8 +1990,13 @@ export class BlockchainService {
 
   /**
    * Step 2 of the two-step slash (SP #329):
-   *   executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof)
-   * For a slash-only proposal repUsers/newScores are empty. `proof` is abi.encode(signerMask, sigG2)
+   *   executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch,
+   *                    bytes evidence, bytes proof)                       (DVTValidator-0.9.0)
+   * For a slash-only proposal repUsers/newScores are empty and `evidence` is
+   * abi.encode(bytes32 category, bytes body), whose evidenceHash must equal the one the proposal was
+   * created with (EvidenceHashMismatch otherwise). A pure-reputation proposal (operator 0, level 0)
+   * takes empty `evidence`. The aggregator's messages are unchanged: they bind the bytes32
+   * evidenceHash, never these bytes. `proof` is abi.encode(signerMask, sigG2)
    * from the quorum co-sign over the step-2 messageHash. Admin wallet + bumped fees +
    * await-receipt (throws on non-success). Returns the tx hash.
    */
@@ -1997,6 +2006,7 @@ export class BlockchainService {
     repUsers: string[],
     newScores: Array<bigint | number>,
     epoch: bigint | number,
+    evidence: string,
     proof: string,
     dryRun = false
   ): Promise<string> {
@@ -2005,14 +2015,14 @@ export class BlockchainService {
         throw new Error("Blockchain not configured. Set ETH_PRIVATE_KEY environment variable.");
       }
       const abi = [
-        "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes proof) external",
+        "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, bytes evidence, bytes proof) external",
       ];
       const contract = this.buildContract(dvtValidatorAddress, abi, this.wallet);
       // STATIC-CALL PREFLIGHT (Codex HIGH 2): simulate the EXACT execute call first so any
       // deterministic revert (signerMask/sigG2/threshold/proposal-state mismatch) surfaces BEFORE the
       // irreversible slash tx spends gas. Only a passing simulation lets the real tx broadcast.
       try {
-        await contract.executeWithProof.staticCall(id, repUsers, newScores, epoch, proof);
+        await contract.executeWithProof.staticCall(id, repUsers, newScores, epoch, evidence, proof);
       } catch (err: unknown) {
         const reason = err instanceof Error ? err.message : String(err);
         throw new Error(
@@ -2033,7 +2043,7 @@ export class BlockchainService {
       }
       const fees = await bumpedFees(this.provider);
       const tx: ethers.TransactionResponse = await this.enqueueWalletWrite(() =>
-        contract.executeWithProof(id, repUsers, newScores, epoch, proof, fees)
+        contract.executeWithProof(id, repUsers, newScores, epoch, evidence, proof, fees)
       );
       this.logger.log(`executeWithProof(id ${id}, epoch ${epoch}) submitted: ${tx.hash}`);
       const receipt = await tx.wait();
