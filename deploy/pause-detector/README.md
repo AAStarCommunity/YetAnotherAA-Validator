@@ -91,7 +91,10 @@ Three layers carry it, and they are not equally strong:
    - a name, key or string that holds a key, signs, broadcasts or runs a
      program;
    - dynamic import, `require`, `eval`, `globalThis`, `.constructor`;
-   - a computed member built from strings;
+   - an inline computed member built from strings (`x["send" + y]`). A variable
+     index (`x[k]`) is allowed: the scan does no data-flow analysis, and a send
+     method reached that way is still refused by the transport (layer 2)
+     (Daybreak M10);
    - `process` or `console` used other than as a few named members;
    - ethers used other than as nine pure utilities;
    - any `fetch` other than to the Telegram Bot API or from the one JSON-RPC
@@ -130,6 +133,11 @@ a missed one.
      Sepolia's block time is 12 s) stops the round as `unknown` (clestons #434
      B1). A node frozen at a height is self-consistent, so every other check
      passes against it; only the head's age shows it.
+   - **A head from the future** (Daybreak M8, DSR 2026-11-17). A head more than
+     300 s ahead of the Mini's clock also stops the round as `unknown`, naming
+     the clock. A real block is never far in the future, so either the Mini's
+     clock is behind (and a frozen head would look fresher than it is by that
+     much) or the provider is wrong.
    - The provider probe treats a stale head as a failed probe, so the fallback
      takes over from a frozen primary.
    - `status.json` records B's timestamp, and preflight FAILs a `clear` on an
@@ -216,13 +224,155 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   clear. That rests on the head-age check, the hash-bound chain-linked
   cross-check watermark above, and the commit-on-canonical rounds.
 - **One provider per round.** Each round reads from one provider, the primary
-  unless it fails its probe. So the trust in "two providers" holds for each one
-  on its own, not as a cross-check between them (see the follow-up below).
-- **The known residual.** A provider that **deliberately** answers one finalized
-  block two different ways, consistently, could still hide an operator. For
-  example, it might serve another fork's block by number and by hash alike, with
-  matching empty logs, along a whole linked stretch. That case is outside the
-  threat model and is not mitigated.
+  unless it fails its probe. Its range answers and its by-hash answers come from
+  the same backend, so a log index that consistently lacks one block's logs (an
+  honest indexer bug is enough) answers `[]` both ways, and the window and daily
+  rescans ask it again (Daybreak H1).
+- **The daily inventory cross-check** (Daybreak H1; **DSR ruling 2026-11-17**).
+  Once a day the detector reads the operator inventory from `startBlock` again
+  from the configured **fallback**, up to the lower of the inventory's cursor
+  and the fallback's finalized block. It compares the two sets of operators
+  (`crossCheckInventory`, `lib/detect.mjs`).
+  - **Fixed roles** (clestons #448 B2). The inventory is never "checked" by the
+    provider whose answers built it. Only the configured fallback compares, and
+    only on a round that the configured primary ran (`crossCheckPlan`,
+    `run.mjs`). A round that ran on the fallback records an incomplete attempt
+    instead.
+  - **The daily full rescan runs on whichever provider the round uses**
+    (clestons #448 B1'', DSR 2026-11-18), each on its own 24 h clock: the
+    primary's rescan is recorded in `lastFullScan`, the fallback's in
+    `lastFallbackFullScan`. With the primary down for days, the fallback still
+    re-reads everything from `startBlock` once a day (not every hour), so an
+    operator the primary's index missed is found within a day. A fallback rescan
+    never moves `lastFullScan`, so it never stands in for the primary's (N6).
+    Residual: blocks that the fallback itself added to the inventory, on rounds
+    when the primary failed its probe, are compared against the fallback's own
+    answers until the primary's next daily full rescan re-reads them.
+  - An operator only the fallback has: the primary's index missed it. That round
+    is `unknown` and the alert names it. The operator **enters the inventory at
+    once**, recorded in `fromCrossCheck` as the fallback's, so its stake is
+    checked from the next round on (clestons #448 B1', DSR 2026-11-17). Entering
+    the inventory is its **only** way out of the disagreement. A later
+    comparison that no longer reports it, whether by the same provider or a
+    lower or self-comparison, does not count: its log was seen on a finalized,
+    hash-checked block. The failure direction is safe. An operator only enters
+    the list of addresses to read; whether it is reported comes from the
+    primary's chain reads at B and SP's own `pauseUnderstakedOperator`
+    simulation. So one that a lying fallback invents reads `not-configured` (a
+    notice), never `PAUSE NEEDED`, and a manual pause of it reverts
+    `OperatorNotConfigured`.
+  - It enters **as each validated chunk of the fallback's answer arrives**, so
+    before a later chunk is asked for and before the primary is re-asked about
+    the entries the fallback lacks (clestons #448 N2; Codex pre-push review). A
+    later chunk or the re-query failing leaves the attempt incomplete, but what
+    was seen is already checked.
+  - **At most `MAX_CROSS_CHECK_ADDED` (100) operators ever enter the inventory
+    from cross-checks, per state** (clestons #448 N8, DSR 2026-11-18). Past
+    that, the rest are only counted (`mismatch.unlisted`), not named or stored,
+    and the disagreement stands: every round is `unknown` while any of them is
+    reported, and the alert says how many were not added. That disagreement is
+    recorded before the fallible re-query of the primary, so a failed re-query
+    cannot lose an over-cap finding (Codex pre-push review). So a lying fallback
+    can add at most 100 addresses to read (each a `not-configured` notice) and
+    cannot grow the state without bound. The cap counts over the state's life,
+    not per comparison: a disagreement is compared again every round, so a
+    per-comparison cap would still let a persistent liar add 100 an hour.
+  - **An overflow is never settled by the detector** (DSR 2026-11-18). The first
+    comparison that goes over the cap writes a persistent marker
+    (`crossCheck.overflow`: provider, first time, largest count). From then on
+    every round is `unknown` (`crosscheck-overflow`), whatever later comparisons
+    find, because past the cap the over-cap operators are unnamed and a
+    comparison cannot tell an honest omission from a lying one (Codex pre-push
+    review: a real understaked operator counted over the cap, then omitted,
+    would otherwise read clear). The marker is set as soon as the chunk that
+    goes over the cap arrives, and the state is written to disk at that moment,
+    before anything else in the run can fail, so a crash later in the run cannot
+    lose it. Under Node's permission model that write, like every state write,
+    is atomic but not fsynced: a power loss right after it can lose it (see
+    `lib/notify.mjs`); a process crash cannot. Only an operator resets it; see
+    "Recovering from a cross-check overflow". Within the cap, an honest
+    comparison after invented operators still completes and rounds read clear
+    again. The cap covers only what cross-checks add. A provider's own rounds
+    add what that provider reports, as before, and now that includes the
+    fallback's daily rescan when it runs the round; that path is the inventory
+    itself and is not capped. A provider that invents logs there falls under the
+    trust ruling above, and the 1 MiB state limit then stops the detector
+    loudly, never as clear.
+  - A first comparison whose height is below `startBlock` compares nothing and
+    is not a completed cross-check (clestons #448 N5).
+  - An inventory entry the other provider lacks is asked of the primary again,
+    by operator: if the primary has no such log either, it is a harmless
+    superset entry (a block that later left the chain) and not a disagreement;
+    otherwise it is one too, named the same way. The inventory entries the
+    fallback lacks are re-asked in one `getLogs` per chunk, with up to 50
+    operators as an OR topic; more than 1000 such entries make the attempt
+    incomplete (clestons #448 N1). More than 1000 harmless superset entries
+    therefore keep every attempt incomplete. That fails safe (3 days later,
+    `crosscheck-incomplete` and then `crosscheck-behind`) and costs availability
+    only (clestons #448 N7, accepted).
+  - If the fallback cannot answer, the day is recorded as incomplete
+    (`status.json` `report.crossCheck`). Three incomplete days in a row raise
+    `the daily inventory cross-check … has not completed for N days`.
+  - **An incomplete cross-check is tolerated for at most 3 days** (Daybreak
+    narrow rerun High A, DSR 2026-11-17). Once the inventory's cursor is more
+    than 3 × `CROSS_CHECK_MAX_LAG_BLOCKS` (21600) blocks past what the last
+    completed cross-check covered, every round is `unknown`
+    (`crosscheck-behind`). That happens at the same point that
+    `crosscheck-incomplete` starts to alert.
+
+  - **It must keep up** (Daybreak rerun High, DSR 2026-11-17). The highest block
+    a completed cross-check covered is kept (`coveredTo`). An attempt whose
+    height is below it, or more than 7200 blocks (a day at Sepolia's 12 s;
+    `CROSS_CHECK_MAX_LAG_BLOCKS` in `lib/detect.mjs`, **chosen for Sepolia's
+    block time: recompute it there, as one day / block time, before watching
+    another chain**, e.g. 43200 on OP Mainnet) behind the primary's cursor, is
+    incomplete: the other provider's finalized block stalled or went back. A
+    standing disagreement is replaced or cleared only by a comparison that
+    reaches its height, whatever that comparison finds (Daybreak narrow rerun
+    High B).
+  - **No round is clear before a first cross-check has completed** (DSR
+    2026-11-17): a first deployment, or a state file that was lost or emptied
+    (which also resets `coveredTo`), reads `unknown`
+    (`no inventory cross-check … has completed yet`) until one completes. On a
+    first deployment with the fallback down, that means `unknown` until it
+    answers.
+
+  - A state whose cross-check record is inconsistent (a completed record without
+    `coveredTo`, a disagreement without its height, Daybreak narrow rerun
+    Medium) is refused. The round stops and reports `unknown`; the state is
+    never rebuilt silently.
+
+  So an honest provider's index gap is found within a day, and a fallback that
+  is down for under 3 days does not turn every round unknown once a first
+  cross-check exists.
+
+  **The cross-check's invariants** (DSR 2026-11-18). A later review finding is
+  first matched against this table: which row broke. Each row is held by the
+  named cells in `check-pause-detector.mjs`, and each of those fails under a
+  mutant that removes the guard.
+
+  | Invariant                                                                                                                                         | Cells                                                                                                                                                                                                                                                                            |
+  | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | The inventory is never checked as passing by the provider that built it                                                                           | `B2: the provider that built the inventory, comparing over the full height, cannot clear the other's finding`; `B2: only the configured primary's rounds are cross-checked, and only by the configured fallback`                                                                 |
+  | A standing fallback-only operator leaves the disagreement only by entering the inventory                                                          | `B1': the same fallback missing OP2 at the same height later does not clear it: OP2 stays checked`; `B1': a fallback that keeps missing OP2 for days never clears it`                                                                                                            |
+  | What the fallback found enters the inventory (over the cap: the overflow marker is set and written at once) even if the rest of the attempt fails | `N2: what the fallback found enters the inventory even when the primary's re-query then fails`; `chunk (Codex pre-push r3): …` (both); `N8+N2: …`; `persist (Codex pre-push r3): …`                                                                                              |
+  | A comparison that reaches less than a standing disagreement, or than an earlier completed one, settles nothing                                    | `H1-R2: a standing disagreement is cleared only by a comparison that reaches its height`; `H1-R2: a cross-check whose H is below what an earlier one covered is incomplete`; `High B: a shorter comparison that itself disagrees does not replace a standing disagreement`       |
+  | Every provider's round does the full rescan when its 24 h are up; only the primary's moves `lastFullScan`                                         | `B1'': the primary misses OP2 at 130 and then goes down: …`; `B1'': the fallback's rescan recurs every 24 h: …`; `N6: a fallback round's due full rescan is recorded apart (lastFallbackFullScan), never as the primary's`                                                       |
+  | No round is clear before a first cross-check has completed                                                                                        | `(b): a fresh or lost state is never clear before a first cross-check completes (coveredTo starts at 0)`; `N5: a first cross-check with the fallback's finalized block below startBlock is not completed`                                                                        |
+  | Coverage more than 3 days behind the inventory is `unknown`                                                                                       | `High A: coverage up to 3 days of blocks behind the inventory still reads clear; one block more is unknown`                                                                                                                                                                      |
+  | Additions from cross-checks are capped; after an overflow every round stays `unknown` until an operator resets it                                 | `N8: 100 invented operators (within the cap) …`; `N8: a lying fallback's 1,001 invented operators: …`; `N8 overflow (Codex pre-push, DSR 2026-11-18): …`; `N8+N2: with the cap used up and the last comparison clean, an over-cap finding survives a failed re-query: not clear` |
+
+- **The known residuals.**
+  - Both providers missing the **same** log the same way is not found.
+  - **The guards' combinations are covered by unit cells only** (DSR
+    2026-11-17). Each guard has its own cell and a mutant that fails it, and the
+    lower-height and swapped-role probes from clestons #448 are cells. No
+    further Daybreak round reviewed how the guards interact.
+  - A provider that **deliberately** answers one finalized block two different
+    ways, consistently, could still hide an operator. For example, it might
+    serve another fork's block by number and by hash alike, with matching empty
+    logs, along a whole linked stretch. That case is outside the threat model
+    (DSR 2026-11-14) and is not mitigated.
 - **A follow-up, not required for rc.8.** With both providers configured, read
   the decision inputs at B (role, minStake, effectiveStake, isPaused) from both
   and treat a disagreement as `unknown`.
@@ -245,6 +395,14 @@ blocks**. Its worst outcome is a missed or late alert, since it sends nothing.
   limit. A message counts as delivered only on HTTP 2xx with a JSON body
   `ok: true`. Only the alerts in delivered messages are marked sent; the rest
   are retried next round.
+  - `undeliveredSince` (for the dead-man) clears on a round in which **nothing
+    failed** (clestons #448 N2, DSR 2026-11-17). An alert whose condition went
+    away before it was ever delivered is no longer owed, so it does not hold the
+    field.
+  - The dead-man treats an unreadable, or future-dated, `undeliveredSince` as
+    "delivered" (clestons #448 N4). The detector writes the field clamped to its
+    own clock, so that needs a forged or corrupted heartbeat; disclosed, not
+    mitigated.
 - **Repeats.** An alert repeats every `realertMinutes` while it holds.
 - **Resolution.** A `resolved:` line is sent once a later round sees the
   condition gone. For an operator, that requires the operator to be read at a
@@ -324,12 +482,22 @@ preflight after every deploy.**
   throw and B still canonical, whether or not it reads clear. A round that reads
   unknown still alerts on its own, so the heartbeat only answers "is the
   detector running rounds at all".
-- **Check.** Of the heartbeat the dead-man reads only `schema`, `at` and `gaps`.
-  With no completed round for more than **2 hours**, it alerts via
-  aastar-monitor, repeating every 6 hours while that lasts. A missing heartbeat,
-  an unreadable one or one dated in the future counts as silence. It sends one
-  `rounds resumed` notice when the heartbeat is fresh again. An alert that was
-  not delivered is retried at the next run.
+- **Undelivered alerts** (Daybreak M7, DSR 2026-11-17). The heartbeat also
+  carries `undeliveredSince`: since when some due alert of the detector could
+  not be delivered (it is retried every round, and the field clears on the first
+  round that delivers everything). A completed round still writes the heartbeat,
+  so without this a detector whose own messages fail would look alive. When
+  `undeliveredSince` is more than 2 h old, the dead-man alerts
+  `the pause detector runs, but its alerts have not been delivered since …`,
+  repeating every 6 hours, and sends one notice when they are delivered again.
+  Both jobs share the bot token, so this covers a failure of the detector's
+  messages only, not of the token (the known gap above).
+- **Check.** Of the heartbeat the dead-man reads only `schema`, `at`, `gaps` and
+  `undeliveredSince`. With no completed round for more than **2 hours**, it
+  alerts via aastar-monitor, repeating every 6 hours while that lasts. A missing
+  heartbeat, an unreadable one or one dated in the future counts as silence. It
+  sends one `rounds resumed` notice when the heartbeat is fresh again. An alert
+  that was not delivered is retried at the next run.
 - **No message lost silently.**
   - Undelivered messages are queued in the dead-man's state, written **before**
     each delivery attempt and emptied only once Telegram accepted them.
@@ -434,10 +602,20 @@ secret-file reader, called with the detector's own name table) and
      too wide makes every round `unknown` until it is fixed; it never makes a
      round clear.
    - `maxHeadAgeSec` (60..86400) is the oldest head a round accepts.
-   - `startBlock` is the rc.8 SP deploy block. The first rounds cross-check
-     every block from there, at most 4096 per round, so a start far in the past
-     reads `cross-check is behind` (unknown, fail-closed) for a while (clestons
-     #434 F5).
+   - `startBlock` is the rc.8 SP deploy block, or earlier. The detector checks
+     it once per state (Daybreak H2, DSR 2026-11-17): SuperPaymaster must have
+     **no code at `startBlock − 1`**, so no earlier `OperatorConfigured` can
+     exist. Until that read returns empty code, every round is `unknown`
+     (`start-block`). A later `startBlock` would leave earlier operators unread
+     for good; fix it with a new `stateDir`. The read needs historical
+     `eth_getCode`, which both configured providers serve.
+   - The state file is read with a 1 MiB limit. The inventory only grows, at
+     about 60 bytes per operator, so that is roughly 17,000 operators (Daybreak
+     L11); rc.8 has a handful. Cross-checks add at most 100 of them
+     (`MAX_CROSS_CHECK_ADDED`).
+   - The first rounds cross-check every block from there, at most 4096 per
+     round, so a start far in the past reads `cross-check is behind` (unknown,
+     fail-closed) for a while (clestons #434 F5).
 3. Create the secrets as 0600 files in a 0700 directory, without argv or
    history:
    - `aoa-dvt-detector-rpc-primary` and `aoa-dvt-detector-rpc-fallback` (RPC
@@ -455,7 +633,18 @@ secret-file reader, called with the detector's own name table) and
      differ from HEAD.
    - It records the commit in `MANIFEST.json`, and prints the source commit and
      the sha256 of `MANIFEST.json`. **Record both in the deploy log.** SP puts
-     them in the step-13 manifest as the detector's identity (DSR).
+     them in the step-13 manifest as the detector's identity (DSR). Preflight
+     compares the running bundle against them (step 7; Daybreak H4).
+   - A bundle built with `--allow-dirty` from files that differ from the commit
+     is marked `dirty` in its manifest, and the detector and preflight refuse it
+     (Daybreak H4); the dead-man then reports the detector's silence.
+   - Every bundled package must be exactly the version `package-lock.json` lists
+     at that path, with an integrity entry; otherwise the bundler stops
+     (Daybreak H5b). **This checks metadata, not the installed bytes:** a file
+     changed inside `node_modules/ethers` with its `package.json` left alone is
+     not caught here. The bytes are checked by `npm ci`, which verifies each
+     tarball against the lockfile's integrity at install time, so build from a
+     fresh `npm ci` (Daybreak rerun Low, disclosed; DSR 2026-11-17).
    - The checkout is not needed after this, and the detector cannot read it.
    - To upgrade, build a new bundle into a new directory and swap it in.
    - It copies ethers from the checkout's `node_modules`. So install that with
@@ -473,7 +662,9 @@ secret-file reader, called with the detector's own name table) and
    - Then the dead-man: `mkdir -m 700 ~/.aoa-pause-detector/deadman`, render and
      load `io.aastar.dvt-pause-detector-deadman.plist`, and check that its run
      interval is 900.
-7. Run `node deploy/pause-job/preflight.mjs`. It checks:
+7. Run
+   `node deploy/pause-job/preflight.mjs --detector-commit <commit> --detector-manifest-sha256 <sha256>`
+   with the two values from step 5's deploy log. It checks:
    - **launchd-on**: the detector, its dead-man and the price keeper are loaded;
      the committee keeper, apply-rotation and the D2 pause job are not; no other
      loaded job runs a DVT sender;
@@ -482,7 +673,8 @@ secret-file reader, called with the detector's own name table) and
      `--permission`, the one read, the one write and the bundle's entry, with no
      injecting variable;
    - **detector-bundle**: the bundle matches its manifest, with no symlink under
-     `~/.aoa-pause-detector`;
+     `~/.aoa-pause-detector`; the manifest is not `dirty`; its `commit` and its
+     sha256 are the recorded ones (missing values FAIL);
    - **pause-detector**: `status.json` is at most two intervals old, is not a
      startup failure, has no undelivered alerts, and a `clear` in it is on a
      head no older than two intervals.
@@ -492,6 +684,25 @@ secret-file reader, called with the detector's own name table) and
    detector (`launchctl bootout gui/$(id -u)/io.aastar.dvt-pause-detector`).
    Within 2 h 15 min the dead-man must send `DEAD-MAN: … no successful round`.
    Then load the detector again and wait for `rounds resumed`.
+
+### Recovering from a cross-check overflow
+
+`crosscheck-overflow` means the fallback reported more operators than the
+inventory may take from cross-checks (100 per state). The detector never clears
+it; every round reads `unknown` until it is reset by hand:
+
+1. Check the fallback provider and replace it (`aoa-dvt-detector-rpc-fallback`
+   and `rpc.fallback` in `config.json`). A provider that reports over 100
+   operators the primary does not have is the incident.
+2. Start a new `stateDir` (point `config.json` at a new 0700 directory; keep the
+   old one for the record).
+3. Restart and wait for the first cross-check to complete.
+
+A new `stateDir` loses everything the state held: the inventory is rebuilt from
+`startBlock`, `coveredTo` starts at 0, the cross-check watermark and both rescan
+clocks start again, and the 100-operator budget is new. Until the first
+cross-check completes, no round is clear (`crosscheck-pending`), and the first
+rounds re-verify every block from `startBlock` at most 4096 per round.
 
 ## Before rc.8
 

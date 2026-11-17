@@ -7,7 +7,10 @@
 //     while it lasts;
 //   - a fresh heartbeat after an alert: one "rounds resumed" notice;
 //   - a fresh heartbeat that carries an outage (gaps) not yet acknowledged: one notice per gap,
-//     acknowledged (reportedGaps) only once every queued message was delivered.
+//     acknowledged (reportedGaps) only once every queued message was delivered;
+//   - a fresh heartbeat whose `undeliveredSince` is more than MAX_SILENCE_MS old: the detector runs
+//     but its alerts do not arrive (Daybreak M7, DSR 2026-11-17). ALERT, repeated every REALERT_MS,
+//     and one notice when it clears.
 // Undelivered messages stay queued in its state and are retried first on the next run.
 // It writes only ~/.aoa-pause-detector/deadman (its own state and status). It holds no key and
 // reads no chain: it watches the detector, not SuperPaymaster.
@@ -63,6 +66,9 @@ export function deadmanDecision(hb, now, st) {
         alerting: true,
         lastSent: due ? now : lastSent,
         reportedGaps: Array.isArray(st?.reportedGaps) ? st.reportedGaps : [],
+        // no heartbeat to judge delivery by: the undelivered-alerts state is kept as it was
+        undeliveredAlerting: st?.undeliveredAlerting === true,
+        undeliveredLastSent: Number.isFinite(st?.undeliveredLastSent) ? st.undeliveredLastSent : 0,
       },
     };
   }
@@ -75,6 +81,18 @@ export function deadmanDecision(hb, now, st) {
   );
   const msgs = [];
   if (alerting) msgs.push("DEAD-MAN: the pause detector's rounds have resumed.");
+  // the detector runs, but some due alert of it has not been delivered for more than 2 h
+  const und = typeof hb?.undeliveredSince === "string" ? Date.parse(hb.undeliveredSince) : NaN;
+  const stuck = Number.isFinite(und) && now - und > MAX_SILENCE_MS;
+  const undAlerting = st?.undeliveredAlerting === true;
+  const undLast = Number.isFinite(st?.undeliveredLastSent) ? st.undeliveredLastSent : 0;
+  const undDue = stuck && (!undAlerting || now - undLast >= REALERT_MS || undLast > now);
+  if (undDue)
+    msgs.push(
+      `DEAD-MAN: the pause detector runs, but its alerts have not been delivered since ${new Date(und).toISOString()} (more than 2 h). Check its status.json "delivery".`
+    );
+  if (!stuck && undAlerting)
+    msgs.push("DEAD-MAN: the pause detector's alerts are delivered again.");
   for (const g of gaps)
     msgs.push(
       `DEAD-MAN: the pause detector had no successful round from ${g.from} to ${g.to} (${Math.round((Date.parse(g.to) - Date.parse(g.from)) / 60_000)} min).`
@@ -90,6 +108,8 @@ export function deadmanDecision(hb, now, st) {
       alerting: false,
       lastSent,
       reportedGaps: [...reported, ...gaps.map(g => g.from)].slice(-50),
+      undeliveredAlerting: stuck,
+      undeliveredLastSent: undDue ? now : undLast,
     },
   };
 }

@@ -5,6 +5,8 @@
 //
 //   node deploy/pause-job/preflight.mjs [--nodes dvt-node-1,dvt-node-2,dvt-node-3]
 //                                       [--detector-status <path to the detector's status.json>]
+//                                       --detector-commit <40 hex> --detector-manifest-sha256 <64 hex>
+//   (the two values bundle.mjs printed and the deploy log recorded; without them detector-bundle FAILs)
 //
 // launchd-on    (rc.8, DSR: "detect, then act by hand") the read-only pause detector and the price
 //               keeper ARE loaded; the committee keeper, apply-rotation and the retired D2 pause job
@@ -30,6 +32,7 @@ import {
   DIR as DETECTOR_DIR,
   ENV_OK as DETECTOR_ENV_OK,
   DEADMAN_STALE_MS,
+  bundleIdentityProblems as detectorBundleIdentity,
   bundleProblems as detectorBundle,
   deadmanRunProblems,
   symlinkProblems as detectorSymlinks,
@@ -367,10 +370,17 @@ export function deadmanFresh(text, now, maxAgeMs = DEADMAN_STALE_MS) {
   return [];
 }
 
-/** detector-bundle: no symlink under ~/.aoa-pause-detector, and the bundle exactly its manifest. */
-export function detectorBundleItem(home) {
+/**
+ * detector-bundle: no symlink under ~/.aoa-pause-detector, the bundle exactly its manifest, and the
+ * manifest the one the deploy log recorded (`expect` = { commit, manifestSha256 }; Daybreak H4).
+ */
+export function detectorBundleItem(home, expect) {
   const dd = join(home, DETECTOR_DIR);
-  return [...detectorSymlinks(dd), ...detectorBundle(join(dd, "app"))];
+  return [
+    ...detectorSymlinks(dd),
+    ...detectorBundle(join(dd, "app")),
+    ...detectorBundleIdentity(join(dd, "app"), expect),
+  ];
 }
 
 /**
@@ -558,7 +568,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     results.push(["deadman-args", ma.length ? "FAIL" : "PASS", ma]);
     // the bundle is exactly its manifest and nothing under ~/.aoa-pause-detector is a symlink:
     // checked here from outside the permission model too, so the entry file itself is covered
-    const db = detectorBundleItem(homedir());
+    const opt = k => {
+      const i = argv.indexOf(k);
+      return i >= 0 ? argv[i + 1] : undefined;
+    };
+    const db = detectorBundleItem(homedir(), {
+      commit: opt("--detector-commit"),
+      manifestSha256: opt("--detector-manifest-sha256"),
+    });
     results.push(["detector-bundle", db.length ? "FAIL" : "PASS", db.slice(0, 5)]);
   }
   const di = argv.indexOf("--detector-status");

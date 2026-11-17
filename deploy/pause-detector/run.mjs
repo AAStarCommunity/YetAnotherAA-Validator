@@ -11,7 +11,13 @@ import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ethers } from "ethers";
-import { emptyState, headStale, runRound, stateProblems } from "./lib/detect.mjs";
+import {
+  crossCheckInventory,
+  emptyState,
+  headStale,
+  runRound,
+  stateProblems,
+} from "./lib/detect.mjs";
 import {
   DIR,
   GuardError,
@@ -221,6 +227,29 @@ export async function deliver(st, due, resolved, header, now, send) {
   return { ok: failed === 0, sent, failed, ...(why ? { why } : {}) };
 }
 
+/**
+ * Since when some due alert could not be delivered (Daybreak M7, DSR 2026-11-17), after a delivery:
+ * an undelivered alert is retried every round, so a round that delivers everything clears it, and a
+ * failing round keeps the EARLIEST time. Pure.
+ */
+export function nextUndeliveredSince(prev, delivery, now) {
+  if (delivery?.ok === true) return null;
+  return Number.isFinite(prev) && prev <= now ? prev : now;
+}
+
+/**
+ * Who checks the inventory this round (clestons #448 B2, DSR 2026-11-17). The inventory must never be
+ * "checked" by the provider whose answers built it: only the configured fallback compares, and only
+ * on a round the primary ran. Returns { run, why }. Pure.
+ */
+export function crossCheckPlan(provider, cfg) {
+  if (provider === cfg.rpc.primary) return { run: true, why: null };
+  return {
+    run: false,
+    why: `this round ran on ${provider}, the cross-check provider: no independent provider to compare with`,
+  };
+}
+
 /** One run, after detector.mjs's guards passed. Returns the exit code. */
 export async function main() {
   const args = process.argv.slice(2);
@@ -345,9 +374,37 @@ export async function main() {
     if (sp.length)
       throw new SafeError(`state: ${sp.join("; ")} (a new deployment needs a new stateDir)`);
     const now = Date.now();
+    // the daily inventory cross-check (Daybreak H1, DSR 2026-11-17), before the round, so the round
+    // reports its result. It records its own failures (an incomplete day does not by itself make a
+    // round unknown). FIXED ROLES (clestons #448 B2): the inventory is built by the primary, and only
+    // the configured fallback checks it; a round that ran on the fallback cannot check anything
+    // independently, so its attempt is incomplete (crossCheckPlan)
+    const plan = crossCheckPlan(provider, cfg);
+    const checker = providers.find(pr => pr.name === cfg.rpc.fallback);
+    try {
+      await crossCheckInventory(st, {
+        primary: chain,
+        primaryName: provider,
+        other: plan.run ? readOnlyChain(checker.url) : null,
+        otherName: cfg.rpc.fallback,
+        unavailable: plan.why,
+        cfg,
+        now,
+        // an overflow marker is on disk before anything else in the run can fail (Codex pre-push r3)
+        persist: () => writeDurable(statePath, st),
+      });
+    } catch {
+      /* not reached: crossCheckInventory catches what it does */
+    }
     let result;
     try {
-      result = await runRound(st, { chain, cfg, now, clock: () => Date.now() });
+      result = await runRound(st, {
+        chain,
+        cfg,
+        now,
+        clock: () => Date.now(),
+        isPrimary: provider === cfg.rpc.primary,
+      });
     } catch (e) {
       result = {
         alerts: [{ key: "round", text: `unknown: the round stopped (${safeText("round", e)})` }],
@@ -386,6 +443,10 @@ export async function main() {
       now,
       text => telegram(cfg, token, text)
     );
+    // since when some due alert could not be delivered (Daybreak M7, DSR 2026-11-17): an undelivered
+    // alert is retried every round, so this clears on the first round that delivers everything. The
+    // heartbeat carries it and the dead-man alerts once it is older than its silence limit (2 h)
+    st.undeliveredSince = nextUndeliveredSince(st.undeliveredSince, delivery, now);
     writeDurable(statePath, st);
     writeDurable(statusPath, {
       schema: "aoa-pause-detector-status/1",
@@ -427,6 +488,7 @@ export async function main() {
         gaps: carryGaps(old, acked, at),
         block: result.report.block?.number ?? null,
         clear: result.report.clear === true,
+        undeliveredSince: st.undeliveredSince ? new Date(st.undeliveredSince).toISOString() : null,
       });
     }
     return result.alerts.length || !delivery.ok ? 1 : 0;

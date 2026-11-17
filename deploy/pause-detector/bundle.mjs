@@ -71,11 +71,28 @@ const resolvePkg = (name, fromDir) => {
   }
   return die(`${name} cannot be resolved from ${relative(REPO, fromDir) || "."}`);
 };
+// every bundled package must be exactly what package-lock.json describes at that path (Daybreak H5b,
+// DSR 2026-11-17): a node_modules that is stale or was not installed with `npm ci` is refused
+let lock;
+try {
+  lock = JSON.parse(readFileSync(join(REPO, "package-lock.json"), "utf8"));
+} catch {
+  die("package-lock.json cannot be read");
+}
+if (lock?.lockfileVersion < 2 || !lock?.packages)
+  die("package-lock.json has no packages map (lockfile v2+)");
 const pkgs = new Set();
 const visit = dir => {
   if (pkgs.has(dir)) return;
   pkgs.add(dir);
   const pj = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+  const key = relative(REPO, dir).split(sep).join("/");
+  const locked = lock.packages[key];
+  if (!locked) die(`${key} is not in package-lock.json: install with npm ci`);
+  if (locked.version !== pj.version)
+    die(`${key} is ${pj.version}, package-lock.json says ${locked.version}: install with npm ci`);
+  if (typeof locked.integrity !== "string" || !locked.integrity)
+    die(`${key} has no integrity in package-lock.json`);
   for (const dep of Object.keys(pj.dependencies ?? {})) {
     if (dep.startsWith("@types/")) continue; // type declarations only, nothing to run
     visit(resolvePkg(dep, dir));
@@ -102,7 +119,15 @@ for (const p of pkgs) listPkg(p);
 
 // 4. copy and write the manifest
 mkdirSync(out, { recursive: true, mode: 0o755 });
-const manifest = { schema: "aoa-pause-detector-bundle/1", commit, files: {} };
+// files that differ from `commit` (allowed only with --allow-dirty, for tests) are recorded: the
+// detector and preflight refuse such a bundle, so it can never pass as built from `commit`
+// (Daybreak H4, DSR 2026-11-17)
+const manifest = {
+  schema: "aoa-pause-detector-bundle/1",
+  commit,
+  ...(dirty ? { dirty: true } : {}),
+  files: {},
+};
 for (const f of [...files].sort()) {
   const to = join(out, f);
   mkdirSync(dirname(to), { recursive: true, mode: 0o755 });
@@ -118,5 +143,7 @@ const manifestSha = createHash("sha256").update(manifestText).digest("hex");
 console.log(
   `bundle: ${Object.keys(manifest.files).length} files (${own.length} detector, ${pkgs.size} packages) -> ${out}`
 );
-console.log(`bundle: source commit ${commit}`);
+console.log(
+  `bundle: source commit ${commit}${dirty ? " (DIRTY: a test bundle, refused at runtime)" : ""}`
+);
 console.log(`bundle: MANIFEST.json sha256 ${manifestSha}`);

@@ -904,11 +904,44 @@ cell(
         [join(here, "../pause-detector/bundle.mjs"), "--out", join(d, "app"), "--allow-dirty"],
         { encoding: "utf8" }
       );
+      // the two values bundle.mjs prints for the deploy log (Daybreak H4)
+      const expect = {
+        commit: b.stdout.match(/source commit ([0-9a-f]{40})/)?.[1],
+        manifestSha256: b.stdout.match(/MANIFEST\.json sha256 ([0-9a-f]{64})/)?.[1],
+      };
       cell(
-        "detector-bundle passes a fresh bundle",
-        b.status === 0 && detectorBundleItem(home).length === 0,
-        detectorBundleItem(home)
+        "detector-bundle passes a fresh bundle with the recorded commit and manifest sha256",
+        b.status === 0 && detectorBundleItem(home, expect).length === 0,
+        detectorBundleItem(home, expect)
       );
+      cell(
+        "detector-bundle fails without the recorded values (Daybreak H4)",
+        detectorBundleItem(home, {}).some(x => /--detector-commit/.test(x)) &&
+          detectorBundleItem(home, {}).some(x => /--detector-manifest-sha256/.test(x))
+      );
+      cell(
+        "detector-bundle fails on another commit (Daybreak H4)",
+        detectorBundleItem(home, { ...expect, commit: "ab".repeat(20) }).some(x =>
+          /was built from/.test(x)
+        )
+      );
+      cell(
+        "detector-bundle fails on another manifest sha256 (Daybreak H4)",
+        detectorBundleItem(home, { ...expect, manifestSha256: "cd".repeat(32) }).some(x =>
+          /MANIFEST\.json's sha256/.test(x)
+        )
+      );
+      {
+        // a manifest marked dirty (bundle.mjs --allow-dirty over changed files) is refused
+        const mp = join(d, "app", "MANIFEST.json");
+        const orig = readFileSync(mp, "utf8");
+        writeFileSync(mp, JSON.stringify({ ...JSON.parse(orig), dirty: true }));
+        cell(
+          "detector-bundle fails on a dirty bundle (Daybreak H4)",
+          detectorBundleItem(home, expect).some(x => /test bundle/.test(x))
+        );
+        writeFileSync(mp, orig);
+      }
       writeFileSync(join(d, "app", "node_state.json"), "{}");
       cell(
         "detector-bundle fails on a file outside the manifest",

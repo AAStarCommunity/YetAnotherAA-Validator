@@ -57,15 +57,24 @@ const height = (n, what) => {
  */
 export function normalizeClock(st, now) {
   let changed = false;
-  if (st.lastFullScan > now) {
-    st.lastFullScan = 0;
-    changed = true;
-  }
+  for (const k of ["lastFullScan", "lastFallbackFullScan"])
+    if (st[k] > now) {
+      st[k] = 0;
+      changed = true;
+    }
   for (const k of Object.keys(st.alerts))
     if (st.alerts[k] > now) {
       st.alerts[k] = 0;
       changed = true;
     }
+  if (st.crossCheck?.lastAttempt > now) {
+    st.crossCheck.lastAttempt = 0;
+    changed = true;
+  }
+  if (st.undeliveredSince > now) {
+    st.undeliveredSince = now;
+    changed = true;
+  }
   return changed;
 }
 
@@ -75,19 +84,38 @@ function resetVerification(st, alerts, why) {
   st.checked = st.startBlock - 1;
   st.checkedHash = null;
   st.lastFullScan = 0;
+  st.lastFallbackFullScan = 0;
   alerts.push({
     key: "reverify",
     text: `unknown: ${why}; everything is read and verified again from block ${st.startBlock}`,
   });
 }
 
+/** How far a head's timestamp may be ahead of this machine's clock (Daybreak M8, DSR 2026-11-17). */
+export const MAX_FUTURE_SKEW_SEC = 300;
+
 /**
- * A head block older than `maxAgeSec` (or without a usable timestamp) at `nowMs` is stale. Pure.
+ * Why a head block cannot be used at `nowMs`, or null: no usable timestamp, older than `maxAgeSec`,
+ * or more than MAX_FUTURE_SKEW_SEC ahead of the clock. A real block is never far in the future, so
+ * that means this machine's clock is behind (a frozen head would then look fresher than it is) or
+ * the provider is wrong: either way the head's age is not known. Pure.
  */
-export function headStale(block, nowMs, maxAgeSec) {
+export function headProblem(block, nowMs, maxAgeSec) {
   const t = Number(block?.timestamp);
-  if (!Number.isSafeInteger(t) || t <= 0 || !Number.isSafeInteger(maxAgeSec)) return true;
-  return nowMs / 1000 - t > maxAgeSec;
+  if (!Number.isSafeInteger(t) || t <= 0 || !Number.isSafeInteger(maxAgeSec))
+    return "has no usable timestamp";
+  // compared unrounded (clestons #448 N3): a head 300.5 s ahead or 1800.4 s old is out
+  const age = nowMs / 1000 - t;
+  if (-age > MAX_FUTURE_SKEW_SEC)
+    return `is ${Math.round(-age)} s AHEAD of this machine's clock (max ${MAX_FUTURE_SKEW_SEC}): check the Mini's clock`;
+  if (age > maxAgeSec)
+    return `is ${Math.round(age)} s old (max ${maxAgeSec}): a frozen or lagging node`;
+  return null;
+}
+
+/** A head block that cannot be used at `nowMs` (headProblem). Pure. */
+export function headStale(block, nowMs, maxAgeSec) {
+  return headProblem(block, nowMs, maxAgeSec) !== null;
 }
 
 /** A fresh state, bound to { chainId, spProxy, startBlock }. */
@@ -98,7 +126,10 @@ export function emptyState({ chainId, spProxy, startBlock }) {
     spProxy: lc(spProxy),
     startBlock,
     cursor: startBlock - 1, // last block whose OperatorConfigured logs are in the inventory
-    lastFullScan: 0, // ms of the last successful rescan from startBlock (daily)
+    lastFullScan: 0, // ms of the primary's last successful rescan from startBlock (daily)
+    // the fallback's, kept apart (clestons #448 B1'', DSR 2026-11-18): a fallback rescan is done when
+    // due but never stands in for the primary's (N6)
+    lastFallbackFullScan: 0,
     operators: {}, // checksummed addr -> first block seen (only ever grows: a superset is safe)
     // every block at or below `checked` had its by-hash and by-range answers compared and agree;
     // it starts below startBlock, so every block is compared once (Codex R11 P1-1), and is bound to
@@ -106,6 +137,29 @@ export function emptyState({ chainId, spProxy, startBlock }) {
     checked: startBlock - 1,
     checkedHash: null,
     alerts: {}, // key -> last alert time (ms)
+    // the proxy has no code at startBlock - 1, read once (Daybreak H2): no earlier event exists
+    startBlockVerified: false,
+    crossCheck: emptyCrossCheck(),
+    undeliveredSince: null, // ms since some due alert could not be delivered (Daybreak M7), or null
+  };
+}
+
+/** The daily second-provider inventory cross-check's state (Daybreak H1, DSR 2026-11-17). */
+export function emptyCrossCheck() {
+  return {
+    lastAttempt: 0, // ms of the last daily attempt, completed or not
+    lastComplete: 0, // ms of the last attempt that completed
+    failedDays: 0, // consecutive daily attempts that did not complete
+    lastError: null, // why the last attempt did not complete
+    // the highest block a completed cross-check covered (Daybreak rerun High, DSR 2026-11-17): a
+    // later one that covers less (the other provider's finalized block stalled or went back) is
+    // not complete. 0 = none yet
+    coveredTo: 0,
+    mismatch: null, // { at, height, provider, fallbackOnly: [op], primaryOnly: [op] } or null
+    // set once a comparison found more than MAX_CROSS_CHECK_ADDED could add, and NEVER cleared by the
+    // detector (DSR 2026-11-18): { provider, since, maxCount }. Every round is unknown until an
+    // operator replaces the fallback and starts a new stateDir
+    overflow: null,
   };
 }
 
@@ -122,6 +176,11 @@ export function stateProblems(st, cfg) {
     p.push("the state cursor is not a block at or after startBlock - 1");
   if (!Number.isFinite(st.lastFullScan) || st.lastFullScan < 0)
     p.push("the state has no lastFullScan time");
+  if (
+    st.lastFallbackFullScan !== undefined &&
+    !(Number.isFinite(st.lastFallbackFullScan) && st.lastFallbackFullScan >= 0)
+  )
+    p.push("the state's lastFallbackFullScan is not a time");
   // a JSON array here would silently drop every operator on the next write (Codex R1 P1-4)
   if (!plainObject(st.operators)) p.push("the state's operators is not a plain map");
   else
@@ -145,6 +204,74 @@ export function stateProblems(st, cfg) {
   if (!plainObject(st.alerts)) p.push("the state's alerts is not a plain map");
   else if (Object.values(st.alerts).some(v => !Number.isFinite(v)))
     p.push("the state's alerts has a time that is not a number");
+  // both are optional (a state written before Daybreak r1 has neither; they start empty)
+  if (
+    st.fromCrossCheck !== undefined &&
+    !(
+      plainObject(st.fromCrossCheck) &&
+      Object.entries(st.fromCrossCheck).every(
+        ([k, v]) =>
+          ADDRESS.test(k) &&
+          plainObject(v) &&
+          typeof v.provider === "string" &&
+          Number.isSafeInteger(v.block) &&
+          Number.isFinite(v.at)
+      )
+    )
+  )
+    p.push("the state's fromCrossCheck is not a map of operators the cross-check added");
+  if (
+    st.undeliveredSince !== undefined &&
+    st.undeliveredSince !== null &&
+    !(Number.isFinite(st.undeliveredSince) && st.undeliveredSince >= 0)
+  )
+    p.push("the state's undeliveredSince is not a time");
+  if (st.startBlockVerified !== undefined && typeof st.startBlockVerified !== "boolean")
+    p.push("the state's startBlockVerified is not a boolean");
+  if (st.crossCheck !== undefined) {
+    const c = st.crossCheck;
+    const addrs = a => Array.isArray(a) && a.every(x => typeof x === "string" && ADDRESS.test(x));
+    if (
+      !plainObject(c) ||
+      !["lastAttempt", "lastComplete"].every(k => Number.isFinite(c[k]) && c[k] >= 0) ||
+      !Number.isSafeInteger(c.failedDays) ||
+      c.failedDays < 0 ||
+      !(c.coveredTo === undefined || (Number.isSafeInteger(c.coveredTo) && c.coveredTo >= 0)) ||
+      // a completed record carries its coverage (Daybreak narrow rerun Medium, DSR 2026-11-17)
+      (c.lastComplete > 0 && c.coveredTo === undefined) ||
+      !(c.lastError === null || typeof c.lastError === "string") ||
+      !(
+        c.overflow === undefined ||
+        c.overflow === null ||
+        (plainObject(c.overflow) &&
+          typeof c.overflow.provider === "string" &&
+          Number.isFinite(c.overflow.since) &&
+          Number.isSafeInteger(c.overflow.maxCount) &&
+          c.overflow.maxCount > 0)
+      ) ||
+      !(
+        c.mismatch === null ||
+        (plainObject(c.mismatch) &&
+          Number.isSafeInteger(c.mismatch.height) &&
+          c.mismatch.height >= 0 &&
+          addrs(c.mismatch.fallbackOnly) &&
+          addrs(c.mismatch.primaryOnly) &&
+          (c.mismatch.unlisted === undefined ||
+            (Number.isSafeInteger(c.mismatch.unlisted) && c.mismatch.unlisted >= 0)) &&
+          (c.mismatch.found === undefined ||
+            (plainObject(c.mismatch.found) &&
+              Object.entries(c.mismatch.found).every(
+                ([k, f]) =>
+                  ADDRESS.test(k) &&
+                  plainObject(f) &&
+                  typeof f.provider === "string" &&
+                  Number.isSafeInteger(f.height) &&
+                  f.height >= 0
+              ))))
+      )
+    )
+      p.push("the state's crossCheck is not a cross-check record");
+  }
   return p;
 }
 
@@ -162,6 +289,7 @@ export function ranges(from, to, size) {
 
 // an ABI-encoded address topic: 12 zero bytes, then the address (Codex R1 P1-3)
 const ADDRESS_TOPIC = /^0x0{24}[0-9a-fA-F]{40}$/;
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const HASH32 = /^0x[0-9a-fA-F]{64}$/;
 
 /**
@@ -354,7 +482,10 @@ export const pauseCommand = (spProxy, op) =>
  * the caller delivers them. `clear` in the report is true ONLY when every read succeeded at a
  * canonical B with the identity confirmed and no operator is actionable or unknown.
  */
-export async function runRound(st, { chain, cfg, now = Date.now(), clock = () => now }) {
+export async function runRound(
+  st,
+  { chain, cfg, now = Date.now(), clock = () => now, isPrimary = true }
+) {
   // a state time after now (a clock that was ahead) would suppress re-alerts and the daily rescan
   // until that date: reset it first, so the progress snapshot below does not undo it (Codex R2 P2)
   const clockReset = normalizeClock(st, now);
@@ -366,10 +497,11 @@ export async function runRound(st, { chain, cfg, now = Date.now(), clock = () =>
     checked: st.checked,
     checkedHash: st.checkedHash,
     lastFullScan: st.lastFullScan,
+    lastFallbackFullScan: st.lastFallbackFullScan,
   };
   let result;
   try {
-    result = await roundOnce(st, { chain, cfg, now, clock });
+    result = await roundOnce(st, { chain, cfg, now, clock, isPrimary });
   } catch (e) {
     Object.assign(st, before);
     throw e;
@@ -383,7 +515,7 @@ export async function runRound(st, { chain, cfg, now = Date.now(), clock = () =>
   return result;
 }
 
-async function roundOnce(st, { chain, cfg, now, clock }) {
+async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   const alerts = [];
   const sp = stateProblems(st, cfg);
   if (sp.length) throw new SafeError(`state: ${sp.join("; ")}`);
@@ -393,6 +525,30 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
     throw new SafeError("logChunk is not a block count");
   const chainId = Number(await chain.chainId());
   if (chainId !== st.chainId) throw new SafeError(`chain id ${chainId}, expected ${st.chainId}`);
+
+  // 0. startBlock is not after SP's deployment (Daybreak H2, DSR 2026-11-17): a late startBlock
+  //    would leave every earlier OperatorConfigured unread for good. The proxy having NO code at
+  //    startBlock - 1 proves it did not exist yet, so no earlier event can exist. Read once per state;
+  //    until it reads "0x" no round is clear.
+  let startOk = st.startBlockVerified === true;
+  if (!startOk) {
+    try {
+      const code = await chain.code(st.spProxy, hex(st.startBlock - 1));
+      if (code === "0x") {
+        st.startBlockVerified = true;
+        startOk = true;
+      } else
+        alerts.push({
+          key: "start-block",
+          text: `unknown: SuperPaymaster already has code at block ${st.startBlock - 1}, so startBlock ${st.startBlock} is after its deployment and earlier operators are never read; set startBlock to SP's deploy block (with a new stateDir)`,
+        });
+    } catch (e) {
+      alerts.push({
+        key: "start-block",
+        text: `unknown: whether SuperPaymaster existed before startBlock ${st.startBlock} could not be read (${safeText("startBlock", e)})`,
+      });
+    }
+  }
 
   // the canonical hash of block n, read once per round (every log is checked against it)
   const hashes = new Map();
@@ -417,7 +573,12 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
       alerts,
       `the state cursor ${st.cursor} is ahead of the finalized block ${finalized}`
     );
-  const full = now - st.lastFullScan >= 24 * 3600_000;
+  // the daily full rescan runs on whichever provider the round uses, each on its own 24 h clock
+  // (clestons #448 B1'', DSR 2026-11-18): with the primary down for days the fallback still re-reads
+  // everything once a day, so an operator the primary's index missed is found within a day. Only the
+  // primary's rescan moves lastFullScan, so a fallback rescan never stands in for it (N6)
+  const scanKey = isPrimary ? "lastFullScan" : "lastFallbackFullScan";
+  const full = now - (st[scanKey] ?? 0) >= 24 * 3600_000;
   const from = full ? st.startBlock : Math.max(st.startBlock, st.cursor + 1 - cfg.rescanBlocks);
   let inventoryOk = true;
   // what the number-range answers said, block by block, this round: compared below with the
@@ -449,7 +610,7 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
       },
       canon
     );
-    if (full) st.lastFullScan = now;
+    if (full) st[scanKey] = now;
   } catch (e) {
     inventoryOk = false;
     alerts.push({
@@ -469,10 +630,8 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
   // a head that stopped moving is the commonest honest failure, and self-consistent: every other
   // check passes against a frozen node (clestons #434 B1). An old head stops the round.
   // checked against the clock WHEN B is accepted, not the round's start (Codex R16 P1-2)
-  if (headStale(head, clock(), cfg.maxHeadAgeSec))
-    throw new SafeError(
-      `the latest block ${B.number} is ${Number.isSafeInteger(head.timestamp) ? Math.round(now / 1000 - head.timestamp) : "?"} s old (max ${cfg.maxHeadAgeSec}): a frozen or lagging node`
-    );
+  const hp = headProblem(head, clock(), cfg.maxHeadAgeSec);
+  if (hp) throw new SafeError(`the latest block ${B.number} ${hp}`);
   // a backend whose latest is below what it calls finalized (or below our cursor) is lagging or
   // inconsistent: nothing it says this round is used (Codex R3 P1-3)
   if (B.number < finalized || B.number < st.cursor)
@@ -598,7 +757,11 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
   for (const [op, n] of recent) st.operators[op] ??= n;
 
   // 5. every operator at B
-  const ops = Object.keys(st.operators).sort();
+  // the inventory, plus any operator only the second provider's cross-check found (Daybreak H1):
+  // those are checked too while the disagreement stands, without entering the primary's inventory
+  const ops = [
+    ...new Set([...Object.keys(st.operators), ...(st.crossCheck?.mismatch?.fallbackOnly ?? [])]),
+  ].sort();
   const results = [];
   for (const op of ops) results.push({ operator: op, ...(await operatorAt(chain, B, cfg, op)) });
 
@@ -653,11 +816,328 @@ async function roundOnce(st, { chain, cfg, now, clock }) {
       text: `unknown: block ${B.number} is older than ${cfg.maxHeadAgeSec} s by the end of the round`,
     });
   report.fresh = freshAtEnd;
+  // the daily cross-check's standing results (crossCheckInventory ran before this round)
+  alerts.push(...crossCheckAlerts(st));
+  // no round is clear before a first cross-check has completed (DSR 2026-11-17): a fresh state,
+  // a first deployment or a lost state file, would otherwise read clear with nothing compared
+  const crossDone = st.crossCheck?.lastComplete > 0;
+  if (!crossDone)
+    alerts.push({
+      key: "crosscheck-pending",
+      text: "unknown: no inventory cross-check with the other RPC provider has completed yet; no round is clear until one has",
+    });
+  // an incomplete cross-check is tolerated for at most CROSS_CHECK_ALERT_DAYS days of blocks
+  // (Daybreak narrow rerun High A, DSR 2026-11-17): beyond that the inventory has outrun what was
+  // compared, and the round is unknown; it turns unknown when crosscheck-incomplete starts to alert
+  const behind = st.cursor - (st.crossCheck?.coveredTo ?? 0);
+  const coverageOk = behind <= CROSS_CHECK_ALERT_DAYS * CROSS_CHECK_MAX_LAG_BLOCKS;
+  if (crossDone && !coverageOk)
+    alerts.push({
+      key: "crosscheck-behind",
+      text: `unknown: the inventory is ${behind} blocks past what the last cross-check covered (block ${st.crossCheck?.coveredTo}; max ${CROSS_CHECK_ALERT_DAYS * CROSS_CHECK_MAX_LAG_BLOCKS})`,
+    });
+  // an overflow is never settled by a later comparison (DSR 2026-11-18): past the cap the over-cap
+  // operators are unnamed, and a comparison cannot tell an honest omission from a lying one
+  const overflow = st.crossCheck?.overflow ?? null;
+  if (overflow)
+    alerts.push({
+      key: "crosscheck-overflow",
+      text:
+        `unknown: the cross-check with ${overflow.provider} found more operators than the inventory may take from it ` +
+        `(up to ${overflow.maxCount} over the cap of ${MAX_CROSS_CHECK_ADDED}, since ${new Date(overflow.since).toISOString()}); ` +
+        "no round is clear until an operator resets it: 1. check that fallback provider and replace it; " +
+        "2. start a new stateDir (the inventory and coveredTo are rebuilt); " +
+        "3. after the restart, wait for the first cross-check to complete (rounds read unknown until then)",
+    });
+  const crossOk = crossDone && coverageOk && !st.crossCheck?.mismatch && !overflow;
+  report.startBlockVerified = startOk;
+  report.crossCheck = st.crossCheck ?? null;
   report.clear =
     freshAtEnd &&
+    startOk &&
+    crossOk &&
     id.ok &&
     inventoryOk &&
     recentOk &&
     results.every(r => r.status === "ok" || r.status === "paused" || r.status === "not-configured");
   return { alerts, report };
+}
+
+/** The daily cross-check's period, and how many failed days in a row raise an alert (DSR 2026-11-17). */
+export const CROSS_CHECK_MS = 24 * 3600_000;
+export const CROSS_CHECK_ALERT_DAYS = 3;
+/** The most inventory entries one cross-check re-asks the primary about, and per getLogs topic list. */
+export const MAX_REQUERY_OPERATORS = 1000;
+export const REQUERY_TOPICS = 50;
+/**
+ * The most operators that ever enter the inventory from cross-checks, per state (clestons #448 N8,
+ * DSR 2026-11-18). Past it the rest are only counted (mismatch.unlisted) and the disagreement stands:
+ * the round is never clear while any is reported. A lying fallback can therefore add at most this
+ * many addresses to read, and cannot grow the state without bound.
+ */
+export const MAX_CROSS_CHECK_ADDED = 100;
+/**
+ * The most blocks the cross-check may trail the primary's cursor: one day at Sepolia's 12 s.
+ * CHAIN-SPECIFIC, NOT CONFIGURED PER CHAIN (DSR 2026-11-17): the value is chosen for Sepolia's block
+ * time and must be recomputed here, as (one day / block time), before the detector watches another
+ * chain. On OP Mainnet's 2 s blocks one day is 43200; left at 7200 it means 4 h, stricter, costing
+ * incomplete days, never a false clear.
+ */
+export const CROSS_CHECK_MAX_LAG_BLOCKS = 7200;
+
+/**
+ * The daily inventory cross-check against the OTHER provider (Daybreak H1, DSR 2026-11-17). Once a
+ * day (and every round while a disagreement stands) the other provider is read from startBlock up to
+ * H = min(the primary inventory's cursor, the other's finalized block), and its set of operators is
+ * compared with the primary's inventory entries at or below H:
+ *   - an operator only the other provider has: the primary's index missed it (an honest indexer gap
+ *     is enough). Recorded as `fallbackOnly`; it is checked every round from then on;
+ *   - an inventory entry the other lacks is asked of the primary again, by operator topic: if the
+ *     primary itself has no such log at or below H, it is a harmless superset entry (a block that
+ *     later left the chain), otherwise it is `primaryOnly`.
+ * Either list non-empty is a disagreement: crossCheckAlerts makes every round unknown until a later
+ * cross-check agrees. An attempt that cannot complete (the other provider down or wrong) records
+ * the day as incomplete and does NOT make a round unknown; CROSS_CHECK_ALERT_DAYS of them in a row
+ * alert. Residual (README): both providers missing the same log the same way is not found.
+ * Mutates st.crossCheck. `other` is null when there is no second provider to ask.
+ */
+export async function crossCheckInventory(
+  st,
+  {
+    primary,
+    primaryName,
+    other,
+    otherName,
+    cfg,
+    now,
+    unavailable = "no second provider to ask",
+    persist = () => {},
+  }
+) {
+  const cc = (st.crossCheck ??= emptyCrossCheck());
+  const daily = now - cc.lastAttempt >= CROSS_CHECK_MS;
+  if (!daily && !cc.mismatch) return { ran: false };
+  // nothing of the primary's inventory to compare yet (its first round has not run): not an attempt
+  if (st.cursor < st.startBlock) return { ran: false };
+  if (daily) cc.lastAttempt = now;
+  const canonOf = chain => {
+    const m = new Map();
+    return async n => {
+      if (!m.has(n)) {
+        const b = await chain.blockByNumber(n);
+        if (!b?.hash) throw new SafeError(`no block ${n}`);
+        m.set(n, b.hash);
+      }
+      return m.get(n);
+    };
+  };
+  try {
+    if (!other) throw new SafeError(unavailable);
+    const id = Number(await other.chainId());
+    if (id !== st.chainId) throw new SafeError(`the other provider is on chain ${id}`);
+    const otherFinal = height(Number(await other.blockNumber("finalized")), "its finalized block");
+    const H = Math.min(st.cursor, otherFinal);
+    // the comparison must keep up (Daybreak rerun High, DSR 2026-11-17): an H below what a completed
+    // cross-check already covered, or more than a day of blocks behind the primary's cursor, means
+    // the other provider's finalized block stalled or went back. Such an attempt is incomplete
+    // nothing below startBlock can be compared: such an attempt is not a completed cross-check
+    // (clestons #448 N5; it would otherwise satisfy "no clear before a first cross-check")
+    if (H < st.startBlock)
+      throw new SafeError(
+        `the other provider's finalized block ${otherFinal} is below startBlock ${st.startBlock}: nothing to compare`
+      );
+    if (H < (cc.coveredTo ?? 0))
+      throw new SafeError(
+        `the other provider's finalized block ${otherFinal} is below block ${cc.coveredTo}, which an earlier cross-check covered`
+      );
+    if (st.cursor - H > CROSS_CHECK_MAX_LAG_BLOCKS)
+      throw new SafeError(
+        `the other provider's finalized block ${otherFinal} is ${st.cursor - H} blocks behind the inventory (max ${CROSS_CHECK_MAX_LAG_BLOCKS})`
+      );
+    // a standing disagreement is replaced or cleared only by a comparison that reaches its height,
+    // whatever that comparison finds (Daybreak narrow rerun High B, DSR 2026-11-17): a shorter one
+    // is not complete
+    if (cc.mismatch && H < cc.mismatch.height)
+      throw new SafeError(
+        `this comparison reaches block ${H}, below the standing disagreement at block ${cc.mismatch.height}`
+      );
+    const mine = new Set(
+      Object.entries(st.operators)
+        .filter(([, n]) => n <= H)
+        .map(([op]) => op)
+    );
+    // what the other provider reported and the inventory lacked ENTERS the inventory (clestons #448
+    // B1', DSR 2026-11-17), recorded as coming from it, so the very next round checks its stake. The
+    // failure direction is safe: an operator only goes into the list of addresses to read; whether it
+    // is reported comes from the primary's chain reads at B and SP's own pauseUnderstakedOperator
+    // simulation. One a lying provider invented reads "not-configured" (a notice), never PAUSE NEEDED.
+    // - chunk by chunk, as each validated chunk arrives (Codex pre-push round 3), and so before the
+    //   primary is re-asked (clestons #448 N2, DSR 2026-11-18): a later chunk or the re-query failing
+    //   leaves the attempt incomplete but what was seen already checked;
+    // - at most MAX_CROSS_CHECK_ADDED per state (N8); past that the overflow marker is set at once,
+    //   kept for good (DSR 2026-11-18), and written to disk at once (`persist`, Codex pre-push round
+    //   3): a crash later in the run cannot lose it
+    st.fromCrossCheck ??= {};
+    let room = MAX_CROSS_CHECK_ADDED - Object.keys(st.fromCrossCheck).length;
+    const overCap = new Set();
+    const markOverflow = count => {
+      if (count <= (cc.overflow?.maxCount ?? 0)) return;
+      cc.overflow = {
+        provider: otherName,
+        since: cc.overflow?.since ?? now,
+        maxCount: count,
+      };
+      persist();
+    };
+    const theirs = new Map(); // operator -> first block the other provider has its log at
+    if (H >= st.startBlock)
+      await operatorLogs(
+        other,
+        st.spProxy,
+        st.startBlock,
+        H,
+        cfg.logChunk,
+        logs => {
+          for (const lg of logs) {
+            const op = opOf(lg.topics[1]);
+            if (theirs.has(op)) continue;
+            const n = Number(lg.blockNumber);
+            theirs.set(op, n);
+            if (mine.has(op) || op in st.operators) continue;
+            if (room > 0) {
+              st.operators[op] = n;
+              st.fromCrossCheck[op] = { provider: otherName, block: n, at: now };
+              room--;
+            } else {
+              overCap.add(op);
+              markOverflow(overCap.size);
+            }
+          }
+        },
+        canonOf(other)
+      );
+    // what the other provider has that the inventory lacks, each with who found it and how far
+    // that comparison reached
+    const found = {};
+    for (const op of theirs.keys())
+      if (!mine.has(op)) found[op] = { provider: otherName, height: H };
+    // a standing fallback-only operator is CARRIED FORWARD (clestons #448 B1/B2/B1'): its only way
+    // out of the disagreement is the inventory. A later comparison that no longer reports it, by any
+    // provider, does not count: its log was seen on a finalized, hash-checked block and cannot
+    // legitimately disappear; a provider that stops reporting it says less, it does not refute it
+    // (DSR 2026-11-17, withdrawing the "same provider no longer reports it" exit)
+    for (const [op, f] of Object.entries(cc.mismatch?.found ?? {}))
+      if (!(op in found) && !(op in st.operators)) found[op] = f;
+    // a mismatch from before `found` existed carries its fallback-only operators the same way
+    for (const op of cc.mismatch?.found ? [] : (cc.mismatch?.fallbackOnly ?? []))
+      if (!(op in found) && !(op in st.operators))
+        found[op] = { provider: cc.mismatch.provider, height: cc.mismatch.height };
+    // over-cap operators (not added during the scan) are dropped from `found` and only counted, so
+    // the record stays bounded and the disagreement stands while they are reported
+    let unlisted = 0;
+    for (const op of Object.keys(found))
+      if (overCap.has(op)) {
+        delete found[op];
+        unlisted++;
+      }
+    const fallbackOnly = Object.keys(found).sort();
+    // what the fallback found stands as a disagreement NOW, before the fallible re-query (Codex on
+    // 4e6dc27, High): an over-cap operator is only counted, so if the re-query below threw, nothing
+    // would be left of it and the round could read clear. The attempt is still incomplete; the
+    // re-query's outcome replaces this record when it completes. The guards above already passed,
+    // so this comparison reaches any standing disagreement's height
+    if (fallbackOnly.length || unlisted)
+      cc.mismatch = {
+        at: now,
+        height: H,
+        provider: otherName,
+        primary: primaryName,
+        fallbackOnly,
+        primaryOnly: cc.mismatch?.primaryOnly ?? [],
+        found,
+        unlisted,
+      };
+    // inventory entries the other provider lacks are asked of the primary again, all at once: one
+    // getLogs per chunk with the operators as an OR topic (clestons #448 N1: not operators x chunks)
+    const candidates = [...mine].filter(op => !theirs.has(op)).sort();
+    if (candidates.length > MAX_REQUERY_OPERATORS)
+      throw new SafeError(
+        `${candidates.length} inventory entries the other provider lacks (max ${MAX_REQUERY_OPERATORS} re-queried)`
+      );
+    const confirmed = new Set();
+    const primaryCanon = canonOf(primary);
+    for (let i = 0; i < candidates.length; i += REQUERY_TOPICS) {
+      const group = candidates.slice(i, i + REQUERY_TOPICS);
+      const want = new Set(group);
+      for (const [a, b] of ranges(st.startBlock, H, cfg.logChunk)) {
+        let logs;
+        try {
+          logs = await primary.getLogs({
+            address: st.spProxy,
+            topics: [OPERATOR_CONFIGURED, group.map(op => ethers.zeroPadValue(op, 32))],
+            fromBlock: hex(a),
+            toBlock: hex(b),
+          });
+        } catch (e) {
+          throw new SafeError(`${safeText("getLogs", e)} (primary, blocks ${a}-${b})`);
+        }
+        await checkLogs(logs, st.spProxy, a, b, primaryCanon);
+        for (const lg of logs) {
+          const op = opOf(lg.topics[1]);
+          if (want.has(op)) confirmed.add(op);
+        }
+        if (group.every(op => confirmed.has(op))) break;
+      }
+    }
+    const primaryOnly = candidates.filter(op => confirmed.has(op));
+    const outcome =
+      fallbackOnly.length || primaryOnly.length || unlisted
+        ? {
+            at: now,
+            height: H,
+            provider: otherName,
+            primary: primaryName,
+            fallbackOnly,
+            primaryOnly,
+            found,
+            unlisted,
+          }
+        : null;
+    cc.lastComplete = now;
+    cc.failedDays = 0;
+    cc.lastError = null;
+    cc.coveredTo = Math.max(cc.coveredTo ?? 0, H);
+    cc.mismatch = outcome;
+  } catch (e) {
+    if (daily) cc.failedDays += 1;
+    cc.lastError = safeText("cross-check", e);
+  }
+  return { ran: true };
+}
+
+/** The alerts the cross-check's state raises, every round while they hold. Pure. */
+export function crossCheckAlerts(st) {
+  const cc = st.crossCheck;
+  const out = [];
+  if (cc?.mismatch) {
+    const m = cc.mismatch;
+    const list = a => (a.length ? a.join(", ") : "none");
+    out.push({
+      key: "crosscheck",
+      text:
+        `unknown: the two RPC providers disagree on the operator inventory up to block ${m.height} ` +
+        `(only ${m.provider} has: ${list(m.fallbackOnly)}` +
+        (m.unlisted
+          ? `, and ${m.unlisted} more not added to the inventory (at most ${MAX_CROSS_CHECK_ADDED} are)`
+          : "") +
+        `; only ${m.primary ?? "the round's provider"} has: ${list(m.primaryOnly)}); ` +
+        "one provider's log index is wrong; every operator either one names is checked",
+    });
+  }
+  if (cc?.failedDays >= CROSS_CHECK_ALERT_DAYS)
+    out.push({
+      key: "crosscheck-incomplete",
+      text: `the daily inventory cross-check with the other RPC provider has not completed for ${cc.failedDays} days (${cc.lastError ?? "?"})`,
+    });
+  return out;
 }
