@@ -1,8 +1,12 @@
 # rc.8 deploy day: what DVT changes
 
-Status: **plan**. The steps below run only after SP's rc.8 manifest PR lands and
-the rc.8 contracts are deployed and read back. Until then nothing here is
-executed (DSR, 2026-11-15).
+Status: **plan**. Nothing here runs before SP's rc.8 manifest PR lands. On
+deploy day the steps fall in two phases:
+
+- **Before the new contracts exist** (between SP's pin and the manifest's first
+  send): the guardian PoP export ("Guardian re-registration", steps 1–3).
+- **After the contracts are deployed and read back:** everything else (A10
+  read-back, settings switch, detector).
 
 ## Why there is a DVT step at all
 
@@ -28,6 +32,12 @@ Both contracts get new addresses and start with empty state:
    re-registration" below).
 3. The DVT nodes and the pause detector are switched to the read-back values
    (see "Settings to change" below).
+   - In the same change, add the DVTValidator and aggregator being replaced to
+     the superseded lists in `src/config/audit-address-guard.ts`
+     (`SUPERSEDED_DVT_VALIDATORS`, `SUPERSEDED_BLS_AGGREGATORS`), so a node with
+     audit on refuses to start on them (DSR 2026-11-17).
+   - A node with audit and the guardian watch off does not check the addresses;
+     its startup log says "audit addresses NOT checked".
 4. Only then may any step that needs a BLS proof run. SP marks these steps in
    the step-13 manifest.
 
@@ -70,79 +80,188 @@ Notes:
 
 ## Guardian re-registration
 
-The interface below was checked against SP main at
-`9cacd4ecf228ca3eb9fb99470861c57de12608c4` (SP #630, BLSAggregator-4.14.0 and
-DVTValidator-0.8.0), `DVTValidator.sol:209`. It is unchanged from SP's earlier
-branch. SP's step 4 is still to come, so check it once more against the step-4
-merge commit.
+### How rc.8 does it (SP and DSR, 2026-11-17)
+
+The guardians are registered **before** the owner hand-off, by the deployer, as
+SP manifest step **A10**. DVT does not send anything. DVT's job is to produce
+the A10 input: three PoP calldata entries.
+
+The new aggregator and DVTValidator do not exist yet when the PoPs are made.
+Their addresses come from SP's frozen plan, which SP precomputes at the pin.
+
+1. **SP pins.** The frozen plan JSON gives `addresses.BLSAggregator`,
+   `addresses.DVTValidator` and `pin.{block, blockHash, oldAggregator}`. It also
+   gives `pin.senders.deployer.{address, nonce}`.
+2. **DVT exports**, from the plan, with no transaction:
+
+   ```
+   node deploy/reregister-guardians.mjs --plan <frozen plan.json> \
+     --sp-aggregator-source <BLSAggregator.sol from the rc.8 tag tree> \
+     --sp-commit <40-hex rc.8 tag commit> \
+     --nodes node_dev_001.json,node_dev_002.json,node_dev_003.json \
+     --export-pop <out.json> --env <Sepolia RPC env>
+   ```
+
+   The source file is `contracts/src/modules/monitoring/BLSAggregator.sol` at
+   the tag, fetched with `gh api`. `DOMAIN_NAME` and `TAG_POP` are extracted
+   from it, not copied into the script.
+
+   Before signing, the script checks four things, read only:
+   - both precomputed addresses have no code;
+   - `pin.blockHash` is the hash of `pin.block` on this chain;
+   - the deployer's nonce (latest and pending) still equals the pin nonce;
+   - the Registry, read from `pin.oldAggregator.REGISTRY()`, has code.
+
+   It computes `domainSeparator` and each `popDigest` locally, signs, checks
+   each PoP with a pairing check, and writes the file. The output has two parts:
+   - `pop`: three entries with exactly SP's six keys: `validator`, `slot`,
+     `calldata`, `aggregator`, `pinBlockHash`, `domainSeparator`
+     (`manifest_exec.py`, `pop_fields`);
+   - `popContext`: `dvt`, `aggregator`, `registry`, `chainId`,
+     `deployerAddress`, `deployerNonce`, `pinBlock`, `pinBlockHash`, `spCommit`,
+     `spAggregatorSourceSha256`, and `popDigests` in `pop` order.
+
+3. **DVT hands the file to SP.** SP freezes the manifest with it.
+4. **SP pauses everything that shares the deployer EOA.** The freeze list is
+   SP's step-13 list. On the DVT side these three must be off:
+   - launchd `io.aastar.dvt-apply-rotation`;
+   - launchd `io.aastar.dvt-committee-keeper`;
+   - the GitHub workflow "Apply Verifier Rotation".
+
+   Check with `launchctl list | grep io.aastar.dvt-` (neither job listed) and
+   `gh workflow list --all` (shows `disabled_manually`). Neither job falls back
+   to the deployer key any more: both take `KEEPER_PRIVATE_KEY` only and refuse
+   to run without it. That does not stop someone from putting the deployer key
+   into `KEEPER_PRIVATE_KEY`; the guarantee is "no silent fallback", not "can
+   never be the deployer". They stay off anyway.
+
+5. **A10 sends** the three calldata entries to the new **DVTValidator**
+   (`popContext.dvt`). On 4.14.0 the aggregator rejects any other caller, so
+   SP's A10 routing patch is needed. Before sending, A10 asserts:
+   - the deployed addresses equal the plan;
+   - the on-chain `domainSeparator()` and `popDigest(validator, key)` equal the
+     export;
+   - the versions, the wiring between the two contracts, and owner == deployer.
+
+   After each send it reads back `validatorAtSlot` and `getBLSPublicKey`.
+
+6. **Before the hand-off, a full read-back:** 3 active keys, slots as planned,
+   none suspended.
+7. **Owners move to the SAFE** (2-of-3, per SP's rc.8 owner table).
+
+**If the deployer sends any transaction that is not part of the frozen manifest,
+between the pin and A10, every precomputed address is void.** The manifest's own
+deployments advance the nonce as planned and do not void anything. The manifest
+stops, SP pins again, and DVT exports again. The script refuses to export unless
+the nonce still equals the pin nonce, so it must run before the manifest starts
+sending. If the contracts land elsewhere, A10's address assertion stops the
+send.
+
+### After the hand-off
+
+Adding or removing a guardian goes through the SAFE. Run the script against the
+deployed contracts with `--deployment` and `--export-pop`, then two SAFE signers
+execute the exported calldata. Here `--expect-owner` is the SAFE. On deploy day
+the owner is the deployer, but A10 checks the owner, not this script.
+
+Before signing in the SAFE, the signers check:
+
+- the target is the DVTValidator;
+- the selector is `0xaded17c5`;
+- the validator, slot and the four key words decoded from the calldata match the
+  node's `publicKeyEip2537`.
+
+`cast calldata-decode` with the signature above prints these fields.
+
+### Interface
+
+Checked against SP main `b5e7544e3970eab24dc9a3412366140207e36b28`
+(BLSAggregator-4.14.0, DVTValidator-0.8.0). SP #633 moves main to 4.14.1 / 0.8.1
+and step 4 moves the DVTValidator to 0.9.0. The script holds no version string:
+`--expect-versions` takes them from the tag's tree. Check the interface again
+against the step-4 merge commit.
 
 ```
-registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point pop)
+DVTValidator.registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point pop)
 ```
 
-- **Path.** The owner path: the DVTValidator owner may register any validator.
-  - The permissionless path needs three things:
-    `aggregator.permissionlessBLSRegistration()`, `msg.sender == validator`, and
-    an eligible validator.
-  - It also picks the slot itself, and slot identity matters (mask bits,
-    historical proofs). So the script stays owner-only, as it is today.
-  - Before sending, it reads `permissionlessBLSRegistration()` and records it.
-- **Addresses.** No address is hard-coded. The DVTValidator and aggregator
-  addresses come from SP's deploy log or manifest output.
-- **PoP.** Every registration, including owner forwarding, needs a PoP. At
-  `9cacd4ec` the PoP format is the same as the one the script already computes:
-  - `popDigest = keccak256(abi.encode(domainSeparator(), TAG_POP, validator, pk))`,
-    with `TAG_POP = keccak256("SuperPaymaster.BLS.PoP.v1")`
-    (`BLSAggregator.sol:290`);
-  - `domainSeparator() = keccak256(abi.encode(keccak256("SuperPaymaster.BLSConsensus.v1"), chainid, aggregator, registry))`;
-  - DST `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`, and `blsKeyOwner` is
-    keyed by `keccak256(abi.encode(pk))`.
+- **Owner path only.** The owner branch requires the caller to be both
+  `DVTValidator.owner()` and `aggregator.owner()` (`DVTValidator.sol:209`, the
+  check at `:227`). The permissionless path picks the slot itself, and slot
+  identity matters (mask bits, historical proofs). The script reads and records
+  `permissionlessBLSRegistration()`.
+- **PoP.**
+  - `popDigest = keccak256(abi.encode(domainSeparator(), TAG_POP, validator, pk))`;
+  - `domainSeparator() = keccak256(abi.encode(DOMAIN_NAME, chainid, aggregator, registry))`;
+  - DST `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`.
 
-  The digest is bound to the **aggregator** address and the validator address,
-  not to the DVTValidator. PoPs are still recomputed for the new aggregator; old
-  ones are worthless. The script keeps checking its digest byte for byte against
-  the contract's `popDigest()` (gates 4 and 7).
+  The digest is bound to the aggregator and the validator address, not to the
+  DVTValidator.
 
-- **Call target.** On 4.14.0, `BLSAggregator.registerBLSPublicKey` accepts only
-  `msg.sender == DVT_VALIDATOR`. The script's current direct call to the
-  aggregator would revert, so it must call the DVTValidator.
-- **Who sends.** At `9cacd4ec`, the DVTValidator's registration branch checks
-  `msg.sender == DVTValidator.owner()`. A follow-up SP fix changes that check to
-  `aggregator.owner() == msg.sender`, as `removeValidator` already does. On rc.8
-  both owners should be the same address. **Before sending, the script reads
-  `DVTValidator.owner()` and `aggregator.owner()` and stops if they differ**
-  (DSR 2026-11-15). If DVT does not hold that key, the script's `--export-pop`
-  writes the public PoP data for the owner to submit. It never signs a
-  transaction.
-- **Rehearsal.**
-  1. Once SP's manifest PR is out, run the script's dry run (staticCall from the
-     on-chain owner) against SP's Sepolia fork rehearsal.
-  2. Send the result to DSR.
-  3. Only after that, the real run.
-- **Review gate.** This script sends transactions. So its PR keeps the strict
-  merge gate: Codex on the exact head with no High, plus clestons approval.
-  (DSR's relaxed gate covers only the read-only pause detector.)
+- **Call target.** `BLSAggregator.registerBLSPublicKey` accepts only
+  `msg.sender == DVT_VALIDATOR`.
 
-## Code changes this needs (after SP's manifest PR, not before)
+### Rehearsed on anvil (2026-11-17)
+
+These ran against SP's `DeployAnvil` at `b5e7544e` with throwaway BLS keys:
+
+- **Pre-deployment flow:**
+  1. Generation 1 plays the old stack.
+  2. A plan with precomputed addresses for a new pair is exported before the
+     pair exists.
+  3. The pair is deployed in the planned order and wired (A8).
+  4. The A10-equivalent assertions pass: addresses, `domainSeparator()`, and all
+     three `popDigest()`.
+  5. The deployer sends the calldata to the DVTValidator: 3/3 status 1.
+  6. The read-back is 3 active keys, slots match, none suspended.
+- **Nonce moved:** one extra deployer transaction after the export. The
+  re-export stops on the nonce check, the pair lands at other addresses, and the
+  address assertion stops.
+- **Post-deployment modes:** `--deployment` dry run and broadcast, and
+  `--export-pop` with the owner on another address sending the calldata. Both
+  read back correctly, and the negative cells each stop the run.
+
+### Review gate
+
+This script produces transactions. Its PR keeps the strict merge gate: Codex on
+the exact head with no High, plus clestons approval.
+
+## Code changes this needs
+
+Items 1 and 3 are on branch `feat/rc8-reregister-dvt`, written against SP main
+`b5e7544e3970eab24dc9a3412366140207e36b28` (BLSAggregator-4.14.0,
+DVTValidator-0.8.0). They are checked again against SP's step-4 merge commit
+before the PR leaves draft.
 
 1. `deploy/reregister-guardians.mjs`:
-   - target DVTValidator's owner path;
-   - read `permissionlessBLSRegistration()`;
-   - call the DVTValidator, not the aggregator;
-   - stop if `DVTValidator.owner()` and `aggregator.owner()` differ;
-   - re-derive the PoP domain;
-   - new `--expect-version`.
+   - addresses come only from SP's output: `--plan <frozen plan>` before
+     deployment (the rc.8 A10 export), or `--deployment <deploy output JSON>`
+     after; `--aggregator` is gone;
+   - calls `DVTValidator.registerBLSPublicKey` on the owner path;
+   - checks the pair is wired to each other and that `Registry.blsAggregator()`
+     is this aggregator;
+   - stops if `DVTValidator.owner()` and `aggregator.owner()` differ, or the
+     signer is not that owner;
+   - reads and records `permissionlessBLSRegistration()`;
+   - re-derives the PoP domain for the new aggregator; `--expect-versions` and
+     `--expect-owner` come from SP's tag tree and owner table, never from the
+     script.
+   - `committee-keeper.mjs` and `apply-verifier-rotation.mjs` take
+     `KEEPER_PRIVATE_KEY` only; their old fallback to `PRIVATE_KEY` (the
+     deployer EOA) is removed (DSR 2026-11-17).
 2. `src/modules/audit`: evidence is filed through
    `BlockchainService.createProposalWithEvidence` (`blockchain.service.ts`).
    That is a TypeScript method, not a contract function. Underneath it calls the
-   four-argument `createProposal(address,uint8,string,bytes32)`, which is
-   unchanged at `9cacd4ec` (`DVTValidator.sol:275`). Check that the ABI fragment
-   still matches the step-4 code. The node keeps no proposal-id cursor.
-3. `configuration.ts`: the address defaults move to the read-back values, and
-   the node's startup check fails when `AUDIT_DVT_VALIDATOR_ADDRESS` or
-   `AUDIT_BLS_AGGREGATOR_ADDRESS` is empty or equals a superseded address (DSR
-   2026-11-15). If it is a single assertion it ships in the re-registration PR;
-   if it needs structural change, it goes back to DSR first.
+   four-argument `createProposal(address,uint8,string,bytes32)`. Its ABI
+   fragment (`blockchain.service.ts:1854`) matches `abis/DVTValidator.json` at
+   `b5e7544e`. Check it again against the step-4 code. The node keeps no
+   proposal-id cursor.
+3. Node startup (`src/config/audit-address-guard.ts`): with `AUDIT_ENABLED` or
+   `AUDIT_GUARDIAN_WATCH_ENABLED` on, the node refuses to start when
+   `AUDIT_DVT_VALIDATOR_ADDRESS` or `AUDIT_BLS_AGGREGATOR_ADDRESS` is empty or
+   on the superseded list. With both off it does not check and logs that it did
+   not (DSR 2026-11-17). The code defaults in `configuration.ts` move to the
+   read-back values in a PR after the read-back.
 4. The sp-parity pin (`ci/sp-parity-pin`) is set to SP's step-4 merge commit.
 
 ## Operations notes from SP #630 (BLSAggregator-4.14.0)
@@ -158,8 +277,10 @@ Read from SP main `9cacd4ec`. Re-check them against the step-4 merge commit.
     `slashThresholds[level]` (`_isRequiredThreshold`, `BLSAggregator.sol:1780`).
     A guardian is counted when it has an active key, is not suspended, holds
     `ROLE_DVT` with at least the minimum stake, and its exit notice has not
-    matured (`_requireCommitteeSurvivesExit`, `BLSAggregator.sol:1800`). At N=3
-    with a threshold of 3, both calls revert.
+    matured (`_requireCommitteeSurvivesExit`, `BLSAggregator.sol:1800`). rc.8
+    sets `minThreshold` 2, `defaultThreshold` 2 and `slashThresholds` (2, 3, 3)
+    with N=3 (DSR 2026-11-17). Three counted guardians equal the slash threshold
+    3, so both calls revert.
   - The way out is for the aggregator owner to call
     `BLSAggregator.revokeAndSuspend(validator)` directly. It skips the quorum
     check, suspends the guardian and revokes its key. A direct owner call to
