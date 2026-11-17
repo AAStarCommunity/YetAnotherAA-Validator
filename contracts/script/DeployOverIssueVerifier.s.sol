@@ -18,7 +18,8 @@ pragma solidity ^0.8.19;
  *           `version() == "BLSAggregator-4.10.0"`); an aggregator predating it carries BOTH
  *           the instant setter and the old three-parameter ABI, and MUST NOT be armed with
  *           this verifier. CC-115 B1 conformance was verified against
- *           `BLSAggregator-4.11.0`, which is what SUPPORTED_AGGREGATOR_VERSION pins:
+ *           `BLSAggregator-4.11.0`; the #441 verifier (2.0.0) recomputes the 4.13.0+ commitment, and
+ *           the release to bind is a required input (EXPECTED_AGGREGATOR_VERSION). Arming:
  *             3a. owner (Safe M-of-N) calls proposeFraudProofVerifier(verifier)
  *                 → emits FraudProofVerifierRotationProposed(verifier, readyAt)
  *                 → readyAt = <propose block.timestamp> + VERIFIER_ROTATION_DELAY (4 days).
@@ -44,8 +45,8 @@ pragma solidity ^0.8.19;
  *        ALLOW_UNVERIFIED_AGGREGATOR (optional) must be "true" to deploy when NO canonical/expected
  *                                    address is available yet — a conscious "I verified out-of-band".
  *        EXPECTED_CHAIN_ID           (optional, default 11155111 Sepolia) guards against a wrong RPC.
- *        EXPECTED_AGGREGATOR_VERSION (optional, default SUPPORTED_AGGREGATOR_VERSION) the exact
- *                                    string `AGGREGATOR.version()` must return. Override ONLY after
+ *        EXPECTED_AGGREGATOR_VERSION (REQUIRED, no default) the exact
+ *                                    string `AGGREGATOR.version()` must return. Set it ONLY after
  *                                    re-verifying that the new release still speaks the
  *                                    four-parameter fraud-proof ABI and still has no direct setter.
  *
@@ -80,14 +81,13 @@ contract DeployOverIssueVerifier is Script {
     ///         (CC-89) → the deploy then HARD-REQUIRES AGGREGATOR == this. address(0) = not yet known.
     address internal constant CANONICAL_AGGREGATOR = address(0);
 
-    /// @notice The exact `version()` string this verifier has been conformance-verified against
-    ///         (CC-115 B1, PR #240). Checked for EQUALITY, not "at least": a different release may
-    ///         change the fraud-proof ABI, the domain-digest schema, or the arming path, and this
-    ///         verifier is immutable once deployed. Bumping SP therefore requires a conscious
-    ///         decision here (or via EXPECTED_AGGREGATOR_VERSION) rather than a silent pass.
+    /// @notice No release is pinned in this file (DSR 2026-11-17, #441). EXPECTED_AGGREGATOR_VERSION is
+    ///         a REQUIRED input, compared for EQUALITY with `version()`: a different release may change
+    ///         the fraud-proof ABI, the domain-digest schema or the arming path, and the verifier is
+    ///         immutable once deployed. Independently, Gate A' only lets anchored releases
+    ///         (>= BLSAggregator-4.13.0) through.
     /// @dev    Version alone is NOT identity: any contract can return this string. See the
     ///         canonical-pin note at the domain-parity gate below.
-    string internal constant SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.14.0";
 
     /// @dev Classifies `v`: RELEASE_UNPARSEABLE unless it is exactly
     ///      "BLSAggregator-<major>.<minor>.<patch>" optionally followed by "-<suffix>" (non-empty,
@@ -158,7 +158,7 @@ contract DeployOverIssueVerifier is Script {
         /// @dev 0 falls THROUGH to CANONICAL_AGGREGATOR; it can never clear a real canonical pin.
         address expectedAggregator;
         bool allowUnverifiedAggregator;
-        /// @dev Empty falls THROUGH to SUPPORTED_AGGREGATOR_VERSION; it can never disable the check.
+        /// @dev REQUIRED. Empty is refused; it can never disable the check.
         string expectedAggregatorVersion;
     }
 
@@ -231,9 +231,11 @@ contract DeployOverIssueVerifier is Script {
         // exposed the full propose/apply surface with a 4-day delay, and a hostile or hybrid contract
         // can expose that surface AND keep an instant `setFraudProofVerifier`. Inferring a release
         // from one selector is exactly the silent-drift failure this gate exists to stop.
-        string memory expectedVersion = bytes(cfg.expectedAggregatorVersion).length != 0
-            ? cfg.expectedAggregatorVersion
-            : SUPPORTED_AGGREGATOR_VERSION;
+        require(
+            bytes(cfg.expectedAggregatorVersion).length != 0,
+            "EXPECTED_AGGREGATOR_VERSION is required: the exact version() of the aggregator being bound"
+        );
+        string memory expectedVersion = cfg.expectedAggregatorVersion;
         string memory reportedVersion;
         try IAggregatorProbe(aggregator).version() returns (string memory v) {
             reportedVersion = v;

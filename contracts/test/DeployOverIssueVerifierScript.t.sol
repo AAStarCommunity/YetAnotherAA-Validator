@@ -184,7 +184,7 @@ contract DeployOverIssueVerifierScriptTest is Test {
             aggregator: aggregator,
             expectedAggregator: aggregator,
             allowUnverifiedAggregator: false,
-            expectedAggregatorVersion: "" // falls through to SUPPORTED_AGGREGATOR_VERSION
+            expectedAggregatorVersion: "BLSAggregator-4.14.0" // the mock's default version()
         });
     }
 
@@ -380,15 +380,14 @@ contract DeployOverIssueVerifierScriptTest is Test {
     }
 
     /// @notice An empty override can never DISABLE the check — it falls through to the pinned default.
-    function test_Deploy_EmptyExpectedVersionFallsThroughToPin() public {
+    /// @notice #441: no release is pinned in the script, so an empty expected version is refused
+    ///         rather than falling through to a default (DSR 2026-11-17).
+    function test_Deploy_RefusesEmptyExpectedVersion() public {
         ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
-        agg.setVersion("");
         DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
         cfg.expectedAggregatorVersion = "";
         vm.expectRevert(
-            bytes(
-                "AGGREGATOR.version() != expected: re-verify the fraud-proof ABI and the arming path for that release, then set EXPECTED_AGGREGATOR_VERSION"
-            )
+            bytes("EXPECTED_AGGREGATOR_VERSION is required: the exact version() of the aggregator being bound")
         );
         deployScript.deploy(cfg);
     }
