@@ -117,6 +117,28 @@ describe("audit address guard (rc.8 startup assertion)", () => {
     expect(p[0]).toContain("AUDIT_BLS_AGGREGATOR_ADDRESS");
   });
 
+  it("surrounding whitespace → refused, not trimmed (#442 review L1)", () => {
+    for (const padded of [` ${NEW_AGG}`, `${NEW_AGG} `, `\t${NEW_AGG}\n`]) {
+      const p = auditAddressProblems({
+        AUDIT_ENABLED: "true",
+        ...good,
+        AUDIT_BLS_AGGREGATOR_ADDRESS: padded,
+      });
+      expect(p).toHaveLength(1);
+      expect(p[0]).toContain("whitespace");
+    }
+  });
+
+  it("the zero address → refused (#442 review L2)", () => {
+    const p = auditAddressProblems({
+      AUDIT_ENABLED: "true",
+      ...good,
+      AUDIT_DVT_VALIDATOR_ADDRESS: "0x0000000000000000000000000000000000000000",
+    });
+    expect(p).toHaveLength(1);
+    expect(p[0]).toContain("zero address");
+  });
+
   it("a malformed address → refused", () => {
     const p = auditAddressProblems({
       AUDIT_ENABLED: "true",

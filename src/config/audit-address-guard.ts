@@ -56,8 +56,19 @@ export function auditAddressProblems(env: Env): string[] {
       );
       return;
     }
+    // #442 review L1: the consumers use the raw string, so a padded value that the guard trimmed
+    // would pass here and then disable the watcher. Refuse it at startup instead.
+    if (value !== (env[name] ?? "")) {
+      problems.push(`${name} has leading or trailing whitespace: remove it`);
+      return;
+    }
     if (!/^0x[0-9a-fA-F]{40}$/.test(value)) {
       problems.push(`${name}=${value} is not a 20-byte hex address`);
+      return;
+    }
+    // #442 review L2: the zero address was left to the bootstrap getCode check; refuse it here.
+    if (/^0x0{40}$/.test(value)) {
+      problems.push(`${name} is the zero address`);
       return;
     }
     if (superseded.includes(value.toLowerCase())) {
