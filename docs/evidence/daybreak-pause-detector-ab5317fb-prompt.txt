@@ -1,0 +1,21 @@
+Defensive security review: deployment gate for deploy/pause-detector (YetAnotherAA-Validator master ab5317fbb150701d2b65ce26f395d25e502845e2).
+
+Scope and rules:
+- Read only files inside this repository's worktree; do not access other directories under ~/Dev, the home directory, or anything outside this worktree.
+- Do not run anything that touches a network, a chain or an RPC endpoint. Do not open .env files, keystores, node_*.json key files or any secrets file, even if they exist.
+- The target is the whole deploy/pause-detector directory (every file in it, including lib/ and the launchd plists). You may read other files in this repository only to understand what pause-detector imports or how it is invoked.
+
+What this component is (verify it against the code; do not take it on trust):
+- A read-only detector that runs from launchd on a Mac Mini. It watches SuperPaymaster contracts on chain, decides whether a pause condition holds, and alerts. It must never sign or send a transaction, and it must never hold a private key; no-signing-scan.mjs is meant to enforce that statically.
+- deadman.mjs / deadman-run.mjs alert when the detector itself has stopped producing fresh output.
+
+Review strictly and adversarially. In particular:
+1. Can any code path sign, send a transaction or reach a private key? Can the no-signing scan be bypassed (dynamic import, eval, indirection, a dependency, a string-built name, a file the scan does not cover)?
+2. Fail-open paths: a condition under which the detector reports "all clear", or stays silent, while the watched state is bad or unknown (RPC errors, stale or frozen data, a partial read, a parse failure, clock problems, a crash before alerting).
+3. Dead-man coverage: can the detector die or wedge without the dead-man alerting? Can the dead-man itself fail silently?
+4. Injection and trust boundaries: config values, RPC responses, environment variables or file contents that can change control flow, alert text, file paths or shell commands.
+5. launchd plists: paths, environment, privileges, what runs from where, and whether a job could run stale or unreviewed code.
+6. Secrets or URLs leaking into logs, alerts or error messages.
+7. Race conditions, TOCTOU on state files, error handling, resource exhaustion.
+
+Output format: a list of findings, each with severity (Critical / High / Medium / Low / Info), file:line, the concrete failure scenario (inputs or state, then the wrong outcome), and a suggested fix. Report only issues you can tie to specific code. If you find no Critical or High issue, say so explicitly in one line at the end: "No Critical or High findings."

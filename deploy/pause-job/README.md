@@ -253,8 +253,14 @@ Until this PR merged, they were manual items on the launch checklist.
 - **node-slash-off**: the node inventory must not be empty, and every running
   `dvt-node-*` container must be in it. On every DVT node container,
   `AUDIT_ENABLED` and `AUDIT_EXECUTE_SLASH` are absent or exactly `"false"`.
-- **spParity**: always **MANUAL** until SP's DVTValidator-0.8.0 is on SP main
-  (DSR 48be82a3).
+- **spParity**: **MANUAL** on the host. SP's DVTValidator-0.9.0 is on SP main
+  since SuperPaymaster#635 (merge commit
+  `053117cc8ca31eb69ae1f62755a1d7790e71190f`). CI's `sp-parity` job runs
+  `check:sp-parity` against the commit pinned in
+  `scripts/evidence/sp-parity-commit`, now SP main
+  `f2b2cd9b4a566d7cb73c8482e1327c674f8887a8` (BLSAggregator-4.14.2,
+  DVTValidator-0.9.0); at the rc.8 freeze the pin becomes the tag commit (DSR
+  48be82a3).
 
 ## Tests
 

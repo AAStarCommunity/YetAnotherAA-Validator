@@ -11,7 +11,19 @@ import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ethers } from "ethers";
-import { emptyState, headStale, runRound, stateProblems } from "./lib/detect.mjs";
+import {
+  crossCheckInventory,
+  emptyState,
+  headStale,
+  runRound,
+  stateProblems,
+  topicProblems,
+  catchUpProblems,
+  knownEventProblems,
+  classifyMaxProblems,
+  CLASSIFY_MIN_BLOCKS,
+  isRateLimited,
+} from "./lib/detect.mjs";
 import {
   DIR,
   GuardError,
@@ -65,7 +77,7 @@ export function configProblems(c) {
   ])
     if (!HASH.test(c[k] ?? "")) p.push(`${k} must be a 32-byte hex hash (from the tag read-back)`);
   if (!Number.isSafeInteger(c.startBlock) || c.startBlock < 1)
-    p.push("startBlock must be a positive block (SP's deploy block)");
+    p.push("startBlock must be a positive block (the SP proxy's deploy block)");
   if (!Number.isSafeInteger(c.logChunk) || c.logChunk < 1 || c.logChunk > 50000)
     p.push("logChunk must be 1..50000");
   if (!Number.isSafeInteger(c.maxHeadAgeSec) || c.maxHeadAgeSec < 60 || c.maxHeadAgeSec > 86_400)
@@ -85,6 +97,10 @@ export function configProblems(c) {
     p.push("rpc must be { primary, fallback } provider names");
   else if (c.rpc.primary === c.rpc.fallback)
     p.push("rpc.primary and rpc.fallback must be different providers");
+  p.push(...topicProblems(c.operatorConfiguredTopics));
+  p.push(...catchUpProblems(c.catchUp));
+  p.push(...knownEventProblems(c.knownProxyEvents));
+  p.push(...classifyMaxProblems(c.classifyMaxBlocks, CLASSIFY_MIN_BLOCKS));
   return p;
 }
 
@@ -105,6 +121,11 @@ export function rpcTransport(url) {
       body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }),
       signal: AbortSignal.timeout(30_000),
     });
+    if (res.status === 429) {
+      const e = new SafeError(`${method}: RATE_LIMITED (HTTP 429)`);
+      e.rateLimited = true;
+      throw e;
+    }
     if (!res.ok) throw new SafeError(`${method}: HTTP ${res.status}`);
     let j;
     try {
@@ -113,9 +134,14 @@ export function rpcTransport(url) {
       throw new SafeError(`${method}: not JSON`);
     }
     if (j?.error) {
+      const limited =
+        j.error.code === -32005 ||
+        j.error.code === 429 ||
+        /rate.?limit|too many requests|exceeded .*(capacity|limit)/i.test(String(j.error.message));
       const e = new SafeError(
-        `${method}: ${j.error.code === 3 || /revert/i.test(String(j.error.message)) ? "CALL_EXCEPTION" : "SERVER_ERROR"}`
+        `${method}: ${limited ? "RATE_LIMITED" : j.error.code === 3 || /revert/i.test(String(j.error.message)) ? "CALL_EXCEPTION" : "SERVER_ERROR"}`
       );
+      if (limited) e.rateLimited = true;
       if (typeof j.error.data === "string") e.data = j.error.data;
       throw e;
     }
@@ -137,6 +163,7 @@ export function readOnlyChain(url, send = null) {
       return await transport(m, params);
     } catch (e) {
       const err = new SafeError(safeText(m, e));
+      if (e?.rateLimited === true) err.rateLimited = true;
       for (const d of [e?.data, e?.info?.error?.data, e?.error?.data])
         if (typeof d === "string" && /^0x[0-9a-fA-F]*$/.test(d)) err.data = d;
       throw err;
@@ -219,6 +246,82 @@ export async function deliver(st, due, resolved, header, now, send) {
     }
   }
   return { ok: failed === 0, sent, failed, ...(why ? { why } : {}) };
+}
+
+/**
+ * Since when some due alert could not be delivered (Daybreak M7, DSR 2026-11-17), after a delivery:
+ * an undelivered alert is retried every round, so a round that delivers everything clears it, and a
+ * failing round keeps the EARLIEST time. Pure.
+ */
+export function nextUndeliveredSince(prev, delivery, now) {
+  if (delivery?.ok === true) return null;
+  return Number.isFinite(prev) && prev <= now ? prev : now;
+}
+
+/**
+ * Who checks the inventory this round (clestons #448 B2, DSR 2026-11-17). The inventory must never be
+ * "checked" by the provider whose answers built it: only the configured fallback compares, and only
+ * on a round the primary ran. Returns { run, why }. Pure.
+ */
+export function crossCheckPlan(provider, cfg) {
+  if (provider === cfg.rpc.primary) return { run: true, why: null };
+  return {
+    run: false,
+    why: `this round ran on ${provider}, the cross-check provider: no independent provider to compare with`,
+  };
+}
+
+/**
+ * ONE provider for the whole round: the primary unless it fails a probe. A provider whose head is
+ * older than maxHeadAgeSec is a failed probe (clestons #434 B1: a node frozen at a height is
+ * self-consistent and would otherwise read clear forever), so the fallback takes over.
+ * EXCEPT a rate limit right after our own throttled catch-up (DSR 2026-11-18): the primary is not
+ * down, we were sending too fast, so the round is skipped (unknown) rather than run on the
+ * fallback, which would move the fallback's rescan clock and the cross-check's roles. `probes` is
+ * [{ name, chain }] in order, primary first. Throws a SafeError when no round can run.
+ */
+export const PROBE_SKIP_MS = 2 * 3600_000;
+/** How long ago the last throttled catch-up round was, or null (none, or in the future). Pure. */
+export const throttleAge = (st, nowMs) => {
+  const t = st?.lastThrottledAt;
+  if (!Number.isFinite(t)) return null;
+  const age = nowMs - t;
+  return age >= 0 ? age : null;
+};
+export async function chooseProvider(probes, cfg, st) {
+  const stale = [];
+  for (const [i, pr] of probes.entries()) {
+    try {
+      if (Number(await pr.chain.chainId()) !== cfg.chainId) continue;
+      const h = await pr.chain.blockByNumber("latest");
+      if (!(h?.number > 0)) continue;
+      if (headStale(h, Date.now(), cfg.maxHeadAgeSec)) {
+        stale.push(pr.name);
+        continue;
+      }
+      return { chain: pr.chain, provider: pr.name };
+    } catch (e) {
+      // only right after OUR throttled catch-up (clestons #453 Medium): within PROBE_SKIP_MS of the
+      // last throttled round; later, or with no throttle, a rate-limited primary hands over as usual
+      if (
+        i === 0 &&
+        isRateLimited(e) &&
+        (st?.catchUpThrottle ?? 0) > 0 &&
+        // a lastThrottledAt in the future (a clock that was ahead) counts as no throttle record
+        // (clestons #453 Low): it would otherwise keep the fallback away indefinitely
+        (age => age !== null && age < PROBE_SKIP_MS)(throttleAge(st, Date.now()))
+      )
+        throw new SafeError(
+          `the primary RPC (${pr.name}) rate-limited the probe after a throttled catch-up round: this round is skipped, not run on the fallback`
+        );
+      /* try the next */
+    }
+  }
+  throw new SafeError(
+    stale.length
+      ? `no RPC provider has a fresh head (stale: ${stale.join(", ")}; max age ${cfg.maxHeadAgeSec} s)`
+      : "neither RPC provider answers for this chain"
+  );
 }
 
 /** One run, after detector.mjs's guards passed. Returns the exit code. */
@@ -310,44 +413,49 @@ export async function main() {
         url: secret(DETECTOR_SECRETS.rpcFallback, "the fallback RPC file"),
       },
     ];
-    // ONE provider for the whole round: the primary unless it fails a probe. A provider whose head
-    // is older than maxHeadAgeSec is a failed probe (clestons #434 B1: a node frozen at a height is
-    // self-consistent and would otherwise read clear forever), so the fallback takes over
-    let chain = null;
-    let provider = null;
-    const stale = [];
-    for (const pr of providers) {
-      const c = readOnlyChain(pr.url);
-      try {
-        if (Number(await c.chainId()) !== cfg.chainId) continue;
-        const h = await c.blockByNumber("latest");
-        if (!(h?.number > 0)) continue;
-        if (headStale(h, Date.now(), cfg.maxHeadAgeSec)) {
-          stale.push(pr.name);
-          continue;
-        }
-        chain = c;
-        provider = pr.name;
-        break;
-      } catch {
-        /* try the next */
-      }
-    }
-    if (!chain)
-      throw new SafeError(
-        stale.length
-          ? `no RPC provider has a fresh head (stale: ${stale.join(", ")}; max age ${cfg.maxHeadAgeSec} s)`
-          : "neither RPC provider answers for this chain"
-      );
-    // the state is created on the first run and bound to { chainId, spProxy, startBlock }
+    // the state is created on the first run and bound to { chainId, spProxy, startBlock }; read
+    // before the probe, which needs to know whether a catch-up was being rate-limited
     const st = existsSync(statePath) ? readOwnJson(statePath, "state") : emptyState(cfg);
     const sp = stateProblems(st, cfg);
     if (sp.length)
       throw new SafeError(`state: ${sp.join("; ")} (a new deployment needs a new stateDir)`);
+    const { chain, provider } = await chooseProvider(
+      providers.map(pr => ({ name: pr.name, chain: readOnlyChain(pr.url) })),
+      cfg,
+      st
+    );
     const now = Date.now();
+    // the daily inventory cross-check (Daybreak H1, DSR 2026-11-17), before the round, so the round
+    // reports its result. It records its own failures (an incomplete day does not by itself make a
+    // round unknown). FIXED ROLES (clestons #448 B2): the inventory is built by the primary, and only
+    // the configured fallback checks it; a round that ran on the fallback cannot check anything
+    // independently, so its attempt is incomplete (crossCheckPlan)
+    const plan = crossCheckPlan(provider, cfg);
+    const checker = providers.find(pr => pr.name === cfg.rpc.fallback);
+    try {
+      await crossCheckInventory(st, {
+        primary: chain,
+        primaryName: provider,
+        other: plan.run ? readOnlyChain(checker.url) : null,
+        otherName: cfg.rpc.fallback,
+        unavailable: plan.why,
+        cfg,
+        now,
+        // an overflow marker is on disk before anything else in the run can fail (Codex pre-push r3)
+        persist: () => writeDurable(statePath, st),
+      });
+    } catch {
+      /* not reached: crossCheckInventory catches what it does */
+    }
     let result;
     try {
-      result = await runRound(st, { chain, cfg, now, clock: () => Date.now() });
+      result = await runRound(st, {
+        chain,
+        cfg,
+        now,
+        clock: () => Date.now(),
+        isPrimary: provider === cfg.rpc.primary,
+      });
     } catch (e) {
       result = {
         alerts: [{ key: "round", text: `unknown: the round stopped (${safeText("round", e)})` }],
@@ -386,6 +494,10 @@ export async function main() {
       now,
       text => telegram(cfg, token, text)
     );
+    // since when some due alert could not be delivered (Daybreak M7, DSR 2026-11-17): an undelivered
+    // alert is retried every round, so this clears on the first round that delivers everything. The
+    // heartbeat carries it and the dead-man alerts once it is older than its silence limit (2 h)
+    st.undeliveredSince = nextUndeliveredSince(st.undeliveredSince, delivery, now);
     writeDurable(statePath, st);
     writeDurable(statusPath, {
       schema: "aoa-pause-detector-status/1",
@@ -427,6 +539,7 @@ export async function main() {
         gaps: carryGaps(old, acked, at),
         block: result.report.block?.number ?? null,
         clear: result.report.clear === true,
+        undeliveredSince: st.undeliveredSince ? new Date(st.undeliveredSince).toISOString() : null,
       });
     }
     return result.alerts.length || !delivery.ok ? 1 : 0;

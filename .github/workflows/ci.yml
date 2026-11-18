@@ -49,63 +49,17 @@ jobs:
       # here: it prints a ::warning:: naming itself.
       #
       # Advisory DATA is never fail-open: if the JSON parses, high+critical > 0 fails the step.
-      - name: Run npm audit
-        run: |
-          set -uo pipefail
-          for attempt in 1 2 3; do
-            # THE PER-ATTEMPT TIMEOUT AND THE JOB TIMEOUT ARE ONE BUDGET, and the first version of
-            # this step blew it: `npm ci` takes ~5.5 min of the job's 10, and 3 x 120s + 45s of
-            # backoff needs 6.75 more. Attempt 3 was killed by `timeout-minutes` and the job went red
-            # with "The operation was canceled" — the retry logic working exactly as written, and the
-            # check still failing for an infrastructure reason, which is the thing this step exists to
-            # stop. 45s is generous for an endpoint that is up; one that is down does not get better
-            # at 120. Worst case is now 45+10+45+20+45 = 165s, and the job has room to spare.
-            out=$(timeout 45 npm audit --audit-level=high --json 2>/dev/null || true)
-            # THE GUARD ASSERTS WHAT THE NEXT LINES CONSUME — the two numbers — not merely that their
-            # parent object exists. `jq -e '.metadata.vulnerabilities'` is true for `{}`, and then
-            # `null + null` is `null`, `[ "null" -gt 0 ]` errors to stderr and lands in the else
-            # branch, and the step prints "no high or critical advisories": the exact sentence this
-            # whole change exists to stop it from saying when it has not checked. Found by @clestons
-            # constructing the input rather than reading the code.
-            #
-            # Deliberately NOT `// 0`, which was independently suggested: defaulting a missing count to
-            # zero translates "I did not find out" into "there are none", which is the same defect
-            # wearing a shorter diff.
-            if [ -n "$out" ] && printf '%s' "$out" \
-                 | jq -e '.metadata.vulnerabilities | (.high|type=="number") and (.critical|type=="number")' \
-                 >/dev/null 2>&1; then
-              break
-            fi
-            out=""
-            # The message and the sleep are behind the SAME condition. They were not: the echo sat
-            # outside the guard, so the third attempt printed "retrying in 30s" and then neither
-            # slept nor retried. Caught in this step's own first live run — a log line stating
-            # something that did not happen, which is the exact class of defect this step exists to
-            # remove from CI. There is no fourth attempt to wait for, and every real outage was
-            # paying for that sleep anyway.
-            if [ "$attempt" -lt 3 ]; then
-              echo "npm audit attempt $attempt did not return advisory data; retrying in $((attempt * 10))s"
-              sleep $((attempt * 10))
-            else
-              echo "npm audit attempt $attempt did not return advisory data; no attempts left"
-            fi
-          done
+      # Since 2026-11-18 (DSR) the loop lives in scripts/ci/npm-audit.sh and runs twice: the
+      # production audit is strict, the full one honours scripts/ci/audit-exceptions.json (each a
+      # GHSA id with an expiry date that fails CI once passed). The decision is scripts/ci/audit-decide.mjs.
+      - name: Check the npm audit gate's decision cells
+        run: node scripts/ci/check-audit-decide.mjs
 
-          if [ -z "$out" ]; then
-            echo "::warning title=npm audit could not run::The registry did not return advisory data after 3 attempts. This step PASSED WITHOUT CHECKING npm advisories — it is not a statement that there are none. Trivy, CodeQL and Dependency Review still ran."
-            exit 0
-          fi
+      - name: Run npm audit (production dependencies, strict)
+        run: bash scripts/ci/npm-audit.sh prod
 
-          printf '%s' "$out" | jq -r '
-            .metadata.vulnerabilities as $v
-            | "advisories: critical=\($v.critical) high=\($v.high) moderate=\($v.moderate) low=\($v.low)"'
-          bad=$(printf '%s' "$out" | jq '.metadata.vulnerabilities.high + .metadata.vulnerabilities.critical')
-          if [ "$bad" -gt 0 ]; then
-            printf '%s' "$out" | jq -r '.vulnerabilities | to_entries[] | "  \(.value.severity)\t\(.key)\t\(.value.range)"'
-            echo "::error title=npm audit found high-severity advisories::$bad high or critical advisory/advisories. This IS advisory data, not an outage."
-            exit 1
-          fi
-          echo "npm audit: no high or critical advisories."
+      - name: Run npm audit (all dependencies, listed exceptions only)
+        run: bash scripts/ci/npm-audit.sh full
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
@@ -290,6 +244,58 @@ jobs:
       - name: Run coverage
         run: forge coverage
 
+  # SP's own DVTValidator._checkEvidence against this repo's M0 §3.1 evidence vectors, byte for byte
+  # (DSR 502ccd64: evidence:spParity stays in DVT's CI). The SP commit is pinned in
+  # scripts/evidence/sp-parity-commit; at the rc.8 freeze (step 17) it becomes the tag commit, and
+  # the tag check asserts this pin equals it. SP is public: the default token reads it.
+  sp-parity:
+    name: SP evidence parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # the token only reads public SP sources: no inherited security-events/actions scopes
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # the same pinned toolchain as the Smart Contracts job
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: "1.7.1"
+
+      - name: Check SP's evidence decoding against the vectors
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # the pin file's raw bytes are exactly one lowercase 40-hex SHA plus at most one newline;
+        # anything else (fragments across lines, NUL bytes, extra newlines) fails here instead of
+        # being repaired. The bytes are checked before any shell substitution, which drops NULs
+        # and trailing newlines.
+        run: |
+          node --version
+          forge --version
+          pin="$(node -e '
+            const b = require("fs").readFileSync("scripts/evidence/sp-parity-commit");
+            const s = b.toString("latin1");
+            if (!/^[0-9a-f]{40}\n?$/.test(s) || b.length > 41) {
+              console.error("::error::scripts/evidence/sp-parity-commit must be one 40-hex SHA");
+              process.exit(1);
+            }
+            process.stdout.write(s.slice(0, 40));
+          ')"
+          npm run -s check:sp-parity -- "$pin"
+
   # Job 6: Type checking
   typecheck:
     name: Type Check
@@ -341,7 +347,7 @@ jobs:
     name: CI Success
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [security, quality, build, test, contracts, typecheck, codeql]
+    needs: [security, quality, build, test, contracts, sp-parity, typecheck, codeql]
     if: always()
     steps:
       - name: Check all jobs status
@@ -351,6 +357,7 @@ jobs:
                 "${{ needs.build.result }}" == "success" &&
                 "${{ needs.test.result }}" == "success" &&
                 "${{ needs.contracts.result }}" == "success" &&
+                "${{ needs.sp-parity.result }}" == "success" &&
                 "${{ needs.typecheck.result }}" == "success" &&
                 "${{ needs.codeql.result }}" == "success" ]]; then
             echo "All CI checks passed!"

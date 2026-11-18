@@ -221,6 +221,8 @@ describe("owner-auth cross-repo interface invariant", () => {
 const DVT_VALIDATOR = "0x" + "44".repeat(20);
 const EPOCH = 999;
 const PROOF = "0x" + "ab".repeat(32);
+/** abi.encode(bytes32 category, bytes body): any non-empty blob, passed through verbatim. */
+const EVIDENCE = "0x" + "e1".repeat(96);
 
 /** A BlockchainService with a truthy wallet + a provider exposing getFeeData (for bumpedFees). */
 function makeWriterService(): BlockchainService {
@@ -255,16 +257,16 @@ describe("BlockchainService.queueSlashWithProof static-call preflight (HIGH 2)",
   it("static call REVERTS → throws (preflight) and NEVER broadcasts the real tx", async () => {
     const svc = makeWriterService();
     const send = installMockContract(svc, "queueSlashWithProof", { staticReverts: true });
-    await expect(svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, PROOF)).rejects.toThrow(
-      /preflight \(staticCall\) reverted/
-    );
+    await expect(
+      svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, EVIDENCE, PROOF)
+    ).rejects.toThrow(/preflight \(staticCall\) reverted/);
     expect(send).not.toHaveBeenCalled(); // no gas spent — the send fn was never invoked
   });
 
   it("static call OK → proceeds and broadcasts the real tx (returns its hash)", async () => {
     const svc = makeWriterService();
     const send = installMockContract(svc, "queueSlashWithProof");
-    const hash = await svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, PROOF);
+    const hash = await svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, EVIDENCE, PROOF);
     expect(hash).toBe("0xTXHASH");
     expect(send).toHaveBeenCalledTimes(1);
   });
@@ -275,7 +277,7 @@ describe("BlockchainService.executeSlashWithProof static-call preflight (HIGH 2)
     const svc = makeWriterService();
     const send = installMockContract(svc, "executeWithProof", { staticReverts: true });
     await expect(
-      svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, PROOF)
+      svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, EVIDENCE, PROOF)
     ).rejects.toThrow(/preflight \(staticCall\) reverted/);
     expect(send).not.toHaveBeenCalled();
   });
@@ -283,9 +285,67 @@ describe("BlockchainService.executeSlashWithProof static-call preflight (HIGH 2)
   it("static call OK → proceeds and broadcasts the slash tx", async () => {
     const svc = makeWriterService();
     const send = installMockContract(svc, "executeWithProof");
-    const hash = await svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, PROOF);
+    const hash = await svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, EVIDENCE, PROOF);
     expect(hash).toBe("0xTXHASH");
     expect(send).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * DVTValidator-0.9.0 (SP #635): queueSlashWithProof and executeWithProof each take `bytes evidence`
+ * immediately before `bytes proof`. The wrappers must put the caller's evidence in that slot, for both
+ * the static-call preflight and the real send, and their ABI fragments must have 0.9.0's selectors.
+ */
+describe("BlockchainService slash writes carry DVTValidator-0.9.0 evidence", () => {
+  it("queueSlashWithProof passes (operator, level, epoch, evidence, proof) to staticCall and send", async () => {
+    const svc = makeWriterService();
+    const send = installMockContract(svc, "queueSlashWithProof");
+    await svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, EVIDENCE, PROOF);
+    expect((send as any).staticCall).toHaveBeenCalledWith(OPERATOR, 1, EPOCH, EVIDENCE, PROOF);
+    expect((send.mock.calls[0] as unknown[]).slice(0, 5)).toEqual([
+      OPERATOR,
+      1,
+      EPOCH,
+      EVIDENCE,
+      PROOF,
+    ]);
+  });
+
+  it("executeSlashWithProof passes (id, repUsers, newScores, epoch, evidence, proof) to staticCall and send", async () => {
+    const svc = makeWriterService();
+    const send = installMockContract(svc, "executeWithProof");
+    await svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, EVIDENCE, PROOF);
+    expect((send as any).staticCall).toHaveBeenCalledWith(7n, [], [], EPOCH, EVIDENCE, PROOF);
+    expect((send.mock.calls[0] as unknown[]).slice(0, 6)).toEqual([
+      7n,
+      [],
+      [],
+      EPOCH,
+      EVIDENCE,
+      PROOF,
+    ]);
+  });
+
+  it("the ABI fragments the wrappers build have DVTValidator-0.9.0's selectors", async () => {
+    const svc = makeWriterService();
+    const seen: string[] = [];
+    (svc as any).buildContract = (_a: string, abi: string[]) => {
+      seen.push(...abi);
+      throw new Error("stop after capturing the ABI");
+    };
+    await expect(
+      svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, EVIDENCE, PROOF)
+    ).rejects.toThrow(/capturing/);
+    await expect(
+      svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, EVIDENCE, PROOF)
+    ).rejects.toThrow(/capturing/);
+    const iface = new ethers.Interface(seen);
+    expect(iface.getFunction("queueSlashWithProof")!.selector).toBe(
+      ethers.id("queueSlashWithProof(address,uint8,uint256,bytes,bytes)").slice(0, 10)
+    );
+    expect(iface.getFunction("executeWithProof")!.selector).toBe(
+      ethers.id("executeWithProof(uint256,address[],uint256[],uint256,bytes,bytes)").slice(0, 10)
+    );
   });
 });
 
@@ -299,7 +359,15 @@ describe("BlockchainService dry-run (AUDIT_DRY_RUN) — queue/execute skip broad
   it("queue dryRun=true → staticCall IS called, real send is NOT, returns the sentinel", async () => {
     const svc = makeWriterService();
     const send = installMockContract(svc, "queueSlashWithProof");
-    const hash = await svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, PROOF, true);
+    const hash = await svc.queueSlashWithProof(
+      DVT_VALIDATOR,
+      OPERATOR,
+      1,
+      EPOCH,
+      EVIDENCE,
+      PROOF,
+      true
+    );
     expect(hash).toBe(DRY_RUN_TX_SENTINEL);
     // The preflight ran (proof validated against the real contract) …
     expect((send as any).staticCall).toHaveBeenCalledTimes(1);
@@ -311,7 +379,7 @@ describe("BlockchainService dry-run (AUDIT_DRY_RUN) — queue/execute skip broad
     const svc = makeWriterService();
     const send = installMockContract(svc, "queueSlashWithProof", { staticReverts: true });
     await expect(
-      svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, PROOF, true)
+      svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, EVIDENCE, PROOF, true)
     ).rejects.toThrow(/preflight \(staticCall\) reverted/);
     expect(send).not.toHaveBeenCalled();
   });
@@ -343,7 +411,15 @@ describe("BlockchainService dry-run (AUDIT_DRY_RUN) — queue/execute skip broad
   it("queue dryRun=false → unchanged: send IS called, returns the real tx hash", async () => {
     const svc = makeWriterService();
     const send = installMockContract(svc, "queueSlashWithProof");
-    const hash = await svc.queueSlashWithProof(DVT_VALIDATOR, OPERATOR, 1, EPOCH, PROOF, false);
+    const hash = await svc.queueSlashWithProof(
+      DVT_VALIDATOR,
+      OPERATOR,
+      1,
+      EPOCH,
+      EVIDENCE,
+      PROOF,
+      false
+    );
     expect(hash).toBe("0xTXHASH");
     expect(send).toHaveBeenCalledTimes(1);
   });
@@ -351,7 +427,16 @@ describe("BlockchainService dry-run (AUDIT_DRY_RUN) — queue/execute skip broad
   it("execute dryRun=true → staticCall IS called, real send is NOT, returns the sentinel", async () => {
     const svc = makeWriterService();
     const send = installMockContract(svc, "executeWithProof");
-    const hash = await svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, PROOF, true);
+    const hash = await svc.executeSlashWithProof(
+      DVT_VALIDATOR,
+      7n,
+      [],
+      [],
+      EPOCH,
+      EVIDENCE,
+      PROOF,
+      true
+    );
     expect(hash).toBe(DRY_RUN_TX_SENTINEL);
     expect((send as any).staticCall).toHaveBeenCalledTimes(1);
     expect(send).not.toHaveBeenCalled();
@@ -361,7 +446,7 @@ describe("BlockchainService dry-run (AUDIT_DRY_RUN) — queue/execute skip broad
     const svc = makeWriterService();
     const send = installMockContract(svc, "executeWithProof", { staticReverts: true });
     await expect(
-      svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, PROOF, true)
+      svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, EVIDENCE, PROOF, true)
     ).rejects.toThrow(/preflight \(staticCall\) reverted/);
     expect(send).not.toHaveBeenCalled();
   });
@@ -369,7 +454,16 @@ describe("BlockchainService dry-run (AUDIT_DRY_RUN) — queue/execute skip broad
   it("execute dryRun=false → unchanged: send IS called, returns the real tx hash", async () => {
     const svc = makeWriterService();
     const send = installMockContract(svc, "executeWithProof");
-    const hash = await svc.executeSlashWithProof(DVT_VALIDATOR, 7n, [], [], EPOCH, PROOF, false);
+    const hash = await svc.executeSlashWithProof(
+      DVT_VALIDATOR,
+      7n,
+      [],
+      [],
+      EPOCH,
+      EVIDENCE,
+      PROOF,
+      false
+    );
     expect(hash).toBe("0xTXHASH");
     expect(send).toHaveBeenCalledTimes(1);
   });

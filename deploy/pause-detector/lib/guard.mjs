@@ -135,6 +135,23 @@ export function carryGaps(old, acked, nowIso) {
 
 /** The bundle's manifest file name, at the bundle root. */
 export const MANIFEST = "MANIFEST.json";
+
+/**
+ * The bundled packages that CI's npm audit lets through by an exception (DSR 2026-11-18): none may
+ * be bundled. An exception in scripts/ci/audit-exceptions.json is granted because the package is
+ * dev tooling only; this is the check that the detector bundle, the thing deployed on the Mini,
+ * really does not carry it. Pure: `names` are the bundled package names, `exceptions` the parsed
+ * file. A file that is not a list of entries with a package is a problem too (fail closed).
+ */
+export function auditExceptedInBundle(names, exceptions) {
+  if (!Array.isArray(exceptions) || exceptions.some(e => typeof e?.package !== "string"))
+    return ["scripts/ci/audit-exceptions.json is not a list of exceptions with a package"];
+  const excepted = new Map(exceptions.map(e => [e.package, e.id]));
+  return [...new Set(names)]
+    .filter(n => excepted.has(n))
+    .sort()
+    .map(n => `${n} is bundled, but CI's audit lets ${excepted.get(n)} in it through as dev-only`);
+}
 /** The detector's directory, under the home directory: config, secrets, state and the bundle. */
 export const DIR = ".aoa-pause-detector";
 
@@ -332,6 +349,11 @@ export function bundleProblems(app) {
     return ["the bundle manifest is not a detector bundle manifest"];
   const { files, problems } = walk(app);
   const p = [...problems];
+  // Daybreak H4 (DSR 2026-11-17): a bundle of files that differ from its recorded commit
+  if (man.dirty !== undefined)
+    p.push(
+      "the bundle was built from files that differ from its recorded commit (--allow-dirty): a test bundle, never a deployed one"
+    );
   const listed = new Set(Object.keys(man.files));
   for (const f of files) {
     if (f === MANIFEST) continue;
@@ -353,6 +375,45 @@ export function bundleProblems(app) {
   }
   for (const f of listed) p.push(`${f} is in the manifest but missing`);
   return p.slice(0, 20);
+}
+
+/**
+ * The bundle at `app` is the one the deploy log recorded (Daybreak H4, DSR 2026-11-17): its
+ * MANIFEST.json's `commit` is `expect.commit` (40 hex) and the file's sha256 is
+ * `expect.manifestSha256` (64 hex), the two values bundle.mjs printed and SP's step-13 manifest
+ * holds. So a stale bundle, or one from another commit, fails preflight. Returns the problems.
+ */
+export function bundleIdentityProblems(app, expect) {
+  const commit = String(expect?.commit ?? "");
+  const sha = String(expect?.manifestSha256 ?? "");
+  const p = [];
+  if (!/^[0-9a-f]{40}$/.test(commit))
+    p.push("no expected detector commit (--detector-commit <40 hex>, from the deploy log)");
+  if (!/^[0-9a-f]{64}$/.test(sha))
+    p.push(
+      "no expected manifest sha256 (--detector-manifest-sha256 <64 hex>, from the deploy log)"
+    );
+  let bytes;
+  try {
+    bytes = readOwn(join(app, MANIFEST), "the bundle manifest");
+  } catch (e) {
+    return [...p, e instanceof GuardError ? e.message : "the bundle manifest cannot be read"];
+  }
+  if (p.length) return p;
+  let man;
+  try {
+    man = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return ["the bundle manifest is not JSON"];
+  }
+  if (man?.commit !== commit)
+    p.push(
+      `the bundle was built from ${String(man?.commit).slice(0, 12)}, not ${commit.slice(0, 12)}`
+    );
+  const got = createHash("sha256").update(bytes).digest("hex");
+  if (got !== sha)
+    p.push(`MANIFEST.json's sha256 is ${got.slice(0, 12)}…, not the recorded ${sha.slice(0, 12)}…`);
+  return p;
 }
 
 /**

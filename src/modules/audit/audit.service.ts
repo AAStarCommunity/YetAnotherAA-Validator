@@ -66,6 +66,17 @@ const RULE_OFFLINE = "offline";
 const OFFLINE_THRESHOLD_MS = 600_000;
 /** ROLE_DVT = keccak256("DVT") — the staking role lock the audit inspects. */
 const ROLE_DVT = ethers.id("DVT");
+/**
+ * The `evidence` bytes the armed slash path passes to DVTValidator-0.9.0's queueSlashWithProof and
+ * executeWithProof. Empty on purpose: the audit-slash evidence body (M0 §3.1: a versioned ABI struct
+ * carrying the proof identity and `bytes32 proofHash`) is not decided yet, and it ships with the
+ * 5.5.x enablement that deploys a DVTValidator with that category (DSR 2026-11-17). Until then
+ * DVTValidator-0.9.0 refuses every slash-shaped proposal (categoryCount() == 0), and empty evidence
+ * cannot decode, so both static-call preflights revert and nothing is broadcast. This also means the
+ * evidenceHash filed below (still the proofHash) is not the category-rule value; both change
+ * together with the body.
+ */
+const AUDIT_SLASH_EVIDENCE = "0x";
 
 export interface AuditDetection {
   operator: string;
@@ -1673,6 +1684,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
           operator,
           slashLevel,
           epoch,
+          AUDIT_SLASH_EVIDENCE,
           encoded,
           dryRun
         );
@@ -1789,6 +1801,7 @@ export class AuditService implements OnApplicationBootstrap, OnApplicationShutdo
             [], // slash-only ⇒ no reputation users
             [], // slash-only ⇒ no reputation scores
             epoch,
+            AUDIT_SLASH_EVIDENCE,
             encoded,
             dryRun
           );

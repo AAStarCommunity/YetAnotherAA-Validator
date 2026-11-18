@@ -939,9 +939,15 @@ or as the author's attestation: nothing in the repository proves them.
 - Placement: DVTValidator computes the committee and checks
   `signers ⊆ committee` before calling the aggregator. The aggregator only
   verifies the aggregate (it has no byte room).
-- Interface prepared in 5.5.0: DVTValidator reserves `committeeOf(proposalId)`
-  returning the full set (no selection) so callers and nodes already speak the
-  interface.
+- Not prepared in 5.5.0: the `committeeOf(proposalId)` reservation was never
+  implemented, and DVTValidator-0.9.0 (SP #635) has neither it nor an on-chain
+  enumerable validator set (nothing in DVT read either). A committee-selecting
+  DVTValidator would bring the interface back. Until then, off-chain code
+  rebuilds the validator set per DVTValidator address from
+  `ValidatorAdded(address)` (whenever an address not currently admitted is
+  admitted, so again after a prune or removal; a repeat `addValidator` emits
+  nothing), `ValidatorPruned` (the permissionless prune of a validator without
+  role or stake) and `ValidatorRemoved(address)` (owner force-removal).
 
 ## 7. Dependencies on SP (rc.8)
 
