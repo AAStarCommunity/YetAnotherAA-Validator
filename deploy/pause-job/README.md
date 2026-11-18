@@ -257,8 +257,10 @@ Until this PR merged, they were manual items on the launch checklist.
   since SuperPaymaster#635 (merge commit
   `053117cc8ca31eb69ae1f62755a1d7790e71190f`). CI's `sp-parity` job runs
   `check:sp-parity` against the commit pinned in
-  `scripts/evidence/sp-parity-commit`; at the rc.8 freeze the pin becomes the
-  tag commit (DSR 48be82a3).
+  `scripts/evidence/sp-parity-commit`, now SP main
+  `f2b2cd9b4a566d7cb73c8482e1327c674f8887a8` (BLSAggregator-4.14.2,
+  DVTValidator-0.9.0); at the rc.8 freeze the pin becomes the tag commit (DSR
+  48be82a3).
 
 ## Tests
 
