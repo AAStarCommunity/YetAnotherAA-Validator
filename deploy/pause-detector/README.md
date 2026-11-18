@@ -658,6 +658,16 @@ secret-file reader, called with the detector's own name table) and
      too wide makes every round `unknown` until it is fixed; it never makes a
      round clear.
    - `maxHeadAgeSec` (60..86400) is the oldest head a round accepts.
+   - **`lockPort`** (DSR 2026-11-18) must be **outside the system's ephemeral
+     port range** (macOS: `sysctl net.inet.ip.portrange.first/last`, default
+     49152–65535), and no service may listen on it. Check with
+     `lsof -nP -iTCP:<port>` before writing it.
+     - Inside that range, any outgoing connection on the Mini can happen to hold
+       the port. A round that finds it taken exits 75 as a lock loser, with no
+       status and no heartbeat: a false dead-man alert.
+     - The example's 47221 is outside it. Preflight checks it
+       (`detector-lockport`), and the value goes in what DSR confirms before
+       deploy.
    - `startBlock` is **the block the SP proxy was deployed at**, or earlier (DSR
      2026-11-18):
      - **Sepolia:** the SP proxy is upgraded in place (rc.8 changes only its
@@ -806,6 +816,8 @@ secret-file reader, called with the detector's own name table) and
    - **detector-args**: the loaded detector runs exactly the pinned node,
      `--permission`, the one read, the one write and the bundle's entry, with no
      injecting variable;
+   - **detector-lockport**: `config.json`'s `lockPort` is outside this machine's
+     ephemeral port range, read with `sysctl`; a range it cannot read FAILS;
    - **detector-bundle**: the bundle matches its manifest, with no symlink under
      `~/.aoa-pause-detector`; the manifest is not `dirty`; its `commit` and its
      sha256 are the recorded ones (missing values FAIL);
