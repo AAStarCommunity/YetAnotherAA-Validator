@@ -102,6 +102,7 @@ import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
 import { keyEnds, fieldShape, pubKeyShape, nodeNameShape } from "./lib/redact.mjs";
+import { aggregatorSourceVersion } from "./lib/sp-source.mjs";
 
 const POP_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 const DEFAULT_NODES = ["node_dev_001.json", "node_dev_002.json", "node_dev_003.json"];
@@ -635,6 +636,16 @@ async function exportFromPlan({ provider, chainId }) {
   const DOMAIN = spConstant(source, "DOMAIN_NAME");
   const POP_TAG = spConstant(source, "TAG_POP");
   const sourceSha256 = createHash("sha256").update(source).digest("hex");
+  // The release this source is (DSR 2026-11-18): version() cannot be read before the deploy, so the
+  // export records the string the source returns. SP's adapter requires it to equal its
+  // RELEASE_VERSIONS aggregator entry, and rejects an export without it.
+  const sourceVersion = aggregatorSourceVersion(source);
+  if (!sourceVersion) {
+    die(
+      `--sp-aggregator-source ${SP_SOURCE} does not have exactly one 'return "BLSAggregator-x.y.z";'`
+    );
+  }
+  console.log(`version    : ${sourceVersion} (from the source)`);
   console.log(`SP source  : ${SP_SOURCE} (sha256 ${sourceSha256}, commit ${SP_COMMIT})`);
   console.log(`DOMAIN_NAME: keccak256("${DOMAIN.preimage}")`);
   console.log(`TAG_POP    : keccak256("${POP_TAG.preimage}")`);
@@ -770,6 +781,8 @@ async function exportFromPlan({ provider, chainId }) {
 
   const out = {
     pop: entries,
+    // Outside popContext, whose keys are SP's (DSR 2026-11-18). Next to spAggregatorSourceSha256.
+    aggregatorSourceVersion: sourceVersion,
     // Exactly SP's popContext keys (DSR/SP 2026-11-17); A10 asserts each, popDigests in pop order.
     // The calldata's target is popContext.dvt: the 4.14.0 aggregator rejects any other caller.
     popContext: {
