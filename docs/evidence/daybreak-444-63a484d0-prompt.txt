@@ -1,0 +1,21 @@
+Defensive security review: final-head gate for YetAnotherAA-Validator PR #444 (head 63a484d087de7ab720de9fdc90d1b274c6b6df95), the rc.8 guardian re-registration tooling.
+
+Scope and rules:
+- Read only files inside this repository's worktree; do not access other directories under ~/Dev, the home directory, or anything outside this worktree.
+- Do not run anything that touches a network, a chain or an RPC endpoint. Do not open .env files, keystores, node_*.json key files or any secrets file, even if they exist.
+- The target is the PR's change set: deploy/reregister-guardians.mjs, deploy/rehearse-reregister-plan.sh, and docs/rc8-deploy-day-dvt.md (the sections on re-registration, --plan / --deployment / --export-pop, the interface and the return path after an exit). Use `git diff 8bbac70888d6...HEAD -- deploy/reregister-guardians.mjs deploy/rehearse-reregister-plan.sh docs/rc8-deploy-day-dvt.md` to see it. You may read other repository files only to understand what these use.
+
+What this tool is (verify against the code; do not take it on trust):
+- It re-registers DVT guardian BLS keys on SuperPaymaster's BLSAggregator-4.14.2 / DVTValidator-0.9.0. It produces proofs of possession (PoP) and calldata; in --plan and --export-pop modes it must not send any transaction (the SAFE owner sends); --deployment can send from a deployer key in a local rehearsal.
+- The PoP digest binds the aggregator address, chain id, registry and the validator address (popDigest / domainSeparator).
+- The rehearsal script runs only against a local anvil with throwaway keys generated per run.
+
+Review strictly and adversarially. In particular:
+1. Key handling: can a real guardian BLS key or an EOA private key be read, logged, written to a world-readable file, passed in argv, or leaked in an error? Can a throwaway-key path be confused with a real one?
+2. Can --plan or --export-pop send a transaction, or can any mode send to an unintended address or chain?
+3. PoP and calldata correctness: can the tool produce a PoP or calldata bound to the wrong aggregator, validator, slot or chain, or accept a plan whose addresses do not match what is deployed (nonce drift, reorder)?
+4. Fail-open paths: a check that passes when it cannot read state (a revert, an RPC error, a missing field), a suspended or slot-conflicting guardian accepted, a version check that can be bypassed.
+5. Injection and trust boundaries: config, file contents, environment variables or RPC responses that change control flow, file paths or shell commands (the .sh script included).
+6. Race conditions, TOCTOU between check and send, error handling.
+
+Output format: a list of findings, each with severity (Critical / High / Medium / Low / Info), file:line, the concrete failure scenario, and a suggested fix. Report only issues you can tie to specific code. If you find no Critical or High issue, say so explicitly in one line at the end: "No Critical or High findings."

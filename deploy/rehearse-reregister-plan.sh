@@ -8,15 +8,22 @@
 #   SP_DIR     an SP checkout already built with `forge build`. Fetch it into its own directory with
 #              `gh api repos/AAStarCommunity/SuperPaymaster/tarball/<sha>` plus its contracts/lib
 #              submodules; never use another session's worktree.
-#   SP_COMMIT  the 40-hex commit SP_DIR was fetched at.
-#   EXPECT_VERSIONS  "BLSAggregator-<x>,DVTValidator-<y>" from SP_COMMIT's tree; both generations
-#              deployed by the rehearsal must report exactly these.
+#   SP_COMMIT  the 40-hex commit SP_DIR was fetched at. CHECKED, not just a label (Daybreak on 63a484d0,
+#              M4): a git checkout must be at SP_COMMIT with no change to a tracked file. Every source
+#              the two artifacts were compiled from must be on disk with the recorded keccak256 and
+#              have the git blob SP_COMMIT pins (OpenZeppelin files: the v5.0.2 tag). Needs `gh`.
+#   EXPECT_VERSIONS  "BLSAggregator-<x>,DVTValidator-<y>"; must equal the version() strings in those
+#              two sources, and both generations deployed by the rehearsal must report exactly these.
 #   PORT       anvil port (default 18645; must be free).
 # The three guardian BLS keys are generated fresh inside the run's temporary directory, so no real
 # guardian key can be used by accident (Codex round 3, L5).
 #
 # Usage: SP_DIR=... SP_COMMIT=... EXPECT_VERSIONS=... deploy/rehearse-reregister-plan.sh [good|nonce-moved]
-#   good         exit 0 and "REHEARSAL PASSED"; any failed assertion exits non-zero.
+#   good         exit 0 and "REHEARSAL PASSED"; any failed assertion exits non-zero. After the A10 sends
+#                it also runs the --deployment --export-pop path (the return-after-exit path) against
+#                the new pair: it must stop on a guardian without ROLE_DVT, pass once each holds
+#                ROLE_DVT and minStake, reproduce the same readsDigest on a later block, and stop on a
+#                node file whose key differs from the active one and on a suspended guardian.
 #   nonce-moved  the deployer sends one unplanned transaction after the export. The re-export must stop
 #                on the nonce check and the address assertion must stop the send: exit 3.
 set -euo pipefail
@@ -34,9 +41,73 @@ R=http://127.0.0.1:$PORT
 K0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 D=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 SRC=$SP_DIR/contracts/src/modules/monitoring/BLSAggregator.sol
+DSRC=$SP_DIR/contracts/src/modules/monitoring/DVTValidator.sol
+[[ "$SP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "SP_COMMIT must be 40 lowercase hex"; exit 1; }
+
+# ---- SP_COMMIT is what SP_DIR holds, and the artifacts are built from it (Daybreak on 63a484d0, M4) ---
+# Every source in the two artifacts' metadata must (1) have the keccak256 the metadata records, on disk
+# in SP_DIR, and (2) have the git blob SP_COMMIT pins: SP's own files from SP_COMMIT's tree, and the
+# OpenZeppelin files vendored under singleton-paymaster from OpenZeppelin's v5.0.2 tag, the version
+# their directory names. Any other source path stops the run (Codex on the #444 delta, M1). Not
+# checked: the compiler settings, and that bytecode was produced by them (printed, not compared).
+BLOBS=$B/sp-blobs.tsv
+if git -C "$SP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  HEAD_SHA=$(git -C "$SP_DIR" rev-parse HEAD)
+  [ "$HEAD_SHA" = "$SP_COMMIT" ] || { echo "FAIL: SP_DIR is at $HEAD_SHA, SP_COMMIT is $SP_COMMIT"; exit 1; }
+  git -C "$SP_DIR" diff --quiet HEAD -- || { echo "FAIL: SP_DIR has changes to tracked files"; exit 1; }
+  git -C "$SP_DIR" ls-tree -r "$SP_COMMIT" | awk -F'\t' '$1 ~ / blob / {split($1, a, " "); print $2 "\t" a[3]}' > "$BLOBS"
+  echo "SP_DIR is a clean checkout at $SP_COMMIT"
+else
+  TREE=$(gh api "repos/AAStarCommunity/SuperPaymaster/git/trees/$SP_COMMIT?recursive=1")
+  [ "$(printf '%s' "$TREE" | python3 -c 'import json,sys;print(json.load(sys.stdin)["truncated"])')" = False ] \
+    || { echo "FAIL: GitHub truncated SP_COMMIT's tree listing"; exit 1; }
+  printf '%s' "$TREE" | python3 -c 'import json,sys;[print(e["path"]+"\t"+e["sha"]) for e in json.load(sys.stdin)["tree"] if e["type"]=="blob"]' > "$BLOBS"
+  echo "SP_COMMIT's tree: $(wc -l < "$BLOBS" | tr -d ' ') blobs (from GitHub)"
+fi
+[ -s "$BLOBS" ] || { echo "FAIL: no blob list for SP_COMMIT"; exit 1; }
+# The expected versions are the ones the two sources return.
+( cd "$WT" && node --input-type=module - "$SP_DIR" "$EXPECT_VERSIONS" "$BLOBS" <<'JS'
+import { readFileSync } from "fs";
+import { createHash } from "crypto";
+import { execFileSync } from "child_process";
+import { ethers } from "ethers";
+const [dir, expect, blobsFile] = process.argv.slice(2);
+const fail = m => { console.log(`FAIL: ${m}`); process.exit(1); };
+const spBlobs = new Map(readFileSync(blobsFile, "utf8").split("\n").filter(Boolean).map(l => l.split("\t")));
+const gitBlob = buf => createHash("sha1").update(`blob ${buf.length}\0`).update(buf).digest("hex");
+const OZ = "singleton-paymaster/lib/openzeppelin-contracts-v5.0.2/";
+const ozBlob = rel => execFileSync("gh", ["api", `repos/OpenZeppelin/openzeppelin-contracts/contents/${rel}?ref=v5.0.2`, "--jq", ".sha"], { encoding: "utf8" }).trim();
+const want = {};
+let n = 0;
+for (const [name, prefix] of [["BLSAggregator", "BLSAggregator-"], ["DVTValidator", "DVTValidator-"]]) {
+  const art = JSON.parse(readFileSync(`${dir}/out/${name}.sol/${name}.json`, "utf8"));
+  const sources = art.metadata?.sources;
+  if (!sources || !Object.keys(sources).length) fail(`out/${name}.sol has no metadata sources`);
+  const c = art.metadata.compiler?.version, st = art.metadata.settings ?? {};
+  console.log(`${name}: solc ${c}, viaIR ${st.viaIR}, optimizer ${JSON.stringify(st.optimizer)}, evm ${st.evmVersion} (printed, not compared)`);
+  for (const [rel, meta] of Object.entries(sources)) {
+    let buf;
+    try { buf = readFileSync(`${dir}/${rel}`); } catch { fail(`${rel} (a source of out/${name}.sol) is missing from SP_DIR`); }
+    if (meta.keccak256 !== ethers.keccak256(buf)) fail(`out/${name}.sol was not compiled from SP_DIR's ${rel}`);
+    const expected = rel.startsWith(OZ) ? ozBlob(rel.slice(OZ.length)) : rel.startsWith("contracts/src/") ? spBlobs.get(rel) : null;
+    if (!expected) fail(`${rel}: no pinned blob for this path (only contracts/src/ and ${OZ} are known)`);
+    if (gitBlob(buf) !== expected) fail(`${rel}: blob ${gitBlob(buf)}, pinned ${expected}`);
+    n++;
+  }
+  const rel = `contracts/src/modules/monitoring/${name}.sol`;
+  if (!sources[rel]) fail(`out/${name}.sol does not list ${rel}`);
+  const m = readFileSync(`${dir}/${rel}`, "utf8").match(new RegExp(`return "(${prefix}[^"]+)";`, "g")) ?? [];
+  if (m.length !== 1) fail(`${rel} has ${m.length} "return \\"${prefix}…\\"" lines, expected exactly 1`);
+  want[name] = m[0].slice(8, -2);
+}
+const got = `${want.BLSAggregator},${want.DVTValidator}`;
+if (got !== expect) fail(`the sources return ${got}; EXPECT_VERSIONS is ${expect}`);
+console.log(`artifacts: ${n} source entries, each on disk with the recorded keccak256 and the pinned blob; they return ${got}`);
+JS
+)
 NODES_DIR=$B/nodes
 NODES="$NODES_DIR/node_test_1.json,$NODES_DIR/node_test_2.json,$NODES_DIR/node_test_3.json"
-( umask 077; printf 'RPC_URL=%s\nREREGISTER_OWNER_PRIVATE_KEY=%s\n' "$R" "$K0" > "$B/anvil.env" )
+( umask 077; printf 'RPC_URL=%s\n' "$R" > "$B/anvil.env" )
 # Fresh throwaway guardians: random BLS keys and random, never-funded validator addresses.
 ( umask 077; mkdir -p "$NODES_DIR" && cd "$WT" && node --input-type=module - "$NODES_DIR" <<'JS'
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
@@ -202,6 +273,92 @@ for i in (1, 2, 3):
             and call("suspended(address)(bool)", n["operator"]) == "false")
     ok &= good
     print("read-back slot %d: %s" % (i, "OK" if good else "BAD"))
-print("REHEARSAL", "PASSED" if ok else "FAILED")
 sys.exit(0 if ok else 1)
 PY
+
+# ---- the --deployment --export-pop path (return after exit) against the new pair ---------------------
+# Daybreak on 63a484d0, M1-M3 (DSR 2026-11-18). The deployer is still the owner here (no hand-off).
+DEP=$B/deployment.json
+printf '{"dvtValidator":"%s","blsAggregator":"%s","registry":"%s"}\n' "$NDVT" "$NAGG" "$REG" > "$DEP"
+dep_export() { # $1 nodes  $2 output file
+  ( cd "$WT" && env -u SEPOLIA_RPC_URL node deploy/reregister-guardians.mjs --env "$B/anvil.env" \
+      --chain-id 31337 --deployment "$DEP" --expect-versions "$EXPECT_VERSIONS" --expect-owner "$D" \
+      --nodes "$1" --export-pop "$2" )
+}
+must_stop() { # $1 what  $2 pattern  $3 nodes  -- the export must fail, and for THIS reason
+  local out
+  if out=$(dep_export "$3" "$B/must-stop.json" 2>&1); then echo "FAIL: $1: the export passed"; exit 1; fi
+  echo "$out" | grep -q -- "$2" || { echo "FAIL: $1: stopped for another reason:"; echo "$out" | grep '✗'; exit 1; }
+  echo "$1: stopped (expected)"
+}
+must_stop "M2 guardians without ROLE_DVT" "does not hold ROLE_DVT" "$NODES"
+
+# Give each throwaway guardian ROLE_DVT with minStake, as a real one would: GToken from the anvil
+# deployer, then approve + registerRole from the guardian itself (impersonated; never-funded address).
+GT=$(jget "$G1" gToken)
+STK=$("$C" call "$REG" 'GTOKEN_STAKING()(address)' --rpc-url "$R")
+ROLE=$("$C" keccak DVT)
+for i in 1 2 3; do
+  V=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['operator'])" "$NODES_DIR/node_test_$i.json")
+  "$C" rpc anvil_setBalance "$V" 0x8AC7230489E80000 --rpc-url "$R" >/dev/null
+  "$C" send "$GT" 'transfer(address,uint256)' "$V" 33ether --private-key "$K0" --rpc-url "$R" >/dev/null
+  "$C" rpc anvil_impersonateAccount "$V" --rpc-url "$R" >/dev/null
+  "$C" send "$GT" 'approve(address,uint256)' "$STK" 33ether --from "$V" --unlocked --rpc-url "$R" >/dev/null
+  "$C" send "$REG" 'registerRole(bytes32,address,bytes)' "$ROLE" "$V" 0x --from "$V" --unlocked --rpc-url "$R" >/dev/null
+  "$C" rpc anvil_stopImpersonatingAccount "$V" --rpc-url "$R" >/dev/null
+  [ "$("$C" call "$REG" 'hasRole(bytes32,address)(bool)' "$ROLE" "$V" --rpc-url "$R")" = true ] \
+    || { echo "FAIL: guardian $i did not get ROLE_DVT"; exit 1; }
+done
+echo "three guardians hold ROLE_DVT with minStake"
+
+dep_export "$NODES" "$B/dep-1.json"
+"$C" rpc anvil_mine 3 --rpc-url "$R" >/dev/null
+dep_export "$NODES" "$B/dep-2.json"
+python3 - "$B/dep-1.json" "$B/dep-2.json" <<'PY'
+import json, sys
+a, b = (json.load(open(f)) for f in sys.argv[1:])
+def need(ok, what):
+    if not ok:
+        print("FAIL:", what); sys.exit(1)
+for x in (a, b):
+    need(sorted(x["basis"]) == ["block", "blockHash", "timestamp"], "basis keys")
+    need(len(x["reads"]["validators"]) == 3, "reads.validators count")
+    need(all(v["hasRoleDvt"] and v["active"] and not v["suspended"] for v in x["reads"]["validators"]), "validator state")
+need(b["basis"]["block"] > a["basis"]["block"], "the second export read a later block")
+need(a["reads"] == b["reads"] and a["readsDigest"] == b["readsDigest"], "reads changed with no state change")
+need([r["calldata"] for r in a["registrations"]] == [r["calldata"] for r in b["registrations"]], "calldata changed")
+print("M3: re-export on block %d reproduces block %d's reads and digest %s" % (b["basis"]["block"], a["basis"]["block"], a["readsDigest"]))
+PY
+
+# M1: a node file with a different key for an ACTIVE guardian (same operator, same slot) must stop,
+# and the message shows only each key's ends.
+STALE=$NODES_DIR/node_stale_1.json
+( umask 077; cd "$WT" && node --input-type=module - "$NODES_DIR/node_test_1.json" "$STALE" <<'JS'
+import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
+import { ethers } from "ethers";
+import { readFileSync, writeFileSync } from "fs";
+const n = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const enc = p => {
+  const o = new Uint8Array(128), a = p.toAffine();
+  o.set(ethers.getBytes("0x" + a.x.toString(16).padStart(96, "0")), 16);
+  o.set(ethers.getBytes("0x" + a.y.toString(16).padStart(96, "0")), 80);
+  return ethers.hexlify(o);
+};
+const sk = bls.utils.randomSecretKey();
+writeFileSync(process.argv[3], JSON.stringify({ ...n, nodeName: "stale-1", privateKey: ethers.hexlify(sk),
+  publicKeyEip2537: enc(bls.longSignatures.getPublicKey(sk)) }), { mode: 0o600 });
+JS
+)
+OUT=$(dep_export "$STALE" "$B/must-stop.json" 2>&1) && { echo "FAIL: M1: a different key for an active guardian passed"; exit 1; }
+echo "$OUT" | grep -q "with a DIFFERENT BLS key" || { echo "FAIL: M1 stopped for another reason:"; echo "$OUT" | grep '✗'; exit 1; }
+for F in "$NODES_DIR/node_test_1.json" "$STALE"; do
+  K=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['publicKeyEip2537'][2:].lower())" "$F")
+  echo "$OUT" | tr 'A-F' 'a-f' | grep -q "$K" && { echo "FAIL: M1 message prints a whole key"; exit 1; }
+done
+echo "M1 a different key for an active guardian: stopped (expected), message shows key ends only"
+
+# A guardian suspended after the export: the re-run before the SAFE executes must stop.
+V1=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['operator'])" "$NODES_DIR/node_test_1.json")
+"$C" send "$NAGG" 'setSuspended(address,bool)' "$V1" true --private-key "$K0" --rpc-url "$R" >/dev/null
+must_stop "M3 a guardian suspended after the export" "is suspended on this aggregator" "$NODES"
+echo "REHEARSAL PASSED"

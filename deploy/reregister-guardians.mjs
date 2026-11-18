@@ -30,38 +30,41 @@
 //                    stake; the slot is assigned as the lowest free one — the caller does not pick it.
 //
 // Slot identity matters — historical proofs and mask bits reference it — so this script uses the
-// owner path only, and refuses to run unless the two owners are the SAME address and the signer is
-// that address (DSR 2026-11-15). It reads and records `permissionlessBLSRegistration()` either way.
+// owner path only, and refuses to run unless the two owners are the SAME address (DSR 2026-11-15).
+// It reads and records `permissionlessBLSRegistration()` either way.
 //
-// WHAT IT VERIFIES BEFORE SPENDING GAS
-// ------------------------------------
-// Every gate below runs for ALL nodes before ANY transaction is sent, and a single failure aborts the
-// whole run (no partial registration):
+// THIS SCRIPT SENDS NOTHING AND USES NO EOA KEY. --broadcast is disabled (Daybreak on 63a484d0,
+// High; DSR 2026-11-18): it is refused before any file or RPC is read. The owner (the SAFE) executes
+// the calldata --export-pop writes.
+//
+// WHAT IT VERIFIES BEFORE EXPORTING
+// ---------------------------------
+// Every gate below runs for ALL nodes, at ONE block, before anything is written, and a single failure
+// aborts the whole run:
 //   1. the connected chainId must equal 11155111 (Sepolia) unless --chain-id overrides it
 //   2. both contracts have code; `version()` of each equals --expect-versions (required for
-//      --broadcast and --export-pop; a dry run without it prints the versions and says so)
+//      --export-pop; a dry run without it prints the versions and says so)
 //   3. the pair is wired to each other: DVTValidator.BLS_AGGREGATOR() == aggregator,
 //      aggregator.DVT_VALIDATOR() == DVTValidator, both REGISTRY() agree (and match the deployment
 //      file if it names one), and Registry.blsAggregator() == aggregator
-//   4. DVTValidator.owner() == aggregator.owner() == the signer -> otherwise abort (see AUTHORIZATION)
+//   4. DVTValidator.owner() == aggregator.owner() (== --expect-owner) -> otherwise abort
 //   5. `keccak(abi.encode(DOMAIN_NAME, chainid, aggregator, REGISTRY))` reproduces the aggregator's
 //      own `domainSeparator()` — proves the PoP domain is bound to THIS aggregator
 //   6. the private key in each node file owns the public key in that same file
 //   7. locally recomputed `popDigest` byte-matches the aggregator's own `popDigest()` view
 //   8. the PoP verifies locally under the pairing check before it is ever submitted
-//   9. the validator is not suspended; if it already has an active key, it is in this same slot;
-//      `validatorAtSlot(slot)` is free or this validator; `blsKeyOwner(keyHash)` is unset or this
-//      validator
+//   9. the validator is not suspended; if it already has an active key, it is in this same slot AND
+//      it is this same key (no silent rotation); `validatorAtSlot(slot)` is free or this validator;
+//      `blsKeyOwner(keyHash)` is unset or this validator
+//  9b. it can sign once registered: ROLE_DVT, a ROLE_DVT lock >= minStake, no exit notice in effect
+//      (the checks SP's _reconstructPkAgg makes at every aggregation)
 //  10. an eth_call dry-run of the real DVTValidator call, from the owner
 //  11. no two plans in the batch claim the same slot, validator, or BLS key
 //
-// Post-broadcast it reads back `validatorAtSlot` AND `getBLSPublicKey` (key, slot, active).
+// Without --export-pop it is a dry run: the gates, then nothing written.
 //
-// Dry-run is the DEFAULT. Nothing is broadcast without --broadcast.
-//
-// --export-pop <file> IS FOR WHEN DVT DOES NOT HOLD THE OWNER KEY. It runs the same gates, simulates
-// each registration from the on-chain owner, and writes the public PoP data plus the DVTValidator
-// calldata for that owner to send. It never creates a wallet and refuses --broadcast.
+// --export-pop <file> writes the public PoP data plus the DVTValidator calldata for the owner to
+// execute, with the block the gates read and those reads (`basis`, `reads`, `readsDigest`).
 //
 // --plan <frozen plan.json> --export-pop <file> IS THE rc.8 DEPLOY-DAY MODE (SP manifest step A10). The
 // contracts do not exist yet: their addresses are SP's precomputed ones from the pin. The script
@@ -75,20 +78,16 @@
 // signer commitment adds the parent block hash, which the drill does not include (issue #441). It
 // writes one valid over-issue fraud proof plus four cases that must be rejected, and NO BLS SIGNATURE.
 //
-// PARTIAL FAILURE IS SAFE TO RETRY. All gates run before the first transaction. If a LATER broadcast
-// reverts, earlier registrations stay — just re-run: re-registering the same (validator, slot, key)
-// is accepted (BLSAggregator.sol, `blsKeyOwner[keyHash] == validator` and the same-slot rule).
+// A PARTLY EXECUTED EXPORT IS SAFE TO RE-EXPORT: re-registering the same (validator, slot, key) is
+// accepted (BLSAggregator.sol, `blsKeyOwner[keyHash] == validator` and the same-slot rule).
 //
-// env file (default .env.sepolia; Sepolia creds actually live in SuperPaymaster/.env.sepolia):
-//   SEPOLIA_RPC_URL (or ETH_RPC_URL/RPC_URL), and, only for a dry run or --broadcast against
-//   deployed contracts, REREGISTER_OWNER_PRIVATE_KEY. No other key name is read (DSR 2026-11-17):
-//   a fallback to PRIVATE_KEY is a silent fallback to the deployer EOA. On rc.8 this script only
-//   exports (--plan / --export-pop); after the hand-off the owner is the SAFE, which no EOA key
-//   can be, so --broadcast is for anvil rehearsals and the pre-hand-off window only.
+// env file (default .env.sepolia; Sepolia creds actually live in SuperPaymaster/.env.sepolia): only
+// SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL are kept from it; every other line, keys included, is
+// dropped as it is split. The file is still read whole, so a shared env file's keys pass through
+// memory; no key is selected, kept, used or printed. Pass an RPC-only file to avoid even that.
 //
 // Usage:
 //   node deploy/reregister-guardians.mjs --deployment <sp-deploy.json> --env ../SuperPaymaster/.env.sepolia
-//   node deploy/reregister-guardians.mjs --deployment <file> --env <path> --broadcast
 //   node deploy/reregister-guardians.mjs --deployment <file> --env <path> --export-pop <file>
 //   node deploy/reregister-guardians.mjs --deployment <file> --env <path> --export-fraud-drill <file> --verifier 0x...
 //   node deploy/reregister-guardians.mjs --plan <plan.json> --sp-aggregator-source <BLSAggregator.sol> --sp-commit <sha> --export-pop <file> --env <path>
@@ -125,7 +124,19 @@ const VALUE_FLAGS = new Set([
   "--sp-aggregator-source",
   "--sp-commit",
 ]);
-const BOOL_FLAGS = new Set(["--broadcast"]);
+const BOOL_FLAGS = new Set();
+// --broadcast IS DISABLED (Daybreak on 63a484d0, High; DSR 2026-11-18). Its only check that the RPC is
+// the real chain was chainId, which a Sepolia fork shares, so a live key could sign a valid Sepolia
+// transaction for a fork (and that transaction could be replayed on Sepolia). On rc.8 the SAFE sends,
+// so this script has no signing path at all: it is refused here, before any file, env var or RPC is
+// read. Restoring it needs a two-provider finalized-block comparison first (docs/rc8-deploy-day-dvt.md,
+// "Follow-ups").
+const DISABLED_FLAGS = {
+  "--broadcast":
+    "--broadcast is disabled in rc.8: this script sends no transaction and uses no EOA key.\n" +
+    "  The owner (the SAFE) executes the calldata from --export-pop; see docs/rc8-deploy-day-dvt.md,\n" +
+    '  "After the hand-off". Restoring --broadcast needs the two-provider check in "Follow-ups".',
+};
 const REMOVED_FLAGS = {
   "--aggregator":
     "pass --deployment <SP deploy output JSON> or --plan <SP frozen plan>; addresses are never typed in",
@@ -139,6 +150,7 @@ for (let i = 0; i < argv.length; i++) {
     console.error(`\n✗ ${m}`);
     process.exit(1);
   };
+  if (DISABLED_FLAGS[a]) fail(DISABLED_FLAGS[a]);
   if (REMOVED_FLAGS[a]) fail(`${a} was removed: ${REMOVED_FLAGS[a]}`);
   if (!VALUE_FLAGS.has(a) && !BOOL_FLAGS.has(a)) fail(`unknown argument ${JSON.stringify(a)}`);
   if (opts.has(a)) fail(`${a} given twice: give each option once`);
@@ -152,11 +164,9 @@ for (let i = 0; i < argv.length; i++) {
   i++;
 }
 const flag = name => opts.get(name);
-const BROADCAST = opts.has("--broadcast");
 const EXPORT_FILE = flag("--export-pop");
 const DRILL_FILE = flag("--export-fraud-drill");
 const VERIFIER = flag("--verifier");
-const READ_ONLY = Boolean(EXPORT_FILE || DRILL_FILE);
 const DEPLOYMENT_FILE = flag("--deployment");
 // The owner both contracts must have. Its value comes from SP's rc.8 owner table
 // (SuperPaymaster docs/security/rc8-owner-table.md), never from this file (DSR 2026-11-17).
@@ -194,18 +204,11 @@ function redactRpc(url) {
   }
 }
 let RPC_FOR_SCRUB = null;
-let KEY_FOR_SCRUB = null;
 /// Every error text that reaches a log goes through here (Codex round 2, M1): provider errors can embed
-/// the request URL, and ethers key-parsing errors can embed the key.
+/// the request URL. No EOA key is kept any more (--broadcast is disabled), so there is none to scrub.
 function scrub(msg) {
   let text = String(msg);
   if (RPC_FOR_SCRUB) text = text.split(RPC_FOR_SCRUB).join(redactRpc(RPC_FOR_SCRUB));
-  if (KEY_FOR_SCRUB) {
-    const bare = KEY_FOR_SCRUB.replace(/^0x/i, "");
-    for (const form of [KEY_FOR_SCRUB, bare, bare.toLowerCase(), bare.toUpperCase()]) {
-      if (form.length >= 16) text = text.split(form).join("<key withheld>");
-    }
-  }
   return text;
 }
 const die = msg => {
@@ -228,12 +231,9 @@ function describe(e) {
 if (argv.includes("--export-pop") && (!EXPORT_FILE || EXPORT_FILE.startsWith("--"))) {
   die("--export-pop needs an output file path");
 }
-if (EXPORT_FILE && BROADCAST) die("--export-pop never sends transactions; remove --broadcast");
 if (argv.includes("--export-fraud-drill") && (!DRILL_FILE || DRILL_FILE.startsWith("--"))) {
   die("--export-fraud-drill needs an output file path");
 }
-if (DRILL_FILE && BROADCAST)
-  die("--export-fraud-drill never sends transactions; remove --broadcast");
 if (DRILL_FILE && EXPORT_FILE) die("use --export-pop or --export-fraud-drill, not both");
 if (DRILL_FILE && !ethers.isAddress(VERIFIER ?? ""))
   die("--export-fraud-drill needs --verifier <address>");
@@ -275,11 +275,11 @@ if (PLAN_FILE !== undefined) {
   if (!/^[0-9a-f]{40}$/.test(SP_COMMIT ?? ""))
     die("--plan needs --sp-commit <40-hex SP commit of that source>");
 }
-if (!PLAN_FILE && (BROADCAST || EXPORT_FILE) && !EXPECT_VERSION) {
-  die("--broadcast and --export-pop need --expect-versions BLSAggregator-<x>,DVTValidator-<y>");
+if (!PLAN_FILE && EXPORT_FILE && !EXPECT_VERSION) {
+  die("--export-pop needs --expect-versions BLSAggregator-<x>,DVTValidator-<y>");
 }
-if (!PLAN_FILE && (BROADCAST || EXPORT_FILE) && !EXPECT_OWNER) {
-  die("--broadcast and --export-pop need --expect-owner <owner from SP's rc.8 owner table>");
+if (!PLAN_FILE && EXPORT_FILE && !EXPECT_OWNER) {
+  die("--export-pop needs --expect-owner <owner from SP's rc.8 owner table>");
 }
 if (!PLAN_FILE && (!DEPLOYMENT_FILE || DEPLOYMENT_FILE.startsWith("--"))) {
   die(
@@ -314,16 +314,19 @@ const DEPLOYMENT_REGISTRY =
     : ethers.getAddress(addressAt(deployment, "registry"));
 
 const strip = s => s.replace(/^["']|["']$/g, "");
+// Only the three RPC names are kept; every other line (the Sepolia env files also hold deployer keys)
+// is dropped as it is split, never parsed into a value (Daybreak on 63a484d0, Low). The file is still
+// read whole, so its text is in memory while it is split (Codex: "reads no key" is not literally
+// true); nothing else from it is kept or printed. An RPC-only env file avoids even that.
+const RPC_NAMES = new Set(["SEPOLIA_RPC_URL", "ETH_RPC_URL", "RPC_URL"]);
 let env;
 try {
   env = Object.fromEntries(
     readFileSync(ENV_FILE, "utf8")
       .split("\n")
-      .filter(l => l.includes("=") && !l.trim().startsWith("#"))
-      .map(l => {
-        const i = l.indexOf("=");
-        return [l.slice(0, i).trim(), strip(l.slice(i + 1).trim())];
-      })
+      .map(l => [l.slice(0, l.indexOf("=")).trim(), l])
+      .filter(([k, l]) => l.includes("=") && !l.trim().startsWith("#") && RPC_NAMES.has(k))
+      .map(([k, l]) => [k, strip(l.slice(l.indexOf("=") + 1).trim())])
   );
 } catch (e) {
   die(
@@ -337,29 +340,10 @@ try {
 // on the fork. It got worse: the fork deployment had landed on the same CREATE address as a real
 // deployment from the same account/nonce, so the address looked right too. Only the version() gate
 // caught it. `--env <path>` is an explicit instruction; ambient variables are the fallback, never the
-// override — this script signs transactions, so the quiet direction must be the safe one.
+// override — the export decides what the SAFE signs, so the quiet direction must be the safe one.
 const RPC = env.SEPOLIA_RPC_URL || env.ETH_RPC_URL || env.RPC_URL || process.env.SEPOLIA_RPC_URL;
-const KEY = READ_ONLY
-  ? undefined
-  : env.REREGISTER_OWNER_PRIVATE_KEY || process.env.REREGISTER_OWNER_PRIVATE_KEY;
 if (!RPC) die(`no RPC url in ${ENV_FILE} (SEPOLIA_RPC_URL / ETH_RPC_URL / RPC_URL)`);
 RPC_FOR_SCRUB = RPC;
-if (KEY) KEY_FOR_SCRUB = KEY;
-if (!READ_ONLY && !KEY) {
-  die(
-    `no REREGISTER_OWNER_PRIVATE_KEY in ${ENV_FILE} or the environment. No other key name is read:\n` +
-      `  PRIVATE_KEY / OWNER_PRIVATE_KEY / DEPLOYER_PRIVATE_KEY are the deployer EOA in the Sepolia env files.\n` +
-      `  On rc.8 use --plan or --export-pop, which need no key.`
-  );
-}
-if (KEY) {
-  // Validate at startup, never echo: ethers can quote a malformed key in its exception.
-  try {
-    new ethers.Wallet(KEY);
-  } catch {
-    die(`REREGISTER_OWNER_PRIVATE_KEY is not a valid private key (value withheld)`);
-  }
-}
 if (process.env.SEPOLIA_RPC_URL && process.env.SEPOLIA_RPC_URL !== RPC) {
   console.warn(
     `! ignoring ambient SEPOLIA_RPC_URL; ${ENV_FILE} wins (see the note above this check)`
@@ -381,6 +365,7 @@ const ABI = [
   "function DVT_VALIDATOR() view returns (address)",
   "function permissionlessBLSRegistration() view returns (bool)",
   "function suspended(address) view returns (bool)",
+  "function guardianExitRequests(address) view returns (uint64 readyAt, uint64 expiresAt)",
   "function fraudProofDigest(uint256 fraudProofId, address[] guiltyGuardians) view returns (bytes32)",
   "function popDigest(address validator, (bytes32,bytes32,bytes32,bytes32) publicKey) view returns (bytes32)",
 ];
@@ -394,7 +379,19 @@ const DVT_ABI = [
   "function REGISTRY() view returns (address)",
   "function registerBLSPublicKey(address validator, (bytes32,bytes32,bytes32,bytes32) key, uint8 slot, (bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32) pop)",
 ];
-const REGISTRY_ABI = ["function blsAggregator() view returns (address)"];
+// SP f2b2cd9b abis/Registry.json and abis/GTokenStaking.json: the reads _reconstructPkAgg makes.
+const REGISTRY_ABI = [
+  "function blsAggregator() view returns (address)",
+  "function GTOKEN_STAKING() view returns (address)",
+  "function hasRole(bytes32, address) view returns (bool)",
+  "function getRoleConfig(bytes32) view returns ((uint256 minStake, uint256 ticketPrice, uint32 slashThreshold, uint32 slashBase, uint32 slashInc, uint32 slashMax, uint16 exitFeePercent, bool isActive, uint256 minExitFee, string description, address owner, uint256 roleLockDuration))",
+];
+const STAKING_ABI = [
+  "function roleLocks(address, bytes32) view returns (uint128 amount, uint128 ticketPrice, uint48 lockedAt, bytes32 roleId, bytes metadata)",
+];
+/// The first and last 8 bytes of a 128-byte key, for messages: enough to tell two keys apart, not the
+/// whole value (DSR 2026-11-18). A public key, but a full one in a log invites copy-paste mistakes.
+const keyEnds = hex => `${hex.slice(0, 18)}…${hex.slice(-16)}`;
 
 /// Split a 0x-prefixed byte string into 32-byte words. EIP-2537 G1 is 128 bytes (4 words) and G2 is
 /// 256 bytes (8 words); those map 1:1 onto SP's BLS.G1Point / BLS.G2Point structs.
@@ -793,19 +790,9 @@ async function exportFromPlan({ provider, chainId }) {
 
 async function main() {
   const provider = new ethers.JsonRpcProvider(RPC);
-  // Codex round 2, M2: ethers can put the offending key text in its exception. Never print it.
-  let wallet = null;
-  if (!READ_ONLY) {
-    try {
-      wallet = new ethers.Wallet(KEY, provider);
-    } catch {
-      die(
-        `the signing key in ${ENV_FILE} is not a valid private key (value withheld) — fix the env file`
-      );
-    }
-  }
-  const agg = new ethers.Contract(AGGREGATOR, ABI, wallet ?? provider);
-  const dvt = new ethers.Contract(DVT, DVT_ABI, wallet ?? provider);
+  // No wallet exists in this script (--broadcast is disabled): every contract is read-only.
+  const agg = new ethers.Contract(AGGREGATOR, ABI, provider);
+  const dvt = new ethers.Contract(DVT, DVT_ABI, provider);
 
   // Print the network before anything else. The address alone is NOT enough to tell you which chain
   // you are on: a CREATE from the same account at the same nonce lands on the same address on every
@@ -818,15 +805,13 @@ async function main() {
   console.log(`${PLAN_FILE ? "plan      " : "deployment"} : ${SOURCE_FILE}`);
   console.log(`dvt        : ${DVT}`);
   console.log(`aggregator : ${AGGREGATOR}`);
-  console.log(`signer     : ${wallet ? wallet.address : "none (export only)"}`);
+  console.log(`signer     : none (this script never signs or sends)`);
   console.log(`env file   : ${ENV_FILE}`);
   const mode = DRILL_FILE
     ? `export fraud drill to ${DRILL_FILE}`
     : EXPORT_FILE
       ? `export PoP data to ${EXPORT_FILE}`
-      : BROADCAST
-        ? "BROADCAST"
-        : "dry-run (pass --broadcast to send)";
+      : "dry-run (pass --export-pop <file> to write the owner's calldata)";
   console.log(`mode       : ${mode}\n`);
   if (chainId !== EXPECT_CHAIN_ID) {
     die(`wrong network: connected to chainId ${chainId}, expected ${EXPECT_CHAIN_ID}`);
@@ -836,17 +821,30 @@ async function main() {
     return;
   }
 
+  // EVERY READ OF THE REGISTRATION PATH (dry run and --export-pop) IS AT ONE BLOCK (Daybreak on
+  // 63a484d0, M3; DSR 2026-11-18). The gates then describe one state, and the export records that
+  // block's number and hash plus the reads the gates relied on, so the SAFE signers can re-run the
+  // export just before executing and compare. --export-fraud-drill, already stale against 4.14.0
+  // (#441), is NOT covered: its own reads after gate 5 use the latest block (Codex, Low).
+  const basis = await provider.getBlock("latest");
+  if (!basis || basis.hash == null) die("cannot read the latest block to pin the reads to");
+  const AT = { blockTag: basis.number };
+  console.log(`reads at   : block ${basis.number} ${basis.hash}`);
+
   // ---- gate 2: both contracts are the releases we expect -------------------------------------
+  const codeHash = {};
   for (const [name, addr] of [
     ["DVTValidator", DVT],
     ["aggregator", AGGREGATOR],
   ]) {
-    if ((await provider.getCode(addr)) === "0x") die(`no code at ${name} ${addr} on this chain`);
+    const code = await provider.getCode(addr, AT.blockTag);
+    if (code === "0x") die(`no code at ${name} ${addr} on this chain`);
+    codeHash[name] = ethers.keccak256(code);
   }
   const versionGate = async (name, contract, expected, override) => {
     let v;
     try {
-      v = await contract.version();
+      v = await contract.version(AT);
     } catch (e) {
       die(`${name} does not answer version() (${e.shortMessage ?? e.message})`);
     }
@@ -867,10 +865,10 @@ async function main() {
 
   // ---- gate 3: the pair is wired to each other and to the Registry ----------------------------
   const [dvtAgg, aggDvt, dvtRegistry, aggRegistry] = await Promise.all([
-    dvt.BLS_AGGREGATOR(),
-    agg.DVT_VALIDATOR(),
-    dvt.REGISTRY(),
-    agg.REGISTRY(),
+    dvt.BLS_AGGREGATOR(AT),
+    agg.DVT_VALIDATOR(AT),
+    dvt.REGISTRY(AT),
+    agg.REGISTRY(AT),
   ]);
   const same = (a, b) => a.toLowerCase() === b.toLowerCase();
   if (!same(dvtAgg, AGGREGATOR))
@@ -883,7 +881,7 @@ async function main() {
   }
   let registryAgg;
   try {
-    registryAgg = await new ethers.Contract(aggRegistry, REGISTRY_ABI, provider).blsAggregator();
+    registryAgg = await new ethers.Contract(aggRegistry, REGISTRY_ABI, provider).blsAggregator(AT);
   } catch (e) {
     die(`Registry ${aggRegistry} does not answer blsAggregator() (${e.shortMessage ?? e.message})`);
   }
@@ -894,31 +892,11 @@ async function main() {
     );
   }
   console.log(`registry   : ${aggRegistry} (blsAggregator() matches)`);
-  // Codex M2: gate 3 alone is a single read before minutes of signing and mining. Routing can move in
-  // between (an SP succession, a Registry switch), so it is read again before EVERY send and before the
-  // final verification. This narrows the window; it cannot close it — only an on-chain assertion in the
-  // same transaction could, and the DVTValidator call has none.
-  const registryContract = new ethers.Contract(aggRegistry, REGISTRY_ABI, provider);
-  const checkRouting = async when => {
-    const [a, d, r] = await Promise.all([
-      dvt.BLS_AGGREGATOR(),
-      agg.DVT_VALIDATOR(),
-      registryContract.blsAggregator(),
-    ]);
-    if (!same(a, AGGREGATOR) || !same(d, DVT) || !same(r, AGGREGATOR)) {
-      die(
-        `${when}: routing changed since the pre-flight gates.\n` +
-          `  DVTValidator.BLS_AGGREGATOR() ${a}, aggregator.DVT_VALIDATOR() ${d}, Registry.blsAggregator() ${r}\n` +
-          `  expected aggregator ${AGGREGATOR} and DVTValidator ${DVT}. Stop and ask SP.`
-      );
-    }
-  };
-
-  // ---- gate 4: one shared owner, and the signer is it (see AUTHORIZATION) ---------------------
+  // ---- gate 4: one shared owner (see AUTHORIZATION) --------------------------------------------
   const [dvtOwner, aggOwner, permissionless] = await Promise.all([
-    dvt.owner(),
-    agg.owner(),
-    agg.permissionlessBLSRegistration(),
+    dvt.owner(AT),
+    agg.owner(AT),
+    agg.permissionlessBLSRegistration(AT),
   ]);
   console.log(`dvt owner  : ${dvtOwner}`);
   console.log(`agg owner  : ${aggOwner}`);
@@ -935,15 +913,6 @@ async function main() {
   }
   if (!EXPECT_OWNER)
     console.log("! --expect-owner not given: the owner was NOT checked against SP's owner table");
-  if (wallet && !same(owner, wallet.address)) {
-    die(
-      `signer is not the shared owner.\n` +
-        `  owner()  = ${owner}\n` +
-        `  signer   = ${wallet.address}\n` +
-        `  The permissionless path is NOT a fallback here: it reassigns slots. Use --export-pop\n` +
-        `  to hand the owner the calls instead.`
-    );
-  }
 
   // Read the PoP domain members explicitly rather than in a bare Promise.all: if --expect-versions
   // names a release that predates them, a raw ethers decode stack is useless to an operator.
@@ -959,11 +928,11 @@ async function main() {
       );
     }
   };
-  const domainSep = await read("domainSeparator()", () => agg.domainSeparator());
-  const tagPop = await read("TAG_POP()", () => agg.TAG_POP());
-  const maxValidators = await read("MAX_VALIDATORS()", () => agg.MAX_VALIDATORS());
-  const domainName = await read("DOMAIN_NAME()", () => agg.DOMAIN_NAME());
-  const registryAddr = await read("REGISTRY()", () => agg.REGISTRY());
+  const domainSep = await read("domainSeparator()", () => agg.domainSeparator(AT));
+  const tagPop = await read("TAG_POP()", () => agg.TAG_POP(AT));
+  const maxValidators = await read("MAX_VALIDATORS()", () => agg.MAX_VALIDATORS(AT));
+  const domainName = await read("DOMAIN_NAME()", () => agg.DOMAIN_NAME(AT));
+  const registryAddr = await read("REGISTRY()", () => agg.REGISTRY(AT));
 
   // Recompute the domain from its four inputs. This proves two things a bare read cannot: that the
   // PoP domain really is bound to THIS aggregator address (so a PoP cannot be lifted from the old
@@ -991,6 +960,39 @@ async function main() {
     await exportFraudDrill({ provider, agg, owner, version, chainId, domainSep, coder });
     return;
   }
+  // Eligibility reads, the same as SP's _reconstructPkAgg: ROLE_DVT = keccak256("DVT"), the lock in
+  // GTokenStaking.roleLocks, minStake from Registry.getRoleConfig, and the guardian exit notice.
+  const ROLE_DVT = ethers.id("DVT");
+  const readElig = async (name, call) => {
+    try {
+      return await call();
+    } catch (e) {
+      die(
+        `${name} failed (${e.shortMessage ?? e.message}): the guardian's eligibility cannot be established, so nothing is exported`
+      );
+    }
+  };
+  const registry = new ethers.Contract(registryAddr, REGISTRY_ABI, provider);
+  const stakingAddr = await readElig("Registry.GTOKEN_STAKING()", () =>
+    registry.GTOKEN_STAKING(AT)
+  );
+  if (stakingAddr === ethers.ZeroAddress)
+    die("Registry.GTOKEN_STAKING() is zero — SP reverts StakingNotConfigured");
+  const staking = new ethers.Contract(stakingAddr, STAKING_ABI, provider);
+  const minStake = (
+    await readElig("Registry.getRoleConfig(ROLE_DVT)", () => registry.getRoleConfig(ROLE_DVT, AT))
+  ).minStake;
+  const eligibility = async v => ({
+    hasRole: await readElig(`Registry.hasRole(ROLE_DVT, ${v})`, () =>
+      registry.hasRole(ROLE_DVT, v, AT)
+    ),
+    locked: (await readElig(`roleLocks(${v}, ROLE_DVT)`, () => staking.roleLocks(v, ROLE_DVT, AT)))
+      .amount,
+    exitReadyAt: (
+      await readElig(`guardianExitRequests(${v})`, () => agg.guardianExitRequests(v, AT))
+    ).readyAt,
+    minStake,
+  });
   const plans = [];
 
   for (const file of NODE_FILES) {
@@ -1041,7 +1043,7 @@ async function main() {
 
     // ---- gate 7: our understanding of popDigest must match the contract's ---------------------
     const onchainDigest = await read(`popDigest() for ${label}`, () =>
-      agg.popDigest(validator, pkWords)
+      agg.popDigest(validator, pkWords, AT)
     );
     const localDigest = ethers.keccak256(
       coder.encode(
@@ -1074,10 +1076,10 @@ async function main() {
       coder.encode(["bytes32", "bytes32", "bytes32", "bytes32"], pkWords)
     );
     const [slotHolder, keyOwner, isSuspended, existing] = await Promise.all([
-      agg.validatorAtSlot(slot),
-      agg.blsKeyOwner(keyHash),
-      agg.suspended(validator),
-      agg.getBLSPublicKey(validator),
+      agg.validatorAtSlot(slot, AT),
+      agg.blsKeyOwner(keyHash, AT),
+      agg.suspended(validator, AT),
+      agg.getBLSPublicKey(validator, AT),
     ]);
     if (isSuspended) {
       die(`${label}: ${validator} is suspended on this aggregator — SP reverts ValidatorSuspended`);
@@ -1087,6 +1089,23 @@ async function main() {
         `${label}: ${validator} already holds slot ${existing.slot}, node file says ${slot} — SP reverts SlotAlreadyTaken`
       );
     }
+    // Daybreak on 63a484d0, M1: an ACTIVE validator re-registered with a different key passes every
+    // check above (a new keyHash is a fresh blsKeyOwner binding, and the slot matches) and silently
+    // rotates the live guardian's key. A stale or mistaken node file must stop here instead. The
+    // message shows each key's first and last bytes only (DSR), enough to tell which side is stale.
+    if (existing.active) {
+      const onchainKey = ethers.concat([...existing.publicKey]).toLowerCase();
+      const fileKey = ethers.concat(pkWords).toLowerCase();
+      if (onchainKey !== fileKey) {
+        die(
+          `${label}: ${validator} is active in slot ${existing.slot} with a DIFFERENT BLS key.\n` +
+            `  on-chain : ${keyEnds(onchainKey)}\n` +
+            `  node file: ${keyEnds(fileKey)}\n` +
+            `  Re-registering would rotate the live guardian's key. Check which side is stale;\n` +
+            `  this script has no key-rotation mode.`
+        );
+      }
+    }
     if (slotHolder !== ethers.ZeroAddress && slotHolder.toLowerCase() !== validator.toLowerCase()) {
       die(`${label}: slot ${slot} is already held by ${slotHolder} — SP reverts SlotAlreadyTaken`);
     }
@@ -1094,10 +1113,30 @@ async function main() {
       die(`${label}: this BLS key is already bound to ${keyOwner} — SP reverts DuplicatePublicKey`);
     }
 
+    // ---- gate 9b: the guardian is eligible to sign (Daybreak on 63a484d0, M2) ------------------------------
+    // The owner path admits any validator, so a registration can succeed for an address whose
+    // signatures every aggregation then rejects. These are the checks SP's _reconstructPkAgg makes
+    // per selected slot (BLSAggregator.sol at f2b2cd9b), read fail-closed: a read that fails stops
+    // the run, it never counts as a pass.
+    const elig = await eligibility(validator);
+    if (!elig.hasRole)
+      die(`${label}: ${validator} does not hold ROLE_DVT — SP reverts SlotValidatorRoleRevoked`);
+    if (elig.locked < elig.minStake) {
+      die(
+        `${label}: ${validator}'s ROLE_DVT lock ${elig.locked} is below minStake ${elig.minStake} — SP reverts SlotValidatorStakeBelowMinimum`
+      );
+    }
+    if (elig.exitReadyAt !== 0n && BigInt(basis.timestamp) >= elig.exitReadyAt) {
+      die(
+        `${label}: ${validator} has a guardian exit in effect since ${elig.exitReadyAt} — SP reverts SlotValidatorExitPending`
+      );
+    }
+
     // ---- gate 10: dry-run the real DVTValidator call ---------------------------------------------------------
     try {
       await dvt.registerBLSPublicKey.staticCall(validator, pkWords, slot, popWords, {
         from: owner,
+        ...AT,
       });
     } catch (e) {
       die(
@@ -1109,7 +1148,25 @@ async function main() {
     console.log(`    validator ${validator}  slot ${slot}`);
     console.log(`    popDigest ${onchainDigest}`);
     console.log(`    slot now  ${slotHolder === ethers.ZeroAddress ? "free" : slotHolder}`);
-    plans.push({ label, validator, slot, pkWords, popWords, popDigest: onchainDigest });
+    plans.push({
+      label,
+      validator,
+      slot,
+      pkWords,
+      popWords,
+      popDigest: onchainDigest,
+      state: {
+        slotHolder,
+        suspended: isSuspended,
+        active: existing.active,
+        activeSlot: Number(existing.slot),
+        activeKey: ethers.concat([...existing.publicKey]),
+        keyOwner,
+        hasRoleDvt: elig.hasRole,
+        roleDvtLocked: elig.locked.toString(),
+        exitReadyAt: elig.exitReadyAt.toString(),
+      },
+    });
   }
 
   // ---- gate 11: the plans must not collide with EACH OTHER ---------------------------------------
@@ -1140,6 +1197,37 @@ async function main() {
     }
   }
 
+  // The block every read used must still be canonical, or the reads describe a dropped fork.
+  const again = await provider.getBlock(basis.number);
+  if (!again || again.hash !== basis.hash) {
+    die(
+      `block ${basis.number} changed while the gates ran (${basis.hash} -> ${again?.hash}): re-run`
+    );
+  }
+  // What the SAFE signers compare against just before executing (Daybreak M3; DSR 2026-11-18):
+  // re-run this export to a new file; `reads` must be identical, and only `basis` may differ.
+  const reads = {
+    dvtCodeHash: codeHash.DVTValidator,
+    aggregatorCodeHash: codeHash.aggregator,
+    dvtBlsAggregator: dvtAgg,
+    aggDvtValidator: aggDvt,
+    registry: aggRegistry,
+    registryBlsAggregator: registryAgg,
+    dvtOwner,
+    aggOwner,
+    aggregatorVersion: version,
+    dvtVersion,
+    permissionlessBLSRegistration: permissionless,
+    domainSeparator: domainSep,
+    domainName,
+    tagPop,
+    maxValidators: maxValidators.toString(),
+    gTokenStaking: stakingAddr,
+    roleDvtMinStake: minStake.toString(),
+    validators: plans.map(p => ({ validator: p.validator, slot: p.slot, ...p.state })),
+  };
+  const readsDigest = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(reads)));
+
   if (EXPORT_FILE) {
     // Listed field by field so a private key from a node file cannot reach this output.
     const exported = {
@@ -1153,7 +1241,11 @@ async function main() {
       owner,
       permissionlessBLSRegistration: permissionless,
       domainSeparator: domainSep,
-      block: await provider.getBlockNumber(),
+      // Every gate read state at this block. `reads` and `readsDigest` are what a re-run before the
+      // SAFE executes must reproduce (docs/rc8-deploy-day-dvt.md, "After the hand-off").
+      basis: { block: basis.number, blockHash: basis.hash, timestamp: basis.timestamp },
+      reads,
+      readsDigest,
       registrations: plans.map(p => ({
         validator: p.validator,
         slot: p.slot,
@@ -1177,68 +1269,13 @@ async function main() {
     return;
   }
 
-  if (!BROADCAST) {
-    console.log(
-      `\nAll ${plans.length} registrations passed every pre-flight gate. Nothing was sent.`
-    );
-    console.log("Re-run with --broadcast to submit.");
-    return;
-  }
-
-  console.log(`\nBroadcasting ${plans.length} registrations…`);
-  // Drive the nonce ourselves. Letting ethers infer it per call fails here: sending back-to-back from
-  // one wallet, the node can still answer eth_getTransactionCount with a pre-inclusion value even
-  // after `wait()` returned, and the next tx is rejected `nonce too low` — observed on the fork run,
-  // where slots 1 and 2 landed and slot 3 was rejected. An explicit counter is deterministic and
-  // makes the failure mode "this tx reverted", never "the tooling raced itself".
-  let nonce = await provider.getTransactionCount(wallet.address, "pending");
-  const receipts = [];
-  for (const p of plans) {
-    await checkRouting(`before sending ${p.label}`);
-    const tx = await dvt.registerBLSPublicKey(p.validator, p.pkWords, p.slot, p.popWords, {
-      nonce: nonce++,
-    });
-    const rc = await tx.wait();
-    if (rc.status !== 1) die(`${p.label}: tx ${tx.hash} reverted on-chain`);
-    console.log(`✓ ${p.label}  slot ${p.slot}  tx ${tx.hash}  block ${rc.blockNumber}`);
-    receipts.push({ ...p, hash: tx.hash, block: rc.blockNumber });
-  }
-
-  // Read the state back rather than trusting the receipts: a status-1 receipt only proves the tx was
-  // mined. And read the KEY, not just the slot occupant: `validatorAtSlot` answers "is anyone in this
-  // slot", while the question is "is the key I just registered the one sitting there now". A stale
-  // node file re-binding a live guardian's slot to the wrong key satisfies the first and fails the
-  // second — SP accepts it (different keyHash is a fresh blsKeyOwner binding, and existing.index ==
-  // slot so SlotAlreadyTaken never fires), and that guardian can then never sign for its own slot.
-  await checkRouting("before the read-back");
-  console.log("\nPost-verify (read back from chain):");
-  let bad = 0;
-  for (const p of receipts) {
-    const holder = await agg.validatorAtSlot(p.slot);
-    const slotOk = holder.toLowerCase() === p.validator.toLowerCase();
-    let keyOk = false;
-    let onchainKey = "<unreadable>";
-    try {
-      const k = await agg.getBLSPublicKey(p.validator);
-      const pk = k.publicKey;
-      onchainKey = ethers.concat([pk[0], pk[1], pk[2], pk[3]]);
-      keyOk =
-        k.active === true &&
-        Number(k.slot) === p.slot &&
-        onchainKey.toLowerCase() === ethers.concat(p.pkWords).toLowerCase();
-      if (!keyOk) onchainKey = `${onchainKey} slot ${k.slot} active ${k.active}`;
-    } catch (e) {
-      onchainKey = `<read failed: ${scrub(e.shortMessage ?? e.message)}>`;
-    }
-    if (!slotOk || !keyOk) bad++;
-    console.log(`  slot ${p.slot} -> ${holder} ${slotOk ? "✓" : `✗ expected ${p.validator}`}`);
-    console.log(
-      `    key      ${keyOk ? "✓ matches the key this run registered" : `✗ on-chain ${onchainKey}`}`
-    );
-  }
-  if (bad) die(`${bad} registration(s) did not read back as expected`);
-  console.log("\nAll slots verified. Hand these tx hashes back to SP for the rc.8 read-back:");
-  for (const p of receipts) console.log(`  slot ${p.slot}  ${p.validator}  ${p.hash}`);
+  console.log(
+    `\nAll ${plans.length} registrations passed every pre-flight gate at block ${basis.number}. Nothing was sent.`
+  );
+  console.log(`reads digest ${readsDigest}`);
+  console.log(
+    "Re-run with --export-pop <file> to write the calldata for the owner (the SAFE) to execute."
+  );
 }
 
 // A non-Error throw (a bare string, a rejected object) has neither .stack nor .message, so

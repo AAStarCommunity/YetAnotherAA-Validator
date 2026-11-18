@@ -157,6 +157,11 @@ jobs:
       - name: A7 fork checks
         run: npm run check:a7-fork
 
+      # rc.8 guardian re-registration (Daybreak on 63a484d0, High; DSR 2026-11-18): --broadcast is
+      # refused before any file is read or any RPC request is sent; a control run shows both recorders
+      - name: Check reregister-guardians refuses --broadcast
+        run: npm run check:reregister
+
   # Job 3: Build project
   build:
     name: Build

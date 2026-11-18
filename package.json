@@ -40,6 +40,7 @@
     "check:sp-parity": "node scripts/evidence/sp-evidence-parity.mjs",
     "check:a7-readback": "node deploy/guardian-watcher/check-a7-readback.mjs",
     "check:a7-fork": "node deploy/guardian-watcher/check-a7-fork.mjs",
+    "check:reregister": "node deploy/check-reregister-guardians.mjs",
     "check:pause-job": "node deploy/pause-job/check-pause-job.mjs",
     "check:pause-job-pin": "node deploy/pause-job/gen-sp-pin.mjs --check",
     "check:pause-detector": "node deploy/pause-detector/check-pause-detector.mjs",

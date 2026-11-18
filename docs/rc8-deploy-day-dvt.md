@@ -164,14 +164,30 @@ the nonce still equals the pin nonce, so it must run before the manifest starts
 sending. If the contracts land elsewhere, A10's address assertion stops the
 send.
 
-### Signing key
+### No signing key: `--broadcast` is disabled
 
-The script reads only `REREGISTER_OWNER_PRIVATE_KEY`, and only for a dry run or
-`--broadcast` against deployed contracts. It never falls back to `PRIVATE_KEY`,
-`OWNER_PRIVATE_KEY` or `DEPLOYER_PRIVATE_KEY`, which are the deployer EOA in the
-Sepolia env files (DSR 2026-11-17). On rc.8 nothing needs it: `--plan` and
-`--export-pop` read no key. After the hand-off the owner is the SAFE, so
-`--broadcast` cannot pass the owner check with any EOA key.
+The script sends no transaction and uses no EOA key (DSR 2026-11-18). Daybreak
+on `63a484d0` found a High in the old `--broadcast` path. Its only check that
+the RPC was the real chain was `chainId`, which a Sepolia fork shares. A live
+key could therefore sign a valid Sepolia transaction for a fork, and that
+transaction could later be replayed on Sepolia. rc.8 never used that path,
+because the SAFE executes the calldata. So the path was removed rather than
+given a network check.
+
+- `--broadcast` anywhere on the command line exits 1 with "--broadcast is
+  disabled in rc.8". This happens before any file is read and before any RPC
+  request is sent. `npm run check:reregister` pins it in CI, and a control run
+  shows that its file and RPC recorders do see a normal run.
+- `REREGISTER_OWNER_PRIVATE_KEY` is no longer used.
+- From the env file only `SEPOLIA_RPC_URL`, `ETH_RPC_URL` and `RPC_URL` are
+  kept. Every other line, including the deployer keys the Sepolia env files
+  hold, is dropped as the file is split. The file is still read whole, so those
+  keys pass through memory, though none is kept, used or printed. To avoid even
+  that, pass an env file that holds only the RPC URL.
+- The script still reads the node files' BLS secret keys, to sign each PoP; they
+  never leave the process.
+
+Restoring `--broadcast` has a precondition, see "Follow-ups".
 
 ### After the hand-off
 
@@ -180,7 +196,33 @@ deployed contracts with `--deployment` and `--export-pop`, then two SAFE signers
 execute the exported calldata. Here `--expect-owner` is the SAFE. On deploy day
 the owner is the deployer, but A10 checks the owner, not this script.
 
-Before signing in the SAFE, the signers check:
+Every gate of the registration path (the dry run and `--export-pop`) reads state
+at one block. `--export-fraud-drill`, already stale against 4.14.0 (#441), is
+not covered. The export records that block as
+`basis: {block, blockHash, timestamp}`. It also records the reads the gates
+relied on, as `reads`, with their digest `readsDigest`:
+
+- both contracts' code hashes;
+- the routing: `DVTValidator.BLS_AGGREGATOR()`, `aggregator.DVT_VALIDATOR()`,
+  `REGISTRY()` and `Registry.blsAggregator()`;
+- both owners and both versions;
+- `permissionlessBLSRegistration`, the domain separator with `DOMAIN_NAME`,
+  `TAG_POP` and `MAX_VALIDATORS`, the staking address and `minStake`;
+- for each guardian: its slot holder, suspension, active flag, slot and key, the
+  key's `blsKeyOwner`, `ROLE_DVT`, its lock and its exit notice.
+
+The calldata carries no state commitment of its own. So, **immediately before
+executing in the SAFE**, re-run the same command to a new file. Then:
+
+- it must pass every gate again;
+- its `readsDigest` must equal the first export's, and only `basis` may differ;
+- its `registrations[].calldata` must be identical.
+
+A difference means the state moved since the export: stop and find out why. The
+rehearsal checks that a re-export on a later block reproduces the digest, and
+that a guardian suspended after the export stops the re-run.
+
+Before signing in the SAFE, the signers also check:
 
 - the target is the DVTValidator;
 - the selector is `0xaded17c5`;
@@ -188,6 +230,23 @@ Before signing in the SAFE, the signers check:
   node's `publicKeyEip2537`.
 
 `cast calldata-decode` with the signature above prints these fields.
+
+The script also refuses two cases where the call itself would succeed (Daybreak
+on `63a484d0`, M1 and M2):
+
+- **A different key for an active guardian.** A guardian that is active in this
+  slot with a different BLS key would have its key silently rotated. The script
+  stops, and prints the first and last bytes of the on-chain key and of the
+  file's key, enough to tell which one is stale. There is no key-rotation mode.
+- **A guardian that cannot sign.** The guardian must:
+  - hold `ROLE_DVT`;
+  - have a `GTokenStaking.roleLocks` amount of at least `minStake`;
+  - have no exit notice in effect.
+
+  These are the checks SP's `_reconstructPkAgg` makes at every aggregation
+  (`BLSAggregator.sol` at `f2b2cd9b`). Any read that fails stops the run. These
+  checks apply to `--deployment`, not to `--plan`: on deploy day A10 registers
+  the guardians on an aggregator that does not exist yet.
 
 **A guardian that comes back after a completed exit** (SP BLSAggregator-4.14.2,
 Daybreak M-01; DSR 2026-11-17). From 4.14.2, `consumeGuardianExit` also suspends
@@ -202,7 +261,7 @@ count (`UnknownValidatorSlot`). The two steps back each restore one half:
    then the SAFE signs as above. The PoP digest does not include an admission
    epoch, so the PoP from before the exit is still valid and can be reused; a
    new one is not required. The guardian must hold `ROLE_DVT` with at least
-   `minStake` again.
+   `minStake` again; the script checks this and refuses the export otherwise.
 3. `DVTValidator.addValidator` is needed only if the address was removed or
    pruned.
 
@@ -211,7 +270,7 @@ This follows SP's `docs/deployment/rc8-guardian-operations.md` at `f2b2cd9b`
 step 1 first. Here DVT sends nothing, so the SAFE lifts the suspension first,
 and only then is the script run; until then it refuses the guardian (below).
 
-The script refuses a suspended guardian before it sends or exports anything
+The script refuses a suspended guardian before it exports anything
 (`reregister-guardians.mjs`, the `suspended(validator)` check: "is suspended on
 this aggregator — SP reverts ValidatorSuspended"). It never lifts a suspension
 itself. Deploy day's A10 registers guardians on a new aggregator, none of which
@@ -244,7 +303,12 @@ checks, all passing:
   `Registry.json`, `SuperPaymaster.full.json`), by selector and output types;
   all match. The script's three other fragments (`AGGREGATOR()`,
   `deriveFraudProofId`, `slashMessageHash`) are this repository's fraud
-  verifier, not SP.
+  verifier, not SP. The five reads added for the Daybreak eligibility check were
+  matched the same way. They are `Registry.GTOKEN_STAKING()`, `hasRole`,
+  `getRoleConfig`, `GTokenStaking.roleLocks` and
+  `BLSAggregator.guardianExitRequests`, checked against `abis/Registry.json`,
+  `abis/GTokenStaking.json` and `abis/BLSAggregator.json` at `f2b2cd9b`; all
+  match.
 - **DVTValidator.** `DVTValidator.sol` has the same git blob as at `d55f76f8`,
   so the lines cited below still hold.
 - **BLSAggregator.** It changed from 4.14.1. In 4.14.2, `popDigest` and
@@ -302,14 +366,57 @@ with its submodules at the commits it pins:
 - **Nonce moved:** one extra deployer transaction after the export. The
   re-export stops on the nonce check, the pair lands at other addresses, and the
   address assertion stops.
-- **Post-deployment modes:** `--deployment` dry run and broadcast, and
-  `--export-pop` with the owner on another address sending the calldata. Both
-  read back correctly, and the negative cells each stop the run.
+- **Post-deployment modes (2026-11-17, before `--broadcast` was disabled):**
+  `--deployment` dry run and broadcast, and `--export-pop` with the owner on
+  another address sending the calldata. Both read back correctly, and the
+  negative cells each stop the run.
+- **`--deployment --export-pop` after the Daybreak fixes** (SP `f2b2cd9b`,
+  2026-11-18, in `good`, against the pair just registered):
+  - with guardians that do not hold `ROLE_DVT`, the export stopped;
+  - each throwaway guardian then got `ROLE_DVT` with `minStake` from its own
+    address (GToken from the anvil deployer). The export then passed, and a
+    re-export three blocks later reproduced `reads`, `readsDigest` and the
+    calldata;
+  - a node file with a new key for slot 1's active guardian stopped the export,
+    and the message showed only each key's ends;
+  - a guardian suspended after the export stopped the re-run.
+- **`SP_COMMIT` is checked.** On a checkout, `HEAD` must equal `SP_COMMIT` and
+  the tree must be clean. In either case, each source the two artifacts were
+  compiled from (8 for BLSAggregator, 9 for DVTValidator) must meet two
+  conditions:
+  - it is on disk with the keccak256 the metadata records;
+  - it has the git blob that is pinned for it. SP's own files are checked
+    against `SP_COMMIT`'s tree (from GitHub for a tarball). The OpenZeppelin
+    files vendored under `singleton-paymaster` are checked against
+    OpenZeppelin's v5.0.2 tag. Any other path stops the run.
+
+  `EXPECT_VERSIONS` must equal the `version()` strings in the sources. The
+  compiler settings are printed, not compared. Two controls were run:
+  `SP_COMMIT` = `b5e7544e` stopped on a blob, and `EXPECT_VERSIONS` = 4.14.1
+  stopped on the sources' versions.
 
 ### Review gate
 
-This script produces transactions. Its PR keeps the strict merge gate: Codex on
-the exact head with no High, plus clestons approval.
+This script produces the calldata the SAFE executes. Its PR keeps the strict
+merge gate: Codex on the exact head with no High, plus clestons approval.
+Daybreak ran once, on `63a484d0`, and found 1 High, 4 Medium and 1 Low; the raw
+report is `docs/evidence/daybreak-444-63a484d0.md`. DSR ruled that no second
+Daybreak is needed, because the path with the High is removed and the other
+changes tighten read-only checks. Codex reviews the delta instead.
+
+### Follow-ups
+
+- **Restoring `--broadcast`** (DSR 2026-11-18). Before this script signs
+  anything again, it needs a check that the RPC is the real chain and not a
+  same-chain-ID fork. Two checks are known not to work:
+  - rejecting localhost or private addresses fails, because hosted forks have
+    public addresses;
+  - a fixed block hash fails, because a fork shares all history before its fork
+    point.
+
+  What works is comparing the latest finalized block's hash with a second,
+  independent provider's at the same height, and requiring that block to be
+  recent. It is a new mechanism and needs its own design and review.
 
 ## Code changes this needs
 
