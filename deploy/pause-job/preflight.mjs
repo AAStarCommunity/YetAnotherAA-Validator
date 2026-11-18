@@ -371,10 +371,6 @@ export function deadmanFresh(text, now, maxAgeMs = DEADMAN_STALE_MS) {
   return [];
 }
 
-/**
- * detector-bundle: no symlink under ~/.aoa-pause-detector, the bundle exactly its manifest, and the
- * manifest the one the deploy log recorded (`expect` = { commit, manifestSha256 }; Daybreak H4).
- */
 /** macOS's default ephemeral port range (sysctl net.inet.ip.portrange.first/last). */
 export const EPHEMERAL_DEFAULT = [49152, 65535];
 /**
@@ -417,6 +413,10 @@ export function ephemeralRange(firstText, lastText) {
     : null;
 }
 
+/**
+ * detector-bundle: no symlink under ~/.aoa-pause-detector, the bundle exactly its manifest, and the
+ * manifest the one the deploy log recorded (`expect` = { commit, manifestSha256 }; Daybreak H4).
+ */
 export function detectorBundleItem(home, expect) {
   const dd = join(home, DETECTOR_DIR);
   return [
