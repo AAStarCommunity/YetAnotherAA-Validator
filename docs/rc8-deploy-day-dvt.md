@@ -119,7 +119,10 @@ Their addresses come from SP's frozen plan, which SP precomputes at the pin.
    - the Registry, read from `pin.oldAggregator.REGISTRY()`, has code.
 
    It computes `domainSeparator` and each `popDigest` locally, signs, checks
-   each PoP with a pairing check, and writes the file. The output has two parts:
+   each PoP with a pairing check, and writes the file. The pairing check only
+   shows the signature matches the key derived from the same secret. What
+   catches a wrong key is the secret↔public-key comparison in the node file, and
+   then SP's A10 (clestons #444). The output has two parts:
    - `pop`: three entries with exactly SP's six keys: `validator`, `slot`,
      `calldata`, `aggregator`, `pinBlockHash`, `domainSeparator`
      (`manifest_exec.py`, `pop_fields`);
@@ -224,6 +227,16 @@ that a guardian suspended after the export stops the re-run.
 
 Before signing in the SAFE, the signers also check:
 
+- **the export's chain is the real one.** Take `basis` from the **final
+  re-export**, the one made just before executing. Read the block hash at
+  `basis.block` from a block explorer or a second provider, not the RPC the
+  script used, and check that it equals `basis.blockHash` (clestons #444,
+  Medium). If they differ, or the hash cannot be read, stop. The script's own
+  end-of-run hash check and the re-run use the same RPC, so a same-chain-ID fork
+  would pass both. The calldata would be the same on a fork, but the state gates
+  (for example, a guardian already active with another key) would have read the
+  fork's state. This catches an ordinary fork; it does not authenticate every
+  state answer of a malicious RPC;
 - the target is the DVTValidator;
 - the selector is `0xaded17c5`;
 - the validator, slot and the four key words decoded from the calldata match the
@@ -336,6 +349,13 @@ DVTValidator.registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot
   `msg.sender == DVT_VALIDATOR`.
 
 ### Rehearsed on anvil (2026-11-17)
+
+Usage note (clestons #444): a run writes SP's `deployments/config.anvil.json`
+through `forge script`. With a git checkout as `SP_DIR`, the next run therefore
+stops on the clean-checkout check ("SP_DIR has changes"). Restore that file
+(`git -C "$SP_DIR" checkout -- deployments/config.anvil.json`) or use a fresh
+`SP_DIR` before each run. A tarball `SP_DIR` is checked by blobs, not by
+cleanliness, so this does not apply to it.
 
 These ran against SP's `DeployAnvil` at `b5e7544e` with throwaway BLS keys. The
 pre-deployment flow is `deploy/rehearse-reregister-plan.sh` (`good` and

@@ -178,6 +178,24 @@ for (const [what, args] of [
   );
 }
 
+// clestons #444 Low 3: a zero --expect-owner stops at the argument checks, before any read.
+{
+  const args = common.map(a =>
+    a === "0x00000000000000000000000000000000000000e1"
+      ? "0x0000000000000000000000000000000000000000"
+      : a
+  );
+  const r = await run(args);
+  cell(
+    "--expect-owner 0x0 exits 1 before reading any file or sending any RPC request",
+    r.status === 1 &&
+      /--expect-owner needs a non-zero address/.test(r.stderr) &&
+      notCode(r).length === 0 &&
+      r.rpcRequests === 0,
+    `status ${r.status} stderr ${r.stderr.slice(0, 200)} read ${notCode(r).join(", ")}`
+  );
+}
+
 // CONTROL: the same command without --broadcast. Both recorders must see the run.
 {
   const r = await run(common);

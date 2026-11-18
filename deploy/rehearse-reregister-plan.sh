@@ -15,6 +15,8 @@
 #   EXPECT_VERSIONS  "BLSAggregator-<x>,DVTValidator-<y>"; must equal the version() strings in those
 #              two sources, and both generations deployed by the rehearsal must report exactly these.
 #   PORT       anvil port (default 18645; must be free).
+# A run rewrites SP_DIR/deployments/config.anvil.json (forge script). With a git checkout, restore it
+# before the next run, or the clean-checkout check stops it (clestons #444).
 # The three guardian BLS keys are generated fresh inside the run's temporary directory, so no real
 # guardian key can be used by accident (Codex round 3, L5).
 #
