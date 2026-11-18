@@ -910,6 +910,35 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
       alerts,
       `the state cursor ${st.cursor} is ahead of the finalized block ${finalized}`
     );
+  // the same for classification's own block numbers (clestons #455 Low 2): a classifiedTo, or a
+  // replay cursor, beyond the finalized block would skip forward classification or mark a replay done
+  // without reading anything. Only a corrupt or foreign state holds one; it is re-verified
+  const aheadOf = [
+    ["classifiedTo", st.classifiedTo, finalized],
+    ...Object.entries(st.replayNext ?? {}).map(([k, v]) => [`replayNext.${k}`, v, finalized]), // stored as rTo + 1 with rTo < finalized (Codex)
+  ].find(([, v, max]) => Number.isSafeInteger(v) && v > max);
+  if (aheadOf)
+    resetVerification(
+      st,
+      alerts,
+      `the state's ${aheadOf[0]} ${aheadOf[1]} is ahead of the finalized block ${finalized}`
+    );
+  // and the cross-check's coverage (written as H <= cursor <= finalized): beyond finalized, every
+  // later comparison would read as "below what was covered" while rounds stay clear, so the coverage
+  // starts over and no round is clear until a cross-check completes again
+  if (
+    st.crossCheck &&
+    Number.isSafeInteger(st.crossCheck.coveredTo) &&
+    st.crossCheck.coveredTo > finalized
+  ) {
+    alerts.push({
+      key: "reverify",
+      text: `unknown: the state's cross-check coverage ${st.crossCheck.coveredTo} is ahead of the finalized block ${finalized}; it starts over`,
+    });
+    st.crossCheck.coveredTo = 0;
+    st.crossCheck.lastComplete = 0;
+    st.crossCheck.lastAttempt = 0;
+  }
   // the daily full rescan runs on whichever provider the round uses, each on its own 24 h clock
   // (clestons #448 B1'', DSR 2026-11-18): with the primary down for days the fallback still re-reads
   // everything once a day, so an operator the primary's index missed is found within a day. Only the

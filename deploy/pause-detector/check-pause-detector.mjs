@@ -3917,6 +3917,49 @@ await cell(
   }
 );
 
+// ---- clestons #455 Low 2: block numbers in the state beyond the finalized block ---------------------
+await cell(
+  "#455 L2: a replayNext or classifiedTo beyond the finalized block does not skip classification: the state is re-verified",
+  async () => {
+    const cfg = cfgOf();
+    for (const [field, set] of [
+      ["replayNext", st => (st.replayNext = { lastFullScan: 9e15 })],
+      ["classifiedTo", st => (st.classifiedTo = 9e15)],
+      // exactly one past finalized (250) is never written either (Codex)
+      ["replayNext = finalized + 1", st => (st.replayNext = { lastFullScan: 251 })],
+    ]) {
+      const st = emptyState(cfg);
+      const w = world({ ops: unlistedOps(130), classifyHides: new Set([130]) });
+      await round(w, cfg, st, 1e12);
+      w.classifyHides = new Set(); // the hidden event is visible from now on
+      set(st);
+      // the next daily full round must classify it, whatever the state said
+      const r = await round(w, cfg, st, 1e12 + 25 * 3600_000);
+      assert(
+        st.unknownTopics[UNLISTED] === 130 && !r.report.clear,
+        `${field}: ${r.report.clear} ${JSON.stringify(st.unknownTopics)} classifiedTo ${st.classifiedTo}`
+      );
+    }
+  }
+);
+
+await cell(
+  "#455 L2: a cross-check coverage beyond the finalized block starts over: no round is clear until a cross-check completes",
+  async () => {
+    const cfg = cfgOf();
+    const st = emptyState(cfg);
+    await round(world(), cfg, st);
+    st.crossCheck.coveredTo = 9e15;
+    const r = await round(world(), cfg, st, 1e12 + 3600_000);
+    assert(
+      st.crossCheck.coveredTo === 0 &&
+        !r.report.clear &&
+        r.alerts.some(a => a.key === "crosscheck-pending"),
+      `${st.crossCheck.coveredTo} ${r.alerts.map(a => a.key).join(",")}`
+    );
+  }
+);
+
 await cell("state: a malformed crossCheck record is refused", () => {
   const st = emptyState(cfgOf());
   st.crossCheck = {
