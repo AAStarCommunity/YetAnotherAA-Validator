@@ -389,6 +389,107 @@ fs.readFileSync(pathToFileURL(${JSON.stringify(c)}));
   );
 }
 
+// --plan's two input shapes (DSR 2026-11-18): SP's manifest plan (no schema, pin.oldAggregator) and
+// DeployLive's deploylive-pop-request/1 (fresh deploy). These checks run before any chain read, so
+// the local RPC (chain 1) is enough; each request must stop for its own reason.
+{
+  const COMMIT = "ab".repeat(20);
+  const A = n => "0x" + String(n).repeat(40);
+  const base = () => ({
+    schema: "deploylive-pop-request/1",
+    chainId: 1,
+    spCommit: COMMIT,
+    addresses: { BLSAggregator: A(1), DVTValidator: A(2), Registry: A(3) },
+    pin: {
+      block: 1,
+      blockHash: "0x" + "11".repeat(32),
+      senders: { deployer: { address: A(4), nonce: 0 } },
+    },
+    guardianCount: 1,
+  });
+  const cases = {
+    "another schema": [
+      r => ((r.schema = "deploylive-pop-request/2"), r),
+      /is not "deploylive-pop-request\/1"/,
+    ],
+    "a fresh request with pin.oldAggregator": [
+      r => ((r.pin.oldAggregator = A(5)), r),
+      /has no pin\.oldAggregator/,
+    ],
+    "a fresh request without addresses.Registry": [
+      r => (delete r.addresses.Registry, r),
+      /addresses\.Registry/,
+    ],
+    "another chainId": [r => ((r.chainId = 11155111), r), /but this RPC is chain 1/],
+    "another spCommit": [r => ((r.spCommit = "cd".repeat(20)), r), /but --sp-commit is/],
+    "the same spCommit in uppercase (popContext must echo it exactly)": [
+      r => ((r.spCommit = COMMIT.toUpperCase()), r),
+      /but --sp-commit is/,
+    ],
+    "guardianCount 0": [r => ((r.guardianCount = 0), r), /not an integer in 1\.\.13/],
+    "guardianCount 2 with 1 node file": [
+      r => ((r.guardianCount = 2), r),
+      /guardianCount is 2, --nodes names 1/,
+    ],
+    "a manifest plan (no schema) naming addresses.Registry": [
+      r => (delete r.schema, (r.pin.oldAggregator = A(5)), r),
+      /belongs to a deploylive-pop-request\/1 request; this plan has no schema/,
+    ],
+  };
+  const failed = [];
+  for (const [name, [mutate, want]] of Object.entries(cases)) {
+    const req = join(dir, `request-${Object.keys(cases).indexOf(name)}.json`);
+    writeFileSync(req, JSON.stringify(mutate(base())));
+    const r = await run([
+      "--plan",
+      req,
+      "--sp-aggregator-source",
+      join(dir, "absent.sol"),
+      "--sp-commit",
+      COMMIT,
+      "--nodes",
+      nodeFile,
+      "--env",
+      envFile,
+      "--chain-id",
+      "1",
+      "--export-pop",
+      join(dir, "out.json"),
+    ]);
+    if (!(r.status === 1 && want.test(r.stderr)))
+      failed.push(`${name}: ${r.stderr.trim().split("\n")[0]}`);
+  }
+  cell(
+    "plan: each malformed fresh-deploy request (or a schema-less plan naming a Registry) stops for its own reason",
+    failed.length === 0,
+    failed.join(" | ")
+  );
+  // CONTROL: the well-formed request passes every shape check and stops later, at the source file.
+  const okReq = join(dir, "request-ok.json");
+  writeFileSync(okReq, JSON.stringify(base()));
+  const ok = await run([
+    "--plan",
+    okReq,
+    "--sp-aggregator-source",
+    join(dir, "absent.sol"),
+    "--sp-commit",
+    COMMIT,
+    "--nodes",
+    nodeFile,
+    "--env",
+    envFile,
+    "--chain-id",
+    "1",
+    "--export-pop",
+    join(dir, "out.json"),
+  ]);
+  cell(
+    "CONTROL a well-formed deploylive-pop-request/1 passes the shape checks (it stops later, at the source file)",
+    ok.status === 1 && /cannot read --sp-aggregator-source/.test(ok.stderr),
+    ok.stderr.trim().split("\n")[0]
+  );
+}
+
 // --plan's aggregatorSourceVersion (DSR 2026-11-18; Codex): BLSAggregator's own version() body,
 // with comments ignored; anything but one plain string-literal return stops the export.
 {

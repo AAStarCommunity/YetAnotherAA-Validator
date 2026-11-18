@@ -270,13 +270,6 @@ Three fixed development nodes are provided for consistent debugging:
 - **node_dev_002.json**: Port 3002, Node ID `0x123e4567e89b12d3a456426614174002`
 - **node_dev_003.json**: Port 3003, Node ID `0x123e4567e89b12d3a456426614174003`
 
-**Testnet only.** These three files hold the test BLS private keys the author
-gave the dvt1/2/3 guardians, as the author recalls (via DSR, 2026-11-18). Use
-them only on testnets, Sepolia included. Guardians on OP mainnet must use keys
-generated separately, and those keys must never be stored in this directory or
-any checkout of this repository. How they are generated and kept is the author's
-decision and has not been made yet.
-
 Start multiple nodes:
 
 ```bash

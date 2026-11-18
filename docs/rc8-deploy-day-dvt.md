@@ -88,6 +88,14 @@ Notes:
 
 ### How rc.8 does it (SP and DSR, 2026-11-17)
 
+**Update 2026-11-18 (author, via DSR): on Sepolia, rc.8 is a fresh deploy.** It
+does not upgrade the existing proxy. SP's DeployLive deploys a new Registry,
+aggregator and DVTValidator, all at new addresses. This rehearses OP mainnet,
+which will also be a fresh deploy. The input to `--plan` is then DeployLive's
+request, not the manifest plan; see "Fresh deploy" below. The output format is
+unchanged. The steps below describe the manifest-plan (upgrade) shape, which the
+script still accepts.
+
 The guardians are registered **before** the owner hand-off, by the deployer, as
 SP manifest step **A10**. DVT does not send anything. DVT's job is to produce
 the A10 input: three PoP calldata entries.
@@ -108,16 +116,51 @@ Their addresses come from SP's frozen plan, which SP precomputes at the pin.
      --export-pop <out.json> --env <Sepolia RPC env>
    ```
 
-   `node_dev_00{1,2,3}.json` are the author's **test** guardian keys for
-   dvt1/2/3, as the author recalls. They are for testnets only (author, via DSR,
-   2026-11-18). OP mainnet guardians must use separately generated keys, kept
-   outside this directory and every checkout of this repository. The author
-   decides how those keys are generated and kept; that decision is still
-   pending.
-
    The source file is `contracts/src/modules/monitoring/BLSAggregator.sol` at
    the tag, fetched with `gh api`. `DOMAIN_NAME` and `TAG_POP` are extracted
    from it, not copied into the script.
+
+   **Fresh deploy (SP DeployLive, DSR 2026-11-18).** Pass DeployLive's
+   prediction file as `--plan`; nothing else changes on the command line:
+
+   ```
+   {
+     "schema": "deploylive-pop-request/1",
+     "chainId": 11155111,
+     "spCommit": "<40-hex SP commit to deploy>",
+     "addresses": { "BLSAggregator": "0x…", "DVTValidator": "0x…", "Registry": "0x…" },
+     "pin": { "block": …, "blockHash": "0x…", "senders": { "deployer": { "address": "0x…", "nonce": … } } },
+     "guardianCount": 3
+   }
+   ```
+
+   - **The three addresses are predicted, and each must have no code** at export
+     time; any one with code stops the export.
+   - **The Registry is taken from the request** and bound into
+     `domainSeparator`. A request with `pin.oldAggregator` is refused.
+   - **Pin checks:** the pin block hash and the deployer's latest and pending
+     nonce must equal the request's values.
+   - **Chain and commit:** `chainId` must equal the RPC's chain, and `spCommit`
+     must equal `--sp-commit`.
+   - **Slots** are 1..`guardianCount` in `--nodes` order, because DeployLive
+     calls `registerBLSPublicKey(account, key, uint8(i + 1), pop)` for each pop
+     in order. A node file that names another slot is refused. The number of
+     node files, and of PoPs, must equal `guardianCount`.
+   - **Schema:** any `schema` other than `deploylive-pop-request/1` is refused,
+     never parsed as a plan. A plan with no `schema` that names
+     `addresses.Registry` is refused too.
+   - **Output:** unchanged. `pop` (6 keys each), `aggregatorSourceVersion` and
+     `popContext` (11 keys). `dvt`, `aggregator` and `registry` are the
+     request's addresses, and the chain, deployer, pin and commit fields are its
+     values. SP's converter compares each one.
+   - **Timing:** the deployer must send no transaction between the export and
+     the broadcast. Using the three real test keys needs the author's nod.
+
+   The anvil rehearsal's `fresh` mode runs this end to end: predict, export,
+   refuse a wrong schema, a wrong `guardianCount` and a request whose addresses
+   already have code (also with only the Registry deployed), deploy, require
+   deployed == predicted == `popContext`, then A10 and the read-back. SP then
+   runs it on a Sepolia fork with DeployLive itself.
 
    Before signing, the script checks four things, read only:
    - both precomputed addresses have no code;
@@ -445,6 +488,32 @@ Daybreak is needed, because the path with the High is removed and the other
 changes tighten read-only checks. Codex reviews the delta instead.
 
 ### Follow-ups
+
+**After the rc.8 release, not on the paper's data path** (DSR 2026-11-18). The
+paper's data, RQ3's three-arm gas comparison and the five GOMS scenarios, needs
+no DVT node online. AOA's sponsorship path does not call DVT (#383). DeployLive
+registers the three guardians itself from the PoPs. So these wait until after
+the release:
+
+- switch the Sepolia DVT nodes to the new aggregator:
+  `AUDIT_BLS_AGGREGATOR_ADDRESS`, `AUDIT_DVT_VALIDATOR_ADDRESS`,
+  `AUDIT_REGISTRY_ADDRESS` and the related `AUDIT_*` addresses, then restart.
+  One process serves one SP address set;
+- `AAStarValidator.setRegistry(<new Registry>)` and the committee validator's,
+  by their owner; ROLE_DVT and stake for the guardians on the new Registry (new
+  GToken);
+- deploy the pause-detector for the new addresses. Regenerate `spProxy`,
+  `registry`, `implementation` and their code hashes, `startBlock` (the new
+  proxy's deploy block), `knownProxyEvents` and the pin, then run
+  compare-inventory. Its gate is unchanged: rc.8 tag plus read-back;
+- OP mainnet DVT nodes: an RPC provider, the number of nodes and their machines,
+  and the mainnet keys (from the author; EIP-2335 keystore with the passphrase
+  injected from outside the disk, or KMS);
+- OP mainnet `AAStarValidator` / committee validator deployment and the
+  airaccount router mount;
+- #441 (the fraud-proof verifier 3.0.0 and the drill): its Daybreak High (the
+  watcher cannot decode the `DVTValidator.executeWithProof` wrapper) plus three
+  Mediums and a Low, for the release after rc.8.
 
 - **Restoring `--broadcast`** (DSR 2026-11-18). Before this script signs
   anything again, it needs a check that the RPC is the real chain and not a

@@ -626,7 +626,51 @@ async function exportFromPlan({ provider, chainId }) {
     die(`${PLAN_FILE}: pin.block is not an integer`);
   if (!/^0x[0-9a-fA-F]{64}$/.test(pin.blockHash ?? ""))
     die(`${PLAN_FILE}: pin.blockHash is not a 32-byte hash`);
-  const oldAggregator = addressAt(deployment, "pin.oldAggregator");
+  // Two input shapes (DSR 2026-11-18):
+  // - SP's manifest plan (an in-place upgrade): no `schema`; names pin.oldAggregator, and the Registry
+  //   is the live one that aggregator is bound to.
+  // - SP DeployLive's request for a FRESH deploy: schema "deploylive-pop-request/1"; chainId,
+  //   spCommit, addresses.{BLSAggregator, DVTValidator, Registry} (all predicted, all still without
+  //   code) and guardianCount; no pin.oldAggregator. Slots are 1..guardianCount in --nodes order,
+  //   because DeployLive registers pop[i] at slot i+1.
+  // Any other schema is refused rather than parsed as a plan. The output format is the same.
+  const FRESH_SCHEMA = "deploylive-pop-request/1";
+  const fresh = deployment?.schema !== undefined;
+  if (fresh && deployment.schema !== FRESH_SCHEMA) {
+    die(`${PLAN_FILE}: schema ${JSON.stringify(deployment.schema)} is not "${FRESH_SCHEMA}"`);
+  }
+  let oldAggregator = null;
+  let freshRegistry = null;
+  let guardianCount = 3; // SP's manifest takes exactly 3 PoPs (pop_count)
+  if (fresh) {
+    if (deployment?.pin?.oldAggregator !== undefined)
+      die(`${PLAN_FILE}: a ${FRESH_SCHEMA} request has no pin.oldAggregator`);
+    freshRegistry = ethers.getAddress(addressAt(deployment, "addresses.Registry"));
+    if (!Number.isInteger(deployment.chainId) || deployment.chainId !== chainId)
+      die(
+        `${PLAN_FILE}: chainId ${JSON.stringify(deployment.chainId)}, but this RPC is chain ${chainId}`
+      );
+    // Exact: popContext.spCommit must repeat the request's string (Codex), and --sp-commit is lowercase.
+    if (typeof deployment.spCommit !== "string" || deployment.spCommit !== SP_COMMIT)
+      die(
+        `${PLAN_FILE}: spCommit ${JSON.stringify(deployment.spCommit)}, but --sp-commit is ${SP_COMMIT}`
+      );
+    guardianCount = deployment.guardianCount;
+    if (!Number.isInteger(guardianCount) || guardianCount < 1 || guardianCount > 13)
+      die(
+        `${PLAN_FILE}: guardianCount ${JSON.stringify(guardianCount)} is not an integer in 1..13`
+      );
+    if (NODE_FILES.length !== guardianCount)
+      die(
+        `${PLAN_FILE}: guardianCount is ${guardianCount}, --nodes names ${NODE_FILES.length} files`
+      );
+  } else {
+    if (deployment?.addresses?.Registry !== undefined)
+      die(
+        `${PLAN_FILE}: addresses.Registry belongs to a ${FRESH_SCHEMA} request; this plan has no schema`
+      );
+    oldAggregator = addressAt(deployment, "pin.oldAggregator");
+  }
 
   let source;
   try {
@@ -658,6 +702,7 @@ async function exportFromPlan({ provider, chainId }) {
   for (const [name, addr] of [
     ["DVTValidator", DVT],
     ["aggregator", AGGREGATOR],
+    ...(freshRegistry ? [["Registry (fresh deploy)", freshRegistry]] : []),
   ]) {
     if ((await provider.getCode(addr)) !== "0x") {
       die(`${name} ${addr} already has code: this is not a pre-deployment plan; use --deployment`);
@@ -684,13 +729,24 @@ async function exportFromPlan({ provider, chainId }) {
     );
   }
   // ---- plan gate 4: the Registry the new aggregator will bind its domain to -------------------
-  const registry = await new ethers.Contract(oldAggregator, ABI, provider).REGISTRY();
-  if ((await provider.getCode(registry)) === "0x")
-    die(`Registry ${registry} (from the old aggregator) has no code`);
+  // Upgrade: the live Registry the old aggregator uses, which must have code. Fresh deploy: the
+  // predicted address, which gate 1 required to be empty; SP's A10 asserts the deployed one equals it.
+  let registry;
+  if (oldAggregator) {
+    registry = await new ethers.Contract(oldAggregator, ABI, provider).REGISTRY();
+    if ((await provider.getCode(registry)) === "0x")
+      die(`Registry ${registry} (from the old aggregator) has no code`);
+  } else {
+    registry = freshRegistry;
+  }
   console.log(
     `deployer   : ${deployer} nonce ${pinNonce} (unchanged since pin block ${pin.block})`
   );
-  console.log(`registry   : ${registry} (old aggregator ${oldAggregator}.REGISTRY())`);
+  console.log(
+    oldAggregator
+      ? `registry   : ${registry} (old aggregator ${oldAggregator}.REGISTRY())`
+      : `registry   : ${registry} (fresh deploy: the plan's predicted address, no code yet)`
+  );
 
   const coder = ethers.AbiCoder.defaultAbiCoder();
   const domainSep = ethers.keccak256(
@@ -705,7 +761,7 @@ async function exportFromPlan({ provider, chainId }) {
   const entries = [];
   const digests = [];
   const seen = { slot: new Map(), validator: new Map(), key: new Map() };
-  for (const file of NODE_FILES) {
+  for (const [nodeIndex, file] of NODE_FILES.entries()) {
     let node;
     try {
       node = JSON.parse(readFileSync(file, "utf8"));
@@ -718,7 +774,14 @@ async function exportFromPlan({ provider, chainId }) {
     }
     const label = `${file} (${nodeNameShape(node.nodeName)})`;
     const validator = node.operator;
-    const slot = Number(node.slot);
+    // Fresh deploy: the slot is the position in --nodes (DeployLive uses uint8(i + 1)); a node file
+    // that names another slot is refused rather than silently renumbered.
+    const slot = fresh ? nodeIndex + 1 : Number(node.slot);
+    if (fresh && node.slot !== undefined && Number(node.slot) !== slot) {
+      die(
+        `${label}: the node file says slot ${fieldShape(node.slot)}, DeployLive will use slot ${slot} (its --nodes position)`
+      );
+    }
     if (!validator || !ethers.isAddress(validator))
       die(`${label}: missing/invalid "operator" address`);
     // SP's manifest accepts slots 1..13 (manifest_exec.py pop_slot_range).
@@ -780,8 +843,12 @@ async function exportFromPlan({ provider, chainId }) {
     digests.push(digest);
     console.log(`✓ ${label}  validator ${validator}  slot ${slot}  popDigest ${digest}`);
   }
-  if (entries.length !== 3)
-    die(`SP's manifest takes exactly 3 PoPs (pop_count); got ${entries.length}`);
+  if (entries.length !== guardianCount)
+    die(
+      fresh
+        ? `the request's guardianCount is ${guardianCount}; got ${entries.length} PoPs`
+        : `SP's manifest takes exactly 3 PoPs (pop_count); got ${entries.length}`
+    );
 
   const out = {
     pop: entries,
@@ -789,10 +856,12 @@ async function exportFromPlan({ provider, chainId }) {
     aggregatorSourceVersion: sourceVersion,
     // Exactly SP's popContext keys (DSR/SP 2026-11-17); A10 asserts each, popDigests in pop order.
     // The calldata's target is popContext.dvt: the 4.14.0 aggregator rejects any other caller.
+    // A fresh-deploy request is echoed exactly as given (Codex): SP's converter compares strings,
+    // so the export does not re-case the request's addresses.
     popContext: {
-      dvt: DVT,
-      aggregator: AGGREGATOR,
-      registry,
+      dvt: fresh ? deployment.addresses.DVTValidator : DVT,
+      aggregator: fresh ? deployment.addresses.BLSAggregator : AGGREGATOR,
+      registry: fresh ? deployment.addresses.Registry : registry,
       chainId,
       deployerAddress: deployer,
       deployerNonce: pinNonce,
