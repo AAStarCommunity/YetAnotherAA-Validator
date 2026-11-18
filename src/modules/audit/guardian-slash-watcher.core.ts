@@ -1,6 +1,10 @@
 import { ethers } from "ethers";
 import {
   decodeVerifyAndExecuteCalldata,
+  decodeExecuteWithProofCalldata,
+  decodeSignerMaskFromBlsProof,
+  DVT_PROPOSALS_ABI,
+  VerifyAndExecuteArgs,
   resolveClaimedSigners,
   rawSlashMessageHash,
   repSlashMessageHash,
@@ -23,6 +27,7 @@ import { GuardianSignerRecord } from "./guardian-signer-store.js";
 const AGGREGATOR_READ_ABI = [
   "function proposalSignersCommitment(uint256 proposalId) view returns (bytes32)",
   "function validatorAtSlot(uint8 slot) view returns (address)",
+  "function DVT_VALIDATOR() view returns (address)",
 ];
 
 /** BLSAggregator.SlashExecuted — the event the watcher polls. */
@@ -59,9 +64,64 @@ export async function buildGuardianSignerRecord(
   const tx = await provider.getTransaction(txHash);
   if (!tx) throw new WatcherRecordError(`tx ${txHash} not found`);
 
-  // Decode the OUTER verifyAndExecute call. Throws if not that call (intermediary-wrapped calls are
-  // Phase-3; see decodeVerifyAndExecuteCalldata). The decoded fields are exactly what SP hashed.
-  const args = decodeVerifyAndExecuteCalldata(tx.data);
+  // Recover exactly the arguments the aggregator's verifyAndExecute saw. Two shapes reach it:
+  // - a direct call to the aggregator: decode verifyAndExecute itself;
+  // - the NORMAL path (SP DVTValidator-0.9.0, Daybreak on #441, High): a call to the DVTValidator
+  //   the aggregator names at that block, executeWithProof(id, repUsers, newScores, epoch, evidence,
+  //   proof). The DVTValidator forwards (id, p.operator, p.slashLevel, repUsers, newScores, epoch,
+  //   p.evidenceHash, proof), having required its recomputed evidence hash to equal p.evidenceHash,
+  //   so operator, level and evidenceHash are read from its proposals(id) at the execution block.
+  // Any other target is refused. The on-chain commitment comparison below then checks the result.
+  const agg = new ethers.Contract(aggregatorAddress, AGGREGATOR_READ_ABI, provider);
+  const target = (tx.to ?? "").toLowerCase();
+  let args: VerifyAndExecuteArgs;
+  if (target === aggregatorAddress.toLowerCase()) {
+    args = decodeVerifyAndExecuteCalldata(tx.data);
+  } else {
+    let dvtAddr: string;
+    try {
+      dvtAddr = await agg.DVT_VALIDATOR({ blockTag: executionBlock });
+    } catch (e) {
+      throw new WatcherRecordError(
+        `cannot read aggregator.DVT_VALIDATOR() at block ${executionBlock}: ${(e as Error).message}`
+      );
+    }
+    if (target !== dvtAddr.toLowerCase()) {
+      throw new WatcherRecordError(
+        `tx ${txHash} targets ${tx.to}, neither the aggregator nor its DVTValidator ${dvtAddr}`
+      );
+    }
+    let w;
+    try {
+      w = decodeExecuteWithProofCalldata(tx.data);
+    } catch (e) {
+      throw new WatcherRecordError(`tx ${txHash} to the DVTValidator: ${(e as Error).message}`);
+    }
+    const dvt = new ethers.Contract(dvtAddr, [DVT_PROPOSALS_ABI], provider);
+    let p;
+    try {
+      p = await dvt.proposals(w.proposalId, { blockTag: executionBlock });
+    } catch (e) {
+      throw new WatcherRecordError(
+        `cannot read DVTValidator.proposals(${w.proposalId}) at block ${executionBlock}: ${(e as Error).message}`
+      );
+    }
+    if (!p.exists || !p.executed) {
+      throw new WatcherRecordError(
+        `DVTValidator proposal ${w.proposalId} is not an executed proposal at block ${executionBlock}`
+      );
+    }
+    args = {
+      proposalId: w.proposalId,
+      operator: ethers.getAddress(p.operator),
+      slashLevel: Number(p.slashLevel),
+      repUsers: w.repUsers,
+      newScores: w.newScores,
+      epoch: w.epoch,
+      evidenceHash: p.evidenceHash,
+      signerMask: decodeSignerMaskFromBlsProof(w.proof),
+    };
+  }
 
   // Cross-check the event's proposalId against the calldata — a mismatch means this tx is not the
   // one that produced this event (e.g. a batched/multicall tx we can't attribute); refuse to record.
@@ -70,8 +130,6 @@ export async function buildGuardianSignerRecord(
       `proposalId mismatch: event ${eventProposalId} vs calldata ${args.proposalId} (tx ${txHash})`
     );
   }
-
-  const agg = new ethers.Contract(aggregatorAddress, AGGREGATOR_READ_ABI, provider);
 
   // Resolve co-signers at the EXECUTION block (SP byte-critical: validatorAtSlot at exec block, NOT
   // the epoch block). resolveClaimedSigners throws on a zero/hole slot → we never record a partial set.
@@ -104,12 +162,20 @@ export async function buildGuardianSignerRecord(
           args.epoch
         );
 
+  // SP 4.14.0 binds blockhash(block.number - 1) of the executing block into the commitment (#441).
+  // Read it from the chain here: it is the one input that cannot be rebuilt from calldata later.
+  const parent = await provider.getBlock(executionBlock - 1);
+  if (!parent?.hash)
+    throw new WatcherRecordError(`parent block ${executionBlock - 1} not available`);
+  const parentBlockHash = parent.hash;
+
   const localCommitment = computeSignersCommitment(
     domain,
     args.proposalId,
     messageHash,
     args.signerMask,
-    claimedSigners
+    claimedSigners,
+    parentBlockHash
   );
 
   // Read the on-chain commitment at the execution block (immutable once set, but pin for reorg
@@ -137,5 +203,6 @@ export async function buildGuardianSignerRecord(
     commitment: onChainCommitment,
     commitmentVerified,
     executionBlockTimestamp,
+    parentBlockHash,
   };
 }

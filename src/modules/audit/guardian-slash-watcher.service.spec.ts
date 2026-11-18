@@ -13,6 +13,8 @@ import type { BlsConsensusDomain } from "./bls-consensus-domain.js";
 import { domainSeparator } from "./bls-consensus-domain.js";
 import { SLASH_EXECUTED_EVENT } from "./guardian-slash-watcher.core.js";
 
+// blockhash(executionBlock - 1) in the fixtures (#441).
+const PARENT = "0x" + "5a".repeat(32);
 const coder = ethers.AbiCoder.defaultAbiCoder();
 const S1 = ethers.getAddress("0x0000000000000000000000000000000000001111");
 const S2 = ethers.getAddress("0x0000000000000000000000000000000000002222");
@@ -77,7 +79,7 @@ function calldataFor(pid: bigint): string {
 }
 function commitmentFor(pid: bigint): string {
   const mh = rawSlashMessageHash(DOMAIN, pid, OPERATOR, LEVEL, EPOCH, EVIDENCE);
-  return computeSignersCommitment(DOMAIN, pid, mh, MASK, [S1, S2, S3]);
+  return computeSignersCommitment(DOMAIN, pid, mh, MASK, [S1, S2, S3], PARENT);
 }
 
 interface FakeLog {
@@ -108,11 +110,11 @@ class MockProvider {
   async getLogs(): Promise<FakeLog[]> {
     return this.logs;
   }
-  async getBlock(): Promise<{ timestamp: number }> {
-    return { timestamp: 1_700_000_000 };
+  async getBlock(): Promise<{ timestamp: number; hash: string }> {
+    return { timestamp: 1_700_000_000, hash: PARENT };
   }
-  async getTransaction(hash: string): Promise<{ data: string } | null> {
-    return this.txData[hash] ? { data: this.txData[hash] } : null;
+  async getTransaction(hash: string): Promise<{ to: string; data: string } | null> {
+    return this.txData[hash] ? { to: AGG, data: this.txData[hash] } : null; // direct aggregator call
   }
   async call(tx: { data: string }): Promise<string> {
     const sel = tx.data.slice(0, 10);

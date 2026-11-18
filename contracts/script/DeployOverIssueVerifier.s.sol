@@ -18,7 +18,8 @@ pragma solidity ^0.8.19;
  *           `version() == "BLSAggregator-4.10.0"`); an aggregator predating it carries BOTH
  *           the instant setter and the old three-parameter ABI, and MUST NOT be armed with
  *           this verifier. CC-115 B1 conformance was verified against
- *           `BLSAggregator-4.11.0`, which is what SUPPORTED_AGGREGATOR_VERSION pins:
+ *           `BLSAggregator-4.11.0`; the #441 verifier (3.0.0) recomputes the 4.14.0+ commitment, and
+ *           the release to bind is a required input (EXPECTED_AGGREGATOR_VERSION). Arming:
  *             3a. owner (Safe M-of-N) calls proposeFraudProofVerifier(verifier)
  *                 → emits FraudProofVerifierRotationProposed(verifier, readyAt)
  *                 → readyAt = <propose block.timestamp> + VERIFIER_ROTATION_DELAY (4 days).
@@ -44,8 +45,8 @@ pragma solidity ^0.8.19;
  *        ALLOW_UNVERIFIED_AGGREGATOR (optional) must be "true" to deploy when NO canonical/expected
  *                                    address is available yet — a conscious "I verified out-of-band".
  *        EXPECTED_CHAIN_ID           (optional, default 11155111 Sepolia) guards against a wrong RPC.
- *        EXPECTED_AGGREGATOR_VERSION (optional, default SUPPORTED_AGGREGATOR_VERSION) the exact
- *                                    string `AGGREGATOR.version()` must return. Override ONLY after
+ *        EXPECTED_AGGREGATOR_VERSION (REQUIRED, no default) the exact
+ *                                    string `AGGREGATOR.version()` must return. Set it ONLY after
  *                                    re-verifying that the new release still speaks the
  *                                    four-parameter fraud-proof ABI and still has no direct setter.
  *
@@ -80,43 +81,59 @@ contract DeployOverIssueVerifier is Script {
     ///         (CC-89) → the deploy then HARD-REQUIRES AGGREGATOR == this. address(0) = not yet known.
     address internal constant CANONICAL_AGGREGATOR = address(0);
 
-    /// @notice The exact `version()` string this verifier has been conformance-verified against
-    ///         (CC-115 B1, PR #240). Checked for EQUALITY, not "at least": a different release may
-    ///         change the fraud-proof ABI, the domain-digest schema, or the arming path, and this
-    ///         verifier is immutable once deployed. Bumping SP therefore requires a conscious
-    ///         decision here (or via EXPECTED_AGGREGATOR_VERSION) rather than a silent pass.
+    /// @notice No release is pinned in this file (DSR 2026-11-17, #441). EXPECTED_AGGREGATOR_VERSION is
+    ///         a REQUIRED input, compared for EQUALITY with `version()`: a different release may change
+    ///         the fraud-proof ABI, the domain-digest schema or the arming path, and the verifier is
+    ///         immutable once deployed. Independently, Gate A' only lets anchored releases
+    ///         (>= BLSAggregator-4.14.0) through.
     /// @dev    Version alone is NOT identity: any contract can return this string. See the
     ///         canonical-pin note at the domain-parity gate below.
-    string internal constant SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.11.0";
 
-    /// @dev True unless `v` is exactly "BLSAggregator-<major>.<minor>.<patch>" optionally followed by
-    ///      "-<suffix>" (non-empty, [0-9A-Za-z.-]), each number 1-6 digits with no leading zero
-    ///      (except "0" itself), and
-    ///      (major, minor) < (4, 13). Anything that does not parse is treated as new (fail closed).
-    function _isAnchoredCommitmentRelease(string memory v) internal pure returns (bool) {
+    /// @dev Classifies `v`: RELEASE_UNPARSEABLE unless it is exactly
+    ///      "BLSAggregator-<major>.<minor>.<patch>" optionally followed by "-<suffix>" (non-empty,
+    ///      [0-9A-Za-z.-]), each number 1-6 digits with no leading zero (except "0" itself); otherwise
+    ///      RELEASE_ANCHORED when (major, minor) >= (4, 13), else RELEASE_PRE_ANCHOR.
+    uint8 internal constant RELEASE_UNPARSEABLE = 0;
+    uint8 internal constant RELEASE_PRE_ANCHOR = 1;
+    uint8 internal constant RELEASE_ANCHORED = 2;
+
+    /// @dev The aggregator the deploy must bind to. A nonzero compiled `canonical` is authoritative:
+    ///      `envExpected` must be zero or equal to it. Only while `canonical` is zero does the env decide.
+    function _expectedAggregator(address envExpected, address canonical) internal pure returns (address) {
+        if (canonical != address(0)) {
+            require(
+                envExpected == address(0) || envExpected == canonical,
+                "EXPECTED_AGGREGATOR differs from the compiled CANONICAL_AGGREGATOR: the constant wins"
+            );
+            return canonical;
+        }
+        return envExpected;
+    }
+
+    function _releaseClass(string memory v) internal pure returns (uint8) {
         bytes memory b = bytes(v);
         bytes memory prefix = bytes("BLSAggregator-");
-        if (b.length <= prefix.length) return true;
+        if (b.length <= prefix.length) return RELEASE_UNPARSEABLE;
         for (uint256 i = 0; i < prefix.length; i++) {
-            if (b[i] != prefix[i]) return true;
+            if (b[i] != prefix[i]) return RELEASE_UNPARSEABLE;
         }
         (bool ok1, uint256 major, uint256 i1) = _readStrictUint(b, prefix.length);
-        if (!ok1 || i1 >= b.length || b[i1] != ".") return true;
+        if (!ok1 || i1 >= b.length || b[i1] != ".") return RELEASE_UNPARSEABLE;
         (bool ok2, uint256 minor, uint256 i2) = _readStrictUint(b, i1 + 1);
-        if (!ok2 || i2 >= b.length || b[i2] != ".") return true;
+        if (!ok2 || i2 >= b.length || b[i2] != ".") return RELEASE_UNPARSEABLE;
         (bool ok3,, uint256 i3) = _readStrictUint(b, i2 + 1);
-        if (!ok3) return true;
+        if (!ok3) return RELEASE_UNPARSEABLE;
         if (i3 != b.length) {
             // "-<suffix>": non-empty, [0-9A-Za-z.-] only.
-            if (b[i3] != "-" || i3 + 1 == b.length) return true;
+            if (b[i3] != "-" || i3 + 1 == b.length) return RELEASE_UNPARSEABLE;
             for (uint256 k = i3 + 1; k < b.length; k++) {
                 bytes1 c = b[k];
                 bool okc = (c >= "0" && c <= "9") || (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || c == "."
                     || c == "-";
-                if (!okc) return true;
+                if (!okc) return RELEASE_UNPARSEABLE;
             }
         }
-        return major > 4 || (major == 4 && minor >= 13);
+        return (major > 4 || (major == 4 && minor >= 14)) ? RELEASE_ANCHORED : RELEASE_PRE_ANCHOR;
     }
 
     /// @dev Reads 1-6 decimal digits at `i` with no leading zero (a lone "0" is allowed). The six-digit
@@ -154,7 +171,7 @@ contract DeployOverIssueVerifier is Script {
         /// @dev 0 falls THROUGH to CANONICAL_AGGREGATOR; it can never clear a real canonical pin.
         address expectedAggregator;
         bool allowUnverifiedAggregator;
-        /// @dev Empty falls THROUGH to SUPPORTED_AGGREGATOR_VERSION; it can never disable the check.
+        /// @dev REQUIRED. Empty is refused; it can never disable the check.
         string expectedAggregatorVersion;
     }
 
@@ -188,11 +205,12 @@ contract DeployOverIssueVerifier is Script {
         require(aggregator != address(0), "AGGREGATOR must be non-zero");
         require(aggregator.code.length > 0, "AGGREGATOR has no code (deploy the BLSAggregator first)");
 
-        // MANDATORY canonical-identity match. Precedence: a NON-ZERO EXPECTED_AGGREGATOR env overrides
-        // the CANONICAL constant; a zero/unset env falls THROUGH to the constant (so a zero env can
-        // never clear a real canonical pin). If neither yields a nonzero address, the operator MUST
-        // explicitly acknowledge deploying against an address verified out-of-band — never silent.
-        address expected = cfg.expectedAggregator != address(0) ? cfg.expectedAggregator : CANONICAL_AGGREGATOR;
+        // MANDATORY canonical-identity match (Daybreak on #441, Medium). Once CANONICAL_AGGREGATOR is
+        // compiled in, it wins: an EXPECTED_AGGREGATOR env may only repeat it, never replace it, so a
+        // stale or hostile env cannot rebind the verifier to a look-alike. While the constant is zero
+        // the env is the pin. If neither yields a nonzero address, the operator MUST explicitly
+        // acknowledge deploying against an address verified out-of-band — never silent.
+        address expected = _expectedAggregator(cfg.expectedAggregator, CANONICAL_AGGREGATOR);
         if (expected != address(0)) {
             require(aggregator == expected, "AGGREGATOR != canonical/expected aggregator");
         } else {
@@ -227,9 +245,11 @@ contract DeployOverIssueVerifier is Script {
         // exposed the full propose/apply surface with a 4-day delay, and a hostile or hybrid contract
         // can expose that surface AND keep an instant `setFraudProofVerifier`. Inferring a release
         // from one selector is exactly the silent-drift failure this gate exists to stop.
-        string memory expectedVersion = bytes(cfg.expectedAggregatorVersion).length != 0
-            ? cfg.expectedAggregatorVersion
-            : SUPPORTED_AGGREGATOR_VERSION;
+        require(
+            bytes(cfg.expectedAggregatorVersion).length != 0,
+            "EXPECTED_AGGREGATOR_VERSION is required: the exact version() of the aggregator being bound"
+        );
+        string memory expectedVersion = cfg.expectedAggregatorVersion;
         string memory reportedVersion;
         try IAggregatorProbe(aggregator).version() returns (string memory v) {
             reportedVersion = v;
@@ -240,16 +260,22 @@ contract DeployOverIssueVerifier is Script {
             keccak256(bytes(reportedVersion)) == keccak256(bytes(expectedVersion)),
             "AGGREGATOR.version() != expected: re-verify the fraud-proof ABI and the arming path for that release, then set EXPECTED_AGGREGATOR_VERSION"
         );
-        // GATE A' — NO OVERRIDE PAST r3b. BLSAggregator-4.13.0 (SP rc.8 r3b) changed the signer
-        // commitment this verifier recomputes: it is now keyed per path and ends with
-        // blockhash(block.number - 1) (BLSAggregator.sol @ f00be603 :1376-1386). This verifier's
-        // `_commitmentMatches` predates that tuple, so on 4.13.0+ it can never verify a fraud proof:
-        // arming it would install a fraud-proof authority that silently never fires. 5.5.0 arms no
-        // verifier at all (M0 D9: fraudProofVerifier == 0); the 5.5.x historical-state verifier is
-        // a new contract. EXPECTED_AGGREGATOR_VERSION cannot lift this gate.
+        // GATE A' — ANCHORED RELEASES ONLY (#441), no override. BLSAggregator-4.13.0 (SP rc.8 r3b)
+        // keyed the signer commitment per path; 4.14.0 (SP #630: BLSAggregator.sol:1376-1388) ended it
+        // with blockhash(block.number - 1). The floor is 4.14.0 (Daybreak on #441, Medium): a 4.13.x
+        // commitment has no parent block hash, so this verifier would reject every honest proof there. This verifier (VERIFIER_VERSION
+        // "OverIssueFraudProofVerifier-3.0.0") recomputes exactly that layout, with the parent block
+        // hash supplied in the fraudProof, so it can never verify against a pre-4.14 aggregator. The
+        // pre-#441 verifier was the reverse; this gate used to refuse >= 4.13.0. An unparseable
+        // version string is refused too (fail closed). EXPECTED_AGGREGATOR_VERSION cannot lift this.
+        uint8 releaseClass = _releaseClass(reportedVersion);
         require(
-            !_isAnchoredCommitmentRelease(reportedVersion),
-            "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
+            releaseClass != RELEASE_UNPARSEABLE,
+            "AGGREGATOR.version() is not a well-formed BLSAggregator-<major>.<minor>.<patch>[-suffix]: refusing"
+        );
+        require(
+            releaseClass == RELEASE_ANCHORED,
+            "AGGREGATOR is BLSAggregator < 4.14.0 (no parent-block-hash commitment): this verifier can never verify there"
         );
 
         // GATE B — ARMING DELAY. Independent of Gate A, and deliberately not implied by it: the

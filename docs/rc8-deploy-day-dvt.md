@@ -615,17 +615,21 @@ Read from SP main `9cacd4ec`. Re-check them against the step-4 merge commit.
   execute-slash path.
 
 - **The commitment now includes a block hash.** The 4.14.0 pre-image ends with
-  `blockhash(block.number - 1)` (`BLSAggregator.sol:1386`).
-  `contracts/src/verifiers/OverIssueFraudProofVerifier.sol` recomputes the
-  commitment without it, so against 4.14.0 it never matches and every honest
-  fraud proof is rejected.
-  - The fork drill (`--export-fraud-drill`) writes the commitment straight into
-    the fork using the old pre-image, so it would still pass and hide this.
-  - Neither matters for rc.8: no fraud-proof verifier is set there (next item).
-    Tracked in #441 as a prerequisite for enabling guardian slash.
-  - The deploy script already blocks this: Gate A' in
-    `contracts/script/DeployOverIssueVerifier.s.sol` refuses to deploy the
-    current verifier against any BLSAggregator from 4.13.0 on, with no override.
+  `blockhash(block.number - 1)` (`BLSAggregator.sol:1386`). Up to
+  OverIssueFraudProofVerifier-2.x the verifier recomputed the commitment without
+  it, so against 4.14.0 it never matched and every honest fraud proof was
+  rejected. **Fixed in OverIssueFraudProofVerifier-3.0.0** (#441 part 1): the
+  fraud proof carries a trailing `parentBlockHash` (zero refused), and the TS
+  encoders and watcher carry it too.
+  - The fork drill (`--export-fraud-drill`) still writes the commitment straight
+    into the fork using the old pre-image; #441 part 2 removes that.
+  - Neither matters for rc.8: no fraud-proof verifier is set there (next item),
+    and SP puts the verifier step behind a default-off switch. Enabling guardian
+    slash is for the release after rc.8.
+  - Gate A' in `contracts/script/DeployOverIssueVerifier.s.sol` now admits only
+    anchored releases (BLSAggregator >= 4.14.0, the first with the parent block
+    hash; 4.13.x is refused), and `EXPECTED_AGGREGATOR_VERSION` is a required
+    input compared for equality with `version()`.
   - Before any 5.5.0 verifier is deployed against a 4.14.0 or later aggregator,
     the verifier and the drill must take the parent block hash as an input.
 - **Do not verify any stake-slash path on deploy day.** DSR stated on 2026-11-15

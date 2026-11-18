@@ -103,6 +103,21 @@ export function assembleOverIssueFraudProof(
   // off-chain filing path cannot re-introduce the subset front-run fixed in the verifier.
   const guilty = [...claimed];
 
+  // #441: a record captured before the 4.14.0 layout has no parent block hash, and the commitment it
+  // anchors cannot be reproduced by the parent-block-hash verifier. Refuse rather than file a proof
+  // that is certain to be rejected.
+  const parentBlockHash = (record as { parentBlockHash?: string }).parentBlockHash;
+  if (
+    typeof parentBlockHash !== "string" ||
+    !/^0x[0-9a-fA-F]{64}$/.test(parentBlockHash) ||
+    parentBlockHash === ethers.ZeroHash
+  ) {
+    throw new Error(
+      `assembler: record for proposal ${record.proposalId} has no non-zero parentBlockHash (captured ` +
+        `before the BLSAggregator-4.14.0 layout, or corrupt); it cannot back a fraud proof for the #441 verifier`
+    );
+  }
+
   const fraudProof = encodeOverIssueFraudProof({
     proposalId,
     operator,
@@ -111,6 +126,7 @@ export function assembleOverIssueFraudProof(
     disputedToken: token,
     signerMask: BigInt(record.signerMask),
     claimedSigners: claimed,
+    parentBlockHash,
   });
 
   return { fraudProofId: deriveFraudProofId(proposalId), guiltyGuardians: guilty, fraudProof };

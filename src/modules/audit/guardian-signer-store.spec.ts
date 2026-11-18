@@ -24,6 +24,7 @@ const makeRecord = (proposalId: string, verified = true): GuardianSignerRecord =
   commitment: "0x" + "22".repeat(32),
   commitmentVerified: verified,
   executionBlockTimestamp: 1_700_000_000,
+  parentBlockHash: "0x" + "5a".repeat(32),
 });
 
 const makeFailure = (block: number, logIndex: number): GuardianCaptureFailure => ({
