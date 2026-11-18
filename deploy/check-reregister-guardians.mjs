@@ -14,9 +14,14 @@ import { tmpdir } from "os";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 
+import * as acorn from "acorn";
+import * as walk from "acorn-walk";
+import { keyEnds, fieldShape, pubKeyShape, nodeNameShape } from "./lib/redact.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, "reregister-guardians.mjs");
 const REPO = dirname(HERE);
+const REDACT = join(HERE, "lib", "redact.mjs"); // the script's one local import
 let pass = 0;
 let fail = 0;
 const cell = (name, ok, detail = "") => {
@@ -145,13 +150,13 @@ const common = [
 ];
 const ours = r => r.reads.filter(p => p.startsWith(dir) && p !== preload);
 // Every path except module loading, which node's loader does through the same wrapped fs: the script
-// itself and node_modules. Nothing else in the repository is exempt, so a read of an in-repo env or
+// itself, its one local import deploy/lib/redact.mjs, and node_modules. Nothing else in the repository is exempt, so a read of an in-repo env or
 // node file by absolute path still counts (Codex on the #444 delta, round 2).
 // Paths are resolved first, against the child's cwd (the temp dir), so neither
 // "node_modules/../.env.sepolia" nor a relative "node_modules/x.json" is exempt (Codex, rounds 3-4).
 const isModuleLoad = p => {
   const r = resolve(dir, p);
-  return r === SCRIPT || r.startsWith(join(REPO, "node_modules") + "/");
+  return r === SCRIPT || r === REDACT || r.startsWith(join(REPO, "node_modules") + "/");
 };
 const notCode = r => r.reads.filter(p => p !== preload && !isModuleLoad(p));
 
@@ -265,6 +270,117 @@ fs.readFileSync(pathToFileURL(${JSON.stringify(c)}));
     "CONTROL the recorder sees fs/promises, callback and URL reads",
     r === 0 && [a, b, c].every(f => reads.includes(f)),
     `status ${r}, recorded ${reads.filter(x => x.startsWith(dir)).join(", ")}`
+  );
+}
+
+// What a node-file value may print as (clestons #460 Lows 1-2): no part of a pasted secret, through
+// any of the shapes, and no raw node-file field interpolated anywhere in the script.
+{
+  const secret = "0x" + "3f9a1c7e5b2d4086".repeat(4); // a throwaway 32-byte value
+  const body = secret.slice(2);
+  const pieces = [];
+  for (let i = 0; i + 6 <= body.length; i++) pieces.push(body.slice(i, i + 6));
+  const leaks = out => pieces.some(p => out.toLowerCase().includes(p));
+  const outs = [
+    fieldShape(secret),
+    fieldShape(body),
+    pubKeyShape(secret),
+    nodeNameShape(secret),
+    fieldShape(secret + secret),
+    nodeNameShape("\u001b[2J" + secret),
+  ];
+  cell(
+    "redact: a 32-byte secret in any node-file field prints no 6-hex-digit piece of it",
+    outs.every(o => !leaks(o)),
+    outs.join(" | ")
+  );
+  const pk = "0x" + "ab".repeat(128);
+  cell(
+    "redact: a well-formed 128-byte public key prints its ends only; small slots and names as they are",
+    pubKeyShape(pk) === keyEnds(pk) &&
+      pubKeyShape(pk).length < 40 &&
+      fieldShape(2) === "2" &&
+      fieldShape("3") === '"3"' &&
+      nodeNameShape("dev-1") === "dev-1" &&
+      nodeNameShape(undefined) === "?",
+    `${pubKeyShape(pk)} ${fieldShape(2)} ${fieldShape("3")} ${nodeNameShape("dev-1")}`
+  );
+  cell(
+    "redact: other types and control characters print only their shape",
+    [true, null, { k: secret }, [secret], 1e21, 12345, "a\u202eb", "x\u009b"].every(v =>
+      /^<\w+(, value withheld| chars, value withheld)>$|^<\d+ chars, value withheld>$/.test(
+        fieldShape(v)
+      )
+    ) && nodeNameShape("n\u001b[2Jx") === "<6 chars, value withheld>",
+    [true, null, 1e21, "a\u202eb"].map(fieldShape).join(" | ")
+  );
+  // Structural (Codex on this PR, rounds 1-2): parse the script and look at every call that prints
+  // or writes — die(), fail(), console.*(), new Error(), writeFileSync(). Inside their arguments,
+  // every use of the node-file object `node` must sit inside a redact.mjs shape call. This sees
+  // interpolation, concatenation, bracket access, extra arguments and JSON.stringify alike. It does
+  // NOT follow aliases (`const x = node.privateKey; die(x)`), and it trusts the shape names without
+  // resolving their bindings (a local function shadowing `fieldShape` would pass); both are left to
+  // review.
+  const leaksIn = code => {
+    const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType: "module" });
+    const found = [];
+    const SHAPE = new Set(["fieldShape", "pubKeyShape", "nodeNameShape", "keyEnds"]);
+    const isSink = n =>
+      (n.type === "CallExpression" &&
+        ((n.callee.type === "Identifier" &&
+          ["die", "fail", "writeFileSync"].includes(n.callee.name)) ||
+          (n.callee.type === "MemberExpression" &&
+            n.callee.object.type === "Identifier" &&
+            n.callee.object.name === "console"))) ||
+      (n.type === "NewExpression" && n.callee.type === "Identifier" && n.callee.name === "Error");
+    walk.fullAncestor(ast, (n, _state, ancestors) => {
+      if (n.type !== "Identifier" || n.name !== "node") return;
+      const path = ancestors.slice(0, -1);
+      const sinkAt = path.findLastIndex(isSink);
+      if (sinkAt < 0) return;
+      // only inside the sink's arguments, not its callee (console[node.x](…) prints no node value)
+      if (!(path[sinkAt].arguments ?? []).includes(path[sinkAt + 1] ?? n)) return;
+      const inShape = path
+        .slice(sinkAt + 1)
+        .some(
+          a =>
+            a.type === "CallExpression" &&
+            a.callee.type === "Identifier" &&
+            SHAPE.has(a.callee.name)
+        );
+      if (!inShape) found.push(code.slice(path[sinkAt].start, path[sinkAt].end).slice(0, 80));
+    });
+    return found;
+  };
+  const found = leaksIn(readFileSync(SCRIPT, "utf8"));
+  cell(
+    "redact: reregister-guardians.mjs passes no node-file value to an output call except through a redact.mjs shape (AST)",
+    found.length === 0,
+    found.join(" | ")
+  );
+  // CONTROL: each form, on its own, is caught; a shape-wrapped one is not.
+  const forms = {
+    interpolation: "die(`x ${node.privateKey}`)",
+    "shape then raw in one interpolation": "die(`x ${(fieldShape(node.slot), node.privateKey)}`)",
+    bracket: "die(`x ${node[k]}`)",
+    "concatenation, node first": 'die(node.privateKey + " suffix")',
+    "concatenation, node second": 'die("x " + node.slot)',
+    "extra console argument": 'console.log("node:", node.privateKey)',
+    "console of the object": "console.error(node)",
+    "JSON.stringify inside a sink": "writeFileSync(f, JSON.stringify(node))",
+    "new Error": "throw new Error(`bad ${node.slot}`)",
+  };
+  const notLeaks = [
+    'console[node.k]("constant")',
+    "die(`x ${fieldShape(node.slot)} ${nodeNameShape(node.nodeName)}`)",
+  ];
+  const missed = Object.entries(forms)
+    .filter(([, c]) => leaksIn(c).length === 0)
+    .map(([k]) => k);
+  cell(
+    "CONTROL the AST scan catches each raw form on its own, and passes a shape-wrapped one",
+    missed.length === 0 && notLeaks.every(c => leaksIn(c).length === 0),
+    `missed: ${missed.join(", ")}; flagged: ${notLeaks.filter(c => leaksIn(c).length).join(", ")}`
   );
 }
 
