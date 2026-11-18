@@ -162,12 +162,21 @@ export const CATCHUP_MAX_THROTTLE = 4;
 export const isRateLimited = e =>
   e?.rateLimited === true || /RATE_LIMITED/.test(String(e?.message ?? ""));
 
+/**
+ * The smallest classifyMaxBlocks a deployed config may set (DSR 2026-11-18, clestons #453 Low): a
+ * replay segment must far outrun the blocks one hourly round adds (Sepolia about 300, OP Mainnet
+ * about 1800), or the replay can never finish. Enforced on the config (configProblems); a round
+ * accepts smaller values so cells can replay a short history.
+ */
+export const CLASSIFY_MIN_BLOCKS = 10_000;
+/** A replay still unfinished after this long alerts (a warning; it does not change clear). */
+export const REPLAY_ALERT_MS = 48 * 3600_000;
 /** Problems with cfg.classifyMaxBlocks (absent = CLASSIFY_MAX_BLOCKS), or []. Pure. */
-export function classifyMaxProblems(v) {
+export function classifyMaxProblems(v, min = 1) {
   if (v === undefined) return [];
-  return Number.isSafeInteger(v) && v >= 1 && v <= CLASSIFY_MAX_BLOCKS
+  return Number.isSafeInteger(v) && v >= min && v <= CLASSIFY_MAX_BLOCKS
     ? []
-    : [`classifyMaxBlocks must be 1..${CLASSIFY_MAX_BLOCKS}`];
+    : [`classifyMaxBlocks must be ${min}..${CLASSIFY_MAX_BLOCKS}`];
 }
 
 /** Problems with cfg.catchUp (absent = no catch-up), or []. Pure. */
@@ -221,6 +230,11 @@ export function normalizeClock(st, now) {
     st.crossCheck.lastAttempt = 0;
     changed = true;
   }
+  for (const k of Object.keys(st.replayStartedAt ?? {}))
+    if (st.replayStartedAt[k] > now) {
+      st.replayStartedAt[k] = now;
+      changed = true;
+    }
   if (st.undeliveredSince > now) {
     st.undeliveredSince = now;
     changed = true;
@@ -402,6 +416,18 @@ export function stateProblems(st, cfg) {
     )
   )
     p.push("the state's unknownTopics is not a map of topic0 to block");
+  if (st.knownSet !== undefined && !HASH32.test(String(st.knownSet)))
+    p.push("the state's knownSet is not a hash");
+  if (
+    st.replayStartedAt !== undefined &&
+    !(
+      plainObject(st.replayStartedAt) &&
+      Object.entries(st.replayStartedAt).every(
+        ([k, v]) => (k === "lastFullScan" || k === "lastFallbackFullScan") && Number.isFinite(v)
+      )
+    )
+  )
+    p.push("the state's replayStartedAt is not a time per clock");
   if (st.topicSet !== undefined && typeof st.topicSet !== "string")
     p.push("the state's topicSet is not a string");
   if (
@@ -773,6 +799,8 @@ export async function runRound(
     lastFallbackFullScan: st.lastFallbackFullScan,
     classifiedTo: st.classifiedTo,
     topicSet: st.topicSet,
+    knownSet: st.knownSet,
+    replayStartedAt: st.replayStartedAt && { ...st.replayStartedAt },
     replayNext: st.replayNext && { ...st.replayNext },
     crossCheck: st.crossCheck && { ...st.crossCheck },
   };
@@ -938,7 +966,24 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
   delete st.unknownTopicsMore;
   st.unknownTopicsOverflow ??= false;
   st.replayNext ??= {};
+  st.replayStartedAt ??= {};
   st.classifiedTo ??= st.startBlock - 1;
+  // 2. the known-event set is part of what classification was done against (DSR 2026-11-18,
+  //    clestons #453 Low): the pin's spEvents (a new tag), knownProxyEvents and the configured topics.
+  //    When it changes, every log is classified again from startBlock; verification is not reset
+  const knownSet = topicOf([...known].sort().join(","));
+  if (st.knownSet !== knownSet) {
+    if (st.classifiedTo >= st.startBlock) {
+      st.classifiedTo = st.startBlock - 1;
+      st.replayNext = {};
+      st.replayStartedAt = {};
+      alerts.push({
+        key: "reclassify",
+        text: "the known events changed (the pin's spEvents or knownProxyEvents): every log of the proxy is classified again from startBlock",
+      });
+    }
+    st.knownSet = knownSet;
+  }
   const maxClassify = cfg.classifyMaxBlocks ?? CLASSIFY_MAX_BLOCKS;
   const take = (lg, t0, n) => {
     if (!known.has(t0)) recordUnknown(st, t0, n);
@@ -963,6 +1008,8 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     // the replay has reached finalized and the inventory rescan succeeded, so a replay that fails
     // or is not finished is resumed next round, never counted as done
     if (full) {
+      // when this clock's replay began (for the overdue alert below)
+      st.replayStartedAt[scanKey] ??= now;
       const rFrom = st.replayNext[scanKey] ?? st.startBlock;
       const rTo = Math.min(finalized, rFrom + maxClassify - 1);
       if (rTo >= rFrom) await allLogs(chain, st.spProxy, rFrom, rTo, cfg.logChunk, canon, take);
@@ -980,7 +1027,18 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     });
   }
   // the daily clock: only a full round whose inventory rescan AND replay both completed
-  if (full && inventoryOk && classifyOk && replayDone) st[scanKey] = now;
+  if (full && inventoryOk && classifyOk && replayDone) {
+    st[scanKey] = now;
+    delete st.replayStartedAt[scanKey];
+  }
+  // a replay unfinished 48 h after it began (DSR 2026-11-18): a warning, clear is not changed. Both
+  // clocks every round (Codex): a round on the other provider does not make the warning look resolved
+  for (const [k, started] of Object.entries(st.replayStartedAt))
+    if (now - started > REPLAY_ALERT_MS)
+      alerts.push({
+        key: `replay-overdue:${k}`,
+        text: `the daily replay (${k}) started at ${new Date(started).toISOString()} and has not reached the finalized block: check classifyMaxBlocks and the provider`,
+      });
   // an unknown topic0 named in the config since is known now: it is dropped
   for (const t of Object.keys(st.unknownTopics)) if (known.has(t)) delete st.unknownTopics[t];
   const unknownEvents = Object.entries(st.unknownTopics);
