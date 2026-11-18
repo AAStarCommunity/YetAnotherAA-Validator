@@ -132,9 +132,16 @@ Their addresses come from SP's frozen plan, which SP precomputes at the pin.
    - `aggregatorSourceVersion`, a top-level field outside `popContext` (DSR
      2026-11-18). It holds the `version()` string the source returns, for
      example `BLSAggregator-4.14.2`. The contract does not exist yet, so this is
-     read from `--sp-aggregator-source`. The source must contain exactly one
-     such line, or the export stops. SP's adapter requires this field to equal
-     the aggregator in its `RELEASE_VERSIONS`, and rejects an export without it.
+     read from `--sp-aggregator-source`. Comments are ignored. The source must
+     define exactly one `contract BLSAggregator`, and inside it exactly one
+     `version()`. That function must take no parameters and have no modifiers
+     (only visibility, mutability, `virtual` and `override(...)` are allowed),
+     and its body must be exactly one string-literal `return`. A bare CR
+     anywhere in the source is refused. Otherwise the export stops. SP is to
+     make its adapter require this field to equal the aggregator in its
+     `RELEASE_VERSIONS`, and reject an export without it. As of SP main
+     `4a29e107` that adapter does not exist yet; an extra top-level key breaks
+     nothing there.
 
 3. **DVT hands the file to SP.** SP freezes the manifest with it.
 4. **SP pauses everything that shares the deployer EOA.** The freeze list is
