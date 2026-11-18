@@ -229,7 +229,7 @@ esac
 
 # ---- A10-equivalent pre-send assertions: keys, on-chain domainSeparator and popDigest == export ------
 python3 - "$C" "$R" "$NAGG" "$B/plan-pop.json" "$NODES_DIR" <<'PY'
-import json, subprocess, sys
+import json, os, subprocess, sys
 C, R, AGG, pop_file, nodes = sys.argv[1:]
 call = lambda *a: subprocess.check_output([C, "call", AGG, *a, "--rpc-url", R], text=True).strip()
 # Explicit checks, not `assert`: PYTHONOPTIMIZE would strip asserts (Codex round 3, M3).
@@ -240,6 +240,9 @@ p = json.load(open(pop_file)); ctx = p["popContext"]
 need(sorted(ctx) == sorted(["dvt", "aggregator", "registry", "chainId", "deployerAddress", "deployerNonce",
     "pinBlock", "pinBlockHash", "spCommit", "spAggregatorSourceSha256", "popDigests"]), "popContext keys")
 need(len(p["pop"]) == 3 and len(ctx["popDigests"]) == 3, "pop count")
+# Outside popContext (DSR 2026-11-18): the release the source returns, as EXPECT_VERSIONS names it.
+need(p.get("aggregatorSourceVersion") == os.environ["EXPECT_VERSIONS"].split(",")[0], "aggregatorSourceVersion")
+print("aggregatorSourceVersion", p["aggregatorSourceVersion"], "== EXPECT_VERSIONS' aggregator")
 for e in p["pop"]:
     need(sorted(e) == sorted(["validator", "slot", "calldata", "aggregator", "pinBlockHash", "domainSeparator"]), "pop keys")
 ds = call("domainSeparator()(bytes32)")

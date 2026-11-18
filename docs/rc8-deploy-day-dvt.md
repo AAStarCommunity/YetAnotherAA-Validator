@@ -122,13 +122,19 @@ Their addresses come from SP's frozen plan, which SP precomputes at the pin.
    each PoP with a pairing check, and writes the file. The pairing check only
    shows the signature matches the key derived from the same secret. What
    catches a wrong key is the secret↔public-key comparison in the node file, and
-   then SP's A10 (clestons #444). The output has two parts:
+   then SP's A10 (clestons #444). The output has three parts:
    - `pop`: three entries with exactly SP's six keys: `validator`, `slot`,
      `calldata`, `aggregator`, `pinBlockHash`, `domainSeparator`
      (`manifest_exec.py`, `pop_fields`);
    - `popContext`: `dvt`, `aggregator`, `registry`, `chainId`,
      `deployerAddress`, `deployerNonce`, `pinBlock`, `pinBlockHash`, `spCommit`,
-     `spAggregatorSourceSha256`, and `popDigests` in `pop` order.
+     `spAggregatorSourceSha256`, and `popDigests` in `pop` order;
+   - `aggregatorSourceVersion`, a top-level field outside `popContext` (DSR
+     2026-11-18). It holds the `version()` string the source returns, for
+     example `BLSAggregator-4.14.2`. The contract does not exist yet, so this is
+     read from `--sp-aggregator-source`. The source must contain exactly one
+     such line, or the export stops. SP's adapter requires this field to equal
+     the aggregator in its `RELEASE_VERSIONS`, and rejects an export without it.
 
 3. **DVT hands the file to SP.** SP freezes the manifest with it.
 4. **SP pauses everything that shares the deployer EOA.** The freeze list is

@@ -17,11 +17,16 @@ import { fileURLToPath } from "url";
 import * as acorn from "acorn";
 import * as walk from "acorn-walk";
 import { keyEnds, fieldShape, pubKeyShape, nodeNameShape } from "./lib/redact.mjs";
+import { aggregatorSourceVersion } from "./lib/sp-source.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(HERE, "reregister-guardians.mjs");
 const REPO = dirname(HERE);
-const REDACT = join(HERE, "lib", "redact.mjs"); // the script's one local import
+// the script's local imports, loaded as modules
+const LOCAL_IMPORTS = new Set([
+  join(HERE, "lib", "redact.mjs"),
+  join(HERE, "lib", "sp-source.mjs"),
+]);
 let pass = 0;
 let fail = 0;
 const cell = (name, ok, detail = "") => {
@@ -156,7 +161,7 @@ const ours = r => r.reads.filter(p => p.startsWith(dir) && p !== preload);
 // "node_modules/../.env.sepolia" nor a relative "node_modules/x.json" is exempt (Codex, rounds 3-4).
 const isModuleLoad = p => {
   const r = resolve(dir, p);
-  return r === SCRIPT || r === REDACT || r.startsWith(join(REPO, "node_modules") + "/");
+  return r === SCRIPT || LOCAL_IMPORTS.has(r) || r.startsWith(join(REPO, "node_modules") + "/");
 };
 const notCode = r => r.reads.filter(p => p !== preload && !isModuleLoad(p));
 
@@ -381,6 +386,76 @@ fs.readFileSync(pathToFileURL(${JSON.stringify(c)}));
     "CONTROL the AST scan catches each raw form on its own, and passes a shape-wrapped one",
     missed.length === 0 && notLeaks.every(c => leaksIn(c).length === 0),
     `missed: ${missed.join(", ")}; flagged: ${notLeaks.filter(c => leaksIn(c).length).join(", ")}`
+  );
+}
+
+// --plan's aggregatorSourceVersion (DSR 2026-11-18; Codex): BLSAggregator's own version() body,
+// with comments ignored; anything but one plain string-literal return stops the export.
+{
+  const fn = ret =>
+    `  function version() external pure override returns (string memory) {\n    ${ret}\n  }\n`;
+  const agg = (ret, extra = "") =>
+    `contract BLSAggregator is X {\n  uint256 a;\n${extra}${fn(ret)}}\n`;
+  const good = {
+    "a plain return": [agg('return "BLSAggregator-4.14.2";'), "BLSAggregator-4.14.2"],
+    "a -tag": [agg('return "BLSAggregator-5.0.0-rc.1";'), "BLSAggregator-5.0.0-rc.1"],
+    "single quotes": [agg("return 'BLSAggregator-4.14.2';"), "BLSAggregator-4.14.2"],
+    "a commented-out old return": [
+      agg('// return "BLSAggregator-4.14.1";\n    return "BLSAggregator-4.14.2";'),
+      "BLSAggregator-4.14.2",
+    ],
+    "an inline comment": [
+      agg('return /* release */ "BLSAggregator-4.14.2";'),
+      "BLSAggregator-4.14.2",
+    ],
+    "another contract's version() first": [
+      `contract DVTValidator {\n${fn('return "BLSAggregator-9.9.9";')}}\n` +
+        agg('return "BLSAggregator-4.14.2";'),
+      "BLSAggregator-4.14.2",
+    ],
+    "a // with quotes in a doc comment": [
+      `/// says "BLSAggregator-1.0.0"; and 'x'\n` + agg('return "BLSAggregator-4.14.2";'),
+      "BLSAggregator-4.14.2",
+    ],
+  };
+  const wrong = Object.entries(good).filter(
+    ([, [src, want]]) => aggregatorSourceVersion(src) !== want
+  );
+  cell(
+    "sp-source: BLSAggregator's version() literal is read; comments and other contracts are ignored",
+    wrong.length === 0,
+    wrong.map(([k, [src]]) => `${k} -> ${aggregatorSourceVersion(src)}`).join(", ")
+  );
+  const bad = {
+    none: "contract BLSAggregator {}",
+    "no contract": fn('return "BLSAggregator-4.14.2";'),
+    "two contracts": agg('return "BLSAggregator-4.14.2";') + agg('return "BLSAggregator-4.14.1";'),
+    "two version()": agg('return "BLSAggregator-4.14.2";', fn('return "BLSAggregator-4.14.1";')),
+    concatenation: agg('return string.concat("BLSAggregator-", "4.14.1");'),
+    "decoy comment + concatenation": agg(
+      '// return "BLSAggregator-4.14.2";\n    return string.concat("BLSAggregator-", "4.14.1");'
+    ),
+    "a constant": agg("return VERSION;"),
+    "no patch": agg('return "BLSAggregator-4.14";'),
+    "another contract's prefix": agg('return "DVTValidator-0.9.0";'),
+    "trailing text": agg('return "BLSAggregator-4.14.2 beta";'),
+    "only in a block comment": `/* contract BLSAggregator {\n${fn('return "BLSAggregator-4.14.2";')}} */`,
+    "not a string": null,
+    "a body-less version() before another member": `contract BLSAggregator is X {\n  function version() external virtual returns (string memory);\n  function other() external pure returns (string memory) {\n    return "BLSAggregator-9.9.9";\n  }\n}\n`,
+    "a $-suffixed contract name only": agg('return "BLSAggregator-4.14.2";').replace(
+      "contract BLSAggregator",
+      "contract BLSAggregator$Other"
+    ),
+    "an unterminated block comment": agg('return "BLSAggregator-4.14.2";') + "/* unterminated",
+    "an unterminated string": agg('return "BLSAggregator-4.14.2";') + '"unterminated',
+    "a version(uint256) overload": `contract BLSAggregator is X {\n  function version(uint256) external pure returns (string memory) {\n    return "BLSAggregator-9.9.9";\n  }\n}\n`,
+    "a modifier on version()": `contract BLSAggregator is X {\n  function version() external pure onlyX returns (string memory) {\n    return "BLSAggregator-9.9.9";\n  }\n}\n`,
+  };
+  const passed = Object.entries(bad).filter(([, src]) => aggregatorSourceVersion(src) !== null);
+  cell(
+    "sp-source: no/two contracts or version(), a non-literal return, or a malformed string gives null (the export stops)",
+    passed.length === 0,
+    passed.map(([k]) => k).join(", ")
   );
 }
 
