@@ -49,6 +49,9 @@ import {
   detectorFresh,
   detectorArgsProblems,
   detectorBundleItem,
+  lockPortProblems,
+  ephemeralRange,
+  EPHEMERAL_DEFAULT,
   deadmanFresh,
 } from "./preflight.mjs";
 
@@ -891,6 +894,46 @@ cell(
     );
     for (const [what, args] of bad)
       cell(`detector-args fails: ${what}`, detectorArgsProblems(args, H).length === 1);
+  }
+  // detector-lockport (DSR 2026-11-18): the fixed lockPort is outside the ephemeral range
+  {
+    const cfgWith = p => JSON.stringify({ lockPort: p });
+    cell(
+      "detector-lockport passes the example's 47221",
+      lockPortProblems(cfgWith(47221)).length === 0
+    );
+    cell(
+      "detector-lockport fails a port inside macOS's ephemeral range (50625, the #438 flake's)",
+      /ephemeral port range 49152-65535/.test(lockPortProblems(cfgWith(50625)).join())
+    );
+    cell(
+      "detector-lockport fails the range's first port",
+      lockPortProblems(cfgWith(EPHEMERAL_DEFAULT[0])).length > 0
+    );
+    cell(
+      "detector-lockport uses the system's own range",
+      lockPortProblems(cfgWith(40000), [32768, 60999]).length > 0
+    );
+    cell(
+      "detector-lockport fails a missing or unreadable config, or a non-port",
+      [null, "{", cfgWith("47221"), cfgWith(80)].every(t => lockPortProblems(t).length > 0)
+    );
+    cell(
+      "detector-lockport fails when the system's range cannot be read; it assumes no default (Codex)",
+      [
+        [null, "65535"],
+        ["49152", null],
+        ["", "65535"],
+        ["x", "65535"],
+        ["60000", "50000"],
+        ["0", "65535"],
+        ["49152", "70000"],
+      ].every(([f, l]) => ephemeralRange(f, l) === null) &&
+        /cannot read this machine's ephemeral port range/.test(
+          lockPortProblems(cfgWith(47221), ephemeralRange(null, null)).join()
+        ) &&
+        JSON.stringify(ephemeralRange("49152\n", "65535\n")) === "[49152,65535]"
+    );
   }
   {
     // detector-bundle on a real bundle (bundle.mjs) and on a broken one (clestons #434 F4)

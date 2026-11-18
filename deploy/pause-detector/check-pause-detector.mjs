@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -4561,6 +4562,34 @@ const rpcServer = age =>
     });
     srv.listen(0, "127.0.0.1", () => res(srv));
   });
+/**
+ * A lock port for a cell (DSR 2026-11-18, the #438 flake): outside the ephemeral ranges (as the
+ * production config must be), and just now bindable on 127.0.0.1. A random 40000-60000 port could
+ * be held by another socket, and the detector then exited 75 as a lock loser, with no status.json.
+ * Another process can still take it between this check and the detector's bind (Codex), so
+ * runBundleAgainst retries a run that lost the lock on a fresh port, at most twice, and only when
+ * portHeld confirms another socket holds the port after the detector exited; otherwise it throws.
+ */
+/** Whether some other socket holds 127.0.0.1:`port` right now (we cannot bind it). */
+const portHeld = port =>
+  new Promise(res => {
+    const s = createNetServer();
+    s.once("error", e => res(e?.code === "EADDRINUSE"));
+    s.listen(port, "127.0.0.1", () => s.close(() => res(false)));
+  });
+const freeLockPort = async () => {
+  for (let k = 0; k < 50; k++) {
+    // 10000-32767: below Linux's default ephemeral range (32768-60999, CI) and macOS's (49152-)
+    const port = 10000 + Math.floor(Math.random() * 22768);
+    const ok = await new Promise(res => {
+      const s = createNetServer();
+      s.once("error", () => res(false));
+      s.listen(port, "127.0.0.1", () => s.close(() => res(true)));
+    });
+    if (ok) return port;
+  }
+  throw new Error("no free lock port in 10000-32767 after 50 tries");
+};
 const runBundleAgainst = async (age, fn, setup = () => {}) => {
   const srv = await rpcServer(age);
   try {
@@ -4570,19 +4599,33 @@ const runBundleAgainst = async (age, fn, setup = () => {}) => {
       for (const n of ["aoa-dvt-detector-rpc-primary", "aoa-dvt-detector-rpc-fallback"])
         writeFileSync(join(h.d, "secrets", n), url, { mode: 0o600 });
       const ex = JSON.parse(readFileSync(join(HERE, "config.example.json"), "utf8"));
-      writeFileSync(
-        join(h.d, "config.json"),
-        JSON.stringify({
-          ...ex,
-          stateDir: join(h.d, "state"),
-          secretsDir: join(h.d, "secrets"),
-          telegram: null,
-          lockPort: 40000 + Math.floor(Math.random() * 20000),
-        }),
-        { mode: 0o600 }
-      );
+      const writeConfig = async () =>
+        writeFileSync(
+          join(h.d, "config.json"),
+          JSON.stringify({
+            ...ex,
+            stateDir: join(h.d, "state"),
+            secretsDir: join(h.d, "secrets"),
+            telegram: null,
+            lockPort: await freeLockPort(),
+          }),
+          { mode: 0o600 }
+        );
+      await writeConfig();
       setup(h);
-      const r = await runDetectorAsync(h);
+      let r = await runDetectorAsync(h);
+      // a run that lost the lock is retried on a fresh port, at most twice, ONLY when another socket
+      // is shown to hold that port right after the detector exited (Codex): a lock loss nobody else
+      // caused would be a detector defect, and the cell then fails on it instead of retrying
+      for (let k = 0; k < 2 && r.status === 75 && /holds the lock/.test(r.stderr); k++) {
+        const port = JSON.parse(readFileSync(join(h.d, "config.json"), "utf8")).lockPort;
+        if (!(await portHeld(port)))
+          throw new Error(
+            `the detector lost the lock on ${port}, which no other socket holds: ${r.stderr.slice(0, 300)}`
+          );
+        await writeConfig();
+        r = await runDetectorAsync(h);
+      }
       const status = JSON.parse(readFileSync(join(h.d, "state", "status.json"), "utf8"));
       fn(r, status, h);
     });
