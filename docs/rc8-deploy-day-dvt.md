@@ -201,7 +201,15 @@ count (`UnknownValidatorSlot`). The two steps back each restore one half:
 2. It signs again only after a re-registration with a valid PoP: `--export-pop`,
    then the SAFE signs as above. The PoP digest does not include an admission
    epoch, so the PoP from before the exit is still valid and can be reused; a
-   new one is not required.
+   new one is not required. The guardian must hold `ROLE_DVT` with at least
+   `minStake` again.
+3. `DVTValidator.addValidator` is needed only if the address was removed or
+   pruned.
+
+This follows SP's `docs/deployment/rc8-guardian-operations.md` at `f2b2cd9b`
+("Re-admission after an exit"). SP says the re-registration script must perform
+step 1 first. Here DVT sends nothing, so the SAFE lifts the suspension first,
+and only then is the script run; until then it refuses the guardian (below).
 
 The script refuses a suspended guardian before it sends or exports anything
 (`reregister-guardians.mjs`, the `suspended(validator)` check: "is suspended on
@@ -226,6 +234,22 @@ is the DVTValidator constructor, now
 passes two empty lists (`categoryCount() == 0`). The script holds no version
 string: `--expect-versions` takes them from the tag's tree. Check the interface
 again against the tag commit at the rc.8 freeze.
+
+**Rechecked at SP main `f2b2cd9b4a566d7cb73c8482e1327c674f8887a8`** (2026-11-18;
+BLSAggregator-4.14.2, DVTValidator-0.9.0; holds SuperPaymaster #636–#639). Three
+checks, all passing:
+
+- **ABI.** Every SP function the script calls was matched against SP's committed
+  ABIs at that commit (`abis/BLSAggregator.json`, `DVTValidator.json`,
+  `Registry.json`, `SuperPaymaster.full.json`), by selector and output types;
+  all match. The script's three other fragments (`AGGREGATOR()`,
+  `deriveFraudProofId`, `slashMessageHash`) are this repository's fraud
+  verifier, not SP.
+- **DVTValidator.** `DVTValidator.sol` has the same git blob as at `d55f76f8`,
+  so the lines cited below still hold.
+- **BLSAggregator.** It changed from 4.14.1. In 4.14.2, `popDigest` and
+  `domainSeparator()` keep the formulas below, and `registerBLSPublicKey` still
+  accepts only `msg.sender == DVT_VALIDATOR` (`BLSAggregator.sol:789`).
 
 ```
 DVTValidator.registerBLSPublicKey(address validator, BLS.G1Point key, uint8 slot, BLS.G2Point pop)
@@ -257,7 +281,14 @@ pre-deployment flow is `deploy/rehearse-reregister-plan.sh` (`good` and
 0.9.0 constructor it passed on #635's head `d55f76f8` (BLSAggregator-4.14.1,
 DVTValidator-0.9.0): `good` exit 0, `nonce-moved` exit 3 with both stops, and
 again with `SP_COMMIT` = the merge commit `053117cc` (same tree): `good` exit 0,
-`nonce-moved` exit 3, both stops firing. The flow:
+`nonce-moved` exit 3, both stops firing. On SP main `f2b2cd9b`
+(BLSAggregator-4.14.2, DVTValidator-0.9.0, 2026-11-18), built from its tarball
+with its submodules at the commits it pins:
+
+- `good` exited 0. Both generations reported the expected versions, the deployed
+  addresses equalled the plan, and the read-back was OK for all 3 slots.
+- `nonce-moved` exited 3. The re-export stopped on the nonce check, and the A10
+  address assertion found the mismatch and stopped the send. The flow:
 
 - **Pre-deployment flow:**
   1. Generation 1 plays the old stack.
