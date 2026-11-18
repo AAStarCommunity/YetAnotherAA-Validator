@@ -113,12 +113,12 @@ const nodeFile = join(dir, "node_test_1.json");
 writeFileSync(nodeFile, "{}", { mode: 0o600 });
 
 // Async, so the local RPC server can answer while the script runs.
-const run = args =>
+const run = (args, extraEnv = {}) =>
   new Promise(res => {
     rmSync(readsLog, { force: true });
     requests.length = 0;
     const c = spawn(process.execPath, ["--import", preload, SCRIPT, ...args], {
-      env: { PATH: process.env.PATH, HOME: dir },
+      env: { PATH: process.env.PATH, HOME: dir, ...extraEnv },
       // cwd is the temp dir, so the script's relative defaults (.env.sepolia, node_dev_00N.json)
       // resolve there and are recorded like any other read
       cwd: dir,
@@ -185,6 +185,45 @@ for (const [what, args] of [
     `--broadcast (${what}) sends no RPC request`,
     r.rpcRequests === 0,
     `${r.rpcRequests} request(s)`
+  );
+}
+
+// Daybreak on #441, Low: the drill without --env stops before reading anything (no default .env.sepolia).
+{
+  const r = await run([
+    "--deployment",
+    deployment,
+    "--export-fraud-drill",
+    join(dir, "drill.json"),
+    "--verifier",
+    "0x0000000000000000000000000000000000000001",
+  ]);
+  cell(
+    "--export-fraud-drill without --env exits 1 before reading any file (it never opens the default .env.sepolia)",
+    r.status === 1 &&
+      /needs --env <an RPC-only env file>/.test(r.stderr) &&
+      notCode(r).length === 0 &&
+      r.rpcRequests === 0,
+    `status ${r.status} ${r.stderr.trim().split("\n").slice(-1)[0]} read ${notCode(r).join(", ")}`
+  );
+  // An inherited DVT_ENV_FILE does not count as --env (Codex): the same refusal, nothing read.
+  const inh = await run(
+    [
+      "--deployment",
+      deployment,
+      "--export-fraud-drill",
+      join(dir, "drill.json"),
+      "--verifier",
+      "0x0000000000000000000000000000000000000001",
+    ],
+    { DVT_ENV_FILE: envFile }
+  );
+  cell(
+    "--export-fraud-drill with only an inherited DVT_ENV_FILE is refused the same way, nothing read",
+    inh.status === 1 &&
+      /needs --env <an RPC-only env file>/.test(inh.stderr) &&
+      notCode(inh).length === 0,
+    `status ${inh.status} read ${notCode(inh).join(", ")}`
   );
 }
 

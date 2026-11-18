@@ -75,9 +75,13 @@
 // (the release the source's version() returns). SP's A10 asserts versions, wiring, owner and
 // on-chain popDigest() equality at send time. If the deployer nonce moves, export again after SP re-pins.
 //
-// --export-fraud-drill <file> IS FOR A FORK REHEARSAL ONLY, and is STALE against 4.14.0: the 4.14.0
-// signer commitment adds the parent block hash, which the drill does not include (issue #441). It
-// writes one valid over-issue fraud proof plus four cases that must be rejected, and NO BLS SIGNATURE.
+// --export-fraud-drill <file> IS FOR A FORK REHEARSAL ONLY. It writes one over-issue fraud proof
+// TEMPLATE plus four cases that must be rejected, and NO BLS SIGNATURE (a guardian signature over a
+// slash message has the same domain on the fork and on the real chain). Since #441 it no longer
+// writes proposalSignersCommitment into fork storage: a poked value made the drill pass by
+// construction. The fork must execute the slash through the aggregator, then put
+// blockhash(executionBlock - 1) into the template's last word. It requires the #441 verifier
+// (COMMITMENT_BINDS_PARENT_BLOCKHASH() == true).
 //
 // A PARTLY EXECUTED EXPORT IS SAFE TO RE-EXPORT: re-registering the same (validator, slot, key) is
 // accepted (BLSAggregator.sol, `blsKeyOwner[keyHash] == validator` and the same-slot rule).
@@ -116,6 +120,7 @@ const argv = process.argv.slice(2);
 const VALUE_FLAGS = new Set([
   "--export-pop",
   "--export-fraud-drill",
+  "--drill-case",
   "--verifier",
   "--deployment",
   "--expect-owner",
@@ -170,6 +175,13 @@ const flag = name => opts.get(name);
 const EXPORT_FILE = flag("--export-pop");
 const DRILL_FILE = flag("--export-fraud-drill");
 const VERIFIER = flag("--verifier");
+// --drill-case <file>: aim the drill at a slash that REALLY executed (a rehearsal), instead of the
+// self-derived template proposal. LOCAL ANVIL ONLY (chain 31337): a fraud proof needs no signature —
+// the stored commitment authenticates it — so a filled case-mode export on a live chain would be a
+// real, submittable fraud proof (Codex). JSON {proposalId, operator, token, epoch, slashLevel, signerMask,
+// guardians[]}, all of that execution (Daybreak on #441, Medium: the acceptance must run the
+// exported cases, not only check their shape). Only with --export-fraud-drill.
+const DRILL_CASE_FILE = flag("--drill-case");
 const DEPLOYMENT_FILE = flag("--deployment");
 // The owner both contracts must have. Its value comes from SP's rc.8 owner table
 // (SuperPaymaster docs/security/rc8-owner-table.md), never from this file (DSR 2026-11-17).
@@ -238,6 +250,14 @@ if (argv.includes("--export-fraud-drill") && (!DRILL_FILE || DRILL_FILE.startsWi
   die("--export-fraud-drill needs an output file path");
 }
 if (DRILL_FILE && EXPORT_FILE) die("use --export-pop or --export-fraud-drill, not both");
+if (DRILL_CASE_FILE && !DRILL_FILE) die("--drill-case only goes with --export-fraud-drill");
+// The drill needs only an RPC URL. It refuses the DEFAULT env file (.env.sepolia, which holds
+// deployer keys in the shared Sepolia setup), and an inherited DVT_ENV_FILE does not count: drill
+// mode needs --env on the command line (Daybreak on #441, Low; Codex): pass an RPC-only file.
+if (DRILL_FILE && !flag("--env"))
+  die(
+    "--export-fraud-drill needs --env <an RPC-only env file>; it does not read the default .env.sepolia"
+  );
 if (DRILL_FILE && !ethers.isAddress(VERIFIER ?? ""))
   die("--export-fraud-drill needs --verifier <address>");
 if (
@@ -437,6 +457,8 @@ const DRILL_ABI = [
   "function domainSeparator() view returns (bytes32)",
   "function deriveFraudProofId(uint256) pure returns (uint256)",
   "function slashMessageHash(uint256,address,uint8,uint256,address) view returns (bytes32)",
+  "function VERIFIER_VERSION() view returns (string)",
+  "function COMMITMENT_BINDS_PARENT_BLOCKHASH() view returns (bool)",
 ];
 // Ascending by uint160, as the verifier requires. Slots 2, 1 and 3 in that order.
 const DRILL_GUARDIANS = [
@@ -453,9 +475,61 @@ const DRILL_MASK = 0x7n;
 async function exportFraudDrill({ provider, agg, owner, version, chainId, domainSep, coder }) {
   const label = s =>
     ethers.keccak256(ethers.toUtf8Bytes(`DVT_FRAUD_DRILL_V1:${s}:${AGGREGATOR.toLowerCase()}`));
-  const proposalId = BigInt(label("proposal"));
-  const operator = ethers.getAddress(ethers.dataSlice(label("operator"), 12));
-  const token = ethers.getAddress(ethers.dataSlice(label("token"), 12));
+  // Template mode: everything is derived from the aggregator address, and the fork must give the
+  // token code. Case mode (--drill-case): the fields of a slash that really executed.
+  let proposalId = BigInt(label("proposal"));
+  let operator = ethers.getAddress(ethers.dataSlice(label("operator"), 12));
+  let token = ethers.getAddress(ethers.dataSlice(label("token"), 12));
+  let slashLevel = DRILL_SLASH_LEVEL;
+  let epoch = DRILL_EPOCH;
+  let mask = DRILL_MASK;
+  let guardians = DRILL_GUARDIANS;
+  const caseMode = Boolean(DRILL_CASE_FILE);
+  if (caseMode) {
+    if (chainId !== 31337)
+      die(`--drill-case is for a local anvil (chain 31337) only; this RPC is chain ${chainId}`);
+    let c;
+    try {
+      c = JSON.parse(readFileSync(DRILL_CASE_FILE, "utf8"));
+    } catch (e) {
+      die(`cannot read --drill-case ${DRILL_CASE_FILE}: ${e.message}`);
+    }
+    const keys = [
+      "epoch",
+      "guardians",
+      "operator",
+      "proposalId",
+      "signerMask",
+      "slashLevel",
+      "token",
+    ];
+    if (
+      Object.keys(c ?? {})
+        .sort()
+        .join() !== keys.join()
+    )
+      die(`--drill-case must have exactly the keys ${keys.join(", ")}`);
+    const asBig = (v, k) => {
+      if (typeof v !== "string" || !/^[0-9]+$/.test(v))
+        die(`--drill-case ${k} must be a decimal string`);
+      return BigInt(v);
+    };
+    if (
+      ![c.operator, c.token, ...(Array.isArray(c.guardians) ? c.guardians : [null])].every(
+        x => typeof x === "string" && ethers.isAddress(x)
+      )
+    )
+      die("--drill-case operator, token and guardians must be addresses");
+    if (!Number.isInteger(c.slashLevel) || c.slashLevel < 0 || c.slashLevel > 255)
+      die("--drill-case slashLevel must be an integer 0..255");
+    proposalId = asBig(c.proposalId, "proposalId");
+    epoch = asBig(c.epoch, "epoch");
+    mask = asBig(c.signerMask, "signerMask");
+    operator = ethers.getAddress(c.operator);
+    token = ethers.getAddress(c.token);
+    slashLevel = c.slashLevel;
+    guardians = c.guardians.map(g => ethers.getAddress(g));
+  }
 
   const verifier = new ethers.Contract(VERIFIER, DRILL_ABI, provider);
   if ((await provider.getCode(VERIFIER)) === "0x") die(`no code at verifier ${VERIFIER}`);
@@ -486,8 +560,23 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
   }
   if (verifierDomain.toLowerCase() !== domainSep.toLowerCase())
     die("verifier and aggregator domain separators differ");
-  if ((await provider.getCode(token)) !== "0x")
+  if (!caseMode && (await provider.getCode(token)) !== "0x")
     die(`drill token address ${token} already has code on this chain`);
+  if (caseMode && (await provider.getCode(token)) === "0x")
+    die(`--drill-case token ${token} has no code: name the token of the slash that executed`);
+  // #441: only the parent-block-hash verifier can verify against BLSAggregator >= 4.13.0.
+  let binds = false;
+  try {
+    binds = await verifier.COMMITMENT_BINDS_PARENT_BLOCKHASH();
+  } catch {
+    /* pre-#441 verifier: no marker */
+  }
+  if (!binds) {
+    die(
+      `${VERIFIER} has no COMMITMENT_BINDS_PARENT_BLOCKHASH() == true: it predates #441 and cannot verify a\n` +
+        `  4.13.0+ commitment. Deploy the #441 verifier (VERIFIER_VERSION "OverIssueFraudProofVerifier-3.0.0").`
+    );
+  }
 
   const artifactPath = resolve(
     dirname(fileURLToPath(import.meta.url)),
@@ -504,35 +593,28 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
   const messageHash = await verifier.slashMessageHash(
     proposalId,
     operator,
-    DRILL_SLASH_LEVEL,
-    DRILL_EPOCH,
+    slashLevel,
+    epoch,
     token
   );
-  const commitment = ethers.keccak256(
+  // #441: the drill no longer writes a commitment into fork storage. A value poked into storage
+  // makes the drill pass by construction and proves nothing; on 4.14.0 the commitment also binds
+  // blockhash(executionBlock - 1), which only a real execution produces. The fork must execute the
+  // slash through the aggregator, then fill parentBlockHash from that execution's parent block.
+  const PARENT_PLACEHOLDER = "0x" + "00".repeat(32);
+  const encodeProof = (m, parent = PARENT_PLACEHOLDER) =>
     coder.encode(
-      ["bytes32", "bytes32", "uint256", "bytes32", "uint256", "address[]"],
-      [
-        domainSep,
-        ethers.id("SuperPaymaster.BLS.SignersCommitment.v1"),
-        proposalId,
-        messageHash,
-        DRILL_MASK,
-        DRILL_GUARDIANS,
-      ]
-    )
-  );
-  const encodeProof = mask =>
-    coder.encode(
-      ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]"],
-      [proposalId, operator, DRILL_SLASH_LEVEL, DRILL_EPOCH, token, mask, DRILL_GUARDIANS]
+      ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]", "bytes32"],
+      [proposalId, operator, slashLevel, epoch, token, m, guardians, parent]
     );
-  const proof = encodeProof(DRILL_MASK);
-  const digest = await agg.fraudProofDigest(fraudProofId, DRILL_GUARDIANS);
+  const proof = encodeProof(mask);
+  const digest = await agg.fraudProofDigest(fraudProofId, guardians);
   const flipped = ethers.getBytes(digest);
   flipped[31] ^= 1;
 
   const drill = {
-    purpose: "fork rehearsal only; contains no signature",
+    purpose:
+      "fork rehearsal only; contains no signature; fraudProof fields are templates until the fork executes the slash (#441)",
     chainId,
     aggregator: AGGREGATOR,
     version,
@@ -546,8 +628,10 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
       commitment: {
         mapping: "proposalSignersCommitment",
         key: proposalId.toString(),
-        value: commitment,
-        check: "proposalSignersCommitment(key) must read back as value, otherwise stop",
+        produce:
+          "execute the slash for (proposalId, operator, slashLevel, epoch, evidence of token) through the aggregator's real execute path; never write this slot directly",
+        check: "proposalSignersCommitment(key) is non-zero after that execution, otherwise stop",
+        messageHash,
       },
     },
     valid: {
@@ -555,34 +639,48 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
       expect: "succeeds and emits GuardianSlashQueued",
       proposalId: proposalId.toString(),
       fraudProofId: fraudProofId.toString(),
-      guiltyGuardians: DRILL_GUARDIANS,
+      guiltyGuardians: guardians,
       fraudProof: proof,
+      // Field 8 is ABI head word 7 (bytes 224-255), NOT the last 32 bytes: the dynamic
+      // guardian array is encoded after it (Codex on #441 part 2).
+      fraudProofNote:
+        "TEMPLATE: field 8 of 8 (parentBlockHash) is zero. Decode fraudProof with fraudProofTypes, set field 8 to blockhash(executionBlock - 1) of the fork execution above, and re-encode. Do not patch the last 32 bytes: the guardian array is encoded after it. The verifier refuses a zero parent hash",
+      fraudProofTypes: [
+        "uint256",
+        "address",
+        "uint8",
+        "uint256",
+        "address",
+        "uint256",
+        "address[]",
+        "bytes32",
+      ],
       domainDigest: digest,
-      signerMask: ethers.toBeHex(DRILL_MASK),
+      signerMask: ethers.toBeHex(mask),
       operator,
-      slashLevel: DRILL_SLASH_LEVEL,
-      epoch: DRILL_EPOCH.toString(),
+      slashLevel,
+      epoch: epoch.toString(),
     },
     mustReject: [
       {
         id: "N1",
         change: "one guardian removed",
-        guiltyGuardians: DRILL_GUARDIANS.slice(0, -1),
+        guiltyGuardians: guardians.slice(0, -1),
         fraudProof: proof,
         expect: "queueGuardianSlash reverts InvalidFraudProof",
       },
       {
         id: "N2",
         change: "set token storage slot 0 to 1 (over-issued), same proof",
-        guiltyGuardians: DRILL_GUARDIANS,
+        guiltyGuardians: guardians,
         fraudProof: proof,
         expect: "queueGuardianSlash reverts InvalidFraudProof",
       },
       {
         id: "N3",
         change: "signerMask in the proof differs by one bit",
-        guiltyGuardians: DRILL_GUARDIANS,
-        fraudProof: encodeProof(DRILL_MASK ^ 1n),
+        guiltyGuardians: guardians,
+        fraudProof: encodeProof(mask ^ 1n),
         expect: "queueGuardianSlash reverts InvalidFraudProof",
       },
       {
@@ -591,7 +689,7 @@ async function exportFraudDrill({ provider, agg, owner, version, chainId, domain
           "digest differs by one bit; call the verifier directly because the aggregator computes its own digest",
         call: "verifier.verify(domainDigest, fraudProofId, guiltyGuardians, fraudProof)",
         domainDigest: ethers.hexlify(flipped),
-        guiltyGuardians: DRILL_GUARDIANS,
+        guiltyGuardians: guardians,
         fraudProof: proof,
         expect: "returns false",
       },
@@ -945,8 +1043,8 @@ async function main() {
   // EVERY READ OF THE REGISTRATION PATH (dry run and --export-pop) IS AT ONE BLOCK (Daybreak on
   // 63a484d0, M3; DSR 2026-11-18). The gates then describe one state, and the export records that
   // block's number and hash plus the reads the gates relied on, so the SAFE signers can re-run the
-  // export just before executing and compare. --export-fraud-drill, already stale against 4.14.0
-  // (#441), is NOT covered: its own reads after gate 5 use the latest block (Codex, Low).
+  // export just before executing and compare. --export-fraud-drill is NOT covered: its own reads
+  // after gate 5 use the latest block (Codex, Low).
   const basis = await provider.getBlock("latest");
   if (!basis || basis.hash == null) die("cannot read the latest block to pin the reads to");
   const AT = { blockTag: basis.number };
