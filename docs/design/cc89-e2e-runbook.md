@@ -6,6 +6,17 @@
 > four-parameter verifier seam and the queue-then-execute slash lifecycle.
 > Companion to `cc89-stage2-shipping-plan.md` (the shipping plan) and
 > `guardian-collusion-slash.md` (stage-0 threat model + A' spec).
+>
+> **#441 update (2026-11-18), verifier `OverIssueFraudProofVerifier-3.0.0` on SP
+> BLSAggregator >= 4.14.0:** the evidence hash follows the `OverIssue.v1`
+> category rule (below); the `fraudProof` has an eighth field, the parent block
+> hash `blockhash(executionBlock - 1)`; and a slash normally arrives through
+> `DVTValidator.executeWithProof`, which the watcher decodes. Where the sections
+> below show the seven-field `fraudProof` or a direct `verifyAndExecute` call,
+> they describe the 4.11 verifier. The current encoder is
+> `src/modules/audit/guardian-fraud-proof.ts`; the current rehearsal is
+> `deploy/rehearse-guardian-slash.sh`. The deploy script refuses non-testnet
+> chains until #447.
 
 ## The chain (who does what)
 
@@ -47,9 +58,10 @@
 The disputed slash MUST be filed as a **pure over-issue slash** so the DVT
 verifier can reconstruct its message:
 
-- `evidenceHash = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", token, operator, epoch))`
-  (`overIssueEvidenceHash` in `guardian-fraud-proof.ts`;
-  `OVERISSUE_EVIDENCE_TAG` in the verifier).
+- `evidenceHash = keccak256(abi.encode(TAG_EVIDENCE, keccak256("DVT.Evidence.OverIssue.v1"), keccak256(abi.encode(token, operator, epoch))))`
+  (`overIssueEvidenceHash` in `guardian-fraud-proof.ts`; `TAG_EVIDENCE` and
+  `OVERISSUE_CATEGORY` in the verifier, 3.0.0). The 4.11-era verifier used
+  `keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", token, operator, epoch))`.
 - **`repUsers` AND `newScores` both empty** — the slash-only branch (8-field
   messageHash committing `evidenceHash` + chainid). A non-empty rep array
   changes the messageHash → the verifier rejects.

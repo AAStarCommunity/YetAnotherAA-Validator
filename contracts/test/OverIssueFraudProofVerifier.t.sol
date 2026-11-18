@@ -14,6 +14,18 @@ import {FraudProofVerifierConformance as Conformance} from "./helpers/FraudProof
 ///      TAG_SIGNERS_COMMITMENT :247, TAG_FRAUD_PROOF :248, domainSeparator() :255, fraudProofDigest()
 ///      :265, execute-slash message :977, _computeSignersCommitment :1299.
 ///      `signers` MUST be pre-sorted ascending by uint160.
+/// The over-issue evidenceHash under the M0 §3.1 category rule, built inline from its definition
+/// (never via the verifier): the filer, DVTValidator-0.9.0 and the verifier must all agree on it.
+function _ovEvidenceHash(address token_, address operator_, uint256 epoch_) pure returns (bytes32) {
+    return keccak256(
+        abi.encode(
+            keccak256("SuperPaymaster.DVT.Evidence.v2"),
+            keccak256("DVT.Evidence.OverIssue.v1"),
+            keccak256(abi.encode(token_, operator_, epoch_))
+        )
+    );
+}
+
 contract MockAggregator {
     mapping(uint256 => bytes32) public proposalSignersCommitment;
 
@@ -56,8 +68,26 @@ contract MockAggregator {
         );
     }
 
-    /// @notice Record an A' commitment in the CURRENT SP layout (BLSAggregator.sol:1299).
-    function recordSP(uint256 proposalId, bytes32 messageHash, uint256 signerMask, address[] memory sortedSigners)
+    /// @notice Record an A' commitment in the CURRENT SP layout: BLSAggregator-4.14.0
+    ///         (SP #630, BLSAggregator.sol:1376-1388), which ends with blockhash(block.number - 1).
+    ///         The parent hash is a parameter so the fixtures are deterministic (#441).
+    function recordSP(
+        uint256 proposalId,
+        bytes32 messageHash,
+        uint256 signerMask,
+        address[] memory sortedSigners,
+        bytes32 parentBlockHash
+    ) external {
+        proposalSignersCommitment[proposalId] = keccak256(
+            abi.encode(
+                domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, sortedSigners, parentBlockHash
+            )
+        );
+    }
+
+    /// @notice Record a commitment in the 4.11 layout (no parent block hash). Exists ONLY to prove the
+    ///         #441 verifier REJECTS it.
+    function recordSP411(uint256 proposalId, bytes32 messageHash, uint256 signerMask, address[] memory sortedSigners)
         external
     {
         proposalSignersCommitment[proposalId] = keccak256(
@@ -119,6 +149,8 @@ contract OverIssueFraudProofVerifierTest is Test {
     uint256 internal constant EPOCH = 1000;
     uint256 internal constant PROPOSAL_ID = 42;
     uint256 internal constant SIGNER_MASK = 0x7; // bits 1,2,3
+    /// blockhash(executionBlock - 1) in the fixtures (#441, SP BLSAggregator-4.14.0 commitment layout).
+    bytes32 internal constant PARENT = 0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a;
 
     function setUp() public {
         agg = new MockAggregator(REGISTRY);
@@ -135,11 +167,12 @@ contract OverIssueFraudProofVerifierTest is Test {
         a[2] = S3;
     }
 
-    /// The DVT over-issue evidence convention (keccak256(abi.encode(TAG, token, operator, epoch))).
-    /// Computed inline — a genuinely SHARED cross-repo value both filer and verifier must agree on —
+    /// The over-issue evidenceHash under the M0 §3.1 category rule (DVTValidator-0.9.0):
+    /// keccak256(abi.encode(TAG_EVIDENCE, keccak256("DVT.Evidence.OverIssue.v1"),
+    ///                      keccak256(abi.encode(token, operator, epoch)))). Computed inline — a genuinely SHARED cross-repo value both filer and verifier must agree on —
     /// so the mock never calls the verifier to obtain it (Codex MEDIUM #3 independence).
     function _evidenceHash(address disputedToken) internal pure returns (bytes32) {
-        return keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", disputedToken, OPERATOR, EPOCH));
+        return _ovEvidenceHash(disputedToken, OPERATOR, EPOCH);
     }
 
     /// SP execute-slash messageHash (current 4.11 layout), built independently via the mock.
@@ -166,11 +199,19 @@ contract OverIssueFraudProofVerifierTest is Test {
     /// records the commitment for a slash over `disputedToken` in the CURRENT SP layout, computed by
     /// the mock independently of the verifier (so a verifier format regression is NOT masked).
     function _record(address[] memory signers, address disputedToken) internal {
-        agg.recordSP(PROPOSAL_ID, _spMessageHash(disputedToken), SIGNER_MASK, signers);
+        agg.recordSP(PROPOSAL_ID, _spMessageHash(disputedToken), SIGNER_MASK, signers, PARENT);
     }
 
     function _proof(address[] memory claimedSigners, address disputedToken) internal pure returns (bytes memory) {
-        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, disputedToken, SIGNER_MASK, claimedSigners);
+        return _proofWith(claimedSigners, disputedToken, PARENT);
+    }
+
+    function _proofWith(address[] memory claimedSigners, address disputedToken, bytes32 parent)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, disputedToken, SIGNER_MASK, claimedSigners, parent);
     }
 
     function _fpid() internal view returns (uint256) {
@@ -189,6 +230,37 @@ contract OverIssueFraudProofVerifierTest is Test {
         token.setOver(false); // NOT over-issued ⇒ the over-issue slash was fraudulent
         address[] memory guilty = _claimed(); // SET-EXACT: the whole signer set colluded
         assertTrue(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, _proof(_claimed(), address(token))));
+    }
+
+    /// SP BLSAggregator.MAX_VALIDATORS is 64 (4.14.x, BLSAggregator.sol:224), so a slash signed by
+    /// guardians in slots 14..64 must be provable (clestons #468: the bound was 13).
+    function _manySigners(uint256 n) internal pure returns (address[] memory a, uint256 mask) {
+        a = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            a[i] = address(uint160(0x10000 + i)); // strictly ascending, non-zero
+            mask |= uint256(1) << i; // slot i+1
+        }
+    }
+
+    function _verifyMany(uint256 n) internal returns (bool) {
+        (address[] memory signers, uint256 mask) = _manySigners(n);
+        agg.recordSP(PROPOSAL_ID, _spMessageHash(address(token)), mask, signers, PARENT);
+        token.setOver(false);
+        bytes memory proof =
+            abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token), mask, signers, PARENT);
+        return verifier.verify(_digest(_fpid(), signers), _fpid(), signers, proof);
+    }
+
+    function test_HappyPath_FourteenSigners_IncludingSlot14() public {
+        assertTrue(_verifyMany(14));
+    }
+
+    function test_HappyPath_SixtyFourSigners_TheAggregatorMaximum() public {
+        assertTrue(_verifyMany(64));
+    }
+
+    function test_Reject_SixtyFiveSigners_AboveTheAggregatorMaximum() public {
+        assertFalse(_verifyMany(65));
     }
 
     /// The verifier's reconstructed digest is byte-identical to the aggregator's — the conformance
@@ -444,6 +516,66 @@ contract OverIssueFraudProofVerifierTest is Test {
         assertTrue(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, _proof(_claimed(), address(token))));
     }
 
+    /// #441: a commitment in the 4.11 layout (no parent block hash) is rejected, even with an
+    /// otherwise perfect proof. This is the layout the pre-#441 verifier reconstructed.
+    function test_441_Layout411Commitment_Rejected() public {
+        agg.recordSP411(PROPOSAL_ID, _spMessageHash(address(token)), SIGNER_MASK, _claimed());
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, _proof(_claimed(), address(token))));
+    }
+
+    /// #441: the parent block hash is load-bearing. A proof with a different one does not reproduce
+    /// the stored commitment.
+    function test_441_WrongParentBlockHash_Rejected() public {
+        _record(_claimed(), address(token));
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        bytes memory p = _proofWith(_claimed(), address(token), bytes32(uint256(PARENT) ^ 1));
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, p));
+    }
+
+    /// #441: a zero parent block hash is refused outright.
+    function test_441_ZeroParentBlockHash_Rejected() public {
+        agg.recordSP(PROPOSAL_ID, _spMessageHash(address(token)), SIGNER_MASK, _claimed(), bytes32(0));
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        bytes memory p = _proofWith(_claimed(), address(token), bytes32(0));
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, p));
+    }
+
+    /// #441: a proof in the old 7-field shape (no parent block hash) is refused, not misread.
+    function test_441_SevenFieldProof_Rejected() public {
+        _record(_claimed(), address(token));
+        token.setOver(false);
+        address[] memory guilty = _claimed();
+        bytes memory p = abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token), SIGNER_MASK, _claimed());
+        assertFalse(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, p));
+    }
+
+    /// #441: the build marker SP's manifest reads.
+    function test_441_BuildMarker() public view {
+        assertEq(verifier.VERIFIER_VERSION(), "OverIssueFraudProofVerifier-3.0.0");
+        assertTrue(verifier.COMMITMENT_BINDS_PARENT_BLOCKHASH());
+    }
+
+    /// 3.0.0: the evidence follows the M0 §3.1 category rule DVTValidator-0.9.0 recomputes, with the
+    /// proposed OverIssue.v1 body; the 2.0.0 pre-image no longer matches.
+    function test_Evidence_FollowsCategoryRule() public view {
+        address t = address(token);
+        assertEq(verifier.TAG_EVIDENCE(), keccak256("SuperPaymaster.DVT.Evidence.v2"), "TAG_EVIDENCE");
+        assertEq(verifier.OVERISSUE_CATEGORY(), keccak256("DVT.Evidence.OverIssue.v1"), "category");
+        assertEq(verifier.evidenceHash(t, OPERATOR, EPOCH), _ovEvidenceHash(t, OPERATOR, EPOCH), "evidenceHash");
+        (bytes32 c, bytes memory body) = abi.decode(verifier.evidence(t, OPERATOR, EPOCH), (bytes32, bytes));
+        assertEq(c, keccak256("DVT.Evidence.OverIssue.v1"), "evidence category");
+        assertEq(body, abi.encode(t, OPERATOR, EPOCH), "evidence body");
+        assertTrue(
+            verifier.evidenceHash(t, OPERATOR, EPOCH)
+                != keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", t, OPERATOR, EPOCH)),
+            "2.0.0 pre-image must not match"
+        );
+    }
+
     function test_OldFormatCommitment_Rejected() public {
         // Obsolete pre-4.11 commitment (string tag + raw chainid/aggregator, old empty-array message).
         agg.recordOldFormat(PROPOSAL_ID, _oldMessageHash(address(token)), SIGNER_MASK, _claimed());
@@ -492,7 +624,9 @@ contract OverIssueFraudProofVerifierTest is Test {
         address goldenToken = address(0xBEEF);
 
         bytes32 mh = gv.slashMessageHash(42, OPERATOR, 2, 1000, goldenToken);
-        assertEq(mh, bytes32(0x7e794aa98ce38cd7e22a456963f67a1a7de057e15ee261a62373af7516cb820d), "messageHash");
+        // 3.0.0 evidence rule (OverIssue.v1 category). Recomputed independently with `cast abi-encode` +
+        // `cast keccak`; the same method reproduces 2.0.0's goldens 0x7e794aa9… / 0xc625f313….
+        assertEq(mh, bytes32(0xbb533ecaa9492a031d8b2cedf23bd7ac1728776e03e86332efdaf50da1dd84d6), "messageHash");
 
         address[] memory signers = new address[](3);
         signers[0] = S1;
@@ -505,10 +639,13 @@ contract OverIssueFraudProofVerifierTest is Test {
                 uint256(42),
                 mh,
                 uint256(0x7),
-                signers
+                signers,
+                PARENT
             )
         );
-        assertEq(commitment, bytes32(0xb35d1e5b965d5a628e796f584596cf57080b6b00f9c566226adf70990db15ad4), "commitment");
+        // 4.14.0 layout with PARENT (#441). Recomputed independently with `cast abi-encode` + `cast keccak`;
+        // the same method reproduces the old 4.11 golden 0xb35d1e5b…, and the TS suite pins the same hex.
+        assertEq(commitment, bytes32(0x5b15a0d0e5ab230f8accd36c14a9878f4acb351b38d96ad3bfbf20a86d0e5d06), "commitment");
     }
 
     // ---- (CRITICAL #2 disclosure) current-token-state limitation, documented as a test ----
@@ -568,6 +705,8 @@ contract OverIssueFraudProofVerifierConformanceTest is Test {
     uint256 internal constant EPOCH = 1000;
     uint256 internal constant PROPOSAL_ID = 42;
     uint256 internal constant SIGNER_MASK = 0x7;
+    /// blockhash(executionBlock - 1) in the fixtures (#441, SP BLSAggregator-4.14.0 commitment layout).
+    bytes32 internal constant PARENT = 0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a;
 
     function setUp() public {
         aggA = new MockAggregator(REGISTRY);
@@ -578,9 +717,9 @@ contract OverIssueFraudProofVerifierConformanceTest is Test {
 
         // Record the A' commitment on aggA for the exact claimed signer set, in the CURRENT SP layout,
         // built independently of the verifier (Codex MEDIUM #3).
-        bytes32 evidence = keccak256(abi.encode("DVT_OVERISSUE_EVIDENCE_V1", address(token), OPERATOR, EPOCH));
-        bytes32 mh = aggA.slashMessage(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, evidence);
-        aggA.recordSP(PROPOSAL_ID, mh, SIGNER_MASK, _claimed());
+        bytes32 evidenceH = _ovEvidenceHash(address(token), OPERATOR, EPOCH);
+        bytes32 mh = aggA.slashMessage(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, evidenceH);
+        aggA.recordSP(PROPOSAL_ID, mh, SIGNER_MASK, _claimed(), PARENT);
     }
 
     function _claimed() internal pure returns (address[] memory a) {
@@ -595,7 +734,7 @@ contract OverIssueFraudProofVerifierConformanceTest is Test {
     }
 
     function _proof() internal view returns (bytes memory) {
-        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token), SIGNER_MASK, _claimed());
+        return abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token), SIGNER_MASK, _claimed(), PARENT);
     }
 
     /// SP release gate 1: domain binding.

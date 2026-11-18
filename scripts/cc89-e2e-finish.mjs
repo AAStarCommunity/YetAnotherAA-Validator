@@ -14,6 +14,16 @@
 import { ethers } from "ethers";
 import { readFileSync } from "fs";
 
+// HISTORICAL (clestons #468). This finisher speaks the SP 4.11 seam: a seven-field fraudProof, the
+// DVT_OVERISSUE_EVIDENCE_V1 evidence hash and the three-argument verify(). Verifier 3.0.0 on SP >= 4.14
+// needs the eighth field (the parent block hash) and the OverIssue.v1 category rule, so this script
+// would only ever fail its preflight there. It refuses to start rather than load a key for that.
+// The current path is deploy/rehearse-guardian-slash.sh.
+console.error(
+  "cc89-e2e-finish.mjs is historical (SP 4.11, verifier 1.x) and refuses to run; use deploy/rehearse-guardian-slash.sh"
+);
+process.exit(1);
+
 const RPC = process.env.SEPOLIA_RPC_URL;
 const AGG = process.env.AGGREGATOR;
 const VERIFIER = process.env.VERIFIER;

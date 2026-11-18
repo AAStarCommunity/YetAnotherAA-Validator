@@ -12,7 +12,7 @@ import {MockAggregator} from "./OverIssueFraudProofVerifier.t.sol";
 ///      re-implementation of SP's published layout rather than being copied a second time here.
 contract ScriptMockAggregator is MockAggregator {
     uint256 internal rotationDelay;
-    string internal reportedVersion = "BLSAggregator-4.11.0";
+    string internal reportedVersion = "BLSAggregator-4.14.0";
     address public fraudProofVerifier;
     address public pendingFraudProofVerifier;
     uint64 public pendingFraudProofVerifierReadyAt;
@@ -60,7 +60,7 @@ contract DivergentDomainMockAggregator {
     }
 
     function version() external pure returns (string memory) {
-        return "BLSAggregator-4.11.0";
+        return "BLSAggregator-4.14.0";
     }
 
     function VERIFIER_ROTATION_DELAY() external pure returns (uint256) {
@@ -184,7 +184,7 @@ contract DeployOverIssueVerifierScriptTest is Test {
             aggregator: aggregator,
             expectedAggregator: aggregator,
             allowUnverifiedAggregator: false,
-            expectedAggregatorVersion: "" // falls through to SUPPORTED_AGGREGATOR_VERSION
+            expectedAggregatorVersion: "BLSAggregator-4.14.0" // the mock's default version()
         });
     }
 
@@ -288,21 +288,16 @@ contract DeployOverIssueVerifierScriptTest is Test {
         deployScript.deploy(_config(address(agg)));
     }
 
-    /// @notice 4.13.0+ changed the signer commitment (key + anchor); this verifier can never verify
-    ///         there, so not even an explicit EXPECTED_AGGREGATOR_VERSION may deploy against it.
-    function test_Deploy_RefusesAnchoredReleaseEvenWhenExpected() public {
+    /// @notice #441: the parent-block-hash verifier deploys against the anchored releases (>= 4.14.0)
+    ///         when they are named explicitly.
+    function test_Deploy_AcceptsAnchoredReleaseWhenExpected() public {
         string[4] memory vs =
-            ["BLSAggregator-4.13.0", "BLSAggregator-4.13.1-rc", "BLSAggregator-4.20.0", "BLSAggregator-5.0.0"];
+            ["BLSAggregator-4.14.0", "BLSAggregator-4.14.2-rc", "BLSAggregator-4.20.0", "BLSAggregator-5.0.0"];
         for (uint256 i = 0; i < vs.length; i++) {
             ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 5 days);
             agg.setVersion(vs[i]);
             DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
             cfg.expectedAggregatorVersion = vs[i];
-            vm.expectRevert(
-                bytes(
-                    "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
-                )
-            );
             deployScript.deploy(cfg);
         }
     }
@@ -336,17 +331,22 @@ contract DeployOverIssueVerifierScriptTest is Test {
             cfg.expectedAggregatorVersion = vs[i];
             vm.expectRevert(
                 bytes(
-                    "AGGREGATOR is BLSAggregator >= 4.13.0 (anchored signer commitment): this verifier predates it and can never verify there"
+                    "AGGREGATOR.version() is not a well-formed BLSAggregator-<major>.<minor>.<patch>[-suffix]: refusing"
                 )
             );
             deployScript.deploy(cfg);
         }
     }
 
-    /// @notice Well-formed pre-4.13 releases still deploy when named explicitly (the gate is not a
-    ///         blanket refusal).
-    function test_Deploy_AcceptsWellFormedOldReleaseWhenExpected() public {
-        string[6] memory vs = [
+    /// @notice #441: well-formed pre-4.14 releases are refused even when named explicitly: their
+    ///         commitment has no parent block hash, so this verifier can never verify there. 4.13.x
+    ///         keyed the commitment per path but had no parent block hash (Daybreak on #441, Medium).
+    function test_Deploy_RefusesPreAnchorReleaseEvenWhenExpected() public {
+        string[10] memory vs = [
+            "BLSAggregator-4.14.0-rc.1", // a pre-release of the floor sorts below it (clestons #468)
+            "BLSAggregator-4.14.0-0",
+            "BLSAggregator-4.13.0",
+            "BLSAggregator-4.13.9-rc",
             "BLSAggregator-4.12.0",
             "BLSAggregator-4.12.3-rc1",
             "BLSAggregator-4.0.0",
@@ -359,29 +359,40 @@ contract DeployOverIssueVerifierScriptTest is Test {
             agg.setVersion(vs[i]);
             DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
             cfg.expectedAggregatorVersion = vs[i];
+            vm.expectRevert(
+                bytes(
+                    "AGGREGATOR is BLSAggregator < 4.14.0 (no parent-block-hash commitment): this verifier can never verify there"
+                )
+            );
             deployScript.deploy(cfg);
         }
+        // The release the pre-#441 verifier was built for is refused too.
+        ScriptMockAggregator old = new ScriptMockAggregator(REGISTRY, 4 days);
+        old.setVersion("BLSAggregator-4.11.0");
+        DeployOverIssueVerifier.DeployConfig memory oc = _config(address(old));
+        oc.expectedAggregatorVersion = "BLSAggregator-4.11.0";
+        vm.expectRevert(bytes("AGGREGATOR is BLSAggregator < 4.14.0 (no parent-block-hash commitment): this verifier can never verify there"));
+        deployScript.deploy(oc);
     }
 
     /// @notice ...and the operator can accept that newer release only by naming it explicitly.
     function test_Deploy_AcceptsNewerVersionWhenExplicitlyExpected() public {
         ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
-        agg.setVersion("BLSAggregator-4.12.0");
+        agg.setVersion("BLSAggregator-4.14.1");
         DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
-        cfg.expectedAggregatorVersion = "BLSAggregator-4.12.0";
+        cfg.expectedAggregatorVersion = "BLSAggregator-4.14.1";
         deployScript.deploy(cfg);
     }
 
     /// @notice An empty override can never DISABLE the check — it falls through to the pinned default.
-    function test_Deploy_EmptyExpectedVersionFallsThroughToPin() public {
+    /// @notice #441: no release is pinned in the script, so an empty expected version is refused
+    ///         rather than falling through to a default (DSR 2026-11-17).
+    function test_Deploy_RefusesEmptyExpectedVersion() public {
         ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
-        agg.setVersion("");
         DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
         cfg.expectedAggregatorVersion = "";
         vm.expectRevert(
-            bytes(
-                "AGGREGATOR.version() != expected: re-verify the fraud-proof ABI and the arming path for that release, then set EXPECTED_AGGREGATOR_VERSION"
-            )
+            bytes("EXPECTED_AGGREGATOR_VERSION is required: the exact version() of the aggregator being bound")
         );
         deployScript.deploy(cfg);
     }
@@ -455,6 +466,24 @@ contract DeployOverIssueVerifierScriptTest is Test {
         deployScript.deploy(cfg);
     }
 
+    /// @notice Testnets only until #447 (clestons #468): a mainnet chain id is refused even when the
+    ///         operator names it as the expected chain. 31337 (this test) is allowed.
+    function test_Deploy_RefusesNonTestnetChains() public {
+        uint256[4] memory ids = [uint256(1), 10, 8453, 42161];
+        for (uint256 i = 0; i < ids.length; i++) {
+            vm.chainId(ids[i]);
+            ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
+            DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
+            cfg.expectedChainId = ids[i];
+            vm.expectRevert(
+                bytes(
+                    "testnets only until #447: the verifier reads the token's current isOverIssued(), not its historical state"
+                )
+            );
+            deployScript.deploy(cfg);
+        }
+    }
+
     /// @notice Wrong-RPC guard still fires ahead of any deployment.
     function test_Deploy_RevertsOnWrongChain() public {
         ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
@@ -462,5 +491,30 @@ contract DeployOverIssueVerifierScriptTest is Test {
         cfg.expectedChainId = block.chainid + 1;
         vm.expectRevert(bytes("wrong chain: set EXPECTED_CHAIN_ID for this RPC"));
         deployScript.deploy(cfg);
+    }
+}
+
+/// @notice Exposes the canonical-pin precedence (Daybreak on #441, Medium), which `deploy` uses with
+///         the compiled CANONICAL_AGGREGATOR (zero today), so the nonzero case can be tested.
+contract ExpectedAggregatorHarness is DeployOverIssueVerifier {
+    function expectedAggregator(address envExpected, address canonical) external pure returns (address) {
+        return _expectedAggregator(envExpected, canonical);
+    }
+}
+
+contract ExpectedAggregatorPrecedenceTest is Test {
+    ExpectedAggregatorHarness internal h = new ExpectedAggregatorHarness();
+    address internal constant CANON = address(0xC0FFEE);
+
+    function test_CanonicalWins_EnvMayOnlyRepeatIt() public {
+        assertEq(h.expectedAggregator(address(0), CANON), CANON, "zero env falls through to the constant");
+        assertEq(h.expectedAggregator(CANON, CANON), CANON, "an env equal to the constant is fine");
+        vm.expectRevert(bytes("EXPECTED_AGGREGATOR differs from the compiled CANONICAL_AGGREGATOR: the constant wins"));
+        h.expectedAggregator(address(0xBAD), CANON);
+    }
+
+    function test_EnvDecidesWhileTheConstantIsZero() public view {
+        assertEq(h.expectedAggregator(address(0xABC), address(0)), address(0xABC));
+        assertEq(h.expectedAggregator(address(0), address(0)), address(0));
     }
 }

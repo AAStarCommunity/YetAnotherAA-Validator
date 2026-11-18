@@ -128,13 +128,27 @@ export function signersCommitment(
   proposalId: bigint,
   messageHash: string,
   signerMask: bigint,
-  signers: string[]
+  signers: string[],
+  parentBlockHash: string
 ): string {
   assertCanonicalSigners(signers);
+  // BLSAggregator-4.14.0 (SP #630) ends the pre-image with blockhash(block.number - 1) of the block
+  // that executed the slash (#441). Without it no 4.14.0+ commitment can be reproduced.
+  if (!/^0x[0-9a-fA-F]{64}$/.test(parentBlockHash) || /^0x0{64}$/.test(parentBlockHash)) {
+    throw new Error(`parentBlockHash must be a non-zero 32-byte hash, got ${parentBlockHash}`);
+  }
   return ethers.keccak256(
     ABI.encode(
-      ["bytes32", "bytes32", "uint256", "bytes32", "uint256", "address[]"],
-      [domainSeparator(d), TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, signers]
+      ["bytes32", "bytes32", "uint256", "bytes32", "uint256", "address[]", "bytes32"],
+      [
+        domainSeparator(d),
+        TAG_SIGNERS_COMMITMENT,
+        proposalId,
+        messageHash,
+        signerMask,
+        signers,
+        parentBlockHash,
+      ]
     )
   );
 }

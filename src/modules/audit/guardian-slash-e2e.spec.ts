@@ -33,6 +33,8 @@ const PID = 42n;
 const LEVEL = 2;
 const EPOCH = 1000n;
 const MASK = 0x7n;
+// blockhash(executionBlock - 1) in the fixtures (#441, SP BLSAggregator-4.14.0 commitment layout).
+const PARENT = "0x" + "5a".repeat(32);
 const TX_HASH = "0x" + "ab".repeat(32);
 const EXEC_BLOCK = 500;
 
@@ -45,7 +47,9 @@ const EVIDENCE = overIssueEvidenceHash(TOKEN, OPERATOR, EPOCH);
 // level=2, epoch=1000, token=…beef, mask=0x7, signers=[S1,S2,S3]. (The TS↔Solidity byte-alignment
 // itself is pinned by the golden vector shared between guardian-fraud-proof.spec.ts and
 // OverIssueFraudProofVerifier.t.sol.)
-const ON_CHAIN_COMMITMENT = "0x6861ffee36303335eaf09555377d293f8ce39694b34e1badb56da95ed112fe8a";
+// 4.14.0 layout with PARENT (#441) and the verifier-3.0.0 OverIssue.v1 evidence rule; recomputed
+// independently with cast (2.0.0 value 0xd8896b47…, old 4.11 value 0x6861ffee…).
+const ON_CHAIN_COMMITMENT = "0x55761c46fb62598dd036c840835da80bc16d18ce99bd2ab7d631c01b1bd5a11c";
 
 const va = new ethers.Interface([
   "function validatorAtSlot(uint8 slot) view returns (address)",
@@ -61,9 +65,10 @@ class MockProvider {
   async resolveName(n: string): Promise<string> {
     return n;
   }
-  async getTransaction(): Promise<{ data: string }> {
+  async getTransaction(): Promise<{ to: string; data: string }> {
     const iface = new ethers.Interface([VERIFY_AND_EXECUTE_ABI]);
     return {
+      to: AGG, // a direct call to the aggregator (the watcher dispatches on tx.to)
       data: iface.encodeFunctionData("verifyAndExecute", [
         PID,
         OPERATOR,
@@ -76,8 +81,10 @@ class MockProvider {
       ]),
     };
   }
-  async getBlock(): Promise<{ timestamp: number }> {
-    return { timestamp: 1_700_000_000 };
+  // Block-sensitive (clestons #468): only block EXEC_BLOCK - 1 carries PARENT.
+  async getBlock(n: number): Promise<{ timestamp: number; hash: string }> {
+    const hash = n === EXEC_BLOCK - 1 ? PARENT : ethers.keccak256(ethers.toBeHex(n, 32));
+    return { timestamp: 1_700_000_000, hash };
   }
   async call(tx: { data: string }): Promise<string> {
     const sel = tx.data.slice(0, 10);
@@ -101,7 +108,8 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
         PID,
         overIssueSlashMessageHash(DOMAIN, PID, OPERATOR, LEVEL, EPOCH, TOKEN),
         MASK,
-        [S1, S2, S3]
+        [S1, S2, S3],
+        PARENT
       )
     ).toBe(ON_CHAIN_COMMITMENT);
   });
@@ -131,10 +139,12 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
 
     // LOAD-BEARING E2E INVARIANT — decode the assembled fraudProof and independently recompute the
     // commitment the on-chain verifier will derive from it; it MUST equal the stored A' commitment.
-    const [pid, op, level, epoch, token, mask, claimed] = coder.decode(
-      ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]"],
+    const [pid, op, level, epoch, token, mask, claimed, parent] = coder.decode(
+      ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]", "bytes32"],
       assembled.fraudProof
     );
+    expect(parent).toBe(PARENT);
+    expect(record.parentBlockHash).toBe(PARENT);
     const recomputed = computeSignersCommitment(
       DOMAIN,
       BigInt(pid),
@@ -147,7 +157,8 @@ describe("CC-89 stage-2 DVT-side E2E dry-run (watcher core → assembler)", () =
         ethers.getAddress(token)
       ),
       BigInt(mask),
-      [...claimed].map((a: string) => ethers.getAddress(a))
+      [...claimed].map((a: string) => ethers.getAddress(a)),
+      parent
     );
     expect(recomputed).toBe(ON_CHAIN_COMMITMENT); // ⇒ the verifier's commitment check passes
     // SET-EXACT is the verifier's one-shot-id front-run protection.

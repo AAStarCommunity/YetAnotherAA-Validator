@@ -4,13 +4,15 @@
 // Node script, and bls-consensus-encoding.spec.ts pins the two together on the golden vector so a
 // drift in either fails CI. Keep this in lock-step with the .ts helper.
 import { ethers } from "ethers";
+import { evidenceCategory, evidenceHashOf } from "../evidence/evidence-lib.mjs";
 
 const ABI = ethers.AbiCoder.defaultAbiCoder();
 
 export const DOMAIN_NAME = ethers.id("SuperPaymaster.BLSConsensus.v1");
 export const TAG_EXECUTE_SLASH = ethers.id("SuperPaymaster.BLS.ExecuteSlash.v1");
 export const TAG_SIGNERS_COMMITMENT = ethers.id("SuperPaymaster.BLS.SignersCommitment.v1");
-export const OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1";
+/** keccak256("DVT.Evidence.OverIssue.v1"): proposal, not finalized (DSR 2026-11-17). */
+export const OVERISSUE_CATEGORY = evidenceCategory("OverIssue", 1);
 
 /** BLSAggregator.domainSeparator() (:255). `d = { chainId, aggregator, registry }`. */
 export function domainSeparator(d) {
@@ -32,12 +34,11 @@ export function executeSlashMessageHash(d, proposalId, operator, slashLevel, epo
   );
 }
 
-/** Over-issue evidenceHash (DVT convention) — binds token/operator/epoch. */
+/** Over-issue evidenceHash under the M0 §3.1 category rule; body = abi.encode(token, operator, epoch). */
 export function overIssueEvidenceHash(token, operator, epoch) {
-  return ethers.keccak256(
-    ABI.encode(
-      ["string", "address", "address", "uint256"],
-      [OVERISSUE_EVIDENCE_TAG, ethers.getAddress(token), ethers.getAddress(operator), epoch]
-    )
+  const body = ABI.encode(
+    ["address", "address", "uint256"],
+    [ethers.getAddress(token), ethers.getAddress(operator), epoch]
   );
+  return evidenceHashOf(OVERISSUE_CATEGORY, body);
 }

@@ -46,10 +46,15 @@ interface IOverIssuable {
  *      set. This is why the verifier passes SP's `FraudProofVerifierConformance.assertSetBound` (a
  *      documented release gate), which the pre-existing `⊆` implementation would have failed.
  *
- * @dev EVIDENCE STRUCTURE (cross-repo alignment). The disputed slash's `evidenceHash` (opaque to SP,
- *      supplied by the slash filer) MUST be `keccak256(abi.encode(OVERISSUE_EVIDENCE_TAG, token,
- *      operator, epoch))`. The E2E slash filer must file with exactly this — else the message
- *      reconstruction won't match and every proof is rejected.
+ * @dev EVIDENCE STRUCTURE (M0 §3.1; DVTValidator-0.9.0, SP #635). The disputed slash's
+ *      `evidenceHash` MUST be the category-rule value DVTValidator recomputes at execute:
+ *        body         = abi.encode(address disputedToken, address operator, uint256 epoch)
+ *        evidence     = abi.encode(OVERISSUE_CATEGORY, body)
+ *        evidenceHash = keccak256(abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(body)))
+ *      with OVERISSUE_CATEGORY = keccak256("DVT.Evidence.OverIssue.v1"). PROPOSAL, NOT FINALIZED
+ *      (DSR 2026-11-17): the category string and body layout are settled with SP, together with SP's
+ *      checker contract, before the category is deployed. A slash filed with any other evidenceHash
+ *      does not reconstruct here and every proof against it is rejected.
  *
  * @dev ⚠️ SECURITY — NOT PRODUCTION-SAFE / DO NOT WIRE TO A SLASH-CAPABLE DEPLOYMENT.
  *      Step 5 reads the disputed token's CURRENT `isOverIssued()`. This is the **testnet-E2E variant**,
@@ -66,9 +71,24 @@ interface IOverIssuable {
  *      deployment where `executeGuardianSlash` moves real stake. Test/E2E use only until that lands.
  */
 contract OverIssueFraudProofVerifier is IFraudProofVerifier {
+    /// @notice Machine-readable build marker (#441, DSR 2026-11-17), for a deploy manifest to read
+    ///         besides a pinned sha256. SP's code does not read either marker today. A verifier without
+    ///         them predates the BLSAggregator-4.14.0 commitment layout and can never verify there.
+    ///         3.0.0: the over-issue evidenceHash follows the M0 §3.1 category rule (OVERISSUE_CATEGORY)
+    ///         instead of 2.0.0's DVT_OVERISSUE_EVIDENCE_V1 pre-image (2.0.0 was never deployed).
+    string public constant VERIFIER_VERSION = "OverIssueFraudProofVerifier-3.0.0";
+    /// @notice True: the recomputed signer commitment ends with blockhash(executionBlock - 1),
+    ///         supplied in the fraudProof (SP #630, BLSAggregator._computeSignersCommitment).
+    bool public constant COMMITMENT_BINDS_PARENT_BLOCKHASH = true;
+
     string internal constant FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1"; // DVT-internal fraudProofId derivation
-    string internal constant OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1"; // DVT evidence convention
-    uint256 internal constant MAX_SIGNERS = 13; // == BLSAggregator.MAX_VALIDATORS
+    /// @notice SP DVTValidator.TAG_EVIDENCE (0.9.0): the evidenceHash domain tag.
+    bytes32 public constant TAG_EVIDENCE = keccak256("SuperPaymaster.DVT.Evidence.v2");
+    /// @notice The over-issue evidence category (proposal, not finalized; see EVIDENCE STRUCTURE).
+    bytes32 public constant OVERISSUE_CATEGORY = keccak256("DVT.Evidence.OverIssue.v1");
+    /// @dev == BLSAggregator.MAX_VALIDATORS (64 in 4.14.x, BLSAggregator.sol:224). A smaller bound
+    ///      would make every slash signed by a guardian at a higher slot unprovable (clestons #468).
+    uint256 internal constant MAX_SIGNERS = 64;
 
     /// @notice SP's BLS-consensus domain-separator + path-tag constants, byte-for-byte identical to
     ///         SuperPaymaster contracts/src/modules/monitoring/BLSAggregator.sol
@@ -121,9 +141,22 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         return uint256(keccak256(abi.encode(FRAUD_ID_TAG, proposalId)));
     }
 
-    /// @notice The over-issue evidenceHash the slash filer MUST use (binds token+operator+epoch).
+    /// @notice The over-issue evidence body: abi.encode(disputedToken, operator, epoch).
+    function evidenceBody(address disputedToken, address operator, uint256 epoch) public pure returns (bytes memory) {
+        return abi.encode(disputedToken, operator, epoch);
+    }
+
+    /// @notice The `evidence` bytes DVTValidator-0.9.0 takes: abi.encode(OVERISSUE_CATEGORY, body).
+    function evidence(address disputedToken, address operator, uint256 epoch) external pure returns (bytes memory) {
+        return abi.encode(OVERISSUE_CATEGORY, evidenceBody(disputedToken, operator, epoch));
+    }
+
+    /// @notice The over-issue evidenceHash the slash filer MUST use (binds token+operator+epoch):
+    ///         keccak256(abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(body))).
     function evidenceHash(address disputedToken, address operator, uint256 epoch) public pure returns (bytes32) {
-        return keccak256(abi.encode(OVERISSUE_EVIDENCE_TAG, disputedToken, operator, epoch));
+        return keccak256(
+            abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(evidenceBody(disputedToken, operator, epoch)))
+        );
     }
 
     /// @notice Reconstruct SP's slash-only `expectedMessageHash`, byte-identical to the LIVE
@@ -155,7 +188,11 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
      * @inheritdoc IFraudProofVerifier
      * @dev fraudProof = abi.encode(
      *        uint256 proposalId, address operator, uint8 slashLevel, uint256 epoch,
-     *        address disputedToken, uint256 signerMask, address[] claimedSigners)
+     *        address disputedToken, uint256 signerMask, address[] claimedSigners,
+     *        bytes32 parentBlockHash)
+     *      parentBlockHash is blockhash(executionBlock - 1) of the block that executed the disputed
+     *      slash. It is caller-supplied, which is safe: it only enters the commitment pre-image, so a
+     *      wrong value cannot reproduce SP's stored commitment (#441).
      *      Wraps the real check in a self-staticcall so a malformed proof or a malicious
      *      `disputedToken` that reverts can only make verify return false — never revert.
      */
@@ -194,8 +231,10 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
             uint256 epoch,
             address disputedToken,
             uint256 signerMask,
-            address[] memory claimedSigners
-        ) = abi.decode(fraudProof, (uint256, address, uint8, uint256, address, uint256, address[]));
+            address[] memory claimedSigners,
+            bytes32 parentBlockHash
+        ) = abi.decode(fraudProof, (uint256, address, uint8, uint256, address, uint256, address[], bytes32));
+        if (parentBlockHash == bytes32(0)) return false;
 
         // 1. Content binding: fraudProofId MUST be the canonical derivation of proposalId.
         if (fraudProofId != deriveFraudProofId(proposalId)) return false;
@@ -205,7 +244,11 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
 
         // 3. Commitment check with disputedToken bound in via evidenceHash → messageHash (an
         //    attacker can't swap disputedToken without breaking evidenceHash → messageHash → commitment).
-        if (!_commitmentMatches(proposalId, operator, slashLevel, epoch, disputedToken, signerMask, claimedSigners)) {
+        if (
+            !_commitmentMatches(
+                proposalId, operator, slashLevel, epoch, disputedToken, signerMask, claimedSigners, parentBlockHash
+            )
+        ) {
             return false;
         }
 
@@ -240,18 +283,25 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         uint256 epoch,
         address disputedToken,
         uint256 signerMask,
-        address[] memory claimedSigners
+        address[] memory claimedSigners,
+        bytes32 parentBlockHash
     ) internal view returns (bool) {
         bytes32 anchor = IBLSAggregatorCommitment(AGGREGATOR).proposalSignersCommitment(proposalId);
         if (anchor == bytes32(0)) return false; // not a recorded proposal
         bytes32 messageHash = slashMessageHash(proposalId, operator, slashLevel, epoch, disputedToken);
-        // Byte-identical to BLSAggregator._computeSignersCommitment (BLSAggregator.sol:1299):
-        // keccak256(abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash,
-        //                      signerMask, signers)). domainSeparator() binds chainid+aggregator+
-        // Registry, replacing the obsolete pre-4.11 `string tag + raw chainid + raw aggregator` shape.
+        // Byte-identical to BLSAggregator-4.14.x _computeSignersCommitment (SP #630;
+        // BLSAggregator.sol:1356 in 4.14.2): keccak256(abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT,
+        // key, messageHash, signerMask, signers, blockhash(block.number - 1))). On the execute-slash
+        // path the key is the proposalId. The 4.11 layout without the last field is no longer accepted.
         bytes32 recomputed = keccak256(
             abi.encode(
-                domainSeparator(), TAG_SIGNERS_COMMITMENT, proposalId, messageHash, signerMask, claimedSigners
+                domainSeparator(),
+                TAG_SIGNERS_COMMITMENT,
+                proposalId,
+                messageHash,
+                signerMask,
+                claimedSigners,
+                parentBlockHash
             )
         );
         return recomputed == anchor;

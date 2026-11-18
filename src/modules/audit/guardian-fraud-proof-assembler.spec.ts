@@ -34,6 +34,7 @@ const verifiedRecord = (over?: Partial<GuardianSignerRecord>): GuardianSignerRec
   commitment: "0x" + "22".repeat(32),
   commitmentVerified: true,
   executionBlockTimestamp: 1_700_000_000,
+  parentBlockHash: "0x" + "5a".repeat(32),
   ...over,
 });
 
@@ -52,7 +53,23 @@ describe("guardian-fraud-proof assembler (CC-89 stage-2 F2)", () => {
         disputedToken: TOKEN,
         signerMask: 0x7n,
         claimedSigners: [S1, S2, S3],
+        parentBlockHash: "0x" + "5a".repeat(32),
       })
+    );
+  });
+
+  it("REFUSES a record captured before the 4.14.0 layout (no parentBlockHash, #441)", () => {
+    const old = verifiedRecord() as Partial<GuardianSignerRecord>;
+    delete old.parentBlockHash;
+    expect(() => assembleOverIssueFraudProof(old as GuardianSignerRecord, TOKEN)).toThrow(
+      /parentBlockHash/
+    );
+  });
+
+  it("REFUSES a record whose parentBlockHash is zero (the verifier refuses it unconditionally)", () => {
+    const z = { ...verifiedRecord(), parentBlockHash: "0x" + "00".repeat(32) };
+    expect(() => assembleOverIssueFraudProof(z as GuardianSignerRecord, TOKEN)).toThrow(
+      /non-zero parentBlockHash/
     );
   });
 
@@ -92,13 +109,25 @@ describe("guardian-fraud-proof assembler (CC-89 stage-2 F2)", () => {
     ).toThrow(/zero address/);
   });
 
-  it("REFUSES a corrupt record with too many claimedSigners (> MAX_VALIDATORS)", () => {
-    const many = Array.from({ length: 14 }, (_, i) =>
+  it("REFUSES a corrupt record with too many claimedSigners (> MAX_VALIDATORS = 64)", () => {
+    const many = Array.from({ length: 65 }, (_, i) =>
       ethers.getAddress("0x" + (i + 1).toString(16).padStart(40, "0"))
     );
     expect(() =>
       assembleOverIssueFraudProof(verifiedRecord({ claimedSigners: many }), TOKEN)
     ).toThrow(/exceeds MAX/);
+  });
+
+  it("accepts a record with 14 and with 64 claimedSigners (SP MAX_VALIDATORS is 64; clestons #468)", () => {
+    for (const n of [14, 64]) {
+      const signers = Array.from({ length: n }, (_, i) =>
+        ethers.getAddress("0x" + (i + 1).toString(16).padStart(40, "0"))
+      );
+      expect(
+        assembleOverIssueFraudProof(verifiedRecord({ claimedSigners: signers }), TOKEN)
+          .guiltyGuardians
+      ).toEqual(signers);
+    }
   });
 
   it("REFUSES a token that does not bind to the slash (token-swap guard)", () => {

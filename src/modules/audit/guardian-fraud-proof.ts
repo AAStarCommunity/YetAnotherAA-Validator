@@ -28,9 +28,16 @@ import {
 
 /** Domain tags — MUST match OverIssueFraudProofVerifier.sol exactly. */
 export const FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1";
-export const OVERISSUE_EVIDENCE_TAG = "DVT_OVERISSUE_EVIDENCE_V1";
-/** BLSAggregator.MAX_VALIDATORS. */
-export const MAX_VALIDATORS = 13;
+/** SP DVTValidator.TAG_EVIDENCE (0.9.0), the M0 §3.1 evidenceHash domain tag. */
+export const TAG_EVIDENCE = ethers.id("SuperPaymaster.DVT.Evidence.v2");
+/**
+ * The over-issue evidence category, keccak256("DVT.Evidence.OverIssue.v1"). PROPOSAL, NOT FINALIZED
+ * (DSR 2026-11-17): the category string and body layout are settled with SP, with SP's checker
+ * contract, before the category is deployed.
+ */
+export const OVERISSUE_CATEGORY = ethers.id("DVT.Evidence.OverIssue.v1");
+/** BLSAggregator.MAX_VALIDATORS: 64 in 4.14.x (BLSAggregator.sol:224). Not 13 (clestons #468). */
+export const MAX_VALIDATORS = 64;
 
 /**
  * Decode the `signerMask` from a raw verifyAndExecute BLS `proof`
@@ -119,7 +126,31 @@ export function deriveFraudProofId(proposalId: bigint): bigint {
   );
 }
 
-/** The over-issue evidenceHash the slash filer MUST use — binds token+operator+epoch. */
+/** The over-issue evidence body (proposal): abi.encode(address disputedToken, address operator, uint256 epoch). */
+export function overIssueEvidenceBody(
+  disputedToken: string,
+  operator: string,
+  epoch: bigint
+): string {
+  return ethers.AbiCoder.defaultAbiCoder().encode(
+    ["address", "address", "uint256"],
+    [disputedToken, operator, epoch]
+  );
+}
+
+/** The `evidence` bytes DVTValidator-0.9.0 takes: abi.encode(OVERISSUE_CATEGORY, body). */
+export function overIssueEvidence(disputedToken: string, operator: string, epoch: bigint): string {
+  return ethers.AbiCoder.defaultAbiCoder().encode(
+    ["bytes32", "bytes"],
+    [OVERISSUE_CATEGORY, overIssueEvidenceBody(disputedToken, operator, epoch)]
+  );
+}
+
+/**
+ * The over-issue evidenceHash the slash filer MUST use — binds token+operator+epoch. The M0 §3.1
+ * category rule DVTValidator-0.9.0 recomputes at execute:
+ * keccak256(abi.encode(TAG_EVIDENCE, OVERISSUE_CATEGORY, keccak256(body))).
+ */
 export function overIssueEvidenceHash(
   disputedToken: string,
   operator: string,
@@ -127,8 +158,12 @@ export function overIssueEvidenceHash(
 ): string {
   return ethers.keccak256(
     ethers.AbiCoder.defaultAbiCoder().encode(
-      ["string", "address", "address", "uint256"],
-      [OVERISSUE_EVIDENCE_TAG, disputedToken, operator, epoch]
+      ["bytes32", "bytes32", "bytes32"],
+      [
+        TAG_EVIDENCE,
+        OVERISSUE_CATEGORY,
+        ethers.keccak256(overIssueEvidenceBody(disputedToken, operator, epoch)),
+      ]
     )
   );
 }
@@ -142,16 +177,29 @@ export interface OverIssueFraudProofInputs {
   signerMask: bigint;
   /** MUST be the strictly-ascending set from resolveClaimedSigners. */
   claimedSigners: string[];
+  /** blockhash(executionBlock - 1): the last field of SP 4.14.0's commitment pre-image (#441). */
+  parentBlockHash: string;
 }
 
 /**
  * Assemble the `fraudProof` bytes the verifier decodes:
  *   abi.encode(uint256 proposalId, address operator, uint8 slashLevel, uint256 epoch,
- *              address disputedToken, uint256 signerMask, address[] claimedSigners)
+ *              address disputedToken, uint256 signerMask, address[] claimedSigners,
+ *              bytes32 parentBlockHash)
+ * The last field is new with the #441 verifier (SP BLSAggregator-4.14.0 commitment layout).
  */
 export function encodeOverIssueFraudProof(i: OverIssueFraudProofInputs): string {
+  // The verifier refuses a zero parent hash unconditionally; never produce a proof it must reject
+  // (Codex on #441 part 1).
+  if (
+    typeof i.parentBlockHash !== "string" ||
+    !/^0x[0-9a-fA-F]{64}$/.test(i.parentBlockHash) ||
+    i.parentBlockHash === ethers.ZeroHash
+  ) {
+    throw new Error("encodeOverIssueFraudProof: parentBlockHash must be a non-zero bytes32");
+  }
   return ethers.AbiCoder.defaultAbiCoder().encode(
-    ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]"],
+    ["uint256", "address", "uint8", "uint256", "address", "uint256", "address[]", "bytes32"],
     [
       i.proposalId,
       i.operator,
@@ -160,6 +208,7 @@ export function encodeOverIssueFraudProof(i: OverIssueFraudProofInputs): string 
       i.disputedToken,
       i.signerMask,
       i.claimedSigners,
+      i.parentBlockHash,
     ]
   );
 }
@@ -230,6 +279,47 @@ export const VERIFY_AND_EXECUTE_ABI =
   "function verifyAndExecute(uint256 proposalId, address operator, uint8 slashLevel, " +
   "address[] repUsers, uint256[] newScores, uint256 epoch, bytes32 evidenceHash, bytes proof)";
 
+/**
+ * SP DVTValidator-0.9.0's executeWithProof: the NORMAL execution path (Daybreak on #441, High). It
+ * forwards to aggregator.verifyAndExecute(id, p.operator, p.slashLevel, repUsers, newScores, epoch,
+ * evidenceHash, proof) internally, so a watcher that decodes only a top-level verifyAndExecute can
+ * never attribute the slashes it produces.
+ */
+export const EXECUTE_WITH_PROOF_ABI =
+  "function executeWithProof(uint256 id, address[] repUsers, uint256[] newScores, uint256 epoch, " +
+  "bytes evidence, bytes proof)";
+/** DVTValidator's `proposals(id)` getter (SP f2b2cd9b abis/DVTValidator.json). */
+export const DVT_PROPOSALS_ABI =
+  "function proposals(uint256) view returns (address operator, uint8 slashLevel, string reason, " +
+  "bool executed, bool exists, bytes32 evidenceHash)";
+
+export interface ExecuteWithProofArgs {
+  proposalId: bigint;
+  repUsers: string[];
+  newScores: bigint[];
+  epoch: bigint;
+  evidence: string;
+  proof: string;
+}
+
+/** Decode a top-level DVTValidator.executeWithProof call; throws if it is not one. */
+export function decodeExecuteWithProofCalldata(data: string): ExecuteWithProofArgs {
+  const iface = new ethers.Interface([EXECUTE_WITH_PROOF_ABI]);
+  const parsed = iface.parseTransaction({ data });
+  if (!parsed || parsed.name !== "executeWithProof") {
+    throw new Error("decodeExecuteWithProofCalldata: not an executeWithProof call");
+  }
+  const a = parsed.args;
+  return {
+    proposalId: BigInt(a[0]),
+    repUsers: [...a[1]].map((x: string) => ethers.getAddress(x)),
+    newScores: [...a[2]].map((x: bigint) => BigInt(x)),
+    epoch: BigInt(a[3]),
+    evidence: a[4],
+    proof: a[5],
+  };
+}
+
 export interface VerifyAndExecuteArgs {
   proposalId: bigint;
   operator: string;
@@ -270,9 +360,10 @@ export function decodeVerifyAndExecuteCalldata(data: string): VerifyAndExecuteAr
 }
 
 /**
- * Recompute SP's A' `proposalSignersCommitment` — byte-identical to the LIVE
- * `_computeSignersCommitment` (:1299): `keccak256(abi.encode(domainSeparator, TAG_SIGNERS_COMMITMENT,
- * proposalId, messageHash, signerMask, signers))`. The watcher can self-check that its assembled
+ * Recompute SP's A' `proposalSignersCommitment` — byte-identical to BLSAggregator-4.14.0's
+ * `_computeSignersCommitment` (SP #630): `keccak256(abi.encode(
+ * domainSeparator, TAG_SIGNERS_COMMITMENT, key, messageHash, signerMask, signers,
+ * blockhash(block.number - 1)))`. For the execute-slash path `key` is the proposalId. The watcher can self-check that its assembled
  * proof WILL pass on-chain before submitting. `messageHash` MUST be built with the SAME `domain`.
  */
 export function computeSignersCommitment(
@@ -280,7 +371,15 @@ export function computeSignersCommitment(
   proposalId: bigint,
   messageHash: string,
   signerMask: bigint,
-  claimedSigners: string[]
+  claimedSigners: string[],
+  parentBlockHash: string
 ): string {
-  return signersCommitment(domain, proposalId, messageHash, signerMask, claimedSigners);
+  return signersCommitment(
+    domain,
+    proposalId,
+    messageHash,
+    signerMask,
+    claimedSigners,
+    parentBlockHash
+  );
 }

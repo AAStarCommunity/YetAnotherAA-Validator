@@ -30,42 +30,55 @@ const DOMAIN = {
   registry: ethers.getAddress("0x00000000000000000000000000000000000000b5"),
 };
 
+// blockhash(executionBlock - 1) in the fixtures (#441).
+const PARENT = "0x" + "5a".repeat(32);
+
 describe("bls-consensus-domain helper", () => {
   // ── fix 5: canonical signer order is enforced, not assumed ──────────────
   describe("signersCommitment canonical-order enforcement", () => {
     const mh = "0x" + "cd".repeat(32);
 
     it("accepts strictly-ascending signers and is order-deterministic", () => {
-      const sorted = signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3]);
+      const sorted = signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3], PARENT);
       expect(sorted).toMatch(/^0x[0-9a-f]{64}$/);
       // Recomputing with the same sorted input is identical.
-      expect(signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3])).toBe(sorted);
+      expect(signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3], PARENT)).toBe(sorted);
     });
 
     it("REJECTS slot-order (unsorted) input rather than silently producing a wrong commitment", () => {
       // e.g. [0x3333, 0x1111, 0x2222] — a caller passing raw slot order. SP sorts internally, so
       // this would yield a different, always-failing commitment; the helper must refuse it.
-      expect(() => signersCommitment(DOMAIN, 42n, mh, 0x7n, [S3, S1, S2])).toThrow(
+      expect(() => signersCommitment(DOMAIN, 42n, mh, 0x7n, [S3, S1, S2], PARENT)).toThrow(
         /not strictly ascending/
       );
     });
 
     it("REJECTS duplicate and zero-address signers", () => {
-      expect(() => signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S1])).toThrow(
+      expect(() => signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S1], PARENT)).toThrow(
         /not strictly ascending/
       );
-      expect(() => signersCommitment(DOMAIN, 42n, mh, 0x7n, [ethers.ZeroAddress, S1])).toThrow(
-        /zero address/
-      );
+      expect(() =>
+        signersCommitment(DOMAIN, 42n, mh, 0x7n, [ethers.ZeroAddress, S1], PARENT)
+      ).toThrow(/zero address/);
     });
   });
 
   // ── fix 3: the cc89-cosign.mjs encoding lib stays byte-identical to the TS helper ──
   describe("cross-language single-source (script .mjs == TS helper)", () => {
+    // M0 §3.1 category rule, OverIssue.v1 body (proposal): built inline, not via either helper
     const evidenceHash = ethers.keccak256(
       ethers.AbiCoder.defaultAbiCoder().encode(
-        ["string", "address", "address", "uint256"],
-        ["DVT_OVERISSUE_EVIDENCE_V1", TOKEN, OPERATOR, 1000n]
+        ["bytes32", "bytes32", "bytes32"],
+        [
+          ethers.id("SuperPaymaster.DVT.Evidence.v2"),
+          ethers.id("DVT.Evidence.OverIssue.v1"),
+          ethers.keccak256(
+            ethers.AbiCoder.defaultAbiCoder().encode(
+              ["address", "address", "uint256"],
+              [TOKEN, OPERATOR, 1000n]
+            )
+          ),
+        ]
       )
     );
 
@@ -85,11 +98,27 @@ describe("bls-consensus-domain helper", () => {
       const viaHelper = executeSlashMessageHash(DOMAIN, 42n, OPERATOR, 2, 1000n, evidenceHash);
       expect(viaScript).toBe(viaHelper);
       // Same golden pinned in guardian-fraud-proof.spec.ts + Foundry test_Golden_CrossLanguage_SPLayout.
-      expect(viaScript).toBe("0x7e794aa98ce38cd7e22a456963f67a1a7de057e15ee261a62373af7516cb820d");
+      expect(viaScript).toBe("0xbb533ecaa9492a031d8b2cedf23bd7ac1728776e03e86332efdaf50da1dd84d6");
     });
 
     it("overIssueEvidenceHash matches the DVT convention", () => {
       expect(scriptLib.overIssueEvidenceHash(TOKEN, OPERATOR, 1000n)).toBe(evidenceHash);
     });
+  });
+});
+
+describe("signersCommitment parent block hash (#441, SP BLSAggregator-4.14.0)", () => {
+  const mh = "0x" + "11".repeat(32);
+  it("a different parent block hash gives a different commitment", () => {
+    const a = signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3], PARENT);
+    const b = signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3], "0x" + "5b".repeat(32));
+    expect(a).not.toBe(b);
+  });
+  it("refuses a missing, short or zero parent block hash", () => {
+    for (const bad of ["", "0x1234", ethers.ZeroHash]) {
+      expect(() => signersCommitment(DOMAIN, 42n, mh, 0x7n, [S1, S2, S3], bad)).toThrow(
+        /parentBlockHash/
+      );
+    }
   });
 });
