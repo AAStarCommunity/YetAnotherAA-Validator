@@ -309,8 +309,7 @@ export async function chooseProvider(probes, cfg, st) {
         (st?.catchUpThrottle ?? 0) > 0 &&
         // a lastThrottledAt in the future (a clock that was ahead) counts as no throttle record
         // (clestons #453 Low): it would otherwise keep the fallback away indefinitely
-        throttleAge(st, Date.now()) !== null &&
-        throttleAge(st, Date.now()) < PROBE_SKIP_MS
+        (age => age !== null && age < PROBE_SKIP_MS)(throttleAge(st, Date.now()))
       )
         throw new SafeError(
           `the primary RPC (${pr.name}) rate-limited the probe after a throttled catch-up round: this round is skipped, not run on the fallback`
