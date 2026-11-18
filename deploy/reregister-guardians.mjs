@@ -237,8 +237,12 @@ if (argv.includes("--export-fraud-drill") && (!DRILL_FILE || DRILL_FILE.startsWi
 if (DRILL_FILE && EXPORT_FILE) die("use --export-pop or --export-fraud-drill, not both");
 if (DRILL_FILE && !ethers.isAddress(VERIFIER ?? ""))
   die("--export-fraud-drill needs --verifier <address>");
-if (argv.includes("--expect-owner") && !ethers.isAddress(EXPECT_OWNER ?? "")) {
-  die("--expect-owner needs an address (the owner from SP's rc.8 owner table)");
+if (
+  argv.includes("--expect-owner") &&
+  (!ethers.isAddress(EXPECT_OWNER ?? "") || ethers.getAddress(EXPECT_OWNER) === ethers.ZeroAddress)
+) {
+  // clestons #444 Low 3: the zero address passed isAddress
+  die("--expect-owner needs a non-zero address (the owner from SP's rc.8 owner table)");
 }
 let EXPECT_VERSION = null;
 let EXPECT_DVT_VERSION = null;
@@ -392,6 +396,27 @@ const STAKING_ABI = [
 /// The first and last 8 bytes of a 128-byte key, for messages: enough to tell two keys apart, not the
 /// whole value (DSR 2026-11-18). A public key, but a full one in a log invites copy-paste mistakes.
 const keyEnds = hex => `${hex.slice(0, 18)}…${hex.slice(-16)}`;
+/// A node-file field for an error message (clestons #444 Low 2). A BLS secret pasted into the wrong
+/// field must not reach the terminal: a small integer is shown as is, anything else only by its type,
+/// its length and, for a long string, its first and last 8 characters.
+const fieldShape = v => {
+  if (typeof v === "number" && Number.isSafeInteger(v) && Math.abs(v) < 1000) return String(v);
+  if (typeof v === "string" && /^\d{1,3}$/.test(v)) return JSON.stringify(v);
+  if (typeof v !== "string") return `<${typeof v}, value withheld>`;
+  // Fragments are shown only when the whole string is printable ASCII: no control, C1 or direction
+  // character can reach the terminal (Codex on #444's follow-up, rounds 1-2).
+  return v.length > 40 && /^[\x20-\x7e]+$/.test(v)
+    ? `<${v.length} chars: ${v.slice(0, 8)}…${v.slice(-8)}>`
+    : `<${v.length} chars, value withheld>`;
+};
+/// nodeName goes into every label, so it is shown only when it looks like a name (Codex on #444's
+/// follow-up): up to 40 letters, digits, '.', '_' or '-'; otherwise only its shape.
+const nodeNameShape = v =>
+  v === undefined
+    ? "?"
+    : typeof v === "string" && /^[A-Za-z0-9._-]{1,40}$/.test(v)
+      ? v
+      : fieldShape(v);
 
 /// Split a 0x-prefixed byte string into 32-byte words. EIP-2537 G1 is 128 bytes (4 words) and G2 is
 /// 256 bytes (8 words); those map 1:1 onto SP's BLS.G1Point / BLS.G2Point structs.
@@ -699,14 +724,14 @@ async function exportFromPlan({ provider, chainId }) {
         `cannot read node file ${file}: ${e.code === "ENOENT" ? "no such file" : "unreadable or not valid JSON"} (details withheld)`
       );
     }
-    const label = `${file} (${node.nodeName ?? "?"})`;
+    const label = `${file} (${nodeNameShape(node.nodeName)})`;
     const validator = node.operator;
     const slot = Number(node.slot);
     if (!validator || !ethers.isAddress(validator))
       die(`${label}: missing/invalid "operator" address`);
     // SP's manifest accepts slots 1..13 (manifest_exec.py pop_slot_range).
     if (!Number.isInteger(slot) || slot < 1 || slot > 13)
-      die(`${label}: slot ${node.slot} out of range 1..13`);
+      die(`${label}: slot ${fieldShape(node.slot)} out of range 1..13`);
     if (!node.publicKeyEip2537 || !node.privateKey)
       die(`${label}: needs "publicKeyEip2537" and "privateKey"`);
     let sk;
@@ -1006,13 +1031,13 @@ async function main() {
         `cannot read node file ${file}: ${e.code === "ENOENT" ? "no such file" : "unreadable or not valid JSON"} (details withheld)`
       );
     }
-    const label = `${file} (${node.nodeName ?? "?"})`;
+    const label = `${file} (${nodeNameShape(node.nodeName)})`;
     const validator = node.operator;
     const slot = Number(node.slot);
     if (!validator || !ethers.isAddress(validator))
       die(`${label}: missing/invalid "operator" address`);
     if (!Number.isInteger(slot) || slot < 1 || slot > Number(maxValidators)) {
-      die(`${label}: slot ${node.slot} out of range 1..${maxValidators}`);
+      die(`${label}: slot ${fieldShape(node.slot)} out of range 1..${maxValidators}`);
     }
     if (!node.publicKeyEip2537) die(`${label}: missing "publicKeyEip2537"`);
     if (!node.privateKey) die(`${label}: missing "privateKey"`);
@@ -1034,8 +1059,8 @@ async function main() {
     if (derived.toLowerCase() !== node.publicKeyEip2537.toLowerCase()) {
       die(
         `${label}: the private key does not match publicKeyEip2537 in the same file.\n` +
-          `  derived : ${derived}\n` +
-          `  in file : ${node.publicKeyEip2537}\n` +
+          `  derived : ${keyEnds(derived)}\n` +
+          `  in file : ${fieldShape(node.publicKeyEip2537)}\n` +
           `  Registering would bind a key nobody can sign with. Fix the node file first.`
       );
     }
