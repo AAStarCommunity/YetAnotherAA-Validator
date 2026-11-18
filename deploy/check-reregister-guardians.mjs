@@ -408,6 +408,19 @@ fs.readFileSync(pathToFileURL(${JSON.stringify(c)}));
       agg('return /* release */ "BLSAggregator-4.14.2";'),
       "BLSAggregator-4.14.2",
     ],
+    "override(IVersioned)": [
+      agg('return "BLSAggregator-4.14.2";').replace(
+        "override returns",
+        "override(IVersioned) returns"
+      ),
+      "BLSAggregator-4.14.2",
+    ],
+    "override(A, B) and CRLF line ends": [
+      agg('return "BLSAggregator-4.14.2";')
+        .replace("override returns", "override(IVersioned, IFoo) returns")
+        .replace(/\n/g, "\r\n"),
+      "BLSAggregator-4.14.2",
+    ],
     "another contract's version() first": [
       `contract DVTValidator {\n${fn('return "BLSAggregator-9.9.9";')}}\n` +
         agg('return "BLSAggregator-4.14.2";'),
@@ -448,6 +461,12 @@ fs.readFileSync(pathToFileURL(${JSON.stringify(c)}));
     ),
     "an unterminated block comment": agg('return "BLSAggregator-4.14.2";') + "/* unterminated",
     "an unterminated string": agg('return "BLSAggregator-4.14.2";') + '"unterminated',
+    "a modifier spelled like two keywords (publicpure)": agg(
+      'return "BLSAggregator-4.14.2";'
+    ).replace("external pure override", "external pure publicpure"),
+    "a bare CR ending a // comment (solc ends it there)": agg(
+      '// note\r    return "BLSAggregator-4.14.3";\n    return "BLSAggregator-4.14.2";'
+    ),
     "a version(uint256) overload": `contract BLSAggregator is X {\n  function version(uint256) external pure returns (string memory) {\n    return "BLSAggregator-9.9.9";\n  }\n}\n`,
     "a modifier on version()": `contract BLSAggregator is X {\n  function version() external pure onlyX returns (string memory) {\n    return "BLSAggregator-9.9.9";\n  }\n}\n`,
   };

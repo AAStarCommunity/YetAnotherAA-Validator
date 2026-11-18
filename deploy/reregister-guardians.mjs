@@ -71,7 +71,8 @@
 // checks only that those addresses are empty, the pin block hash matches, the deployer's nonce is
 // unchanged since the pin, and the Registry (read from pin.oldAggregator) has code. It computes the
 // domain and popDigests locally, with DOMAIN_NAME / TAG_POP extracted from --sp-aggregator-source,
-// and writes SP's six-key `pop` entries plus `popContext`. SP's A10 asserts versions, wiring, owner and
+// and writes SP's six-key `pop` entries plus `popContext`, and, outside it, aggregatorSourceVersion
+// (the release the source's version() returns). SP's A10 asserts versions, wiring, owner and
 // on-chain popDigest() equality at send time. If the deployer nonce moves, export again after SP re-pins.
 //
 // --export-fraud-drill <file> IS FOR A FORK REHEARSAL ONLY, and is STALE against 4.14.0: the 4.14.0
@@ -637,12 +638,15 @@ async function exportFromPlan({ provider, chainId }) {
   const POP_TAG = spConstant(source, "TAG_POP");
   const sourceSha256 = createHash("sha256").update(source).digest("hex");
   // The release this source is (DSR 2026-11-18): version() cannot be read before the deploy, so the
-  // export records the string the source returns. SP's adapter requires it to equal its
-  // RELEASE_VERSIONS aggregator entry, and rejects an export without it.
+  // export records the string the source returns. SP is to make its adapter require it to equal
+  // its RELEASE_VERSIONS aggregator entry, and reject an export without it (not yet on SP main).
   const sourceVersion = aggregatorSourceVersion(source);
   if (!sourceVersion) {
     die(
-      `--sp-aggregator-source ${SP_SOURCE} does not have exactly one 'return "BLSAggregator-x.y.z";'`
+      `--sp-aggregator-source ${SP_SOURCE}: cannot read the release BLSAggregator's version() returns.\n` +
+        `  It needs exactly one contract BLSAggregator with exactly one version() whose header is\n` +
+        `  "() [external|public|pure|view|virtual|override(...)]* returns (string memory)" and whose body\n` +
+        `  is exactly one 'return "BLSAggregator-x.y.z";' (comments are ignored; a bare CR is refused).`
     );
   }
   console.log(`version    : ${sourceVersion} (from the source)`);

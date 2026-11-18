@@ -51,6 +51,9 @@ const blockEnd = (bare, open) => {
 /// second definition) returns null, and the caller stops.
 export const aggregatorSourceVersion = source => {
   if (typeof source !== "string") return null;
+  // A bare CR ends a // comment for solc, but this lexer ends comments only at LF, so it could hide
+  // a real `return` from the reader (clestons #463 Low). Refuse any CR not followed by LF.
+  if (/\r(?!\n)/.test(source)) return null;
   const { ok, code, bare } = lex(source);
   if (!ok) return null;
   // Whole Solidity identifiers: `$` is an identifier character there, which JavaScript's \b ignores.
@@ -74,7 +77,9 @@ export const aggregatorSourceVersion = source => {
   // a parameter makes it another overload, and a modifier could change what it returns (Codex).
   const header = bare.slice(after + fns[0][0].length - 1, fOpen);
   if (
-    !/^\(\s*\)\s*(?:(?:external|public|pure|view|override|virtual)\s+)*returns\s*\(\s*string\s+memory\s*\)\s*$/.test(
+    // `override` may name its bases, `override(IVersioned, IFoo)` (clestons #463 Info 1). Each bare
+    // keyword still needs whitespace after it, so `publicpure` (a modifier) is not read as two (Codex).
+    !/^\(\s*\)\s*(?:override\s*\(\s*[A-Za-z_$][A-Za-z0-9_$]*(?:\s*,\s*[A-Za-z_$][A-Za-z0-9_$]*)*\s*\)\s*|(?:external|public|pure|view|virtual|override)\s+)*returns\s*\(\s*string\s+memory\s*\)\s*$/.test(
       header
     )
   )
