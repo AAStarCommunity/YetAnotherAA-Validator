@@ -163,7 +163,7 @@ export async function buildGuardianSignerRecord(
         );
 
   // SP 4.14.0 binds blockhash(block.number - 1) of the executing block into the commitment (#441).
-  // Read it from the chain here: it is the one input that cannot be rebuilt from calldata later.
+  // It is not in the calldata, so it is read from the chain here (any node can serve it later too).
   const parent = await provider.getBlock(executionBlock - 1);
   if (!parent?.hash)
     throw new WatcherRecordError(`parent block ${executionBlock - 1} not available`);

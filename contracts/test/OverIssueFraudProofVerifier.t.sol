@@ -232,6 +232,37 @@ contract OverIssueFraudProofVerifierTest is Test {
         assertTrue(verifier.verify(_digest(_fpid(), guilty), _fpid(), guilty, _proof(_claimed(), address(token))));
     }
 
+    /// SP BLSAggregator.MAX_VALIDATORS is 64 (4.14.x, BLSAggregator.sol:224), so a slash signed by
+    /// guardians in slots 14..64 must be provable (clestons #468: the bound was 13).
+    function _manySigners(uint256 n) internal pure returns (address[] memory a, uint256 mask) {
+        a = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            a[i] = address(uint160(0x10000 + i)); // strictly ascending, non-zero
+            mask |= uint256(1) << i; // slot i+1
+        }
+    }
+
+    function _verifyMany(uint256 n) internal returns (bool) {
+        (address[] memory signers, uint256 mask) = _manySigners(n);
+        agg.recordSP(PROPOSAL_ID, _spMessageHash(address(token)), mask, signers, PARENT);
+        token.setOver(false);
+        bytes memory proof =
+            abi.encode(PROPOSAL_ID, OPERATOR, SLASH_LEVEL, EPOCH, address(token), mask, signers, PARENT);
+        return verifier.verify(_digest(_fpid(), signers), _fpid(), signers, proof);
+    }
+
+    function test_HappyPath_FourteenSigners_IncludingSlot14() public {
+        assertTrue(_verifyMany(14));
+    }
+
+    function test_HappyPath_SixtyFourSigners_TheAggregatorMaximum() public {
+        assertTrue(_verifyMany(64));
+    }
+
+    function test_Reject_SixtyFiveSigners_AboveTheAggregatorMaximum() public {
+        assertFalse(_verifyMany(65));
+    }
+
     /// The verifier's reconstructed digest is byte-identical to the aggregator's — the conformance
     /// property the deploy script also asserts.
     function test_DomainDigest_MatchesAggregatorByteForByte() public view {

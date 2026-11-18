@@ -15,6 +15,8 @@ import { SLASH_EXECUTED_EVENT } from "./guardian-slash-watcher.core.js";
 
 // blockhash(executionBlock - 1) in the fixtures (#441).
 const PARENT = "0x" + "5a".repeat(32);
+/** Every log in these cases is at this block (logFor(..., 50, ...)). */
+const EXEC_BLOCK = 50;
 const coder = ethers.AbiCoder.defaultAbiCoder();
 const S1 = ethers.getAddress("0x0000000000000000000000000000000000001111");
 const S2 = ethers.getAddress("0x0000000000000000000000000000000000002222");
@@ -110,8 +112,11 @@ class MockProvider {
   async getLogs(): Promise<FakeLog[]> {
     return this.logs;
   }
-  async getBlock(): Promise<{ timestamp: number; hash: string }> {
-    return { timestamp: 1_700_000_000, hash: PARENT };
+  // Block-sensitive (clestons #468): every captured slash in these cases executes at block
+  // EXEC_BLOCK, so only its parent carries PARENT.
+  async getBlock(n: number): Promise<{ timestamp: number; hash: string }> {
+    const hash = n === EXEC_BLOCK - 1 ? PARENT : ethers.keccak256(ethers.toBeHex(n, 32));
+    return { timestamp: 1_700_000_000, hash };
   }
   async getTransaction(hash: string): Promise<{ to: string; data: string } | null> {
     return this.txData[hash] ? { to: AGG, data: this.txData[hash] } : null; // direct aggregator call

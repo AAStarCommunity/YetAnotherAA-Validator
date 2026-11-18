@@ -194,10 +194,20 @@ describe("guardian-fraud-proof encoding (CC-89 stage-2)", () => {
       expect(await orderSignersFromSlotMap(0x5n, resolver)).toEqual([S2, S3]);
     });
 
-    it("rejects a signerMask with bits above MAX_VALIDATORS (slot 13)", async () => {
-      await expect(orderSignersFromSlotMap(1n << 13n, resolver)).rejects.toThrow(
-        /bits above slot 13/
+    it("rejects a signerMask with bits above MAX_VALIDATORS (slot 64)", async () => {
+      await expect(orderSignersFromSlotMap(1n << 64n, resolver)).rejects.toThrow(
+        /bits above slot 64/
       );
+    });
+
+    it("accepts slots 14 and 64 (SP MAX_VALIDATORS is 64, not 13; clestons #468)", async () => {
+      const hi: Record<number, string> = { 14: S3, 64: S2 };
+      const hiResolver = (slot: number) => Promise.resolve(hi[slot] ?? ethers.ZeroAddress);
+      // bit 13 ⇔ slot 14, bit 63 ⇔ slot 64
+      expect(await orderSignersFromSlotMap((1n << 13n) | (1n << 63n), hiResolver)).toEqual([
+        S2,
+        S3,
+      ]);
     });
 
     it("rejects a zero-address slot (partial/wrong set)", async () => {

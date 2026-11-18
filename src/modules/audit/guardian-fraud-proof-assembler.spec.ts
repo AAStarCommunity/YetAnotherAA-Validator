@@ -109,13 +109,25 @@ describe("guardian-fraud-proof assembler (CC-89 stage-2 F2)", () => {
     ).toThrow(/zero address/);
   });
 
-  it("REFUSES a corrupt record with too many claimedSigners (> MAX_VALIDATORS)", () => {
-    const many = Array.from({ length: 14 }, (_, i) =>
+  it("REFUSES a corrupt record with too many claimedSigners (> MAX_VALIDATORS = 64)", () => {
+    const many = Array.from({ length: 65 }, (_, i) =>
       ethers.getAddress("0x" + (i + 1).toString(16).padStart(40, "0"))
     );
     expect(() =>
       assembleOverIssueFraudProof(verifiedRecord({ claimedSigners: many }), TOKEN)
     ).toThrow(/exceeds MAX/);
+  });
+
+  it("accepts a record with 14 and with 64 claimedSigners (SP MAX_VALIDATORS is 64; clestons #468)", () => {
+    for (const n of [14, 64]) {
+      const signers = Array.from({ length: n }, (_, i) =>
+        ethers.getAddress("0x" + (i + 1).toString(16).padStart(40, "0"))
+      );
+      expect(
+        assembleOverIssueFraudProof(verifiedRecord({ claimedSigners: signers }), TOKEN)
+          .guiltyGuardians
+      ).toEqual(signers);
+    }
   });
 
   it("REFUSES a token that does not bind to the slash (token-swap guard)", () => {

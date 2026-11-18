@@ -520,6 +520,224 @@ export function solidityCodeOnly(text) {
 export { splitSolidity };
 
 // ---------------------------------------------------------------------------------------------
+//                       RELEASE GATE (pure, so it is testable; #441, clestons #468)
+// ---------------------------------------------------------------------------------------------
+// The deploy script must refuse every aggregator below BLSAggregator-4.14.0, including a pre-release
+// of 4.14.0 itself, with no override. This is a tripwire on the source; the behaviour itself is
+// pinned by the forge cases in DeployOverIssueVerifierScript.t.sol (Smart Contracts CI). Checked in
+// the CODE view (comments and strings blanked) with ALL whitespace removed, so a reflow by prettier
+// or forge fmt changes nothing, while a commented-out or quoted copy cannot stand in for the gate:
+//   1. exactly one `function _releaseClass` exists, and it is inside `contract DeployOverIssueVerifier`;
+//   2. its last three statements are exactly the reviewed ones (the pre-release flag, the 4.14.0
+//      pre-release refusal, and the floor with RELEASE_ANCHORED only on its true branch), and no
+//      `minor >= N` with N < 14 appears anywhere in it;
+//   3. that contract's `deploy()` classifies `version()` and requires RELEASE_ANCHORED;
+//   4. no env read can lift it (no vm.env* naming a RELEASE / ANCHOR / FLOOR variable).
+const RELEASE_CLASS_TAIL = [
+  "boolpreRelease=i3!=b.length;",
+  "if(major==4&&minor==14&&patch==0&&preRelease)returnRELEASE_PRE_ANCHOR;",
+  "return(major>4||(major==4&&minor>=14))?RELEASE_ANCHORED:RELEASE_PRE_ANCHOR;",
+].join("");
+const squeeze = t => t.replace(/\s+/g, "");
+
+/// @dev `[start, end)` of the body of `contract <name>` in a code view, or null.
+function contractBodyRange(codeView, name) {
+  const m = new RegExp(`\\bcontract\\s+${name}\\b[^{;]*\\{`).exec(codeView);
+  if (!m) return null;
+  const open = m.index + m[0].length - 1;
+  let depth = 0;
+  for (let i = open; i < codeView.length; i++) {
+    if (codeView[i] === "{") depth++;
+    else if (codeView[i] === "}" && --depth === 0) return [open, i + 1];
+  }
+  return null;
+}
+
+export function checkReleaseGate(src) {
+  const errs = [];
+  const v = splitSolidity(src);
+  const defs = [...v.code.matchAll(/function\s+_releaseClass\s*\(/g)].length;
+  if (defs !== 1) errs.push(`expected exactly one \`function _releaseClass\`, found ${defs}.`);
+  const cr = contractBodyRange(v.code, "DeployOverIssueVerifier");
+  if (!cr) {
+    errs.push("cannot locate `contract DeployOverIssueVerifier`: the release gate has no home.");
+    return errs;
+  }
+  const contractCode = v.code.slice(cr[0], cr[1]);
+  const rc = functionBodyRange(contractCode, "_releaseClass");
+  if (!rc) {
+    errs.push("cannot locate `_releaseClass(...)` inside `contract DeployOverIssueVerifier`.");
+  } else {
+    const body = squeeze(contractCode.slice(rc[0], rc[1]));
+    if (!body.endsWith(RELEASE_CLASS_TAIL + "}")) {
+      errs.push(
+        "`_releaseClass` must end with the reviewed floor: `bool preRelease = i3 != b.length;`, " +
+          "`if (major == 4 && minor == 14 && patch == 0 && preRelease) return RELEASE_PRE_ANCHOR;`, " +
+          "`return (major > 4 || (major == 4 && minor >= 14)) ? RELEASE_ANCHORED : RELEASE_PRE_ANCHOR;`."
+      );
+    }
+    const low = [...body.matchAll(/minor>=(\d+)/g)].map(m => Number(m[1])).filter(n => n < 14);
+    if (low.length)
+      errs.push(`\`_releaseClass\` compares \`minor >= ${low[0]}\`: the floor is 4.14.0.`);
+    if (body.split("RELEASE_ANCHORED").length - 1 !== 1) {
+      errs.push("`_releaseClass` may return RELEASE_ANCHORED from the floor's true branch only.");
+    }
+  }
+  const dr = functionBodyRange(contractCode, "deploy");
+  if (!dr) {
+    errs.push("cannot locate `deploy(...)` inside `contract DeployOverIssueVerifier`.");
+  } else {
+    const raw = contractCode.slice(dr[0], dr[1]);
+    const body = squeeze(raw);
+    // Assigned once each, and the anchored require follows the classification directly, so neither
+    // a later `releaseClass = RELEASE_ANCHORED;` nor a rewritten `reportedVersion` can bypass the
+    // floor (Codex on the #468 delta, round 2).
+    for (const name of ["releaseClass", "reportedVersion"]) {
+      // Counted before squeezing, so `else reportedVersion = v;` keeps its token boundary (Codex, round 3).
+      const n = [...raw.matchAll(new RegExp(`\\b${name}\\s*=(?!=)`, "g"))].length;
+      if (n !== 1) errs.push(`\`deploy()\` must assign \`${name}\` exactly once (found ${n}).`);
+    }
+    if (
+      !/uint8releaseClass=_releaseClass\(reportedVersion\);require\(releaseClass!=RELEASE_UNPARSEABLE,[^;]*\);require\(releaseClass==RELEASE_ANCHORED,/.test(
+        body
+      )
+    ) {
+      errs.push(
+        "`deploy()` must require RELEASE_ANCHORED right after `uint8 releaseClass = _releaseClass(reportedVersion);` and the unparseable check."
+      );
+    }
+    if (!body.includes("releaseClass=_releaseClass(reportedVersion);")) {
+      errs.push(
+        "`deploy()` must classify the aggregator's own `version()`: `releaseClass = _releaseClass(reportedVersion)`."
+      );
+    }
+    if (!body.includes("require(releaseClass==RELEASE_ANCHORED,")) {
+      errs.push(
+        "`deploy()` must `require(releaseClass == RELEASE_ANCHORED, ...)`: no aggregator below 4.14.0."
+      );
+    }
+  }
+  if (/vm\.env\w*\(\s*"[A-Z_]*(RELEASE|ANCHOR|FLOOR)[A-Z_]*"/.test(v.codeAndStrings)) {
+    errs.push("the 4.14.0 release floor must not become env-overridable.");
+  }
+  return errs;
+}
+
+/// @dev A whitespace-insensitive pattern for `lit`, so the mutants still apply after a reflow.
+function loose(lit) {
+  return new RegExp(
+    [...lit.replace(/\s+/g, "")].map(c => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s*")
+  );
+}
+
+/// @dev The gate must pass on the real deploy script and on a reflowed copy, and fail on each
+///      regression a reviewer named (clestons #468; Codex on the #468 delta).
+function releaseGateSelfTest(realSrc) {
+  const failures = [];
+  // A harmless reflow: the require joined onto one line, the pre-release condition wrapped.
+  const reflowed = realSrc
+    .replace(
+      loose("require( releaseClass == RELEASE_ANCHORED,"),
+      "require(releaseClass == RELEASE_ANCHORED,"
+    )
+    .replace(loose("minor == 14 && patch == 0"), "minor == 14 &&\n            patch == 0");
+  if (reflowed === realSrc)
+    failures.push("release-gate reflow fixture did not apply (stale anchor)");
+  const floor = "(major > 4 || (major == 4 && minor >= 14))";
+  const pre =
+    "if (major == 4 && minor == 14 && patch == 0 && preRelease) return RELEASE_PRE_ANCHOR;";
+  const req = "require( releaseClass == RELEASE_ANCHORED,";
+  const helperDecoy = src => {
+    const start = src.search(/\n\s*function\s+_releaseClass\s*\(/);
+    const end = src.indexOf("/// @dev Reads 1-6 decimal digits", start);
+    if (start < 0 || end < 0) return src;
+    const correctCopy = src.slice(start, end);
+    return src
+      .replace(loose(floor), "(major > 4 || (major == 4 && minor >= 13))")
+      .replace(/\ncontract\s+DeployOverIssueVerifier\b/, `\ncontract Helper {${correctCopy}}\n$&`);
+  };
+  const mutants = [
+    [
+      "floor back to 4.11",
+      s => s.replace(loose(floor), "(major > 4 || (major == 4 && minor >= 11))"),
+    ],
+    [
+      "floor back to 4.13",
+      s => s.replace(loose(floor), "(major > 4 || (major == 4 && minor >= 13))"),
+    ],
+    [
+      "both ternary branches anchored",
+      s =>
+        s.replace(
+          loose("? RELEASE_ANCHORED : RELEASE_PRE_ANCHOR;"),
+          "? RELEASE_ANCHORED : RELEASE_ANCHORED;"
+        ),
+    ],
+    [
+      "pre-release flag inverted",
+      s =>
+        s.replace(loose("bool preRelease = i3 != b.length;"), "bool preRelease = i3 == b.length;"),
+    ],
+    ["pre-release refusal removed", s => s.replace(loose(pre), "")],
+    ["pre-release refusal commented out", s => s.replace(loose(pre), `// ${pre}`)],
+    ["anchored require removed", s => s.replace(loose(req), "(releaseClass == RELEASE_ANCHORED,")],
+    [
+      "anchored require quoted in a string",
+      s =>
+        s.replace(
+          loose(req),
+          `string memory q = "require(releaseClass == RELEASE_ANCHORED,"; (releaseClass == RELEASE_ANCHORED,`
+        ),
+    ],
+    [
+      "classifying a constant instead of version()",
+      s =>
+        s.replace(loose("_releaseClass(reportedVersion)"), '_releaseClass("BLSAggregator-4.14.0")'),
+    ],
+    ["a correct decoy classifier in an earlier contract, the real one regressed", helperDecoy],
+    [
+      "releaseClass overwritten after the classification",
+      s =>
+        s.replace(
+          loose("uint8 releaseClass = _releaseClass(reportedVersion);"),
+          "uint8 releaseClass = _releaseClass(reportedVersion);\n        releaseClass = RELEASE_ANCHORED;"
+        ),
+    ],
+    [
+      "reportedVersion rewritten before the classification",
+      s =>
+        s.replace(
+          loose("uint8 releaseClass = _releaseClass(reportedVersion);"),
+          'reportedVersion = "BLSAggregator-4.14.0";\n        uint8 releaseClass = _releaseClass(reportedVersion);'
+        ),
+    ],
+    [
+      "env override added",
+      s =>
+        s.replace(
+          loose("function run() external {"),
+          'function run() external {\n        vm.envOr("ALLOW_PRE_ANCHOR_RELEASE", false);'
+        ),
+    ],
+  ];
+  for (const [label, src] of [
+    ["the real deploy script", realSrc],
+    ["a reflowed copy", reflowed],
+  ]) {
+    const e = checkReleaseGate(src);
+    if (e.length !== 0) failures.push(`release gate rejects ${label}: ${e.join(" ")}`);
+    for (const [name, mutate] of mutants) {
+      const m = mutate(src);
+      if (m === src)
+        failures.push(`release-gate mutant "${name}" did not apply to ${label} (stale anchor)`);
+      else if (checkReleaseGate(m).length === 0)
+        failures.push(`release gate missed mutant on ${label}: ${name}`);
+    }
+  }
+  return failures;
+}
+
+// ---------------------------------------------------------------------------------------------
 //                              RUNBOOK GATE (pure, so it is testable)
 // ---------------------------------------------------------------------------------------------
 
@@ -1548,6 +1766,7 @@ const errors = [];
 
 // --- Gate 0: the detector itself works -----------------------------------------------------------
 errors.push(...selfTest());
+errors.push(...releaseGateSelfTest(readFileSync(join(ROOT, DEPLOY_SCRIPT), "utf8")));
 
 if (!process.argv.includes("--self-test-only")) {
   // --- Gate 1: nothing may INVOKE the removed setter ---------------------------------------------
@@ -1626,26 +1845,10 @@ if (!process.argv.includes("--self-test-only")) {
       if (!re.test(deployBodyText)) errors.push(`${DEPLOY_SCRIPT}: missing ${what}.`);
   }
 
-  // The pinned constant lives at contract scope, not inside deploy(). The DECLARATION must be live
-  // code (so a string decoy quoting the whole line cannot stand in for it) while its VALUE is
-  // legitimately a string — so the declaration is located in the code view and the literal is then
-  // read from the same offsets in the string-bearing view. Pinned to the EXACT reviewed release:
-  // accepting any "BLSAggregator-*" would let a regression to a pre-rotation release through the very
-  // gate meant to catch it.
-  const pinDecl = /string\s+internal\s+constant\s+SUPPORTED_AGGREGATOR_VERSION\s*=/.exec(
-    deployViews.code
-  );
-  if (!pinDecl) {
-    errors.push(`${DEPLOY_SCRIPT}: no live declaration of SUPPORTED_AGGREGATOR_VERSION.`);
-  } else {
-    const tail = deployViews.codeAndStrings.slice(pinDecl.index, pinDecl.index + 200);
-    if (!/=\s*"BLSAggregator-4\.11\.0"\s*;/.test(tail)) {
-      errors.push(
-        `${DEPLOY_SCRIPT}: SUPPORTED_AGGREGATOR_VERSION must stay pinned to the exact reviewed release ` +
-          `"BLSAggregator-4.11.0".`
-      );
-    }
-  }
+  // The release gate (#441). The exact pin on SUPPORTED_AGGREGATOR_VERSION = "BLSAggregator-4.11.0"
+  // is gone: the 3.0.0 verifier speaks only the 4.14 commitment, so the gate is now a floor. Its
+  // shape is checked by `checkReleaseGate`, whose mutations are regression cells (clestons #468).
+  for (const e of checkReleaseGate(deploySrc)) errors.push(`${DEPLOY_SCRIPT}: ${e}`);
 
   // The floor must not become a knob.
   if (/vm\.env\w*\(\s*"[A-Z_]*ROTATION[A-Z_]*"/.test(deployViews.codeAndStrings)) {
