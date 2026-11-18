@@ -1,0 +1,431 @@
+{
+  "purpose": "#441 acceptance (anvil, throwaway keys)",
+  "steps": [
+    {
+      "name": "fund guardian 1",
+      "tx": "0x4e47cca4dd759a319e4030e6e159bc9d9d2e6732e152a93b37fede85e270b99f",
+      "block": 72
+    },
+    {
+      "name": "mint GToken to guardian 1",
+      "tx": "0xea4bb27920b563e9156350b25476cb0e731d1180fa5d2faffbd8dfcdc18ca7f5",
+      "block": 73
+    },
+    {
+      "name": "guardian 1 approves staking",
+      "tx": "0xb5aff9594d6a85c9846cec5f2efaa1d8ab90a89ee3bc4dfebcde498e398226ab",
+      "block": 74
+    },
+    {
+      "name": "guardian 1 registerRole(ROLE_DVT)",
+      "tx": "0x293998106e67a813117b0c5224324178f8223853d8727949336e39964a2de921",
+      "block": 75
+    },
+    {
+      "name": "register guardian 1 BLS key, slot 1 (owner path)",
+      "tx": "0xe997a4025eec3cb391e676fcd94c94a2578e7b6ec51f59f1d200e225750503ff",
+      "block": 76
+    },
+    {
+      "name": "fund guardian 2",
+      "tx": "0x75061e90ea27495df33f2087e3a1e63b17a96bf746f3b4a9c24d819c36c0140e",
+      "block": 77
+    },
+    {
+      "name": "mint GToken to guardian 2",
+      "tx": "0x4a51f17094aeaad11e0920f7c28d49be3f91fb5dc162adab0ea97e2c8c92ba88",
+      "block": 78
+    },
+    {
+      "name": "guardian 2 approves staking",
+      "tx": "0xf27be96be14ac3d63b1b4330b8692339d9c04b41e9902f9df7c1f506adbddf29",
+      "block": 79
+    },
+    {
+      "name": "guardian 2 registerRole(ROLE_DVT)",
+      "tx": "0xd1fbddc4de7dcd5a478f4344dab6443975ecc30870a0ad6eb62cbf11f75ad956",
+      "block": 80
+    },
+    {
+      "name": "register guardian 2 BLS key, slot 2 (owner path)",
+      "tx": "0xa765353175cb71ae713c767396b78353f8e204d416efac6c77defcd3f16702c5",
+      "block": 81
+    },
+    {
+      "name": "fund guardian 3",
+      "tx": "0xa1cf0aa692b2ec4063424f8223849756862386c6e7ffb95c1a9e8ce887810677",
+      "block": 82
+    },
+    {
+      "name": "mint GToken to guardian 3",
+      "tx": "0x895363ca8a4927d2dad74d0db1871edaf124ebdc14356aab90a72e85da619fc8",
+      "block": 83
+    },
+    {
+      "name": "guardian 3 approves staking",
+      "tx": "0x77d854b9177e84b28e118f608ddd0403bce57c37b0e23ebc8ab3cec6804346d6",
+      "block": 84
+    },
+    {
+      "name": "guardian 3 registerRole(ROLE_DVT)",
+      "tx": "0x6bfbc40c90279d37264e836e1df2be6d97db75604ae5fef5876eb542860feb35",
+      "block": 85
+    },
+    {
+      "name": "register guardian 3 BLS key, slot 3 (owner path)",
+      "tx": "0x0e08141ef8850b9d42d4faa1a68ee16980400e64a39215eab4e306505a956801",
+      "block": 86
+    },
+    {
+      "name": "DVTValidator.addValidator(guardian 1) (owner)",
+      "tx": "0xc8080886b356415e160fe29a8d7a564099bf24808eb09643621776ff6cbcd9da",
+      "block": 87
+    },
+    {
+      "name": "DVTValidator.addValidator(guardian 2) (owner)",
+      "tx": "0xb0e6cd3c1f510f094a82c33d490703038d4e7afa09a0d8da52b843a60d84585c",
+      "block": 88
+    },
+    {
+      "name": "DVTValidator.addValidator(guardian 3) (owner)",
+      "tx": "0x3f6577873243a1f1129869118f9192cc9569a3472caa19a24486abcd80f931fb",
+      "block": 89
+    },
+    {
+      "name": "deploy SP MockEvidenceCategory",
+      "address": "0x202CCe504e04bEd6fC0521238dDf04Bc9E8E15aB",
+      "args": []
+    },
+    {
+      "name": "deploy SP DVTValidator",
+      "address": "0xf4B146FbA71F41E0592668ffbF264F1D186b2Ca8",
+      "args": [
+        "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
+        "1",
+        "0xed9aaaf3032e387fc8fe43b97ce7b66864cc146be1c2034cf454a279d2967f5c",
+        "0x202CCe504e04bEd6fC0521238dDf04Bc9E8E15aB"
+      ]
+    },
+    {
+      "name": "E3a newDVT.setBLSAggregator(aggregator) (owner)",
+      "tx": "0xaa4b8a9adb04ca4fd4d63ac787ba84d31431367cf9ef003862c820a9132da162",
+      "block": 92
+    },
+    {
+      "name": "E3b aggregator.setDVTValidator(newDVT) (owner)",
+      "tx": "0x7c1519a1a3883ca152c82333ac4092513f88bd405ec117746ff6802c6dd5f395",
+      "block": 93
+    },
+    {
+      "name": "E3c newDVT.addValidator(guardian 1) (owner)",
+      "tx": "0xb3ad35b94124357dd691870c9afe86e653aa437daf1ec60616ed38181816eff4",
+      "block": 94
+    },
+    {
+      "name": "E3c newDVT.addValidator(guardian 2) (owner)",
+      "tx": "0x388b8bc43b67a1fee0044318527348637ca37094c2f433f41fe68f9e04e46625",
+      "block": 95
+    },
+    {
+      "name": "E3c newDVT.addValidator(guardian 3) (owner)",
+      "tx": "0x8b7fb3ce3205a11cb739719569f283b4d40dc9c77aca4f4870a93559abb316b2",
+      "block": 96
+    },
+    {
+      "name": "deploy OverIssueFraudProofVerifier",
+      "address": "0xfbC22278A96299D91d41C453234d97b4F5Eb9B2d"
+    },
+    {
+      "name": "deploy MockOverIssuableToken",
+      "address": "0x46b142DD1E924FAb83eCc3c08e4D46E82f005e0E"
+    },
+    {
+      "name": "guardian 1 DVTValidator.createProposal(operator, MINOR, reason, evidenceHash)",
+      "tx": "0x7f62cf8728bc708404aabea51ce0f3b60f4df33c8eee3e2b0439047bf980b580",
+      "block": 99,
+      "proposalId": "1"
+    },
+    {
+      "name": "guardian 1 DVTValidator.queueSlashWithProof (BLS, SP two-step slash, step 1)",
+      "tx": "0x3f4ee965a84b4184221b8510b3c56e56b96496591c37d0f668797a55523278b0",
+      "block": 100
+    },
+    {
+      "name": "N0b checker.setAccepted(false)",
+      "tx": "0x22b8fc49e2455ac393794284936c38d6bb65d0ab4e5715de8bad0c754e566e14",
+      "block": 101
+    },
+    {
+      "name": "N0b checker.setAccepted(true)",
+      "tx": "0xd82efa37376baf2a9329e7d4a72e3b00727cc0e595245fe61da2b7a15ba8ef83",
+      "block": 102
+    },
+    {
+      "name": "guardian 1 DVTValidator.executeWithProof -> aggregator.verifyAndExecute (SP two-step slash step 2; writes the signer commitment)",
+      "tx": "0xaf08f6b58dd41f6036ee66ed40bcb6377daf163b58f2fed067fa65955603ad51",
+      "block": 103,
+      "proposalId": "1",
+      "threshold": "3"
+    },
+    {
+      "name": "E2a proposeFraudProofVerifier(#441 verifier) (owner)",
+      "tx": "0xb6f41e5794f904f0000bad5dad83fe9ffb02908992b42f2c46d440bc87374453",
+      "block": 104
+    },
+    {
+      "name": "wait VERIFIER_ROTATION_DELAY (432000 s, anvil time warp)"
+    },
+    {
+      "name": "E2b applyFraudProofVerifier() (permissionless)",
+      "tx": "0xdadf3639c19e8a9f4b94f5ce003a98ff1cee3b025a0c06f995f6d6dc9fe3a4c5",
+      "block": 106
+    },
+    {
+      "name": "queueGuardianSlash (correct proof)",
+      "tx": "0x9b6c7c71e09da5b3d76fae06ccf6211b18c9f523a56f20614f9573e9ec037995",
+      "block": 107
+    },
+    {
+      "name": "executeGuardianSlash WITHOUT slasher authorization",
+      "tx": "0x24140a79d23c4caac10230ef6cea875d532d796a5186f6455dd31626928b59c2",
+      "block": 108
+    },
+    {
+      "name": "E1 GTokenStaking.setAuthorizedSlasher(aggregator, true) (owner)",
+      "tx": "0xa3c3d0dc0d23e1cdd7deac6595267e3ff7c10b7a4137884cb03bb0a07e1b48ac",
+      "block": 109
+    },
+    {
+      "name": "executeGuardianSlash WITH slasher authorization",
+      "tx": "0xec038c52ac82c2b61cb26615dd9f0ce693ad2ba3fdf9b272dab75bdff6f65398",
+      "block": 110
+    }
+  ],
+  "checks": [
+    {
+      "name": "aggregator is an anchored release (>= 4.13.0)",
+      "ok": true,
+      "version": "BLSAggregator-4.14.2"
+    },
+    {
+      "name": "all three guardians hold ROLE_DVT",
+      "ok": true
+    },
+    {
+      "name": "DeployAnvil's DVTValidator has no evidence category (rc.8)",
+      "ok": true
+    },
+    {
+      "name": "rc.8: a slash-shaped createProposal reverts UnknownEvidenceCategory",
+      "ok": true,
+      "revert": "UnknownEvidenceCategory"
+    },
+    {
+      "name": "E3 DVTValidator version",
+      "ok": true,
+      "version": "DVTValidator-0.9.0"
+    },
+    {
+      "name": "E3 DVTValidator holds exactly the OverIssue.v1 category with the mock checker",
+      "ok": true
+    },
+    {
+      "name": "aggregator.DVT_VALIDATOR() is the new DVTValidator",
+      "ok": true
+    },
+    {
+      "name": "the old DVTValidator can no longer file proposals (NotCurrentDVT)",
+      "ok": true,
+      "revert": "NotCurrentDVT"
+    },
+    {
+      "name": "ValidatorAdded emitted once per guardian on the new DVTValidator",
+      "ok": true,
+      "added": 3
+    },
+    {
+      "name": "the guardians' BLS keys survive the rotation (active, same slots)",
+      "ok": true
+    },
+    {
+      "name": "verifier build marker",
+      "ok": true
+    },
+    {
+      "name": "verifier and E3 DVTValidator use the same evidence category",
+      "ok": true
+    },
+    {
+      "name": "verifier and aggregator agree on the domain separator",
+      "ok": true
+    },
+    {
+      "name": "the queue path stored its commitment under key uint256(messageHash)",
+      "ok": true,
+      "key": "0x3919cc2e49eeb7042a61aa68b942688c588292e9570324decf6d38601520f09b",
+      "block": 100
+    },
+    {
+      "name": "N0 execute with evidence for another token -> EvidenceHashMismatch",
+      "ok": true,
+      "revert": "EvidenceHashMismatch"
+    },
+    {
+      "name": "N0b with the checker rejecting, the matching evidence -> EvidenceRejected",
+      "ok": true,
+      "revert": "EvidenceRejected"
+    },
+    {
+      "name": "the aggregator itself stored a non-zero commitment",
+      "ok": true,
+      "commitment": "0xf262495033cb6525bfe99c7899d36529c517b3e26a2d3cc012c58072d830e6ce"
+    },
+    {
+      "name": "watcher fixture: the execution tx is sent to the DVTValidator (the wrapper path)",
+      "ok": true
+    },
+    {
+      "name": "the 4.14 pre-image WITH the parent block hash reproduces the stored commitment",
+      "ok": true
+    },
+    {
+      "name": "the 4.11 pre-image WITHOUT it does not (the #441 bug, observed)",
+      "ok": true
+    },
+    {
+      "name": "fraudProofVerifier() is the #441 verifier",
+      "ok": true
+    },
+    {
+      "name": "drill: --export-fraud-drill exits 0 against the #441 verifier",
+      "ok": true,
+      "status": 0,
+      "stderr": ""
+    },
+    {
+      "name": "drill: the valid fraudProof has 8 fields and a zero parentBlockHash placeholder",
+      "ok": true
+    },
+    {
+      "name": "drill: filling field 8 as the note says sets parentBlockHash and keeps the guardians",
+      "ok": true
+    },
+    {
+      "name": "drill: forkState.commitment has no value to write, only how to produce it",
+      "ok": true
+    },
+    {
+      "name": "drill: the four must-reject cases are present, N3 also with 8 fields",
+      "ok": true
+    },
+    {
+      "name": "N1 old 7-field proof (no parent block hash) -> InvalidFraudProof",
+      "ok": true,
+      "revert": "InvalidFraudProof"
+    },
+    {
+      "name": "N2 parent block hash off by one bit -> InvalidFraudProof",
+      "ok": true,
+      "revert": "InvalidFraudProof"
+    },
+    {
+      "name": "verifier.verify accepts the correct proof directly",
+      "ok": true
+    },
+    {
+      "name": "drill case: --export-fraud-drill --drill-case exits 0 for the executed slash",
+      "ok": true,
+      "status": 0,
+      "stderr": ""
+    },
+    {
+      "name": "drill case: the filled exported proof equals the proof built from the execution, byte for byte",
+      "ok": true
+    },
+    {
+      "name": "drill case: valid -> verifier.verify true and queueGuardianSlash accepts it (staticCall)",
+      "ok": true
+    },
+    {
+      "name": "drill case N1 (one guardian removed) -> InvalidFraudProof",
+      "ok": true,
+      "revert": "InvalidFraudProof"
+    },
+    {
+      "name": "drill case N3 (signerMask one bit off) -> InvalidFraudProof",
+      "ok": true,
+      "revert": "InvalidFraudProof"
+    },
+    {
+      "name": "drill case N2 (token over-issued) -> InvalidFraudProof",
+      "ok": true,
+      "revert": "InvalidFraudProof"
+    },
+    {
+      "name": "drill case N2: token storage restored",
+      "ok": true
+    },
+    {
+      "name": "drill case N4 (digest one bit off) -> verifier.verify false",
+      "ok": true
+    },
+    {
+      "name": "GuardianSlashQueued emitted",
+      "ok": true
+    },
+    {
+      "name": "DeployAnvil leaves the aggregator NOT authorised as slasher (as rc.8 will)",
+      "ok": true
+    },
+    {
+      "name": "without E1 every guardian slash fails (GuardianSlashFailed x3, no GuardianSlashed)",
+      "ok": true
+    },
+    {
+      "name": "GuardianSlashed x3",
+      "ok": true
+    },
+    {
+      "name": "each lock fell by guardianSlashBps (3000/10000), by a positive amount",
+      "ok": true,
+      "deltas": [
+        {
+          "guardian": "0x2150657d0D82096FE9c18f0da4861916bfbF9c51",
+          "before": "30000000000000000000",
+          "after": "21000000000000000000"
+        },
+        {
+          "guardian": "0x7B47fcc56bFD0eD8fDDEC4F1FC30C5400ec22A6C",
+          "before": "30000000000000000000",
+          "after": "21000000000000000000"
+        },
+        {
+          "guardian": "0xD81cfA934F18AA6a518F8CE5dFF615B9E29AA441",
+          "before": "30000000000000000000",
+          "after": "21000000000000000000"
+        }
+      ]
+    },
+    {
+      "name": "the case is resolved (status 2)",
+      "ok": true,
+      "status": 2
+    }
+  ],
+  "aggregator": "0xE6E340D132b5f46d1e472DebcD681B2aBc16e57E",
+  "aggregatorVersion": "BLSAggregator-4.14.2",
+  "e3": {
+    "dvtValidator": "0xf4B146FbA71F41E0592668ffbF264F1D186b2Ca8",
+    "checker": "0x202CCe504e04bEd6fC0521238dDf04Bc9E8E15aB",
+    "category": "0xed9aaaf3032e387fc8fe43b97ce7b66864cc146be1c2034cf454a279d2967f5c"
+  },
+  "operator": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "evidenceHash": "0x0648dcdff9fcb3dd86a6a4e253413667afc03521be334f26a85ef0005dc7945c",
+  "proposalId": "1",
+  "executionBlock": 103,
+  "parentBlockHash": "0x9497395c2fc9797b35629e689b64885f64e3ede9480487b7e7a1b926e1fdca9a",
+  "slasherAuthorizedAfterDeployAnvil": false,
+  "result": "PASSED",
+  "spCommit": "f2b2cd9b4a566d7cb73c8482e1327c674f8887a8",
+  "expectVersions": "BLSAggregator-4.14.2,DVTValidator-0.9.0"
+}

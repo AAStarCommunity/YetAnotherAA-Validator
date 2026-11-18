@@ -1,0 +1,22 @@
+Defensive security review: pre-PR gate for YetAnotherAA-Validator #441 (head e8d2a9a8c68c485cbcbba8773122b9bc53309f7f), the over-issue fraud-proof verifier that decides guardian SLASHING, plus its off-chain encoders, watcher, fork drill and anvil acceptance.
+
+Scope and rules:
+- Read only files inside this repository's worktree; do not access other directories under ~/Dev, the home directory, or anything outside this worktree.
+- Do not run anything that touches a network, a chain or an RPC endpoint. Do not open .env files, keystores, node_*.json key files or any secrets file, even if they exist.
+- The target is `git diff 4f356cfc HEAD` (two commits: part 1 = contracts/src/verifiers/OverIssueFraudProofVerifier.sol, contracts/script/DeployOverIssueVerifier.s.sol, their tests, src/modules/audit/*, scripts/lib/bls-consensus-encoding.mjs, scripts/cc89-cosign.mjs; part 2 = deploy/reregister-guardians.mjs --export-fraud-drill, deploy/rehearse-guardian-slash.{sh,mjs}, docs/evidence/441-*, docs/rc8-deploy-day-dvt.md). You may read other repository files only to understand what these use.
+
+What this is (verify against the code; do not take it on trust):
+- SP BLSAggregator-4.14 stores, per proposal, signersCommitment = keccak256(abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT, key, messageHash, signerMask, signers, blockhash(block.number - 1))). The verifier recomputes it from a fraudProof carrying a trailing parentBlockHash (zero refused); matching the stored commitment proves the supplied hash. If the proof is accepted and the disputed token is not over-issued, the aggregator burns the named guardians' stake.
+- The evidence rule (a proposal): category = keccak256("DVT.Evidence.OverIssue.v1"), body = abi.encode(disputedToken, operator, epoch), evidenceHash = keccak256(abi.encode(TAG_EVIDENCE, category, keccak256(body))).
+- KNOWN AND DISCLOSED, do not re-report as new: the verifier reads the token's CURRENT isOverIssued(), not its state at the disputed epoch (historical-state gap, issue #447); this blocks arming with real stake. rc.8 deploys no verifier.
+- The drill exports a template and no BLS signature; E3 runs on a local anvil with throwaway keys.
+
+Review strictly and adversarially. In particular:
+1. False accept: any proof the verifier accepts although the named guardians did not sign what the stored commitment records (encoding ambiguity, signer order/duplicates, mask vs signer list, another proposal's or another key's commitment, cross-aggregator/chain replay, the parentBlockHash binding).
+2. False reject: an honest proof refused (wrong key choice, wrong parent block, version gating).
+3. Deploy script gates (Gate A', EXPECTED_AGGREGATOR_VERSION, canonical aggregator) that can be bypassed or misconfigured into deploying against the wrong aggregator.
+4. Off-chain: the watcher reading parentBlockHash from the wrong block, failing open when it cannot read, or an encoder/Solidity layout mismatch (goldens on both sides).
+5. The drill or E3 producing anything usable as a real slash on a live chain (a signature, a filled proof against real guardians), key handling, injection in the .sh.
+6. Acceptance checks that pass vacuously.
+
+Output format: a list of findings, each with severity (Critical / High / Medium / Low / Info), file:line, the concrete failure scenario, and a suggested fix. Report only issues you can tie to specific code. If you find no Critical or High issue, say so explicitly in one line at the end: "No Critical or High findings."

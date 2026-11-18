@@ -270,10 +270,9 @@ execute the exported calldata. Here `--expect-owner` is the SAFE. On deploy day
 the owner is the deployer, but A10 checks the owner, not this script.
 
 Every gate of the registration path (the dry run and `--export-pop`) reads state
-at one block. `--export-fraud-drill`, already stale against 4.14.0 (#441), is
-not covered. The export records that block as
-`basis: {block, blockHash, timestamp}`. It also records the reads the gates
-relied on, as `reads`, with their digest `readsDigest`:
+at one block. `--export-fraud-drill` is not covered. The export records that
+block as `basis: {block, blockHash, timestamp}`. It also records the reads the
+gates relied on, as `reads`, with their digest `readsDigest`:
 
 - both contracts' code hashes;
 - the routing: `DVTValidator.BLS_AGGREGATOR()`, `aggregator.DVT_VALIDATOR()`,
@@ -518,9 +517,14 @@ the release:
   injected from outside the disk, or KMS);
 - OP mainnet `AAStarValidator` / committee validator deployment and the
   airaccount router mount;
-- #441 (the fraud-proof verifier 3.0.0 and the drill): its Daybreak High (the
-  watcher cannot decode the `DVTValidator.executeWithProof` wrapper) plus three
-  Mediums and a Low, for the release after rc.8.
+- #441 (the fraud-proof verifier 3.0.0, the watcher and the drill), for the
+  release after rc.8. Its Daybreak findings are fixed in its two PRs:
+  - the High: the watcher now decodes the `DVTValidator.executeWithProof`
+    wrapper;
+  - three Mediums and a Low.
+
+  Enabling guardian slash with real stake still waits on #447 (the verifier
+  reads the token's current state, not its state at the disputed epoch).
 
 - **Restoring `--broadcast`** (DSR 2026-11-18). Before this script signs
   anything again, it needs a check that the RPC is the real chain and not a
@@ -621,8 +625,11 @@ Read from SP main `9cacd4ec`. Re-check them against the step-4 merge commit.
   rejected. **Fixed in OverIssueFraudProofVerifier-3.0.0** (#441 part 1): the
   fraud proof carries a trailing `parentBlockHash` (zero refused), and the TS
   encoders and watcher carry it too.
-  - The fork drill (`--export-fraud-drill`) still writes the commitment straight
-    into the fork using the old pre-image; #441 part 2 removes that.
+  - The fork drill (`--export-fraud-drill`) no longer writes the commitment into
+    fork storage (#441 part 2). A poked value made the drill pass by
+    construction. The fork must execute the slash through the aggregator, then
+    fill the template's `parentBlockHash` from that execution's parent block.
+    The drill refuses a verifier without `COMMITMENT_BINDS_PARENT_BLOCKHASH()`.
   - Neither matters for rc.8: no fraud-proof verifier is set there (next item),
     and SP puts the verifier step behind a default-off switch. Enabling guardian
     slash is for the release after rc.8.
