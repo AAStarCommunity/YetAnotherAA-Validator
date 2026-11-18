@@ -641,18 +641,25 @@ fs.readFileSync(pathToFileURL(${JSON.stringify(c)}));
   extra.extra = 1;
   const noPrefix = request();
   noPrefix.addresses.Registry = "e1".repeat(20);
+  const dvtIsAgg = request();
+  dvtIsAgg.addresses.DVTValidator = dvtIsAgg.addresses.BLSAggregator;
   const bad = [];
   for (const [name, req, want] of [
     ["Registry == aggregator", dup, /equals another predicted address/],
     ["an unknown top-level key", extra, /must have exactly the keys/],
     ["an address without 0x", noPrefix, /0x followed by 40 hex digits/],
+    [
+      "DVTValidator == aggregator",
+      dvtIsAgg,
+      /addresses\.DVTValidator equals addresses\.BLSAggregator/,
+    ],
   ]) {
     const r = await exportWith(req, join(dir, "fresh-out-x.json"));
     if (!(r.status === 1 && want.test(r.stderr)))
       bad.push(`${name}: ${r.stderr.trim().split("\n").slice(-1)[0]}`);
   }
   cell(
-    "plan (fake chain): duplicate addresses, unknown keys and un-prefixed addresses stop (clestons #466)",
+    "plan (fake chain): duplicate addresses (incl. DVTValidator == aggregator), unknown keys and un-prefixed addresses stop (clestons #466)",
     bad.length === 0,
     bad.join(" | ")
   );
