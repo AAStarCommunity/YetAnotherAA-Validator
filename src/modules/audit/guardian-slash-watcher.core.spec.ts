@@ -28,6 +28,8 @@ const EPOCH = 1000n;
 const MASK = 0x7n; // slots 1,2,3
 const EVIDENCE = ethers.keccak256(ethers.toUtf8Bytes("disputed-over-issue-evidence"));
 const EXEC_BLOCK = 500;
+const blockHashAt = (n: number): string =>
+  n === EXEC_BLOCK - 1 ? PARENT : ethers.keccak256(ethers.toBeHex(n, 32));
 const TX_HASH = "0x" + "ab".repeat(32);
 
 /**
@@ -73,8 +75,10 @@ class MockProvider {
     return { to: AGG, data: this.txData }; // a direct call to the aggregator
   }
 
-  async getBlock(_n: number): Promise<{ timestamp: number; hash: string }> {
-    return { timestamp: 1_700_000_000, hash: PARENT };
+  // Block-sensitive (clestons #468): only the execution block's parent carries PARENT, so a read of
+  // any other block (e.g. getBlock(executionBlock)) yields a commitment that does not match.
+  async getBlock(n: number): Promise<{ timestamp: number; hash: string }> {
+    return { timestamp: 1_700_000_000, hash: blockHashAt(n) };
   }
 }
 
@@ -266,8 +270,10 @@ class WrapperProvider {
   async getTransaction(_h: string): Promise<{ to: string; data: string }> {
     return { to: this.txTo, data: this.txData };
   }
-  async getBlock(_n: number): Promise<{ timestamp: number; hash: string }> {
-    return { timestamp: 1_700_000_000, hash: PARENT };
+  // Block-sensitive (clestons #468): only the execution block's parent carries PARENT, so a read of
+  // any other block (e.g. getBlock(executionBlock)) yields a commitment that does not match.
+  async getBlock(n: number): Promise<{ timestamp: number; hash: string }> {
+    return { timestamp: 1_700_000_000, hash: blockHashAt(n) };
   }
 }
 

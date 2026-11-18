@@ -36,8 +36,8 @@ export const TAG_EVIDENCE = ethers.id("SuperPaymaster.DVT.Evidence.v2");
  * contract, before the category is deployed.
  */
 export const OVERISSUE_CATEGORY = ethers.id("DVT.Evidence.OverIssue.v1");
-/** BLSAggregator.MAX_VALIDATORS. */
-export const MAX_VALIDATORS = 13;
+/** BLSAggregator.MAX_VALIDATORS: 64 in 4.14.x (BLSAggregator.sol:224). Not 13 (clestons #468). */
+export const MAX_VALIDATORS = 64;
 
 /**
  * Decode the `signerMask` from a raw verifyAndExecute BLS `proof`
@@ -361,7 +361,7 @@ export function decodeVerifyAndExecuteCalldata(data: string): VerifyAndExecuteAr
 
 /**
  * Recompute SP's A' `proposalSignersCommitment` — byte-identical to BLSAggregator-4.14.0's
- * `_computeSignersCommitment` (SP #630, BLSAggregator.sol:1376-1388): `keccak256(abi.encode(
+ * `_computeSignersCommitment` (SP #630): `keccak256(abi.encode(
  * domainSeparator, TAG_SIGNERS_COMMITMENT, key, messageHash, signerMask, signers,
  * blockhash(block.number - 1)))`. For the execute-slash path `key` is the proposalId. The watcher can self-check that its assembled
  * proof WILL pass on-chain before submitting. `messageHash` MUST be built with the SAME `domain`.

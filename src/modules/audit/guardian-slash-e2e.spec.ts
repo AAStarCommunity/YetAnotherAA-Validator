@@ -81,8 +81,10 @@ class MockProvider {
       ]),
     };
   }
-  async getBlock(): Promise<{ timestamp: number; hash: string }> {
-    return { timestamp: 1_700_000_000, hash: PARENT };
+  // Block-sensitive (clestons #468): only block EXEC_BLOCK - 1 carries PARENT.
+  async getBlock(n: number): Promise<{ timestamp: number; hash: string }> {
+    const hash = n === EXEC_BLOCK - 1 ? PARENT : ethers.keccak256(ethers.toBeHex(n, 32));
+    return { timestamp: 1_700_000_000, hash };
   }
   async call(tx: { data: string }): Promise<string> {
     const sel = tx.data.slice(0, 10);

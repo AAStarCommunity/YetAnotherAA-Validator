@@ -92,7 +92,9 @@ contract DeployOverIssueVerifier is Script {
     /// @dev Classifies `v`: RELEASE_UNPARSEABLE unless it is exactly
     ///      "BLSAggregator-<major>.<minor>.<patch>" optionally followed by "-<suffix>" (non-empty,
     ///      [0-9A-Za-z.-]), each number 1-6 digits with no leading zero (except "0" itself); otherwise
-    ///      RELEASE_ANCHORED when (major, minor) >= (4, 13), else RELEASE_PRE_ANCHOR.
+    ///      RELEASE_ANCHORED when the release is >= 4.14.0 in semver order, else RELEASE_PRE_ANCHOR.
+    ///      A pre-release of the floor itself ("4.14.0-rc.1") sorts BELOW 4.14.0 and is refused: it may
+    ///      predate the parent-block-hash commitment (clestons #468, Low).
     uint8 internal constant RELEASE_UNPARSEABLE = 0;
     uint8 internal constant RELEASE_PRE_ANCHOR = 1;
     uint8 internal constant RELEASE_ANCHORED = 2;
@@ -121,7 +123,7 @@ contract DeployOverIssueVerifier is Script {
         if (!ok1 || i1 >= b.length || b[i1] != ".") return RELEASE_UNPARSEABLE;
         (bool ok2, uint256 minor, uint256 i2) = _readStrictUint(b, i1 + 1);
         if (!ok2 || i2 >= b.length || b[i2] != ".") return RELEASE_UNPARSEABLE;
-        (bool ok3,, uint256 i3) = _readStrictUint(b, i2 + 1);
+        (bool ok3, uint256 patch, uint256 i3) = _readStrictUint(b, i2 + 1);
         if (!ok3) return RELEASE_UNPARSEABLE;
         if (i3 != b.length) {
             // "-<suffix>": non-empty, [0-9A-Za-z.-] only.
@@ -133,6 +135,8 @@ contract DeployOverIssueVerifier is Script {
                 if (!okc) return RELEASE_UNPARSEABLE;
             }
         }
+        bool preRelease = i3 != b.length;
+        if (major == 4 && minor == 14 && patch == 0 && preRelease) return RELEASE_PRE_ANCHOR;
         return (major > 4 || (major == 4 && minor >= 14)) ? RELEASE_ANCHORED : RELEASE_PRE_ANCHOR;
     }
 
@@ -161,6 +165,14 @@ contract DeployOverIssueVerifier is Script {
     ///         operator must see, not a knob to turn. This is an INDEPENDENT floor, not a proxy for
     ///         the version check: both must hold.
     uint256 internal constant MIN_VERIFIER_ROTATION_DELAY = 4 days;
+
+    /// @notice Testnets only, until #447 (clestons #468). Step 5 of the verifier reads the token's
+    ///         CURRENT isOverIssued(), not its state at the disputed slash, so this verifier must not
+    ///         reach a chain where guardian stake has value. Sepolia, OP Sepolia, a local anvil.
+    ///         Not env-overridable: lifting it is a reviewed change made together with #447.
+    function _isTestnet(uint256 chainId) internal pure returns (bool) {
+        return chainId == 11155111 || chainId == 11155420 || chainId == 31337;
+    }
 
     /// @dev Every input `deploy` needs, so the guards below can be exercised by
     ///      `test/DeployOverIssueVerifierScript.t.sol` without touching process-global env vars
@@ -200,6 +212,10 @@ contract DeployOverIssueVerifier is Script {
     /// @return verifier The freshly deployed, domain-conformant `OverIssueFraudProofVerifier`.
     function deploy(DeployConfig memory cfg) public returns (OverIssueFraudProofVerifier verifier) {
         require(block.chainid == cfg.expectedChainId, "wrong chain: set EXPECTED_CHAIN_ID for this RPC");
+        require(
+            _isTestnet(block.chainid),
+            "testnets only until #447: the verifier reads the token's current isOverIssued(), not its historical state"
+        );
 
         address aggregator = cfg.aggregator;
         require(aggregator != address(0), "AGGREGATOR must be non-zero");
@@ -261,7 +277,7 @@ contract DeployOverIssueVerifier is Script {
             "AGGREGATOR.version() != expected: re-verify the fraud-proof ABI and the arming path for that release, then set EXPECTED_AGGREGATOR_VERSION"
         );
         // GATE A' — ANCHORED RELEASES ONLY (#441), no override. BLSAggregator-4.13.0 (SP rc.8 r3b)
-        // keyed the signer commitment per path; 4.14.0 (SP #630: BLSAggregator.sol:1376-1388) ended it
+        // keyed the signer commitment per path; 4.14.0 (SP #630, _computeSignersCommitment) ended it
         // with blockhash(block.number - 1). The floor is 4.14.0 (Daybreak on #441, Medium): a 4.13.x
         // commitment has no parent block hash, so this verifier would reject every honest proof there. This verifier (VERIFIER_VERSION
         // "OverIssueFraudProofVerifier-3.0.0") recomputes exactly that layout, with the parent block

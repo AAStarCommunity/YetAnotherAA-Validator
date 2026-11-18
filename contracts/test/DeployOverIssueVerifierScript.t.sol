@@ -342,7 +342,9 @@ contract DeployOverIssueVerifierScriptTest is Test {
     ///         commitment has no parent block hash, so this verifier can never verify there. 4.13.x
     ///         keyed the commitment per path but had no parent block hash (Daybreak on #441, Medium).
     function test_Deploy_RefusesPreAnchorReleaseEvenWhenExpected() public {
-        string[8] memory vs = [
+        string[10] memory vs = [
+            "BLSAggregator-4.14.0-rc.1", // a pre-release of the floor sorts below it (clestons #468)
+            "BLSAggregator-4.14.0-0",
             "BLSAggregator-4.13.0",
             "BLSAggregator-4.13.9-rc",
             "BLSAggregator-4.12.0",
@@ -462,6 +464,24 @@ contract DeployOverIssueVerifierScriptTest is Test {
         cfg.expectedAggregator = address(0);
         cfg.allowUnverifiedAggregator = true;
         deployScript.deploy(cfg);
+    }
+
+    /// @notice Testnets only until #447 (clestons #468): a mainnet chain id is refused even when the
+    ///         operator names it as the expected chain. 31337 (this test) is allowed.
+    function test_Deploy_RefusesNonTestnetChains() public {
+        uint256[4] memory ids = [uint256(1), 10, 8453, 42161];
+        for (uint256 i = 0; i < ids.length; i++) {
+            vm.chainId(ids[i]);
+            ScriptMockAggregator agg = new ScriptMockAggregator(REGISTRY, 4 days);
+            DeployOverIssueVerifier.DeployConfig memory cfg = _config(address(agg));
+            cfg.expectedChainId = ids[i];
+            vm.expectRevert(
+                bytes(
+                    "testnets only until #447: the verifier reads the token's current isOverIssued(), not its historical state"
+                )
+            );
+            deployScript.deploy(cfg);
+        }
     }
 
     /// @notice Wrong-RPC guard still fires ahead of any deployment.

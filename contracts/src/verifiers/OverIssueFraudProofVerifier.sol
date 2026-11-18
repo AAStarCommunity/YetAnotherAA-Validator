@@ -71,14 +71,14 @@ interface IOverIssuable {
  *      deployment where `executeGuardianSlash` moves real stake. Test/E2E use only until that lands.
  */
 contract OverIssueFraudProofVerifier is IFraudProofVerifier {
-    /// @notice Machine-readable build marker (#441, DSR 2026-11-17). SP's manifest reads these two
-    ///         instead of relying only on a pinned sha256: a verifier without them predates the
-    ///         BLSAggregator-4.14.0 commitment layout and can never verify a proof there.
+    /// @notice Machine-readable build marker (#441, DSR 2026-11-17), for a deploy manifest to read
+    ///         besides a pinned sha256. SP's code does not read either marker today. A verifier without
+    ///         them predates the BLSAggregator-4.14.0 commitment layout and can never verify there.
     ///         3.0.0: the over-issue evidenceHash follows the M0 §3.1 category rule (OVERISSUE_CATEGORY)
     ///         instead of 2.0.0's DVT_OVERISSUE_EVIDENCE_V1 pre-image (2.0.0 was never deployed).
     string public constant VERIFIER_VERSION = "OverIssueFraudProofVerifier-3.0.0";
     /// @notice True: the recomputed signer commitment ends with blockhash(executionBlock - 1),
-    ///         supplied in the fraudProof (SP #630, BLSAggregator.sol:1376-1388).
+    ///         supplied in the fraudProof (SP #630, BLSAggregator._computeSignersCommitment).
     bool public constant COMMITMENT_BINDS_PARENT_BLOCKHASH = true;
 
     string internal constant FRAUD_ID_TAG = "GUARDIAN_FRAUD_V1"; // DVT-internal fraudProofId derivation
@@ -86,7 +86,9 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
     bytes32 public constant TAG_EVIDENCE = keccak256("SuperPaymaster.DVT.Evidence.v2");
     /// @notice The over-issue evidence category (proposal, not finalized; see EVIDENCE STRUCTURE).
     bytes32 public constant OVERISSUE_CATEGORY = keccak256("DVT.Evidence.OverIssue.v1");
-    uint256 internal constant MAX_SIGNERS = 13; // == BLSAggregator.MAX_VALIDATORS
+    /// @dev == BLSAggregator.MAX_VALIDATORS (64 in 4.14.x, BLSAggregator.sol:224). A smaller bound
+    ///      would make every slash signed by a guardian at a higher slot unprovable (clestons #468).
+    uint256 internal constant MAX_SIGNERS = 64;
 
     /// @notice SP's BLS-consensus domain-separator + path-tag constants, byte-for-byte identical to
     ///         SuperPaymaster contracts/src/modules/monitoring/BLSAggregator.sol
@@ -287,8 +289,8 @@ contract OverIssueFraudProofVerifier is IFraudProofVerifier {
         bytes32 anchor = IBLSAggregatorCommitment(AGGREGATOR).proposalSignersCommitment(proposalId);
         if (anchor == bytes32(0)) return false; // not a recorded proposal
         bytes32 messageHash = slashMessageHash(proposalId, operator, slashLevel, epoch, disputedToken);
-        // Byte-identical to BLSAggregator-4.14.0 _computeSignersCommitment (SP #630,
-        // BLSAggregator.sol:1376-1388): keccak256(abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT,
+        // Byte-identical to BLSAggregator-4.14.x _computeSignersCommitment (SP #630;
+        // BLSAggregator.sol:1356 in 4.14.2): keccak256(abi.encode(domainSeparator(), TAG_SIGNERS_COMMITMENT,
         // key, messageHash, signerMask, signers, blockhash(block.number - 1))). On the execute-slash
         // path the key is the proposalId. The 4.11 layout without the last field is no longer accepted.
         bytes32 recomputed = keccak256(
