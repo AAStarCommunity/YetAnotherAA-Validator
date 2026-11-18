@@ -108,6 +108,13 @@ Their addresses come from SP's frozen plan, which SP precomputes at the pin.
      --export-pop <out.json> --env <Sepolia RPC env>
    ```
 
+   `node_dev_00{1,2,3}.json` are the author's **test** guardian keys for
+   dvt1/2/3, as the author recalls. They are for testnets only (author, via DSR,
+   2026-11-18). OP mainnet guardians must use separately generated keys, kept
+   outside this directory and every checkout of this repository. The author
+   decides how those keys are generated and kept; that decision is still
+   pending.
+
    The source file is `contracts/src/modules/monitoring/BLSAggregator.sol` at
    the tag, fetched with `gh api`. `DOMAIN_NAME` and `TAG_POP` are extracted
    from it, not copied into the script.
