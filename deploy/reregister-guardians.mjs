@@ -101,6 +101,7 @@ import { readFileSync, writeFileSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import { bls12_381 as bls } from "@noble/curves/bls12-381.js";
+import { keyEnds, fieldShape, pubKeyShape, nodeNameShape } from "./lib/redact.mjs";
 
 const POP_DST = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 const DEFAULT_NODES = ["node_dev_001.json", "node_dev_002.json", "node_dev_003.json"];
@@ -393,30 +394,6 @@ const REGISTRY_ABI = [
 const STAKING_ABI = [
   "function roleLocks(address, bytes32) view returns (uint128 amount, uint128 ticketPrice, uint48 lockedAt, bytes32 roleId, bytes metadata)",
 ];
-/// The first and last 8 bytes of a 128-byte key, for messages: enough to tell two keys apart, not the
-/// whole value (DSR 2026-11-18). A public key, but a full one in a log invites copy-paste mistakes.
-const keyEnds = hex => `${hex.slice(0, 18)}…${hex.slice(-16)}`;
-/// A node-file field for an error message (clestons #444 Low 2). A BLS secret pasted into the wrong
-/// field must not reach the terminal: a small integer is shown as is, anything else only by its type,
-/// its length and, for a long string, its first and last 8 characters.
-const fieldShape = v => {
-  if (typeof v === "number" && Number.isSafeInteger(v) && Math.abs(v) < 1000) return String(v);
-  if (typeof v === "string" && /^\d{1,3}$/.test(v)) return JSON.stringify(v);
-  if (typeof v !== "string") return `<${typeof v}, value withheld>`;
-  // Fragments are shown only when the whole string is printable ASCII: no control, C1 or direction
-  // character can reach the terminal (Codex on #444's follow-up, rounds 1-2).
-  return v.length > 40 && /^[\x20-\x7e]+$/.test(v)
-    ? `<${v.length} chars: ${v.slice(0, 8)}…${v.slice(-8)}>`
-    : `<${v.length} chars, value withheld>`;
-};
-/// nodeName goes into every label, so it is shown only when it looks like a name (Codex on #444's
-/// follow-up): up to 40 letters, digits, '.', '_' or '-'; otherwise only its shape.
-const nodeNameShape = v =>
-  v === undefined
-    ? "?"
-    : typeof v === "string" && /^[A-Za-z0-9._-]{1,40}$/.test(v)
-      ? v
-      : fieldShape(v);
 
 /// Split a 0x-prefixed byte string into 32-byte words. EIP-2537 G1 is 128 bytes (4 words) and G2 is
 /// 256 bytes (8 words); those map 1:1 onto SP's BLS.G1Point / BLS.G2Point structs.
@@ -1060,7 +1037,7 @@ async function main() {
       die(
         `${label}: the private key does not match publicKeyEip2537 in the same file.\n` +
           `  derived : ${keyEnds(derived)}\n` +
-          `  in file : ${fieldShape(node.publicKeyEip2537)}\n` +
+          `  in file : ${pubKeyShape(node.publicKeyEip2537)}\n` +
           `  Registering would bind a key nobody can sign with. Fix the node file first.`
       );
     }
