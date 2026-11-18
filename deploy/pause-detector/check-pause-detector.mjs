@@ -3878,6 +3878,45 @@ await cell(
   }
 );
 
+await cell(
+  "#454 Low: a replayStartedAt no Date can print is refused as state, not thrown on every round",
+  async () => {
+    const cfg = cfgOf();
+    for (const v of [-1e20, -1, 1.5, 1e300, 8.7e15]) {
+      const st = emptyState(cfg);
+      st.replayStartedAt = { lastFullScan: v };
+      assert(
+        stateProblems(st, cfg).some(p => /replayStartedAt/.test(p)),
+        `accepted ${v}`
+      );
+    }
+    // the same for the other state times a round prints (Codex): the overflow's start, undeliveredSince
+    const ov = emptyState(cfg);
+    ov.crossCheck.overflow = { provider: "infura", since: -1e20, maxCount: 101 };
+    assert(
+      stateProblems(ov, cfg).some(p => /crossCheck/.test(p)),
+      "an unprintable overflow.since accepted"
+    );
+    for (const bad of [{ provider: { toString: null } }, { provider: "infura", primary: 7 }]) {
+      const mm = emptyState(cfg);
+      mm.crossCheck.mismatch = { at: 1, height: 130, fallbackOnly: [], primaryOnly: [], ...bad };
+      assert(
+        stateProblems(mm, cfg).some(p => /crossCheck/.test(p)),
+        `accepted ${JSON.stringify(bad)}`
+      );
+    }
+    const ud = emptyState(cfg);
+    ud.undeliveredSince = 1e300;
+    assert(
+      stateProblems(ud, cfg).some(p => /undeliveredSince/.test(p)),
+      "an unprintable undeliveredSince accepted"
+    );
+    const ok = emptyState(cfg);
+    ok.replayStartedAt = { lastFullScan: 1e12 };
+    assert(!stateProblems(ok, cfg).some(p => /replayStartedAt/.test(p)), "a real time refused");
+  }
+);
+
 await cell("state: a malformed crossCheck record is refused", () => {
   const st = emptyState(cfgOf());
   st.crossCheck = {

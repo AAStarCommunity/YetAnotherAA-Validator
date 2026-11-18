@@ -336,6 +336,8 @@ export function emptyCrossCheck() {
   };
 }
 
+/** A state time a Date can print: a safe integer of ms in 0..8.64e15 (clestons #454, Codex). Pure. */
+const isTime = v => Number.isSafeInteger(v) && v >= 0 && v <= 8.64e15;
 const plainObject = o => o !== null && typeof o === "object" && !Array.isArray(o); // the state is JSON: an object or an array
 
 /** Problems of a loaded state against the config it must belong to. Pure. */
@@ -396,7 +398,7 @@ export function stateProblems(st, cfg) {
   if (
     st.undeliveredSince !== undefined &&
     st.undeliveredSince !== null &&
-    !(Number.isFinite(st.undeliveredSince) && st.undeliveredSince >= 0)
+    !isTime(st.undeliveredSince)
   )
     p.push("the state's undeliveredSince is not a time");
   // the classification fields are optional (a state from before them starts at startBlock - 1)
@@ -423,7 +425,9 @@ export function stateProblems(st, cfg) {
     !(
       plainObject(st.replayStartedAt) &&
       Object.entries(st.replayStartedAt).every(
-        ([k, v]) => (k === "lastFullScan" || k === "lastFallbackFullScan") && Number.isFinite(v)
+        // a time a Date can print (clestons #454 Low: a huge negative one threw in the overdue alert
+        // on every round, and the rollback kept it)
+        ([k, v]) => (k === "lastFullScan" || k === "lastFallbackFullScan") && isTime(v)
       )
     )
   )
@@ -482,7 +486,7 @@ export function stateProblems(st, cfg) {
         c.overflow === null ||
         (plainObject(c.overflow) &&
           typeof c.overflow.provider === "string" &&
-          Number.isFinite(c.overflow.since) &&
+          isTime(c.overflow.since) &&
           Number.isSafeInteger(c.overflow.maxCount) &&
           c.overflow.maxCount > 0)
       ) ||
@@ -491,6 +495,9 @@ export function stateProblems(st, cfg) {
         (plainObject(c.mismatch) &&
           Number.isSafeInteger(c.mismatch.height) &&
           c.mismatch.height >= 0 &&
+          // the alert prints both names (Codex): anything but a string threw on every round
+          typeof c.mismatch.provider === "string" &&
+          (c.mismatch.primary === undefined || typeof c.mismatch.primary === "string") &&
           addrs(c.mismatch.fallbackOnly) &&
           addrs(c.mismatch.primaryOnly) &&
           (c.mismatch.unlisted === undefined ||
@@ -1037,7 +1044,10 @@ async function roundOnce(st, { chain, cfg, now, clock, isPrimary = true }) {
     if (now - started > REPLAY_ALERT_MS)
       alerts.push({
         key: `replay-overdue:${k}`,
-        text: `the daily replay (${k}) started at ${new Date(started).toISOString()} and has not reached the finalized block: check classifyMaxBlocks and the provider`,
+        text:
+          `the daily replay (${k}) started at ${new Date(started).toISOString()} and has not reached the finalized block: check classifyMaxBlocks and the provider` +
+          // (the fallback's replay advances only on rounds the fallback runs: clestons #454 Info)
+          (k === "lastFallbackFullScan" ? "; it advances only on rounds run on the fallback" : ""),
       });
   // an unknown topic0 named in the config since is known now: it is dropped
   for (const t of Object.keys(st.unknownTopics)) if (known.has(t)) delete st.unknownTopics[t];
