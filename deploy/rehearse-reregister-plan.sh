@@ -26,6 +26,10 @@
 #                the new pair: it must stop on a guardian without ROLE_DVT, pass once each holds
 #                ROLE_DVT and minStake, reproduce the same readsDigest on a later block, and stop on a
 #                node file whose key differs from the active one and on a suspended guardian.
+#   fresh        SP DeployLive's shape: Registry, aggregator and DVTValidator all new. Predict (snapshot,
+#                DeployAnvil, revert), export from a deploylive-pop-request/1, refuse a wrong schema and a
+#                wrong guardianCount, deploy again, require deployed == predicted == popContext, then the
+#                same A10 assertions, sends, read-back and --deployment steps as `good`. Exit 0.
 #   nonce-moved  the deployer sends one unplanned transaction after the export. The re-export must stop
 #                on the nonce check and the address assertion must stop the send: exit 3.
 set -euo pipefail
@@ -146,12 +150,93 @@ trap 'kill $APID 2>/dev/null || true' EXIT
 sleep 3
 [ "$("$C" chain-id --rpc-url "$R")" = 31337 ] || { echo "not a local anvil"; exit 1; }
 
+jget() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"; }
+if [ "$MODE" = fresh ]; then
+# ---- FRESH deploy (SP DeployLive's shape; DSR 2026-11-18): Registry, aggregator and DVTValidator all new --
+# 1. predict: snapshot, run DeployAnvil once to learn the addresses, revert to the snapshot.
+SNAP=$("$C" rpc evm_snapshot --rpc-url "$R" | tr -d '"')
+N=$("$C" nonce "$D" --rpc-url "$R"); BLK=$("$C" block-number --rpc-url "$R")
+BH=$("$C" block "$BLK" --field hash --rpc-url "$R")
+( cd "$SP_DIR" && LOCAL_DEV_GOVERNANCE_ACK=true "$FORGE" script "contracts/script/v3/DeployAnvil.s.sol:DeployAnvil" \
+    --rpc-url "$R" --broadcast --slow --disable-code-size-limit --timeout 300 --non-interactive \
+    --private-key "$K0" --offline > "$B/deploy-predict.log" 2>&1 )
+CFG=$SP_DIR/deployments/config.anvil.json
+PAGG=$(jget "$CFG" blsAggregator); PDVT=$(jget "$CFG" dvtValidator); PREG=$(jget "$CFG" registry)
+[ "$("$C" rpc evm_revert "$SNAP" --rpc-url "$R")" = true ] || { echo "FAIL: evm_revert"; exit 1; }
+[ "$("$C" nonce "$D" --rpc-url "$R")" = "$N" ] && [ "$("$C" code "$PAGG" --rpc-url "$R")" = 0x ] \
+  || { echo "FAIL: the revert did not restore the pre-deploy state"; exit 1; }
+echo "predicted: aggregator $PAGG dvtValidator $PDVT registry $PREG (deployer nonce $N, block $BLK)"
+# 2. DeployLive's request (deploylive-pop-request/1), then DVT's export, before anything exists.
+write_request() { # $1 out  $2 schema  $3 guardianCount
+  python3 - "$1" "$2" "$3" "$PAGG" "$PDVT" "$PREG" "$BLK" "$BH" "$D" "$N" "$SP_COMMIT" <<'PY'
+import json, sys
+out, schema, gc, agg, dvt, reg, blk, bh, dep, n, commit = sys.argv[1:]
+json.dump({"schema": schema, "chainId": 31337, "spCommit": commit,
+           # lowercase on purpose: the export must echo the request's strings, not re-case them
+           "addresses": {"BLSAggregator": agg.lower(), "DVTValidator": dvt.lower(), "Registry": reg.lower()},
+           "pin": {"block": int(blk), "blockHash": bh, "senders": {"deployer": {"address": dep, "nonce": int(n)}}},
+           "guardianCount": int(gc)}, open(out, "w"), indent=2)
+PY
+}
+fresh_export() { # $1 request  $2 output
+  ( cd "$WT" && env -u SEPOLIA_RPC_URL node deploy/reregister-guardians.mjs --env "$B/anvil.env" \
+      --chain-id 31337 --plan "$1" --sp-aggregator-source "$SRC" --sp-commit "$SP_COMMIT" \
+      --nodes "$NODES" --export-pop "$2" )
+}
+fresh_must_stop() { # $1 what  $2 pattern  $3 request
+  local out
+  if out=$(fresh_export "$3" "$B/fresh-must-stop.json" 2>&1); then echo "FAIL: $1: the export passed"; exit 1; fi
+  echo "$out" | grep -q -- "$2" || { echo "FAIL: $1: stopped for another reason:"; echo "$out" | grep '✗'; exit 1; }
+  echo "$1: stopped (expected)"
+}
+write_request "$B/request.json" deploylive-pop-request/1 3
+fresh_export "$B/request.json" "$B/plan-pop.json"
+write_request "$B/request-bad-schema.json" deploylive-pop-request/2 3
+fresh_must_stop "another schema" 'is not "deploylive-pop-request/1"' "$B/request-bad-schema.json"
+write_request "$B/request-2.json" deploylive-pop-request/1 2
+fresh_must_stop "guardianCount 2 with 3 node files" "guardianCount is 2, --nodes names 3" "$B/request-2.json"
+# 3. DeployLive stand-in: the same DeployAnvil, from the same nonce, lands at the predicted addresses.
+( cd "$SP_DIR" && LOCAL_DEV_GOVERNANCE_ACK=true "$FORGE" script "contracts/script/v3/DeployAnvil.s.sol:DeployAnvil" \
+    --rpc-url "$R" --broadcast --slow --disable-code-size-limit --timeout 300 --non-interactive \
+    --private-key "$K0" --offline > "$B/deploy-fresh.log" 2>&1 )
+NAGG=$(jget "$CFG" blsAggregator); NDVT=$(jget "$CFG" dvtValidator); REG=$(jget "$CFG" registry)
+check_versions "$NAGG" "$NDVT" "fresh stack"
+# Once deployed, the same request must be refused: the predicted addresses have code now.
+fresh_must_stop "the request after the deploy" "already has code" "$B/request.json"
+# Only the Registry has code (aggregator and DVTValidator are never-used addresses): still refused.
+python3 - "$B/request.json" "$B/request-reg-only.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+r["addresses"]["BLSAggregator"] = "0x" + "a1" * 20
+r["addresses"]["DVTValidator"] = "0x" + "d1" * 20
+json.dump(r, open(sys.argv[2], "w"))
+PY
+fresh_must_stop "a request whose Registry alone has code" "Registry (fresh deploy)" "$B/request-reg-only.json"
+# 4. A10-equivalent for the fresh shape: every deployed address == the request == popContext.
+python3 - "$B/plan-pop.json" "$B/request.json" "$NAGG" "$NDVT" "$REG" <<'PY'
+import json, sys
+f, reqf, agg, dvt, reg = sys.argv[1:]
+p = json.load(open(f)); c = p["popContext"]; q = json.load(open(reqf))
+def need(ok, what):
+    if not ok:
+        print("FAIL:", what); sys.exit(1)
+lo = lambda x: x.lower()
+a = q["addresses"]
+need(lo(agg) == lo(a["BLSAggregator"]) and lo(dvt) == lo(a["DVTValidator"]) and lo(reg) == lo(a["Registry"]), "deployed != predicted")
+# popContext repeats the request EXACTLY (string for string), as SP's converter compares it.
+need(c["aggregator"] == a["BLSAggregator"] and c["dvt"] == a["DVTValidator"] and c["registry"] == a["Registry"], "popContext addresses != request strings")
+d = q["pin"]["senders"]["deployer"]
+need(c["chainId"] == q["chainId"] and c["deployerAddress"] == d["address"] and c["deployerNonce"] == d["nonce"], "popContext chain/deployer != request")
+need(c["pinBlock"] == q["pin"]["block"] and c["pinBlockHash"] == q["pin"]["blockHash"] and c["spCommit"] == q["spCommit"], "popContext pin/commit != request")
+need([e["slot"] for e in p["pop"]] == list(range(1, q["guardianCount"] + 1)), "slots are 1..guardianCount in order")
+print("fresh: deployed == predicted; popContext == the request, string for string; slots 1..%d" % q["guardianCount"])
+PY
+else
 # ---- generation 1 plays the OLD stack (old aggregator, Registry) -----------------------------------
 ( cd "$SP_DIR" && LOCAL_DEV_GOVERNANCE_ACK=true "$FORGE" script "contracts/script/v3/DeployAnvil.s.sol:DeployAnvil" \
     --rpc-url "$R" --broadcast --slow --disable-code-size-limit --timeout 300 --non-interactive \
     --private-key "$K0" --offline > "$B/deploy-gen1.log" 2>&1 )
 G1=$SP_DIR/deployments/config.anvil.json
-jget() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"; }
 OLDAGG=$(jget "$G1" blsAggregator); REG=$(jget "$G1" registry); SPX=$(jget "$G1" superPaymaster)
 echo "gen1 (old) aggregator $OLDAGG registry $REG"
 check_versions "$OLDAGG" "$(jget "$G1" dvtValidator)" "gen1"
@@ -226,6 +311,7 @@ esac
 # ---- A8 wiring ---------------------------------------------------------------------------------------
 "$C" send "$NDVT" 'setBLSAggregator(address)' "$NAGG" --private-key "$K0" --rpc-url "$R" >/dev/null
 "$C" send "$REG" 'setBLSAggregator(address)' "$NAGG" --private-key "$K0" --rpc-url "$R" >/dev/null
+fi
 
 # ---- A10-equivalent pre-send assertions: keys, on-chain domainSeparator and popDigest == export ------
 python3 - "$C" "$R" "$NAGG" "$B/plan-pop.json" "$NODES_DIR" <<'PY'
@@ -281,6 +367,7 @@ for i in (1, 2, 3):
 sys.exit(0 if ok else 1)
 PY
 
+G1=${G1:-$SP_DIR/deployments/config.anvil.json}
 # ---- the --deployment --export-pop path (return after exit) against the new pair ---------------------
 # Daybreak on 63a484d0, M1-M3 (DSR 2026-11-18). The deployer is still the owner here (no hand-off).
 DEP=$B/deployment.json
