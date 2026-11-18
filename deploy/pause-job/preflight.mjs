@@ -15,6 +15,7 @@
 //               price keeper is the one approved sender and is not scanned; the detector is.
 // detector-args the loaded detector runs the pinned node under --permission, exactly as its plist
 // detector-bundle ~/.aoa-pause-detector/app is exactly its manifest; no symlink under the directory
+// detector-lockport config.json's lockPort is outside this machine's ephemeral port range
 // pause-detector its last round's status.json is fresh (at most two intervals old): the trigger
 //               fired, not just the job loaded
 // node-slash-off every DVT node container has AUDIT_ENABLED and AUDIT_EXECUTE_SLASH absent or exactly
@@ -374,6 +375,48 @@ export function deadmanFresh(text, now, maxAgeMs = DEADMAN_STALE_MS) {
  * detector-bundle: no symlink under ~/.aoa-pause-detector, the bundle exactly its manifest, and the
  * manifest the one the deploy log recorded (`expect` = { commit, manifestSha256 }; Daybreak H4).
  */
+/** macOS's default ephemeral port range (sysctl net.inet.ip.portrange.first/last). */
+export const EPHEMERAL_DEFAULT = [49152, 65535];
+/**
+ * detector-lockport (DSR 2026-11-18): the detector's fixed lockPort must be outside the system's
+ * ephemeral port range. Inside it, any outgoing connection on the machine can happen to hold it,
+ * and a round that finds it taken exits 75 without a status or heartbeat (an alert, but a false
+ * one). `cfgText` is config.json (null when missing); `range` the system's [first, last], or null
+ * when it could not be read: then the item FAILS, never assumes a default (Codex). Pure.
+ */
+export function lockPortProblems(cfgText, range = EPHEMERAL_DEFAULT) {
+  if (range === null)
+    return [
+      "cannot read this machine's ephemeral port range (sysctl net.inet.ip.portrange.first/last), so lockPort cannot be checked against it",
+    ];
+  if (cfgText === null) return ["~/.aoa-pause-detector/config.json is missing"];
+  let c;
+  try {
+    c = JSON.parse(cfgText);
+  } catch {
+    return ["config.json cannot be read as JSON"];
+  }
+  const p = c?.lockPort;
+  if (!Number.isSafeInteger(p) || p < 1024 || p > 65535)
+    return [`lockPort ${p} is not a port in 1024..65535`];
+  const [a, b] = range;
+  if (p >= a && p <= b)
+    return [
+      `lockPort ${p} is inside the ephemeral port range ${a}-${b}: any outgoing connection can hold it, and a round that finds it taken exits without a heartbeat. Choose a port below ${a} that no service listens on (check: lsof -nP -iTCP:<port>)`,
+    ];
+  return [];
+}
+
+/** sysctl's two outputs (strings, or null when the call failed) as [first, last], or null. Pure. */
+export function ephemeralRange(firstText, lastText) {
+  const num = t => (typeof t === "string" && /^\s*\d+\s*$/.test(t) ? Number(t) : NaN);
+  const a = num(firstText);
+  const b = num(lastText);
+  return Number.isSafeInteger(a) && Number.isSafeInteger(b) && a > 0 && b >= a && b <= 65535
+    ? [a, b]
+    : null;
+}
+
 export function detectorBundleItem(home, expect) {
   const dd = join(home, DETECTOR_DIR);
   return [
@@ -577,6 +620,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       manifestSha256: opt("--detector-manifest-sha256"),
     });
     results.push(["detector-bundle", db.length ? "FAIL" : "PASS", db.slice(0, 5)]);
+    // the lock port, against this machine's ephemeral range (sysctl); unreadable range = FAIL
+    const range = ephemeralRange(
+      run("sysctl", ["-n", "net.inet.ip.portrange.first"]),
+      run("sysctl", ["-n", "net.inet.ip.portrange.last"])
+    );
+    let cfgText = null;
+    try {
+      cfgText = readFileSync(join(homedir(), ".aoa-pause-detector/config.json"), "utf8");
+    } catch {
+      cfgText = null;
+    }
+    const lp = lockPortProblems(cfgText, range);
+    results.push(["detector-lockport", lp.length ? "FAIL" : "PASS", lp]);
   }
   const di = argv.indexOf("--detector-status");
   const statusPath =
