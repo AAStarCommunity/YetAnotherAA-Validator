@@ -418,7 +418,7 @@ fs.readFileSync(pathToFileURL(${JSON.stringify(c)}));
     ],
     "a fresh request without addresses.Registry": [
       r => (delete r.addresses.Registry, r),
-      /addresses\.Registry/,
+      /addresses must have exactly the keys BLSAggregator, DVTValidator, Registry/,
     ],
     "another chainId": [r => ((r.chainId = 11155111), r), /but this RPC is chain 1/],
     "another spCommit": [r => ((r.spCommit = "cd".repeat(20)), r), /but --sp-commit is/],
@@ -488,6 +488,175 @@ fs.readFileSync(pathToFileURL(${JSON.stringify(c)}));
     ok.status === 1 && /cannot read --sp-aggregator-source/.test(ok.stderr),
     ok.stderr.trim().split("\n")[0]
   );
+}
+
+// --plan fresh deploy against a FAKE CHAIN (clestons #466 Low 4): eth_getCode answers code only for
+// chosen addresses, so the two decisions the shape cells cannot reach are pinned in CI: a request
+// whose Registry alone has code stops at gate 1, and a passing export echoes the request exactly.
+{
+  const { bls12_381: bls } = await import("@noble/curves/bls12-381.js");
+  const { ethers } = await import("ethers");
+  const BH = "0x" + "22".repeat(32);
+  const fake = { code: new Set() };
+  const chain = createServer((req, res) => {
+    let body = "";
+    req.on("data", c => (body += c));
+    req.on("end", () => {
+      const one = q => {
+        const m = q?.method;
+        const prm = q?.params ?? [];
+        let result = null;
+        if (m === "eth_chainId") result = "0x1";
+        else if (m === "net_version") result = "1";
+        else if (m === "eth_blockNumber") result = "0x10";
+        else if (m === "eth_getCode")
+          result = fake.code.has(String(prm[0]).toLowerCase()) ? "0x6001" : "0x";
+        else if (m === "eth_getTransactionCount") result = "0x5";
+        else if (m === "eth_getBlockByNumber")
+          result = {
+            number: prm[0],
+            hash: BH,
+            parentHash: "0x" + "33".repeat(32),
+            timestamp: "0x1",
+            nonce: "0x0000000000000000",
+            difficulty: "0x0",
+            gasLimit: "0x1c9c380",
+            gasUsed: "0x0",
+            miner: "0x" + "00".repeat(20),
+            extraData: "0x",
+            baseFeePerGas: "0x1",
+            transactions: [],
+          };
+        return { jsonrpc: "2.0", id: q?.id ?? 1, result };
+      };
+      let reply;
+      try {
+        const j = JSON.parse(body);
+        reply = Array.isArray(j) ? j.map(one) : one(j);
+      } catch {
+        reply = one(null);
+      }
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(reply));
+    });
+  });
+  await new Promise(r => chain.listen(0, "127.0.0.1", r));
+  const chainEnv = join(dir, "chain.env");
+  writeFileSync(chainEnv, `RPC_URL=http://127.0.0.1:${chain.address().port}\n`, { mode: 0o600 });
+  const src = join(dir, "BLSAggregator.sol");
+  writeFileSync(
+    src,
+    `contract BLSAggregator {\n  bytes32 public constant DOMAIN_NAME = keccak256("Test.Domain");\n  bytes32 public constant TAG_POP = keccak256("Test.Pop");\n  function version() external pure returns (string memory) {\n    return "BLSAggregator-4.14.2";\n  }\n}\n`
+  );
+  const enc = p => {
+    const o = new Uint8Array(128),
+      a = p.toAffine();
+    o.set(ethers.getBytes("0x" + a.x.toString(16).padStart(96, "0")), 16);
+    o.set(ethers.getBytes("0x" + a.y.toString(16).padStart(96, "0")), 80);
+    return ethers.hexlify(o);
+  };
+  const nodes = [1, 2].map(i => {
+    const sk = bls.utils.randomSecretKey(); // throwaway, generated per run
+    const f = join(dir, `fresh_node_${i}.json`);
+    writeFileSync(
+      f,
+      JSON.stringify({
+        nodeName: `t${i}`,
+        operator: ethers.Wallet.createRandom().address,
+        privateKey: ethers.hexlify(sk),
+        publicKeyEip2537: enc(bls.longSignatures.getPublicKey(sk)),
+      }),
+      { mode: 0o600 }
+    );
+    return f;
+  });
+  const COMMIT = "ef".repeat(20);
+  const addr = n => "0x" + n.repeat(20); // lowercase on purpose: the echo must not re-case it
+  const request = () => ({
+    schema: "deploylive-pop-request/1",
+    chainId: 1,
+    spCommit: COMMIT,
+    addresses: { BLSAggregator: addr("a1"), DVTValidator: addr("d1"), Registry: addr("e1") },
+    pin: { block: 7, blockHash: BH, senders: { deployer: { address: addr("0f"), nonce: 5 } } },
+    guardianCount: 2,
+  });
+  const exportWith = async (req, out) => {
+    const f = join(dir, "fresh-request.json");
+    writeFileSync(f, JSON.stringify(req));
+    return run([
+      "--plan",
+      f,
+      "--sp-aggregator-source",
+      src,
+      "--sp-commit",
+      COMMIT,
+      "--nodes",
+      nodes.join(","),
+      "--env",
+      chainEnv,
+      "--chain-id",
+      "1",
+      "--export-pop",
+      out,
+    ]);
+  };
+  fake.code = new Set([addr("e1")]);
+  const regOnly = await exportWith(request(), join(dir, "fresh-out-1.json"));
+  cell(
+    "plan (fake chain): a fresh request whose Registry alone has code stops at the no-code gate",
+    regOnly.status === 1 && /Registry \(fresh deploy\).*already has code/.test(regOnly.stderr),
+    regOnly.stderr.trim().split("\n").slice(-1)[0]
+  );
+  fake.code = new Set();
+  const outFile = join(dir, "fresh-out-2.json");
+  const okRun = await exportWith(request(), outFile);
+  let ctx = null;
+  try {
+    ctx = JSON.parse(readFileSync(outFile, "utf8"));
+  } catch {
+    ctx = null;
+  }
+  const q = request();
+  const c = ctx?.popContext;
+  cell(
+    "plan (fake chain): a passing fresh export echoes the request exactly (lowercase addresses kept), slots 1..2",
+    okRun.status === 0 &&
+      c?.aggregator === q.addresses.BLSAggregator &&
+      c?.dvt === q.addresses.DVTValidator &&
+      c?.registry === q.addresses.Registry &&
+      c?.deployerAddress === q.pin.senders.deployer.address &&
+      c?.deployerNonce === 5 &&
+      c?.pinBlock === 7 &&
+      c?.pinBlockHash === BH &&
+      c?.spCommit === COMMIT &&
+      c?.chainId === 1 &&
+      ctx.pop.every(e => e.aggregator === q.addresses.BLSAggregator) &&
+      ctx.pop.map(e => e.slot).join() === "1,2" &&
+      ctx.aggregatorSourceVersion === "BLSAggregator-4.14.2",
+    `status ${okRun.status} ${okRun.stderr.trim().split("\n").slice(-1)[0]} ${JSON.stringify(c)}`
+  );
+  const dup = request();
+  dup.addresses.Registry = dup.addresses.BLSAggregator;
+  const extra = request();
+  extra.extra = 1;
+  const noPrefix = request();
+  noPrefix.addresses.Registry = "e1".repeat(20);
+  const bad = [];
+  for (const [name, req, want] of [
+    ["Registry == aggregator", dup, /equals another predicted address/],
+    ["an unknown top-level key", extra, /must have exactly the keys/],
+    ["an address without 0x", noPrefix, /0x followed by 40 hex digits/],
+  ]) {
+    const r = await exportWith(req, join(dir, "fresh-out-x.json"));
+    if (!(r.status === 1 && want.test(r.stderr)))
+      bad.push(`${name}: ${r.stderr.trim().split("\n").slice(-1)[0]}`);
+  }
+  cell(
+    "plan (fake chain): duplicate addresses, unknown keys and un-prefixed addresses stop (clestons #466)",
+    bad.length === 0,
+    bad.join(" | ")
+  );
+  chain.close();
 }
 
 // --plan's aggregatorSourceVersion (DSR 2026-11-18; Codex): BLSAggregator's own version() body,

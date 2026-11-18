@@ -645,7 +645,36 @@ async function exportFromPlan({ provider, chainId }) {
   if (fresh) {
     if (deployment?.pin?.oldAggregator !== undefined)
       die(`${PLAN_FILE}: a ${FRESH_SCHEMA} request has no pin.oldAggregator`);
+    // Exact keys, as the schema is versioned (clestons #466): an unknown or missing key stops.
+    const exact = (obj, keys, where) => {
+      const got = obj && typeof obj === "object" ? Object.keys(obj).sort() : [];
+      if (got.join() !== [...keys].sort().join())
+        die(
+          `${PLAN_FILE}: ${where} must have exactly the keys ${keys.join(", ")}; it has ${got.join(", ") || "none"}`
+        );
+    };
+    exact(
+      deployment,
+      ["schema", "chainId", "spCommit", "addresses", "pin", "guardianCount"],
+      "the request"
+    );
+    exact(deployment.addresses, ["BLSAggregator", "DVTValidator", "Registry"], "addresses");
+    exact(deployment.pin, ["block", "blockHash", "senders"], "pin");
+    exact(deployment.pin.senders, ["deployer"], "pin.senders");
+    exact(deployment.pin.senders.deployer, ["address", "nonce"], "pin.senders.deployer");
+    // 0x-prefixed 20-byte hex, as they are echoed into popContext verbatim (clestons #466).
+    for (const [k, v] of [
+      ["addresses.BLSAggregator", deployment.addresses.BLSAggregator],
+      ["addresses.DVTValidator", deployment.addresses.DVTValidator],
+      ["addresses.Registry", deployment.addresses.Registry],
+      ["pin.senders.deployer.address", deployment.pin.senders.deployer.address],
+    ]) {
+      if (typeof v !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(v))
+        die(`${PLAN_FILE}: ${k} must be 0x followed by 40 hex digits`);
+    }
     freshRegistry = ethers.getAddress(addressAt(deployment, "addresses.Registry"));
+    if (freshRegistry === AGGREGATOR || freshRegistry === DVT)
+      die(`${PLAN_FILE}: addresses.Registry equals another predicted address`);
     if (!Number.isInteger(deployment.chainId) || deployment.chainId !== chainId)
       die(
         `${PLAN_FILE}: chainId ${JSON.stringify(deployment.chainId)}, but this RPC is chain ${chainId}`
@@ -671,6 +700,10 @@ async function exportFromPlan({ provider, chainId }) {
       );
     oldAggregator = addressAt(deployment, "pin.oldAggregator");
   }
+
+  // The DVTValidator and the aggregator are two contracts (clestons #466), in both shapes.
+  if (DVT === AGGREGATOR)
+    die(`${PLAN_FILE}: addresses.DVTValidator equals addresses.BLSAggregator`);
 
   let source;
   try {
