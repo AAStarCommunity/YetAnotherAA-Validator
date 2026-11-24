@@ -115,6 +115,28 @@ expect "a rollback that cannot complete: exit 4, INSTALL-INCOMPLETE written, sta
 rm -rf "$D"/.stage.*; in2 op-sepolia
 expect "the next successful install clears INSTALL-INCOMPLETE" '[ "$IRC" = 0 ] && [ ! -e "$D/INSTALL-INCOMPLETE" ]'
 
+# the marker is in place before publishing: a SIGKILL in the middle leaves INSTALL-INCOMPLETE
+cat > "$T/mvkill" <<'S'
+#!/bin/bash
+case "${@: -1}" in */aastar-price-keeper-op-sepolia/run.sh) kill -9 "$INSTALL_PID" ;; esac
+exec /bin/mv "$@"
+S
+chmod +x "$T/mvkill"; mkdir -p "$T/killbin"; ln -sf "$T/mvkill" "$T/killbin/mv"
+sed "s#^export PATH=\"#export PATH=\"$T/killbin:#" "$HERE/install.sh" > "$T/pk-kill.sh"
+mkdir -p "$T/pkk"; cp -R "$HERE/entries" "$HERE"/*.in "$HERE/run.sh" "$HERE/stale-watch.sh" "$HERE/status.mjs" "$HERE/keeperctl.sh" "$T/pkk/"
+cp "$T/pk-kill.sh" "$T/pkk/install.sh"; echo "# before-kill" >> "$D/run.sh"
+env HOME="$H" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" bash -c 'export INSTALL_PID=$$; exec bash "$0" op-sepolia' "$T/pkk/install.sh" > "$T/inst.out" 2>&1; IRC=$?
+expect "an install killed (SIGKILL) while publishing leaves INSTALL-INCOMPLETE behind" '[ "$IRC" = 137 ] && [ -f "$D/INSTALL-INCOMPLETE" ] && grep -q "publishing in progress" "$D/INSTALL-INCOMPLETE"'
+rm -rf "$D"/.stage.* "$D"/.run.sh.* ; in2 op-sepolia
+expect "the next install completes and removes the marker" '[ "$IRC" = 0 ] && [ ! -e "$D/INSTALL-INCOMPLETE" ]'
+# a marker path that is a link to a secret: replaced by rename, the secret untouched
+cp "$D/key.env" "$T/key.before"; ln -s "$D/key.env" "$D/INSTALL-INCOMPLETE"; chmod 500 "$LA"; in2 op-sepolia; chmod 700 "$LA"
+expect "an INSTALL-INCOMPLETE link to key.env never writes key.env (publish failed, rollback ok)" \
+  '[ "$IRC" = 1 ] && cmp -s "$D/key.env" "$T/key.before" && [ ! -e "$D/INSTALL-INCOMPLETE" ] && [ ! -L "$D/INSTALL-INCOMPLETE" ]'
+mv "$D" "$T/entrydir"; ln -s "$T/entrydir" "$D"; in2 op-sepolia
+expect "an entry dir that is a link refused" '[ "$IRC" = 65 ] && grep -q "is a link" "$T/inst.out"'
+rm "$D"; mv "$T/entrydir" "$D"
+
 # ---------- refused destinations and names
 mv "$D/entry.env" "$T/entry.keep"; ln -s "$D/key.env" "$D/entry.env"; in2 op-sepolia
 expect "an entry.env that is a link refused, the link left alone" '[ "$IRC" = 65 ] && grep -q "is a link" "$T/inst.out" && [ -L "$D/entry.env" ] && ! grep -q 0x "$T/inst.out"'
