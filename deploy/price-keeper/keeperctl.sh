@@ -10,12 +10,13 @@
 #          KeepAlive, a reboot nor a stray bootstrap can start a new one meanwhile. PAUSED (exit 0)
 #          only when all of that is confirmed; any failure is NOT PAUSED (exit 1).
 # resume = check both plists name their own labels, enable + bootstrap both, then wait until the
-#          keeper job's process runs scripts/keeper.ts with its worker child, and 10 s later is still
+#          keeper job's process runs scripts/keeper.ts with its worker child (within 120 s), and 10 s later is still
 #          the same process (launchd's run count unchanged, so no KeepAlive restart in between) with
-#          its child (run.sh refuses a bad config within a second). RESUMED (exit 0) only then.
+#          its child (run.sh refuses a bad config within a second). RESUMED (exit 0) only then; any
+#          failure after the first enable rolls back to paused ("rolled back: PAUSED" or "ROLLBACK FAILED").
 # restart = kickstart -k the keeper job (it must be loaded; a paused entry stays paused).
-# pause, resume and install.sh of one entry are serialized by a lock directory holding the holder's
-# pid; a lock whose holder is gone is taken over.
+# pause, resume and install.sh of one entry are serialized by a flock(2) lock on the entry's
+# .keeperctl.lock; the kernel drops it when the holder exits.
 set -uo pipefail
 HOST_ALIAS="${KEEPER_SSH_HOST:-mac-mini}"
 
@@ -115,8 +116,11 @@ do_pause() { # the pause steps; exits 0 with PAUSED, or 1 via not_paused (no loc
 case "$CMD" in
   status)
     for j in "$LABEL" "$WATCH"; do
-      if loaded "$j"; then echo "$j: loaded"; "$LAUNCHCTL" print "$DOM/$j" | grep -E '^\s+(state|pid|runs|last exit code) ='
-      else echo "$j: not loaded"; fi
+      job_state "$j"; case $? in
+        0) echo "$j: loaded"; "$LAUNCHCTL" print "$DOM/$j" | grep -E '^\s+(state|pid|runs|last exit code) =' ;;
+        1) echo "$j: not loaded" ;;
+        *) echo "$j: UNKNOWN (launchctl print failed)" ;;
+      esac
       "$LAUNCHCTL" print-disabled "$DOM" | grep -F "\"$j\"" || true
     done
     grep -E '^TICK ' "$LOG" 2>/dev/null | tail -1
@@ -131,16 +135,37 @@ case "$CMD" in
     lock
     [ ! -e "$CONFIG_DIR/INSTALL-INCOMPLETE" ] ||
       { echo "NOT RESUMED $ENTRY: an install did not complete ($(cat "$CONFIG_DIR/INSTALL-INCOMPLETE")); re-run install.sh $ENTRY" >&2; exit 1; }
+    # Preflight, before launchd is touched: the files run.sh needs, secrets at mode 600, both plists
+    # naming their own labels. A missing secret would otherwise make the keeper exit at every KeepAlive
+    # restart, and start by itself (no dry-run, no resume) once the file appears.
+    for f in rpc.env key.env address; do
+      [ -f "$CONFIG_DIR/$f" ] || { echo "NOT RESUMED $ENTRY: $CONFIG_DIR/$f is missing (nothing changed)" >&2; exit 66; }
+    done
+    for f in rpc.env key.env telegram.env; do
+      [ -e "$CONFIG_DIR/$f" ] || continue
+      m="$(stat -L -f %Lp "$CONFIG_DIR/$f")"
+      [ "$m" = 600 ] || { echo "NOT RESUMED $ENTRY: $CONFIG_DIR/$f is mode $m, not 600 (nothing changed)" >&2; exit 65; }
+    done
     for j in "$LABEL" "$WATCH"; do
       [ -f "$LA/$j.plist" ] || { echo "missing $LA/$j.plist (run install.sh $ENTRY)" >&2; exit 66; }
       [ "$(plutil -extract Label raw -o - "$LA/$j.plist" 2>/dev/null)" = "$j" ] ||
         { echo "$LA/$j.plist does not have Label $j (reinstall: install.sh $ENTRY)" >&2; exit 65; }
     done
+    # From the first enable on, any failure rolls back to paused, by the same steps as pause: a failed
+    # resume never leaves the jobs enabled for KeepAlive (or a reboot) to start later.
+    rollback() {
+      if out="$(do_pause 2>&1)"; then echo "NOT RESUMED $ENTRY: $1; rolled back: $out" >&2
+      else echo "NOT RESUMED $ENTRY: $1; ROLLBACK FAILED: $out" >&2; fi
+      exit 1
+    }
     for j in "$LABEL" "$WATCH"; do
-      "$LAUNCHCTL" enable "$DOM/$j" || { echo "launchctl enable $j failed" >&2; exit 1; }
-      loaded "$j" || "$LAUNCHCTL" bootstrap "$DOM" "$LA/$j.plist" || { echo "launchctl bootstrap $j failed" >&2; exit 1; }
+      "$LAUNCHCTL" enable "$DOM/$j" || rollback "launchctl enable $j failed"
+      job_state "$j"; st=$?
+      [ "$st" = 2 ] && rollback "launchctl print $j failed"
+      [ "$st" = 0 ] || "$LAUNCHCTL" bootstrap "$DOM" "$LA/$j.plist" || rollback "launchctl bootstrap $j failed"
     done
-    end=$((SECONDS + 60))
+    # The keeper may take a while to start (tsx compiles first): up to 120 s.
+    end=$((SECONDS + 120))
     while [ "$SECONDS" -lt "$end" ]; do
       p="$(job_pid)"
       # the job's process is the keeper (run.sh exec'd tsx) and has its worker child
@@ -155,14 +180,7 @@ case "$CMD" in
       fi
       sleep 1
     done
-    # A failed resume does not leave the entry enabled for KeepAlive to keep restarting: it is paused
-    # again, by the same steps as pause, and the result of that is part of the answer.
-    if out="$(do_pause 2>&1)"; then
-      echo "NOT RESUMED $ENTRY: the keeper is not running scripts/keeper.ts (see keeperctl.sh $ENTRY logs); the entry is paused again: $out" >&2
-    else
-      echo "NOT RESUMED $ENTRY: the keeper is not running scripts/keeper.ts, AND pausing it again failed: $out" >&2
-    fi
-    exit 1
+    rollback "the keeper did not run scripts/keeper.ts steadily within 120 s (see keeperctl.sh $ENTRY logs)"
     ;;
   restart)
     loaded "$LABEL" || { echo "$LABEL is not loaded (paused?); use resume" >&2; exit 1; }

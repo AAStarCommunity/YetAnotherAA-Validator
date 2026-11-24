@@ -17,7 +17,8 @@
 # first replacement until the set is whole again; keeperctl resume refuses while it exists.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-LAUNCHCTL="${KEEPER_LAUNCHCTL:-launchctl}"   # the test swaps in a stub
+# Only a test (KEEPER_LOCAL=1, as for keeperctl.sh) may swap launchctl for a stub.
+LAUNCHCTL=launchctl; [ -n "${KEEPER_LOCAL:-}" ] && LAUNCHCTL="${KEEPER_LAUNCHCTL:-launchctl}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTRY="${1:-}"
 # Reserved: bin (the shared control dir), list (a keeperctl command), stale-watch and any name

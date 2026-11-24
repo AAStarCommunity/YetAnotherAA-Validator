@@ -16,6 +16,8 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$D" "$LA"; SPA=0x00000000000000000000000000000000000000a1
 printf 'KEEPER_ENTRY=%s\nKEEPER_NETWORK=op-sepolia\nKEEPER_SUPERPAYMASTER=%s\n' "$E" "$SPA" > "$D/entry.env"
+# the files resume's preflight requires (placeholders; nothing reads them in this test)
+for f in rpc.env key.env; do echo "# test" > "$D/$f"; chmod 600 "$D/$f"; done; echo 0x0 > "$D/address"
 for j in "$L" "$W"; do
   cat > "$LA/$j.plist" <<P
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -63,8 +65,8 @@ HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/lc-norec" bash "$HERE/keeperctl.sh
 expect "an unrecorded disable is NOT PAUSED (exit 1)" '[ "$RC" = 1 ] && grep -q "does not list" "$T/out"'
 # a resume whose keeper never reaches scripts/keeper.ts is NOT RESUMED
 ctl pause
-plutil -replace ProgramArguments -json '["/bin/bash","-c","exit 3"]' "$LA/$L.plist"
-ctl resume; expect "a keeper that exits at once (as run.sh does on a bad config) is NOT RESUMED, and paused again (KeepAlive stops)" '[ "$RC" = 1 ] && grep -q "paused again: PAUSED" "$T/out" && ! loaded "$L"'
+plutil -replace ProgramArguments -json '["/bin/bash","-c","exit 78"]' "$LA/$L.plist"
+ctl resume; expect "a keeper that exits at once (as run.sh does on a bad config) is NOT RESUMED, and paused again (KeepAlive stops)" '[ "$RC" = 1 ] && grep -q "rolled back: PAUSED" "$T/out" && ! loaded "$L"'
 ctl pause
 plutil -replace Label -string io.aastar.price-keeper-other "$LA/$L.plist"
 ctl resume; expect "a plist whose Label is not its own is refused before launchd is touched" '[ "$RC" = 65 ] && [ -z "$(pid)" ]'
@@ -98,11 +100,34 @@ expect "list with extra arguments is a usage error" '[ "$RC" = 64 ]'
 cp "$LA/$L.plist" "$T/keeper.plist.good"
 plutil -replace ProgramArguments -json '["/bin/bash","-c","exec -a \"node scripts/keeper.ts nochild\" /bin/sleep 3600"]' "$LA/$L.plist"
 plutil -replace Label -string "$L" "$LA/$L.plist"
-ctl resume; expect "a keeper.ts process without its worker child is NOT RESUMED, and the entry is paused again" '[ "$RC" = 1 ] && grep -q "NOT RESUMED.*paused again: PAUSED" "$T/out" && ! loaded "$L" && ! loaded "$W" && launchctl print-disabled "$DOM" | grep -qF "\"$L\" => disabled"'
+ctl resume; expect "a keeper.ts process without its worker child is NOT RESUMED, and the entry is paused again" '[ "$RC" = 1 ] && grep -q "NOT RESUMED.*rolled back: PAUSED" "$T/out" && ! loaded "$L" && ! loaded "$W" && launchctl print-disabled "$DOM" | grep -qF "\"$L\" => disabled"'
 ctl pause
 plutil -replace ProgramArguments -json '["/bin/bash","-c","exec -a \"node scripts/keeper.ts crashy\" /bin/bash -c \"/bin/sleep 60 & /bin/sleep 6; exit 1\""]' "$LA/$L.plist"
-ctl resume; expect "a keeper that dies after 6 s and is restarted by KeepAlive is NOT RESUMED, and nothing is left running" '[ "$RC" = 1 ] && grep -q "paused again: PAUSED" "$T/out" && sleep 12 && [ -z "$(pid)" ] && ! loaded "$L"'
+ctl resume; expect "a keeper that dies after 6 s and is restarted by KeepAlive is NOT RESUMED, and nothing is left running" '[ "$RC" = 1 ] && grep -q "rolled back: PAUSED" "$T/out" && sleep 12 && [ -z "$(pid)" ] && ! loaded "$L"'
+ctl pause
+# a slow starter: 20 s before it runs keeper.ts; resume waits for it (120 s bound) and succeeds
+plutil -replace ProgramArguments -json '["/bin/bash","-c","sleep 20; exec -a \"node scripts/keeper.ts slow\" /bin/bash -c \"/bin/sleep 3600 & wait\""]' "$LA/$L.plist"
+ctl resume; expect "a keeper that needs 20 s to start is RESUMED, not rolled back" '[ "$RC" = 0 ] && grep -q "^RESUMED" "$T/out"'
 ctl pause; cp "$T/keeper.plist.good" "$LA/$L.plist"
+plutil -replace Label -string "$L" "$LA/$L.plist"
+# preflight: nothing in launchd changes when a file is missing or a secret is not 600
+mv "$D/key.env" "$T/key.keep"; ctl resume
+expect "resume with key.env missing: refused before launchd is touched, still paused" '[ "$RC" = 66 ] && grep -q "key.env is missing" "$T/out" && [ -z "$(pid)" ] && launchctl print-disabled "$DOM" | grep -qF "\"$L\" => disabled"'
+mv "$T/key.keep" "$D/key.env"; chmod 644 "$D/rpc.env"; ctl resume
+expect "resume with rpc.env at mode 644: refused, still paused" '[ "$RC" = 65 ] && grep -q "mode 644" "$T/out" && [ -z "$(pid)" ]'
+chmod 600 "$D/rpc.env"
+# a failing enable after the first one rolls back to paused
+printf '#!/bin/bash\n[ "$1" = enable ] && [ "${2##*/}" = "%s" ] && exit 1\nexec launchctl "$@"\n' "$W" > "$T/lc-enable"; chmod +x "$T/lc-enable"
+HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/lc-enable" bash "$HERE/keeperctl.sh" "$E" resume > "$T/out" 2>&1; RC=$?
+expect "the watcher's enable failing after the keeper's: NOT RESUMED, rolled back: PAUSED" '[ "$RC" = 1 ] && grep -q "enable $W failed; rolled back: PAUSED" "$T/out" && ! loaded "$L"'
+printf '#!/bin/bash\n[ "$1" = print ] && exit 5\nexec launchctl "$@"\n' > "$T/lc-p5"; chmod +x "$T/lc-p5"
+HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/lc-p5" bash "$HERE/keeperctl.sh" "$E" status > "$T/out" 2>&1
+expect "status says UNKNOWN, not 'not loaded', when launchctl print fails" 'grep -q "$L: UNKNOWN" "$T/out"'
+for n in bin list stale-watch x-stale-watch Op 'a b'; do
+  HOME="$H" KEEPER_LOCAL=1 bash "$HERE/keeperctl.sh" "$n" status > "$T/out" 2>&1; RC=$?
+  expect "entry name '$n': usage, exit 64" '[ "$RC" = 64 ]'
+done
+cp "$T/keeper.plist.good" "$LA/$L.plist"
 ctl pause; expect "and pause again: exit 0, nothing left" '[ "$RC" = 0 ] && sleep 3 && [ -z "$(kids)" ]'
 HOME="$H" KEEPER_LOCAL=1 bash "$HERE/keeperctl.sh" "no-such-entry" status > "$T/out" 2>&1; RC=$?
 expect "unknown entry: exit 66" '[ "$RC" = 66 ]'
