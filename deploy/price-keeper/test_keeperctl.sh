@@ -64,7 +64,7 @@ expect "an unrecorded disable is NOT PAUSED (exit 1)" '[ "$RC" = 1 ] && grep -q 
 # a resume whose keeper never reaches scripts/keeper.ts is NOT RESUMED
 ctl pause
 plutil -replace ProgramArguments -json '["/bin/bash","-c","exit 3"]' "$LA/$L.plist"
-ctl resume; expect "a keeper that exits at once (as run.sh does on a bad config) is NOT RESUMED" '[ "$RC" = 1 ] && grep -q "NOT RESUMED" "$T/out"'
+ctl resume; expect "a keeper that exits at once (as run.sh does on a bad config) is NOT RESUMED, and paused again (KeepAlive stops)" '[ "$RC" = 1 ] && grep -q "paused again: PAUSED" "$T/out" && ! loaded "$L"'
 ctl pause
 plutil -replace Label -string io.aastar.price-keeper-other "$LA/$L.plist"
 ctl resume; expect "a plist whose Label is not its own is refused before launchd is touched" '[ "$RC" = 65 ] && [ -z "$(pid)" ]'
@@ -98,10 +98,10 @@ expect "list with extra arguments is a usage error" '[ "$RC" = 64 ]'
 cp "$LA/$L.plist" "$T/keeper.plist.good"
 plutil -replace ProgramArguments -json '["/bin/bash","-c","exec -a \"node scripts/keeper.ts nochild\" /bin/sleep 3600"]' "$LA/$L.plist"
 plutil -replace Label -string "$L" "$LA/$L.plist"
-ctl resume; expect "a keeper.ts process without its worker child is NOT RESUMED" '[ "$RC" = 1 ] && grep -q "NOT RESUMED" "$T/out"'
+ctl resume; expect "a keeper.ts process without its worker child is NOT RESUMED, and the entry is paused again" '[ "$RC" = 1 ] && grep -q "NOT RESUMED.*paused again: PAUSED" "$T/out" && ! loaded "$L" && ! loaded "$W" && launchctl print-disabled "$DOM" | grep -qF "\"$L\" => disabled"'
 ctl pause
 plutil -replace ProgramArguments -json '["/bin/bash","-c","exec -a \"node scripts/keeper.ts crashy\" /bin/bash -c \"/bin/sleep 60 & /bin/sleep 6; exit 1\""]' "$LA/$L.plist"
-ctl resume; expect "a keeper that dies after 6 s and is restarted by KeepAlive is NOT RESUMED" '[ "$RC" = 1 ] && grep -q "NOT RESUMED" "$T/out"'
+ctl resume; expect "a keeper that dies after 6 s and is restarted by KeepAlive is NOT RESUMED, and nothing is left running" '[ "$RC" = 1 ] && grep -q "paused again: PAUSED" "$T/out" && sleep 12 && [ -z "$(pid)" ] && ! loaded "$L"'
 ctl pause; cp "$T/keeper.plist.good" "$LA/$L.plist"
 ctl pause; expect "and pause again: exit 0, nothing left" '[ "$RC" = 0 ] && sleep 3 && [ -z "$(kids)" ]'
 HOME="$H" KEEPER_LOCAL=1 bash "$HERE/keeperctl.sh" "no-such-entry" status > "$T/out" 2>&1; RC=$?

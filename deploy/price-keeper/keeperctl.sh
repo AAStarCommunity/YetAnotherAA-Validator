@@ -86,6 +86,31 @@ lock() {
     *) echo "cannot lock $CONFIG_DIR/.keeperctl.lock" >&2; exit 75 ;; esac
 }
 not_paused() { echo "NOT PAUSED $ENTRY: $*" >&2; exit 1; }
+do_pause() { # the pause steps; exits 0 with PAUSED, or 1 via not_paused (no lock: the caller holds it)
+  # Without both fields the command-line scan cannot run, so a keeper outside the job's group
+  # could not be seen: unconfirmed is NOT PAUSED, never an empty scan.
+  [ -n "$SIG_NET" ] && [ -n "$SIG_SP" ] || not_paused "entry.env has no KEEPER_NETWORK or KEEPER_SUPERPAYMASTER to find its keeper by"
+  p="$(job_pid)"; g=""; [ -n "$p" ] && g="$(group_of "$p")"
+  for j in "$LABEL" "$WATCH"; do
+    "$LAUNCHCTL" disable "$DOM/$j" || not_paused "launchctl disable $j failed"
+    disabled "$j" || not_paused "launchd does not list $j as disabled"
+  done
+  for j in "$LABEL" "$WATCH"; do
+    job_state "$j"; st=$?
+    [ "$st" = 2 ] && not_paused "launchctl print $j failed"
+    [ "$st" = 0 ] && { "$LAUNCHCTL" bootout "$DOM/$j" 2>/dev/null || true; }   # judged below, by state
+  done
+  # bootout sends SIGTERM and waits; the keeper exits within 15 s (its own shutdown budget).
+  for _ in $(seq 1 30); do
+    job_state "$LABEL"; a=$?; job_state "$WATCH"; b=$?
+    { [ "$a" = 2 ] || [ "$b" = 2 ]; } && not_paused "launchctl print failed while waiting"
+    if [ "$a" = 1 ] && [ "$b" = 1 ] && [ -z "$(keeper_procs "$g")" ]; then
+      echo "PAUSED $ENTRY $(date -u +%Y-%m-%dT%H:%M:%SZ) (stopped: ${p:-none running}${g:+, process group $g})"; exit 0
+    fi
+    sleep 1
+  done
+  not_paused "keeper job state $a, keeper processes left: $(keeper_procs "$g")"
+}
 
 case "$CMD" in
   status)
@@ -100,29 +125,7 @@ case "$CMD" in
     ;;
   pause)
     lock
-    # Without both fields the command-line scan cannot run, so a keeper outside the job's group
-    # could not be seen: unconfirmed is NOT PAUSED, never an empty scan.
-    [ -n "$SIG_NET" ] && [ -n "$SIG_SP" ] || not_paused "entry.env has no KEEPER_NETWORK or KEEPER_SUPERPAYMASTER to find its keeper by"
-    p="$(job_pid)"; g=""; [ -n "$p" ] && g="$(group_of "$p")"
-    for j in "$LABEL" "$WATCH"; do
-      "$LAUNCHCTL" disable "$DOM/$j" || not_paused "launchctl disable $j failed"
-      disabled "$j" || not_paused "launchd does not list $j as disabled"
-    done
-    for j in "$LABEL" "$WATCH"; do
-      job_state "$j"; st=$?
-      [ "$st" = 2 ] && not_paused "launchctl print $j failed"
-      [ "$st" = 0 ] && { "$LAUNCHCTL" bootout "$DOM/$j" 2>/dev/null || true; }   # judged below, by state
-    done
-    # bootout sends SIGTERM and waits; the keeper exits within 15 s (its own shutdown budget).
-    for _ in $(seq 1 30); do
-      job_state "$LABEL"; a=$?; job_state "$WATCH"; b=$?
-      { [ "$a" = 2 ] || [ "$b" = 2 ]; } && not_paused "launchctl print failed while waiting"
-      if [ "$a" = 1 ] && [ "$b" = 1 ] && [ -z "$(keeper_procs "$g")" ]; then
-        echo "PAUSED $ENTRY $(date -u +%Y-%m-%dT%H:%M:%SZ) (stopped: ${p:-none running}${g:+, process group $g})"; exit 0
-      fi
-      sleep 1
-    done
-    not_paused "keeper job state $a, keeper processes left: $(keeper_procs "$g")"
+    do_pause
     ;;
   resume)
     lock
@@ -152,7 +155,14 @@ case "$CMD" in
       fi
       sleep 1
     done
-    echo "NOT RESUMED $ENTRY: the keeper is not running scripts/keeper.ts (see keeperctl.sh $ENTRY logs)" >&2; exit 1
+    # A failed resume does not leave the entry enabled for KeepAlive to keep restarting: it is paused
+    # again, by the same steps as pause, and the result of that is part of the answer.
+    if out="$(do_pause 2>&1)"; then
+      echo "NOT RESUMED $ENTRY: the keeper is not running scripts/keeper.ts (see keeperctl.sh $ENTRY logs); the entry is paused again: $out" >&2
+    else
+      echo "NOT RESUMED $ENTRY: the keeper is not running scripts/keeper.ts, AND pausing it again failed: $out" >&2
+    fi
+    exit 1
     ;;
   restart)
     loaded "$LABEL" || { echo "$LABEL is not loaded (paused?); use resume" >&2; exit 1; }
