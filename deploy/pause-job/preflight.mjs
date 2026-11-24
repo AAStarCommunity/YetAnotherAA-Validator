@@ -40,7 +40,9 @@ import {
 } from "../pause-detector/lib/guard.mjs";
 
 export const DETECTOR_LABEL = "io.aastar.dvt-pause-detector";
-export const KEEPER_LABEL = "io.aastar.price-keeper";
+// the one approved sender: the OP Sepolia price keeper (the Sepolia keeper io.aastar.price-keeper
+// was retired on 2026-11-24, author; see deploy/price-keeper/README.md)
+export const KEEPER_LABEL = "io.aastar.price-keeper-op-sepolia";
 // the detector's dead-man check (DSR: required before the detector is rc.8's pause path)
 export const DEADMAN_LABEL = "io.aastar.dvt-pause-detector-deadman";
 export const REQUIRED_LABELS = [DETECTOR_LABEL, DEADMAN_LABEL, KEEPER_LABEL];
@@ -49,6 +51,8 @@ export const FORBIDDEN_LABELS = [
   "io.aastar.dvt-apply-rotation",
   // the D2 pause job is retired (DSR fae09c1e): its signer was refunded and deleted
   "io.aastar.dvt-pause-job",
+  // the Sepolia price keeper is retired (author, 2026-11-24); only the OP Sepolia entry runs
+  "io.aastar.price-keeper",
 ];
 // DVT scripts that send transactions; a loaded job running any of them (other than ours) fails
 export const SENDING_SCRIPTS = [
