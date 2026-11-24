@@ -231,6 +231,7 @@ rm -rf "$T/state"
 # status.mjs itself: a broken setup must exit 2, not 1, so it reads UNDETERMINED, not STALE.
 if command -v node >/dev/null; then
   # a launchable entry "t" (run.sh would start it); each case changes one thing
+  K1=0x1111111111111111111111111111111111111111111111111111111111111111; K2=0x2222222222222222222222222222222222222222222222222222222222222222   # the stub viem/accounts maps K1 to 0x..c1 (the address file), K2 to 0x..c2
   base='KEEPER_ENTRY=t
 KEEPER_NETWORK=op-sepolia
 KEEPER_SDK_DIR="~/Dev/aastar/aastar-sdk-t"
@@ -246,18 +247,23 @@ KEEPER_MIN_BALANCE_WEI=1000000000000000'
 const fs=require("fs"),log=s=>fs.appendFileSync(process.env.READS,s+"\n");
 module.exports={http:u=>{log("rpc "+u);return 0},parseAbi:()=>[],formatEther:w=>String(Number(w)/1e18),createPublicClient:()=>({
   getChainId:async()=>Number(process.env.STUB_CHAIN||11155420),
-  getBlock:async()=>({number:7n,timestamp:5000n}),
+  getBlock:async()=>({number:7n,timestamp:BigInt(Math.floor(Date.now()/1000)-Number(process.env.STUB_HEAD_AGE||5))}),
   getBalance:async({address,blockNumber})=>{log("balance "+address+"@"+blockNumber);return 5000000000000000n},
   readContract:async({address,functionName,blockNumber})=>{log(address+" "+functionName+"@"+blockNumber);
-    return functionName==="cachedPrice"?[1n,BigInt(process.env.STUB_UPDATED||4000)]:4200n}})};
+    return functionName==="cachedPrice"?[1n,BigInt(Math.floor(Date.now()/1000)-Number(process.env.STUB_HEAD_AGE||5)-Number(process.env.STUB_AGE||1000))]:4200n}})};
 J
+    cat > "$v/accounts.js" <<A
+const m = { "$K1": "0x00000000000000000000000000000000000000C1", "$K2": "0x00000000000000000000000000000000000000c2" };
+exports.privateKeyToAccount = k => { if (!m[k]) throw new Error("bad key"); return { address: m[k] }; };
+A
     echo RPC_URL=http://127.0.0.1:9 > "$E/rpc.env"; echo 0x00000000000000000000000000000000000000c1 > "$E/address"'
   # mjs NAME SETUP [ENV...] -- a fresh fake HOME and entry dir from $base, then SETUP, then status.mjs
   mjs() {
     local H="$T/home-$1"; local E="$H/.config/aastar-price-keeper-t"; mkdir -p "$E"
     printf '%s\n' "$base" > "$E/entry.env"; cp "$HERE/status.mjs" "$E/status.mjs"; echo KEEPER_PRIVATE_KEY=0x1111111111111111111111111111111111111111111111111111111111111111 > "$E/key.env"
     eval "$2"; : > "$T/reads"; CUR="status.mjs: $1"; shift 2
-    out=$(env "$@" HOME="$H" READS="$T/reads" node "$E/status.mjs" 2>&1); rc=$?
+    # bounded: a file-type regression would block on a FIFO; the alarm turns that into a failure
+    out=$(env "$@" HOME="$H" READS="$T/reads" perl -e 'alarm 20; exec @ARGV' node "$E/status.mjs" 2>&1); rc=$?
   }
   und() { expect "exit 2, UNDETERMINED $1" '[ "$rc" = 2 ] && printf "%s" "$out" | grep -q "^UNDETERMINED.*'"$1"'"'; }
   mjs no-viem ':'; und "Cannot find module"
@@ -276,7 +282,7 @@ J
   mjs wrong-entry-name "$fake; sed -i '' 's/^KEEPER_ENTRY=t/KEEPER_ENTRY=u/' \$E/entry.env"; und "does not name this directory"
   mjs mainnet-linked-key "$fake; sed -i '' 's/=op-sepolia/=op-mainnet/' \$E/entry.env; echo x > \$H/k; rm \$E/key.env; echo KEEPER_PRIVATE_KEY=0x1111111111111111111111111111111111111111111111111111111111111111 > \$H/k; ln -s \$H/k \$E/key.env"; und "a mainnet entry needs its own key"
   mjs wrong-chain "$fake" STUB_CHAIN=11155111; und "is chain 11155111, entry t is chain 11155420"
-  mjs cache-after-block "$fake" STUB_UPDATED=5100; und "cache time is after its block time"
+  mjs cache-after-block "$fake" STUB_AGE=-100; und "cache time is after its block time"
 
   mjs bad-interval "$fake; echo KEEPER_POLL_INTERVAL=1s >> \$E/entry.env"; und "KEEPER_POLL_INTERVAL must be an integer"
   mjs no-key-env "$fake; rm \$E/key.env"; und ENOENT
@@ -289,6 +295,13 @@ J
   mjs key-fifo "$fake; rm \$E/key.env; mkfifo \$E/key.env"; und "key.env is not a regular file"
   mjs network-proto "$fake; sed -i '' 's/=op-sepolia/=constructor/' \$E/entry.env"; und "KEEPER_NETWORK must be"
   mjs address-two-lines "$fake; printf '0x0000000000000000000\\n000000000000000000000c1\\n' > \$E/address"; und "exactly one address on one line"
+  mjs key-address-mismatch "$fake; echo KEEPER_PRIVATE_KEY=$K2 > \$E/key.env"; und "key.env signs as 0x0*c2, but the address file names 0x0*c1"
+  mjs key-viem-rejects "$fake; echo KEEPER_PRIVATE_KEY=0x$(printf '3%.0s' $(seq 64)) > \$E/key.env"; und "bad key"
+  mjs stale-head "$fake" STUB_HEAD_AGE=86400; und "is 86400s old by the wall clock"
+  mjs future-head "$fake" STUB_HEAD_AGE=-600; und "by the wall clock"
+  for f in entry.env rpc.env address; do
+    mjs "fifo-$f" "$fake; rm -f \$E/$f; mkfifo \$E/$f"; und "is not a regular file"
+  done
   mjs no-v4 "$fake"
   expect "exit 0, SuperPaymaster only, every read at block 7" \
     '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "^FRESH SuperPaymaster 0x0*a1 age=1000s" && ! printf "%s" "$out" | grep -q PaymasterV4 &&
@@ -297,7 +310,7 @@ J
   expect "a V4 in entry.env is checked too" '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "^FRESH PaymasterV4 0x0*b2" && grep -q "^0x0*b2 cachedPrice@7" "$T/reads"'
   mjs low-gas "$fake; sed -i '' 's/^KEEPER_MIN_BALANCE_WEI=.*/KEEPER_MIN_BALANCE_WEI=6000000000000000/' \$E/entry.env"
   expect "the floor comes from entry.env: 0.005 ETH below 0.006 is LOW_GAS, exit 1" '[ "$rc" = 1 ] && printf "%s" "$out" | grep -q "^LOW_GAS keeper"'
-  mjs stale "$fake" STUB_UPDATED=100
+  mjs stale "$fake" STUB_AGE=4900
   expect "a cache older than its limit is STALE, exit 1" '[ "$rc" = 1 ] && printf "%s" "$out" | grep -q "^STALE SuperPaymaster"'
 else
   echo "skip status.mjs check: no node"

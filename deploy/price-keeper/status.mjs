@@ -29,12 +29,15 @@ const ENTRY_FIELDS = new Set([
 ]);
 const CHAIN_ID = { "op-sepolia": 11155420, sepolia: 11155111, "op-mainnet": 10, mainnet: 1 };
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const HEAD_MAX_AGE_SEC = 300n;
 
 // The grammar of run.sh's read_fields: blank, comment, or NAME=value with NAME allowed, at most once;
 // value bare (no quote, $, backtick, backslash, space or shell metacharacter) or wholly in double quotes.
 function readFields(file, allowed) {
   const name = basename(file);
   const out = {};
+  // the type first, so a FIFO or a directory is refused instead of blocking or throwing late
+  if (!statSync(file).isFile()) throw new Error(`${name} is not a regular file`);
   const bytes = readFileSync(file);
   // printable ASCII and newlines only, as run.sh requires, so both read the same bytes
   if (bytes.some(b => b !== 0x0a && (b < 0x20 || b > 0x7e)))
@@ -99,9 +102,6 @@ try {
         "key.env is a link; a mainnet entry needs its own key (run.sh refuses to start)"
       );
   }
-  for (const f of ["key.env", "telegram.env"])
-    if (existsSync(`${dir}/${f}`) && !statSync(`${dir}/${f}`).isFile())
-      throw new Error(`${f} is not a regular file`);
   const key = readFields(`${dir}/key.env`, new Set(["KEEPER_PRIVATE_KEY"])).KEEPER_PRIVATE_KEY;
   if (!/^0x[0-9a-fA-F]{64}$/.test(key ?? ""))
     throw new Error(
@@ -115,13 +115,22 @@ try {
 
   const require = createRequire(`${sdk}/packages/core/package.json`);
   const { createPublicClient, http, parseAbi, formatEther } = require("viem");
+  const { privateKeyToAccount } = require("viem/accounts");
 
   const rpc = readFields(`${dir}/rpc.env`, new Set(["RPC_URL"])).RPC_URL;
   if (!rpc) throw new Error("RPC_URL missing from rpc.env");
   // exactly one line, as run.sh reads it: the address and at most one trailing newline
+  if (!statSync(`${dir}/address`).isFile()) throw new Error("address is not a regular file");
   const keeper = readFileSync(`${dir}/address`, "utf8").replace(/\n$/, "");
   if (!ADDRESS.test(keeper))
     throw new Error("address file must hold exactly one address on one line");
+  // The account this check watches must be the one that signs, as run.sh requires before it starts
+  // the keeper. Only addresses are compared and printed, never the key.
+  const signer = privateKeyToAccount(key).address;
+  if (signer.toLowerCase() !== keeper.toLowerCase())
+    throw new Error(
+      `key.env signs as ${signer}, but the address file names ${keeper} (run.sh refuses to start)`
+    );
   // Only the contracts this entry updates: an entry without a PaymasterV4 checks no V4.
   const targets = { SuperPaymaster: entry.KEEPER_SUPERPAYMASTER };
   if (entry.KEEPER_PAYMASTER) targets.PaymasterV4 = entry.KEEPER_PAYMASTER;
@@ -137,6 +146,13 @@ try {
     throw new Error(`rpc.env RPC_URL is chain ${got}, entry ${e} is chain ${chainId}`);
   // Every read at one block, so the cache time and the block time cannot straddle two heights.
   const { number: blockNumber, timestamp } = await client.getBlock();
+  // A stalled or lagging RPC serves an old head in which a cache can still look fresh: the head must
+  // be recent by the wall clock (OP and Ethereum produce a block every 2-12 s).
+  const headAge = BigInt(Math.floor(Date.now() / 1000)) - timestamp;
+  if (headAge > HEAD_MAX_AGE_SEC || headAge < -60n)
+    throw new Error(
+      `RPC head block ${blockNumber} is ${headAge}s old by the wall clock (limit ${HEAD_MAX_AGE_SEC}s)`
+    );
   let ok = true;
   for (const [name, address] of Object.entries(targets)) {
     const [, updatedAt] = await client.readContract({
