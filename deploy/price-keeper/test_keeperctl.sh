@@ -84,6 +84,14 @@ kill "$stray" 2>/dev/null; wait "$stray" 2>/dev/null || true
 printf '#!/bin/bash\n[ "$1" = print ] && exit 5\nexec launchctl "$@"\n' > "$T/lc-printerr"; chmod +x "$T/lc-printerr"
 HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/lc-printerr" bash "$HERE/keeperctl.sh" "$E" pause > "$T/out" 2>&1; RC=$?
 expect "a failing launchctl print is NOT PAUSED, never PAUSED" '[ "$RC" = 1 ] && ! grep -q "^PAUSED" "$T/out"'
+cp "$D/entry.env" "$T/entry.good"; grep -v '^KEEPER_SUPERPAYMASTER=' "$T/entry.good" > "$D/entry.env"; ctl pause
+expect "an entry.env without KEEPER_SUPERPAYMASTER: pause is NOT PAUSED (cannot scan), never PAUSED" '[ "$RC" = 1 ] && grep -q "find its keeper by" "$T/out"'
+cp "$T/entry.good" "$D/entry.env"
+echo "install.sh test: rollback incomplete" > "$D/INSTALL-INCOMPLETE"; ctl resume
+expect "resume refuses while INSTALL-INCOMPLETE exists" '[ "$RC" = 1 ] && grep -q "did not complete" "$T/out" && [ -z "$(pid)" ]'
+rm "$D/INSTALL-INCOMPLETE"
+HOME="$H" KEEPER_LOCAL=1 bash "$HERE/keeperctl.sh" stale-watch status > "$T/out" 2>&1; RC=$?
+expect "the reserved name stale-watch is a usage error" '[ "$RC" = 64 ]'
 HOME="$H" KEEPER_LOCAL=1 bash "$HERE/keeperctl.sh" list pause > "$T/out" 2>&1; RC=$?
 expect "list with extra arguments is a usage error" '[ "$RC" = 64 ]'
 # resume must see the keeper with its worker, stable for 10 s

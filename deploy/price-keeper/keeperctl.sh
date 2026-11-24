@@ -34,7 +34,7 @@ LA="$HOME/Library/LaunchAgents"
 # 0 loaded, 1 not loaded (launchctl: "Could not find service", exit 113), 2 launchctl failed otherwise
 job_state() { "$LAUNCHCTL" print "$DOM/$1" >/dev/null 2>&1; case $? in 0) return 0 ;; 113) return 1 ;; *) return 2 ;; esac; }
 loaded() { job_state "$1"; }
-disabled() { "$LAUNCHCTL" print-disabled "$DOM" 2>/dev/null | grep -qF "\"$1\" => disabled"; }
+disabled() { "$LAUNCHCTL" print-disabled "$DOM" 2>/dev/null | grep -qxF "		\"$1\" => disabled"; }
 
 if [ "${1:-}" = list ]; then
   [ $# = 1 ] || usage
@@ -51,7 +51,7 @@ fi
 ENTRY="${1:-}"; CMD="${2:-status}"
 # the same names install.sh accepts: no reserved word, no name whose keeper label is another's watcher
 [[ "$ENTRY" =~ ^[a-z0-9][a-z0-9-]*$ ]] || usage
-case "$ENTRY" in bin | list | *-stale-watch) usage ;; esac
+case "$ENTRY" in bin | list | stale-watch | *-stale-watch) usage ;; esac
 CONFIG_DIR="$HOME/.config/aastar-price-keeper-$ENTRY"
 [ -f "$CONFIG_DIR/entry.env" ] || { echo "no entry $ENTRY: $CONFIG_DIR/entry.env is missing (run install.sh $ENTRY)" >&2; exit 66; }
 LABEL="io.aastar.price-keeper-$ENTRY"
@@ -100,6 +100,9 @@ case "$CMD" in
     ;;
   pause)
     lock
+    # Without both fields the command-line scan cannot run, so a keeper outside the job's group
+    # could not be seen: unconfirmed is NOT PAUSED, never an empty scan.
+    [ -n "$SIG_NET" ] && [ -n "$SIG_SP" ] || not_paused "entry.env has no KEEPER_NETWORK or KEEPER_SUPERPAYMASTER to find its keeper by"
     p="$(job_pid)"; g=""; [ -n "$p" ] && g="$(group_of "$p")"
     for j in "$LABEL" "$WATCH"; do
       "$LAUNCHCTL" disable "$DOM/$j" || not_paused "launchctl disable $j failed"
@@ -123,6 +126,8 @@ case "$CMD" in
     ;;
   resume)
     lock
+    [ ! -e "$CONFIG_DIR/INSTALL-INCOMPLETE" ] ||
+      { echo "NOT RESUMED $ENTRY: an install did not complete ($(cat "$CONFIG_DIR/INSTALL-INCOMPLETE")); re-run install.sh $ENTRY" >&2; exit 1; }
     for j in "$LABEL" "$WATCH"; do
       [ -f "$LA/$j.plist" ] || { echo "missing $LA/$j.plist (run install.sh $ENTRY)" >&2; exit 66; }
       [ "$(plutil -extract Label raw -o - "$LA/$j.plist" 2>/dev/null)" = "$j" ] ||
