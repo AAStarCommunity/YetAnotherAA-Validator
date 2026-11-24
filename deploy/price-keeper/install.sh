@@ -111,6 +111,12 @@ if [ -n "$first" ] || ! "$LAUNCHCTL" print "$DOM/$LABEL" >/dev/null 2>&1; then
   done
   state="paused (both jobs disabled; start with: keeperctl.sh $ENTRY resume)"
 else
+  # A running entry keeps its old settings until it restarts, while status.mjs would read new ones
+  # at its next check: a settings change is installed only into a paused entry.
+  if [ -f "$D/entry.env" ] && ! cmp -s "$SRC" "$D/entry.env"; then
+    echo "entries/$ENTRY.env differs from the running entry's settings: pause it first (keeperctl.sh $ENTRY pause), install, then resume" >&2
+    exit 3
+  fi
   state="loaded and running the previous files until: keeperctl.sh $ENTRY pause, then resume"
 fi
 put "$HERE/run.sh" "$D/run.sh" 755

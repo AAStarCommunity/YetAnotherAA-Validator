@@ -77,6 +77,12 @@ for k in 1 2; do
 done; wait
 expect "two concurrent installs: one exits 0, the other 75 (or both 0, one after the other), never a broken set" \
   '{ [ "$(sort "$T/conc.rc1" "$T/conc.rc2" | tr "\n" " ")" = "0 75 " ] || [ "$(cat "$T/conc.rc1" "$T/conc.rc2" | tr "\n" " ")" = "0 0 " ]; } && cmp -s "$D/run.sh" "$HERE/run.sh" && plutil -lint "$LA/io.aastar.price-keeper-op-sepolia.plist" >/dev/null'
+# a settings change is refused while the entry is loaded, installed once it is paused
+cp "$D/entry.env" "$T/entry.installed"; echo "# changed setting" >> "$D/entry.env"
+: > "$T/lc.log"; LOADED=io.aastar.price-keeper-op-sepolia inst op-sepolia
+expect "entry.env change into a loaded entry: exit 3, nothing replaced" '[ "$IRC" = 3 ] && grep -q "pause it first" "$T/inst.out" && grep -q "# changed setting" "$D/entry.env"'
+inst op-sepolia
+expect "the same change into a paused (unloaded) entry is installed" '[ "$IRC" = 0 ] && cmp -s "$D/entry.env" "$HERE/entries/op-sepolia.env"'
 expect "a key file that is not mode 600 is reported" 'grep -q "key.env is mode 644" "$T/inst.out"'
 inst bin; expect "entry name bin refused" '[ "$IRC" = 64 ]'
 inst list; expect "entry name list refused" '[ "$IRC" = 64 ]'
