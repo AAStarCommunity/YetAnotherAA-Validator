@@ -1,10 +1,10 @@
 #!/bin/bash
 # Offline test for stale-watch.sh: a stub status command and a stub curl, no chain and no Telegram.
-#   bash deploy/price-keeper/test-stale-watch.sh      exit 0 = all cases pass
+#   bash deploy/price-keeper/test_stale_watch.sh      exit 0 = all cases pass
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 T="$(mktemp -d)"; trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
-mkdir -p "$T/cfg"
+mkdir -p "$T/cfg"; cp "$HERE/stale-watch.sh" "$T/cfg/stale-watch.sh"   # it runs as the entry it is installed in
 printf 'TELEGRAM_BOT_TOKEN=tok-SECRET\nTELEGRAM_CHAT_ID=42\n' > "$T/cfg/telegram.env"
 
 cat > "$T/status" <<'S'
@@ -42,8 +42,8 @@ run() {
   case "${1:-}" in WANT_RC=*) want="${1#WANT_RC=}"; shift ;; esac
   : > "$T/sent"; : > "$T/pids"
   local t0; t0=$(date +%s)
-  env "$@" KEEPER_CONFIG_DIR="$T/cfg" STALE_WATCH_STATE_DIR="${SD:-$T/state}" STALE_WATCH_STATUS_CMD="$T/status" \
-    STALE_WATCH_CURL="$T/curl" SENT="$T/sent" PIDS="$T/pids" bash "$HERE/stale-watch.sh" ${ARGS:-} > "$T/log" 2>&1
+  env "$@" STALE_WATCH_STATE_DIR="${SD:-$T/state}" STALE_WATCH_STATUS_CMD="$T/status" \
+    STALE_WATCH_CURL="$T/curl" SENT="$T/sent" PIDS="$T/pids" bash "$T/cfg/stale-watch.sh" ${ARGS:-} > "$T/log" 2>&1
   RC=$?; ELAPSED=$(( $(date +%s) - t0 )); CUR="$name"
   if [ "$RC" != "$want" ]; then echo "FAIL $CUR: exit $RC, wanted $want"; cat "$T/log"; fail=1; fi
 }
@@ -77,6 +77,29 @@ expect "last-run stamped" '[ -s "$T/state/last-run" ]'
 
 run "stale cache" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 0x2118 age=517632s limit=4200s"
 expect "one alert" '[ "$(sent)" = 1 ] && grep -q "ALERT.*STALE PaymasterV4" "$T/sent"'
+cp "$T/cfg/telegram.env" "$T/tg.good"; printf 'exit 0\nTELEGRAM_BOT_TOKEN="tok-SECRET"\nTELEGRAM_CHAT_ID=42\n' > "$T/cfg/telegram.env"
+rm -rf "$T/state"; run "telegram.env is data, not code" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 age=9s limit=1s"
+expect "a stray exit line is refused as data, never run (the watcher logs and records the run)" \
+  '[ "$(sent)" = 0 ] && grep -q "not TELEGRAM_BOT_TOKEN= or TELEGRAM_CHAT_ID= -- cannot alert" "$T/log" && [ -f "$T/state/last-run" ]'
+printf 'TELEGRAM_BOT_TOKEN="tok-SECRET"\n# chat\nTELEGRAM_CHAT_ID=42\n' > "$T/cfg/telegram.env"; rm -rf "$T/state"
+run "telegram.env: quoted token and a comment" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 age=9s limit=1s"
+expect "CONTROL accepted; the quoted token is used" '[ "$(sent)" = 1 ] && grep -q "CFG.*bottok-SECRET/sendMessage" "$T/sent.cfg"'
+for bad in 'TELEGRAM_CHAT_ID="42" # current' 'TELEGRAM_CHAT_ID="42' "$(printf 'TELEGRAM_CHAT_ID=42\r')"; do
+  printf 'TELEGRAM_BOT_TOKEN=tok-SECRET\n%s\n' "$bad" > "$T/cfg/telegram.env"; rm -rf "$T/state"
+  run "telegram.env: malformed chat line" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 age=9s limit=1s"
+  expect "refused, nothing sent, said in the log" '[ "$(sent)" = 0 ] && grep -qE "TELEGRAM_CHAT_ID has an unsupported value|outside printable ASCII" "$T/log"'
+done
+for bad in 'TELEGRAM_CHAT_ID =42' 'TELEGRAM_CHAT_ID=42;' "$(printf 'TELEGRAM_CHAT_ID=4\3022')"; do
+  printf 'TELEGRAM_BOT_TOKEN=tok-SECRET\n%s\n' "$bad" > "$T/cfg/telegram.env"; rm -rf "$T/state"
+  run "telegram.env: a line run.sh would refuse" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 age=9s limit=1s"
+  expect "refused, nothing sent, said in the log" '[ "$(sent)" = 0 ] && grep -q "telegram.env.*cannot alert" "$T/log"'
+done
+printf 'TELEGRAM_BOT_TOKEN=tok-SECRET\nTELEGRAM_CHAT_ID=41\nTELEGRAM_CHAT_ID=42\n' > "$T/cfg/telegram.env"; rm -rf "$T/state"
+run "telegram.env: chat set twice" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 age=9s limit=1s"
+expect "refused rather than picking one" '[ "$(sent)" = 0 ] && grep -q "TELEGRAM_CHAT_ID is set twice" "$T/log"'
+cp "$T/tg.good" "$T/cfg/telegram.env"; rm -rf "$T/state"
+run "re-arm the first alert" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 age=9s limit=1s"
+expect "the alert names the entry (the config dir is cfg)" 'grep -q "\[price-keeper cfg\] ALERT" "$T/sent"'
 expect "token never on argv" '! grep -q "tok-SECRET" "$T/sent" && grep -q "CFG.*tok-SECRET" "$T/sent.cfg"'
 
 run "still stale within the interval" STUB_CODE=1 STUB_OUT="STALE PaymasterV4"
@@ -192,9 +215,9 @@ expect "not blocking: alert sent" '[ "$(sent)" = 1 ]'
 rm -rf "$T/state"
 
 # The worker (not a parent that could be killed separately) must hold the lock for the whole check.
-env KEEPER_CONFIG_DIR="$T/cfg" STALE_WATCH_STATE_DIR="$T/state" STALE_WATCH_STATUS_CMD="$T/status" \
+env STALE_WATCH_STATE_DIR="$T/state" STALE_WATCH_STATUS_CMD="$T/status" \
   STALE_WATCH_CURL="$T/curl" SENT="$T/sent.bg" STUB_SLEEP=4 STALE_WATCH_STATUS_TIMEOUT=30 \
-  bash "$HERE/stale-watch.sh" > "$T/log.bg" 2>&1 & bg=$!
+  bash "$T/cfg/stale-watch.sh" > "$T/log.bg" 2>&1 & bg=$!
 sleep 1
 # $bg runs perl as a child; perl must have exec'd into the bash worker, not stayed around as its parent.
 kid=$(pgrep -P "$bg" | head -1); comm=$(ps -o comm= -p "$kid" 2>/dev/null)
@@ -207,19 +230,88 @@ rm -rf "$T/state"
 
 # status.mjs itself: a broken setup must exit 2, not 1, so it reads UNDETERMINED, not STALE.
 if command -v node >/dev/null; then
-  mjs() { # name, expected message, setup of $H -- run status.mjs under a fake HOME
-    local H="$T/home-$1"; mkdir -p "$H/.config/aastar-price-keeper"; eval "$3"
-    out=$(HOME="$H" node "$HERE/status.mjs" 2>&1); rc=$?; CUR="status.mjs: $1"
-    expect "exit 2, UNDETERMINED $2" '[ "$rc" = 2 ] && printf "%s" "$out" | grep -q "^UNDETERMINED.*'"$2"'"'
-  }
-  mjs no-viem "" ':'
-  # A stub viem, so the config paths are reached; any RPC call it would make fails the test (exit 9).
-  viem='v="$H/Dev/aastar/aastar-sdk-price-keeper/packages/core/node_modules/viem"; mkdir -p "$v"
+  # a launchable entry "t" (run.sh would start it); each case changes one thing
+  K1=0x1111111111111111111111111111111111111111111111111111111111111111; K2=0x2222222222222222222222222222222222222222222222222222222222222222   # the stub viem/accounts maps K1 to 0x..c1 (the address file), K2 to 0x..c2
+  base='KEEPER_ENTRY=t
+KEEPER_NETWORK=op-sepolia
+KEEPER_SDK_DIR="~/Dev/aastar/aastar-sdk-t"
+KEEPER_SUPERPAYMASTER=0x00000000000000000000000000000000000000a1
+KEEPER_PAYMASTER=
+KEEPER_HARD_MAX_FEE_GWEI=2
+KEEPER_MIN_BALANCE_WEI=1000000000000000'
+  # A stub viem that answers chain 11155420, block 7 at time 5000, every cache updated at 4000 (age
+  # 1000s), limit 4200s, balance 5e15 wei, and records every read with its block. STUB_* change one answer.
+  fake='v="$H/Dev/aastar/aastar-sdk-t/packages/core/node_modules/viem"; mkdir -p "$v"
     echo "{\"name\":\"viem\",\"main\":\"index.js\"}" > "$v/package.json"
-    echo "const no=()=>process.exit(9); module.exports={createPublicClient:no,http:()=>0,parseAbi:()=>[],formatEther:String}" > "$v/index.js"'
-  mjs no-rpc-env ENOENT "$viem"
-  mjs no-rpc-url "RPC_URL missing" "$viem; echo OTHER=1 > \$H/.config/aastar-price-keeper/rpc.env"
-  mjs no-address ENOENT "$viem; echo RPC_URL=http://127.0.0.1:9 > \$H/.config/aastar-price-keeper/rpc.env"
+    cat > "$v/index.js" <<"J"
+const fs=require("fs"),log=s=>fs.appendFileSync(process.env.READS,s+"\n");
+module.exports={http:u=>{log("rpc "+u);return 0},parseAbi:()=>[],formatEther:w=>String(Number(w)/1e18),createPublicClient:()=>({
+  getChainId:async()=>Number(process.env.STUB_CHAIN||11155420),
+  getBlock:async()=>({number:7n,timestamp:BigInt(Math.floor(Date.now()/1000)-Number(process.env.STUB_HEAD_AGE||5))}),
+  getBalance:async({address,blockNumber})=>{log("balance "+address+"@"+blockNumber);return 5000000000000000n},
+  readContract:async({address,functionName,blockNumber})=>{log(address+" "+functionName+"@"+blockNumber);
+    return functionName==="cachedPrice"?[1n,BigInt(Math.floor(Date.now()/1000)-Number(process.env.STUB_HEAD_AGE||5)-Number(process.env.STUB_AGE||1000))]:4200n}})};
+J
+    cat > "$v/accounts.js" <<A
+const m = { "$K1": "0x00000000000000000000000000000000000000C1", "$K2": "0x00000000000000000000000000000000000000c2" };
+exports.privateKeyToAccount = k => { if (!m[k]) throw new Error("bad key"); return { address: m[k] }; };
+A
+    echo RPC_URL=http://127.0.0.1:9 > "$E/rpc.env"; echo 0x00000000000000000000000000000000000000c1 > "$E/address"'
+  # mjs NAME SETUP [ENV...] -- a fresh fake HOME and entry dir from $base, then SETUP, then status.mjs
+  mjs() {
+    local H="$T/home-$1"; local E="$H/.config/aastar-price-keeper-t"; mkdir -p "$E"
+    printf '%s\n' "$base" > "$E/entry.env"; cp "$HERE/status.mjs" "$E/status.mjs"; echo KEEPER_PRIVATE_KEY=0x1111111111111111111111111111111111111111111111111111111111111111 > "$E/key.env"
+    eval "$2"; : > "$T/reads"; CUR="status.mjs: $1"; shift 2
+    # bounded: a file-type regression would block on a FIFO; the alarm turns that into a failure
+    out=$(env "$@" HOME="$H" READS="$T/reads" perl -e 'alarm 20; exec @ARGV' node "$E/status.mjs" 2>&1); rc=$?
+  }
+  und() { expect "exit 2, UNDETERMINED $1" '[ "$rc" = 2 ] && printf "%s" "$out" | grep -q "^UNDETERMINED.*'"$1"'"'; }
+  mjs no-viem ':'; und "Cannot find module"
+  mjs no-rpc-env "$fake; rm \$E/rpc.env"; und ENOENT
+  mjs no-rpc-url "$fake; echo '# none' > \$E/rpc.env"; und "RPC_URL missing"
+  mjs rpc-env-extra "$fake; echo KEEPER_PAYMASTER=0x00000000000000000000000000000000000000b2 >> \$E/rpc.env"; und "KEEPER_PAYMASTER is not allowed"
+  mjs no-address "$fake; rm \$E/address"; und ENOENT
+  mjs no-entry-env "$fake; rm \$E/entry.env"; und ENOENT
+  mjs bad-superpaymaster "$fake; sed -i '' 's/=0x0*a1\$/=0x12/' \$E/entry.env"; und "KEEPER_SUPERPAYMASTER missing"
+  mjs bad-paymaster "$fake; sed -i '' 's/^KEEPER_PAYMASTER=\$/KEEPER_PAYMASTER=0x12/' \$E/entry.env"; und "KEEPER_PAYMASTER is not an address"
+  mjs no-min-balance "$fake; sed -i '' '/MIN_BALANCE/d' \$E/entry.env"; und "KEEPER_MIN_BALANCE_WEI missing"
+  mjs no-fee-ceiling "$fake; sed -i '' '/HARD_MAX_FEE/d' \$E/entry.env"; und "KEEPER_HARD_MAX_FEE_GWEI missing"
+  mjs a-command-line "$fake; echo false >> \$E/entry.env"; und "line 8 is not NAME=value"
+  mjs export-form "$fake; sed -i '' 's/^KEEPER_PAYMASTER=/export KEEPER_PAYMASTER=/' \$E/entry.env"; und "is not NAME=value"
+  mjs set-twice "$fake; echo KEEPER_PAYMASTER=0x00000000000000000000000000000000000000b2 >> \$E/entry.env"; und "KEEPER_PAYMASTER is set twice"
+  mjs wrong-entry-name "$fake; sed -i '' 's/^KEEPER_ENTRY=t/KEEPER_ENTRY=u/' \$E/entry.env"; und "does not name this directory"
+  mjs mainnet-linked-key "$fake; sed -i '' 's/=op-sepolia/=op-mainnet/' \$E/entry.env; echo x > \$H/k; rm \$E/key.env; echo KEEPER_PRIVATE_KEY=0x1111111111111111111111111111111111111111111111111111111111111111 > \$H/k; ln -s \$H/k \$E/key.env"; und "a mainnet entry needs its own key"
+  mjs wrong-chain "$fake" STUB_CHAIN=11155111; und "is chain 11155111, entry t is chain 11155420"
+  mjs cache-after-block "$fake" STUB_AGE=-100; und "cache time is after its block time"
+
+  mjs bad-interval "$fake; echo KEEPER_POLL_INTERVAL=1s >> \$E/entry.env"; und "KEEPER_POLL_INTERVAL must be an integer"
+  mjs no-key-env "$fake; rm \$E/key.env"; und ENOENT
+  mjs bad-telegram "$fake; echo 'TELEGRAM_BOT_TOKEN=a b' > \$E/telegram.env"; und "telegram.env line 1: TELEGRAM_BOT_TOKEN has an unsupported value"
+  mjs sdk-dotenv "$fake; touch \$H/Dev/aastar/aastar-sdk-t/.env.op-sepolia"; und "run.sh refuses to start"
+  mjs non-ascii "$fake; printf 'KEEPER_ETHUSD_URL=a\\302\\240b\\n' >> \$E/entry.env"; und "byte outside printable ASCII"
+  mjs inherited-dir "$fake" KEEPER_CONFIG_DIR=/nonexistent
+  expect "an inherited KEEPER_CONFIG_DIR is ignored (still checks its own dir)" '[ "$rc" = 0 ]'
+  mjs bad-key-format "$fake; echo KEEPER_PRIVATE_KEY=0xk > \$E/key.env"; und "must be 0x and 64 hex digits"
+  mjs key-fifo "$fake; rm \$E/key.env; mkfifo \$E/key.env"; und "key.env is not a regular file"
+  mjs network-proto "$fake; sed -i '' 's/=op-sepolia/=constructor/' \$E/entry.env"; und "KEEPER_NETWORK must be"
+  mjs address-two-lines "$fake; printf '0x0000000000000000000\\n000000000000000000000c1\\n' > \$E/address"; und "exactly one address on one line"
+  mjs key-address-mismatch "$fake; echo KEEPER_PRIVATE_KEY=$K2 > \$E/key.env"; und "key.env signs as 0x0*c2, but the address file names 0x0*c1"
+  mjs key-viem-rejects "$fake; echo KEEPER_PRIVATE_KEY=0x$(printf '3%.0s' $(seq 64)) > \$E/key.env"; und "bad key"
+  mjs stale-head "$fake" STUB_HEAD_AGE=86400; und "is 86400s old by the wall clock"
+  mjs future-head "$fake" STUB_HEAD_AGE=-600; und "by the wall clock"
+  for f in entry.env rpc.env address; do
+    mjs "fifo-$f" "$fake; rm -f \$E/$f; mkfifo \$E/$f"; und "is not a regular file"
+  done
+  mjs no-v4 "$fake"
+  expect "exit 0, SuperPaymaster only, every read at block 7" \
+    '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "^FRESH SuperPaymaster 0x0*a1 age=1000s" && ! printf "%s" "$out" | grep -q PaymasterV4 &&
+     [ "$(tr "\n" " " < "$T/reads")" = "rpc http://127.0.0.1:9 0x00000000000000000000000000000000000000a1 cachedPrice@7 0x00000000000000000000000000000000000000a1 priceStalenessThreshold@7 balance 0x00000000000000000000000000000000000000c1@7 " ]'
+  mjs with-v4 "$fake; sed -i '' 's/^KEEPER_PAYMASTER=\$/KEEPER_PAYMASTER=0x00000000000000000000000000000000000000b2/' \$E/entry.env"
+  expect "a V4 in entry.env is checked too" '[ "$rc" = 0 ] && printf "%s" "$out" | grep -q "^FRESH PaymasterV4 0x0*b2" && grep -q "^0x0*b2 cachedPrice@7" "$T/reads"'
+  mjs low-gas "$fake; sed -i '' 's/^KEEPER_MIN_BALANCE_WEI=.*/KEEPER_MIN_BALANCE_WEI=6000000000000000/' \$E/entry.env"
+  expect "the floor comes from entry.env: 0.005 ETH below 0.006 is LOW_GAS, exit 1" '[ "$rc" = 1 ] && printf "%s" "$out" | grep -q "^LOW_GAS keeper"'
+  mjs stale "$fake" STUB_AGE=4900
+  expect "a cache older than its limit is STALE, exit 1" '[ "$rc" = 1 ] && printf "%s" "$out" | grep -q "^STALE SuperPaymaster"'
 else
   echo "skip status.mjs check: no node"
 fi

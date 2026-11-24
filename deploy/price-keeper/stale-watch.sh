@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# External check on the price keeper, run by launchd on the Mac Mini every 10 minutes.
+# External check on one price-keeper entry, run by launchd on the Mac Mini every 10 minutes.
+# install.sh copies it into the entry directory, ~/.config/aastar-price-keeper-<entry>/, and runs it from there.
 # It does not trust the keeper process: it runs status.mjs, which reads the on-chain caches and the
 # keeper balance, and sends a Telegram alert through the same bot and chat the keeper uses.
 #
@@ -14,7 +15,11 @@
 #   state that cannot be written                     alert at once (it would otherwise mute the rules above)
 set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-CONFIG_DIR="${KEEPER_CONFIG_DIR:-$HOME/.config/aastar-price-keeper}"
+# The entry is the directory this copy is installed in, nothing else (it reads that entry's state and
+# telegram.env, and status.mjs next to it).
+CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# The entry name tags every message, so alerts from two entries in one chat can be told apart.
+ENTRY="$(basename "$CONFIG_DIR")"; ENTRY="${ENTRY#aastar-price-keeper-}"
 STATE_DIR="${STALE_WATCH_STATE_DIR:-$CONFIG_DIR/stale-watch}"
 STATUS_CMD="${STALE_WATCH_STATUS_CMD:-node $CONFIG_DIR/status.mjs}"
 STATUS_TIMEOUT="${STALE_WATCH_STATUS_TIMEOUT:-120}"
@@ -37,9 +42,21 @@ read_int() {
 
 send() { # text -> 0 only when curl succeeded and Telegram answered ok:true
   [ -f "$CONFIG_DIR/telegram.env" ] || { log "no telegram.env -- cannot alert: $1"; return 1; }
-  local TELEGRAM_BOT_TOKEN="" TELEGRAM_CHAT_ID=""
-  # shellcheck disable=SC1091
-  . "$CONFIG_DIR/telegram.env"
+  # Read as data, never sourced, by run.sh's grammar: blank, comment, or one of the two fields on a
+  # NAME=value line, at most once, bare or wholly in double quotes. Any other line, or a byte outside
+  # printable ASCII, means no alert, and the log says why.
+  local TELEGRAM_BOT_TOKEN="" TELEGRAM_CHAT_ID="" line k v seen=""
+  [ "$(LC_ALL=C tr -d '\n -~' < "$CONFIG_DIR/telegram.env" | wc -c | tr -d ' ')" = 0 ] ||
+    { log "telegram.env holds a byte outside printable ASCII -- cannot alert"; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | '#'*) continue ;; TELEGRAM_BOT_TOKEN=* | TELEGRAM_CHAT_ID=*) ;;
+      *) log "telegram.env has a line that is not TELEGRAM_BOT_TOKEN= or TELEGRAM_CHAT_ID= -- cannot alert"; return 1 ;; esac
+    k="${line%%=*}"; v="${line#*=}"
+    if [[ "$v" =~ ^\"([^\"\$\`\\]*)\"$ ]]; then v="${BASH_REMATCH[1]}"
+    elif ! [[ "$v" =~ ^[^\"\'\$\`\\\;\&\|\<\>\(\)[:space:]]*$ ]]; then log "telegram.env: $k has an unsupported value -- cannot alert"; return 1; fi
+    case " $seen " in *" $k "*) log "telegram.env: $k is set twice -- cannot alert"; return 1 ;; esac
+    seen="$seen $k"; printf -v "$k" '%s' "$v"
+  done < "$CONFIG_DIR/telegram.env"
   [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || { log "telegram.env incomplete -- cannot alert"; return 1; }
   # The token goes through curl's config on stdin, so it never appears in the process list.
   local resp rc errf; errf="$(mktemp)"
@@ -64,7 +81,7 @@ put() { # file value -> atomic replace; 1 on failure
 host="$(scutil --get LocalHostName 2>/dev/null || hostname)"
 
 if [ "${1:-}" = "--test" ]; then
-  if send "[price-keeper stale-watch] TEST from $host at $(date -u +%Y-%m-%dT%H:%M:%SZ) -- alerts reach this chat"; then
+  if send "[price-keeper $ENTRY stale-watch] TEST from $host at $(date -u +%Y-%m-%dT%H:%M:%SZ) -- alerts reach this chat"; then
     log "test message sent"; exit 0
   fi
   exit 1
@@ -72,7 +89,7 @@ fi
 
 state_broken() {
   log "state dir $STATE_DIR not writable: $1"
-  send "[price-keeper] stale-watch on $host cannot write its state ($1) -- alerts may be muted until fixed"
+  send "[price-keeper $ENTRY] stale-watch on $host cannot write its state ($1) -- alerts may be muted until fixed"
   exit 1
 }
 mkdir -p "$STATE_DIR" 2>/dev/null || state_broken "mkdir failed"
@@ -170,7 +187,7 @@ case "$code" in
   0)
     put "$undet_file" 0 || state_broken "undetermined-count"
     if [ -f "$stale_stamp" ] || [ -f "$undet_stamp" ]; then
-      if send "[price-keeper] RECOVERED on $host: $(printf '%s' "$out" | tr '\n' ' ')"; then
+      if send "[price-keeper $ENTRY] RECOVERED on $host: $(printf '%s' "$out" | tr '\n' ' ')"; then
         rm -f "$stale_stamp" "$stale_kinds" "$undet_stamp" || state_broken "clear stamps"
       fi
     fi
@@ -190,7 +207,7 @@ case "$code" in
     for k in $kinds; do case "$alerted" in *" $k "*) ;; *) new_item="$k"; break ;; esac; done
     set +f
     if due "$stale_stamp" || [ -n "$new_item" ]; then
-      if send "[price-keeper] ALERT on $host: ${bad:-status exit 1 }-- run keeperctl.sh status"; then
+      if send "[price-keeper $ENTRY] ALERT on $host: ${bad:-status exit 1 }-- check the entry with status.mjs"; then
         put "$stale_stamp" "$now_s" || state_broken "alerted-stale"
         put "$stale_kinds" "$kinds" || state_broken "alerted-stale-kinds"
       fi
@@ -202,7 +219,7 @@ case "$code" in
     n=$(( $(read_int "$undet_file") + 1 ))
     put "$undet_file" "$n" || state_broken "undetermined-count"
     if [ "$n" -ge "$UNDETERMINED_AFTER" ] && due "$undet_stamp"; then
-      if send "[price-keeper] UNDETERMINED on $host for $n checks in a row: $(printf '%s' "$out" | tail -1)"; then
+      if send "[price-keeper $ENTRY] UNDETERMINED on $host for $n checks in a row: $(printf '%s' "$out" | tail -1)"; then
         put "$undet_stamp" "$now_s" || state_broken "alerted-undetermined"
       fi
     fi

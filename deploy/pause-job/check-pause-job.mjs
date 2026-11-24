@@ -836,6 +836,16 @@ cell(
     nk.some(p => p.includes(`${KEEPER_LABEL} is not loaded`)),
     nk
   );
+  // the retired Sepolia keeper must not come back next to the OP Sepolia one
+  const retired = launchdOff(
+    [DETECTOR_LABEL, DEADMAN_LABEL, KEEPER_LABEL, "io.aastar.price-keeper"],
+    () => []
+  );
+  cell(
+    "launchd-on fails when the retired Sepolia keeper io.aastar.price-keeper is loaded",
+    KEEPER_LABEL === "io.aastar.price-keeper-op-sepolia" &&
+      retired.some(p => p.includes("io.aastar.price-keeper is loaded"))
+  );
   const nd = launchdOff([KEEPER_LABEL], () => []);
   cell(
     "launchd-on fails when the pause detector is not loaded",
