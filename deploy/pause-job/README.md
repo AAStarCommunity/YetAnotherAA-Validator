@@ -217,9 +217,11 @@ Until this PR merged, they were manual items on the launch checklist.
   - the committee keeper is not loaded;
   - apply-rotation is not loaded;
   - this D2 pause job (`io.aastar.dvt-pause-job`) is **not** loaded;
+  - the retired Sepolia price keeper (`io.aastar.price-keeper`, stopped by the
+    author on 2026-11-24) is **not** loaded;
   - the read-only pause detector (`io.aastar.dvt-pause-detector`) **is** loaded,
-    and so is the price keeper (`io.aastar.price-keeper`, the one approved
-    sender, not scanned);
+    and so is the price keeper (`io.aastar.price-keeper-op-sepolia`, the one
+    approved sender, not scanned);
   - no other loaded job runs a DVT transaction-sending script. This is judged by
     the job's ProgramArguments, not its label: a script name anywhere in an
     argument counts, and shell wrapper scripts are read. A wrapper that cannot
