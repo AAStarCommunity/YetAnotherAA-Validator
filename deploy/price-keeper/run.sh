@@ -47,8 +47,8 @@ ENTRY="$(get KEEPER_ENTRY)"; NETWORK="$(get KEEPER_NETWORK)"; SP="$(get KEEPER_S
 PM="$(get KEEPER_PAYMASTER)"; FEE="$(get KEEPER_HARD_MAX_FEE_GWEI)"; SDK="$(get KEEPER_SDK_DIR)"
 
 [[ "$ENTRY" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "KEEPER_ENTRY must be lowercase letters, digits and dashes"
-# reserved as in install.sh and keeperctl.sh: bin, list, and *-stale-watch (another entry's watcher label)
-case "$ENTRY" in bin | list | *-stale-watch) die "KEEPER_ENTRY $ENTRY is a reserved name" ;; esac
+# reserved as in install.sh and keeperctl.sh: bin, list, stale-watch and *-stale-watch (watcher labels)
+case "$ENTRY" in bin | list | stale-watch | *-stale-watch) die "KEEPER_ENTRY $ENTRY is a reserved name" ;; esac
 [ "$(basename "$CONFIG_DIR")" = "aastar-price-keeper-$ENTRY" ] ||
   die "entry $ENTRY must live in ~/.config/aastar-price-keeper-$ENTRY, not $CONFIG_DIR"
 case "$NETWORK" in

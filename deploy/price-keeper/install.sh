@@ -6,19 +6,23 @@
 #     ~/.config/aastar-price-keeper-<entry>/ (mode 700), backing up any file it replaces;
 #   - copies keeperctl.sh into ~/.config/aastar-price-keeper-bin/;
 #   - writes the two plists io.aastar.price-keeper-<entry>{,-stale-watch}.plist to ~/Library/LaunchAgents;
-#   - on a FIRST install, disables both jobs, so nothing runs (and a reboot starts nothing) until
-#     `keeperctl.sh <entry> resume`. On an update of a loaded entry it changes no launchd state:
-#     the new files take effect at the next pause + resume.
+#   - installs only into a PAUSED entry: if either of its jobs is loaded it refuses (exit 75) and
+#     changes nothing, because KeepAlive would run new files in place at the keeper's next restart,
+#     without a dry-run. Every install leaves both jobs disabled (checked), so nothing runs, and a
+#     reboot starts nothing, until `keeperctl.sh <entry> resume`.
 # It never creates or reads secrets. It reports which of rpc.env / key.env / address / telegram.env
-# are missing; exit 0 = installed and ready to resume, 2 = installed but a required file is missing.
+# are missing. Exit 0 = installed and ready to resume; 2 = installed but a required file is
+# missing; 1 = publishing failed and the previous files were put back; 4 = publishing failed and
+# could not be undone (INSTALL-INCOMPLETE is left in the entry dir and resume refuses).
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 LAUNCHCTL="${KEEPER_LAUNCHCTL:-launchctl}"   # the test swaps in a stub
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTRY="${1:-}"
-# Reserved: bin (the shared control dir), list (a keeperctl command), and any name ending in
-# -stale-watch, whose keeper label would be another entry's watcher label.
-[[ "$ENTRY" =~ ^[a-z0-9][a-z0-9-]*$ ]] && case "$ENTRY" in bin | list | *-stale-watch) false ;; esac || { echo "usage: install.sh <entry>  (entries/: $(cd "$HERE/entries" && ls | sed 's/\.env$//' | tr '\n' ' '))" >&2; exit 64; }
+# Reserved: bin (the shared control dir), list (a keeperctl command), stale-watch and any name
+# ending in -stale-watch, whose keeper label would be a watcher label (another entry's, or for
+# stale-watch the retired Sepolia watcher io.aastar.price-keeper-stale-watch).
+[[ "$ENTRY" =~ ^[a-z0-9][a-z0-9-]*$ ]] && case "$ENTRY" in bin | list | stale-watch | *-stale-watch) false ;; esac || { echo "usage: install.sh <entry>  (entries/: $(cd "$HERE/entries" && ls | sed 's/\.env$//' | tr '\n' ' '))" >&2; exit 64; }
 SRC="$HERE/entries/$ENTRY.env"
 [ -f "$SRC" ] || { echo "no entries/$ENTRY.env" >&2; exit 66; }
 grep -qx "KEEPER_ENTRY=$ENTRY" "$SRC" || { echo "entries/$ENTRY.env must contain KEEPER_ENTRY=$ENTRY" >&2; exit 65; }
@@ -29,7 +33,10 @@ LA="$HOME/Library/LaunchAgents"
 DOM="gui/$(id -u)"
 LABEL="io.aastar.price-keeper-$ENTRY"
 WATCH="$LABEL-stale-watch"
+# $HOME goes into sed and the plists: only plain path characters. Checked before anything is created.
+[[ "$HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "HOME $HOME has characters install.sh does not write into a plist" >&2; exit 65; }
 mkdir -p -m 700 "$D" "$D/stale-watch" "$BIN"
+chmod 700 "$D"   # also an entry dir that already existed with a wider mode
 # take_lock FILE FD: an exclusive flock(2) on FILE through descriptor FD of this shell. The kernel
 # drops it when this process exits, however it exits, so there is no stale lock and no takeover race.
 take_lock() {
@@ -40,13 +47,18 @@ take_lock() {
 # every entry publishes the shared keeperctl.sh.
 take_lock "$D/.keeperctl.lock" 8 || { echo "keeperctl.sh or install.sh for $ENTRY is running" >&2; exit 75; }
 take_lock "$BIN/.install.lock" 7 || { echo "another install.sh is running" >&2; exit 75; }
-# Decided under both locks: a first install is one with no entry.env published yet.
-first=""; [ -f "$D/entry.env" ] || first=1
 mkdir -p "$LA"
 backup="$D/backup-$(date -u +%Y%m%dT%H%M%SZ)"
-
-# $HOME goes into sed and the plists: only plain path characters.
-[[ "$HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "HOME $HOME has characters install.sh does not write into a plist" >&2; exit 65; }
+# Decided under both locks: the entry must be paused. launchctl print exits 113 for a job it does
+# not know; 0 means loaded; anything else means it cannot tell, which is refused too.
+for j in "$LABEL" "$WATCH"; do
+  st=0; "$LAUNCHCTL" print "$DOM/$j" >/dev/null 2>&1 || st=$?   # under set -e, so not "; st=$?"
+  case "$st" in
+    113) ;;
+    0) echo "$j is loaded: pause the entry first (keeperctl.sh $ENTRY pause), install, then resume" >&2; exit 75 ;;
+    *) echo "launchctl print $j failed ($st): cannot tell whether the entry is paused; nothing installed" >&2; exit 75 ;;
+  esac
+done
 # Every managed destination is a plain file or absent: never a link (it could alias a secret).
 for f in "$D/run.sh" "$D/stale-watch.sh" "$D/status.mjs" "$D/entry.env" "$BIN/keeperctl.sh" "$LA/$LABEL.plist" "$LA/$WATCH.plist"; do
   if [ -L "$f" ] || { [ -e "$f" ] && { [ ! -f "$f" ] || [ "$(stat -f %l "$f")" != 1 ]; }; }; then
@@ -96,29 +108,21 @@ publish() {
     done
     if [ -n "$bad" ]; then
       trap - EXIT   # keep the staged copies: they are the only good versions left
-      echo "install.sh: publishing failed AND ROLLBACK INCOMPLETE for:$bad; previous files are in $stage (prev.*); do not resume" >&2; exit 2
+      printf 'install.sh %s: rollback incomplete for:%s; previous files in %s (prev.*)\n' "$(date -u +%FT%TZ)" "$bad" "$stage" > "$D/INSTALL-INCOMPLETE"
+      echo "install.sh: publishing failed AND ROLLBACK INCOMPLETE for:$bad; previous files are in $stage (prev.*); resume refuses until $D/INSTALL-INCOMPLETE is resolved" >&2; exit 4
     fi
     echo "install.sh: publishing failed; the previous files were put back" >&2; exit 1
   fi
 }
 
-# A first install disables the jobs BEFORE their plists exist, so no login or reboot can load them.
-if [ -n "$first" ] || ! "$LAUNCHCTL" print "$DOM/$LABEL" >/dev/null 2>&1; then
-  for j in "$LABEL" "$WATCH"; do
-    "$LAUNCHCTL" disable "$DOM/$j" || { echo "launchctl disable $j failed; nothing installed" >&2; exit 1; }
-    "$LAUNCHCTL" print-disabled "$DOM" | grep -qF "\"$j\" => disabled" ||
-      { echo "launchd does not list $j as disabled; nothing installed" >&2; exit 1; }
-  done
-  state="paused (both jobs disabled; start with: keeperctl.sh $ENTRY resume)"
-else
-  # A running entry keeps its old settings until it restarts, while status.mjs would read new ones
-  # at its next check: a settings change is installed only into a paused entry.
-  if [ -f "$D/entry.env" ] && ! cmp -s "$SRC" "$D/entry.env"; then
-    echo "entries/$ENTRY.env differs from the running entry's settings: pause it first (keeperctl.sh $ENTRY pause), install, then resume" >&2
-    exit 3
-  fi
-  state="loaded and running the previous files until: keeperctl.sh $ENTRY pause, then resume"
-fi
+# Both jobs are disabled BEFORE any plist is published, on every install, so no login, reboot or
+# stray bootstrap can load them until resume.
+for j in "$LABEL" "$WATCH"; do
+  "$LAUNCHCTL" disable "$DOM/$j" || { echo "launchctl disable $j failed; nothing installed" >&2; exit 1; }
+  "$LAUNCHCTL" print-disabled "$DOM" | grep -qxF "		\"$j\" => disabled" ||
+    { echo "launchd does not list $j as disabled; nothing installed" >&2; exit 1; }
+done
+state="paused (both jobs disabled; start with: keeperctl.sh $ENTRY resume)"
 put "$HERE/run.sh" "$D/run.sh" 755
 put "$HERE/stale-watch.sh" "$D/stale-watch.sh" 755
 put "$HERE/status.mjs" "$D/status.mjs" 644
@@ -126,7 +130,12 @@ put "$SRC" "$D/entry.env" 644
 put "$HERE/keeperctl.sh" "$BIN/keeperctl.sh" 755
 render "$HERE/keeper.plist.in" "$LA/$LABEL.plist"
 render "$HERE/stale-watch.plist.in" "$LA/$WATCH.plist"
+# A signal in the middle of publishing would leave a mix (and delete the staged copies): the
+# publish and its rollback run to the end.
+trap '' INT TERM HUP
 publish
+trap - INT TERM HUP
+rm -f "$D/INSTALL-INCOMPLETE"
 
 echo "installed entry $ENTRY in $D"
 [ -d "$backup" ] && echo "replaced files backed up in $backup"
