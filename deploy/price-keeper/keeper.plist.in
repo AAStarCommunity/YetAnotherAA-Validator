@@ -1,13 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: install.sh replaces @ENTRY@ and @HOME@ and writes ~/Library/LaunchAgents/io.aastar.price-keeper-@ENTRY@.plist -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>io.aastar.price-keeper</string>
+  <string>io.aastar.price-keeper-@ENTRY@</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/jason/.config/aastar-price-keeper/run.sh</string>
+    <string>@HOME@/.config/aastar-price-keeper-@ENTRY@/run.sh</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -16,8 +17,8 @@
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>StandardOutPath</key>
-  <string>/Users/jason/Library/Logs/aastar-price-keeper.log</string>
+  <string>@HOME@/Library/Logs/aastar-price-keeper-@ENTRY@.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/jason/Library/Logs/aastar-price-keeper.log</string>
+  <string>@HOME@/Library/Logs/aastar-price-keeper-@ENTRY@.log</string>
 </dict>
 </plist>

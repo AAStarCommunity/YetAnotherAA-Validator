@@ -87,6 +87,9 @@ edit 'KEEPER_POLL_INTERVAL=$(echo 1)'; expect "a command substitution in entry.e
 edit 'KEEPER_ETHUSD_URL="x"; echo hi'; expect "a second command after a value refused" '[ "$RRC" = 78 ] && ! grep -q "^ARG" "$T/run.out"'
 edit "if then"; expect "a syntax error in entry.env refused before sourcing" '[ "$RRC" = 78 ] && ! grep -q "syntax error" "$T/run.out"'
 edit 'KEEPER_ETHUSD_URL="https://api.example/x?symbol=ETHUSDT"' '# a comment' '' ; expect "CONTROL quoted URL, comment and blank line are accepted" '[ "$RRC" = 0 ] && [ "$(next --external-ethusd-url)" = "https://api.example/x?symbol=ETHUSDT" ]'
+for n in bin list op-sepolia-stale-watch; do
+  edit "KEEPER_ENTRY=$n"; expect "reserved entry name $n refused" '[ "$RRC" = 78 ] && grep -qE "reserved name|must live in" "$T/run.out"'
+done
 edit "KEEPER_ENTRY=op-mainnet"; expect "entry name not matching its directory refused" '[ "$RRC" = 78 ] && grep -q "must live in" "$T/run.out"'
 cp "$T/entry.good" "$D/entry.env"
 
