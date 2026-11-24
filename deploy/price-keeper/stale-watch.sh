@@ -207,7 +207,7 @@ case "$code" in
     for k in $kinds; do case "$alerted" in *" $k "*) ;; *) new_item="$k"; break ;; esac; done
     set +f
     if due "$stale_stamp" || [ -n "$new_item" ]; then
-      if send "[price-keeper $ENTRY] ALERT on $host: ${bad:-status exit 1 }-- check the entry with status.mjs"; then
+      if send "[price-keeper $ENTRY] ALERT on $host: ${bad:-status exit 1 }-- run keeperctl.sh $ENTRY status"; then
         put "$stale_stamp" "$now_s" || state_broken "alerted-stale"
         put "$stale_kinds" "$kinds" || state_broken "alerted-stale-kinds"
       fi

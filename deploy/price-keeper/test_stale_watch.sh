@@ -99,7 +99,7 @@ run "telegram.env: chat set twice" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 age=9
 expect "refused rather than picking one" '[ "$(sent)" = 0 ] && grep -q "TELEGRAM_CHAT_ID is set twice" "$T/log"'
 cp "$T/tg.good" "$T/cfg/telegram.env"; rm -rf "$T/state"
 run "re-arm the first alert" STUB_CODE=1 STUB_OUT="STALE PaymasterV4 age=9s limit=1s"
-expect "the alert names the entry (the config dir is cfg)" 'grep -q "\[price-keeper cfg\] ALERT" "$T/sent"'
+expect "the alert names the entry (the config dir is cfg) and its keeperctl command" 'grep -q "\[price-keeper cfg\] ALERT" "$T/sent" && grep -q "run keeperctl.sh cfg status" "$T/sent"'
 expect "token never on argv" '! grep -q "tok-SECRET" "$T/sent" && grep -q "CFG.*tok-SECRET" "$T/sent.cfg"'
 
 run "still stale within the interval" STUB_CODE=1 STUB_OUT="STALE PaymasterV4"

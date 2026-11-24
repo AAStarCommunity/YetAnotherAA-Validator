@@ -1,13 +1,14 @@
 # Price keeper on the Mac Mini
 
 > **Being migrated (2026-11-24, author: only the OP Sepolia keeper is served).**
-> `run.sh`, `status.mjs` and `stale-watch.sh` run one **entry** from
+> The scripts now run one **entry** from
 > `~/.config/aastar-price-keeper-<entry>/`, configured by `entries/<entry>.env`
-> (only `op-sepolia`), and `bash deploy/price-keeper/install.sh <entry>`
-> installs one, with both jobs disabled until resumed. Control (`keeperctl.sh`)
-> below still describes the old single-keeper layout until the follow-up PR
-> lands. Tests: `test_run.sh`, `test_stale_watch.sh`, `test_install.sh` in
-> `deploy/price-keeper/`.
+> (only `op-sepolia`). `bash deploy/price-keeper/install.sh <entry>` installs
+> one with both jobs disabled;
+> `keeperctl.sh <entry> pause|resume|restart|status|logs|dry-run` controls it.
+> The text below still describes the old single-keeper layout until the README
+> rewrite lands. Tests: `test_run.sh`, `test_stale_watch.sh`, `test_install.sh`,
+> `test_keeperctl.sh` in `deploy/price-keeper/`.
 
 DVT runs the SuperPaymaster price keeper on the Mac Mini (`ssh mac-mini`). It
 keeps `cachedPrice` fresh on the SuperPaymaster proxy and on PaymasterV4
