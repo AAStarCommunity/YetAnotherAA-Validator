@@ -27,8 +27,8 @@ chmod +x "$T/launchctl"
 
 H="$T/home"; mkdir -p "$H"
 # inst [VAR=value ...] ENTRY -- install.sh under the fake HOME; exit code in IRC, output in inst.out
-inst() { env HOME="$H" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" "$@" bash "$HERE/install.sh" > "$T/inst.out" 2>&1 <<< "" ; IRC=$?; }
-in2() { local e="${!#}"; set -- "${@:1:$(($# - 1))}"; env HOME="$H" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" "$@" bash "$HERE/install.sh" "$e" > "$T/inst.out" 2>&1; IRC=$?; }
+inst() { env HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" "$@" bash "$HERE/install.sh" > "$T/inst.out" 2>&1 <<< "" ; IRC=$?; }
+in2() { local e="${!#}"; set -- "${@:1:$(($# - 1))}"; env HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" "$@" bash "$HERE/install.sh" "$e" > "$T/inst.out" 2>&1; IRC=$?; }
 D="$H/.config/aastar-price-keeper-op-sepolia"
 LA="$H/Library/LaunchAgents"
 KP="$LA/io.aastar.price-keeper-op-sepolia.plist"; WP="$LA/io.aastar.price-keeper-op-sepolia-stale-watch.plist"
@@ -80,7 +80,7 @@ expect "an existing entry dir with mode 755 is set to 700" '[ "$IRC" = 0 ] && [ 
 H2="$T/home2"; mkdir -p "$H2"
 for v in STUB_DISABLE_FAIL=1 STUB_NO_RECORD=1 "STUB_PD_PREFIX=x"; do
   rm -rf "$H2/.config" "$H2/Library"; : > "$T/lc2.log"; rm -f "$T/lc2.log.disabled"
-  env HOME="$H2" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc2.log" "$v" bash "$HERE/install.sh" op-sepolia > "$T/inst.out" 2>&1; IRC=$?
+  env HOME="$H2" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc2.log" "$v" bash "$HERE/install.sh" op-sepolia > "$T/inst.out" 2>&1; IRC=$?
   expect "first install with $v: exit 1, no plist and no script published" \
     '[ "$IRC" = 1 ] && [ ! -e "$H2/Library/LaunchAgents/$L.plist" ] && [ ! -e "$H2/.config/aastar-price-keeper-op-sepolia/run.sh" ]'
 done
@@ -94,7 +94,7 @@ expect "no temp file or staging dir left behind" '! ls -a "$D" "$LA" | grep -qE 
 in2 op-sepolia; expect "CONTROL the same install then succeeds" '[ "$IRC" = 0 ] && cmp -s "$D/run.sh" "$HERE/run.sh"'
 # a first install whose publish fails removes the files it created
 H3="$T/home3"; mkdir -p "$H3/Library/LaunchAgents"; chmod 500 "$H3/Library/LaunchAgents"
-env HOME="$H3" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc3.log" bash "$HERE/install.sh" op-sepolia > "$T/inst.out" 2>&1; IRC=$?
+env HOME="$H3" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc3.log" bash "$HERE/install.sh" op-sepolia > "$T/inst.out" 2>&1; IRC=$?
 chmod 700 "$H3/Library/LaunchAgents"
 expect "a failed first install removes the files it created" \
   '[ "$IRC" = 1 ] && [ ! -e "$H3/.config/aastar-price-keeper-op-sepolia/run.sh" ] && [ ! -e "$H3/.config/aastar-price-keeper-op-sepolia/entry.env" ]'
@@ -107,13 +107,35 @@ case "${@: -1}" in */aastar-price-keeper-op-sepolia/run.sh) n=$(cat "$MVCOUNT" 2
 exec /bin/mv "$@"
 S
 chmod +x "$T/mv"; mkdir -p "$T/mvbin"; ln -sf "$T/mv" "$T/mvbin/mv"; rm -f "$T/mvcount"
-env HOME="$H" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" MVCOUNT="$T/mvcount" PATH="$T/mvbin:/usr/bin:/bin" \
+env HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" MVCOUNT="$T/mvcount" PATH="$T/mvbin:/usr/bin:/bin" \
   bash -c "sed 's#^export PATH=\"#export PATH=\"$T/mvbin:#' '$HERE/install.sh' > '$T/install-mv.sh'; cp -R '$HERE/entries' '$T/' ; cp '$HERE'/*.in '$HERE'/run.sh '$HERE'/stale-watch.sh '$HERE'/status.mjs '$HERE'/keeperctl.sh '$T/'; bash '$T/install-mv.sh' op-sepolia" > "$T/inst.out" 2>&1; IRC=$?
 chmod 700 "$LA"
 expect "a rollback that cannot complete: exit 4, INSTALL-INCOMPLETE written, staged copies kept" \
   '[ "$IRC" = 4 ] && [ -f "$D/INSTALL-INCOMPLETE" ] && ls -d "$D"/.stage.* >/dev/null 2>&1 && grep -q "ROLLBACK INCOMPLETE" "$T/inst.out"'
 rm -rf "$D"/.stage.*; in2 op-sepolia
 expect "the next successful install clears INSTALL-INCOMPLETE" '[ "$IRC" = 0 ] && [ ! -e "$D/INSTALL-INCOMPLETE" ]'
+
+# the marker is in place before publishing: a SIGKILL in the middle leaves INSTALL-INCOMPLETE
+cat > "$T/mvkill" <<'S'
+#!/bin/bash
+case "${@: -1}" in */aastar-price-keeper-op-sepolia/run.sh) kill -9 "$INSTALL_PID" ;; esac
+exec /bin/mv "$@"
+S
+chmod +x "$T/mvkill"; mkdir -p "$T/killbin"; ln -sf "$T/mvkill" "$T/killbin/mv"
+sed "s#^export PATH=\"#export PATH=\"$T/killbin:#" "$HERE/install.sh" > "$T/pk-kill.sh"
+mkdir -p "$T/pkk"; cp -R "$HERE/entries" "$HERE"/*.in "$HERE/run.sh" "$HERE/stale-watch.sh" "$HERE/status.mjs" "$HERE/keeperctl.sh" "$T/pkk/"
+cp "$T/pk-kill.sh" "$T/pkk/install.sh"; echo "# before-kill" >> "$D/run.sh"
+env HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" bash -c 'export INSTALL_PID=$$; exec bash "$0" op-sepolia' "$T/pkk/install.sh" > "$T/inst.out" 2>&1; IRC=$?
+expect "an install killed (SIGKILL) while publishing leaves INSTALL-INCOMPLETE behind" '[ "$IRC" = 137 ] && [ -f "$D/INSTALL-INCOMPLETE" ] && grep -q "publishing in progress" "$D/INSTALL-INCOMPLETE"'
+rm -rf "$D"/.stage.* "$D"/.run.sh.* ; in2 op-sepolia
+expect "the next install completes and removes the marker" '[ "$IRC" = 0 ] && [ ! -e "$D/INSTALL-INCOMPLETE" ]'
+# a marker path that is a link to a secret: replaced by rename, the secret untouched
+cp "$D/key.env" "$T/key.before"; ln -s "$D/key.env" "$D/INSTALL-INCOMPLETE"; chmod 500 "$LA"; in2 op-sepolia; chmod 700 "$LA"
+expect "an INSTALL-INCOMPLETE link to key.env never writes key.env (publish failed, rollback ok)" \
+  '[ "$IRC" = 1 ] && cmp -s "$D/key.env" "$T/key.before" && [ ! -e "$D/INSTALL-INCOMPLETE" ] && [ ! -L "$D/INSTALL-INCOMPLETE" ]'
+mv "$D" "$T/entrydir"; ln -s "$T/entrydir" "$D"; in2 op-sepolia
+expect "an entry dir that is a link refused" '[ "$IRC" = 65 ] && grep -q "is a link" "$T/inst.out"'
+rm "$D"; mv "$T/entrydir" "$D"
 
 # ---------- refused destinations and names
 mv "$D/entry.env" "$T/entry.keep"; ln -s "$D/key.env" "$D/entry.env"; in2 op-sepolia
@@ -124,10 +146,10 @@ rm "$T/entry.hardlink"; mv "$D/run.sh" "$T/run.keep"; mkdir "$D/run.sh"; in2 op-
 expect "a run.sh that is a directory refused" '[ "$IRC" = 65 ] && grep -q "not a regular file" "$T/inst.out"'
 rmdir "$D/run.sh"; mv "$T/run.keep" "$D/run.sh"
 H4="$T/home&x"; mkdir -p "$H4"
-env HOME="$H4" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc4.log" bash "$HERE/install.sh" op-sepolia > "$T/inst.out" 2>&1; IRC=$?
+env HOME="$H4" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc4.log" bash "$HERE/install.sh" op-sepolia > "$T/inst.out" 2>&1; IRC=$?
 expect "a HOME with a sed/plist metacharacter refused before anything is created" '[ "$IRC" = 65 ] && [ ! -e "$H4/.config" ] && [ ! -e "$H4/Library" ]'
 cp -R "$HERE" "$T/pk"; sed -i '' 's#<string>io.aastar.price-keeper-@ENTRY@</string>#<string>io.aastar.price-keeper-other</string>#' "$T/pk/keeper.plist.in"
-env HOME="$H" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" bash "$T/pk/install.sh" op-sepolia > "$T/inst.out" 2>&1; IRC=$?
+env HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.log" bash "$T/pk/install.sh" op-sepolia > "$T/inst.out" 2>&1; IRC=$?
 expect "a template whose rendered Label is not its own refused, nothing published" '[ "$IRC" = 70 ] && grep -q "wrong Label" "$T/inst.out" && [ "$(plutil -extract Label raw -o - "$KP")" = "$L" ]'
 for n in bin list stale-watch op-sepolia-stale-watch 'op;rm' 'Op'; do
   in2 "$n"; expect "entry name '$n' refused (usage)" '[ "$IRC" = 64 ]'
@@ -145,7 +167,7 @@ expect "the install lock held (another entry installing): exit 75" '[ "$IRC" = 7
 kill -9 "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true; in2 op-sepolia
 expect "after the holder is killed (kill -9) the lock is free at once" '[ "$IRC" = 0 ]'
 for k in 1 2; do
-  ( env HOME="$H" KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.c$k" bash "$HERE/install.sh" op-sepolia > "$T/conc.$k" 2>&1; echo $? > "$T/conc.rc$k" ) &
+  ( env HOME="$H" KEEPER_LOCAL=1 KEEPER_LAUNCHCTL="$T/launchctl" LCLOG="$T/lc.c$k" bash "$HERE/install.sh" op-sepolia > "$T/conc.$k" 2>&1; echo $? > "$T/conc.rc$k" ) &
 done; wait
 expect "two concurrent installs: one 0 and one 75 (or both 0 in turn), and a consistent set" \
   '{ [ "$(sort "$T/conc.rc1" "$T/conc.rc2" | tr "\n" " ")" = "0 75 " ] || [ "$(cat "$T/conc.rc1" "$T/conc.rc2" | tr "\n" " ")" = "0 0 " ]; } && cmp -s "$D/run.sh" "$HERE/run.sh" && plutil -lint "$KP" >/dev/null'

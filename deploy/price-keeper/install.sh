@@ -7,16 +7,18 @@
 #   - copies keeperctl.sh into ~/.config/aastar-price-keeper-bin/;
 #   - writes the two plists io.aastar.price-keeper-<entry>{,-stale-watch}.plist to ~/Library/LaunchAgents;
 #   - installs only into a PAUSED entry: if either of its jobs is loaded it refuses (exit 75) and
-#     changes nothing, because KeepAlive would run new files in place at the keeper's next restart,
+#     replaces no managed file (the entry dir and lock files may already exist), because KeepAlive would run new files in place at the keeper's next restart,
 #     without a dry-run. Every install leaves both jobs disabled (checked), so nothing runs, and a
 #     reboot starts nothing, until `keeperctl.sh <entry> resume`.
 # It never creates or reads secrets. It reports which of rpc.env / key.env / address / telegram.env
 # are missing. Exit 0 = installed and ready to resume; 2 = installed but a required file is
 # missing; 1 = publishing failed and the previous files were put back; 4 = publishing failed and
-# could not be undone (INSTALL-INCOMPLETE is left in the entry dir and resume refuses).
+# could not be undone. INSTALL-INCOMPLETE marks an install that has not finished, from before the
+# first replacement until the set is whole again; keeperctl resume refuses while it exists.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-LAUNCHCTL="${KEEPER_LAUNCHCTL:-launchctl}"   # the test swaps in a stub
+# Only a test (KEEPER_LOCAL=1, as for keeperctl.sh) may swap launchctl for a stub.
+LAUNCHCTL=launchctl; [ -n "${KEEPER_LOCAL:-}" ] && LAUNCHCTL="${KEEPER_LAUNCHCTL:-launchctl}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTRY="${1:-}"
 # Reserved: bin (the shared control dir), list (a keeperctl command), stale-watch and any name
@@ -35,6 +37,8 @@ LABEL="io.aastar.price-keeper-$ENTRY"
 WATCH="$LABEL-stale-watch"
 # $HOME goes into sed and the plists: only plain path characters. Checked before anything is created.
 [[ "$HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "HOME $HOME has characters install.sh does not write into a plist" >&2; exit 65; }
+# The entry dir is a real directory, never a link (chmod and every write below would follow it).
+for d in "$D" "$BIN"; do [ ! -L "$d" ] || { echo "$d is a link; refusing" >&2; exit 65; }; done
 mkdir -p -m 700 "$D" "$D/stale-watch" "$BIN"
 chmod 700 "$D"   # also an entry dir that already existed with a wider mode
 # take_lock FILE FD: an exclusive flock(2) on FILE through descriptor FD of this shell. The kernel
@@ -108,9 +112,10 @@ publish() {
     done
     if [ -n "$bad" ]; then
       trap - EXIT   # keep the staged copies: they are the only good versions left
-      printf 'install.sh %s: rollback incomplete for:%s; previous files in %s (prev.*)\n' "$(date -u +%FT%TZ)" "$bad" "$stage" > "$D/INSTALL-INCOMPLETE"
+      marker "rollback incomplete for:$bad; previous files in $stage (prev.*)" || true   # already in place since before publish
       echo "install.sh: publishing failed AND ROLLBACK INCOMPLETE for:$bad; previous files are in $stage (prev.*); resume refuses until $D/INSTALL-INCOMPLETE is resolved" >&2; exit 4
     fi
+    rm -f "$D/INSTALL-INCOMPLETE"   # the previous set is intact again
     echo "install.sh: publishing failed; the previous files were put back" >&2; exit 1
   fi
 }
@@ -132,6 +137,13 @@ render "$HERE/keeper.plist.in" "$LA/$LABEL.plist"
 render "$HERE/stale-watch.plist.in" "$LA/$WATCH.plist"
 # A signal in the middle of publishing would leave a mix (and delete the staged copies): the
 # publish and its rollback run to the end.
+# INSTALL-INCOMPLETE is in place BEFORE the first file is replaced and removed only once the set is
+# whole again, so even a SIGKILL in the middle leaves the entry marked, and keeperctl resume refuses.
+marker() { # TEXT -> written by mktemp + rename (rename replaces a link instead of writing through it)
+  local m; m="$(mktemp "$D/.marker.XXXXXX")" && printf 'install.sh %s: %s\n' "$(date -u +%FT%TZ)" "$1" > "$m" &&
+    mv -f "$m" "$D/INSTALL-INCOMPLETE" || { rm -f "$m"; return 1; }
+}
+marker "publishing in progress (pid $$)" || { echo "cannot write $D/INSTALL-INCOMPLETE; nothing installed" >&2; exit 1; }
 trap '' INT TERM HUP
 publish
 trap - INT TERM HUP
